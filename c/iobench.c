@@ -12,7 +12,9 @@
 #include <time.h>
 #include <errno.h>
 #include <string.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 static double now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 int main(int argc,char**argv){
     if(argc<2){fprintf(stderr,"uso: %s file [blkMB] [n] [threads] [direct 0/1]\n",argv[0]);return 1;}
@@ -20,9 +22,18 @@ int main(int argc,char**argv){
     int n=argc>3?atoi(argv[3]):64;
     int nth=argc>4?atoi(argv[4]):8;
     int direct=argc>5?atoi(argv[5]):1;
+#ifdef O_DIRECT
     int fd=open(argv[1],O_RDONLY|(direct?O_DIRECT:0));
     if(fd<0 && direct){ fprintf(stderr,"O_DIRECT non disponibile (%s), uso buffered\n",strerror(errno));
         direct=0; fd=open(argv[1],O_RDONLY); }
+#else
+    int fd=open(argv[1],O_RDONLY);                 /* macOS: F_NOCACHE ~ O_DIRECT */
+#ifdef __APPLE__
+    if(direct && fd>=0) fcntl(fd,F_NOCACHE,1);
+#else
+    if(direct){ fprintf(stderr,"O_DIRECT non disponibile, uso buffered\n"); direct=0; }
+#endif
+#endif
     if(fd<0){perror("open");return 1;}
     off_t sz=lseek(fd,0,SEEK_END);
     if(sz<blk*2){fprintf(stderr,"file troppo piccolo\n");return 1;}

@@ -32,6 +32,11 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
     lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
     sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
 }
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>                             /* Apple Silicon / aarch64: kernel NEON */
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
 
 typedef struct {
@@ -104,7 +109,13 @@ typedef struct {
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
-static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/(1024.0*1024.0); }
+static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
+#ifdef __APPLE__
+    return r.ru_maxrss/(1024.0*1024.0*1024.0);   /* macOS: ru_maxrss in BYTE */
+#else
+    return r.ru_maxrss/(1024.0*1024.0);          /* Linux: in KB */
+#endif
+}
 static float *falloc(int64_t n){ float *p=malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
@@ -123,6 +134,12 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
             for(;i+8<=I;i+=8){ __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i)));
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i), _mm256_cvtepi32_ps(wi), acc); }
             a=hsum256(acc);
+#elif defined(__ARM_NEON)
+            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+            for(;i+8<=I;i+=8){ int16x8_t w16=vmovl_s8(vld1_s8(w+i));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),   vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)))); }
+            a=vaddvq_f32(vaddq_f32(ac0,ac1));
 #endif
             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
 }
@@ -143,6 +160,18 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
+#elif defined(__ARM_NEON)
+            const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
+            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+            for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));               /* 8 byte=16 nibble */
+                uint8x8x2_t z=vzip_u8(vand_u8(by,m4), vshr_n_u8(by,4));        /* nibble in ordine */
+                int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[0]),b8));
+                int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[1]),b8));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
+            a=vaddvq_f32(vaddq_f32(ac0,ac1));
 #endif
             for(;i+1<I;i+=2){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8, hi=(int)(byte>>4)-8;
                 a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
@@ -168,6 +197,21 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
+#elif defined(__ARM_NEON)
+            const uint8x8_t m2v=vdup_n_u8(3); const int8x8_t b2v=vdup_n_s8(2);
+            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+            for(;i+16<=I;i+=16){ uint32_t wd; memcpy(&wd, w+(i>>2), 4);        /* 4 byte=16 valori */
+                uint8x8_t by=vreinterpret_u8_u32(vdup_n_u32(wd));
+                uint8x8x2_t z01=vzip_u8(vand_u8(by,m2v),              vand_u8(vshr_n_u8(by,2),m2v));
+                uint8x8x2_t z23=vzip_u8(vand_u8(vshr_n_u8(by,4),m2v), vshr_n_u8(by,6));
+                uint16x4x2_t zz=vzip_u16(vreinterpret_u16_u8(z01.val[0]), vreinterpret_u16_u8(z23.val[0]));
+                int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u16(zz.val[0]),b2v));  /* 16 valori in ordine */
+                int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u16(zz.val[1]),b2v));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
+            a=vaddvq_f32(vaddq_f32(ac0,ac1));
 #endif
             for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
             y[(int64_t)s*O+o]=a*sc; } }
@@ -203,6 +247,21 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__ARM_NEON)
+    /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
+     * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+16<=I;i+=16){
+        int8x16_t wv=vld1q_s8(w+i), xv=vld1q_s8(x+i);
+#if defined(__ARM_FEATURE_DOTPROD)
+        acc=vdotq_s32(acc,wv,xv);
+#else
+        int16x8_t p=vmull_s8(vget_low_s8(wv),vget_low_s8(xv));
+        p=vmlal_s8(p,vget_high_s8(wv),vget_high_s8(xv));
+        acc=vpadalq_s16(acc,p);
+#endif
+    }
+    sum=vaddvq_s32(acc);
 #endif
     for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
     return sum;
@@ -224,6 +283,27 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
+        int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
+        int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
+#if defined(__ARM_FEATURE_DOTPROD)
+        acc=vdotq_s32(acc,w0,x0); acc=vdotq_s32(acc,w1,x1);
+#else
+        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: nessun overflow */
+        p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
+        acc=vpadalq_s16(acc,p);
+        p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
+        p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
+        acc=vpadalq_s16(acc,p);
+#endif
+    }
+    sum=vaddvq_s32(acc);
 #endif
     for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
     if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
@@ -1419,12 +1499,23 @@ static void pin_load(Model *m, const char *statspath, double gb){
 }
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
-/* RAM disponibile ADESSO (GB) da /proc/meminfo: e' il tetto vero, non il totale */
+/* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
+ * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
+ * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
+ * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
+#ifdef __APPLE__
+    mach_msg_type_number_t cnt=HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vm,&cnt)!=KERN_SUCCESS) return 0;
+    return ((double)vm.free_count+(double)vm.inactive_count+(double)vm.purgeable_count)
+           * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#else
     FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
     char ln[256]; double kb=0;
     while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
     fclose(f); return kb/1e6;
+#endif
 }
 
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */

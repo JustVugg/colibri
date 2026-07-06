@@ -7,10 +7,18 @@ cd "$(dirname "$0")"
 echo "🐦 colibrì — setup"
 
 # 1) dipendenze
-command -v gcc  >/dev/null || { echo "manca gcc (es: sudo apt install build-essential)"; exit 1; }
 command -v make >/dev/null || { echo "manca make"; exit 1; }
-echo "  gcc: $(gcc -dumpversion) · $(nproc) core"
-echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "manca (libgomp)"; exit 1; }
+if [ "$(uname -s)" = "Darwin" ]; then
+    command -v clang >/dev/null || { echo "manca clang (xcode-select --install)"; exit 1; }
+    echo "  clang: $(clang --version | head -1) · $(sysctl -n hw.ncpu) core"
+    echo -n "  OpenMP: "
+    if brew --prefix libomp >/dev/null 2>&1; then echo "ok (libomp)"
+    else echo "libomp assente -> build single-thread (consigliato: brew install libomp)"; fi
+else
+    command -v gcc  >/dev/null || { echo "manca gcc (es: sudo apt install build-essential)"; exit 1; }
+    echo "  gcc: $(gcc -dumpversion) · $(nproc) core"
+    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "manca (libgomp)"; exit 1; }
+fi
 
 # 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
 echo "  compilo (ARCH=${ARCH:-native})…"
@@ -23,7 +31,11 @@ if [ -d glm_tiny ] && [ -f ref_glm.json ]; then
 fi
 
 # 4) info macchina (la velocità dipende da QUESTI due numeri, non dalla GPU)
-ram=$(awk '/MemTotal/{printf "%.0f", $2/1e6}' /proc/meminfo 2>/dev/null || echo "?")
+if [ "$(uname -s)" = "Darwin" ]; then
+    ram=$(( $(sysctl -n hw.memsize) / 1000000000 ))
+else
+    ram=$(awk '/MemTotal/{printf "%.0f", $2/1e6}' /proc/meminfo 2>/dev/null || echo "?")
+fi
 echo "  RAM: ${ram} GB   (più RAM = più expert in cache = più veloce)"
 echo
 echo "pronto. Prossimi passi:"
