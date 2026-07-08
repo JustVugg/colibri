@@ -130,6 +130,17 @@ PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 
 These are estimates, not measurements — if you run colibrì on serious hardware, **please open an issue with your numbers**: real datapoints from better machines are exactly what this project needs next.
 
+### Community benchmarks (measured)
+
+Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decoding, `--ngen 32`, MTP active:
+
+| machine | disk (iobench, 19 MB × 64, 8 threads) | config | measured |
+|---|---|---|---|
+| Intel Core Ultra 7 270K Plus (24 threads) · WSL2 · 24 GB RAM · NVMe VHDX ([#2](https://github.com/JustVugg/colibri/issues/2)) | 1.96 GB/s buffered · 2.74 GB/s O_DIRECT | default | 0.07 tok/s · expert hit 3–4% · RSS 14.1 GB |
+| 〃 | 〃 | `--topp 0.7` | **0.11 tok/s** · expert hit 11% · RSS 14.7 GB |
+
+Takeaways from this datapoint: with 24 GB of RAM the engine auto-caps the expert cache to 2 slots/layer, so decode stays cold even on a disk 2–2.7× faster than the dev box — **on small-RAM machines the RAM cap, not the disk, is the binding constraint**, exactly as the table above predicts. And `--topp 0.7` alone bought a clean 1.6× end-to-end speedup.
+
 ## Quality benchmark — help wanted
 
 We have never measured how much the int4 quantization costs in accuracy — the harness is built and wired, but scoring is one forward per answer option, and on the dev box's ~1 GB/s disk a full run takes the better part of a day. **This is the single most valuable thing a faster machine can contribute.** The code is here and ready; one command runs it end to end (it auto-downloads the datasets on first use):
