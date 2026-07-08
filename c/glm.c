@@ -228,7 +228,17 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
  * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
  * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
  * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#define IDOT_KERNEL "avx512-vnni"
+#elif defined(__AVX2__)
+#define IDOT_KERNEL "avx2"
+#elif defined(__ARM_NEON)
+#define IDOT_KERNEL "neon"
+#else
+#define IDOT_KERNEL "scalar"
+#endif
 static int g_idot=1;
+static int g_i4s=2;   /* min batch S for int4 IDOT; VNNI default 1 (set in main), I4S=n overrides */
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
@@ -246,7 +256,21 @@ static inline int hsum256_i32(__m256i v){
  * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     int32_t sum=0; int i=0;
-#ifdef __AVX2__
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* VNNI: vpdpbusd u8*s8 -> s32 directly, 64 bytes/iter, no 16-bit intermediate.
+     * AVX-512 has no vpsignb: |w| via abs, sign folded into x with a mask-negate
+     * (w==0 -> product 0 either way). |x|<=127 (qrow_i8), |w|<=128 as u8: each
+     * s32 lane adds <= 4*128*127, safe up to I=16384 like the AVX2 bound. */
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m512i wv=_mm512_loadu_si512((const void*)(w+i));
+        __m512i xv=_mm512_loadu_si512((const void*)(x+i));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVX2__)
     __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
     for(;i+32<=I;i+=32){
         __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i));
@@ -277,7 +301,27 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 /* dot int4(packed)·int8: nibble -> int8 [-8,7] al volo, poi stesso trucco */
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
-#ifdef __AVX2__
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
+     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
+     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
+     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
+    const __m256i m4v=_mm256_set1_epi8(0x0F);
+    const __m512i b8v=_mm512_set1_epi8(8);
+    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
+        __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
+        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
+        __m512i xv=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x+i)));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVX2__)
     const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
     const __m256i ones=_mm256_set1_epi16(1);
     __m256i acc=_mm256_setzero_si256();
@@ -335,7 +379,7 @@ static void matmul_qt(float *y, const float *x, const QT *w, int S){
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* misurato (mmbench, 12 core): int8 IDOT vince sempre (1.4-2.5x); int4 IDOT vince
      * solo con S>=2 (1.8x) e PERDE a S=1 (unpack+sign non ripagano su una riga) */
-    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=2))){
+    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
         int I=w->I;
         int8_t *xq=malloc((size_t)S*I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
@@ -1708,6 +1752,11 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    g_i4s = getenv("I4S")?atoi(getenv("I4S")):1;           /* VNNI: int4 IDOT pays even at S=1 */
+#else
+    g_i4s = getenv("I4S")?atoi(getenv("I4S")):2;           /* AVX2: single row loses (mmbench) */
+#endif
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
@@ -1718,7 +1767,7 @@ int main(int argc, char **argv){
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
-    printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit ==\n", cap, ebits, dbits);
+    printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0) g_draft = m.has_mtp ? 3 : 0;
