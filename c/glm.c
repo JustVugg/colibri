@@ -23,6 +23,9 @@
 #include <math.h>
 #include <time.h>
 #include <sys/resource.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
+#endif
 #include "st.h"
 #include "tok.h"
 #ifdef __AVX2__
@@ -1589,6 +1592,51 @@ static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_pat
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
  * Ogni hit evita una lettura dal disco lento. */
+/* MLOCK: inchioda in RAM fisica gli expert pinnati cosi' il compressore di memoria di
+ * macOS non li comprime/evacua (visto: RSS reale < residente previsto -> "hit" lenti).
+ * -1 = auto (ON su macOS dove serve e RLIMIT_MEMLOCK e' permissivo; OFF altrove, dove
+ * il limite e' spesso minuscolo e va alzato a mano), 0 = off, 1 = force.
+ * EN: MLOCK: wire pinned experts into physical RAM so macOS's memory compressor can't
+ * compress/evict them (we saw actual RSS < intended resident -> slow "hits"). -1 = auto
+ * (ON on macOS where it matters and RLIMIT_MEMLOCK is permissive; OFF elsewhere, where the
+ * limit is often tiny and must be raised by hand), 0 = off, 1 = force. */
+static int g_mlock=-1;
+static int mem_should_wire(void){
+    if(g_mlock>=0) return g_mlock;
+#if defined(__APPLE__)
+    return 1;                                     /* macOS: default ON */
+#else
+    return 0;                                     /* Linux/altri: opt-in via MLOCK=1 / opt-in */
+#endif
+}
+/* Inchioda [addr,addr+len) in RAM fisica. No-op fuori da POSIX (Windows ecc.).
+ * EN: wire [addr,addr+len) into physical RAM. No-op off POSIX (Windows, etc.). */
+static int mem_wire(void *addr, size_t len){
+#if defined(__APPLE__) || defined(__linux__)
+    return mlock(addr, len);
+#else
+    (void)addr; (void)len; return 0;
+#endif
+}
+/* Inchioda tutti gli slab degli expert pinnati (pesi + scale). Non fatale se fallisce.
+ * EN: wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
+static void pin_wire(Model *m){
+    if(!mem_should_wire()) return;
+    Cfg *c=&m->c; double t0=now_s(); int64_t wired=0; long failed=0;
+    for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
+        ESlot *s=&m->pin[i][z];
+        if(s->slab){  if(mem_wire(s->slab, s->slab_cap)==0) wired+=s->slab_cap; else failed++; }
+        if(s->fslab){ size_t fl=(size_t)s->fslab_cap*sizeof(float);
+                      if(mem_wire(s->fslab, fl)==0) wired+=fl; else failed++; }
+    }
+    if(failed)
+        fprintf(stderr,"[PIN] mlock: %.1f GB inchiodati/wired, %ld alloc fallite/failed "
+            "(alza il limite / raise it: ulimit -l unlimited) in %.0fs\n", wired/1e9, failed, now_s()-t0);
+    else
+        fprintf(stderr,"[PIN] mlock: %.1f GB inchiodati in RAM fisica / wired in physical RAM "
+            "(niente compressione/no compression) in %.0fs\n", wired/1e9, now_s()-t0);
+}
+
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
@@ -1623,6 +1671,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     m->resident_bytes += (int64_t)npin*eb;
     fprintf(stderr,"[PIN] hot-store: %d expert in RAM (%.1f GB) in %.0fs da %s\n",
         npin, npin*eb/1e9, now_s()-t0, statspath);
+    pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l);
 }
 
@@ -1704,6 +1753,7 @@ int main(int argc, char **argv){
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
