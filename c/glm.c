@@ -1464,6 +1464,55 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * piu' umano, piu' veloce). Template chat GLM con token speciali (CHAT_TEMPLATE=0 -> grezzo).
  * Protocollo: "\x01\x01" "READY" "\x01\x01\n" dopo il load; risposta in streaming; "\x01\x01" "END" "\x01\x01\n" a fine turno.
  * ":reset" (riga "\x02RESET") azzera la memoria. EOF -> esce. */
+/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
+ * Upstream fa AUTOPIN allo START (dalla storia .coli_usage). Questo aggiunge un re-pin
+ * TRA I TURNI: nel punto sicuro dopo la risposta scambia i pin peggiori con i non-pinnati
+ * piu' caldi, cosi' l'hot-store insegue il carico VIVO senza un profilo a parte. Isteresi
+ * 25% (+4) contro il ping-pong; max 4 scambi/passata (~20 MB di disco l'uno). Usa eusage
+ * cumulativo (l'aging LFU del mio fork non e' incluso qui: vedi PR.md).
+ * EN: upstream AUTOPINs at START (from .coli_usage). This adds a between-turns re-pin: at
+ * the safe point after the reply, swap the worst pins for the hottest unpinned, so the
+ * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
+ * ping-pong; max 4 swaps/pass (~20 MB disk each). Uses cumulative eusage (my fork's LFU
+ * aging is NOT included here: see PR.md). */
+static int g_repin=0;
+static uint64_t g_last_repin=0;
+typedef struct { long gain; int l, slot, eid; } RepinCand;
+static int repin_pick(Model *m, RepinCand *out, int maxc){
+    Cfg *c=&m->c; int nb=0;
+    for(int l=0;l<c->n_layers;l++){
+        if(!m->npin || m->npin[l]<1 || !m->eusage[l]) continue;
+        uint32_t *u=m->eusage[l]; ESlot *P=m->pin[l];
+        int zp=0; for(int z=1;z<m->npin[l];z++) if(u[P[z].eid]<u[P[zp].eid]) zp=z;   /* pin piu' freddo / coldest pin */
+        int eu=-1; uint32_t fu=0;
+        for(int e=0;e<c->n_experts;e++){
+            int pinned=0; for(int z=0;z<m->npin[l];z++) if(P[z].eid==e){pinned=1;break;}
+            if(!pinned && u[e]>fu){ fu=u[e]; eu=e; }                                 /* non-pin piu' caldo / hottest unpinned */
+        }
+        if(eu<0) continue;
+        uint32_t fp=u[P[zp].eid];
+        if(fu <= fp + (fp>>2) + 4) continue;                                         /* isteresi 25% / hysteresis */
+        long g=(long)fu-(long)fp;
+        if(nb<maxc){ out[nb].gain=g; out[nb].l=l; out[nb].slot=zp; out[nb].eid=eu; nb++; }
+        else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
+               if(g>out[w].gain){ out[w].gain=g; out[w].l=l; out[w].slot=zp; out[w].eid=eu; } }
+    }
+    return nb;
+}
+static void repin_pass(Model *m){
+    if(g_repin<=0) return;
+    if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
+    g_last_repin = m->n_emit;
+    RepinCand cd[4]; int nb=repin_pick(m,cd,4);
+    for(int b=0;b<nb;b++){
+        int old=m->pin[cd[b].l][cd[b].slot].eid;
+        double t0=now_s();
+        expert_load(m, cd[b].l, cd[b].eid, &m->pin[cd[b].l][cd[b].slot]);
+        fprintf(stderr,"[REPIN] layer %d: esce/out %d (f=%u) <- entra/in %d (f=%u) in %.0f ms\n",
+            cd[b].l, old, m->eusage[cd[b].l][old], cd[b].eid, m->eusage[cd[b].l][cd[b].eid],
+            (now_s()-t0)*1e3);
+    }
+}
 static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
@@ -1498,7 +1547,7 @@ static void run_serve(Model *m, const char *snap){
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
-            fflush(stdout); continue; }
+            fflush(stdout); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         int bl=0;                                /* costruisce il testo del turno (con template) */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
@@ -1708,6 +1757,7 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
