@@ -229,6 +229,14 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
  * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
  * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
 static int g_idot=1;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
+                       * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
+                       * IDOT pays even at S=1 (decode); measured on Apple M-series. */
+#else
+static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
+                       * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
+#endif
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
@@ -333,9 +341,13 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
 
 static void matmul_qt(float *y, const float *x, const QT *w, int S){
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    /* misurato (mmbench, 12 core): int8 IDOT vince sempre (1.4-2.5x); int4 IDOT vince
-     * solo con S>=2 (1.8x) e PERDE a S=1 (unpack+sign non ripagano su una riga) */
-    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=2))){
+    /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
+     * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
+     * PR #9 per il gemello VNNI). Soglia configurabile con I4S.
+     * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
+     * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
+     * twin). Threshold configurable via I4S. */
+    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
         int I=w->I;
         int8_t *xq=malloc((size_t)S*I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
@@ -1708,6 +1720,7 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    g_i4s  = getenv("I4S")?atoi(getenv("I4S")):g_i4s;      /* soglia S per int4 IDOT (default: 1 con SDOT) / S threshold for int4 IDOT (default 1 with SDOT) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
