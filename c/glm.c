@@ -23,6 +23,9 @@
 #include <math.h>
 #include <time.h>
 #include <sys/resource.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
+#endif
 #include "st.h"
 #include "tok.h"
 #ifdef __AVX2__
@@ -228,6 +231,15 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
  * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
  * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
  * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#define IDOT_KERNEL "avx512-vnni"
+#elif defined(__AVX2__)
+#define IDOT_KERNEL "avx2"
+#elif defined(__ARM_NEON)
+#define IDOT_KERNEL "neon"
+#else
+#define IDOT_KERNEL "scalar"
+#endif
 static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
@@ -254,7 +266,21 @@ static inline int hsum256_i32(__m256i v){
  * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     int32_t sum=0; int i=0;
-#ifdef __AVX2__
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* VNNI: vpdpbusd u8*s8 -> s32 directly, 64 bytes/iter, no 16-bit intermediate.
+     * AVX-512 has no vpsignb: |w| via abs, sign folded into x with a mask-negate
+     * (w==0 -> product 0 either way). |x|<=127 (qrow_i8), |w|<=128 as u8: each
+     * s32 lane adds <= 4*128*127, safe up to I=16384 like the AVX2 bound. */
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m512i wv=_mm512_loadu_si512((const void*)(w+i));
+        __m512i xv=_mm512_loadu_si512((const void*)(x+i));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVX2__)
     __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
     for(;i+32<=I;i+=32){
         __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i));
@@ -285,7 +311,27 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 /* dot int4(packed)·int8: nibble -> int8 [-8,7] al volo, poi stesso trucco */
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
-#ifdef __AVX2__
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
+     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
+     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
+     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
+    const __m256i m4v=_mm256_set1_epi8(0x0F);
+    const __m512i b8v=_mm512_set1_epi8(8);
+    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
+        __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
+        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
+        __m512i xv=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x+i)));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVX2__)
     const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
     const __m256i ones=_mm256_set1_epi16(1);
     __m256i acc=_mm256_setzero_si256();
@@ -1601,6 +1647,51 @@ static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_pat
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
  * Ogni hit evita una lettura dal disco lento. */
+/* MLOCK: inchioda in RAM fisica gli expert pinnati cosi' il compressore di memoria di
+ * macOS non li comprime/evacua (visto: RSS reale < residente previsto -> "hit" lenti).
+ * -1 = auto (ON su macOS dove serve e RLIMIT_MEMLOCK e' permissivo; OFF altrove, dove
+ * il limite e' spesso minuscolo e va alzato a mano), 0 = off, 1 = force.
+ * EN: MLOCK: wire pinned experts into physical RAM so macOS's memory compressor can't
+ * compress/evict them (we saw actual RSS < intended resident -> slow "hits"). -1 = auto
+ * (ON on macOS where it matters and RLIMIT_MEMLOCK is permissive; OFF elsewhere, where the
+ * limit is often tiny and must be raised by hand), 0 = off, 1 = force. */
+static int g_mlock=-1;
+static int mem_should_wire(void){
+    if(g_mlock>=0) return g_mlock;
+#if defined(__APPLE__)
+    return 1;                                     /* macOS: default ON */
+#else
+    return 0;                                     /* Linux/altri: opt-in via MLOCK=1 / opt-in */
+#endif
+}
+/* Inchioda [addr,addr+len) in RAM fisica. No-op fuori da POSIX (Windows ecc.).
+ * EN: wire [addr,addr+len) into physical RAM. No-op off POSIX (Windows, etc.). */
+static int mem_wire(void *addr, size_t len){
+#if defined(__APPLE__) || defined(__linux__)
+    return mlock(addr, len);
+#else
+    (void)addr; (void)len; return 0;
+#endif
+}
+/* Inchioda tutti gli slab degli expert pinnati (pesi + scale). Non fatale se fallisce.
+ * EN: wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
+static void pin_wire(Model *m){
+    if(!mem_should_wire()) return;
+    Cfg *c=&m->c; double t0=now_s(); int64_t wired=0; long failed=0;
+    for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
+        ESlot *s=&m->pin[i][z];
+        if(s->slab){  if(mem_wire(s->slab, s->slab_cap)==0) wired+=s->slab_cap; else failed++; }
+        if(s->fslab){ size_t fl=(size_t)s->fslab_cap*sizeof(float);
+                      if(mem_wire(s->fslab, fl)==0) wired+=fl; else failed++; }
+    }
+    if(failed)
+        fprintf(stderr,"[PIN] mlock: %.1f GB inchiodati/wired, %ld alloc fallite/failed "
+            "(alza il limite / raise it: ulimit -l unlimited) in %.0fs\n", wired/1e9, failed, now_s()-t0);
+    else
+        fprintf(stderr,"[PIN] mlock: %.1f GB inchiodati in RAM fisica / wired in physical RAM "
+            "(niente compressione/no compression) in %.0fs\n", wired/1e9, now_s()-t0);
+}
+
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
@@ -1635,6 +1726,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     m->resident_bytes += (int64_t)npin*eb;
     fprintf(stderr,"[PIN] hot-store: %d expert in RAM (%.1f GB) in %.0fs da %s\n",
         npin, npin*eb/1e9, now_s()-t0, statspath);
+    pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l);
 }
 
@@ -1716,6 +1808,7 @@ int main(int argc, char **argv){
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
@@ -1731,7 +1824,7 @@ int main(int argc, char **argv){
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
-    printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit ==\n", cap, ebits, dbits);
+    printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0) g_draft = m.has_mtp ? 3 : 0;

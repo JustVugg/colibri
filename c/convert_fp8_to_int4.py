@@ -178,40 +178,202 @@ def main():
         return
 
     # reale: scarica shard per shard, converte, cancella
-    # ROBUSTEZZA RETE (WSL: la scheda virtuale puo' bloccarsi): timeout sulle read cosi' un
-    # download appeso FALLISCE invece di restare fermo per sempre, e retry con backoff.
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
-    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
-    # hf_xet si blocca quando la rete WSL viene riavviata (connessioni zombie senza timeout):
+    # EN: real: download shard by shard, convert, delete
+    #
+    # ROBUSTEZZA RETE: timeout brevi sulle read cosi' un download appeso FALLISCE invece
+    # di restare fermo per sempre. 8s, non 30: "timeout" = ZERO byte ricevuti in quella
+    # finestra; su un transfer vivo i chunk arrivano di continuo, quindi 8s e' sicuro e
+    # uno stallo costa 8s invece di 30.
+    # EN: NETWORK ROBUSTNESS: short read timeouts so a hung download FAILS instead of
+    # EN: sitting there forever. 8s, not 30: a "timeout" means ZERO bytes received in that
+    # EN: window; a live transfer delivers chunks constantly, so 8s is safe and a stall
+    # EN: costs 8s instead of 30.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "8")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "15")
+    # log con timestamp: i messaggi "Trying to resume" di hf_hub diventano databili.
+    # EN: timestamped logs: hf_hub's "Trying to resume" messages become datable.
+    import logging
+    logging.basicConfig(format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    # hf_xet si blocca quando la rete si riavvia (connessioni zombie senza timeout):
     # forza la via HTTP classica, che curl ha dimostrato funzionare. (misurato 2026-07-02)
-    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    # EN: hf_xet hangs when the network restarts (zombie connections with no timeout):
+    # EN: force the classic HTTP path, which curl proved works (measured 2026-07-02).
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # =0 per riabilitare xet / to re-enable xet
     from huggingface_hub import HfApi, hf_hub_download
 
-    # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda
+    # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
+    # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
     import fcntl
     lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
     try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("ERRORE: un altro convertitore sta gia' lavorando su questa outdir. Esco."); return
 
+    # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
+    # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
+    # EN: known file sizes, filled after repo_info: the multi-stream downloader uses them
+    # EN: to compute segment boundaries and to know when a file is complete.
+    SIZES = {}
+
     def download_retry(repo, fn, dest, tries=999):
-        import time as _t
-        for att in range(tries):
+        """Downloader multi-stream con resume via Range. Apre N segmenti concorrenti
+        (default 2, COLI_DL_STREAMS per cambiarli) e salva lo stato per-segmento in un
+        sidecar .seg -> NESSUN byte perso comunque muoia la connessione. Un singolo stream
+        HF e' limitato a ~2 MB/s (misurato); 2 stream ~ raddoppiano il throughput senza
+        saturare una linea domestica. File piccoli, COLI_DL_STREAMS=1 o un vecchio .part
+        legacy -> percorso a stream singolo (_download_single).
+        EN: multi-stream Range-resume downloader. Opens N concurrent segments (default 2,
+        EN: COLI_DL_STREAMS to change) and saves per-segment state in a .seg sidecar -> NO
+        EN: byte is lost however the connection dies. A single HF stream is paced at
+        EN: ~2 MB/s (measured); 2 streams roughly double throughput without saturating a
+        EN: home line. Small files, COLI_DL_STREAMS=1 or a legacy .part -> single-stream
+        EN: path (_download_single)."""
+        import time as _t, threading, urllib.request, urllib.error
+        url = f"https://huggingface.co/{repo}/resolve/main/{fn}"
+        out = os.path.join(dest, fn); part = out + ".part"; side = part + ".seg"
+        os.makedirs(dest, exist_ok=True)
+        expected = SIZES.get(fn)
+        if os.path.exists(out) and (expected is None or os.path.getsize(out) == expected):
+            return out
+        NS = max(1, min(8, int(os.environ.get("COLI_DL_STREAMS", "2"))))
+        # un .part senza sidecar l'ha scritto una versione precedente a stream singolo.
+        # EN: a .part without a sidecar was written by an older single-stream version.
+        legacy = os.path.exists(part) and not os.path.exists(side)
+        if expected is None or expected < (256 << 20) or NS == 1 or legacy:
+            return _download_single(url, fn, out, part, expected)
+        # ---- multi-stream ----
+        segs = [(expected * t // NS, expected * (t + 1) // NS) for t in range(NS)]
+        done = [0] * NS
+        # riprendi lo stato dei segmenti se il sidecar combacia (stesso N, stessa size).
+        # EN: resume per-segment progress if the sidecar matches (same N, same size).
+        if os.path.exists(side):
             try:
-                return hf_hub_download(repo, fn, local_dir=dest)
+                st = json.loads(open(side).read())
+                if st.get("n") == NS and st.get("size") == expected: done = st["done"]
+            except Exception: pass
+        if not os.path.exists(part):
+            with open(part, "wb") as f: f.truncate(expected)   # file sparse / sparse file
+        fd = os.open(part, os.O_WRONLY)
+        t0 = _t.time(); nres = [0]; log_lock = threading.Lock(); stopfail = []
+        def worker(t):
+            s0, s1 = segs[t]
+            while done[t] < s1 - s0 and not stopfail:
+                pos = s0 + done[t]
+                req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
+                                                           "Range": f"bytes={pos}-{s1-1}"})
+                try:
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        if r.status != 206:               # Range ignorato: multi-stream impossibile
+                            stopfail.append(t); return    # EN: Range ignored: multi-stream impossible
+                        while done[t] < s1 - s0:
+                            chunk = r.read(1 << 20)
+                            if not chunk: break
+                            rem = (s1 - s0) - done[t]     # mai oltre il segmento / never past the segment
+                            if len(chunk) > rem: chunk = chunk[:rem]
+                            os.pwrite(fd, chunk, s0 + done[t])
+                            done[t] += len(chunk)
+                except KeyboardInterrupt: raise
+                except Exception as ex:
+                    with log_lock:
+                        nres[0] += 1
+                        print(f"    [dl] s{t}: {type(ex).__name__} a/at {(s0+done[t])/1e9:.2f} GB: "
+                              f"riprendo/resuming (#{nres[0]})", flush=True)
+                    _t.sleep(min(15, 1 + nres[0] // NS))
+        th = [threading.Thread(target=worker, args=(t,), daemon=True) for t in range(NS)]
+        for x in th: x.start()
+        print(f"    [dl {_t.strftime('%H:%M:%S')}] connesso/connected: {NS} stream, "
+              f"{sum(done)/1e9:.2f} di/of {expected/1e9:.2f} GB", flush=True)
+        mark = sum(done); tmark = t0
+        while any(x.is_alive() for x in th):
+            _t.sleep(5)
+            have = sum(done)
+            tmpside = side + ".tmp"                       # checkpoint atomico / atomic checkpoint
+            open(tmpside, "w").write(json.dumps({"n": NS, "size": expected, "done": list(done)}))
+            os.replace(tmpside, side)
+            now = _t.time()
+            if now - tmark >= 30:
+                print(f"    [dl {_t.strftime('%H:%M:%S')}] {have/1e9:5.2f} GB "
+                      f"({(have-mark)/max(now-tmark,1e-9)/1e6:5.1f} MB/s, {NS} stream)", flush=True)
+                mark = have; tmark = now
+        os.close(fd)
+        if stopfail:                                      # il server non onora il Range: fallback
+            for f2 in (part, side):                       # EN: server won't honor Range: fall back
+                if os.path.exists(f2): os.remove(f2)
+            return _download_single(url, fn, out, part, expected)
+        assert sum(done) == expected
+        if os.path.exists(side): os.remove(side)
+        os.replace(part, out)
+        dt = max(_t.time() - t0, 1e-9)
+        print(f"    [dl] {fn}: {expected/1e9:.2f} GB in {dt/60:.1f} min "
+              f"({expected/dt/1e6:.1f} MB/s medi/avg, {NS} stream, {nres[0]} riprese/resumes)", flush=True)
+        return out
+
+    def _download_single(url, fn, out, part, expected):
+        """Percorso a stream singolo con resume via Range (file piccoli / .part legacy /
+        COLI_DL_STREAMS=1). Un EOF corto ma pulito conta come ripresa; se non arriva
+        NESSUN byte nuovo, backoff invece di girare a vuoto.
+        EN: single-stream path with Range resume (small files / legacy .part /
+        EN: COLI_DL_STREAMS=1). A clean short EOF counts as a resume; if NO new byte
+        EN: arrives, back off instead of spinning."""
+        import time as _t, urllib.request, urllib.error
+        t0 = _t.time(); nres = 0; mark = 0; tmark = t0
+        while True:
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            if expected is not None and have >= expected: break
+            have0 = have
+            req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
+            if have: req.add_header("Range", f"bytes={have}-")
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    if have and r.status == 200:          # server ha ignorato il Range: riparti pulito
+                        have = 0                          # EN: server ignored Range: restart clean
+                    if expected is None:
+                        cl = r.headers.get("Content-Length")
+                        if cl: expected = have + int(cl)
+                    if have == 0 or nres:                 # segnale di vita subito / immediate sign of life
+                        print(f"    [dl {_t.strftime('%H:%M:%S')}] connesso/connected"
+                              f"{f' @ {have/1e9:.2f} GB' if have else ''}"
+                              f"{f' di/of {expected/1e9:.2f} GB' if expected else ''}", flush=True)
+                    with open(part, "ab" if have else "wb") as f:
+                        if not have: f.truncate(0)
+                        while True:
+                            chunk = r.read(1 << 20)
+                            if not chunk: break
+                            f.write(chunk); have += len(chunk)
+                            if have - mark >= 512 * 1024 * 1024 or _t.time() - tmark >= 30:
+                                now = _t.time()
+                                print(f"    [dl {_t.strftime('%H:%M:%S')}] {have/1e9:5.2f} GB "
+                                      f"({(have-mark)/max(now-tmark,1e-9)/1e6:5.1f} MB/s)", flush=True)
+                                mark = have; tmark = now
+                if expected is None: break                # lunghezza ignota: passata singola / unknown length
+                if have < expected:                       # EOF corto ma pulito: conta come ripresa
+                    nres += 1                             # EN: clean short EOF: counts as a resume
+                    if have == have0: _t.sleep(min(15, 1 + nres))   # zero progresso -> backoff / zero progress -> back off
             except KeyboardInterrupt: raise
+            except urllib.error.HTTPError as ex:
+                if ex.code == 416: break                  # gia' completo / already complete
+                nres += 1
+                print(f"    [dl] HTTP {ex.code} a/at {have/1e9:.2f} GB: riprendo/resuming (#{nres})", flush=True)
+                _t.sleep(min(15, 1 + nres))
             except Exception as ex:
-                wait = min(60, 5 * (att + 1))
-                print(f"    rete KO ({type(ex).__name__}): riprovo tra {wait}s "
-                      f"(tentativo {att+1})", flush=True)
-                _t.sleep(wait)
-        raise RuntimeError("download fallito dopo troppi tentativi")
+                nres += 1
+                print(f"    [dl] {type(ex).__name__} a/at {have/1e9:.2f} GB: riprendo/resuming (#{nres})", flush=True)
+                _t.sleep(min(15, 1 + nres))
+        os.replace(part, out)
+        dt = max(_t.time() - t0, 1e-9); sz = os.path.getsize(out)
+        print(f"    [dl] {fn}: {sz/1e9:.2f} GB in {dt/60:.1f} min "
+              f"({sz/dt/1e6:.1f} MB/s medi/avg, {nres} riprese/resumes)", flush=True)
+        return out
 
     from safetensors.numpy import save_file
     import time as _t
     for att in range(999):
         try:
-            info = HfApi().repo_info(a.repo, files_metadata=True); break
+            info = HfApi().repo_info(a.repo, files_metadata=True)
+            # dimensioni note dallo store: abilitano il download multi-stream a segmenti.
+            # EN: sizes known from the store: enable segmented multi-stream download.
+            SIZES.update({s.rfilename: s.size for s in info.siblings if s.size})
+            break
         except KeyboardInterrupt: raise
         except Exception as ex:
             w = min(60, 5*(att+1)); print(f"repo_info KO ({type(ex).__name__}): riprovo tra {w}s", flush=True); _t.sleep(w)
