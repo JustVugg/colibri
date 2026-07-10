@@ -110,6 +110,21 @@ sets the RAM budget and context immediately; the VRAM tier is enabled only when
 the current `glm` binary is linked with CUDA. Explicit flags and environment
 variables keep precedence over automatic values.
 
+Before loading the model, `coli doctor` performs a read-only readiness check and
+explains whether the selected Disk/RAM/VRAM placement is runnable:
+
+```bash
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor --gpu 0 --ram 128 --json
+```
+
+Doctor validates the model directory, config, tokenizer, safetensors headers,
+engine executable, available RAM, requested NVIDIA devices, CUDA linkage, and the
+same placement budget used by `coli plan`. It never starts `glm`, reads tensor
+payloads, imports a model framework, or creates a CUDA context. The versioned JSON
+report uses stable check IDs for automation. Warnings keep exit status 0; missing
+requirements or an unsafe RAM projection return 1, while invalid CLI values return 2.
+
 The engine at runtime is pure C — python is only used by the one-time converter.
 
 ### OpenAI-compatible API
