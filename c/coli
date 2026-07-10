@@ -7,6 +7,7 @@ CLI per far girare GLM-5.2 (744B) in locale, su CPU, in ~15-26 GB di RAM.
   coli serve                API HTTP compatibile OpenAI (motore persistente)
   coli run "prompt"         generazione singola
   coli info                 stato: modello, RAM, disco, config
+  coli plan                 piano risorse Disk / RAM / VRAM
   coli bench [task...]      benchmark di qualità (MMLU/HellaSwag/...)
   coli convert              converte GLM-5.2-FP8 -> int4 (streaming)
   coli build                compila il motore
@@ -265,6 +266,23 @@ def cmd_info(a):
     if knobs: row("tuning", " · ".join(knobs))
     print()
 
+def cmd_plan(a):
+    from resource_plan import build_plan, format_plan
+    try:
+        if a.ctx<1: raise ValueError("--ctx deve essere positivo")
+        if a.vram<0: raise ValueError("--vram non puo essere negativo")
+        devices=None if a.gpu=="auto" else ([] if a.gpu=="none" else
+            [int(value) for value in a.gpu.split(",")])
+        plan=build_plan(a.model,a.ram,a.ctx,devices,a.vram)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        sys.exit(f"{C.yel}impossibile creare il piano:{C.r} {error}")
+    if a.json:
+        print(json.dumps(plan,indent=2))
+        return
+    banner("plan · Disk / RAM / VRAM")
+    print(textwrap.indent(format_plan(plan),"  "))
+    print()
+
 def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('uso: coli run "il tuo prompt"')
@@ -432,6 +450,10 @@ def main():
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — GLM-5.2 in locale")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
+    pp=sub.add_parser("plan",parents=[common]); pp.add_argument("--ctx",type=int,default=4096)
+    pp.add_argument("--gpu",default="auto",help="auto, none oppure lista device, es. 0,1")
+    pp.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
+    pp.add_argument("--json",action="store_true")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
     sub.add_parser("chat", parents=[common])
     ps=sub.add_parser("serve", parents=[common])
@@ -445,7 +467,7 @@ def main():
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="salta la testa MTP (niente draft speculativi)")
     a=ap.parse_args()
-    {"build":cmd_build,"info":cmd_info,"run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
+    {"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
      "convert":cmd_convert}.get(a.cmd, lambda _:(banner(),print(__doc__)))(a)
 
 if __name__=="__main__":
