@@ -35,7 +35,9 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+PYTHON    ?= python3
 CUDA_OBJ  =
+TEST_BINS = tests/test_json tests/test_st
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -66,5 +68,28 @@ olmoe: olmoe.c st.h json.h
 portable:
 	$(MAKE) glm ARCH=x86-64-v3
 
+tests/test_json: tests/test_json.c json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st: tests/test_st.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test-c: $(TEST_BINS)
+	@for test in $(TEST_BINS); do ./$$test || exit 1; done
+
+test-python:
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+test: test-c test-python
+
+# CI-friendly validation: one portable CPU build and dependency-free tests.
+check:
+	$(MAKE) clean
+	$(MAKE) portable
+	$(MAKE) test
+
 clean:
-	rm -f olmoe glm backend_cuda.o backend_cuda_test
+	rm -f olmoe glm backend_cuda.o backend_cuda_test $(TEST_BINS)
+	rm -rf tests/__pycache__
+
+.PHONY: all cuda-test portable test-c test-python test check clean

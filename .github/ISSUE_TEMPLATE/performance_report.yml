@@ -1,0 +1,45 @@
+name: Performance report
+description: Report a benchmark result or performance regression.
+title: "[Performance]: "
+body:
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      placeholder: git rev-parse HEAD
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and storage
+      description: Include CPU, RAM, GPU/VRAM, disk model/type, and filesystem.
+    validations:
+      required: true
+  - type: textarea
+    id: software
+    attributes:
+      label: Software environment
+      description: Include OS, compiler, CUDA/driver versions, and relevant environment variables.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Build and benchmark commands
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Include warm-up policy, run count, median tok/s, and profile timings when available.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Baseline comparison
+      description: For regressions, provide the last known-good commit and its result.

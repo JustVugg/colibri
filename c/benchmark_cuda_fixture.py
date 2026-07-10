@@ -17,15 +17,20 @@ PROFILE_RE = re.compile(
 PROFILE_KEYS = ("disk", "expert_matmul", "attention", "lm_head", "other")
 
 
+def parse_output(stdout: str, stderr: str = "") -> tuple[float, list[float]]:
+    """Extract throughput and profile timings from one engine run."""
+    speed = SPEED_RE.search(stdout)
+    profile = PROFILE_RE.search(stdout)
+    if not speed or not profile:
+        raise RuntimeError(f"benchmark output missing\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    return float(speed.group(1)), [float(value) for value in profile.groups()]
+
+
 def execute(engine: str, env: dict[str, str]) -> tuple[float, list[float]]:
     run = subprocess.run(
         [engine, "4", "4", "4"], env=env, text=True, capture_output=True, check=True
     )
-    speed = SPEED_RE.search(run.stdout)
-    profile = PROFILE_RE.search(run.stdout)
-    if not speed or not profile:
-        raise RuntimeError(f"benchmark output missing\nstdout:\n{run.stdout}\nstderr:\n{run.stderr}")
-    return float(speed.group(1)), [float(value) for value in profile.groups()]
+    return parse_output(run.stdout, run.stderr)
 
 
 def main() -> None:

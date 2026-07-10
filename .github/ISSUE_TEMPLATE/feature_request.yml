@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a focused improvement to Colibri.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What real limitation or workflow problem does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and compatibility
+      description: Note effects on the zero-dependency CPU path, CUDA path, model formats, or platforms.

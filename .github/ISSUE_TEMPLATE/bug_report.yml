@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible defect in Colibri.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to provide a reproducible report.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      description: Paste the exact commit hash when possible.
+      placeholder: git rev-parse HEAD
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, CPU, RAM, GPU/CUDA if enabled, compiler, and storage type.
+      placeholder: Ubuntu 24.04, Ryzen 7950X, 64 GB RAM, NVMe, gcc 13
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include the exact build and run commands with sensitive paths removed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      render: shell
+    validations:
+      required: true
