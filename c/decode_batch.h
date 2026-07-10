@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <math.h>
 
 /* `base` belongs to one sequence's KV state.  Keeping this arithmetic in a
  * model-independent seam makes ragged decode row ownership directly testable. */
@@ -27,7 +28,8 @@ static inline int coli_submit_parse(const char *line, ColiSubmit *s)
                &s->bytes, &s->max_tokens, &s->temperature, &s->top_p,
                &tail) != 6)
         return 0;
-    return s->bytes <= (16u << 20) && s->slot >= 0 && s->max_tokens >= 1 &&
+    return s->id > 0 && s->bytes <= (16u << 20) && s->slot >= 0 && s->max_tokens >= 1 &&
+           isfinite(s->temperature) && isfinite(s->top_p) &&
            s->temperature >= 0 && s->temperature <= 2 &&
            s->top_p > 0 && s->top_p <= 1;
 }

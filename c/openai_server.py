@@ -6,6 +6,7 @@ import codecs
 import collections
 import contextlib
 import json
+import math
 import os
 import select
 import queue
@@ -215,9 +216,11 @@ def generation_options(body, limit):
     top_p = 0.9 if top_p is None else top_p
     if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
         raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
-    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
+            not math.isfinite(temperature) or not 0 <= temperature <= 2):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
-    if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
+    if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
+            not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p)
 
@@ -315,6 +318,8 @@ class Engine:
                 if kind == "DATA" and len(fields) == 3:
                     request_id = fields[1]
                     size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine DATA size")
                     data = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
@@ -358,6 +363,8 @@ class Engine:
 
         events = queue.Queue()
         with self.pending_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
             if self.dispatcher_error is not None:
                 raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
             if self.process.poll() is not None:
@@ -391,7 +398,10 @@ class Engine:
                 raise value
 
     def close(self):
-        self.closed = True
+        with self.pending_lock:
+            if self.closed:
+                return
+            self.closed = True
         self._fail_pending(RuntimeError("colibri engine is shutting down"))
         if self.process.poll() is None:
             self.process.terminate()
@@ -399,6 +409,9 @@ class Engine:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                self.process.wait(timeout=5)
+        if self.dispatcher is not threading.current_thread():
+            self.dispatcher.join(timeout=5)
 
 
 def model_object(model_id, created):

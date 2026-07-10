@@ -2363,13 +2363,20 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
-    int delim=fgetc(stdin); if(delim!='\n' && delim!=EOF) ungetc(delim,stdin);
+    int delim=fgetc(stdin);
+    if(delim!='\n'){
+        printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+        free(raw); free(line); return -1;
+    }
     raw[sub.bytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
         printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
     }
     if(req[sub.slot].active){
         printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+    }
+    for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==sub.id){
+        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
