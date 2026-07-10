@@ -553,10 +553,19 @@ static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quant
                           * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
                           *     un'attention di anticipo: il punto dove il prefetch avrebbe
                           *     un intero giro di disco per lavorare in ombra). */
-static int64_t la_hit[3], la_tot[3];
-static int la_pred[2][130][16]; static signed char la_val[2][130];
+/* profondita' massima del lookahead multi-layer (PILOT_N / misure LOOKA):
+ * kind 0 = token precedente, kind 1 = salto attention, kind 1+d = layer L+d
+ * predetto dallo stato post-attention di L (d=1..LA_MAXD). */
+#define LA_MAXD 8
+static int64_t la_hit[2+LA_MAXD], la_tot[2+LA_MAXD];
+static int la_pred[1+LA_MAXD][130][16]; static signed char la_val[1+LA_MAXD][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+static int g_pilot_n=1;  /* PILOT_N=n: profondita' del lookahead — predice i layer L+1..L+n
+                          * dallo stato post-attention di L. Piu' profondo = piu' letture in volo
+                          * (coda NVMe piena piu' avanti), ma predizioni piu' stantie: K decade. */
+static int g_pilot_decay=2; /* PILOT_DECAY: K perde tanto per ogni livello di profondita' in piu'
+                          * (la testa del ranking resta affidabile, la coda diventa rumore). */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -1176,7 +1185,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
             la_tot[0]+=Ke;
         }
-        for(int kind=0;kind<2;kind++) if(la_val[kind][layer]){   /* [1]/[2] vs predizioni */
+        for(int kind=0;kind<1+LA_MAXD;kind++) if(la_val[kind][layer]){   /* [1..] vs predizioni */
             for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
                 if(la_pred[kind][layer][z]==idxs[kk]){ la_hit[1+kind]++; break; }
             la_tot[1+kind]+=Ke; la_val[kind][layer]=0;
@@ -1281,6 +1290,17 @@ static void la_predict(Model *m, int target, const float *h, int kind){
     la_val[kind][target]=1;
     free(nrm); free(ch);
 }
+static void la_print(void){
+    printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
+    printf("  %-38s %5.1f%%  (%lld/%lld)\n","token precedente (=SPEC prefetch)",
+        la_tot[0]?100.0*la_hit[0]/la_tot[0]:0.0,(long long)la_hit[0],(long long)la_tot[0]);
+    printf("  %-38s %5.1f%%  (%lld/%lld)\n","ingresso layer, salto attention",
+        la_tot[1]?100.0*la_hit[1]/la_tot[1]:0.0,(long long)la_hit[1],(long long)la_tot[1]);
+    for(int d=1;d<=LA_MAXD;d++){ if(!la_tot[1+d]) continue;
+        char lab[64]; snprintf(lab,sizeof(lab),"layer L+%d (%d giri di anticipo)",d,d);
+        printf("  %-38s %5.1f%%  (%lld/%lld)\n",lab,
+            100.0*la_hit[1+d]/la_tot[1+d],(long long)la_hit[1+d],(long long)la_tot[1+d]); }
+}
 
 /* PILOTA: prefetch guidato dal router. Predice il top-K del layer L+1 dallo stato
  * post-attention di L (recall misurato 71.6% su GLM-5.2, vs 41.3% del token precedente)
@@ -1308,28 +1328,48 @@ static void *pilot_worker(void *arg){
     }
     return NULL;
 }
-static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
-    Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
-    int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
+/* dedup degli hint: layer adiacenti ripredicono gli STESSI target (L predice L+3,
+ * poi L+1 lo ripredice a profondita' 2, ...) — senza memoria ogni expert verrebbe
+ * accodato n volte per token, saturando il ring e il worker con fadvise ripetuti.
+ * pilot_seen[l][e] = tick dell'ultimo hint; un hint resta "fresco" per un giro
+ * intero di layer (~1 token): entro quel giro non si riaccoda. */
+static uint32_t *pilot_seen[130];
+static uint32_t pilot_tick=0;
+static void pilot_prefetch(Model *m, int li, const float *x, int S){
+    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts;
     if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    pilot_tick++;
     float *nrm=falloc(D), *ch=falloc(E);
-    for(int s=0;s<S;s++){
-        rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
-        matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
-        for(int kk=0;kk<K;kk++){
-            int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
-            ch[best]=-2e30f;
-            int found=0; ESlot *P=m->pin[lnext];
-            for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
-            ESlot *Sl=m->ecache[lnext];
-            for(int z=0;z<m->ecn[lnext] && !found;z++) if(Sl[z].eid==best) found=1;
-            if(!found){
-                unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
-                if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
-                    pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
-                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
-                }
+    for(int d=1;d<=g_pilot_n;d++){
+        int lt=li+d;                                   /* layer bersaglio */
+        if(lt>=c->n_layers) break;
+        Layer *l=&m->L[lt]; if(!l->sparse) continue;
+        if(!pilot_seen[lt]) pilot_seen[lt]=calloc(E,sizeof(uint32_t));
+        /* K decade con la profondita': la predizione invecchia (mancano d residui MoE
+         * e d-1 attention), solo la testa del ranking resta affidabile. */
+        int K = g_pilot_k - (d-1)*g_pilot_decay;
+        if(K>c->topk) K=c->topk;
+        if(K<1) break;
+        for(int s=0;s<S;s++){
+            rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
+            matmul(ch, nrm, l->router, 1, D, E);
+            for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+            for(int kk=0;kk<K;kk++){
+                int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
+                ch[best]=-2e30f;
+                if(pilot_seen[lt][best] && pilot_tick - pilot_seen[lt][best] < (uint32_t)c->n_layers) continue;
+                int found=0; ESlot *P=m->pin[lt];
+                for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
+                ESlot *Sl=m->ecache[lt];
+                for(int z=0;z<m->ecn[lt] && !found;z++) if(Sl[z].eid==best) found=1;
+                if(!found){
+                    unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
+                    if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
+                        pilot_q[w&4095].l=lt; pilot_q[w&4095].e=best;
+                        __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
+                        pilot_seen[lt][best]=pilot_tick;
+                    }
+                }else pilot_seen[lt][best]=pilot_tick;
             }
         }
     }
@@ -1345,8 +1385,9 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
-    if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
-    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+    if(g_pilot && S<=8 && li+1<c->n_layers) pilot_prefetch(m,li,x,S);
+    if(g_looka && S==1) for(int d=1;d<=LA_MAXD && li+d<c->n_layers;d++)
+        if(m->L[li+d].sparse) la_predict(m,li+d,x,d);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -1755,12 +1796,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     profile_print(m,dt);
-    if(g_looka){
-        const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
-        printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
-            la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
-    }
+    if(g_looka) la_print();
     free(pids); free(all);
     usage_save(m);
 }
@@ -2331,6 +2367,10 @@ int main(int argc, char **argv){
     g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):8;
     if(g_pilot_k<1) g_pilot_k=1;
+    g_pilot_n = getenv("PILOT_N")?atoi(getenv("PILOT_N")):1;   /* profondita' del lookahead */
+    if(g_pilot_n<1) g_pilot_n=1; if(g_pilot_n>LA_MAXD) g_pilot_n=LA_MAXD;
+    g_pilot_decay = getenv("PILOT_DECAY")?atoi(getenv("PILOT_DECAY")):2;
+    if(g_pilot_decay<0) g_pilot_decay=0;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
@@ -2467,12 +2507,7 @@ int main(int argc, char **argv){
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
-    if(g_looka){
-        const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
-        printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
-            la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
-    }
+    if(g_looka) la_print();
     if(stats) stats_dump(&m,stats);
     return 0;
 }

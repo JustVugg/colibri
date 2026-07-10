@@ -5,6 +5,7 @@ not runtime dependencies of the C engine.
 
 - `convert_fp8_to_int4.py`, `download_glm52.py`: model preparation
 - `make_glm_oracle.py`, `make_glm_bench_model.py`: deterministic fixtures
+- `make_io_fixture.py`: numpy-only disk-streaming fixture for I/O A/B benchmarks (prefetch/cache)
 - `benchmark_cuda_fixture.py`, `eval_glm.py`, `fetch_benchmarks.py`: benchmarks
 - `gen_unicode.py`: tokenizer table generation
 
