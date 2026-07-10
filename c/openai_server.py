@@ -348,7 +348,8 @@ class Engine:
                 self.dispatcher_error = error
                 self._fail_pending(error)
 
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0):
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -385,15 +386,24 @@ class Engine:
                 self.pending.pop(request_id, None)
             raise
 
+        cancel_sent = False
         while True:
             kind, value = events.get()
             if kind == "data":
-                decode(value)
+                if not cancel_sent:
+                    decode(value)
+                    if cancelled and cancelled():
+                        cancel_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
             elif kind == "done":
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
                 return value
+            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+                raise ClientCancelled()
             else:
                 raise value
 
@@ -569,7 +579,8 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, output.append, cache_slot)
+                    prompt, maximum, temperature, top_p, output.append, cache_slot,
+                    self.client_disconnected)
                 text = "".join(output)
                 finish = "length" if stats["length_limited"] else "stop"
                 choice = ({"index": 0, "message": {"role": "assistant", "content": text,
@@ -617,7 +628,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 event([choice])
 
             stats = self.server.engine.generate(
-                prompt, maximum, temperature, top_p, emit, cache_slot)
+                prompt, maximum, temperature, top_p, emit, cache_slot,
+                lambda: not connected)
             finish = "length" if stats["length_limited"] else "stop"
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
