@@ -7,20 +7,20 @@ Serve a capire se la quantizzazione int4 ha lasciato il modello "tale" rispetto 
 punteggi PUBBLICATI di GLM-5.2 (e, per contesto, Claude/GPT).
 
 Dipendenze: solo `tokenizers` + il binario ./glm. I dataset si leggono da JSONL locali
-(uno per task) prodotti da `fetch_benchmarks.py`. Formato di ogni riga JSONL:
+(uno per task) prodotti da `tools/fetch_benchmarks.py`. Formato di ogni riga JSONL:
     {"ctx": "...", "choices": ["...","..."], "gold": 0}
 Cosi' la harness e' offline e deterministica.
 
 USO:
   # 1) (una volta, quando hai rete) scarica i benchmark in ./bench/*.jsonl
-  python3 fetch_benchmarks.py --out ./bench --tasks hellaswag,arc_challenge,mmlu --limit 200
+  python3 tools/fetch_benchmarks.py --out ./bench --tasks hellaswag,arc_challenge,mmlu --limit 200
   # 2) plumbing test della meccanica (senza motore):
-  python3 eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks smoke --dry
+  python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks smoke --dry
   # 3) validazione vera quando il modello e' pronto:
-  python3 eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench \
+  python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench \
                       --tasks hellaswag,arc_challenge,mmlu --limit 40 --ram 15
   # leve di ricerca: passate al motore via env
-  TOPP=0.9 python3 eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks mmlu --ram 15
+  TOPP=0.9 python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks mmlu --ram 15
 """
 import os, sys, subprocess, argparse, random, json, tempfile, time
 
@@ -43,7 +43,7 @@ def load_docs(task, data_dir, limit, seed):
         return SMOKE[:limit] if limit else SMOKE
     path = os.path.join(data_dir, task + ".jsonl")
     if not os.path.exists(path):
-        sys.exit(f"manca {path} — generalo con: python3 fetch_benchmarks.py --out {data_dir} --tasks {task}")
+        sys.exit(f"manca {path} — generalo con: python3 tools/fetch_benchmarks.py --out {data_dir} --tasks {task}")
     docs = [json.loads(l) for l in open(path) if l.strip()]
     random.Random(seed).shuffle(docs)
     return docs[:limit] if limit else docs
@@ -138,7 +138,7 @@ def main():
     print(f"(motore: {time.time()-t0:.0f}s){proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ''}", file=sys.stderr)
     score_accuracy(tasks, meta, perq, lp)
     print("\nNB: confronta acc_norm col punteggio PUBBLICATO di GLM-5.2 (model card). Se vicino,"
-          "\n    la quantizzazione int4 ha preservato il modello. (riempi REFERENCE in eval_glm.py)")
+          "\n    la quantizzazione int4 ha preservato il modello. (riempi REFERENCE in tools/eval_glm.py)")
     os.remove(req_path)
 
 if __name__ == "__main__":

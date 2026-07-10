@@ -1,4 +1,4 @@
-/* GENERATO da gen_unicode.py — non modificare a mano. */
+/* GENERATO da tools/gen_unicode.py — non modificare a mano. */
 #ifndef TOK_UNICODE_H
 #define TOK_UNICODE_H
 #include <stdint.h>

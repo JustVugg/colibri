@@ -4,11 +4,11 @@
 #  - se un download resta FERMO >180s (connessione zombie), lo ammazza e lo rilancia:
 #    hf_hub riprende il .incomplete dal punto esatto, non si perde nulla
 #  - esce da solo quando tutti i 141 shard sono fatti
-# uso:  nohup ./supervisor.sh > supervisor.log 2>&1 &
+# uso da c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
 set -u
-DIR=/home/vincenzo/glm52_i4
-CODE=/mnt/c/Users/User/Desktop/moe-stream/c
-TOTAL=141
+DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"
+CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TOTAL="${TOTAL_SHARDS:-141}"
 STALL_S=180          # secondi senza crescita del download -> riavvio
 CONVLOG=/tmp/convert_supervised.log
 
@@ -19,7 +19,7 @@ log(){ echo "[$(date +%H:%M:%S)] $*"; }
 
 start_conv(){
     cd "$CODE"
-    nohup python3 convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 \
+    nohup python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 \
         --outdir "$DIR" --ebits 4 --io-bits 8 >> "$CONVLOG" 2>&1 &
     log "convertitore avviato (PID $!)"
 }

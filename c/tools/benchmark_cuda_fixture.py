@@ -1,4 +1,4 @@
-"""Reproducible CPU/CUDA A/B benchmark for make_glm_bench_model.py output."""
+"""Reproducible CPU/CUDA A/B benchmark for tools/make_glm_bench_model.py output."""
 
 import argparse
 import json

@@ -19,6 +19,7 @@ Config via env o flag (validi anche dopo il sottocomando):
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(HERE, "tools")
 GLM  = os.path.join(HERE, "glm")
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
@@ -385,9 +386,9 @@ def cmd_bench(a):
     missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
     if missing:
         print(f"  {C.dim}scarico i dataset mancanti: {', '.join(missing)}{C.r}")
-        subprocess.call([py, os.path.join(HERE,"fetch_benchmarks.py"),
+        subprocess.call([py, os.path.join(TOOLS,"fetch_benchmarks.py"),
                          "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
-    cmd=[py, os.path.join(HERE,"eval_glm.py"), "--snap",a.model,
+    cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
     e=dict(os.environ)
@@ -401,7 +402,7 @@ def cmd_convert(a):
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     venv_py=os.path.join(HERE,"mio_env","bin","python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
-    base=[py, os.path.join(HERE,"convert_fp8_to_int4.py"),
+    base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
     if a.xbits: base+=["--xbits",str(a.xbits)]
     # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.

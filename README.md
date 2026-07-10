@@ -36,7 +36,7 @@ The engine is a single C file (`c/glm.c`, ~1,300 lines) plus small headers. No B
 - **Batch-union MoE**: in prefill (and MTP verification), each unique expert of the batch is read once and applied to every position that routes to it.
 - **Byte-level BPE tokenizer in C** (GPT-2-style with Unicode-property regex, 320k merges).
 - **RAM safety**: the expert cache is auto-sized from `MemAvailable` at startup — an honest peak projection (working set, KV, MTP row, reconstruction buffers) so the kernel OOM-killer never fires.
-- **Offline FP8→int4 converter** (`c/convert_fp8_to_int4.py`): downloads one shard at a time (~5 GB), dequants (128×128 block scales), requantizes to the engine's container, deletes the shard — the 756 GB FP8 checkpoint never needs to exist on disk at once. Resumable.
+- **Offline FP8→int4 converter** (`c/tools/convert_fp8_to_int4.py`): downloads one shard at a time (~5 GB), dequants (128×128 block scales), requantizes to the engine's container, deletes the shard — the 756 GB FP8 checkpoint never needs to exist on disk at once. Resumable.
 
 ## Honest numbers (WSL2, 12 cores, 25 GB RAM, NVMe via VHDX)
 
@@ -147,8 +147,8 @@ deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:
 
 ```bash
 cd c
-python make_glm_bench_model.py --output /nvme/colibri-bench-medium --device cuda
-python benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 0
+python tools/make_glm_bench_model.py --output /nvme/colibri-bench-medium --device cuda
+python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 0
 ```
 
 The fixture has random weights and is not a language model. It exists only to
@@ -240,15 +240,25 @@ Every contribution, from a datapoint to a disk, moves the ceiling.
 ## Repo layout
 
 ```
-c/glm.c          the engine (GLM-5.2 forward, streaming MoE, MTP, serve mode)
-c/st.h           safetensors reader: pread + fadvise, no mmap (RSS stays flat)
-c/tok.h          byte-level BPE tokenizer in C
-c/coli           CLI: chat / run / bench / convert / info
-c/iobench.c      parallel disk microbenchmark (measures what the engine feels)
-c/convert_fp8_to_int4.py   disk-safe FP8 → int4 converter
-c/make_glm_oracle.py       tiny-random oracle generator for validation
-c/olmoe.c        stage-A engine (OLMoE), first validation target
+Makefile                  root build/check entry point
+c/
+├── glm.c                 single-file GLM engine
+├── st.h, tok.h, json.h   runtime headers
+├── backend_cuda.*        optional CUDA tier
+├── Makefile              build and local checks
+├── coli                  user-facing CLI
+├── setup.sh              one-command local setup
+├── tools/                offline conversion, fixtures and benchmarks
+├── scripts/              long-running conversion helpers
+└── tests/                dependency-free C and Python tests
 ```
+
+The runtime path intentionally stays flat and readable: `glm.c` plus its small
+headers. Auxiliary Python and shell tooling is grouped separately and is never a
+runtime dependency of the engine.
+
+From the repository root, `make`, `make check`, and `make clean` delegate to the
+engine Makefile. Existing commands run from `c/` continue to work unchanged.
 
 ## Why "colibrì"
 

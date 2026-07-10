@@ -7,8 +7,11 @@ Keep changes focused and preserve Colibri's dependency-free default CPU path.
 Run the lightweight checks locally:
 
 ```sh
-make -C c check
+make check
 ```
+
+`make -C c check` remains available for scripts that already run from the
+engine directory.
 
 This performs one portable CPU build, C unit tests, and Python standard-library
 tests. It does not download a model or require CUDA.

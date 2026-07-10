@@ -56,9 +56,9 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_cuda_test.cu
+cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu backend_cuda_test.cu -o backend_cuda_test
+	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test
 	./backend_cuda_test
 
 olmoe: olmoe.c st.h json.h
@@ -82,7 +82,7 @@ test-python:
 
 test: test-c test-python
 
-# CI-friendly validation: one portable CPU build and dependency-free tests.
+# Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
 	$(MAKE) portable

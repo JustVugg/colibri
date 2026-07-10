@@ -1,6 +1,6 @@
 import unittest
 
-from benchmark_cuda_fixture import parse_output
+from tools.benchmark_cuda_fixture import parse_output
 
 
 SAMPLE = """

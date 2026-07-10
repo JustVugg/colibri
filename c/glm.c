@@ -12,7 +12,7 @@
  * E' cio' che fa entrare GLM-5.2 nei 15 GB: ~17B param residenti a int4 ~= 8.7 GB.
  * Norme/router/bias restano f32 (piccoli e sensibili).
  *
- * Validazione: stessi token id di ref_glm.json (oracolo transformers, c/make_glm_oracle.py).
+ * Validazione: stessi token id di ref_glm.json (oracolo transformers, c/tools/make_glm_oracle.py).
  *   build: make glm   run: SNAP=./glm_tiny ./glm <cap> <expert_bits> <dense_bits>
  *   TF=1 -> teacher-forcing (valida il prefill su tutta la sequenza)
  */

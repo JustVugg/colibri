@@ -4,7 +4,7 @@ pre-tokenizer cl100k (regex del tokenizer GLM-5.2):
   - \\p{N}  numeri    (categoria che inizia per 'N')
   - \\s     whitespace (proprieta' Unicode White_Space)
 Ogni classe diventa un array ordinato di range [lo,hi] inclusivi; il C fa ricerca
-binaria. Eseguire una volta: python3 gen_unicode.py > tok_unicode.h
+binaria. Eseguire una volta: python3 tools/gen_unicode.py > tok_unicode.h
 """
 import sys, unicodedata
 
@@ -41,7 +41,7 @@ def emit(name, rs):
     print("};")
     print(f"static const int {name}_n = {len(rs)};\n")
 
-print("/* GENERATO da gen_unicode.py — non modificare a mano. */")
+print("/* GENERATO da tools/gen_unicode.py — non modificare a mano. */")
 print("#ifndef TOK_UNICODE_H\n#define TOK_UNICODE_H\n#include <stdint.h>\n")
 emit("uni_L", L); emit("uni_N", N); emit("uni_S", S)
 print("""static int uni_in(const uint32_t t[][2], int n, uint32_t cp){

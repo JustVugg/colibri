@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Pipeline GLM-5.2 (int4, streaming, 15 GB RAM) — tutto in WSL, modello su ext4.
-#   uso:  ./run.sh ["prompt"] [n_token]
+#   uso da c/:  scripts/run.sh ["prompt"] [n_token]
 # Fa: (1) attende lo spostamento su ext4, (2) riprende la conversione fino a completarla,
 #     (3) compila il motore, (4) genera testo restando nel budget RAM.
 set -euo pipefail
 
-DIR=/home/vincenzo/glm52_i4          # modello int4 su ext4 (NON /mnt/c!)
-REPO=zai-org/GLM-5.2-FP8
-CODE=/mnt/c/Users/User/Desktop/moe-stream/c
-RAM_GB=15
+DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"          # modello int4 su ext4 (NON /mnt/c!)
+REPO="${COLI_REPO:-zai-org/GLM-5.2-FP8}"
+CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RAM_GB="${RAM_GB:-15}"
 PROMPT="${1:-Ciao, chi sei?}"
 NGEN="${2:-64}"
 
@@ -25,7 +25,7 @@ echo "[1/4] spostamento completato: $(du -sh "$DIR" | cut -f1), shard $(ls "$DIR
 
 # 2) riprende+completa la conversione (ripartibile: salta gli shard gia' fatti)
 echo "[2/4] conversione (riprende da dove era): output -> $DIR"
-python3 convert_fp8_to_int4.py --repo "$REPO" --outdir "$DIR" --ebits 4 --io-bits 8
+python3 tools/convert_fp8_to_int4.py --repo "$REPO" --outdir "$DIR" --ebits 4 --io-bits 8
 
 # 3) il motore richiede tokenizer.json + config.json nella dir del modello
 for f in config.json tokenizer.json; do

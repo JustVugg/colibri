@@ -1,8 +1,8 @@
 /* Validazione del tokenizer C contro l'oracolo HF.
- * build: gcc -O2 tok_test.c -o tok_test
+ * build da c/: gcc -O2 tests/test_tok.c -o tok_test
  * uso:  ./tok_test <tokenizer.json>   (legge righe "TEXT\tID,ID,.." da stdin) */
 #define _GNU_SOURCE
-#include "tok.h"
+#include "../tok.h"
 
 int main(int argc, char **argv){
     if(argc<2){ fprintf(stderr,"uso: %s tokenizer.json < casi\n",argv[0]); return 1; }

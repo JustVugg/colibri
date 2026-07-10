@@ -19,11 +19,11 @@ dati impacchettati, `nome.qs` F32 = scale per riga).
 
 USO:
   # test locale (oracolo tiny, niente download): converte una dir gia' presente
-  python3 convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
+  python3 tools/convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
   # selftest del dequant fp8 (richiede torch)
-  python3 convert_fp8_to_int4.py --selftest
+  python3 tools/convert_fp8_to_int4.py --selftest
   # reale: scarica+converte+cancella shard per shard
-  python3 convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /home/vincenzo/glm52_i4
+  python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /home/vincenzo/glm52_i4
 """
 import os, sys, glob, json, shutil, argparse
 import numpy as np

@@ -9,8 +9,8 @@ NB: i pesi sono F8_E4M3 + tensori `*.weight_scale_inv` (blocchi 128x128). Il loa
 deve supportare fp8+block-scale prima di poterli usare (vedi memoria glm52-specs).
 
 USO:
-    python3 download_glm52.py            # scarica tutto in /home/vincenzo/glm52  (ripartibile)
-    python3 download_glm52.py --check    # solo stima spazio e conteggio file, niente download
+    python3 tools/download_glm52.py            # scarica tutto in /home/vincenzo/glm52  (ripartibile)
+    python3 tools/download_glm52.py --check    # solo stima spazio e conteggio file, niente download
 
 Lo scaricamento e' di centinaia di GB e ore: lancialo tu quando il resto e' pronto.
 """
