@@ -14,6 +14,7 @@ typedef struct ColiCudaTensor ColiCudaTensor;
 /* Returns 1 when CUDA is ready, 0 when the requested device is unavailable. */
 int coli_cuda_init(int device);
 void coli_cuda_shutdown(void);
+int coli_cuda_mem_info(size_t *free_bytes, size_t *total_bytes);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.

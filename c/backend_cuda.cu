@@ -102,6 +102,11 @@ extern "C" void coli_cuda_shutdown(void) {
     g_ready = 0;
 }
 
+extern "C" int coli_cuda_mem_info(size_t *free_bytes, size_t *total_bytes) {
+    if (!g_ready || !free_bytes || !total_bytes) return 0;
+    return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
