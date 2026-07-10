@@ -101,6 +101,8 @@ cd c
 make cuda-test CUDA=1                  # q8/q4/q2/f32 kernel correctness
 make CUDA=1
 COLI_CUDA=1 COLI_GPU=0 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# multi-GPU: every resident tensor gets one deterministic owner
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Requirements: Linux, an NVIDIA driver, and a CUDA Toolkit under
@@ -122,13 +124,16 @@ PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 Selected experts are uploaded during startup, so capacity failures occur before
 inference and the log reports their exact tensor footprint. The budget is clamped
 against free VRAM after reserving the projected dense resident set and 2 GB of
-runtime headroom. Multi-GPU placement and a NUMA-local RAM backing store are not
+runtime headroom per selected device. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
+total budget across the device set; experts are assigned whole to the
+least-loaded device that can hold them. A NUMA-local RAM backing store is not
 implemented yet.
 
-Current limitations: one CUDA device, synchronous host/device activation
-copies, and custom correctness-first kernels rather than cuBLAS/Tensor Core
-kernels. This draft intentionally makes no end-to-end speedup claim before the
-full model is benchmarked.
+Current limitations: devices use independent contexts and synchronous
+host-staged activation copies—there is no P2P/NCCL dependency yet. The kernels
+are correctness-first custom kernels rather than cuBLAS/Tensor Core kernels.
+This draft intentionally makes no end-to-end speedup claim before the full model
+is benchmarked.
 
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
 

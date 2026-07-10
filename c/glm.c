@@ -22,6 +22,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -67,7 +68,7 @@ typedef struct {
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
-    int cuda_eligible, cuda_failed;               /* resident tensor, never a reused expert slot */
+    int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -133,17 +134,40 @@ static void usage_save(Model *m);        /* cache che impara: definita accanto a
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
+static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
+static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
+    t->cuda_failed=0;
 }
 static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
-    return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O);
+    return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
 static void cuda_stats_print(void){
-    size_t n=0,b=0; coli_cuda_stats(&n,&b);
+    size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensor, %.2f GB VRAM\n",n,b/1e9);
+    if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
+        coli_cuda_stats(g_cuda_devices[i],&n,&b);
+        fprintf(stderr,"[CUDA]   device %d: %zu tensor, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
+    }
+}
+static int parse_cuda_devices(const char *list, int *out){
+    if(!list||!*list) return 0;
+    int n=0; const char *p=list;
+    while(*p){
+        char *end=NULL; long v=strtol(p,&end,10);
+        if(end==p||v<0||v>INT_MAX||n>=COLI_CUDA_MAX_DEVICES) return 0;
+        for(int i=0;i<n;i++) if(out[i]==(int)v) return 0;
+        out[n++]=(int)v; p=end;
+        while(*p==' '||*p=='\t') p++;
+        if(!*p) break;
+        if(*p++!=',') return 0;
+        while(*p==' '||*p=='\t') p++;
+        if(!*p) return 0;
+    }
+    return n;
 }
 #endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
@@ -416,14 +440,15 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
      * Streaming expert slots are reused for different IDs and must never enter
-     * this cache. Nested OpenMP calls stay on CPU because the CUDA scratch
-     * buffers are intentionally single-stream in this first backend stage. */
+     * this cache. Nested OpenMP calls stay on CPU because each device context
+     * intentionally owns one synchronous scratch stream in this stage. */
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O)) return;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
         w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] disabilitato dopo errore; fallback CPU\n",w->O,w->I);
+        fprintf(stderr,"[CUDA] tensor [%d,%d] su device %d disabilitato dopo errore; fallback CPU\n",
+            w->O,w->I,w->cuda_device);
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -620,7 +645,14 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     }
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
-    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t); t.cuda_eligible=1; return t;
+    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t); t.cuda_eligible=1;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled){
+        int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
+        g_cuda_dense_projected[slot]+=qt_bytes(&t);
+    }
+#endif
+    return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"manca %s\n",name);exit(1);}
@@ -1830,37 +1862,55 @@ static void pin_load(Model *m, const char *statspath, double gb){
         npin, npin*eb/1e9, now_s()-t0, statspath);
 #ifdef COLI_CUDA
     if(g_cuda_enabled && g_cuda_expert_gb>0){
-        size_t free_b=0,total_b=0;
-        double budget=g_cuda_expert_gb*1e9;
-        if(coli_cuda_mem_info(&free_b,&total_b)){
-            /* Dense resident tensors upload lazily too. Reserve their RAM-sized
-             * projection plus 2 GB for activations, CUDA context and scratch. */
-            double dense_b=(double)m->resident_bytes-(double)npin*eb;
-            double safe=(double)free_b-dense_b-2e9;
-            if(safe<0) safe=0; if(budget>safe) budget=safe;
+        double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+        int placed_n[COLI_CUDA_MAX_DEVICES]={0};
+        double budget=g_cuda_expert_gb*1e9, safe_total=0;
+        for(int i=0;i<g_cuda_ndev;i++){
+            size_t free_b=0,total_b=0;
+            if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
+                /* Dense tensors are assigned round-robin and upload lazily.
+                 * Reserve their projected footprint plus 2 GB per device. */
+                remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+                if(remaining[i]<0) remaining[i]=0;
+                safe_total+=remaining[i];
+            }
         }
-        int ngpu=(int)(budget/eb); if(ngpu>npin) ngpu=npin;
-        int gpu_full=0;
-        for(int a=0;a<ngpu && !gpu_full;a++){
+        if(budget>safe_total) budget=safe_total;
+        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
             for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
                 ESlot *s=&m->pin[li][z];
-                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                    m->gpu_expert_count++;
-                    m->gpu_expert_bytes += (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                         + (int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                         + (int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                } else {
-                    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
-                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                    gpu_full=1;
+                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+                if(m->gpu_expert_bytes+need>budget) break;
+                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
+                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
+                    int best=-1;
+                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+                        (best<0||placed_b[i]<placed_b[best])) best=i;
+                    if(best<0) break;
+                    tried[best]=1;
+                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        placed=1;
+                    } else {
+                        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                        remaining[best]=0;             /* device rejected its projected capacity */
+                    }
                 }
                 break;
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget %.1f GB)\n",
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget totale %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
+        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d expert, %.2f GB\n",
+            g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
 #endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
@@ -1963,14 +2013,21 @@ int main(int argc, char **argv){
     int dbits= argc>3?atoi(argv[3]):ebits;
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
-        int device=getenv("COLI_GPU")?atoi(getenv("COLI_GPU")):0;
-        g_cuda_enabled=coli_cuda_init(device);
+        const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
+        if(one&&many){ fprintf(stderr,"usa COLI_GPU oppure COLI_GPUS, non entrambi\n"); return 2; }
+        if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
+        else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
+        else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
+        if(g_cuda_ndev<1){ fprintf(stderr,"COLI_GPUS non valido: usa una lista come 0,1,2\n"); return 2; }
+        g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
     }
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) richiede COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB richiede COLI_CUDA=1\n"); return 2; }
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
+       getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
         fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
         return 2;
