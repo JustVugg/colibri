@@ -44,7 +44,7 @@ def main() -> None:
     base = os.environ.copy()
     for key in (
         "COLI_CUDA", "COLI_GPU", "COLI_GPUS", "CUDA_EXPERT_GB",
-        "PIN", "PIN_GB", "STATS", "TF", "REPLAY",
+        "PIN", "PIN_GB", "STATS", "TF", "REPLAY", "CUDA_DENSE",
     ):
         base.pop(key, None)
     base.update(
@@ -59,10 +59,15 @@ def main() -> None:
     execute(args.engine, base | {"STATS": str(stats)})
     modes = {
         "cpu_stream": {},
-        "dense_cuda": {"COLI_CUDA": "1", "COLI_GPU": args.gpu},
+        "dense_cuda": {"COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1"},
         "cpu_pin": {"PIN": str(stats), "PIN_GB": args.pin_gb},
         "cuda_pin": {
             "COLI_CUDA": "1", "COLI_GPU": args.gpu,
+            "PIN": str(stats), "PIN_GB": args.pin_gb,
+            "CUDA_EXPERT_GB": args.cuda_expert_gb,
+        },
+        "cuda_pin_dense": {
+            "COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1",
             "PIN": str(stats), "PIN_GB": args.pin_gb,
             "CUDA_EXPERT_GB": args.cuda_expert_gb,
         },

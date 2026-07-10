@@ -134,6 +134,7 @@ static void usage_save(Model *m);        /* cache che impara: definita accanto a
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
+static int g_cuda_dense;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -645,9 +646,10 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     }
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
-    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t); t.cuda_eligible=1;
+    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_CUDA
-    if(g_cuda_enabled){
+    if(g_cuda_enabled&&g_cuda_dense){
+        t.cuda_eligible=1;
         int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
     }
@@ -2051,12 +2053,16 @@ int main(int argc, char **argv){
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
     }
+    g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) richiede COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE richiede COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB richiede COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s\n",g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
+       (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
        (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
         fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
         return 2;

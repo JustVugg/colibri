@@ -100,9 +100,8 @@ PCIe bottleneck. Resident quantized tensors are uploaded lazily once and reused.
 cd c
 make cuda-test CUDA=1                  # q8/q4/q2/f32 kernel correctness
 make CUDA=1
-COLI_CUDA=1 COLI_GPU=0 SNAP=/nvme/glm52_i4 ./glm 64 4 4
-# multi-GPU: every resident tensor gets one deterministic owner
-COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# optional dense-path experiment (hot experts are configured below)
+COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Requirements: Linux, an NVIDIA driver, and a CUDA Toolkit under
@@ -111,13 +110,19 @@ builds for the GPU in the current machine; set an explicit architecture when
 cross-compiling. Requesting CUDA with a CPU-only binary, an invalid device, or
 an unavailable runtime fails at startup instead of silently falling back.
 
-The normal `make` build and runtime behavior are unchanged. This is the first
-stage of the hybrid design. A measured `PIN` profile can promote its hottest
-experts into the same persistent VRAM tier while keeping the rest in RAM:
+The normal `make` build and runtime behavior are unchanged. CUDA defaults to an
+expert-only accelerator: resident dense/attention tensors stay on CPU because
+fixture measurements show that moving them does not help while expert I/O is
+the bottleneck. `CUDA_DENSE=1` keeps the earlier all-resident experimental path.
+A measured `PIN` profile can promote its hottest experts into the persistent
+VRAM tier while keeping the rest in RAM:
 
 ```bash
 STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
+PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# multi-GPU expert tier, 96 GB total budget across six devices
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=96 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
