@@ -1812,8 +1812,9 @@ static void kv_hdr(Model *m, int32_t *h, int nrec){
 }
 static void kv_disk_truncate(int nrec){
     if(!g_kvsave) return;
+    FILE *f=fopen(g_kv_path,"r+b");
+    if(!f){ g_kv_nrec=0; return; }
     g_kv_nrec=nrec;
-    FILE *f=fopen(g_kv_path,"r+b"); if(!f) return;
     int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
 }
 static void kv_disk_reset(void){ kv_disk_truncate(0); }
