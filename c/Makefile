@@ -1,4 +1,7 @@
 UNAME_S := $(shell uname -s)
+MINGW    := $(findstring MINGW,$(UNAME_S))
+MSYS     := $(findstring MSYS,$(UNAME_S))
+IS_WIN   := $(MINGW)$(MSYS)
 
 ifeq ($(UNAME_S),Darwin)
 # --- macOS / Apple Silicon ---
@@ -17,6 +20,18 @@ OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm $(OMPL)
+EXE     =
+else ifneq ($(IS_WIN),)
+# --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
+# GCC + libgomp + winpthreads: pthread, OpenMP, clock_gettime, opendir/readdir,
+# AVX2 intrinsics — tutto gratis, nessun porting.
+# ARCH default = x86-64-v3 (binario portabile con AVX2). Per max velocita'
+# su QUESTA macchina: make ARCH=native
+CC      = gcc
+ARCH   ?= x86-64-v3
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp -static
+EXE     = .exe
 else
 # --- Linux x86-64 (percorso originale, invariato) ---
 CC      = gcc
@@ -26,6 +41,7 @@ CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp
+EXE     =
 endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
@@ -37,20 +53,27 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json tests/test_st tests/test_tier
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
+endif
+ifneq ($(IS_WIN),)
+# GPU: stub only in Phase 1 (G0). G1 builds coli_cuda.dll with MSVC+nvcc.
+$(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see PORT_WINDOWS_PLAN.md §8))
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
-all: glm
+all: glm$(EXE)
 
-glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
+# phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
+glm: glm$(EXE)
+
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -58,23 +81,26 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h
 
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test
-	./backend_cuda_test
+	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	./backend_cuda_test$(EXE)
 
-olmoe: olmoe.c st.h json.h
-	$(CC) $(CFLAGS) olmoe.c -o olmoe $(LDFLAGS)
+olmoe$(EXE): olmoe.c st.h json.h compat.h
+	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
 # binario portabile da distribuire su altre macchine x86-64
 portable:
-	$(MAKE) glm ARCH=x86-64-v3
+	$(MAKE) glm$(EXE) ARCH=x86-64-v3
 
-tests/test_json: tests/test_json.c json.h
+iobench$(EXE): iobench.c compat.h
+	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
+
+tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_st: tests/test_st.c st.h json.h compat.h
+tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_tier: tests/test_tier.c tier.h
+tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
@@ -92,7 +118,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe glm backend_cuda.o backend_cuda_test $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all cuda-test portable test-c test-python test check clean
+.PHONY: all glm cuda-test portable test-c test-python test check clean

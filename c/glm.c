@@ -25,8 +25,8 @@
 #include <limits.h>
 #include <pthread.h>                              /* thread I/O del PILOTA */
 #include <unistd.h>
-#include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
+#include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif
 #include "st.h"
@@ -889,7 +889,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
      * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
     if(!s->slab || wtot+8192 > s->slab_cap){
-        free(s->slab);
+        compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
         s->slab_cap=wtot+8192;
     }
@@ -2292,6 +2292,10 @@ static double mem_available_gb(void){
     if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vm,&cnt)!=KERN_SUCCESS) return 0;
     return ((double)vm.free_count+(double)vm.inactive_count+(double)vm.purgeable_count)
            * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#elif defined(_WIN32)
+    double total, avail;
+    compat_meminfo(&total, &avail);
+    return avail;
 #else
     FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
     char ln[256]; double kb=0;
@@ -2510,9 +2514,15 @@ int main(int argc, char **argv){
         int *tf=read_arr(ref,"tf_pred",&(int){0});
         int *pred=malloc(nfull*sizeof(int)); double tt=now_s();
         forward_all(&m, full, nfull, pred); double tdt=now_s()-tt;
-        int ok=0; for(int i=0;i<nfull;i++) ok+=(pred[i]==tf[i]);
+        int ok=0; for(int i=0;i<nfull;i++){
+            if(pred[i]==tf[i]) ok++;
+            else fprintf(stderr,"[ORACLE] mismatch pos=%d expected=%d got=%d\n",i,tf[i],pred[i]);
+        }
         printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni | %.1f pos/s\n",
             ok,nfull,nfull/tdt);
+        if(ok<nfull) fprintf(stderr,
+            "[ORACLE] %d/%d mismatches — run: TF=1 DEBUG_LOGITS=1 for top-5 logit dump\n",
+            nfull-ok,nfull);
         profile_print(&m,tdt);
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();

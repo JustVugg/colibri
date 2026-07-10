@@ -21,9 +21,15 @@ Config via env o flag (validi anche dopo il sottocomando):
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
+# Windows: forza output UTF-8 (console cp1252 tronca Unicode box-drawing/emoji)
+if sys.platform == "win32":
+    for s in (sys.stdout, sys.stderr):
+        try: s.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError): pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "tools")
-GLM  = os.path.join(HERE, "glm")
+GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
@@ -299,8 +305,11 @@ def cmd_info(a):
         av=int(re.search(r'MemAvailable:\s+(\d+)',mi).group(1))/1e6
         row("RAM", f"{tot:.0f} GB totali · {av:.1f} GB disponibili")
     except Exception: pass
-    fs=os.statvfs(a.model if os.path.isdir(a.model) else HERE)
-    row("disco", f"{fs.f_bavail*fs.f_frsize/1e9:.0f} GB liberi")
+    try:
+        fs = shutil.disk_usage(a.model if os.path.isdir(a.model) else HERE)
+        row("disco", f"{fs.free/1e9:.0f} GB liberi")
+    except OSError:
+        row("disco", "? GB (non disponibile)")
     row("motore", "pronto ✓" if os.path.exists(GLM) else "da compilare (coli build)")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
@@ -447,7 +456,7 @@ def cmd_bench(a):
     need_model(a.model)
     banner("bench")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py=os.path.join(HERE,"mio_env","bin","python3")
+    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
@@ -466,7 +475,7 @@ def cmd_bench(a):
 def cmd_convert(a):
     banner("convert")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py=os.path.join(HERE,"mio_env","bin","python3")
+    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
     base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
