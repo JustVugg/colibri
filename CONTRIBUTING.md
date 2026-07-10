@@ -4,7 +4,7 @@ Keep changes focused and preserve Colibri's dependency-free default CPU path.
 
 ## Local checks
 
-Run the same lightweight checks as CI:
+Run the lightweight checks locally:
 
 ```sh
 make -C c check
