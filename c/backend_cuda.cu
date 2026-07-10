@@ -107,33 +107,42 @@ extern "C" int coli_cuda_mem_info(size_t *free_bytes, size_t *total_bytes) {
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
 }
 
+extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
+                                        const void *weights, const float *scales,
+                                        int fmt, int I, int O) {
+    if (!g_ready || !tensor || !weights || I < 1 || O < 1) return 0;
+    size_t rb = row_bytes(fmt, I);
+    if (!rb || (fmt && !scales)) return 0;
+    if (*tensor) {
+        ColiCudaTensor *t = *tensor;
+        return t->fmt == fmt && t->I == I && t->O == O;
+    }
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->weight_bytes = rb * (size_t)O;
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
+        !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+        coli_cuda_tensor_free(t);
+        return 0;
+    }
+    if (fmt) {
+        if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
+            !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
+            coli_cuda_tensor_free(t);
+            return 0;
+        }
+    }
+    *tensor = t;
+    return 1;
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O) {
-    if (!g_ready || !tensor || !weights || S < 1 || I < 1 || O < 1) return 0;
+    if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O)) return 0;
     size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
-    if (!*tensor) {
-        ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
-        if (!t) return 0;
-        t->fmt = fmt; t->I = I; t->O = O; t->weight_bytes = rb * (size_t)O;
-        if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
-            !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
-            coli_cuda_tensor_free(t);
-            return 0;
-        }
-        if (fmt) {
-            if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
-                !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
-                coli_cuda_tensor_free(t);
-                return 0;
-            }
-        }
-        *tensor = t;
-    }
     ColiCudaTensor *t = *tensor;
-    if (t->fmt != fmt || t->I != I || t->O != O) return 0;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&g_x, &g_x_cap, xb) || !reserve(&g_y, &g_y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(g_x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;

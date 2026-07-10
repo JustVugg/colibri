@@ -112,9 +112,11 @@ COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
-The GPU expert budget is clamped against free VRAM after reserving the projected
-dense resident set and 2 GB of runtime headroom. Multi-GPU placement and a
-NUMA-local RAM backing store are not implemented yet.
+Selected experts are uploaded during startup, so capacity failures occur before
+inference and the log reports their exact tensor footprint. The budget is clamped
+against free VRAM after reserving the projected dense resident set and 2 GB of
+runtime headroom. Multi-GPU placement and a NUMA-local RAM backing store are not
+implemented yet.
 
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
 

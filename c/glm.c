@@ -123,7 +123,7 @@ typedef struct {
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
-    uint64_t gpu_expert_calls; int gpu_expert_count;
+    uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     double t_edisk, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (sempre attivo) */
     int64_t resident_bytes;
@@ -135,6 +135,11 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
+}
+static int qt_cuda_upload(QT *t){
+    const void *weights = t->fmt==0 ? (const void*)t->qf
+                        : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O);
 }
 #endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
@@ -1547,8 +1552,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
 #ifdef COLI_CUDA
-    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti | %llu chiamate servite da VRAM\n",
-        m->gpu_expert_count,(unsigned long long)m->gpu_expert_calls);
+    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+        m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
 #endif
     double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILO: expert-disk %.1fs | expert-matmul %.1fs | attention %.1fs (di cui kvb %.1fs) | lm_head %.1fs | altro %.1fs\n",
@@ -1828,17 +1833,27 @@ static void pin_load(Model *m, const char *statspath, double gb){
             if(safe<0) safe=0; if(budget>safe) budget=safe;
         }
         int ngpu=(int)(budget/eb); if(ngpu>npin) ngpu=npin;
-        for(int a=0;a<ngpu;a++){
+        int gpu_full=0;
+        for(int a=0;a<ngpu && !gpu_full;a++){
             int li=r[a].l;
             for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
                 ESlot *s=&m->pin[li][z];
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                m->gpu_expert_count++;
+                if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                    m->gpu_expert_count++;
+                    m->gpu_expert_bytes += (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                                         + (int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                                         + (int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                } else {
+                    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                    gpu_full=1;
+                }
                 break;
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, budget %.1f GB (richiesto %.1f GB)\n",
-            m->gpu_expert_count,npin,m->gpu_expert_count*eb/1e9,g_cuda_expert_gb);
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget %.1f GB)\n",
+            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
     }
 #endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
@@ -2027,8 +2042,8 @@ int main(int argc, char **argv){
     printf("Hit-rate cache expert: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hits, (unsigned long long)m.miss, rss_gb(), n_new/dt);
 #ifdef COLI_CUDA
-    if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti | %llu chiamate servite da VRAM\n",
-        m.gpu_expert_count,(unsigned long long)m.gpu_expert_calls);
+    if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+        m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
 #endif
     if(stats) stats_dump(&m,stats);
     return 0;

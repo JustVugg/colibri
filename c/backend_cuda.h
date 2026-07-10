@@ -16,6 +16,11 @@ int coli_cuda_init(int device);
 void coli_cuda_shutdown(void);
 int coli_cuda_mem_info(size_t *free_bytes, size_t *total_bytes);
 
+/* Upload without executing, so capacity failures happen during model startup. */
+int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
+                            const void *weights, const float *scales,
+                            int fmt, int I, int O);
+
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
  * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2.
