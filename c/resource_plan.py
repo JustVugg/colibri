@@ -14,19 +14,20 @@ EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
 
 
 def _tensor_sizes(path):
+    file_size = path.stat().st_size
     with path.open("rb") as stream:
         raw = stream.read(8)
         if len(raw) != 8:
             raise ValueError(f"short safetensors header: {path}")
         length = int.from_bytes(raw, "little")
-        if length < 2 or length > path.stat().st_size - 8:
+        if length < 2 or length > file_size - 8:
             raise ValueError(f"invalid safetensors header length: {path}")
         header = json.loads(stream.read(length))
     for name, meta in header.items():
         if name == "__metadata__":
             continue
         start, end = meta["data_offsets"]
-        if not 0 <= start <= end <= path.stat().st_size - 8 - length:
+        if not 0 <= start <= end <= file_size - 8 - length:
             raise ValueError(f"invalid tensor offsets for {name}: {path}")
         yield name, end - start
 
@@ -167,6 +168,29 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         },
         "warnings": warnings,
     }
+
+
+def environment_for_plan(plan, env=None, cuda_enabled=True):
+    """Apply a plan without overriding explicit user environment settings."""
+    result = dict(env or {})
+    ram = plan["tiers"]["ram"]
+    result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
+
+    vram = plan["tiers"]["vram"]
+    devices = [device["index"] for device in vram["devices"]]
+    if not cuda_enabled or not devices or vram["budget_bytes"] <= 0:
+        return result
+    if result.get("COLI_CUDA", "1") == "0":
+        return result
+
+    result.setdefault("COLI_CUDA", "1")
+    if "COLI_GPU" not in result and "COLI_GPUS" not in result:
+        key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
+        result[key] = ",".join(map(str, devices))
+    result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    if result.get("PIN"):
+        result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    return result
 
 
 def format_bytes(value):

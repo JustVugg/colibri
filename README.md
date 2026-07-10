@@ -96,12 +96,19 @@ Inspect the planned storage hierarchy before loading the model:
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli plan
 COLI_MODEL=/nvme/glm52_i4 ./coli plan --gpu 0,1 --ram 128 --vram 48 --json
+
+# apply the bounded plan to the normal runner
+COLI_MODEL=/nvme/glm52_i4 ./coli chat --auto-tier
 ```
 
 `coli plan` reads only safetensors headers and reports the model's exact dense/expert
 footprint, runtime RAM reserve, safe expert-cache cap, and bounded VRAM hot tier. Its
 versioned JSON output is intended to be shared by the CLI, API server, Web UI, and
 desktop shell; it does not allocate model tensors or start inference.
+`--auto-tier` applies the same plan to `chat`, `run`, `serve`, and benchmarks. It
+sets the RAM budget and context immediately; the VRAM tier is enabled only when
+the current `glm` binary is linked with CUDA. Explicit flags and environment
+variables keep precedence over automatic values.
 
 The engine at runtime is pure C — python is only used by the one-time converter.
 

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from resource_plan import GB, analyze_model, build_plan, format_plan
+from resource_plan import GB, analyze_model, build_plan, environment_for_plan, format_plan
 
 
 def write_shard(path, tensors):
@@ -80,6 +80,31 @@ class ResourcePlanTest(unittest.TestCase):
         plan = json.loads(run.stdout)
         self.assertEqual(plan["version"], 1)
         self.assertEqual(plan["model"]["expert_count"], 2)
+
+    def test_applies_plan_without_overriding_explicit_settings(self):
+        gpus = [
+            {"index": 0, "name": "a", "total_bytes": 12 * GB, "free_bytes": 10 * GB},
+            {"index": 1, "name": "b", "total_bytes": 12 * GB, "free_bytes": 10 * GB},
+        ]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus)
+        env = environment_for_plan(plan, {"RAM_GB": "12", "PIN": "stats.txt",
+                                               "COLI_GPUS": "1"})
+        self.assertEqual(env["RAM_GB"], "12")
+        self.assertEqual(env["COLI_CUDA"], "1")
+        self.assertEqual(env["COLI_GPUS"], "1")
+        self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
+
+    def test_cpu_binary_does_not_apply_gpu_tier(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[{"index": 0, "name": "a", "total_bytes": 8 * GB,
+                                 "free_bytes": 8 * GB}])
+        env = environment_for_plan(plan, cuda_enabled=False)
+        self.assertIn("RAM_GB", env)
+        self.assertNotIn("COLI_CUDA", env)
+        disabled = environment_for_plan(plan, {"COLI_CUDA": "0"}, cuda_enabled=True)
+        self.assertNotIn("COLI_GPU", disabled)
+        self.assertNotIn("CUDA_EXPERT_GB", disabled)
 
 
 if __name__ == "__main__":

@@ -98,6 +98,25 @@ def need_model(model):
     if not os.path.exists(GLM):
         sys.exit(f"{C.yel}motore non compilato.{C.r} Esegui:  coli build")
 
+def cuda_binary():
+    if not os.path.exists(GLM) or sys.platform != "linux": return False
+    try:
+        linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+        return any("libcudart" in line and "not found" not in line
+                   for line in linked.stdout.splitlines())
+    except (OSError,subprocess.SubprocessError): return False
+
+def resource_request(a, env):
+    ctx=a.ctx or int(env.get("CTX",4096))
+    ram=a.ram or float(env.get("RAM_GB",0))
+    vram=a.vram or float(env.get("CUDA_EXPERT_GB",0))
+    gpu=a.gpu
+    if gpu is None:
+        gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
+    devices=None if gpu=="auto" else ([] if gpu=="none" else
+        [int(value) for value in gpu.split(",")])
+    return ram,ctx,devices,vram
+
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
     if a.ram:  e["RAM_GB"]=str(a.ram)
@@ -105,6 +124,28 @@ def env_for(a):
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
     if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    if a.ctx: e["CTX"]=str(a.ctx)
+    if a.auto_tier:
+        from resource_plan import build_plan, environment_for_plan, format_bytes
+        if a.gpu is not None:
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            if a.gpu=="none":
+                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+            else: e.pop("COLI_CUDA",None)
+        elif e.get("COLI_CUDA")=="0":
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+        if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
+        try:
+            ram,ctx,devices,vram=resource_request(a,e)
+            plan=build_plan(a.model,ram,ctx,devices,vram)
+        except (OSError,ValueError,json.JSONDecodeError) as error:
+            sys.exit(f"{C.yel}piano risorse non valido:{C.r} {error}")
+        has_cuda=cuda_binary()
+        e=environment_for_plan(plan,e,has_cuda)
+        rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
+        gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
+        print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -269,11 +310,10 @@ def cmd_info(a):
 def cmd_plan(a):
     from resource_plan import build_plan, format_plan
     try:
-        if a.ctx<1: raise ValueError("--ctx deve essere positivo")
+        ram,ctx,devices,vram=resource_request(a,os.environ)
+        if ctx<1: raise ValueError("--ctx deve essere positivo")
         if a.vram<0: raise ValueError("--vram non puo essere negativo")
-        devices=None if a.gpu=="auto" else ([] if a.gpu=="none" else
-            [int(value) for value in a.gpu.split(",")])
-        plan=build_plan(a.model,a.ram,a.ctx,devices,a.vram)
+        plan=build_plan(a.model,ram,ctx,devices,vram)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}impossibile creare il piano:{C.r} {error}")
     if a.json:
@@ -416,9 +456,7 @@ def cmd_bench(a):
     cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
-    e=dict(os.environ)
-    if a.topp: e["TOPP"]=str(a.topp)
-    if a.topk: e["TOPK"]=str(a.topk)
+    e=env_for(a)
     print(f"  {C.dim}decode disk-bound: su hardware lento questo richiede ORE. Alza --limit su macchine veloci.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
@@ -444,15 +482,17 @@ def cmd_convert(a):
 def main():
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
+    common.add_argument("--auto-tier",action="store_true",help="applica automaticamente il piano RAM/VRAM")
+    common.add_argument("--ctx",type=int,default=0)
+    common.add_argument("--gpu",default=None,help="auto, none oppure lista device, es. 0,1")
+    common.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — GLM-5.2 in locale")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
-    pp=sub.add_parser("plan",parents=[common]); pp.add_argument("--ctx",type=int,default=4096)
-    pp.add_argument("--gpu",default="auto",help="auto, none oppure lista device, es. 0,1")
-    pp.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
+    pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
     sub.add_parser("chat", parents=[common])
