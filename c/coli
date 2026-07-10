@@ -15,6 +15,7 @@ CLI per far girare GLM-5.2 (744B) in locale, su CPU, in ~15-26 GB di RAM.
 Config via env o flag (validi anche dopo il sottocomando):
   COLI_MODEL=<dir>   modello (default /home/vincenzo/glm52_i4)
   --ram N            budget RAM in GB (auto-cap cache expert)
+  --repin N          adatta gli expert RAM/VRAM ogni N token
   --topp P           top-p adattivo sugli expert     --topk N   top-k fisso
   --ngen N           token massimi per risposta      --cap N    slot cache/layer
 """
@@ -124,6 +125,7 @@ def env_for(a):
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
     if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    if a.repin: e["REPIN"]=str(a.repin)
     if a.ctx: e["CTX"]=str(a.ctx)
     if a.auto_tier:
         from resource_plan import build_plan, environment_for_plan, format_bytes
@@ -486,6 +488,7 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none oppure lista device, es. 0,1")
     common.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
+    common.add_argument("--repin", type=int, default=0, help="adatta gli expert RAM/VRAM ogni N token")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
