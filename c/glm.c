@@ -1559,6 +1559,37 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
 }
 
+static void profile_print(Model *m, double elapsed){
+    double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
+    printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
+           "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
+        m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+}
+
+/* Fixed-token decode benchmark: prefill all but the prompt's last token, then
+ * replay the oracle sequence one token at a time. CPU and CUDA therefore see
+ * identical hidden-state inputs even if their argmax predictions differ. */
+static void run_replay(Model *m, const int *full, int nfull, int np){
+    if(np<2||nfull<=np){ fprintf(stderr,"REPLAY richiede prompt e continuation non vuoti\n"); return; }
+    kv_alloc(m,nfull+2);
+    float *logit=step(m,full,np-1,0); free(logit);
+    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
+    m->t_edisk=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
+    double t0=now_s(); int steps=0;
+    for(int i=np-1;i<nfull-1;i++){
+        logit=step(m,full+i,1,i); free(logit); steps++;
+    }
+    double dt=now_s()-t0, tot=m->hits+m->miss;
+    printf("REPLAY decode: %d token in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
+        steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    profile_print(m,dt);
+#ifdef COLI_CUDA
+    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+        m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
+    if(g_cuda_enabled) cuda_stats_print();
+#endif
+}
+
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
@@ -1594,9 +1625,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
-    double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
-    printf("PROFILO: expert-disk %.1fs | expert-matmul %.1fs | attention %.1fs (di cui kvb %.1fs) | lm_head %.1fs | altro %.1fs\n",
-        m->t_edisk, m->t_emm, m->t_attn, m->t_kvb, m->t_head, dt-acc);
+    profile_print(m,dt);
     free(pids); free(all);
     usage_save(m);
 }
@@ -2094,11 +2123,20 @@ int main(int argc, char **argv){
     int np,nfull; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     int n_new=nfull-np;
 
+    if(getenv("REPLAY")){
+        run_replay(&m,full,nfull,np);
+        if(stats) stats_dump(&m,stats);
+        return 0;
+    }
+
     if(getenv("TF")){
         int *tf=read_arr(ref,"tf_pred",&(int){0});
-        int *pred=malloc(nfull*sizeof(int)); forward_all(&m, full, nfull, pred);
+        int *pred=malloc(nfull*sizeof(int)); double tt=now_s();
+        forward_all(&m, full, nfull, pred); double tdt=now_s()-tt;
         int ok=0; for(int i=0;i<nfull;i++) ok+=(pred[i]==tf[i]);
-        printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni\n", ok, nfull);
+        printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni | %.1f pos/s\n",
+            ok,nfull,nfull/tdt);
+        profile_print(&m,tdt);
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();
 #endif
@@ -2115,6 +2153,7 @@ int main(int argc, char **argv){
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
     printf("Hit-rate cache expert: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hits, (unsigned long long)m.miss, rss_gb(), n_new/dt);
+    profile_print(&m,dt);
 #ifdef COLI_CUDA
     if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);

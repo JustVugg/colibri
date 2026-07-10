@@ -135,6 +135,19 @@ are correctness-first custom kernels rather than cuBLAS/Tensor Core kernels.
 This draft intentionally makes no end-to-end speedup claim before the full model
 is benchmarked.
 
+For a reproducible backend A/B without the full checkpoint, generate the
+deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:
+
+```bash
+cd c
+python make_glm_bench_model.py --output /nvme/colibri-bench-medium --device cuda
+python benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 0
+```
+
+The fixture has random weights and is not a language model. It exists only to
+preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
+CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
 
 **The learning cache**: the engine records which experts your usage actually routes to (`.coli_usage` next to the model, updated every turn) and at startup automatically pins the hottest ones in spare RAM. colibrì literally gets faster the more you use it.
