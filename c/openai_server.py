@@ -3,9 +3,13 @@
 
 import argparse
 import codecs
+import collections
+import contextlib
 import json
 import os
+import select
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -29,18 +33,105 @@ DEFAULT_CORS_ORIGINS = (
 
 
 class APIError(Exception):
-    def __init__(self, status, message, param=None, code=None, error_type="invalid_request_error"):
+    def __init__(self, status, message, param=None, code=None, error_type="invalid_request_error",
+                 headers=None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.param = param
         self.code = code
         self.error_type = error_type
+        self.headers = headers or {}
+
+
+class ClientCancelled(Exception):
+    pass
 
 
 def error_object(error):
     return {"error": {"message": error.message, "type": error.error_type,
                       "param": error.param, "code": error.code}}
+
+
+class GenerationScheduler:
+    """Bounded FIFO admission for the engine's single mutable KV context."""
+
+    def __init__(self, max_queue=8, queue_timeout=300):
+        if max_queue < 0:
+            raise ValueError("max_queue cannot be negative")
+        if queue_timeout <= 0:
+            raise ValueError("queue_timeout must be positive")
+        self.max_queue = max_queue
+        self.queue_timeout = queue_timeout
+        self.condition = threading.Condition()
+        self.queue = collections.deque()
+        self.active = False
+        self.closed = False
+        self.admitted = 0
+        self.completed = 0
+        self.rejected = 0
+        self.timed_out = 0
+        self.cancelled = 0
+
+    @contextlib.contextmanager
+    def admit(self, cancelled=None):
+        ticket = object()
+        queued_at = time.monotonic()
+        with self.condition:
+            if self.closed:
+                raise APIError(503, "The inference scheduler is shutting down.", None,
+                               "scheduler_closed", "server_error")
+            if (self.active or self.queue) and len(self.queue) >= self.max_queue:
+                self.rejected += 1
+                raise APIError(429, "The inference queue is full.", None, "queue_full",
+                               "rate_limit_error", {"Retry-After": "1"})
+            self.queue.append(ticket)
+            deadline = queued_at + self.queue_timeout
+            while True:
+                if self.closed:
+                    self.queue.remove(ticket)
+                    self.condition.notify_all()
+                    raise APIError(503, "The inference scheduler is shutting down.", None,
+                                   "scheduler_closed", "server_error")
+                if not self.active and self.queue[0] is ticket:
+                    break
+                if cancelled and cancelled():
+                    self.queue.remove(ticket)
+                    self.cancelled += 1
+                    self.condition.notify_all()
+                    raise ClientCancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.queue.remove(ticket)
+                    self.timed_out += 1
+                    self.condition.notify_all()
+                    raise APIError(429, "Timed out waiting for the inference engine.", None,
+                                   "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
+                self.condition.wait(min(remaining, 0.25))
+            self.queue.popleft()
+            self.active = True
+            self.admitted += 1
+            wait_seconds = time.monotonic() - queued_at
+        try:
+            yield wait_seconds
+        finally:
+            with self.condition:
+                self.active = False
+                self.completed += 1
+                self.condition.notify_all()
+
+    def snapshot(self):
+        with self.condition:
+            return {"active": self.active, "queued": len(self.queue),
+                    "max_queue": self.max_queue, "queue_timeout_seconds": self.queue_timeout,
+                    "admitted": self.admitted, "completed": self.completed,
+                    "rejected": self.rejected, "timed_out": self.timed_out,
+                    "cancelled": self.cancelled}
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
 
 
 def content_text(content, param):
@@ -205,12 +296,13 @@ class APIServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
-                 cors_origins=DEFAULT_CORS_ORIGINS):
+                 cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
         self.api_key = api_key
         self.max_tokens = max_tokens
+        self.scheduler = GenerationScheduler(max_queue, queue_timeout)
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
 
@@ -222,13 +314,15 @@ class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
 
-    def send_json(self, status, body, request_id=None):
+    def send_json(self, status, body, request_id=None, headers=None):
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         if request_id:
             self.send_header("x-request-id", request_id)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_cors_headers()
         self.end_headers()
         self.wfile.write(data)
@@ -240,7 +334,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Expose-Headers", "x-request-id")
+        self.send_header("Access-Control-Expose-Headers",
+                         "x-request-id, x-colibri-queue-wait-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
         if "*" not in self.server.cors_origins:
             self.send_header("Vary", "Origin")
@@ -275,7 +370,7 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path).path
             if path == "/health":
-                self.send_json(200, {"status": "ok"}, request_id)
+                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot()}, request_id)
                 return
             self.require_auth()
             if path == "/v1/models":
@@ -286,7 +381,7 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, error_object(error), request_id)
+            self.send_json(error.status, error_object(error), request_id, error.headers)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -308,7 +403,9 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, error_object(error), request_id)
+            self.send_json(error.status, error_object(error), request_id, error.headers)
+        except ClientCancelled:
+            pass
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as error:
@@ -325,77 +422,91 @@ class APIHandler(BaseHTTPRequestHandler):
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
+        stream_options = body.get("stream_options") if stream else None
+        if stream and stream_options is not None and not isinstance(stream_options, dict):
+            raise APIError(400, "`stream_options` must be an object.", "stream_options")
+        include_usage = bool((stream_options or {}).get("include_usage"))
         object_name = "chat.completion" if chat else "text_completion"
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
 
-        if not stream:
-            output = []
-            stats = self.server.engine.generate(prompt, maximum, temperature, top_p, output.append)
-            text = "".join(output)
-            finish = "length" if stats["length_limited"] else "stop"
-            choice = ({"index": 0, "message": {"role": "assistant", "content": text,
-                       "refusal": None}, "logprobs": None, "finish_reason": finish} if chat else
-                      {"index": 0, "text": text, "logprobs": None, "finish_reason": finish})
-            self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
-                "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)}, request_id)
-            return
-
-        stream_options = body.get("stream_options")
-        if stream_options is not None and not isinstance(stream_options, dict):
-            raise APIError(400, "`stream_options` must be an object.", "stream_options")
-        include_usage = bool((stream_options or {}).get("include_usage"))
-        stream_object = "chat.completion.chunk" if chat else object_name
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("x-request-id", request_id)
-        self.send_cors_headers()
-        self.end_headers()
-        connected = True
-
-        def event(choices, usage_marker=False):
-            nonlocal connected
-            if not connected:
+        with self.server.scheduler.admit(self.client_disconnected) as queue_wait:
+            queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if not stream:
+                output = []
+                stats = self.server.engine.generate(prompt, maximum, temperature, top_p, output.append)
+                text = "".join(output)
+                finish = "length" if stats["length_limited"] else "stop"
+                choice = ({"index": 0, "message": {"role": "assistant", "content": text,
+                           "refusal": None}, "logprobs": None, "finish_reason": finish} if chat else
+                          {"index": 0, "text": text, "logprobs": None, "finish_reason": finish})
+                self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
+                    "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
+                    request_id, queue_headers)
                 return
-            event_body = {"id": completion_id, "object": stream_object, "created": created,
-                          "model": self.server.model_id, "choices": choices}
+
+            stream_object = "chat.completion.chunk" if chat else object_name
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("x-request-id", request_id)
+            for name, value in queue_headers.items(): self.send_header(name, value)
+            self.send_cors_headers()
+            self.end_headers()
+            connected = True
+
+            def event(choices, usage_marker=False):
+                nonlocal connected
+                if not connected:
+                    return
+                event_body = {"id": completion_id, "object": stream_object, "created": created,
+                              "model": self.server.model_id, "choices": choices}
+                if include_usage:
+                    event_body["usage"] = None if not usage_marker else usage_marker
+                try:
+                    data = json.dumps(event_body, ensure_ascii=False, separators=(",", ":"))
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                    self.wfile.flush()
+                except OSError:
+                    connected = False
+
+            if chat:
+                event([{"index": 0, "delta": {"role": "assistant", "content": ""},
+                        "logprobs": None, "finish_reason": None}])
+
+            def emit(text):
+                choice = ({"index": 0, "delta": {"content": text}, "logprobs": None,
+                           "finish_reason": None} if chat else
+                          {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
+                event([choice])
+
+            stats = self.server.engine.generate(prompt, maximum, temperature, top_p, emit)
+            finish = "length" if stats["length_limited"] else "stop"
+            final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
+                            if chat else {"index": 0, "text": "", "logprobs": None,
+                                          "finish_reason": finish})
+            event([final_choice])
             if include_usage:
-                event_body["usage"] = None if not usage_marker else usage_marker
-            try:
-                data = json.dumps(event_body, ensure_ascii=False, separators=(",", ":"))
-                self.wfile.write(f"data: {data}\n\n".encode())
-                self.wfile.flush()
-            except OSError:
-                connected = False
+                event([], self.usage(stats))
+            if connected:
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
+            self.close_connection = True
 
-        if chat:
-            event([{"index": 0, "delta": {"role": "assistant", "content": ""},
-                    "logprobs": None, "finish_reason": None}])
-
-        def emit(text):
-            choice = ({"index": 0, "delta": {"content": text}, "logprobs": None,
-                       "finish_reason": None} if chat else
-                      {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
-            event([choice])
-
-        stats = self.server.engine.generate(prompt, maximum, temperature, top_p, emit)
-        finish = "length" if stats["length_limited"] else "stop"
-        final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
-                        if chat else {"index": 0, "text": "", "logprobs": None,
-                                      "finish_reason": finish})
-        event([final_choice])
-        if include_usage:
-            event([], self.usage(stats))
-        if connected:
-            try:
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except OSError:
-                pass
-        self.close_connection = True
+    def client_disconnected(self):
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+            return self.connection.recv(1, flags) == b""
+        except (OSError, ValueError):
+            return True
 
     @staticmethod
     def usage(stats):
@@ -424,16 +535,21 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None):
+          cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
+          max_queue=8, queue_timeout=300):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
+    if max_queue < 0:
+        raise ValueError("max_queue cannot be negative")
+    if queue_timeout <= 0:
+        raise ValueError("queue_timeout must be positive")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
     runtime = Engine(engine, model, cap, max_tokens, env)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins)
+    server = APIServer((host, port),runtime,model_id,api_key,max_tokens,origins,max_queue,queue_timeout)
     print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -441,6 +557,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         server.serve_forever()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
+        server.scheduler.close()
         server.server_close()
         runtime.close()
 
@@ -457,9 +574,13 @@ def main():
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
     parser.add_argument("--cap", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
+    parser.add_argument("--queue-timeout", type=float,
+                        default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     args = parser.parse_args()
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
-          args.cap, args.max_tokens, args.engine, cors_origins=args.cors_origin)
+          args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
+          max_queue=args.max_queue,queue_timeout=args.queue_timeout)
 
 
 if __name__ == "__main__":

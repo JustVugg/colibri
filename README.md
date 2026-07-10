@@ -132,6 +132,14 @@ Browser access from the Vite development server and Tauri local origins is enabl
 by default. Repeat `--cors-origin https://your-ui.example` to allow another exact
 origin, or use `--cors-origin '*'` only on a trusted local network.
 
+The engine owns one mutable KV context, so HTTP generation uses a bounded FIFO
+admission queue instead of pretending to run unsafe parallel sequences. Configure it
+with `--max-queue N` (default 8) and `--queue-timeout SECONDS` (default 300), or the
+`COLI_MAX_QUEUE` / `COLI_QUEUE_TIMEOUT` environment variables. Saturated and timed-out
+requests receive OpenAI-shaped HTTP 429 errors before streaming headers are sent.
+`GET /health` exposes active/queued/completed/rejected counters, and successful
+generation responses include `x-colibri-queue-wait-ms`.
+
 ### Experimental resident CUDA backend
 
 colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
