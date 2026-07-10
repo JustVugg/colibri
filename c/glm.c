@@ -2053,6 +2053,18 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"CANCEL ",7)){
+        unsigned long long id=0; char tail;
+        if(sscanf(line+7,"%llu %c",&id,&tail)!=1 || id==0){
+            printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0;
+        }
+        for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==id){
+            req[i].active=0; kv_bind(m,&ctx[i].kv);
+            kv_disk_append(m,ctx[i].hist,ctx[i].len);
+            printf("ERROR %llu CANCELLED\n",id); fflush(stdout); free(line); return 0;
+        }
+        printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
+    }
     ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
     if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
     char *raw=malloc((size_t)sub.bytes+1);
@@ -2120,6 +2132,7 @@ static void run_serve_mux(Model *m, const char *snap){
         struct timeval tv={0,0}, *ptv=active?&tv:NULL;
         int ready=eof?0:select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
         if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds)) if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+        active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[16]; int slots[16], S=0;
         for(int i=0;i<nctx;i++) if(req[i].active){

@@ -16,7 +16,8 @@ class FakeEngine:
     def __init__(self):
         self.calls = []
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
         on_text("Hé")
         on_text("llo")
@@ -29,10 +30,12 @@ class BlockingEngine(FakeEngine):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
         self.entered.set()
         self.release.wait(2)
-        return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot)
+        return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
+                                cancelled)
 
 
 class TemplateTest(unittest.TestCase):
@@ -355,6 +358,29 @@ class DispatcherTest(unittest.TestCase):
         engine.generate("hello", 4, 0.7, 0.9, chunks.append)
         engine.close()
         self.assertEqual(chunks, ["é"])
+
+    def test_cancels_generation_after_consumer_disconnects(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"CANCEL":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, output.append, cancelled=lambda: True)
+        engine.close()
+        self.assertEqual(output, ["x"])
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
 
 class HTTPTest(unittest.TestCase):
