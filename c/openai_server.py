@@ -20,6 +20,12 @@ HERE = Path(__file__).resolve().parent
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
+DEFAULT_CORS_ORIGINS = (
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://tauri.localhost",
+    "tauri://localhost",
+)
 
 
 class APIError(Exception):
@@ -198,12 +204,14 @@ def model_object(model_id, created):
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024):
+    def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
+                 cors_origins=DEFAULT_CORS_ORIGINS):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
         self.api_key = api_key
         self.max_tokens = max_tokens
+        self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
 
 
@@ -221,8 +229,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if request_id:
             self.send_header("x-request-id", request_id)
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def send_cors_headers(self):
+        origin = self.headers.get("Origin")
+        if not origin or ("*" not in self.server.cors_origins and origin not in self.server.cors_origins):
+            return
+        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Expose-Headers", "x-request-id")
+        self.send_header("Access-Control-Max-Age", "600")
+        if "*" not in self.server.cors_origins:
+            self.send_header("Vary", "Origin")
 
     def require_auth(self):
         if self.server.api_key and self.headers.get("Authorization") != f"Bearer {self.server.api_key}":
@@ -266,6 +287,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
             self.send_json(error.status, error_object(error), request_id)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_cors_headers()
+        self.end_headers()
 
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
@@ -325,6 +352,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("x-request-id", request_id)
+        self.send_cors_headers()
         self.end_headers()
         connected = True
 
@@ -396,7 +424,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=HERE / "glm", env=None):
+          cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -404,7 +432,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
     runtime = Engine(engine, model, cap, max_tokens, env)
-    server = APIServer((host, port), runtime, model_id, api_key, max_tokens)
+    origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
+    server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins)
     print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -424,11 +453,13 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    parser.add_argument("--cors-origin", action="append", default=None,
+                        help="allowed browser origin; repeat as needed (use '*' for any origin)")
     parser.add_argument("--cap", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=1024)
     args = parser.parse_args()
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
-          args.cap, args.max_tokens, args.engine)
+          args.cap, args.max_tokens, args.engine, cors_origins=args.cors_origin)
 
 
 if __name__ == "__main__":

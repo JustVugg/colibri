@@ -96,6 +96,17 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.assertEqual(caught.exception.code, 401)
 
+    def test_browser_preflight(self):
+        request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        })
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.headers["Access-Control-Allow-Origin"], "http://localhost:5173")
+            self.assertIn("Authorization", response.headers["Access-Control-Allow-Headers"])
+
     def test_chat_completion(self):
         with self.request("/v1/chat/completions", {
             "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],

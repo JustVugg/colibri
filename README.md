@@ -128,6 +128,10 @@ sequences, log probabilities, and token penalties return an explicit error rathe
 than being silently ignored. The default bind address is localhost; set
 `COLI_API_KEY` before exposing the server beyond the machine.
 
+Browser access from the Vite development server and Tauri local origins is enabled
+by default. Repeat `--cors-origin https://your-ui.example` to allow another exact
+origin, or use `--cors-origin '*'` only on a trusted local network.
+
 ### Experimental resident CUDA backend
 
 colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming

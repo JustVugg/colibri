@@ -380,7 +380,7 @@ def cmd_serve(a):
     need_model(a.model)
     from openai_server import serve
     serve(a.model, a.host, a.port, a.model_id, a.api_key,
-          a.cap, a.ngen, GLM, env_for(a))
+          a.cap, a.ngen, GLM, env_for(a), a.cors_origin)
 
 def cmd_bench(a):
     need_model(a.model)
@@ -438,6 +438,7 @@ def main():
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
+    ps.add_argument("--cors-origin",action="append",default=None)
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
