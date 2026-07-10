@@ -31,6 +31,7 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#include "tier.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -112,7 +113,8 @@ typedef struct {
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
-    uint32_t **eusage;                           /* contatori uso expert per layer (per STATS/PIN) */
+    uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
+    uint32_t **eheat;                            /* calore recente per promotion/demotion live */
     /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
@@ -708,7 +710,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
-    m->eusage=calloc(NR,sizeof(uint32_t*));
+    m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
     m->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
@@ -737,6 +739,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
     }
@@ -781,6 +784,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
             #undef PM
         }
@@ -1157,7 +1161,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=w[kk]; if(cum>=g_topp*tot){ Ke=kk+1; break; } }
         }
         keff[s]=Ke; m->ereq+=Ke;
-        for(int kk=0;kk<Ke;kk++) m->eusage[layer][idx[kk]]++;
+        for(int kk=0;kk<Ke;kk++){
+            m->eusage[layer][idx[kk]]++;
+            if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
+        }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
@@ -1768,31 +1775,24 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * Upstream fa AUTOPIN allo START (dalla storia .coli_usage). Questo aggiunge un re-pin
  * TRA I TURNI: nel punto sicuro dopo la risposta scambia i pin peggiori con i non-pinnati
  * piu' caldi, cosi' l'hot-store insegue il carico VIVO senza un profilo a parte. Isteresi
- * 25% (+4) contro il ping-pong; max 4 scambi/passata (~20 MB di disco l'uno). Usa eusage
- * cumulativo (l'aging LFU del mio fork non e' incluso qui: vedi PR.md).
+ * 25% (+4) contro il ping-pong; max 4 scambi/passata (~20 MB di disco l'uno). Una heat
+ * map separata decade a ogni passata: la storia persistente .coli_usage resta intatta.
  * EN: upstream AUTOPINs at START (from .coli_usage). This adds a between-turns re-pin: at
  * the safe point after the reply, swap the worst pins for the hottest unpinned, so the
  * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
- * ping-pong; max 4 swaps/pass (~20 MB disk each). Uses cumulative eusage (my fork's LFU
- * aging is NOT included here: see PR.md). */
+ * ping-pong; max 4 swaps/pass (~20 MB disk each). A separate decaying heat map keeps
+ * persistent .coli_usage intact while adapting to the current workload. */
 static int g_repin=0;
 static uint64_t g_last_repin=0;
 typedef struct { long gain; int l, slot, eid; } RepinCand;
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
     for(int l=0;l<c->n_layers;l++){
-        if(!m->npin || m->npin[l]<1 || !m->eusage[l]) continue;
-        uint32_t *u=m->eusage[l]; ESlot *P=m->pin[l];
-        int zp=0; for(int z=1;z<m->npin[l];z++) if(u[P[z].eid]<u[P[zp].eid]) zp=z;   /* pin piu' freddo / coldest pin */
-        int eu=-1; uint32_t fu=0;
-        for(int e=0;e<c->n_experts;e++){
-            int pinned=0; for(int z=0;z<m->npin[l];z++) if(P[z].eid==e){pinned=1;break;}
-            if(!pinned && u[e]>fu){ fu=u[e]; eu=e; }                                 /* non-pin piu' caldo / hottest unpinned */
-        }
-        if(eu<0) continue;
-        uint32_t fp=u[P[zp].eid];
-        if(fu <= fp + (fp>>2) + 4) continue;                                         /* isteresi 25% / hysteresis */
-        long g=(long)fu-(long)fp;
+        if(!m->npin || m->npin[l]<1 || !m->eheat[l]) continue;
+        ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
+        int np=m->npin[l]; if(np>4096) np=4096;
+        for(int z=0;z<np;z++) ids[z]=P[z].eid;
+        if(!tier_pick_swap(m->eheat[l],c->n_experts,ids,np,&zp,&eu,&g)) continue;
         if(nb<maxc){ out[nb].gain=g; out[nb].l=l; out[nb].slot=zp; out[nb].eid=eu; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
                if(g>out[w].gain){ out[w].gain=g; out[w].l=l; out[w].slot=zp; out[w].eid=eu; } }
@@ -1805,13 +1805,37 @@ static void repin_pass(Model *m){
     g_last_repin = m->n_emit;
     RepinCand cd[4]; int nb=repin_pick(m,cd,4);
     for(int b=0;b<nb;b++){
-        int old=m->pin[cd[b].l][cd[b].slot].eid;
+        ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        int old=s->eid;
+        uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
+#ifdef COLI_CUDA
+        int gpu=s->g.cuda_eligible;
+        int64_t old_gpu=gpu ? (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                             +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                             +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
+#endif
         double t0=now_s();
-        expert_load(m, cd[b].l, cd[b].eid, &m->pin[cd[b].l][cd[b].slot]);
-        fprintf(stderr,"[REPIN] layer %d: esce/out %d (f=%u) <- entra/in %d (f=%u) in %.0f ms\n",
-            cd[b].l, old, m->eusage[cd[b].l][old], cd[b].eid, m->eusage[cd[b].l][cd[b].eid],
-            (now_s()-t0)*1e3);
+        expert_load(m,cd[b].l,cd[b].eid,s);       /* disk -> RAM, same resident slot */
+        const char *tier="RAM";
+#ifdef COLI_CUDA
+        if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
+            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                               +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                               +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                m->gpu_expert_bytes+=now_gpu-old_gpu; tier="VRAM";
+            } else {
+                qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                m->gpu_expert_count--; m->gpu_expert_bytes-=old_gpu;
+                fprintf(stderr,"[REPIN] upload VRAM fallito; slot degradato a RAM\n");
+            }
+        }
+#endif
+        fprintf(stderr,"[REPIN] %s layer %d: esce/out %d (heat=%u) <- entra/in %d (heat=%u) in %.0f ms\n",
+            tier,cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
+    for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
