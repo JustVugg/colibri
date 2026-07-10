@@ -10,6 +10,7 @@ struct ColiCudaTensor {
     float *scales;
     size_t weight_bytes;
     int fmt, I, O;
+    int tracked;
 };
 
 static int g_ready;
@@ -18,6 +19,8 @@ static float *g_x;
 static float *g_y;
 static size_t g_x_cap;
 static size_t g_y_cap;
+static size_t g_tensor_count;
+static size_t g_tensor_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -80,8 +83,11 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
 
 extern "C" int coli_cuda_init(int device) {
     int count = 0;
-    if (!cuda_ok(cudaGetDeviceCount(&count), "device discovery") || device < 0 || device >= count)
+    if (!cuda_ok(cudaGetDeviceCount(&count), "device discovery")) return 0;
+    if (device < 0 || device >= count) {
+        std::fprintf(stderr, "[CUDA] invalid device %d (available: 0..%d)\n", device, count - 1);
         return 0;
+    }
     if (!cuda_ok(cudaSetDevice(device), "select device")) return 0;
     cudaDeviceProp prop{};
     if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
@@ -105,6 +111,11 @@ extern "C" void coli_cuda_shutdown(void) {
 extern "C" int coli_cuda_mem_info(size_t *free_bytes, size_t *total_bytes) {
     if (!g_ready || !free_bytes || !total_bytes) return 0;
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
+}
+
+extern "C" void coli_cuda_stats(size_t *tensor_count, size_t *tensor_bytes) {
+    if (tensor_count) *tensor_count = g_tensor_count;
+    if (tensor_bytes) *tensor_bytes = g_tensor_bytes;
 }
 
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
@@ -132,6 +143,9 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
             return 0;
         }
     }
+    t->tracked = 1;
+    g_tensor_count++;
+    g_tensor_bytes += t->weight_bytes + (fmt ? (size_t)O * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -155,6 +169,11 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (!tensor) return;
+    if (tensor->tracked) {
+        size_t bytes = tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * sizeof(float) : 0);
+        if (g_tensor_count) g_tensor_count--;
+        if (g_tensor_bytes >= bytes) g_tensor_bytes -= bytes;
+    }
     if (tensor->weights) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
     std::free(tensor);

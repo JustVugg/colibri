@@ -67,7 +67,7 @@ typedef struct {
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
-    int cuda_eligible;                            /* resident tensor, never a reused expert slot */
+    int cuda_eligible, cuda_failed;               /* resident tensor, never a reused expert slot */
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -140,6 +140,10 @@ static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O);
+}
+static void cuda_stats_print(void){
+    size_t n=0,b=0; coli_cuda_stats(&n,&b);
+    fprintf(stderr,"[CUDA] resident set: %zu tensor, %.2f GB VRAM\n",n,b/1e9);
 }
 #endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
@@ -414,10 +418,12 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * Streaming expert slots are reused for different IDs and must never enter
      * this cache. Nested OpenMP calls stay on CPU because the CUDA scratch
      * buffers are intentionally single-stream in this first backend stage. */
-    if(g_cuda_enabled && w->cuda_eligible && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O)) return;
+        w->cuda_failed=1;
+        fprintf(stderr,"[CUDA] tensor [%d,%d] disabilitato dopo errore; fallback CPU\n",w->O,w->I);
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -1554,6 +1560,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
+    if(g_cuda_enabled) cuda_stats_print();
 #endif
     double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILO: expert-disk %.1fs | expert-matmul %.1fs | attention %.1fs (di cui kvb %.1fs) | lm_head %.1fs | altro %.1fs\n",
@@ -1958,9 +1965,16 @@ int main(int argc, char **argv){
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         int device=getenv("COLI_GPU")?atoi(getenv("COLI_GPU")):0;
         g_cuda_enabled=coli_cuda_init(device);
-        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend non disponibile, fallback CPU\n"); }
+        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
     }
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB richiede COLI_CUDA=1\n"); return 2; }
+#else
+    if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
+       (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
+        fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
+        return 2;
+    }
 #endif
     printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
@@ -2028,6 +2042,9 @@ int main(int argc, char **argv){
         int *pred=malloc(nfull*sizeof(int)); forward_all(&m, full, nfull, pred);
         int ok=0; for(int i=0;i<nfull;i++) ok+=(pred[i]==tf[i]);
         printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni\n", ok, nfull);
+#ifdef COLI_CUDA
+        if(g_cuda_enabled) cuda_stats_print();
+#endif
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
@@ -2044,6 +2061,7 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
     if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
+    if(g_cuda_enabled) cuda_stats_print();
 #endif
     if(stats) stats_dump(&m,stats);
     return 0;

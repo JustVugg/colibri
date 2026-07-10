@@ -34,8 +34,12 @@ CUDA      ?= 0
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 CUDA_OBJ  =
 ifeq ($(CUDA),1)
+ifeq ($(UNAME_S),Darwin)
+$(error CUDA=1 is supported only on Linux)
+endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
@@ -47,10 +51,12 @@ glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -c backend_cuda.cu -o $@
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
 cuda-test: backend_cuda.cu backend_cuda.h backend_cuda_test.cu
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) backend_cuda.cu backend_cuda_test.cu -o backend_cuda_test
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) backend_cuda.cu backend_cuda_test.cu -o backend_cuda_test
 	./backend_cuda_test
 
 olmoe: olmoe.c st.h json.h

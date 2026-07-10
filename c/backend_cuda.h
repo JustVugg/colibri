@@ -15,6 +15,7 @@ typedef struct ColiCudaTensor ColiCudaTensor;
 int coli_cuda_init(int device);
 void coli_cuda_shutdown(void);
 int coli_cuda_mem_info(size_t *free_bytes, size_t *total_bytes);
+void coli_cuda_stats(size_t *tensor_count, size_t *tensor_bytes);
 
 /* Upload without executing, so capacity failures happen during model startup. */
 int coli_cuda_tensor_upload(ColiCudaTensor **tensor,

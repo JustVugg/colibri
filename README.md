@@ -103,11 +103,18 @@ make CUDA=1
 COLI_CUDA=1 COLI_GPU=0 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
+Requirements: Linux, an NVIDIA driver, and a CUDA Toolkit under
+`/usr/local/cuda` (override with `CUDA_HOME=/path/to/cuda`). `CUDA_ARCH=native`
+builds for the GPU in the current machine; set an explicit architecture when
+cross-compiling. Requesting CUDA with a CPU-only binary, an invalid device, or
+an unavailable runtime fails at startup instead of silently falling back.
+
 The normal `make` build and runtime behavior are unchanged. This is the first
 stage of the hybrid design. A measured `PIN` profile can promote its hottest
 experts into the same persistent VRAM tier while keeping the rest in RAM:
 
 ```bash
+STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
@@ -117,6 +124,11 @@ inference and the log reports their exact tensor footprint. The budget is clampe
 against free VRAM after reserving the projected dense resident set and 2 GB of
 runtime headroom. Multi-GPU placement and a NUMA-local RAM backing store are not
 implemented yet.
+
+Current limitations: one CUDA device, synchronous host/device activation
+copies, and custom correctness-first kernels rather than cuBLAS/Tensor Core
+kernels. This draft intentionally makes no end-to-end speedup claim before the
+full model is benchmarked.
 
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
 
