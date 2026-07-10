@@ -1810,12 +1810,13 @@ static void kv_hdr(Model *m, int32_t *h, int nrec){
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
     h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
 }
-static void kv_disk_reset(void){
+static void kv_disk_truncate(int nrec){
     if(!g_kvsave) return;
+    g_kv_nrec=nrec;
     FILE *f=fopen(g_kv_path,"r+b"); if(!f) return;
-    int32_t nz=0; fseek(f,8+6*4,SEEK_SET); fwrite(&nz,4,1,f); fclose(f);
-    g_kv_nrec=0;
+    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
 }
+static void kv_disk_reset(void){ kv_disk_truncate(0); }
 static void kv_disk_append(Model *m, const int *hist, int len){
     if(!g_kvsave || len<=g_kv_nrec) return;
     Cfg *c=&m->c;
@@ -1912,33 +1913,79 @@ static void run_serve(Model *m, const char *snap){
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
             fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
-        int bl=0;                                /* costruisce il testo del turno (con template) */
+        /* API mode: an exact, length-prefixed prompt. Unlike the interactive
+         * line protocol this accepts newlines. The tokenized prompt is matched
+         * against hist so the common KV prefix survives stateless HTTP turns.
+         * Per-request generation controls follow the byte count:
+         *   \x02PROMPT <bytes> <max_tokens> <temperature> <top_p>\n<prompt>\n */
+        char *raw=NULL, *input=line;
+        int input_n=(int)nr, raw_mode=0, req_ngen=ngen, prompt_tokens=0;
+        float base_temp=g_temp, base_nuc=g_nuc;
+        if(!strncmp(line,"\x02PROMPT ",8)){
+            unsigned long long nb=0; double rt=0, rp=0;
+            if(sscanf(line+8,"%llu %d %lf %lf",&nb,&req_ngen,&rt,&rp)!=4 ||
+               nb>(16u<<20) || req_ngen<1 || rt<0 || rt>2 || rp<=0 || rp>1){
+                printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n",rss_gb()); fflush(stdout); continue;
+            }
+            raw=malloc((size_t)nb+1); if(!raw){fprintf(stderr,"OOM raw prompt\n");exit(1);}
+            if(fread(raw,1,(size_t)nb,stdin)!=(size_t)nb){free(raw);break;}
+            int delim=fgetc(stdin); if(delim!='\n' && delim!=EOF) ungetc(delim,stdin);
+            if(memchr(raw,0,(size_t)nb)){free(raw); printf("\x01\x01" "END" "\x01\x01\n");
+                printf("STAT 0 0.00 0.0 %.2f 0 0\n",rss_gb()); fflush(stdout); continue;}
+            raw[nb]=0; input=raw; input_n=(int)nb; raw_mode=1;
+            if(req_ngen>ngen) req_ngen=ngen;
+            g_temp=(float)rt; g_nuc=(float)rp;
+        }
+        int bl=0, k=0;                           /* costruisce/tokenizza il turno */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
          * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita. */
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
-        if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                   bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",line,tk); }
-        else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",line);
-        int k=tok_encode(&T,buf,bl,hist+len,maxctx-len);
-        if(k<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
-        if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset();   /* contesto pieno: azzera e ricomincia */
-            bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",line,tk); }
-            else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",line);
-            k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft; }
+        if(raw_mode){
+            int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
+            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
+            int old_len=len, prefix=0;
+            while(prefix<old_len && prefix<prompt_tokens && hist[prefix]==tmp[prefix]) prefix++;
+            if(prefix<old_len){
+                len=prefix;
+                if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+                kv_disk_truncate(len);             /* il prossimo append sovrascrive solo la coda */
+            }
+            k=prompt_tokens-len;
+            if(k>0) memcpy(hist+len,tmp+len,k*sizeof(int));
+            fprintf(stderr,"[API] KV prefix %d/%d token, prefill %d\n",len,prompt_tokens,k);
+            free(tmp);
+        } else {
+            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
+                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
+            else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
+            k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
+            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset();
+                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
+                else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
+                k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
+                prompt_tokens=k;
+            }
+        }
+        if(prompt_tokens<1){ free(raw); g_temp=base_temp; g_nuc=base_nuc;
+            printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
         first=0;
-        int cur=ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
+        int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
-        float *logit=step(m,hist+len,k,len); len+=k;
+        float *logit;
+        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
         if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
         double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
-        printf("\n\x01\x01" "END" "\x01\x01\n");
-        printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
+        printf("%s\x01\x01" "END" "\x01\x01\n",raw_mode?"":"\n");
+        printf("STAT %d %.2f %.1f %.2f %d %d\n", prod, prod/tdt,
+            (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb(), prompt_tokens, prod>=cur);
         fflush(stdout);
+        free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
     }

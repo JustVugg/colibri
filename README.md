@@ -93,6 +93,41 @@ COLI_MODEL=/nvme/glm52_i4 ./coli chat
 
 The engine at runtime is pure C — python is only used by the one-time converter.
 
+### OpenAI-compatible API
+
+`coli serve` keeps one model process loaded and exposes a text-only OpenAI-compatible
+HTTP API. The gateway uses only the Python standard library; inference still runs in
+the same dependency-free C engine.
+
+```bash
+cd c
+COLI_MODEL=/nvme/glm52_i4 COLI_API_KEY=local-secret ./coli serve \
+  --host 127.0.0.1 --port 8000 --model-id glm-5.2-colibri
+
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Authorization: Bearer local-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "glm-5.2-colibri",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
+`POST /v1/chat/completions`, and legacy `POST /v1/completions`. Chat and
+completion requests support JSON responses, SSE streaming, usage counts,
+`max_tokens`/`max_completion_tokens`, `temperature`, and `top_p`. The extension
+`enable_thinking: true` enables GLM-5.2's reasoning block; the standard
+`reasoning_effort` field also enables it unless set to `none`.
+
+The first version is deliberately text-only and serves one generation at a time:
+the 744B model stays in one persistent process, so concurrent HTTP requests queue
+instead of loading duplicate model copies. Tools, image/audio input, custom stop
+sequences, log probabilities, and token penalties return an explicit error rather
+than being silently ignored. The default bind address is localhost; set
+`COLI_API_KEY` before exposing the server beyond the machine.
+
 ### Experimental resident CUDA backend
 
 colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
@@ -266,6 +301,7 @@ c/
 ├── backend_cuda.*        optional CUDA tier
 ├── Makefile              build and local checks
 ├── coli                  user-facing CLI
+├── openai_server.py      OpenAI-compatible HTTP gateway
 ├── setup.sh              one-command local setup
 ├── tools/                offline conversion, fixtures and benchmarks
 ├── scripts/              long-running conversion helpers
