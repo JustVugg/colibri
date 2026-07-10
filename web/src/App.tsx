@@ -20,18 +20,17 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
+import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
+import { persistPublicSettings, stored } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 
-const stored = (key: string, fallback: string) => {
-  try { return localStorage.getItem(key) || fallback } catch { return fallback }
-}
 const message = (role: ChatMessage["role"], content: string): ChatMessage => ({ id: crypto.randomUUID(), role, content })
 
 export default function App() {
-  const [baseUrl, setBaseUrl] = useState(() => stored("colibri.baseUrl", "http://127.0.0.1:8000/v1"))
+  const [baseUrl, setBaseUrl] = useState(() => stored(localStorage, "colibri.baseUrl", "http://127.0.0.1:8000/v1"))
   const [apiKey, setApiKey] = useState("")
   const [models, setModels] = useState<string[]>([])
-  const [model, setModel] = useState(() => stored("colibri.model", "glm-5.2-colibri"))
+  const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(512)
   const [thinking, setThinking] = useState(false)
@@ -50,7 +49,7 @@ export default function App() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const messages = conversations[cacheSlot] || []
   const kvSlots = Math.max(1, health?.kv_slots || 1)
-  const active = Number(health?.scheduler?.active || 0)
+  const active = activeRequests(health)
   const capacity = health?.scheduler?.capacity || kvSlots
   const failures = health?.scheduler ? health.scheduler.rejected + health.scheduler.timed_out + health.scheduler.cancelled : 0
 
@@ -61,11 +60,7 @@ export default function App() {
     }))
 
   useEffect(() => {
-    try {
-      localStorage.setItem("colibri.baseUrl", baseUrl)
-      localStorage.setItem("colibri.model", model)
-      localStorage.removeItem("colibri.apiKey")
-    } catch { /* restricted storage mode */ }
+    persistPublicSettings(localStorage, baseUrl, model)
   }, [baseUrl, model])
 
   useEffect(() => {
@@ -155,7 +150,7 @@ export default function App() {
         temperature,
         maxTokens,
         enableThinking: thinking,
-        cacheSlot: health?.kv_slots ? cacheSlot : undefined,
+        cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
         onDelta: (delta) =>
           updateMessages((current) => current.map((item) =>

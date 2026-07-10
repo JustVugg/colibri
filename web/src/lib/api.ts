@@ -42,11 +42,11 @@ export interface StreamChatResult {
   queueWaitMs: number | null
 }
 
-function endpoint(baseUrl: string, path: string) {
+export function endpoint(baseUrl: string, path: string) {
   return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`
 }
 
-function serverEndpoint(baseUrl: string, path: string) {
+export function serverEndpoint(baseUrl: string, path: string) {
   return endpoint(baseUrl.replace(/\/v1\/?$/, ""), path)
 }
 
