@@ -32,6 +32,7 @@
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
+#include "decode_batch.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -106,6 +107,11 @@ typedef struct {
     int disk_nrec;
     char disk_path[2048];
 } KVState;
+
+typedef struct {
+    KVState *kv;
+    int token, pos;
+} DecodeRow;
 
 typedef struct {
     Cfg c; shards S;
@@ -987,7 +993,10 @@ static int cmp_fdesc(const void *a,const void *b){
     float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
 
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
-static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
+/* kvs/pos describe a ragged decode batch: each row may belong to a different
+ * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
+static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
+                           KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
@@ -997,14 +1006,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* 1) per ogni token nuovo: query roped + latente normato e k_rot roped -> in cache.
      * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA. */
     for(int s=0;s<S;s++){
-        const float *xs=x+(int64_t)s*D; int pos=pos_base+s;
+        KVState *ks=kvs?kvs[s]:m->kv;
+        const float *xs=x+(int64_t)s*D; int pos=positions?positions[s]:pos_base+s;
         float *qresid=QR+(int64_t)s*c->q_lora;
         matmul_qt(qresid, xs, &l->q_a, 1);
         rmsnorm(qresid, qresid, l->q_a_ln, c->q_lora, c->eps);
         float *qfull=Q+(int64_t)s*H*qh; matmul_qt(qfull, qresid, &l->q_b, 1);
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
         matmul_qt(comp, xs, &l->kv_a, 1);
-        float *Ldst=m->Lc[layer]+(int64_t)pos*c->kv_lora, *Rdst=m->Rc[layer]+(int64_t)pos*c->qk_rope;
+        float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
+        float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
         memcpy(Ldst, comp, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
         memcpy(Rdst, comp+c->kv_lora, c->qk_rope*sizeof(float));
@@ -1015,12 +1026,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
      * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
      * (o DSA_FORCE=1 per il test: selezionare TUTTO deve dare l'output denso esatto). */
     const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
-    if(m->has_dsa && layer<c->n_layers && m->kv_start[layer]==0){
+    if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
             for(int s=0;s<S;s++){
-                const float *xs=x+(int64_t)s*D; int pos=pos_base+s;
-                float *kd=m->Ic[layer]+(int64_t)pos*hd;
+                KVState *ks=kvs?kvs[s]:m->kv;
+                const float *xs=x+(int64_t)s*D; int pos=positions?positions[s]:pos_base+s;
+                float *kd=coli_kv_row(ks->Ic[layer],pos,hd);
                 matmul_qt(kd, xs, &m->ix_wk[layer], 1);
                 layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, 1e-6f);
                 rope_interleave(kd, pos, c);                 /* primi qk_rope dim, interleaved */
@@ -1033,7 +1045,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
             #pragma omp parallel for schedule(dynamic,1)
             for(int s=0;s<S;s++){
-                int pos=pos_base+s, nk=pos+1;
+                KVState *ks=kvs?kvs[s]:m->kv;
+                int pos=positions?positions[s]:pos_base+s, nk=pos+1;
+                if(ks->kv_start[layer]!=0){ m->dsa_nsel[s]=0; continue; }
                 if(nk<=dtopk && !g_dsa_force){ m->dsa_nsel[s]=0; continue; }
                 int keep = nk<dtopk ? nk : dtopk;
                 float *qi=falloc((int64_t)nh*hd);
@@ -1044,7 +1058,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
                 float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
                 float *isc=falloc(nk);
                 for(int t=0;t<nk;t++){
-                    const float *kt=m->Ic[layer]+(int64_t)t*hd;
+                    const float *kt=coli_kv_row(ks->Ic[layer],t,hd);
                     float a=0;
                     for(int h=0;h<nh;h++){ const float *qhp=qi+(int64_t)h*hd;
                         float d0=0; for(int i=0;i<hd;i++) d0+=qhp[i]*kt[i];
@@ -1069,25 +1083,26 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
      * k/v per ogni token del contesto. Per linearita':
      *   q·k_nope_t = (W_K^hT q_nope)·L_t      ctx^h = W_V^h (Σ_t a_t L_t)
      * costo per step ~O(T·kv_lora) invece di O(T·H·(nope+vh)) del matmul kvb_all. */
-    int absorb = g_absorb==1 || (g_absorb<0 && S<=4);
+    int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4);
     if(absorb && c->kv_lora<=512){
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
         #pragma omp parallel for collapse(2) schedule(static)
         for(int s=0;s<S;s++) for(int h=0;h<H;h++){
-            int pos=pos_base+s;
+            KVState *ks=kvs?kvs[s]:m->kv;
+            int pos=positions?positions[s]:pos_base+s;
             const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;
             const float *qr=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
             float sc[8192];
-            int st0=m->kv_start[layer];
+            int st0=ks->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-                const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
-                const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
+                const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
+                const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
                 float a=0; for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
                 sc[jj]=a*c->attn_scale;
@@ -1095,7 +1110,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-                const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
+                const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
@@ -1137,6 +1152,10 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     matmul_qt(out, ctx, &l->o, S);
     free(ctx); free(Q); free(QR); free(comp); free(kvb_all);
     m->t_attn += now_s()-ta0;
+}
+
+static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
+    attention_rows(m,l,layer,x,S,pos_base,NULL,NULL,out);
 }
 
 /* MoE GLM su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, + shared expert).
@@ -1346,13 +1365,14 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 }
 
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
-static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
+static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int pos_base,
+                               KVState *const *kvs, const int *positions, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
-    attention(m,l,li,nrm,S,pos_base,tmp);
+    attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
@@ -1360,7 +1380,11 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
-static void layers_forward(Model *m, float *x, int S, int pos_base){
+static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
+    layer_forward_rows(m,l,li,x,S,pos_base,NULL,NULL,nrm,tmp);
+}
+static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
+                                KVState *const *kvs, const int *positions){
     Cfg *c=&m->c; int D=c->hidden;
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
     for(int i=0;i<c->n_layers;i++){
@@ -1368,9 +1392,12 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
-        layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        layer_forward_rows(m,&m->L[i],i,x,S,pos_base,kvs,positions,nrm,tmp);
     }
     free(nrm); free(tmp);
+}
+static void layers_forward(Model *m, float *x, int S, int pos_base){
+    layers_forward_rows(m,x,S,pos_base,NULL,NULL);
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -1422,6 +1449,35 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
     free(x); free(row); return lo;
+}
+
+/* One decode token from each independent sequence, evaluated as a single MoE
+ * batch.  Prefill and speculative batches retain their contiguous-KV path. */
+static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
+    Cfg *c=&m->c; int D=c->hidden;
+    /* Ragged KV currently uses MLA absorption; the stack kernel is sized to 512. */
+    if(S<1 || S>64 || c->kv_lora>512) return NULL;
+    KVState *kvs[64]; int positions[64];
+    float *x=falloc((int64_t)S*D);
+    for(int s=0;s<S;s++){
+        if(!rows[s].kv || !rows[s].kv->Lc || rows[s].token<0 || rows[s].token>=c->vocab ||
+           rows[s].pos<0 || rows[s].pos>=rows[s].kv->max_t){
+            free(x); return NULL;
+        }
+        for(int p=0;p<s;p++) if(rows[p].kv==rows[s].kv){ free(x); return NULL; }
+        kvs[s]=rows[s].kv; positions[s]=rows[s].pos;
+        embed_row(m,rows[s].token,x+(int64_t)s*D);
+    }
+    layers_forward_rows(m,x,S,0,kvs,positions);
+    float *norm=falloc((int64_t)S*D);
+    for(int s=0;s<S;s++)
+        rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
+    double th0=now_s();
+    float *logit=falloc((int64_t)S*c->vocab);
+    matmul_qt(logit,norm,&m->lm_head,S);
+    m->t_head+=now_s()-th0;
+    free(x); free(norm);
+    return logit;
 }
 
 /* METODO E — prompt-lookup: cerca l'occorrenza piu' recente dell'ultimo bigramma nel
