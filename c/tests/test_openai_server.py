@@ -2,11 +2,13 @@ import io
 import json
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIError, APIServer, ClientCancelled, END, GenerationScheduler,
-                           generation_options, read_engine_turn, render_chat, serve)
+                           READY, Engine, generation_options, read_engine_turn, render_chat,
+                           serve)
 
 
 class FakeEngine:
@@ -84,6 +86,12 @@ class ProtocolTest(unittest.TestCase):
 
 
 class SchedulerTest(unittest.TestCase):
+    def test_admits_up_to_capacity_without_serializing(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=1, capacity=2)
+        with scheduler.admit():
+            with scheduler.admit():
+                self.assertEqual(scheduler.snapshot()["active"], 2)
+
     def test_rejects_when_waiting_queue_is_full(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
         with scheduler.admit():
@@ -158,6 +166,131 @@ class SchedulerTest(unittest.TestCase):
         second = threading.Thread(target=waiting); second.start()
         scheduler.close(); release.set(); first.join(1); second.join(1)
         self.assertEqual(errors, ["scheduler_closed"])
+
+
+class BlockingStream:
+    def __init__(self, initial=b""):
+        self.buffer = bytearray(initial)
+        self.closed = False
+        self.condition = threading.Condition()
+
+    def feed(self, data):
+        with self.condition:
+            self.buffer.extend(data)
+            self.condition.notify_all()
+
+    def read(self, size=1):
+        with self.condition:
+            while len(self.buffer) < size and not self.closed:
+                self.condition.wait()
+            if not self.buffer and self.closed:
+                return b""
+            size = min(size, len(self.buffer))
+            data = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            return data
+
+    def readline(self):
+        with self.condition:
+            while b"\n" not in self.buffer and not self.closed:
+                self.condition.wait()
+            if not self.buffer and self.closed:
+                return b""
+            end = self.buffer.find(b"\n")
+            size = len(self.buffer) if end < 0 else end + 1
+            data = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            return data
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+
+
+class FakeProcess:
+    def __init__(self, on_write):
+        self.stdout = BlockingStream(READY + b"STAT 0 0 0 0\n")
+        self.stdin = self
+        self.on_write = on_write
+        self.writes = []
+        self.returncode = None
+
+    def write(self, data):
+        self.writes.append(data)
+        self.on_write(self, data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+        self.stdout.close()
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.terminate()
+
+
+class DispatcherTest(unittest.TestCase):
+    def test_dispatches_interleaved_requests_by_id(self):
+        submitted = []
+
+        def respond(process, frame):
+            fields = frame.split(b"\n", 1)[0].split()
+            self.assertEqual(fields[0], b"SUBMIT")
+            submitted.append(fields[1])
+            if len(submitted) == 2:
+                first, second = submitted
+                process.stdout.feed(b"DATA " + second + b" 3\nB-2\n")
+                process.stdout.feed(b"DATA " + first + b" 3\nA-1\n")
+                process.stdout.feed(b"DONE " + second + b" STAT 1 2.5 0 1.0 4 0\n")
+                process.stdout.feed(b"DATA " + first + b" 3\nA-2\n")
+                process.stdout.feed(b"DONE " + first + b" STAT 2 3.5 0 1.0 5 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model", kv_slots=2)
+        results = {}
+
+        def generate(name, prompt, slot):
+            chunks = []
+            stats = engine.generate(prompt, 8, 0.7, 0.9, chunks.append, slot)
+            results[name] = ("".join(chunks), stats)
+
+        threads = [threading.Thread(target=generate, args=("a", "alpha", 0)),
+                   threading.Thread(target=generate, args=("b", "beta", 1))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        engine.close()
+
+        self.assertEqual(results["a"][0], "A-1A-2")
+        self.assertTrue(results["a"][1]["length_limited"])
+        self.assertEqual(results["b"][0], "B-2")
+        headers = [frame.split(b"\n", 1)[0].split() for frame in process.writes]
+        self.assertEqual({int(header[2]) for header in headers}, {0, 1})
+        self.assertEqual({header[3] for header in headers}, {b"4", b"5"})
+
+    def test_routes_engine_error_to_request(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ERROR " + request_id + b" slot is busy\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "slot is busy"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
 
 
 class HTTPTest(unittest.TestCase):

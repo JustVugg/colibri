@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import select
+import queue
 import signal
 import socket
 import subprocess
@@ -54,18 +55,21 @@ def error_object(error):
 
 
 class GenerationScheduler:
-    """Bounded FIFO admission for the engine's single mutable KV context."""
+    """Bounded FIFO admission for the engine's independent KV contexts."""
 
-    def __init__(self, max_queue=8, queue_timeout=300):
+    def __init__(self, max_queue=8, queue_timeout=300, capacity=1):
         if max_queue < 0:
             raise ValueError("max_queue cannot be negative")
         if queue_timeout <= 0:
             raise ValueError("queue_timeout must be positive")
+        if capacity < 1:
+            raise ValueError("capacity must be positive")
         self.max_queue = max_queue
         self.queue_timeout = queue_timeout
+        self.capacity = capacity
         self.condition = threading.Condition()
         self.queue = collections.deque()
-        self.active = False
+        self.active = 0
         self.closed = False
         self.admitted = 0
         self.completed = 0
@@ -81,7 +85,7 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if (self.active or self.queue) and len(self.queue) >= self.max_queue:
+            if (self.active >= self.capacity or self.queue) and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
@@ -93,7 +97,7 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
-                if not self.active and self.queue[0] is ticket:
+                if self.active < self.capacity and self.queue[0] is ticket:
                     break
                 if cancelled and cancelled():
                     self.queue.remove(ticket)
@@ -109,20 +113,21 @@ class GenerationScheduler:
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
                 self.condition.wait(min(remaining, 0.25))
             self.queue.popleft()
-            self.active = True
+            self.active += 1
             self.admitted += 1
             wait_seconds = time.monotonic() - queued_at
         try:
             yield wait_seconds
         finally:
             with self.condition:
-                self.active = False
+                self.active -= 1
                 self.completed += 1
                 self.condition.notify_all()
 
     def snapshot(self):
         with self.condition:
             return {"active": self.active, "queued": len(self.queue),
+                    "capacity": self.capacity,
                     "max_queue": self.max_queue, "queue_timeout_seconds": self.queue_timeout,
                     "admitted": self.admitted, "completed": self.completed,
                     "rejected": self.rejected, "timed_out": self.timed_out,
@@ -248,15 +253,95 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 class Engine:
     def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
-        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", NGEN=str(max_tokens),
-                         KV_SLOTS=str(kv_slots))
+        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
+                         NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
             [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
         )
-        self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending = {}
+        self.next_request_id = 1
+        self.closed = False
+        self.dispatcher_error = None
         self.kv_slots = kv_slots
         read_engine_turn(self.process.stdout, READY, lambda _: None)
+        self.dispatcher = threading.Thread(target=self._dispatch_stdout,
+                                           name="colibri-stdout", daemon=True)
+        self.dispatcher.start()
+
+    @staticmethod
+    def _stats(fields):
+        if len(fields) < 5 or fields[0] != "STAT":
+            raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
+        return {
+            "completion_tokens": int(fields[1]),
+            "tokens_per_second": float(fields[2]),
+            "cache_hit_percent": float(fields[3]),
+            "rss_gb": float(fields[4]),
+            "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
+            "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+        }
+
+    def _fail_pending(self, error):
+        with self.pending_lock:
+            requests = list(self.pending.values())
+            self.pending.clear()
+        for events in requests:
+            events.put(("error", error))
+
+    def _read_exact(self, size):
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = self.process.stdout.read(remaining)
+            if chunk == b"":
+                raise RuntimeError("truncated engine DATA payload")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _dispatch_stdout(self):
+        try:
+            while True:
+                line = self.process.stdout.readline()
+                if line == b"":
+                    raise RuntimeError("colibri engine exited unexpectedly")
+                fields = line.decode("utf-8", "replace").strip().split()
+                if not fields:
+                    continue
+                kind = fields[0]
+                if kind == "DATA" and len(fields) == 3:
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DATA terminator")
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("data", data))
+                elif kind == "DONE" and len(fields) >= 7:
+                    request_id = fields[1]
+                    stats = self._stats(fields[2:])
+                    with self.pending_lock:
+                        events = self.pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("done", stats))
+                elif kind == "ERROR" and len(fields) >= 2:
+                    request_id = fields[1]
+                    message = " ".join(fields[2:]) or "engine request failed"
+                    with self.pending_lock:
+                        events = self.pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("error", RuntimeError(message)))
+                else:
+                    raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
+        except Exception as error:
+            if not self.closed:
+                self.dispatcher_error = error
+                self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
@@ -271,20 +356,43 @@ class Engine:
             if text:
                 on_text(text)
 
-        with self.lock:
+        events = queue.Queue()
+        with self.pending_lock:
+            if self.dispatcher_error is not None:
+                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
-            header = (f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} "
-                      f"{top_p:.8g} {cache_slot}\n").encode()
-            self.process.stdin.write(header + payload + b"\n")
-            self.process.stdin.flush()
-            stats = read_engine_turn(self.process.stdout, END, decode)
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                on_text(tail)
-            return stats
+            request_id = str(self.next_request_id)
+            self.next_request_id += 1
+            self.pending[request_id] = events
+        header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
+                  f"{temperature:.8g} {top_p:.8g}\n").encode()
+        try:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    raise RuntimeError("colibri engine is not running")
+                self.process.stdin.write(header + payload + b"\n")
+                self.process.stdin.flush()
+        except Exception:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            raise
+
+        while True:
+            kind, value = events.get()
+            if kind == "data":
+                decode(value)
+            elif kind == "done":
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    on_text(tail)
+                return value
+            else:
+                raise value
 
     def close(self):
+        self.closed = True
+        self._fail_pending(RuntimeError("colibri engine is shutting down"))
         if self.process.poll() is None:
             self.process.terminate()
             try:
@@ -308,7 +416,7 @@ class APIServer(ThreadingHTTPServer):
         self.model_id = model_id
         self.api_key = api_key
         self.max_tokens = max_tokens
-        self.scheduler = GenerationScheduler(max_queue, queue_timeout)
+        self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
