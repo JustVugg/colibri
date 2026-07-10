@@ -1936,6 +1936,7 @@ out:
 }
 
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+static double kv_pool_bytes(Model *m, int max_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -1971,7 +1972,8 @@ static void run_serve(Model *m, const char *snap){
     ServeCtx *ctx=calloc(nctx,sizeof(ServeCtx));
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
     int active=0; ServeCtx *sc=&ctx[0]; kv_bind(m,&sc->kv);
-    fprintf(stderr,"[KV] context slot: %d x %d token\n",nctx,maxctx);
+    fprintf(stderr,"[KV] context slots: %d x %d token, projected pool %.2f GB\n",
+        nctx,maxctx,kv_pool_bytes(m,maxctx)/1e9);
     #define hist  (sc->hist)
     #define len   (sc->len)
     #define first (sc->first)
