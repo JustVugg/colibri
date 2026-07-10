@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the main colibri window",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
