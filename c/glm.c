@@ -181,7 +181,7 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
     return r.ru_maxrss/(1024.0*1024.0);          /* Linux: in KB */
 #endif
 }
-static float *falloc(int64_t n){ float *p=malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+static float *falloc(int64_t n){ if(n<=0){fprintf(stderr,"OOM\n");exit(1);} float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
@@ -463,7 +463,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * twin). Threshold configurable via I4S. */
     if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
         int I=w->I;
-        int8_t *xq=malloc((size_t)S*I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
+        int8_t *xq=calloc((size_t)S,(size_t)I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
@@ -554,10 +554,11 @@ static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per 
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    if(O<=0||I<=0) return;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
-    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=malloc((int64_t)O*I); t->s=falloc(O); }
-    else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }
-    else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }
+    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=calloc((size_t)O,(size_t)I); t->s=falloc(O); }
+    else if(bits>=3){ t->fmt=2; t->q4=calloc((size_t)O,(size_t)(((int64_t)I+1)/2)); t->s=falloc(O); }
+    else { t->fmt=3; t->q4=calloc((size_t)O,(size_t)(((int64_t)I+3)/4)); t->s=falloc(O); }
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
@@ -997,8 +998,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             if((int64_t)S*dtopk > m->dsa_scap){
                 free(m->dsa_sel); free(m->dsa_nsel);
                 m->dsa_scap=(int64_t)S*dtopk;
-                m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
-                m->dsa_nsel=malloc((size_t)S*sizeof(int));
+                m->dsa_sel=calloc((size_t)m->dsa_scap,sizeof(int));
+                m->dsa_nsel=calloc((size_t)S,sizeof(int));
             }
             #pragma omp parallel for schedule(dynamic,1)
             for(int s=0;s<S;s++){
@@ -1118,8 +1119,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     float *logit=falloc(E), *sig=falloc(E), *choice=falloc(E);
     int sI=c->moe_inter*c->n_shared;
     /* ---- FASE A: routing di tutte le S posizioni ---- */
-    int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
-    int *keff=malloc(S*sizeof(int));
+    int *idxs=calloc((size_t)S,(size_t)K*sizeof(int)); float *ws=calloc((size_t)S,(size_t)K*sizeof(float));
+    int *keff=calloc((size_t)S,sizeof(int));
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
@@ -1159,14 +1160,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
-    int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
+    int *uniq=calloc((size_t)E,sizeof(int)); int nu=0;
     { char *seen=calloc(E,1);
       for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){ int e=idxs[(int64_t)s*K+kk];
           if(!seen[e]){ seen[e]=1; uniq[nu++]=e; } }
       free(seen); }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
-    int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+    int *rows=calloc((size_t)S,sizeof(int)); float *rw=calloc((size_t)S,sizeof(float));
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int nmiss=0;
@@ -1482,7 +1483,7 @@ static int cmp_pdesc(const void *a,const void *b){
     return pa<pb ? 1 : pa>pb ? -1 : 0; }
 /* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc */
 static void dist_build(const float *lo, int V){
-    if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
+    if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=calloc((size_t)V,sizeof(int)); }
     float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
     double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
     for(int i=0;i<V;i++){ g_pbuf[i]=expf((lo[i]-mx)*invt); s+=g_pbuf[i]; }
@@ -1634,7 +1635,7 @@ static void run_score(Model *m, const char *path){
         free(ln); }
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
-    int *ids=malloc(maxT*sizeof(int));
+    int *ids=calloc((size_t)maxT,sizeof(int));
     rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
     while(getline(&ln,&cp,f)>0){
         char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
@@ -1703,13 +1704,13 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     stops_arm(&m->c, eos);
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
-    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
+    int cap=(int)strlen(prompt)+16; int *pids=calloc((size_t)cap,sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
     printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
-    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
+    int *all=calloc((size_t)(np+ngen+g_draft+2),sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double t=now_s();
     float *logit=step(m,pids,np,0);
     EmitStream es={&T,m,t,0,0};
@@ -1884,7 +1885,7 @@ static void run_serve(Model *m, const char *snap){
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
     kv_alloc(m,maxctx);
     int len=0, first=1;                          /* len = contesto gia' in KV (persiste tra turni) */
-    int *hist=malloc(maxctx*sizeof(int));        /* storia token (= contenuto della KV): serve
+    int *hist=calloc((size_t)maxctx,sizeof(int));        /* storia token (= contenuto della KV): serve
                                                   * al lookup n-gram e resta allineata a len */
     g_kvsave = getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     snprintf(g_kv_path,sizeof(g_kv_path),"%s/.coli_kv",snap);
@@ -1946,7 +1947,7 @@ static void run_serve(Model *m, const char *snap){
     usage_save(m);
 }
 
-static int *read_arr(jval*o,const char*k,int*n){ jval*a=json_get(o,k); int*r=malloc(a->len*sizeof(int));
+static int *read_arr(jval*o,const char*k,int*n){ jval*a=json_get(o,k); int*r=calloc((size_t)a->len,sizeof(int));
     for(int i=0;i<a->len;i++) r[i]=(int)a->kids[i]->num; *n=a->len; return r; }
 
 /* byte residenti di un tensore [O,I] al numero di bit dato (specchio di qt_bytes) */
@@ -2051,7 +2052,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
-    Rec *r=malloc((size_t)cap*sizeof(Rec)); int n=0;
+    Rec *r=calloc((size_t)cap,sizeof(Rec)); int n=0;
     int l,e; uint32_t cnt;
     while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3){
         int ok = l>=0 && e>=0 && e<c->n_experts &&
@@ -2349,7 +2350,7 @@ int main(int argc, char **argv){
 
     if(getenv("TF")){
         int *tf=read_arr(ref,"tf_pred",&(int){0});
-        int *pred=malloc(nfull*sizeof(int)); double tt=now_s();
+        int *pred=calloc((size_t)nfull,sizeof(int)); double tt=now_s();
         forward_all(&m, full, nfull, pred); double tdt=now_s()-tt;
         int ok=0; for(int i=0;i<nfull;i++) ok+=(pred[i]==tf[i]);
         printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni | %.1f pos/s\n",
