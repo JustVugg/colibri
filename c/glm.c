@@ -25,6 +25,7 @@
 #include <limits.h>
 #include <pthread.h>                              /* thread I/O del PILOTA */
 #include <unistd.h>
+#include <sys/select.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -1174,7 +1175,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 float *qi=falloc((int64_t)nh*hd);
                 matmul_qt(qi, QR+(int64_t)s*c->q_lora, &m->ix_wq[layer], 1);
                 for(int h=0;h<nh;h++) rope_interleave(qi+(int64_t)h*hd, pos, c);
-                float w32[64];
+                float *w32=falloc(nh);
                 matmul_qt(w32, x+(int64_t)s*D, &m->ix_wp[layer], 1);
                 float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
                 float *isc=falloc(nk);
@@ -1195,7 +1196,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
                 m->dsa_nsel[s]=nd;
-                free(qi); free(isc); free(tmp);
+                free(qi); free(w32); free(isc); free(tmp);
             }
         }
         if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
@@ -1216,11 +1217,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
-            float sc[8192];
             int st0=ks->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
+            float *sc=falloc(nt);
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
@@ -1234,6 +1235,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
+            free(sc);
         }
         matmul_qt(out, ctx, &l->o, S);
         free(ctx); free(Q); free(QR); free(comp);
@@ -1252,11 +1254,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         int pos=pos_base+s;
         const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
         const float *qr=qp+c->qk_nope;
-        float sc[8192];
         int st0=m->kv_start[layer];
         int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: lista top-k o range pieno */
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
+        float *sc=falloc(nt);
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
@@ -1269,6 +1271,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
+        free(sc);
     }
     matmul_qt(out, ctx, &l->o, S);
     free(ctx); free(Q); free(QR); free(comp); free(kvb_all);
@@ -1684,13 +1687,20 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
 static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
     Cfg *c=&m->c; int D=c->hidden;
     /* Ragged KV currently uses MLA absorption; the stack kernel is sized to 512. */
-    if(S<1 || S>64 || c->kv_lora>512) return NULL;
+    if(!rows || S<1 || S>64 || c->kv_lora>512) return NULL;
     KVState *kvs[64]; int positions[64];
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++){
-        if(!rows[s].kv || !rows[s].kv->Lc || rows[s].token<0 || rows[s].token>=c->vocab ||
+        if(!rows[s].kv || !rows[s].kv->Lc || !rows[s].kv->Rc || !rows[s].kv->kv_start ||
+           rows[s].token<0 || rows[s].token>=c->vocab ||
            rows[s].pos<0 || rows[s].pos>=rows[s].kv->max_t){
             free(x); return NULL;
+        }
+        for(int l=0;l<c->n_layers;l++){
+            if(!rows[s].kv->Lc[l] || !rows[s].kv->Rc[l] ||
+               rows[s].kv->kv_start[l]<0 || rows[s].kv->kv_start[l]>rows[s].pos ||
+               (m->has_dsa && c->idx_type[l] &&
+                (!rows[s].kv->Ic || !rows[s].kv->Ic[l]))){ free(x); return NULL; }
         }
         for(int p=0;p<s;p++) if(rows[p].kv==rows[s].kv){ free(x); return NULL; }
         kvs[s]=rows[s].kv; positions[s]=rows[s].pos;
@@ -2316,6 +2326,121 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
 }
 
+typedef struct {
+    int active, pending, emitted, maximum, prompt_tokens, length_limited;
+    unsigned long long id;
+    float temp, top_p;
+    double started;
+    uint64_t hits0, miss0;
+} ServeReq;
+
+static void mux_data(Tok *T, unsigned long long id, int token){
+    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    printf("DATA %llu %d\n",id,n); if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
+    fflush(stdout);
+}
+
+static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
+    double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
+    double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
+    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
+           r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
+           r->prompt_tokens,r->length_limited);
+    fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
+    r->active=0;
+}
+
+/* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
+ * 1 for an accepted request. Prefill deliberately remains serial: continuous
+ * batching starts at decode, where every active slot contributes one row. */
+static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
+                      int maxctx, int eos){
+    char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
+    if(nr<0){ free(line); return -1; }
+    if(nr && line[nr-1]=='\n') line[--nr]=0;
+    ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
+    if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
+    char *raw=malloc((size_t)sub.bytes+1);
+    if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
+    if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
+    int delim=fgetc(stdin); if(delim!='\n' && delim!=EOF) ungetc(delim,stdin);
+    raw[sub.bytes]=0;
+    if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
+        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+    }
+    if(req[sub.slot].active){
+        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+    }
+    ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
+    int *tmp=malloc(maxctx*sizeof(int));
+    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-2);
+    free(raw); free(line);
+    if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
+    int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+        kv_disk_truncate(m,sc->len); }
+    int add=nt-sc->len;
+    if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
+    free(tmp);
+    float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
+                         : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    sc->len+=add; sc->first=0;
+    ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
+    r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
+    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
+    g_temp=r->temp; g_nuc=r->top_p;
+    int next=pick_tok(logit,m->c.vocab,-1); free(logit);
+    if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
+    r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    mux_data(T,r->id,next);
+    if(r->emitted>=r->maximum) mux_done(m,sc,r);
+    return 1;
+}
+
+static void run_serve_mux(Model *m, const char *snap){
+    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
+    g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
+    int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+    int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
+    if(nctx<1||nctx>16){fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n");exit(2);}
+    g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
+    KVState *initial=m->kv; free(initial->kv_start); free(initial);
+    ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
+    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    setvbuf(stdin,NULL,_IONBF,0);
+    printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    int eof=0;
+    for(;;){
+        int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+        struct timeval tv={0,0}, *ptv=active?&tv:NULL;
+        int ready=eof?0:select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
+        if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds)) if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+        if(!active){ if(eof) break; continue; }
+        DecodeRow rows[16]; int slots[16], S=0;
+        for(int i=0;i<nctx;i++) if(req[i].active){
+            rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
+        }
+        float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
+        m->n_fw++;
+        for(int s=0;s<S;s++){
+            int i=slots[s]; ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
+            sc->len++; g_temp=r->temp; g_nuc=r->top_p;
+            int next=pick_tok(lo+(int64_t)s*m->c.vocab,m->c.vocab,-1);
+            if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
+            r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            mux_data(&T,r->id,next);
+            if(r->emitted>=r->maximum) mux_done(m,sc,r);
+        }
+        free(lo);
+    }
+    usage_save(m);
+    for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
+    m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+}
+
 static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
@@ -2886,7 +3011,11 @@ int main(int argc, char **argv){
     if(getenv("SCORE")){ run_score(&m, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
-    if(getenv("SERVE")){ run_serve(&m, snap); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SERVE")){
+        if(getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"))) run_serve_mux(&m,snap);
+        else run_serve(&m,snap);
+        if(stats) stats_dump(&m,stats); return 0;
+    }
 
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
     if(getenv("PROMPT")){

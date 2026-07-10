@@ -29,10 +29,23 @@ static void test_const_reader_selects_the_same_row(void)
     assert(row == &storage[28]);
 }
 
+static void test_submit_header(void)
+{
+    ColiSubmit sub;
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95", &sub));
+    assert(sub.id == 42 && sub.slot == 3 && sub.bytes == 17);
+    assert(sub.max_tokens == 64 && sub.temperature > .69f && sub.top_p > .94f);
+    assert(!coli_submit_parse("SUBMIT 1 -1 2 3 0.7 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 1 0 2 0 0.7 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 1 0 2 3 4 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 1 0 2 3 1 1 trailing", &sub));
+}
+
 int main(void)
 {
     test_rows_use_their_own_sequence_storage();
     test_const_reader_selects_the_same_row();
+    test_submit_header();
     puts("decode batch helper tests: ok");
     return 0;
 }
