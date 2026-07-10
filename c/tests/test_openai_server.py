@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import threading
 import unittest
 from unittest.mock import patch
@@ -67,6 +68,10 @@ class TemplateTest(unittest.TestCase):
                          (4, 0.0, 1.0))
         with self.assertRaises(APIError):
             generation_options({"max_tokens": 9}, 8)
+        with self.assertRaises(APIError):
+            generation_options({"temperature": math.nan}, 8)
+        with self.assertRaises(APIError):
+            generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
                          (8, 0.7, 0.9))
 
@@ -291,6 +296,65 @@ class DispatcherTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "slot is busy"):
             engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
         engine.close()
+
+    def test_close_wakes_pending_generation_and_is_idempotent(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        errors = []
+
+        def generate():
+            try:
+                engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+            except RuntimeError as error:
+                errors.append(str(error))
+
+        thread = threading.Thread(target=generate)
+        thread.start()
+        for _ in range(100):
+            with engine.pending_lock:
+                if engine.pending:
+                    break
+            threading.Event().wait(0.01)
+        engine.close()
+        engine.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ["colibri engine is shutting down"])
+        self.assertFalse(engine.dispatcher.is_alive())
+        with engine.pending_lock:
+            self.assertFalse(engine.pending)
+        with self.assertRaisesRegex(RuntimeError, "shutting down"):
+            engine.generate("again", 4, 0.7, 0.9, lambda _: None)
+
+    def test_protocol_corruption_fails_request_and_stops_dispatcher(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" -1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "DATA size"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped"):
+            engine.generate("again", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+    def test_decodes_utf8_split_across_data_frames(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 1\n\xc3\n")
+            process.stdout.feed(b"DATA " + request_id + b" 1\n\xa9\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        engine.generate("hello", 4, 0.7, 0.9, chunks.append)
+        engine.close()
+        self.assertEqual(chunks, ["é"])
 
 
 class HTTPTest(unittest.TestCase):

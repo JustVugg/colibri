@@ -38,6 +38,11 @@ static void test_submit_header(void)
     assert(!coli_submit_parse("SUBMIT 1 -1 2 3 0.7 1", &sub));
     assert(!coli_submit_parse("SUBMIT 1 0 2 0 0.7 1", &sub));
     assert(!coli_submit_parse("SUBMIT 1 0 2 3 4 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 0 0 2 3 1 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 1 0 2 3 nan 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 1 0 2 3 1 inf", &sub));
+    assert(coli_submit_parse("SUBMIT 1 0 16777216 3 1 1", &sub));
+    assert(!coli_submit_parse("SUBMIT 1 0 16777217 3 1 1", &sub));
     assert(!coli_submit_parse("SUBMIT 1 0 2 3 1 1 trailing", &sub));
 }
 
