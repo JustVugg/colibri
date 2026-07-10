@@ -101,6 +101,13 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
 
 typedef struct {
+    float **Lc, **Rc, **Ic;
+    int *kv_start, max_t;
+    int disk_nrec;
+    char disk_path[2048];
+} KVState;
+
+typedef struct {
     Cfg c; shards S;
     int ebits, dbits;                            /* bit expert / bit densa */
     QT embed, lm_head; float *final_norm;
@@ -108,8 +115,9 @@ typedef struct {
     /* KV-cache MLA COMPRESSA: per token si tiene solo il latente normato [kv_lora] e
      * k_rot [qk_rope] (576 vs 32768 valori/token). k_nope e value si ricostruiscono al
      * volo con kv_b. E' cio' che rende gestibile il contesto su 15 GB (64 teste, no GQA). */
-    float **Lc, **Rc; int max_t;
+    float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
+    KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
@@ -119,7 +127,7 @@ typedef struct {
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
     float **ix_knw, **ix_knb;                    /* k_norm (LayerNorm, eps 1e-6) */
-    float **Ic;                                  /* cache k dell'indexer per layer full [max_t*hd] */
+    float **Ic;                                  /* alias KVState: cache indexer [max_t*hd] */
     int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
     int has_mtp; Layer mtpL; QT eh_proj;
@@ -711,7 +719,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
-    m->kv_start=calloc(NR,sizeof(int));
+    m->kv=calloc(1,sizeof(KVState));
+    m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
@@ -1366,17 +1375,24 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
 
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
-    if(m->Lc){ for(int i=0;i<c->n_layers+1;i++){ free(m->Lc[i]); free(m->Rc[i]); } free(m->Lc); free(m->Rc); }
-    if(m->Ic){ for(int i=0;i<c->n_layers;i++) free(m->Ic[i]); free(m->Ic); m->Ic=NULL; }
+    KVState *k=m->kv;
+    if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){ free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
+    if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
     if(m->has_dsa){
-        m->Ic=calloc(c->n_layers,sizeof(float*));
-        for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) m->Ic[i]=falloc((int64_t)max_t*c->index_hd);
+        k->Ic=calloc(c->n_layers,sizeof(float*));
+        for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) k->Ic[i]=falloc((int64_t)max_t*c->index_hd);
     }
-    m->max_t=max_t;
+    k->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
-    m->Lc=calloc(NR,sizeof(float*)); m->Rc=calloc(NR,sizeof(float*));
-    for(int i=0;i<NR;i++){ m->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
-        m->Rc[i]=falloc((int64_t)max_t*c->qk_rope); }
+    k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
+    for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
+        k->Rc[i]=falloc((int64_t)max_t*c->qk_rope); }
+    m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic; m->max_t=k->max_t; m->kv_start=k->kv_start;
+}
+
+static void kv_bind(Model *m, KVState *k){
+    m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
+    m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
@@ -1844,7 +1860,7 @@ static void repin_pass(Model *m){
  * si appendono SOLO le posizioni nuove e si riscrive nrec per ultimo: un crash a meta'
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
-static char g_kv_path[2048]; static int g_kvsave=1; static int g_kv_nrec=0;
+static int g_kvsave=1;
 #define KV_MAGIC "COLIKV1\0"
 static void kv_hdr(Model *m, int32_t *h, int nrec){
     Cfg *c=&m->c; int nic=0;
@@ -1852,24 +1868,26 @@ static void kv_hdr(Model *m, int32_t *h, int nrec){
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
     h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
 }
-static void kv_disk_truncate(int nrec){
+static void kv_disk_truncate(Model *m, int nrec){
     if(!g_kvsave) return;
-    FILE *f=fopen(g_kv_path,"r+b");
-    if(!f){ g_kv_nrec=0; return; }
-    g_kv_nrec=nrec;
+    KVState *k=m->kv;
+    FILE *f=fopen(k->disk_path,"r+b");
+    if(!f){ k->disk_nrec=0; return; }
+    k->disk_nrec=nrec;
     int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
 }
-static void kv_disk_reset(void){ kv_disk_truncate(0); }
+static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
 static void kv_disk_append(Model *m, const int *hist, int len){
-    if(!g_kvsave || len<=g_kv_nrec) return;
+    KVState *k=m->kv;
+    if(!g_kvsave || len<=k->disk_nrec) return;
     Cfg *c=&m->c;
-    FILE *f=fopen(g_kv_path,"r+b");
-    if(!f){ f=fopen(g_kv_path,"wb"); if(!f) return;
+    FILE *f=fopen(k->disk_path,"r+b");
+    if(!f){ f=fopen(k->disk_path,"wb"); if(!f) return;
         int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f); }
     int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
-    fseek(f, 8+8*4 + (int64_t)g_kv_nrec*rec, SEEK_SET);
-    for(int p=g_kv_nrec;p<len;p++){
+    fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
+    for(int p=k->disk_nrec;p<len;p++){
         int32_t tk=hist[p]; fwrite(&tk,4,1,f);
         for(int i=0;i<c->n_layers;i++){
             fwrite(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f);
@@ -1880,12 +1898,13 @@ static void kv_disk_append(Model *m, const int *hist, int len){
     }
     fflush(f);                                   /* dati prima, contatore poi */
     int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
-    g_kv_nrec=len;
+    k->disk_nrec=len;
 }
 static int kv_disk_load(Model *m, int *hist, int maxctx){
     if(!g_kvsave) return 0;
+    KVState *k=m->kv;
     Cfg *c=&m->c;
-    FILE *f=fopen(g_kv_path,"rb"); if(!f) return 0;
+    FILE *f=fopen(k->disk_path,"rb"); if(!f) return 0;
     char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
     if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) || fread(h,4,8,f)!=8 ||
        h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
@@ -1912,8 +1931,27 @@ out:
         fprintf(stderr,"[KV] conversazione ripresa dal disco: %d token in %.1fs (niente re-prefill)\n",
             nrec, now_s()-t0);
     }
-    g_kv_nrec=nrec;
+    k->disk_nrec=nrec;
     return nrec;
+}
+
+typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+
+static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
+    s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
+    if(m->has_mtp) s->kv.kv_start[m->c.n_layers]=-1;
+    kv_bind(m,&s->kv); kv_alloc(m,maxctx);
+    s->hist=malloc(maxctx*sizeof(int)); s->first=1;
+    if(slot==0) snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv",snap);
+    else snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv.%d",snap,slot);
+    s->len=kv_disk_load(m,s->hist,maxctx); if(s->len>0) s->first=0;
+}
+
+static void serve_ctx_free(Model *m, ServeCtx *s){
+    KVState *k=&s->kv; int NR=m->c.n_layers+1;
+    if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
+    if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
+    free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
 }
 
 static void run_serve(Model *m, const char *snap){
@@ -1926,19 +1964,23 @@ static void run_serve(Model *m, const char *snap){
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
-    kv_alloc(m,maxctx);
-    int len=0, first=1;                          /* len = contesto gia' in KV (persiste tra turni) */
-    int *hist=malloc(maxctx*sizeof(int));        /* storia token (= contenuto della KV): serve
-                                                  * al lookup n-gram e resta allineata a len */
     g_kvsave = getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
-    snprintf(g_kv_path,sizeof(g_kv_path),"%s/.coli_kv",snap);
-    { int r=kv_disk_load(m,hist,maxctx); if(r>0){ len=r; first=0; } }
+    int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
+    if(nctx<1||nctx>16){ fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n"); exit(2); }
+    KVState *initial=m->kv; free(initial->kv_start); free(initial);
+    ServeCtx *ctx=calloc(nctx,sizeof(ServeCtx));
+    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    int active=0; ServeCtx *sc=&ctx[0]; kv_bind(m,&sc->kv);
+    fprintf(stderr,"[KV] context slot: %d x %d token\n",nctx,maxctx);
+    #define hist  (sc->hist)
+    #define len   (sc->len)
+    #define first (sc->first)
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
-            kv_disk_reset();
+            kv_disk_reset(m);
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
             la storia e' gia' in KV, basta ri-forwardare l'ULTIMO token per riavere i logits */
@@ -1960,16 +2002,18 @@ static void run_serve(Model *m, const char *snap){
          * line protocol this accepts newlines. The tokenized prompt is matched
          * against hist so the common KV prefix survives stateless HTTP turns.
          * Per-request generation controls follow the byte count:
-         *   \x02PROMPT <bytes> <max_tokens> <temperature> <top_p>\n<prompt>\n */
+         *   \x02PROMPT <bytes> <max_tokens> <temperature> <top_p> [kv_slot]\n<prompt>\n */
         char *raw=NULL, *input=line;
         int input_n=(int)nr, raw_mode=0, req_ngen=ngen, prompt_tokens=0;
         float base_temp=g_temp, base_nuc=g_nuc;
         if(!strncmp(line,"\x02PROMPT ",8)){
-            unsigned long long nb=0; double rt=0, rp=0;
-            if(sscanf(line+8,"%llu %d %lf %lf",&nb,&req_ngen,&rt,&rp)!=4 ||
-               nb>(16u<<20) || req_ngen<1 || rt<0 || rt>2 || rp<=0 || rp>1){
+            unsigned long long nb=0; double rt=0, rp=0; int slot=0;
+            int nf=sscanf(line+8,"%llu %d %lf %lf %d",&nb,&req_ngen,&rt,&rp,&slot);
+            if(nf<4 || nb>(16u<<20) || req_ngen<1 || rt<0 || rt>2 || rp<=0 || rp>1 ||
+               slot<0 || slot>=nctx){
                 printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n",rss_gb()); fflush(stdout); continue;
             }
+            active=slot; sc=&ctx[active]; kv_bind(m,&sc->kv);
             raw=malloc((size_t)nb+1); if(!raw){fprintf(stderr,"OOM raw prompt\n");exit(1);}
             if(fread(raw,1,(size_t)nb,stdin)!=(size_t)nb){free(raw);break;}
             int delim=fgetc(stdin); if(delim!='\n' && delim!=EOF) ungetc(delim,stdin);
@@ -1978,7 +2022,7 @@ static void run_serve(Model *m, const char *snap){
             raw[nb]=0; input=raw; input_n=(int)nb; raw_mode=1;
             if(req_ngen>ngen) req_ngen=ngen;
             g_temp=(float)rt; g_nuc=(float)rp;
-        }
+        } else { active=0; sc=&ctx[0]; kv_bind(m,&sc->kv); }
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
@@ -1992,18 +2036,19 @@ static void run_serve(Model *m, const char *snap){
             if(prefix<old_len){
                 len=prefix;
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
-                kv_disk_truncate(len);             /* il prossimo append sovrascrive solo la coda */
+                kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
             }
             k=prompt_tokens-len;
             if(k>0) memcpy(hist+len,tmp+len,k*sizeof(int));
-            fprintf(stderr,"[API] KV prefix %d/%d token, prefill %d\n",len,prompt_tokens,k);
+            fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",
+                active,len,prompt_tokens,k);
             free(tmp);
         } else {
             if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
                        bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
-            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset();
+            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
                 bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
@@ -2032,8 +2077,13 @@ static void run_serve(Model *m, const char *snap){
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
     }
-    free(line); free(hist); free(buf);
+    free(line); free(buf);
     usage_save(m);
+    #undef hist
+    #undef len
+    #undef first
+    for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]);
+    free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
 static int *read_arr(jval*o,const char*k,int*n){ jval*a=json_get(o,k); int*r=malloc(a->len*sizeof(int));
@@ -2248,12 +2298,25 @@ static double mem_available_gb(void){
 #endif
 }
 
+static int kv_slot_count(void){
+    if(!getenv("SERVE")) return 1;
+    return getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
+}
+
+static double kv_pool_bytes(Model *m, int max_ctx){
+    Cfg *c=&m->c; double one=(double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0;
+    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
+        one+=(double)max_ctx*c->index_hd*4.0;
+    int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
+    return one*slots;
+}
+
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
     double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb
-        + (double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0
+        + kv_pool_bytes(m,max_ctx)
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
@@ -2274,7 +2337,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
      *  attivazioni+logits+overhead ~1.2 GB */
     double ws_b  = 64.0*(double)eb;
-    double kv_b  = (double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0;
+    double kv_b  = kv_pool_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     /* RISERVA PAGE-CACHE (misurato 2026-07-06): strangolarla fa crollare le pread
      * buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di quanto
@@ -2285,9 +2348,10 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
     if(capmax<1) capmax=1;
     if(capmax < m->ecap){
-        fprintf(stderr,"[RAM_GB=%.1f%s] residente %.1f GB + slack %.1f GB (ws %.1f, KV@%d %.1f, kvb %.1f), "
+        fprintf(stderr,"[RAM_GB=%.1f%s] residente %.1f GB + slack %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
             "expert %.1f MB x %d layer -> cap abbassato %d->%d (proiezione picco %.1f GB)\n",
-            ram_gb, auto_b?" auto":"", m->resident_bytes/1e9, slack/1e9, ws_b/1e9, max_ctx, kv_b/1e9, kvb_b/1e9,
+            ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
+            kv_slot_count(),max_ctx,kv_b/1e9,kvb_b/1e9,
             eb/1e6, nsp, m->ecap, capmax,
             (m->resident_bytes + (double)capmax*nsp*eb + slack)/1e9);
         m->ecap=capmax;
@@ -2344,6 +2408,9 @@ int main(int argc, char **argv){
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
+    if(getenv("SERVE") && (kv_slot_count()<1 || kv_slot_count()>16)){
+        fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n"); return 2;
+    }
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");

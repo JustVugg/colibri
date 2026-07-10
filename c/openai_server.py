@@ -247,16 +247,20 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 class Engine:
-    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None):
-        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", NGEN=str(max_tokens))
+    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
+        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", NGEN=str(max_tokens),
+                         KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
             [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
         )
         self.lock = threading.Lock()
+        self.kv_slots = kv_slots
         read_engine_turn(self.process.stdout, READY, lambda _: None)
 
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text):
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0):
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
@@ -270,7 +274,8 @@ class Engine:
         with self.lock:
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
-            header = f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} {top_p:.8g}\n".encode()
+            header = (f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} "
+                      f"{top_p:.8g} {cache_slot}\n").encode()
             self.process.stdin.write(header + payload + b"\n")
             self.process.stdin.flush()
             stats = read_engine_turn(self.process.stdout, END, decode)
@@ -296,13 +301,15 @@ class APIServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
-                 cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300):
+                 cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
+                 kv_slots=1):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout)
+        self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
 
@@ -370,7 +377,8 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path).path
             if path == "/health":
-                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot()}, request_id)
+                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
+                                     "kv_slots": self.server.kv_slots}, request_id)
                 return
             self.require_auth()
             if path == "/v1/models":
@@ -419,6 +427,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def generation(self, body, prompt, request_id, chat):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
+        cache_slot = body.get("cache_slot", 0)
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots:
+            raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
+                           "cache_slot")
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -435,7 +447,8 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
-                stats = self.server.engine.generate(prompt, maximum, temperature, top_p, output.append)
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, output.append, cache_slot)
                 text = "".join(output)
                 finish = "length" if stats["length_limited"] else "stop"
                 choice = ({"index": 0, "message": {"role": "assistant", "content": text,
@@ -482,7 +495,8 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
-            stats = self.server.engine.generate(prompt, maximum, temperature, top_p, emit)
+            stats = self.server.engine.generate(
+                prompt, maximum, temperature, top_p, emit, cache_slot)
             finish = "length" if stats["length_limited"] else "stop"
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
@@ -536,7 +550,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300):
+          max_queue=8, queue_timeout=300, kv_slots=1):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -545,11 +559,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("max_queue cannot be negative")
     if queue_timeout <= 0:
         raise ValueError("queue_timeout must be positive")
+    if not 1 <= kv_slots <= 16:
+        raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
-    runtime = Engine(engine, model, cap, max_tokens, env)
+    runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    server = APIServer((host, port),runtime,model_id,api_key,max_tokens,origins,max_queue,queue_timeout)
+    server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins,
+                       max_queue, queue_timeout, kv_slots)
     print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -577,10 +594,11 @@ def main():
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
+    parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
     args = parser.parse_args()
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
-          max_queue=args.max_queue,queue_timeout=args.queue_timeout)
+          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
 
 
 if __name__ == "__main__":

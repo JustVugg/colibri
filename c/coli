@@ -440,7 +440,8 @@ def cmd_serve(a):
     need_model(a.model)
     from openai_server import serve
     serve(a.model, a.host, a.port, a.model_id, a.api_key,
-          a.cap,a.ngen,GLM,env_for(a),a.cors_origin,a.max_queue,a.queue_timeout)
+          a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+          a.max_queue,a.queue_timeout,a.kv_slots)
 
 def cmd_bench(a):
     need_model(a.model)
@@ -506,6 +507,7 @@ def main():
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
+    ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")

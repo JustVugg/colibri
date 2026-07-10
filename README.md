@@ -159,6 +159,27 @@ requests receive OpenAI-shaped HTTP 429 errors before streaming headers are sent
 `GET /health` exposes active/queued/completed/rejected counters, and successful
 generation responses include `x-colibri-queue-wait-ms`.
 
+### Isolated KV contexts
+
+`coli serve --kv-slots N` allocates up to 16 independent sequence contexts. Requests
+select one with the optional integer `cache_slot` field; ordinary OpenAI clients omit
+it and keep the original slot 0 behavior.
+
+```json
+{
+  "model": "glm-5.2-colibri",
+  "messages": [{"role": "user", "content": "Continue this conversation"}],
+  "cache_slot": 1
+}
+```
+
+Each slot owns its token history, compressed MLA/DSA KV memory, MTP window, and
+crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...). The engine still executes
+one sequence at a time; this establishes explicit KV ownership without pretending that
+threaded HTTP is continuous batching. RAM admission accounts for every configured slot.
+Use `COLI_KV_SLOTS=N` as the environment equivalent. Start with a small value: at the
+default 4096-token context, every slot costs hundreds of MB.
+
 ### Experimental resident CUDA backend
 
 colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming

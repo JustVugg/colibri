@@ -6,15 +6,15 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIError, APIServer, ClientCancelled, END, GenerationScheduler,
-                           generation_options, read_engine_turn, render_chat)
+                           generation_options, read_engine_turn, render_chat, serve)
 
 
 class FakeEngine:
     def __init__(self):
         self.calls = []
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text):
-        self.calls.append((prompt, maximum, temperature, top_p))
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
         on_text("Hé")
         on_text("llo")
         return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
@@ -26,10 +26,10 @@ class BlockingEngine(FakeEngine):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0):
         self.entered.set()
         self.release.wait(2)
-        return super().generate(prompt, maximum, temperature, top_p, on_text)
+        return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot)
 
 
 class TemplateTest(unittest.TestCase):
@@ -77,6 +77,10 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(b"".join(chunks), b"hello")
         self.assertEqual(stats["prompt_tokens"], 7)
         self.assertTrue(stats["length_limited"])
+
+    def test_rejects_invalid_kv_pool_before_engine_start(self):
+        with self.assertRaisesRegex(ValueError, "kv_slots"):
+            serve("/missing", kv_slots=0)
 
 
 class SchedulerTest(unittest.TestCase):
@@ -160,7 +164,7 @@ class HTTPTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.engine = FakeEngine()
-        cls.server = APIServer(("127.0.0.1", 0), cls.engine, "test-model", "secret", 16)
+        cls.server = APIServer(("127.0.0.1", 0),cls.engine,"test-model","secret",16,kv_slots=2)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
@@ -187,11 +191,13 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.assertEqual(caught.exception.code, 401)
 
-    def test_health_reports_scheduler(self):
+    def test_health_reports_scheduler_and_kv_slots(self):
         with self.request("/health") as response:
-            scheduler = json.load(response)["scheduler"]
+            health = json.load(response)
+            scheduler = health["scheduler"]
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
+        self.assertEqual(health["kv_slots"], 2)
 
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={
@@ -207,7 +213,7 @@ class HTTPTest(unittest.TestCase):
     def test_chat_completion(self):
         with self.request("/v1/chat/completions", {
             "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 4,
+            "max_tokens": 4, "cache_slot": 1,
         }) as response:
             body = json.load(response)
             queue_wait = response.headers.get("x-colibri-queue-wait-ms")
@@ -216,6 +222,15 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(body["usage"], {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9})
         self.assertIsNotNone(queue_wait)
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
+        self.assertEqual(self.engine.calls[-1][4], 1)
+
+    def test_rejects_invalid_cache_slot(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "cache_slot": 2,
+            })
+        self.assertEqual(caught.exception.code, 400)
 
     def test_streaming_chat_completion(self):
         with self.request("/v1/chat/completions", {
