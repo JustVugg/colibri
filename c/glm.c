@@ -32,10 +32,15 @@
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
+#include "cpu_pool.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
 #endif
+
+static CpuPool g_cpu_pool;
+static int g_cpu_pool_enabled;
+static void cpu_pool_shutdown_global(void){ if(g_cpu_pool_enabled) cpu_pool_destroy(&g_cpu_pool); }
 #ifdef __AVX2__
 #include <immintrin.h>
 static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
@@ -270,13 +275,14 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
 /* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
  * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
  * this keeps colibri dependency-free while removing one team launch/expert. */
-static void matmul_i4_pair(float *yg, float *yu, const float *x,
-                           const uint8_t *qg, const float *sg,
-                           const uint8_t *qu, const float *su, int I, int O){
-    int rb=(I+1)/2;
-    #pragma omp parallel for schedule(static)
-    for(int z=0;z<2*O;z++){
-        int o=z<O?z:z-O; const uint8_t *w=(z<O?qg:qu)+(int64_t)o*rb;
+typedef struct { float *yg,*yu; const float *x; const uint8_t *qg,*qu;
+                 const float *sg,*su; int I,O,rb; } I4PairJob;
+static void matmul_i4_pair_rows(void *opaque,int begin,int end){
+    I4PairJob *j=opaque;
+    for(int z=begin;z<end;z++){
+        int o=z<j->O?z:z-j->O;
+        const uint8_t *w=(z<j->O?j->qg:j->qu)+(int64_t)o*j->rb;
+        const float *x=j->x; int I=j->I;
         float a=0; int i=0;
 #ifdef __AVX2__
         const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
@@ -304,7 +310,17 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
 #endif
         for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; a+=x[i]*(float)((b&15)-8)+x[i+1]*(float)((b>>4)-8); }
         if(i<I) a+=x[i]*(float)((w[i>>1]&15)-8);
-        (z<O?yg:yu)[o]=a*(z<O?sg:su)[o];
+        (z<j->O?j->yg:j->yu)[o]=a*(z<j->O?j->sg:j->su)[o];
+    }
+}
+static void matmul_i4_pair(float *yg, float *yu, const float *x,
+                           const uint8_t *qg, const float *sg,
+                           const uint8_t *qu, const float *su, int I, int O){
+    I4PairJob job={yg,yu,x,qg,qu,sg,su,I,O,(I+1)/2};
+    if(g_cpu_pool_enabled) cpu_pool_for(&g_cpu_pool,2*O,matmul_i4_pair_rows,&job);
+    else {
+        #pragma omp parallel for schedule(static)
+        for(int z=0;z<2*O;z++) matmul_i4_pair_rows(&job,z,z+1);
     }
 }
 
@@ -2596,6 +2612,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
 int main(int argc, char **argv){
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
+    int pool_threads=getenv("CPU_POOL_THREADS")?atoi(getenv("CPU_POOL_THREADS")):0;
+    if(pool_threads>0){
+        g_cpu_pool_enabled=cpu_pool_init(&g_cpu_pool,pool_threads);
+        if(!g_cpu_pool_enabled){ fprintf(stderr,"CPU_POOL_THREADS: impossibile creare il pool\n"); return 2; }
+        atexit(cpu_pool_shutdown_global);
+        fprintf(stderr,"[CPU] persistent expert pool: %d thread\n",pool_threads);
+    }
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
