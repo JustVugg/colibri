@@ -53,7 +53,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_cpu_pool$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_cpu_pool$(EXE) tests/test_io_policy$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -72,7 +72,7 @@ all: glm$(EXE)
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h cpu_pool.h $(CUDA_OBJ)
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h cpu_pool.h io_policy.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
@@ -104,6 +104,9 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cpu_pool$(EXE): tests/test_cpu_pool.c cpu_pool.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_io_policy$(EXE): tests/test_io_policy.c io_policy.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)

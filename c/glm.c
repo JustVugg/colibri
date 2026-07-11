@@ -33,6 +33,7 @@
 #include "tok.h"
 #include "tier.h"
 #include "cpu_pool.h"
+#include "io_policy.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -1352,10 +1353,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; miss_pos[j]=1; m->miss++; }
         }
         pthread_t load_thread; int load_threaded=0;
-        int io_threads=nmiss<8?nmiss:8;
-        if(nmiss==nb) io_threads=nmiss;            /* no foreground work: retain full I/O fan-out */
+        int io_threads=expert_io_threads(nmiss,nmiss<nb);
         ExpertLoadJob load_job={m,layer,base,nmiss,io_threads,uniq,missk,0};
-        if(getenv("IO_THREADS")) load_job.threads=atoi(getenv("IO_THREADS"));
         if(load_job.threads<1) load_job.threads=1;
         if(nmiss){
             load_threaded=!pthread_create(&load_thread,NULL,expert_load_run,&load_job);

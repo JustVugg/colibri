@@ -337,8 +337,11 @@ quality does not.
 
 Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
 while missing experts are loaded in a bounded background I/O pool, then the
-cold results join before the layer completes. `IO_THREADS=n` overrides the
-default eight loader threads when foreground work exists. Profiling reports
+cold results join before the layer completes. The phase-aware defaults use at
+most eight loaders while resident experts are executing and full fan-out when
+the layer has no foreground work. `IO_OVERLAP_THREADS=n` and
+`IO_IDLE_THREADS=n` tune those phases independently; the legacy
+`IO_THREADS=n` still overrides both. Profiling reports
 both disk service time and the smaller foreground-visible wait time so overlap
 is explicit rather than credited as unexplained speedup.
 
