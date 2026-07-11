@@ -365,6 +365,12 @@ experts. `--policy quality` leaves live replacement off by default; `REPIN=0`
 always disables it. Persistent `.coli_usage` history and session-local LFRU
 state remain separate.
 
+For single-token q4 CPU experts, gate and up projections share one OpenMP
+dispatch while retaining the same per-row AVX2/NEON arithmetic. This removes
+one thread-team launch per RAM expert without activation requantization or a
+lower-precision fallback. It is a stepping stone toward a persistent native
+CPU expert pool, not a replacement for one.
+
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
 **Router-lookahead prefetch** (`PILOT=1`, experimental): GLM-5.2's expert routing is measurably predictable *ahead of time* — applying layer L+1's router to layer L's post-attention state recalls **71.6%** of the true top-8 (vs 41.3% for "same experts as last token"). `PILOT=1` uses this to issue next-layer expert readahead from a dedicated I/O thread while the current layer computes. On our dev box the disk is already ~80% saturated, so it measures neutral; on machines where compute and disk are balanced (like the Ryzen AI 9 in issue #12: 43% disk / 46% matmul) it should overlap real work — measurements welcome.
