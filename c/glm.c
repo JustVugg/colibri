@@ -1210,9 +1210,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
 #ifdef COLI_CUDA
-    float *group_x=falloc((int64_t)S*K*D), *group_y=falloc((int64_t)S*K*D);
-    int *group_row=malloc((size_t)64*S*sizeof(int));
-    float *group_weight=malloc((size_t)64*S*sizeof(float));
+    int group_enabled=S<=64;
+    float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
+    float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
+    int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;
+    float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
@@ -1250,7 +1252,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             if(!nr) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
-            if(g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
+            if(group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
                !omp_in_parallel()){
                 group_e[ngroup]=e; group_n[ngroup]=nr;
                 for(int r=0;r<nr;r++){ group_row[(int64_t)ngroup*S+r]=rows[r]; group_weight[(int64_t)ngroup*S+r]=rw[r]; }
@@ -1259,6 +1261,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
+#ifdef COLI_CUDA
+            if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
+               e->d.cuda_eligible && !omp_in_parallel() &&
+               coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                m->t_emm+=now_s()-t0; continue;
+            }
+#endif
             matmul_qt(gg, xg, &e->g, nr);
             matmul_qt(uu, xg, &e->u, nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
