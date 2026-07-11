@@ -1201,6 +1201,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+#ifdef COLI_CUDA
+    float *group_x=falloc((int64_t)S*K*D), *group_y=falloc((int64_t)S*K*D);
+    int *group_row=malloc((size_t)64*S*sizeof(int));
+    float *group_weight=malloc((size_t)64*S*sizeof(float));
+#endif
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int nmiss=0;
@@ -1227,6 +1232,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
+#ifdef COLI_CUDA
+        ESlot *group_e[64]; int group_n[64]; int ngroup=0;
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
@@ -1234,18 +1242,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             if(!nr) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+            if(g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
+               !omp_in_parallel()){
+                group_e[ngroup]=e; group_n[ngroup]=nr;
+                for(int r=0;r<nr;r++){ group_row[(int64_t)ngroup*S+r]=rows[r]; group_weight[(int64_t)ngroup*S+r]=rw[r]; }
+                ngroup++; continue;
+            }
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
-#ifdef COLI_CUDA
-            if(g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
-               !omp_in_parallel() && coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                m->t_emm += now_s()-t0;
-                continue;
-            }
-#endif
             matmul_qt(gg, xg, &e->g, nr);
             matmul_qt(uu, xg, &e->u, nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -1254,6 +1259,39 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
         }
+#ifdef COLI_CUDA
+        for(int di=0;di<g_cuda_ndev;di++){
+            ColiCudaTensor *gates[64],*ups[64],*downs[64]; int nrows[64], which[64];
+            int nc=0,total=0,device=g_cuda_devices[di];
+            for(int q=0;q<ngroup;q++) if(group_e[q]->g.cuda_device==device){
+                ESlot *e=group_e[q]; gates[nc]=e->g.cuda; ups[nc]=e->u.cuda; downs[nc]=e->d.cuda;
+                nrows[nc]=group_n[q]; which[nc]=q;
+                for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(total+r)*D,
+                    x+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
+                total+=group_n[q]; nc++;
+            }
+            if(!nc) continue;
+            double t0=now_s();
+            int ok=coli_cuda_expert_group(gates,ups,downs,nrows,nc,group_y,group_x);
+            int off=0;
+            for(int q=0;q<nc;q++){
+                int gi=which[q],nr=group_n[gi]; ESlot *e=group_e[gi];
+                if(!ok){
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
+                    if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
+                        matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
+                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        matmul_qt(hh,gg,&e->d,nr);
+                    }
+                }
+                float *src=ok?group_y+(int64_t)off*D:hh;
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)group_row[(int64_t)gi*S+r]*D, wgt=group_weight[(int64_t)gi*S+r];
+                    for(int d=0;d<D;d++) os[d]+=wgt*src[(int64_t)r*D+d]; }
+                off+=nr;
+            }
+            m->t_emm+=now_s()-t0;
+        }
+#endif
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -1271,6 +1309,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(logit); free(sig); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
+#ifdef COLI_CUDA
+    free(group_x); free(group_y); free(group_row); free(group_weight);
+#endif
 }
 
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){

@@ -71,6 +71,10 @@ int main(int argc, char **argv) {
     }
     if (!coli_cuda_expert_mlp(tg,tu,td,expert,x,2) ||
         !close_enough(expert,want_expert,8)) return 1;
+    ColiCudaTensor *gates[2]={tg,tg},*ups[2]={tu,tu},*downs[2]={td,td};
+    int group_rows[2]={1,1}; float grouped[8];
+    if (!coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,x) ||
+        !close_enough(grouped,want_expert,8)) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {
