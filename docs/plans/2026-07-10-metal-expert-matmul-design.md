@@ -213,3 +213,16 @@ single highest-leverage remaining work.
   expert (rw=1.0, all S rows) — 3 fewer CPU matmuls/layer, bigger GPU submits.
 - Next candidate: router on GPU (score matmul + sigmoid + top-8 of 256) to merge the
   attention and expert command buffers into ONE per layer (halves submit count).
+
+## Iteration 2 final A/B (interleaved M/C/M/C, identical speculation + hit-rate)
+Metal 33.6/30.9s vs CPU 49.4/51.1s -> **0.31 vs 0.20 tok/s = ~1.56x end-to-end**, token-exact.
+
+## Iteration 3 plan: overlap disk with GPU inside the layer
+Router-on-GPU is NOT the right lever: the top-8 result must return to the CPU to decide
+which experts to LOAD FROM DISK, so a CPU sync after routing is unavoidable and the CBs
+cannot merge on miss layers (~99% of layers at 58% hit). Instead, split each layer's
+expert block into two submits: (1) immediately submit the CB for RESIDENT experts
+(pin/LRU hits) and let the GPU work while (2) the CPU preads the missed experts in
+parallel, then (3) submit the misses CB and combine. Overlaps ~8ms GPU compute with
+~38ms disk per block: est. ~3s off a 32s run, and keeps the GPU warmer between submits.
+Needs: two-phase moe_block API (begin/end) + non-shared scratch (2-slot ring).
