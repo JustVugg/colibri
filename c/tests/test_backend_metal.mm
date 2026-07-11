@@ -96,6 +96,87 @@ static int run_moe(const std::vector<int>& nrv, const char* name) {
   return pass?0:1;
 }
 
+// ---- fused decode attention vs a CPU reference replicating glm.c's exact math ----
+// GLM-5.2 dims (hardcoded in the backend): hidden=6144 H=64 q_lora=2048 kv_lora=512
+// nope=192 rope=64 vh=256; theta=10000 ascale=1/16 eps=1e-5.
+enum { TH=6144, THH=64, TQL=2048, TKVL=512, TNOPE=192, TROPE=64, TVH=256, TQH=256, TROWSH=448 };
+static void t_rms(float*o,const float*x,const float*w,int n,float eps){ double ms=0; for(int i=0;i<n;i++) ms+=(double)x[i]*x[i];
+  float r=1.f/sqrtf((float)(ms/n)+eps); for(int i=0;i<n;i++) o[i]=x[i]*r*w[i]; }
+static void t_rope(float*v,int pos,float th){ int hl=TROPE/2; float in[TROPE]; memcpy(in,v,sizeof(in));
+  for(int j=0;j<hl;j++){ float inv=powf(th,-2.f*j/TROPE), a=in[2*j], b=in[2*j+1], cs=cosf(pos*inv), sn=sinf(pos*inv);
+    v[j]=a*cs-b*sn; v[hl+j]=b*cs+a*sn; } }
+static void t_gemv4(float*y,const float*x,const uint8_t*w,const float*sc,int O,int I){ int rb=(I+1)/2;
+  for(int o=0;o<O;o++){ const uint8_t*r=w+(size_t)o*rb; float a=0;
+    for(int i=0;i<I;i++){ uint8_t b=r[i>>1]; int v=(i&1)?(b>>4):(b&0xF); a+=(float)(v-8)*x[i]; } y[o]=a*sc[o]; } }
+struct TW { uint8_t*w; float*s; size_t wb, sb; };
+static TW t_mkw(int O,int I){ TW t; int rb=(I+1)/2;
+  t.wb=((size_t)O*rb+16383)&~(size_t)16383; t.sb=((size_t)O*4+16383)&~(size_t)16383;
+  posix_memalign((void**)&t.w,16384,t.wb); posix_memalign((void**)&t.s,16384,t.sb);
+  for(size_t i=0;i<(size_t)O*rb;i++) t.w[i]=(uint8_t)(rand()&0xFF);
+  for(int i=0;i<O;i++) t.s[i]=0.01f+(rand()%40)/40000.f;
+  coli_metal_register(t.w,t.wb); coli_metal_register(t.s,t.sb); return t; }
+static int run_attn(int S, int pos_base, const char* name){
+  const float eps=1e-5f, theta=10000.f, ascale=1.f/16.f;
+  srand(4242+S+pos_base);
+  TW qa=t_mkw(TQL,TH), qb=t_mkw(THH*TQH,TQL), kva=t_mkw(TKVL+TROPE,TH), kvb=t_mkw(THH*TROWSH,TKVL), o=t_mkw(TH,THH*TVH);
+  std::vector<float> qaln(TQL), kvaln(TKVL);
+  for(auto&v:qaln) v=0.5f+(rand()%1000)/1000.f; for(auto&v:kvaln) v=0.5f+(rand()%1000)/1000.f;
+  int T=pos_base+S; size_t lcb=(((size_t)T*TKVL*4)+16383)&~(size_t)16383, rcb=(((size_t)T*TROPE*4)+16383)&~(size_t)16383;
+  float *Lc,*Rc; posix_memalign((void**)&Lc,16384,lcb); posix_memalign((void**)&Rc,16384,rcb);
+  coli_metal_register(Lc,lcb); coli_metal_register(Rc,rcb);
+  // pre-existing cache history [0,pos_base): random normed latents + roped krot
+  for(int t=0;t<pos_base;t++){ for(int i=0;i<TKVL;i++) Lc[(size_t)t*TKVL+i]=((rand()%2000)-1000)/1500.f;
+    for(int i=0;i<TROPE;i++) Rc[(size_t)t*TROPE+i]=((rand()%2000)-1000)/1500.f; }
+  std::vector<float> x((size_t)S*TH); for(auto&v:x) v=((rand()%2000)-1000)/1000.f;
+  std::vector<float> Lr((size_t)T*TKVL), Rr((size_t)T*TROPE);   // reference cache copies
+  memcpy(Lr.data(),Lc,(size_t)pos_base*TKVL*4); memcpy(Rr.data(),Rc,(size_t)pos_base*TROPE*4);
+  // CPU reference: mirrors glm.c attention() absorb branch (per new token, then per head)
+  std::vector<float> Q((size_t)S*THH*TQH), ref((size_t)S*TH);
+  for(int s=0;s<S;s++){ int pos=pos_base+s;
+    std::vector<float> qr(TQL), comp(TKVL+TROPE);
+    t_gemv4(qr.data(),&x[(size_t)s*TH],qa.w,qa.s,TQL,TH); t_rms(qr.data(),qr.data(),qaln.data(),TQL,eps);
+    t_gemv4(&Q[(size_t)s*THH*TQH],qr.data(),qb.w,qb.s,THH*TQH,TQL);
+    for(int h=0;h<THH;h++) t_rope(&Q[(size_t)s*THH*TQH+(size_t)h*TQH+TNOPE],pos,theta);
+    t_gemv4(comp.data(),&x[(size_t)s*TH],kva.w,kva.s,TKVL+TROPE,TH);
+    t_rms(&Lr[(size_t)pos*TKVL],comp.data(),kvaln.data(),TKVL,eps);
+    memcpy(&Rr[(size_t)pos*TROPE],&comp[TKVL],TROPE*4); t_rope(&Rr[(size_t)pos*TROPE],pos,theta);
+  }
+  int rb=(TKVL+1)/2;
+  for(int s=0;s<S;s++){ int pos=pos_base+s; std::vector<float> ctx((size_t)THH*TVH);
+    for(int h=0;h<THH;h++){ int rbase=h*TROWSH;
+      const float* qp=&Q[(size_t)s*THH*TQH+(size_t)h*TQH]; const float* qro=qp+TNOPE;
+      std::vector<float> qabs(TKVL,0);
+      for(int d=0;d<TNOPE;d++){ const uint8_t*r=kvb.w+(size_t)(rbase+d)*rb; float sc=kvb.s[rbase+d];
+        for(int i=0;i<TKVL;i++){ uint8_t b=r[i>>1]; int v=(i&1)?(b>>4):(b&0xF); qabs[i]+=qp[d]*(float)(v-8)*sc; } }
+      std::vector<float> a(pos+1);
+      for(int t=0;t<=pos;t++){ const float*Lt=&Lr[(size_t)t*TKVL]; const float*Rt=&Rr[(size_t)t*TROPE];
+        float v=0; for(int i=0;i<TKVL;i++) v+=qabs[i]*Lt[i]; for(int d=0;d<TROPE;d++) v+=qro[d]*Rt[d]; a[t]=v*ascale; }
+      float mx=-1e30f; for(float v:a) mx=fmaxf(mx,v); float sum=0; for(float&v:a){ v=expf(v-mx); sum+=v; } for(float&v:a) v/=sum;
+      std::vector<float> cl(TKVL,0);
+      for(int t=0;t<=pos;t++){ const float*Lt=&Lr[(size_t)t*TKVL]; for(int i=0;i<TKVL;i++) cl[i]+=a[t]*Lt[i]; }
+      for(int j=0;j<TVH;j++){ const uint8_t*r=kvb.w+(size_t)(rbase+TNOPE+j)*rb; float sc=kvb.s[rbase+TNOPE+j];
+        float v=0; for(int i=0;i<TKVL;i++){ uint8_t b=r[i>>1]; int vv=(i&1)?(b>>4):(b&0xF); v+=cl[i]*(float)(vv-8)*sc; }
+        ctx[(size_t)h*TVH+j]=v; } }
+    t_gemv4(&ref[(size_t)s*TH],ctx.data(),o.w,o.s,TH,THH*TVH);
+  }
+  std::vector<float> got((size_t)S*TH);
+  int ok=coli_metal_attn_decode(x.data(), qa.w,qa.s,2,qaln.data(), qb.w,qb.s,2,
+        kva.w,kva.s,2,kvaln.data(), kvb.w,kvb.s,2, o.w,o.s,2,
+        Lc,Rc,S,pos_base,0,eps,theta,ascale,got.data());
+  double ma=0,ym=0; for(size_t i=0;i<ref.size();i++){ ma=fmax(ma,fabs(got[i]-ref[i])); ym=fmax(ym,fabs(ref[i])); }
+  // also verify the cache write-back (Lc/Rc for the new positions)
+  double mc=0; for(int s=0;s<S;s++){ int pos=pos_base+s;
+    for(int i=0;i<TKVL;i++) mc=fmax(mc,fabs(Lc[(size_t)pos*TKVL+i]-Lr[(size_t)pos*TKVL+i]));
+    for(int i=0;i<TROPE;i++) mc=fmax(mc,fabs(Rc[(size_t)pos*TROPE+i]-Rr[(size_t)pos*TROPE+i])); }
+  double nerr=ma/(ym+1e-9);
+  int pass = ok && nerr<2e-4 && mc<1e-4;
+  printf("  %-24s nerr=%.2e cache=%.2e  %s\n", name, nerr, mc, pass?"ok":"*** MISMATCH");
+  auto freew=[&](TW&t){ coli_metal_unregister(t.w); coli_metal_unregister(t.s); free(t.w); free(t.s); };
+  freew(qa); freew(qb); freew(kva); freew(kvb); freew(o);
+  coli_metal_unregister(Lc); coli_metal_unregister(Rc); free(Lc); free(Rc);
+  return pass?0:1;
+}
+
 int main(void) {
   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
   printf("Metal backend kernel tests:\n");
@@ -111,6 +192,11 @@ int main(void) {
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
+  printf("Metal fused attention tests:\n");
+  fail |= run_attn(1, 0,   "attn S=1 pos=0");
+  fail |= run_attn(1, 37,  "attn S=1 pos=37");
+  fail |= run_attn(4, 12,  "attn S=4 pos=12 (MTP)");
+  fail |= run_attn(3, 0,   "attn S=3 pos=0");
   printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
   coli_metal_shutdown();
   return fail;
