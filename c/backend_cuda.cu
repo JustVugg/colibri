@@ -167,6 +167,35 @@ __global__ static void grouped_down(float *y,const float *x,const GroupDesc *des
     if(!threadIdx.x) y[(size_t)(d.offset+s)*D+o]=p[0]*(d.df?d.ds[o]:1.f);
 }
 
+__device__ static void unpack_s4(uint8_t v,float *lo,float *hi){
+    int a=v&15,b=v>>4; *lo=(float)(a&8?a-16:a); *hi=(float)(b&8?b-16:b);
+}
+
+/* Exact low-row W4A32 path. It consumes each packed weight byte once instead
+ * of routing both nibbles through weight_at(), preserving FP32 activations. */
+__global__ static void grouped_hidden_w4(float *y,const float *x,const GroupDesc *desc,
+                                         int I,int D,int which){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *w=(const uint8_t*)(which?d.u:d.g);const float *sc=which?d.us:d.gs;
+    const uint8_t *row=w+(size_t)o*((D+1)/2);const float *xs=x+(size_t)(d.offset+s)*D;
+    float sum=0;for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],&a,&z);
+        int i=b*2;sum+=xs[i]*a;if(i+1<D)sum+=xs[i+1]*z;}
+    __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)(d.offset+s)*I+o]=p[0]*sc[o];
+}
+
+__global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*((I+1)/2);
+    const float *xs=x+(size_t)(d.offset+s)*I;float sum=0;
+    for(int b=threadIdx.x;b<(I+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],&a,&z);
+        int i=b*2;sum+=xs[i]*a;if(i+1<I)sum+=xs[i+1]*z;}
+    __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0]*d.ds[o];
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -393,6 +422,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
         quantize_s4_rows<<<total,256>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
+    }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_w4<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
+        grouped_hidden_w4<<<hg,256>>>(ctx->up,ctx->x,dev,I,D,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down_w4<<<og,256>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
