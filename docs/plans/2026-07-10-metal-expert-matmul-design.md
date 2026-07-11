@@ -177,6 +177,23 @@ total). The win needs **fewer submits / a hotter GPU**, not faster kernels:
 - Or handle S<=4 to amortize (covers MTP verify) — but latency, not compute, is the ceiling.
 Fused attention should help at **long context** (kernel time grows past the fixed latency).
 
+
+
+## CLEAN warm A/B (2026-07-11, 96 GB, MTP on, ~55% hit, machine idle) — the real result
+Earlier "attention neutral" was DRAFT=0 + machine contention. In the realistic MTP config,
+warm and uncontended, the combined offload (experts + S<=4 attention) is a genuine win:
+
+| | CPU | Metal | speedup |
+|---|---|---|---|
+| end-to-end | 49.9s (0.20 tok/s) | 35.1s (0.28 tok/s) | ~1.4x |
+| attention | 15.2s | 8.0s | ~1.9x |
+| expert-matmul | 12.0s | 7.3s | ~1.65x |
+| disk (matched) | 16.2s | 16.4s | - |
+
+Token-exact. GPU still latency-bound (attn kernel 0.70s of 3.04s wall) so more upside exists
+if submit count drops, but GPU already beats CPU on both. Measure MTP-on + warm + idle machine;
+DRAFT=0 and contention both mislead.
+
 ## Status of the offload overall
 Expert matmul: real ~1.2-1.3x warm. Attention: correct + token-exact but latency-neutral
 at short context. Both are gated by Metal submit latency; reducing submit count is the
