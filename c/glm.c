@@ -42,6 +42,9 @@
 #include <omp.h>
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
+/* routing precalcolata dalla GPU (layer CB): moe() la usa e salta la FASE A */
+static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
+static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su GPU */
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -727,7 +730,8 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"manca %s\n",name);exit(1);}
-    float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
+    float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
+    st_read_f32(&m->S,name,p,0); return p;
 }
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
@@ -1282,6 +1286,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     /* ---- FASE A: routing di tutte le S posizioni ---- */
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
+#ifdef COLI_METAL
+    if(g_pre_idx){                               /* routing gia' calcolata dal layer CB (GPU) */
+        memcpy(idxs,g_pre_idx,(size_t)S*K*sizeof(int));
+        memcpy(ws,g_pre_w,(size_t)S*K*sizeof(float));
+        memcpy(keff,g_pre_keff,(size_t)S*sizeof(int));
+        for(int s=0;s<S;s++){
+            m->ereq+=keff[s];
+            for(int kk=0;kk<keff[s];kk++){
+                m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
+                if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
+            }
+            for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
+        }
+    } else
+#endif
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
@@ -1391,7 +1410,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int q=0;q<nmiss;q++) is_miss[missk[q]]=1;
             mxg=falloc((int64_t)(nb+1)*S*D);
             mrows=malloc((size_t)(nb+1)*S*sizeof(int)); mrw=malloc((size_t)(nb+1)*S*sizeof(float));
-            MB_BUILD(0, base==0);
+            MB_BUILD(0, base==0 && !g_pre_sh);
             if(nbb>0){
                 double t0=now_s();
                 mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
@@ -1466,6 +1485,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     }
     /* ---- FASE E: shared expert, un matmul a S righe (skipped se fuso nel blocco GPU) ---- */
     float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
+#ifdef COLI_METAL
+    if(g_pre_sh){ for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=g_pre_sh[z]; shared_on_gpu=1; }
+#endif
     if(!shared_on_gpu){
         matmul_qt(sg, x, &l->sh_gate, S);
         matmul_qt(su, x, &l->sh_up,   S);
@@ -1564,6 +1586,60 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
+#ifdef COLI_METAL
+    /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
+     * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
+     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto. */
+    if(g_metal_enabled && S<=4 && li<c->n_layers && l->sparse
+       && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
+       && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
+       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
+       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048){
+        int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
+        if(!sel_active){
+            static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
+            if(!linrm){ linrm=falloc(4*(int64_t)D); lnrm=falloc(4*(int64_t)D); lsh=falloc(4*(int64_t)D);
+                        lidx=malloc(4*8*sizeof(int)); lw=malloc(4*8*sizeof(float)); lkeff=malloc(4*sizeof(int)); }
+            int Ksel = g_topk>0 ? (g_topk<8?g_topk:8) : 8;
+            float tp = (g_topp>0 && g_topp<1.f) ? g_topp : 0.f;
+            double ta0=now_s();
+            #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
+            int ok = coli_metal_layer_decode(x, l->in_ln, l->post_ln,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->o), l->o.s, l->o.fmt,
+                WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt,
+                WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,
+                WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt,
+                l->router, l->router_bias,
+                c->n_experts, c->topk, Ksel, tp, c->norm_topk, c->routed_scale,
+                m->Lc[li], m->Rc[li], S, pos_base, m->kv_start[li],
+                c->eps, c->theta, c->attn_scale,
+                linrm, lnrm, lsh, lidx, lw, lkeff);
+            #undef WP_
+            if(ok){
+                m->t_attn += now_s()-ta0;
+                if(m->has_dsa && c->idx_type[li]){            /* index key per selezioni future */
+                    for(int s=0;s<S;s++){ int pos=pos_base+s;
+                        float *kd=m->Ic[li]+(int64_t)pos*c->index_hd;
+                        matmul_qt(kd, linrm+(int64_t)s*D, &m->ix_wk[li], 1);
+                        layernorm(kd, m->ix_knw[li], m->ix_knb[li], c->index_hd, 1e-6f);
+                        rope_interleave(kd, pos, c);
+                    }
+                }
+                if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
+                if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+                g_pre_idx=lidx; g_pre_w=lw; g_pre_keff=lkeff; g_pre_sh=lsh;
+                moe(m,l,li,lnrm,S,tmp);
+                g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; g_pre_sh=NULL;
+                for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+                return;
+            }
+        }
+    }
+#endif
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];

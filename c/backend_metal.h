@@ -60,6 +60,28 @@ void coli_metal_unregister(void *base);
  * registered (page-aligned) for zero-copy resolve. GLM-5.2 dims compiled in. Handles st0==0
  * full-range only. Returns 1 on success, 0 to signal CPU fallback.
  */
+/*
+ * Full decode layer in ONE command buffer: in_ln -> attention -> residual -> post_ln ->
+ * shared expert -> router+top-K (exact phase-A semantics). x updated in place; nrm_out
+ * is the expert input; sh_out the shared-expert output; idx/w/keff the routing.
+ * Returns 0 -> caller runs the whole layer on the CPU path.
+ */
+int coli_metal_layer_decode(float *x,
+    const float *in_ln, const float *post_ln,
+    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt,
+    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *o_w, const float *o_s, int o_fmt,
+    const void *shg_w, const float *shg_s, int shg_fmt,
+    const void *shu_w, const float *shu_s, int shu_fmt,
+    const void *shd_w, const float *shd_s, int shd_fmt,
+    const float *router_w, const float *router_bias,
+    int E, int K, int Ksel, float topp, int normk, float rscale,
+    float *Lc, float *Rc, int S, int pos_base, int st0,
+    float eps, float theta, float ascale,
+    float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out);
+
 int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales,
                     int fmt, int S, int I, int O);   /* large-batch sync GEMM; 0 -> CPU */
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);

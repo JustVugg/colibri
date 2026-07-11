@@ -170,6 +170,55 @@ kernel void a_ctx(device const uchar* kvb [[buffer(0)]], device const float* sc 
   int sh=gid/A_VH, j=gid%A_VH, h=sh%A_H; int row=h*A_ROWSH+A_NOPE+j; device const float* cl=clat+(long)sh*A_KVL;
   float a=0; for(int i=0;i<A_KVL;i++) a+=cl[i]*a_deqrow(kvb,row,i,sc); ctx[(long)sh*A_VH+j]=a;
 }
+
+// ===== full-layer tail kernels =====
+// y[i] += a[i]  (residual add), grid = n
+kernel void a_add(device float* y [[buffer(0)]], device const float* a [[buffer(1)]],
+                  uint i [[thread_position_in_grid]]) { y[i] += a[i]; }
+// router: logit[s][e] = x[s].w_e (f32 rows [E,D]) -> sig=1/(1+exp(-logit)). One simdgroup/row.
+kernel void r_router(device const float* rw [[buffer(0)]], device const float* x [[buffer(1)]],
+                     device float* sig [[buffer(2)]], constant int& E [[buffer(3)]],
+                     constant int& D [[buffer(4)]], constant int& NT [[buffer(5)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint slane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) {
+  long row=(long)tg*4+sgid; if(row>=NT) return;
+  int e=row%E, s=row/E;
+  device const float4* w4=(device const float4*)(rw+(long)e*D);
+  device const float4* x4=(device const float4*)(x+(long)s*D);
+  float acc=0; int D4=D/4;
+  for(int c=slane;c<D4;c+=32) acc+=dot(w4[c],x4[c]);
+  acc=simd_sum(acc);
+  if(slane==0) sig[row]=1.0f/(1.0f+exp(-acc));
+}
+// exact replica of glm.c phase-A selection per row s (serial, deterministic ties):
+// choice=sig+bias; greedy top-Ksel by choice; w=sig[best]; optional topp truncation
+// (insertion-sort desc + cumulative); optional norm_topk; * routed_scale.
+kernel void r_top8(device const float* sig [[buffer(0)]], device const float* bias [[buffer(1)]],
+                   device int* idx [[buffer(2)]], device float* w [[buffer(3)]],
+                   device int* keff [[buffer(4)]], constant int& E [[buffer(5)]],
+                   constant int& K [[buffer(6)]], constant int& Ksel [[buffer(7)]],
+                   constant float& topp [[buffer(8)]], constant int& normk [[buffer(9)]],
+                   constant float& rscale [[buffer(10)]],
+                   uint s [[thread_position_in_grid]]) {
+  device const float* sg=sig+(long)s*E;
+  device int* id_=idx+(long)s*K; device float* ww=w+(long)s*K;
+  for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
+    for(int e=0;e<E;e++){ bool tk=false; for(int j=0;j<kk;j++) if(id_[j]==e){tk=true;break;}
+      float ch=sg[e]+bias[e];
+      if(!tk && ch>bv){bv=ch;best=e;} }
+    id_[kk]=best; ww[kk]=sg[best];
+  }
+  int Ke=Ksel;
+  if(topp>0.0f && topp<1.0f){
+    for(int a=1;a<Ksel;a++){ int ii=id_[a]; float wv=ww[a]; int b=a-1;
+      while(b>=0 && ww[b]<wv){ ww[b+1]=ww[b]; id_[b+1]=id_[b]; b--; } ww[b+1]=wv; id_[b+1]=ii; }
+    float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=ww[kk];
+    float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=ww[kk]; if(cum>=topp*tot){ Ke=kk+1; break; } }
+  }
+  keff[s]=Ke;
+  if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
+  for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -182,6 +231,7 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
+static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8;
 static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
@@ -249,6 +299,8 @@ extern "C" int coli_metal_init(void) {
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
+    g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8");
+    if(!g_a_add||!g_r_router||!g_r_top8){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
@@ -350,12 +402,15 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
 // ---- fused decode attention scratch (GLM-5.2 dims) ----
 enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=4 };
 static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
+static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_;   // full-layer tail
 static void attn_scratch_init(){
   if(ax_) return;
   auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:g_res_opts]; };
   ax_=L(AH*4); aqr_=L(AQLORA*4); aqf_=L(AHQH*4); acomp_=L((AKVL+AROPE)*4);
   aqabs_=L((size_t)AHEADS*AKVL*4); aclat_=L((size_t)AHEADS*AKVL*4); actx_=L(AHVH*4); aout_=L(AH*4);
   aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
+  axr_=L(AH*4); anrm_=L(AH*4); ash1_=L(2048*4); ash2_=L(2048*4); ashout_=L(AH*4);
+  asig_=L(256*4); aidx_=L(8*4); aw_=L(8*4); akeff_=L(4);
 }
 // y[S,O] = quantized-weight(w) applied to xin[S,I]. Weights are registered (page-aligned,
 // zero-copy) at model load; resolve to (buffer,offset). Returns false to fall back to CPU.
@@ -465,6 +520,104 @@ extern "C" int coli_metal_attn_decode(const float* x,
     g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
     g_attn_sched += [cb GPUStartTime]-[cb kernelStartTime]; g_attn_ksched += [cb kernelStartTime]-tc;
     memcpy(out,[aout_ contents],(size_t)S*AH*4);
+  }
+  return 1;
+}
+
+// Full decode layer on the GPU in ONE command buffer:
+//   in_ln rmsnorm -> fused attention -> residual add (x updated) -> post_ln rmsnorm ->
+//   shared expert (gate/up/silu/down) -> router (f32 matvec+sigmoid) -> exact top-K select.
+// CPU keeps: expert resolve/disk loads + expert CBs + scatter (unchanged). Outputs:
+// x (updated in place), nrm=post_ln(x) (expert input), sh_out (shared-expert output),
+// idx/w/keff (routing). Returns 0 -> CPU fallback (whole layer falls back).
+extern "C" int coli_metal_layer_decode(float *x,
+    const float *in_ln, const float *post_ln,
+    const void* qa_w,const float* qa_s,int qa_fmt,const float* qa_ln,
+    const void* qb_w,const float* qb_s,int qb_fmt,
+    const void* kva_w,const float* kva_s,int kva_fmt,const float* kva_ln,
+    const void* kvb_w,const float* kvb_s,int kvb_fmt,
+    const void* o_w,const float* o_s,int o_fmt,
+    const void* shg_w,const float* shg_s,int shg_fmt,
+    const void* shu_w,const float* shu_s,int shu_fmt,
+    const void* shd_w,const float* shd_s,int shd_fmt,
+    const float *router_w, const float *router_bias,
+    int E, int K, int Ksel, float topp, int normk, float rscale,
+    float *Lc, float *Rc, int S, int pos_base, int st0,
+    float eps, float theta, float ascale,
+    float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out) {
+  if(!g_dev) return 0;
+  if(st0!=0 || S<1 || S>AMAXS || E!=256 || K!=8) return 0;
+  int T=pos_base+S; const int SI=2048;
+  @autoreleasepool {
+    attn_scratch_init();
+    AttnW W={qa_w,qa_s,qa_fmt,qa_ln,qb_w,qb_s,qb_fmt,kva_w,kva_s,kva_fmt,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt};
+    id<MTLBuffer> Lb,Rb,kvbW,kvbS; size_t loff,roff,kvbwoff,kvbsoff;
+    if(!resolve_attn(&W,Lc,Rc,&Lb,&loff,&Rb,&roff,&kvbW,&kvbwoff,&kvbS,&kvbsoff)) return 0;
+    uint64_t ina=0,pna=0,rwa=0,rba=0,d;
+    id<MTLBuffer> inB=resolve(in_ln,&ina), pnB=resolve(post_ln,&pna);
+    id<MTLBuffer> rwB=resolve(router_w,&rwa), rbB=resolve(router_bias,&rba);
+    if(!inB||!pnB||!rwB||!rbB) return 0;
+    { const void* ws[]={shg_w,shg_s,shu_w,shu_s,shd_w,shd_s};
+      for(auto p:ws) if(!resolve(p,&d)) return 0; }
+    size_t inoff=ina-(uint64_t)[inB gpuAddress], pnoff=pna-(uint64_t)[pnB gpuAddress];
+    size_t rwoff=rwa-(uint64_t)[rwB gpuAddress], rboff=rba-(uint64_t)[rbB gpuAddress];
+    ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
+    memcpy([axr_ contents],x,(size_t)S*AH*4);
+
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e useResource:Lb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rb usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
+    [e useResource:inB usage:MTLResourceUsageRead]; [e useResource:pnB usage:MTLResourceUsageRead];
+    [e useResource:rwB usage:MTLResourceUsageRead]; [e useResource:rbB usage:MTLResourceUsageRead];
+    auto BAR=[&]{ [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    auto rmsw=[&](id<MTLBuffer> b,id<MTLBuffer> wb,size_t woff,int n,int nrows){ [e setComputePipelineState:g_a_rms];
+      [e setBuffer:b offset:0 atIndex:0]; [e setBuffer:wb offset:woff atIndex:1]; [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
+      [e dispatchThreadgroups:MTLSizeMake(nrows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
+    auto copyrow=[&](id<MTLBuffer> src,id<MTLBuffer> dst,int n){ int off=0,ss=n; [e setComputePipelineState:g_a_copy];
+      [e setBuffer:src offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
+      [e setBuffer:dst offset:0 atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5];
+      [e dispatchThreads:MTLSizeMake((size_t)S*n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
+    // 1) in_ln: ax_ = rmsnorm(x)
+    copyrow(axr_,ax_,AH); BAR(); rmsw(ax_,inB,inoff,AH,S); BAR();
+    // 2) attention (ax_ -> aout_)
+    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale)) return 0;
+    BAR();
+    // 3) residual: axr_ += aout_ ; then nrm = post_ln(x_new)
+    [e setComputePipelineState:g_a_add]; [e setBuffer:axr_ offset:0 atIndex:0]; [e setBuffer:aout_ offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((size_t)S*AH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    copyrow(axr_,anrm_,AH); BAR(); rmsw(anrm_,pnB,pnoff,AH,S); BAR();
+    // 4) shared expert gate/up + router (all read anrm_, independent)
+    bind_gemv(e,shg_w,shg_s,shg_fmt,AH,SI,anrm_,ash1_,S);
+    bind_gemv(e,shu_w,shu_s,shu_fmt,AH,SI,anrm_,ash2_,S);
+    { int NT=S*E, D=AH; [e setComputePipelineState:g_r_router];
+      [e setBuffer:rwB offset:rwoff atIndex:0]; [e setBuffer:anrm_ offset:0 atIndex:1]; [e setBuffer:asig_ offset:0 atIndex:2];
+      [e setBytes:&E length:4 atIndex:3]; [e setBytes:&D length:4 atIndex:4]; [e setBytes:&NT length:4 atIndex:5];
+      [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)]; }
+    BAR();
+    // 5) silu(gate)*up + exact top-K select
+    [e setComputePipelineState:g_moe_silu]; [e setBuffer:ash1_ offset:0 atIndex:0]; [e setBuffer:ash2_ offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((size_t)S*SI,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    { [e setComputePipelineState:g_r_top8];
+      [e setBuffer:asig_ offset:0 atIndex:0]; [e setBuffer:rbB offset:rboff atIndex:1];
+      [e setBuffer:aidx_ offset:0 atIndex:2]; [e setBuffer:aw_ offset:0 atIndex:3]; [e setBuffer:akeff_ offset:0 atIndex:4];
+      [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6]; [e setBytes:&Ksel length:4 atIndex:7];
+      [e setBytes:&topp length:4 atIndex:8]; [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
+      [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
+    BAR();
+    // 6) shared down
+    bind_gemv(e,shd_w,shd_s,shd_fmt,SI,AH,ash1_,ashout_,S);
+    double tc=mnow();
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] layer cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
+    g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
+    g_attn_sched += [cb GPUStartTime]-[cb kernelStartTime]; g_attn_ksched += [cb kernelStartTime]-tc;
+    memcpy(x,[axr_ contents],(size_t)S*AH*4);
+    memcpy(inrm_out,[ax_ contents],(size_t)S*AH*4);
+    memcpy(nrm_out,[anrm_ contents],(size_t)S*AH*4);
+    memcpy(sh_out,[ashout_ contents],(size_t)S*AH*4);
+    memcpy(idx_out,[aidx_ contents],(size_t)S*K*4);
+    memcpy(w_out,[aw_ contents],(size_t)S*K*4);
+    memcpy(keff_out,[akeff_ contents],(size_t)S*4);
   }
   return 1;
 }
