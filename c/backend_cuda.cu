@@ -15,8 +15,8 @@ struct ColiCudaTensor {
 
 typedef struct {
     int device;
-    float *x, *y;
-    size_t x_cap, y_cap;
+    float *x, *y, *gate, *up;
+    size_t x_cap, y_cap, gate_cap, up_cap;
     size_t tensor_count, tensor_bytes;
 } DeviceContext;
 
@@ -81,6 +81,14 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         y[(size_t)s * O + o] = partial[0] * (fmt ? scales[o] : 1.0f);
 }
 
+__global__ static void silu_mul(float *gate, const float *up, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = gate[i];
+        gate[i] = (v / (1.0f + expf(-v))) * up[i];
+    }
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -127,8 +135,10 @@ extern "C" void coli_cuda_shutdown(void) {
         if (!select_ctx(ctx)) continue;
         if (ctx->x) cudaFree(ctx->x);
         if (ctx->y) cudaFree(ctx->y);
-        ctx->x = ctx->y = nullptr;
-        ctx->x_cap = ctx->y_cap = 0;
+        if (ctx->gate) cudaFree(ctx->gate);
+        if (ctx->up) cudaFree(ctx->up);
+        ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
+        ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
     }
     g_nctx = 0;
 }
@@ -204,6 +214,35 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                      ColiCudaTensor *down, float *y,
+                                      const float *x, int S) {
+    if (!gate || !up || !down || !x || !y || S < 1 ||
+        gate->device != up->device || gate->device != down->device ||
+        gate->I != up->I || gate->O != up->O ||
+        down->I != gate->O || down->O != gate->I) return 0;
+    DeviceContext *ctx = find_ctx(gate->device);
+    if (!select_ctx(ctx)) return 0;
+    int D = gate->I, I = gate->O;
+    size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
+    size_t yb=(size_t)S*D*sizeof(float);
+    if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
+        !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
+    dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
+    quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
+        gate->fmt,S,D,I,row_bytes(gate->fmt,D));
+    quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
+        up->fmt,S,D,I,row_bytes(up->fmt,D));
+    size_t n=(size_t)S*I;
+    silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
+    quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
+        down->fmt,S,I,D,row_bytes(down->fmt,I));
+    if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
+        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
 }
 
