@@ -73,6 +73,39 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     y[(long)si * O + o] = t * scale[o];
   }
 }
+
+// Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
+// scale live at gpuAddresses waddr[e]/saddr[e] (zero-copy in the RAM slab). fmt 1=i8, 2=i4.
+kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong* saddr [[buffer(1)]],
+                     device const int* erow [[buffer(2)]], device const float* xin [[buffer(3)]],
+                     device float* yout [[buffer(4)]],
+                     constant int& O [[buffer(5)]], constant int& K [[buffer(6)]],
+                     constant int& Kin [[buffer(7)]], constant int& fmt [[buffer(8)]],
+                     uint tg [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                     uint tgsz [[threads_per_threadgroup]], uint slane [[thread_index_in_simdgroup]],
+                     uint sgid [[simdgroup_index_in_threadgroup]]) {
+  int gr = tg / O, o = tg % O; int e = erow[gr]; int K4 = (K & 3) ? 0 : (K/4);
+  device const float* xr = xin + (long)gr * Kin;
+  device const float* sc = (device const float*)(saddr[e]);
+  device const float4* x4 = (device const float4*)xr;
+  float acc = 0.0f;
+  if (fmt == 2) { int rb=(K+1)/2; device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
+    device const uchar2* w2=(device const uchar2*)w;
+    for(int c=lid;c<K4;c+=tgsz){ uchar2 bb=w2[c];
+      float4 wv=float4(float(int(bb.x&0xF)-8),float(int(bb.x>>4)-8),float(int(bb.y&0xF)-8),float(int(bb.y>>4)-8));
+      acc+=dot(wv,x4[c]); }
+    for(int i=K4*4+lid;i<K;i+=tgsz){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]; }
+  } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
+    device const char4* w4=(device const char4*)w;
+    for(int c=lid;c<K4;c+=tgsz) acc+=dot(float4(w4[c]),x4[c]);
+    for(int i=K4*4+lid;i<K;i+=tgsz) acc+=float(w[i])*xr[i];
+  }
+  acc=simd_sum(acc); threadgroup float sh[32];
+  if(slane==0) sh[sgid]=acc; threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(lid==0){ uint n=(tgsz+31)/32; float t=0; for(uint k=0;k<n;k++) t+=sh[k]; yout[(long)gr*O+o]=t*sc[o]; }
+}
+kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
+                     uint i [[thread_position_in_grid]]) { float v=g[i]; g[i]=(v/(1.0f+exp(-v)))*u[i]; }
 )METAL";
 
 struct ColiMetalTensor {
@@ -83,9 +116,19 @@ struct ColiMetalTensor {
 
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
-static id<MTLComputePipelineState> g_gemv;
+static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
 static size_t g_tensor_count, g_tensor_bytes;
 static const int TG = 128;
+
+// Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
+struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
+static std::vector<Slab> g_slabs;
+// Persistent scratch buffers (grow-only) for the MoE pipeline.
+static id<MTLBuffer> g_gg, g_uu, g_hh, g_xg; static size_t g_gg_cap, g_uu_cap, g_hh_cap, g_xg_cap;
+static id<MTLBuffer> ensure(id<MTLBuffer> b, size_t *cap, size_t need) {
+  if (b && *cap >= need) return b;
+  *cap = need; return [g_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
+}
 
 static size_t fmt_bytes(int fmt, int I, int O) {
   if (fmt == 1) return (size_t)O * I;
@@ -113,10 +156,30 @@ extern "C" int coli_metal_init(void) {
                                              options:nil error:&err];
     if (!lib) { fprintf(stderr, "[metal] shader compile failed: %s\n",
                         err ? [[err localizedDescription] UTF8String] : "?"); g_dev = nil; return 0; }
-    g_gemv = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_gemv"] error:&err];
-    if (!g_gemv) { fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
+    g_gemv     = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_gemv"]   error:&err];
+    g_moe_gemv = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_gemv"] error:&err];
+    g_moe_silu = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_silu"] error:&err];
+    if (!g_gemv || !g_moe_gemv || !g_moe_silu) { fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
   }
   return 1;
+}
+
+extern "C" void coli_metal_register(void *base, size_t len) {
+  if (!g_dev || !base) return;
+  for (auto &s : g_slabs) if (s.base == base) { s.len = len; return; }  // already registered
+  id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
+                              options:MTLResourceStorageModeShared deallocator:nil];
+  if (b) g_slabs.push_back({base, len, b});
+}
+extern "C" void coli_metal_unregister(void *base) {
+  for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) { g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); return; }
+}
+// Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
+static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
+  uintptr_t u=(uintptr_t)p;
+  for (auto &s : g_slabs) { uintptr_t b=(uintptr_t)s.base;
+    if (u>=b && u<b+s.len) { *addr = (uint64_t)[s.buf gpuAddress] + (u-b); return s.buf; } }
+  return nil;
 }
 
 extern "C" void coli_metal_shutdown(void) { g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0; }
@@ -166,13 +229,63 @@ extern "C" void coli_metal_tensor_free(ColiMetalTensor *t) {
 }
 extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ? t->wbytes : 0; }
 
-// Milestone 2: batched MoE block. Returns 0 so glm.c keeps the CPU path for now.
+// Batched routed-expert SwiGLU for one block in ONE command buffer. Returns 0 (CPU fallback)
+// if Metal is off or any expert pointer is not in a registered slab.
 extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw, float *out, int S) {
-  (void)nb;(void)D;(void)Iinter;(void)fmt;(void)g;(void)u;(void)d;(void)gs;(void)us;(void)ds;
-  (void)xg;(void)xoff;(void)nr;(void)rows;(void)rw;(void)out;(void)S;
-  return 0;
+  if (!g_dev || (fmt != 1 && fmt != 2)) return 0;
+  (void)S;
+  @autoreleasepool {
+    int R = 0; for (int e=0;e<nb;e++) R += nr[e];
+    if (R == 0) return 1;
+    // address + erow tables
+    std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
+    std::vector<id<MTLBuffer>> use; use.reserve(nb*2);
+    auto add_use=[&](id<MTLBuffer> b){ for(auto&x:use) if(x==b) return; use.push_back(b); };
+    for (int e=0;e<nb;e++) {
+      id<MTLBuffer> b;
+      if(!(b=resolve(g[e],&ag[e]))) return 0; add_use(b);
+      if(!(b=resolve(u[e],&au[e]))) return 0; add_use(b);
+      if(!(b=resolve(d[e],&ad[e]))) return 0; add_use(b);
+      if(!(b=resolve(gs[e],&sgv[e]))) return 0; add_use(b);
+      if(!(b=resolve(us[e],&suv[e]))) return 0; add_use(b);
+      if(!(b=resolve(ds[e],&sdv[e]))) return 0; add_use(b);
+    }
+    std::vector<int> erow(R); for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++) erow[xoff[e]+r]=e;
+    auto shb=[&](const void*p,size_t n){ return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared]; };
+    id<MTLBuffer> bag=shb(ag.data(),nb*8), bau=shb(au.data(),nb*8), bad=shb(ad.data(),nb*8);
+    id<MTLBuffer> bsg=shb(sgv.data(),nb*8), bsu=shb(suv.data(),nb*8), bsd=shb(sdv.data(),nb*8);
+    id<MTLBuffer> berow=shb(erow.data(),R*4);
+    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);       memcpy([g_xg contents], xg, (size_t)R*D*4);
+    g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
+    g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
+    g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
+
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
+    auto gemv=[&](id<MTLBuffer> wa,id<MTLBuffer> sa,id<MTLBuffer> xin,id<MTLBuffer> y,int O,int K,int Kin){
+      [e setComputePipelineState:g_moe_gemv];
+      [e setBuffer:wa offset:0 atIndex:0];[e setBuffer:sa offset:0 atIndex:1];[e setBuffer:berow offset:0 atIndex:2];
+      [e setBuffer:xin offset:0 atIndex:3];[e setBuffer:y offset:0 atIndex:4];
+      [e setBytes:&O length:4 atIndex:5];[e setBytes:&K length:4 atIndex:6];[e setBytes:&Kin length:4 atIndex:7];[e setBytes:&fmt length:4 atIndex:8];
+      [e dispatchThreadgroups:MTLSizeMake((size_t)R*O,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)]; };
+    gemv(bag,bsg,g_xg,g_gg,Iinter,D,D);                       // gate
+    gemv(bau,bsu,g_xg,g_uu,Iinter,D,D);                       // up
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [e setComputePipelineState:g_moe_silu];
+    [e setBuffer:g_gg offset:0 atIndex:0];[e setBuffer:g_uu offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    gemv(bad,bsd,g_gg,g_hh,D,Iinter,Iinter);                  // down
+    [e endEncoding];[cb commit];[cb waitUntilCompleted];
+
+    // scatter-add: out[rows[gr]] += rw[gr] * hh[gr]
+    const float *hh=(const float*)[g_hh contents];
+    for(int gr=0;gr<R;gr++){ float *os=out+(size_t)rows[gr]*D, w=rw[gr]; const float *hr=hh+(size_t)gr*D;
+      for(int dd=0;dd<D;dd++) os[dd]+=w*hr[dd]; }
+  }
+  return 1;
 }

@@ -42,6 +42,16 @@ void   coli_metal_tensor_free(ColiMetalTensor *tensor);
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 
 /*
+ * Register a page-aligned host allocation (expert slab / scale slab) so the batched
+ * MoE path can read it zero-copy: the backend wraps it once in an MTLBuffer
+ * (newBufferWithBytesNoCopy) and resolves any pointer inside [base,base+len) to a GPU
+ * address. Call after (re)allocating a slab; call unregister before freeing it.
+ * base must be aligned to 16384 (Apple page) and len a multiple of it.
+ */
+void coli_metal_register(void *base, size_t len);
+void coli_metal_unregister(void *base);
+
+/*
  * Batched routed-expert SwiGLU for one MoE block, in ONE command buffer.
  * For each expert e in [0,nb): computes hh_e[nr_e, D] = down( silu(gate(xg_e)) * up(xg_e) )
  * and scatter-adds rw * hh_e into out. All experts share the command buffer so the
