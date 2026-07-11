@@ -246,6 +246,44 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     return 1;
 }
 
+extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
+                                        ColiCudaTensor *const *ups,
+                                        ColiCudaTensor *const *downs,
+                                        const int *rows, int count,
+                                        float *y, const float *x) {
+    if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
+    ColiCudaTensor *first=gates[0];
+    if (!first) return 0;
+    int device=first->device,D=first->I,I=first->O,total=0;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
+        total+=rows[c];
+    }
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert group input upload")) return 0;
+    int base=0;
+    for(int c=0;c<count;c++){
+        int S=rows[c]; ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        float *dx=ctx->x+(size_t)base*D,*dg=ctx->gate+(size_t)base*I;
+        float *du=ctx->up+(size_t)base*I,*dy=ctx->y+(size_t)base*D;
+        dim3 hg((unsigned)I,(unsigned)S),og((unsigned)D,(unsigned)S);
+        quant_matmul<<<hg,256>>>(dg,dx,g->weights,g->scales,g->fmt,S,D,I,row_bytes(g->fmt,D));
+        quant_matmul<<<hg,256>>>(du,dx,u->weights,u->scales,u->fmt,S,D,I,row_bytes(u->fmt,D));
+        size_t n=(size_t)S*I;
+        silu_mul<<<(unsigned)((n+255)/256),256>>>(dg,du,n);
+        quant_matmul<<<og,256>>>(dy,dg,d->weights,d->scales,d->fmt,S,I,D,row_bytes(d->fmt,I));
+        base+=S;
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert group launch")||
+       !cuda_ok(cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost),"expert group output download")) return 0;
+    return 1;
+}
+
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (!tensor) return;
     DeviceContext *ctx = find_ctx(tensor->device);
