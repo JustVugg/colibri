@@ -1310,23 +1310,35 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             m->t_emm += now_s()-t0;
         }
 #ifdef COLI_CUDA
+        ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
+        ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
+        int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
+        int dev_nc[COLI_CUDA_MAX_DEVICES]={0},dev_total[COLI_CUDA_MAX_DEVICES]={0};
+        int dev_off[COLI_CUDA_MAX_DEVICES]={0},dev_ok[COLI_CUDA_MAX_DEVICES]={0};
+        for(int di=0;di<g_cuda_ndev;di++) for(int q=0;q<ngroup;q++)
+            if(group_e[q]->g.cuda_device==g_cuda_devices[di]) dev_total[di]+=group_n[q];
+        for(int di=1;di<g_cuda_ndev;di++) dev_off[di]=dev_off[di-1]+dev_total[di-1];
         for(int di=0;di<g_cuda_ndev;di++){
-            ColiCudaTensor *gates[64],*ups[64],*downs[64]; int nrows[64], which[64];
-            int nc=0,total=0,device=g_cuda_devices[di];
+            int cursor=0,device=g_cuda_devices[di];
             for(int q=0;q<ngroup;q++) if(group_e[q]->g.cuda_device==device){
-                ESlot *e=group_e[q]; gates[nc]=e->g.cuda; ups[nc]=e->u.cuda; downs[nc]=e->d.cuda;
-                nrows[nc]=group_n[q]; which[nc]=q;
-                for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(total+r)*D,
+                int nc=dev_nc[di]++; ESlot *e=group_e[q];
+                dev_g[di][nc]=e->g.cuda; dev_u[di][nc]=e->u.cuda; dev_d[di][nc]=e->d.cuda;
+                dev_rows[di][nc]=group_n[q]; dev_which[di][nc]=q;
+                for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(dev_off[di]+cursor+r)*D,
                     x+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
-                total+=group_n[q]; nc++;
+                cursor+=group_n[q];
             }
-            if(!nc) continue;
-            double t0=now_s();
-            int ok=coli_cuda_expert_group(gates,ups,downs,nrows,nc,group_y,group_x);
-            int off=0;
-            for(int q=0;q<nc;q++){
-                int gi=which[q],nr=group_n[gi]; ESlot *e=group_e[gi];
-                if(!ok){
+        }
+        double tg=now_s();
+        #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
+        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di])
+            dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
+                group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
+        for(int di=0;di<g_cuda_ndev;di++){
+            int off=dev_off[di];
+            for(int q=0;q<dev_nc[di];q++){
+                int gi=dev_which[di][q],nr=group_n[gi]; ESlot *e=group_e[gi];
+                if(!dev_ok[di]){
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
@@ -1334,13 +1346,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                         matmul_qt(hh,gg,&e->d,nr);
                     }
                 }
-                float *src=ok?group_y+(int64_t)off*D:hh;
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)group_row[(int64_t)gi*S+r]*D, wgt=group_weight[(int64_t)gi*S+r];
+                float *src=dev_ok[di]?group_y+(int64_t)off*D:hh;
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)group_row[(int64_t)gi*S+r]*D,wgt=group_weight[(int64_t)gi*S+r];
                     for(int d=0;d<D;d++) os[d]+=wgt*src[(int64_t)r*D+d]; }
                 off+=nr;
             }
-            m->t_emm+=now_s()-t0;
         }
+        m->t_emm+=now_s()-tg;
 #endif
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
