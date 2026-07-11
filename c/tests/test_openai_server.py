@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import socket
 import threading
 import unittest
 from unittest.mock import patch
@@ -91,6 +92,18 @@ class ProtocolTest(unittest.TestCase):
     def test_rejects_invalid_kv_pool_before_engine_start(self):
         with self.assertRaisesRegex(ValueError, "kv_slots"):
             serve("/missing", kv_slots=0)
+
+    def test_occupied_port_fails_before_engine_start(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        try:
+            with patch("openai_server.subprocess.Popen") as popen:
+                with self.assertRaises(OSError):
+                    serve("/missing", port=listener.getsockname()[1])
+            popen.assert_not_called()
+        finally:
+            listener.close()
 
 
 class SchedulerTest(unittest.TestCase):

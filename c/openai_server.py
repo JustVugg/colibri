@@ -696,20 +696,25 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
-    runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins,
+    # Bind before starting the 744B engine. A stale/occupied port must fail in
+    # milliseconds rather than loading hundreds of GB and leaking a child.
+    server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots)
-    print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
+    runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     try:
+        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        server.engine = runtime
+        print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
+        signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         server.serve_forever()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
         server.server_close()
-        runtime.close()
+        if runtime is not None:
+            runtime.close()
 
 
 def main():
