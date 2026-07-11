@@ -4,6 +4,11 @@
 
 **Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
 
+Colibrì is a lightweight, quality-preserving MoE runtime that treats VRAM,
+RAM, and storage as one managed memory hierarchy. Insufficient fast memory may
+reduce speed, but the default policy never silently changes model precision or
+router semantics.
+
 ```
 $ ./coli chat
   🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
@@ -326,6 +331,25 @@ compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+
+### Resource policy
+
+`coli plan` reports the planned hot (VRAM), warm (RAM), and cold backing
+(disk) tiers, the reason for each placement, and the expected bottleneck. The
+default `--policy quality` and `--policy balanced` modes preserve checkpoint
+quantization and the original router decisions. Lossy `TOPK`/`TOPP` overrides
+require the explicit `--policy experimental-fast` opt-in.
+
+```bash
+coli plan --model /models/glm52_i4 --policy quality
+coli run --auto-tier --policy quality "Explain MoE offloading"
+# Explicit research-only router reduction:
+coli run --policy experimental-fast --topk 4 "Benchmark prompt"
+```
+
+Disk is an immutable recovery source, not a normal decode target. If the plan
+leaves cold expert bytes on disk, speed depends on cache hit rate; output
+quality does not.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
