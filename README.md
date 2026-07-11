@@ -335,6 +335,13 @@ Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output
 quality does not.
 
+Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
+while missing experts are loaded in a bounded background I/O pool, then the
+cold results join before the layer completes. `IO_THREADS=n` overrides the
+default eight loader threads when foreground work exists. Profiling reports
+both disk service time and the smaller foreground-visible wait time so overlap
+is explicit rather than credited as unexplained speedup.
+
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
 **Router-lookahead prefetch** (`PILOT=1`, experimental): GLM-5.2's expert routing is measurably predictable *ahead of time* — applying layer L+1's router to layer L's post-attention state recalls **71.6%** of the true top-8 (vs 41.3% for "same experts as last token"). `PILOT=1` uses this to issue next-layer expert readahead from a dedicated I/O thread while the current layer computes. On our dev box the disk is already ~80% saturated, so it measures neutral; on machines where compute and disk are balanced (like the Ryzen AI 9 in issue #12: 43% disk / 46% matmul) it should overlap real work — measurements welcome.

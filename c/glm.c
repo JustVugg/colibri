@@ -138,7 +138,7 @@ typedef struct {
     uint64_t eclock, hits, miss, ereq;
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
-    double t_edisk, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (sempre attivo) */
+    double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
     int64_t resident_bytes;
 } Model;
 
@@ -985,6 +985,19 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
 }
 #endif
 
+typedef struct {
+    Model *model; int layer,base,nmiss,threads;
+    int *uniq,*missk; double seconds;
+} ExpertLoadJob;
+static void *expert_load_run(void *opaque){
+    ExpertLoadJob *j=opaque; double t0=now_s();
+    #pragma omp parallel for schedule(dynamic,1) num_threads(j->threads)
+    for(int q=0;q<j->nmiss;q++)
+        expert_load(j->model,j->layer,j->uniq[j->base+j->missk[q]],&j->model->ws[q]);
+    j->seconds=now_s()-t0;
+    return NULL;
+}
+
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
  * cosi' le letture sincrone successive trovano la page-cache calda. */
 static void expert_prefetch(Model *m, int layer, int eid){
@@ -1254,18 +1267,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
-        ESlot *use[64]; int missk[64]; int nmiss=0;
+        ESlot *use[64]; int missk[64],miss_pos[64]={0}; int nmiss=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
-            if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+            if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; miss_pos[j]=1; m->miss++; }
         }
-        if(nmiss){ double t0=now_s();
-            #pragma omp parallel for schedule(dynamic,1)
-            for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
-            m->t_edisk += now_s()-t0; }
+        pthread_t load_thread; int load_threaded=0;
+        int io_threads=nmiss<8?nmiss:8;
+        if(nmiss==nb) io_threads=nmiss;            /* no foreground work: retain full I/O fan-out */
+        ExpertLoadJob load_job={m,layer,base,nmiss,io_threads,uniq,missk,0};
+        if(getenv("IO_THREADS")) load_job.threads=atoi(getenv("IO_THREADS"));
+        if(load_job.threads<1) load_job.threads=1;
+        if(nmiss){
+            load_threaded=!pthread_create(&load_thread,NULL,expert_load_run,&load_job);
+            if(!load_threaded) expert_load_run(&load_job);
+        }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
         if(base+64<nu){
@@ -1282,6 +1301,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         ESlot *group_e[64]; int group_n[64]; int ngroup=0;
 #endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+            if(miss_pos[j]) continue;                    /* loader owns this slot for now */
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
@@ -1361,6 +1381,30 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         }
         m->t_emm+=now_s()-tg;
 #endif
+        if(nmiss){
+            double tw=now_s();
+            if(load_threaded) pthread_join(load_thread,NULL);
+            m->t_ewait+=now_s()-tw;
+            m->t_edisk+=load_job.seconds;
+            /* Deferred cold experts: hot RAM/VRAM work above ran while their
+             * reads were in flight. Router choices and weights are unchanged. */
+            for(int q=0;q<nmiss;q++){
+                int j=missk[q],eid=uniq[base+j],nr=0; ESlot *e=use[j];
+                (void)eid;
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==uniq[base+j]){
+                        rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break;
+                    }
+                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)rows[r]*D,D*sizeof(float));
+                double tc=now_s();
+                matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(hh,gg,&e->d,nr);
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                m->t_emm+=now_s()-tc;
+            }
+        }
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -1824,10 +1868,10 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
-    printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
+    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    printf("PROFILO: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
-        m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+        m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -1838,7 +1882,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     kv_alloc(m,nfull+2);
     float *logit=step(m,full,np-1,0); free(logit);
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
-    m->t_edisk=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
+    m->t_edisk=m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         logit=step(m,full+i,1,i); free(logit); steps++;
