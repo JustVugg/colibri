@@ -121,3 +121,35 @@ latency and (still) disk streaming are.
 2. **Reduce per-block submit overhead** — persistent encoders / fewer command buffers;
    partial help while attention stays on CPU.
 3. **Warm cache further** — disk streaming (~17 s) still co-dominates at ~55% hit.
+
+---
+
+# Phase 2: Fused decode attention (in progress)
+
+Goal: run the whole S=1 decode attention for a layer in ONE Metal command buffer
+(keeps the GPU hot across the layer → speeds attention AND reclaims the ~5s expert
+latency). DSA top-2048 selection stays on CPU (passed in as an index list); prefill
+falls back to CPU.
+
+Real GLM-5.2 attention dims (config.json): hidden=6144, H=64, q_lora=2048,
+kv_lora=512, qk_nope=192, qk_rope=64, v_head=256 → qk_head=256; kv_b=[28672,512];
+o_proj=[6144,16384]; attn_scale=1/16; theta=10000; index_nh=32 hd=128 topk=2048.
+
+Exact math captured from glm.c: projections 1024-1037 (q_a→rmsnorm→q_b→rope; kv_a→
+split→latent rmsnorm + krot rope → cache); absorption core 1097-1126 (qabs via
+qt_addrow over kv_b nope-rows, T-scoring qabs·Lc + qr·Rc ×1/16, softmax, clat=Σa·Lc,
+ctx via qt_matvec_rows over kv_b V-rows); o_proj 1127. Helpers: rmsnorm 587,
+rope_interleave 604 (half=32, interleaved-in/split-out), softmax 598.
+
+Kernel plan (all one command buffer, barriers between): q_a matmul → rmsnorm →
+q_b matmul → rope → kv_a matmul → (cache write) → [qabs → score → softmax → clat →
+ctx] absorption core → o_proj matmul.
+
+## Validated so far
+- [x] **Absorption core kernel** (qabs/score/softmax/clat/ctx, 64 heads, int4 kv_b
+  row-gather): correct vs CPU (nerr ~1e-6) at T=128/512/2048; 0.37-0.68 ms/layer.
+  This was the novel/high-risk piece — de-risked.
+- [ ] rmsnorm + rope kernels (trivial) + projection matmuls (reuse expert kernel).
+- [ ] Assemble full fused decode attention (one command buffer) + CPU-ref microbench.
+- [ ] Integrate into attention() behind COLI_METAL (decode/absorb path only; prefill
+  and DSA-select stay CPU); token-exact validation; A/B for latency reclaim.
