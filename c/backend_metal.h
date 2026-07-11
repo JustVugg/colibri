@@ -94,6 +94,21 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
                          const int *rows, const float *rw,
                          float *out, int S);
 
+/*
+ * Async two-phase variant: begin encodes+commits the block (own scratch, no wait) and
+ * returns a handle, so the CPU can load missed experts from disk WHILE the GPU computes
+ * the resident ones; end waits, checks for GPU faults, scatter-adds into out, and frees
+ * the handle. begin returns NULL (nothing submitted) on unresolved slab / bad fmt / R==0;
+ * end returns 0 on GPU fault (caller redoes those experts on CPU).
+ */
+typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
+ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw);
+int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -431,75 +431,125 @@ extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ?
 
 // Batched routed-expert SwiGLU for one block in ONE command buffer. Returns 0 (CPU fallback)
 // if Metal is off or any expert pointer is not in a registered slab.
+// Encode + commit a MoE block (no wait). Writes hh[R,D] into hh_buf. Returns nil on
+// unresolved slab / bad fmt (caller falls back to CPU).
+static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr, int R,
+                         id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
+  if (!g_dev || (fmt != 1 && fmt != 2)) return nil;
+  double ts_start = mnow();
+  std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
+  std::vector<id<MTLBuffer>> use; use.reserve(nb*2);
+  auto add_use=[&](id<MTLBuffer> b){ for(auto&x:use) if(x==b) return; use.push_back(b); };
+  for (int e=0;e<nb;e++) {
+    id<MTLBuffer> b;
+    if(!(b=resolve(g[e],&ag[e]))) {g_moe_fb++; return nil;} add_use(b);
+    if(!(b=resolve(u[e],&au[e]))) {g_moe_fb++; return nil;} add_use(b);
+    if(!(b=resolve(d[e],&ad[e]))) {g_moe_fb++; return nil;} add_use(b);
+    if(!(b=resolve(gs[e],&sgv[e]))) {g_moe_fb++; return nil;} add_use(b);
+    if(!(b=resolve(us[e],&suv[e]))) {g_moe_fb++; return nil;} add_use(b);
+    if(!(b=resolve(ds[e],&sdv[e]))) {g_moe_fb++; return nil;} add_use(b);
+  }
+  std::vector<int> erow(R); for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++) erow[xoff[e]+r]=e;
+  auto shb=[&](const void*p,size_t n){ return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared]; };
+  id<MTLBuffer> bag=shb(ag.data(),nb*8), bau=shb(au.data(),nb*8), bad=shb(ad.data(),nb*8);
+  id<MTLBuffer> bsg=shb(sgv.data(),nb*8), bsu=shb(suv.data(),nb*8), bsd=shb(sdv.data(),nb*8);
+  id<MTLBuffer> berow=shb(erow.data(),R*4);
+  memcpy([xg_buf contents], xg, (size_t)R*D*4);
+
+  id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+  for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
+  auto gemv=[&](id<MTLBuffer> wa,id<MTLBuffer> sa,id<MTLBuffer> xin,id<MTLBuffer> y,int O,int K,int Kin){
+    [e setComputePipelineState:g_moe_gemv];
+    [e setBuffer:wa offset:0 atIndex:0];[e setBuffer:sa offset:0 atIndex:1];[e setBuffer:berow offset:0 atIndex:2];
+    [e setBuffer:xin offset:0 atIndex:3];[e setBuffer:y offset:0 atIndex:4];
+    [e setBytes:&O length:4 atIndex:5];[e setBytes:&K length:4 atIndex:6];[e setBytes:&Kin length:4 atIndex:7];[e setBytes:&fmt length:4 atIndex:8];
+    [e dispatchThreadgroups:MTLSizeMake((size_t)R*O,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)]; };
+  gemv(bag,bsg,xg_buf,gg_buf,Iinter,D,D);                     // gate
+  gemv(bau,bsu,xg_buf,uu_buf,Iinter,D,D);                     // up
+  [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  [e setComputePipelineState:g_moe_silu];
+  [e setBuffer:gg_buf offset:0 atIndex:0];[e setBuffer:uu_buf offset:0 atIndex:1];
+  [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  gemv(bad,bsd,gg_buf,hh_buf,D,Iinter,Iinter);                // down
+  g_t_setup += mnow() - ts_start;
+  [e endEncoding];[cb commit];
+  return cb;
+}
+
+// Wait + error-check + scatter-add hh into out. Returns 0 on GPU fault.
+static int moe_finish(id<MTLCommandBuffer> cb, id<MTLBuffer> hh_buf, int nb, int R, int D,
+                      const int *rows, const float *rw, float *out) {
+  double t0 = mnow();
+  [cb waitUntilCompleted];
+  double ts_gpu = mnow(); g_t_gpu += ts_gpu - t0;
+  g_t_kernel += [cb GPUEndTime] - [cb GPUStartTime];
+  if (cb.status == MTLCommandBufferStatusError) {
+    fprintf(stderr, "[metal] moe_block cmdbuf error (nb=%d R=%d): %s\n", nb, R,
+            cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
+    g_moe_fb++; return 0;
+  }
+  const float *hh=(const float*)[hh_buf contents];
+  for(int gr=0;gr<R;gr++){ float *os=out+(size_t)rows[gr]*D, w=rw[gr]; const float *hr=hh+(size_t)gr*D;
+    for(int dd=0;dd<D;dd++) os[dd]+=w*hr[dd]; }
+  g_t_scatter += mnow() - ts_gpu;
+  g_moe_ok++; g_moe_experts += nb;
+  return 1;
+}
+
 extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw, float *out, int S) {
-  if (!g_dev || (fmt != 1 && fmt != 2)) return 0;
   (void)S;
   @autoreleasepool {
     int R = 0; for (int e=0;e<nb;e++) R += nr[e];
     if (R == 0) return 1;
-    double ts_start = mnow();
-    // address + erow tables
-    std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
-    std::vector<id<MTLBuffer>> use; use.reserve(nb*2);
-    auto add_use=[&](id<MTLBuffer> b){ for(auto&x:use) if(x==b) return; use.push_back(b); };
-    for (int e=0;e<nb;e++) {
-      id<MTLBuffer> b;
-      if(!(b=resolve(g[e],&ag[e]))) {g_moe_fb++; return 0;} add_use(b);
-      if(!(b=resolve(u[e],&au[e]))) {g_moe_fb++; return 0;} add_use(b);
-      if(!(b=resolve(d[e],&ad[e]))) {g_moe_fb++; return 0;} add_use(b);
-      if(!(b=resolve(gs[e],&sgv[e]))) {g_moe_fb++; return 0;} add_use(b);
-      if(!(b=resolve(us[e],&suv[e]))) {g_moe_fb++; return 0;} add_use(b);
-      if(!(b=resolve(ds[e],&sdv[e]))) {g_moe_fb++; return 0;} add_use(b);
-    }
-    static int dbg=-1; if(dbg<0) dbg = getenv("COLI_METAL_DEBUG")?atoi(getenv("COLI_METAL_DEBUG")):0;
-    if(dbg){ dbg=0; fprintf(stderr,"[metal dbg] moe_block nb=%d R=%d D=%d Iinter=%d fmt=%d | e0: wg=%p ag=0x%llx sg=0x%llx slabs=%zu\n",
-             nb,R,D,Iinter,fmt,g[0],(unsigned long long)ag[0],(unsigned long long)sgv[0],g_slabs.size()); }
-    std::vector<int> erow(R); for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++) erow[xoff[e]+r]=e;
-    auto shb=[&](const void*p,size_t n){ return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared]; };
-    id<MTLBuffer> bag=shb(ag.data(),nb*8), bau=shb(au.data(),nb*8), bad=shb(ad.data(),nb*8);
-    id<MTLBuffer> bsg=shb(sgv.data(),nb*8), bsu=shb(suv.data(),nb*8), bsd=shb(sdv.data(),nb*8);
-    id<MTLBuffer> berow=shb(erow.data(),R*4);
-    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);       memcpy([g_xg contents], xg, (size_t)R*D*4);
+    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);
     g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
     g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
     g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-
-    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-    for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
-    auto gemv=[&](id<MTLBuffer> wa,id<MTLBuffer> sa,id<MTLBuffer> xin,id<MTLBuffer> y,int O,int K,int Kin){
-      [e setComputePipelineState:g_moe_gemv];
-      [e setBuffer:wa offset:0 atIndex:0];[e setBuffer:sa offset:0 atIndex:1];[e setBuffer:berow offset:0 atIndex:2];
-      [e setBuffer:xin offset:0 atIndex:3];[e setBuffer:y offset:0 atIndex:4];
-      [e setBytes:&O length:4 atIndex:5];[e setBytes:&K length:4 atIndex:6];[e setBytes:&Kin length:4 atIndex:7];[e setBytes:&fmt length:4 atIndex:8];
-      [e dispatchThreadgroups:MTLSizeMake((size_t)R*O,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)]; };
-    gemv(bag,bsg,g_xg,g_gg,Iinter,D,D);                       // gate
-    gemv(bau,bsu,g_xg,g_uu,Iinter,D,D);                       // up
-    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    [e setComputePipelineState:g_moe_silu];
-    [e setBuffer:g_gg offset:0 atIndex:0];[e setBuffer:g_uu offset:0 atIndex:1];
-    [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    gemv(bad,bsd,g_gg,g_hh,D,Iinter,Iinter);                  // down
-    double ts_commit = mnow(); g_t_setup += ts_commit - ts_start;
-    [e endEncoding];[cb commit];[cb waitUntilCompleted];
-    double ts_gpu = mnow(); g_t_gpu += ts_gpu - ts_commit;
-    g_t_kernel += [cb GPUEndTime] - [cb GPUStartTime];   // actual on-GPU execution window
-    if (cb.status == MTLCommandBufferStatusError) {           // GPU fault -> fall back to CPU for this block
-      fprintf(stderr, "[metal] moe_block cmdbuf error (nb=%d R=%d): %s\n", nb, R,
-              cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
-      g_moe_fb++; return 0;
-    }
-
-    // scatter-add: out[rows[gr]] += rw[gr] * hh[gr]
-    const float *hh=(const float*)[g_hh contents];
-    for(int gr=0;gr<R;gr++){ float *os=out+(size_t)rows[gr]*D, w=rw[gr]; const float *hr=hh+(size_t)gr*D;
-      for(int dd=0;dd<D;dd++) os[dd]+=w*hr[dd]; }
-    g_t_scatter += mnow() - ts_gpu;
-    g_moe_ok++; g_moe_experts += nb;
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    if (!cb) return 0;
+    return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
   }
-  return 1;
+}
+
+// Async two-phase API: begin submits the block (own scratch, no wait) so the CPU can
+// overlap disk loads with GPU compute; end waits + scatters. Handle owns everything.
+struct ColiMetalMoeHandle {
+  id<MTLCommandBuffer> cb; id<MTLBuffer> hh;
+  std::vector<int> rows; std::vector<float> rwv;
+  int nb, R, D;
+};
+extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw) {
+  @autoreleasepool {
+    int R = 0; for (int e=0;e<nb;e++) R += nr[e];
+    if (R == 0 || !g_dev) return nullptr;
+    id<MTLBuffer> bxg=[g_dev newBufferWithLength:(size_t)R*D*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
+    if (!cb) return nullptr;
+    ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
+    h->cb=cb; h->hh=bhh; h->rows.assign(rows,rows+R); h->rwv.assign(rw,rw+R);
+    h->nb=nb; h->R=R; h->D=D;
+    return h;
+  }
+}
+extern "C" int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out) {
+  if (!h) return 0;
+  int ok;
+  @autoreleasepool { ok = moe_finish(h->cb,h->hh,h->nb,h->R,h->D,h->rows.data(),h->rwv.data(),out); }
+  h->cb=nil; h->hh=nil; delete h;
+  return ok;
 }

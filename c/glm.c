@@ -1275,6 +1275,63 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
             if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
+        int metal_done=0;
+#ifdef COLI_METAL
+        /* GPU/disk OVERLAP: submit the RESIDENT experts (pin/LRU hits, + shared expert on
+         * the first block) to the GPU BEFORE loading the missed experts from disk, so the
+         * preads run while the GPU computes; the missed subset follows in a second submit.
+         * Per-subset CPU fallback on unresolved slab / bad fmt / GPU fault. */
+        int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
+        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
+        const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
+        int xoffb[65],nrb[65];
+        float *mxg=NULL; int *mrows=NULL; float *mrw=NULL;
+        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH) */
+        #define MB_BUILD(WANTMISS, TRY_SH) do{ \
+            nbb=0; Rtot=0; mfmt=-1; sh_in=0; \
+            for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; \
+                int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0; \
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
+                    if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
+                if(!cnt) continue; \
+                if(mfmt<0) mfmt=e->g.fmt; \
+                MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
+                MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
+                MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \
+                MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s; \
+                xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++; \
+            } \
+            if(TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
+                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf){ \
+                    if(mfmt<0) mfmt=shf; \
+                    MG[nbb]=shf==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4; \
+                    MU[nbb]=shf==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4; \
+                    MD[nbb]=shf==1?(const void*)l->sh_down.q8:(const void*)l->sh_down.q4; \
+                    MGS[nbb]=l->sh_gate.s; MUS[nbb]=l->sh_up.s; MDS[nbb]=l->sh_down.s; \
+                    xoffb[nbb]=Rtot; nrb[nbb]=S; Rtot+=S; nbb++; sh_in=1; } } \
+            int p=0; \
+            for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; int eid=uniq[base+j]; \
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
+                    if(idxs[(int64_t)s*K+kk]==eid){ \
+                        memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float)); \
+                        mrows[p]=s; mrw[p]=ws[(int64_t)s*K+kk]; p++; break; } } \
+            if(sh_in) for(int s=0;s<S;s++){ \
+                memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float)); \
+                mrows[p]=s; mrw[p]=1.0f; p++; } \
+        }while(0)
+        if(g_metal_enabled){
+            for(int q=0;q<nmiss;q++) is_miss[missk[q]]=1;
+            mxg=falloc((int64_t)(nb+1)*S*D);
+            mrows=malloc((size_t)(nb+1)*S*sizeof(int)); mrw=malloc((size_t)(nb+1)*S*sizeof(float));
+            MB_BUILD(0, base==0);
+            if(nbb>0){
+                double t0=now_s();
+                mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
+                m->t_emm += now_s()-t0;
+                if(mh){ cpu_res=0; mh_shared=sh_in; }
+            } else cpu_res=0;
+        }
+#endif
         if(nmiss){ double t0=now_s();
             #pragma omp parallel for schedule(dynamic,1)
             for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
@@ -1291,59 +1348,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
-        int metal_done=0;
 #ifdef COLI_METAL
-        /* Batched GPU path: gate/up/silu/down for the whole block in ONE command buffer,
-         * reading each expert's weights zero-copy from its RAM slab. Falls back to CPU on
-         * any unresolved slab or unsupported fmt. Numerics = dequant->f32 MAC (like CUDA). */
         if(g_metal_enabled){
-            const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
-            int xoffb[65],nrb[65],nbb=0,Rtot=0,fmt=use[0]?use[0]->g.fmt:2;
-            /* fuse the SHARED expert into the first block: identical shapes to a routed
-             * expert (gate/up [I,D], down [D,I]) applied to all S rows with weight 1.0.
-             * Removes 3 CPU matmuls/layer (Phase E) and fills the same GPU submit. */
-            int want_shared = (base==0 && c->n_shared==1 && sI==I &&
-                               l->sh_gate.fmt==fmt && l->sh_up.fmt==fmt && l->sh_down.fmt==fmt);
-            for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0;
-                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                    if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; }
-                if(!cnt) continue;
-                MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4;
-                MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4;
-                MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4;
-                MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s;
-                xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++;
-            }
-            if(want_shared){
-                MG[nbb]=fmt==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4;
-                MU[nbb]=fmt==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4;
-                MD[nbb]=fmt==1?(const void*)l->sh_down.q8:(const void*)l->sh_down.q4;
-                MGS[nbb]=l->sh_gate.s; MUS[nbb]=l->sh_up.s; MDS[nbb]=l->sh_down.s;
-                xoffb[nbb]=Rtot; nrb[nbb]=S; Rtot+=S; nbb++;
-            }
-            if(nbb==0) metal_done=1;
-            else {
-                float *mxg=falloc((int64_t)Rtot*D); int *mrows=malloc(Rtot*sizeof(int)); float *mrw=malloc(Rtot*sizeof(float));
-                int p=0;
-                for(int j=0;j<nb;j++){ int eid=uniq[base+j];
-                    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                        if(idxs[(int64_t)s*K+kk]==eid){
-                            memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float));
-                            mrows[p]=s; mrw[p]=ws[(int64_t)s*K+kk]; p++; break; }
-                }
-                if(want_shared) for(int s=0;s<S;s++){
-                    memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float));
-                    mrows[p]=s; mrw[p]=1.0f; p++; }
+            MB_BUILD(1, 0);                                   /* missed experts, now loaded */
+            if(nbb>0){
                 double t0=now_s();
-                metal_done=coli_metal_moe_block(nbb,D,I,fmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S);
+                if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
-                free(mxg); free(mrows); free(mrw);
-                if(metal_done && want_shared) shared_on_gpu=1;
-            }
+            } else cpu_miss=0;
+            if(mh){ double t0=now_s();
+                if(coli_metal_moe_block_end(mh,out)){ if(mh_shared) shared_on_gpu=1; }
+                else cpu_res=1;
+                m->t_emm += now_s()-t0; mh=NULL; }
+            metal_done = (!cpu_res && !cpu_miss);
+            free(mxg); free(mrows); free(mrw);
         }
+        #undef MB_BUILD
 #endif
         if(!metal_done)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+#ifdef COLI_METAL
+            /* skip the subsets already computed on GPU */
+            if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
+#endif
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
