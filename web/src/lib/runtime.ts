@@ -7,4 +7,3 @@ export function activeRequests(health: HealthResponse | null): number {
 export function supportsCacheSlots(health: HealthResponse | null): boolean {
   return typeof health?.kv_slots === "number" && health.kv_slots > 0
 }
-
