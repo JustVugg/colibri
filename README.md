@@ -277,7 +277,7 @@ COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 # multi-GPU expert tier, 150 GB total budget across six 32 GB devices
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
-CUDA_DENSE=1 PIN=stats.txt PIN_GB=290 RAM_GB=226 \
+CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
@@ -295,10 +295,10 @@ When host backing is released, placement is disjoint and staged: the hottest
 prefix is loaded, uploaded to VRAM, and freed before the next-ranked suffix is
 loaded into RAM. `PIN_GB` therefore describes the combined ranked set rather
 than duplicate RAM and VRAM copies. On a 256 GB dual-socket host, moving from a
-150 GB VRAM + 130 GB RAM placement to 150 GB VRAM + 140 GB RAM raised fixed-token
-replay from 1.87 to 2.13 tok/s (+13.9%), reduced expert disk wait from 5.144s to
-4.355s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
-down automatically (54 to 47 in that run) so the larger pinned tier does not exceed
+150 GB VRAM + 130 GB RAM placement to 150 GB VRAM + 150 GB RAM raised fixed-token
+replay from 1.87 to 2.16 tok/s (+15.7%), reduced expert disk wait from 5.144s to
+3.948s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
+down automatically (54 to 40 in that run) so the larger pinned tier does not exceed
 the process budget. Start lower on hosts with less available RAM.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
