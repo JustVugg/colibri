@@ -19,60 +19,48 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
                     device float*       y      [[buffer(3)]],   // [S,O]
                     constant int& S [[buffer(4)]], constant int& I [[buffer(5)]],
                     constant int& O [[buffer(6)]], constant int& fmt [[buffer(7)]],
-                    uint tg   [[threadgroup_position_in_grid]],
-                    uint lid  [[thread_position_in_threadgroup]],
-                    uint tgsz [[threads_per_threadgroup]],
-                    uint slane[[thread_index_in_simdgroup]],
+                    constant int& NT [[buffer(8)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint slane [[thread_index_in_simdgroup]],
                     uint sgid [[simdgroup_index_in_threadgroup]]) {
-  int o  = tg % O;          // output row
-  int si = tg / O;          // sequence position
+  // one SIMDGROUP per output element, 4 per threadgroup, 8-value loads (see moe_gemv)
+  long row = (long)tg*4 + sgid; if (row >= NT) return;
+  int o = row % O, si = row / O;
   device const float* xr = x + (long)si * I;
-  int I4 = (I & 3) ? 0 : (I / 4);   // vector path only when 4-aligned; else scalar tail covers all
+  device const float4* x4 = (device const float4*)xr;
+  int I8 = (I & 7) ? 0 : (I/8);
   float acc = 0.0f;
-
   if (fmt == 1) {                                   // int8
     device const char* wr = (device const char*)(w) + (long)o * I;
     device const char4* w4 = (device const char4*)wr;
-    device const float4* x4 = (device const float4*)xr;
-    for (int c = lid; c < I4; c += tgsz) acc += dot(float4(w4[c]), x4[c]);
-    for (int i = I4*4 + lid; i < I; i += tgsz) acc += float(wr[i]) * xr[i];
+    for (int c = slane; c < I8; c += 32) acc += dot(float4(w4[2*c]),x4[2*c]) + dot(float4(w4[2*c+1]),x4[2*c+1]);
+    for (int i = I8*8 + slane; i < I; i += 32) acc += float(wr[i]) * xr[i];
   } else if (fmt == 2) {                            // int4 packed, rb=(I+1)/2
     int rb = (I+1)/2;
     device const uchar* wr = w + (long)o * rb;
-    device const uchar2* w2 = (device const uchar2*)wr;   // 2 bytes = 4 nibbles
-    device const float4* x4 = (device const float4*)xr;
-    for (int c = lid; c < I4; c += tgsz) {
-      uchar2 bb = w2[c];
-      float4 wv = float4(float(int(bb.x & 0xF)-8), float(int(bb.x >> 4)-8),
-                         float(int(bb.y & 0xF)-8), float(int(bb.y >> 4)-8));
-      acc += dot(wv, x4[c]);
+    device const uchar4* w4 = (device const uchar4*)wr;
+    for (int c = slane; c < I8; c += 32) { uchar4 b = w4[c];
+      float4 w0 = float4(float(int(b.x&0xF)-8), float(int(b.x>>4)-8), float(int(b.y&0xF)-8), float(int(b.y>>4)-8));
+      float4 w1 = float4(float(int(b.z&0xF)-8), float(int(b.z>>4)-8), float(int(b.w&0xF)-8), float(int(b.w>>4)-8));
+      acc += dot(w0,x4[2*c]) + dot(w1,x4[2*c+1]);
     }
-    for (int i = I4*4 + lid; i < I; i += tgsz) {
+    for (int i = I8*8 + slane; i < I; i += 32) {
       uchar b = wr[i>>1]; int v = (i&1) ? (b>>4) : (b&0xF); acc += float(v-8) * xr[i];
     }
   } else if (fmt == 3) {                            // int2 packed, rb=(I+3)/4
     int rb = (I+3)/4;
     device const uchar* wr = w + (long)o * rb;
-    for (int i = lid; i < I; i += tgsz) {
+    for (int i = slane; i < I; i += 32) {
       uchar b = wr[i>>2]; int v = (b >> (2*(i&3))) & 0x3; acc += float(v-2) * xr[i];
     }
   } else {                                          // f32
     device const float* wr = (device const float*)(w) + (long)o * I;
     device const float4* w4 = (device const float4*)wr;
-    device const float4* x4 = (device const float4*)xr;
-    for (int c = lid; c < I4; c += tgsz) acc += dot(w4[c], x4[c]);
-    for (int i = I4*4 + lid; i < I; i += tgsz) acc += wr[i] * xr[i];
+    for (int c = slane; c < I8; c += 32) acc += dot(w4[2*c],x4[2*c]) + dot(w4[2*c+1],x4[2*c+1]);
+    for (int i = I8*8 + slane; i < I; i += 32) acc += wr[i] * xr[i];
   }
-
   acc = simd_sum(acc);
-  threadgroup float sh[32];
-  if (slane == 0) sh[sgid] = acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (lid == 0) {
-    uint nsg = (tgsz + 31) / 32; float t = 0.0f;
-    for (uint k = 0; k < nsg; k++) t += sh[k];
-    y[(long)si * O + o] = t * scale[o];
-  }
+  if (slane == 0) y[row] = acc * scale[o];
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -345,9 +333,11 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
     [e setComputePipelineState:g_gemv];
     [e setBuffer:t->w offset:0 atIndex:0]; [e setBuffer:t->s offset:0 atIndex:1];
     [e setBuffer:bx offset:0 atIndex:2];   [e setBuffer:by offset:0 atIndex:3];
+    int NT=S*O;
     [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
     [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
-    [e dispatchThreadgroups:MTLSizeMake((size_t)O*S,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
+    [e setBytes:&NT length:4 atIndex:8];
+    [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     memcpy(y, [by contents], (size_t)S*O*sizeof(float));
   }
@@ -375,8 +365,10 @@ static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float
   [e setComputePipelineState:g_gemv];
   [e setBuffer:wb offset:woff atIndex:0]; [e setBuffer:sb offset:soff atIndex:1];
   [e setBuffer:xin offset:0 atIndex:2]; [e setBuffer:yout offset:0 atIndex:3];
+  int NT=S*O;
   [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5]; [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
-  [e dispatchThreadgroups:MTLSizeMake((size_t)O*S,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
+  [e setBytes:&NT length:4 atIndex:8];
+  [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
   return true;
 }
 
@@ -473,9 +465,11 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
     [e setComputePipelineState:g_gemv];
     [e setBuffer:wb offset:woff atIndex:0]; [e setBuffer:sb offset:soff atIndex:1];
     [e setBuffer:g_gx offset:0 atIndex:2]; [e setBuffer:g_gy offset:0 atIndex:3];
+    int NT=S*O;
     [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
     [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
-    [e dispatchThreadgroups:MTLSizeMake((size_t)O*S,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
+    [e setBytes:&NT length:4 atIndex:8];
+    [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] gemm cmdbuf error (S=%d O=%d)\n",S,O); return 0; }
     memcpy(y,[g_gy contents],(size_t)S*O*4);
