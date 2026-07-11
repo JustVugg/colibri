@@ -186,6 +186,7 @@ static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
 static const int TG = 128;
+static MTLResourceOptions g_res_opts = MTLResourceStorageModeShared;   // COLI_METAL_UNTRACKED=1 adds HazardTrackingModeUntracked
 #include <mach/mach_time.h>
 static double mnow(){ static mach_timebase_info_data_t tb; if(tb.denom==0) mach_timebase_info(&tb);
   return (double)mach_absolute_time()*tb.numer/tb.denom/1e9; }
@@ -211,7 +212,7 @@ static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel Ope
 static id<MTLBuffer> g_gg, g_uu, g_hh, g_xg; static size_t g_gg_cap, g_uu_cap, g_hh_cap, g_xg_cap;
 static id<MTLBuffer> ensure(id<MTLBuffer> b, size_t *cap, size_t need) {
   if (b && *cap >= need) return b;
-  *cap = need; return [g_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
+  *cap = need; return [g_dev newBufferWithLength:need options:g_res_opts];
 }
 
 static size_t fmt_bytes(int fmt, int I, int O) {
@@ -231,6 +232,8 @@ static id<MTLBuffer> wrap(const void *p, size_t n) {
 
 extern "C" int coli_metal_init(void) {
   if (g_dev) return 1;
+  if (getenv("COLI_METAL_UNTRACKED") && atoi(getenv("COLI_METAL_UNTRACKED")))
+    g_res_opts = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
   @autoreleasepool {
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return 0;
@@ -256,7 +259,7 @@ extern "C" int coli_metal_init(void) {
 extern "C" void coli_metal_register(void *base, size_t len) {
   if (!g_dev || !base) return;
   id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
-                              options:MTLResourceStorageModeShared deallocator:nil];
+                              options:g_res_opts deallocator:nil];
   if (!b) return;
   std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
   for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; return; }
@@ -349,7 +352,7 @@ enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, AN
 static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
 static void attn_scratch_init(){
   if(ax_) return;
-  auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:MTLResourceStorageModeShared]; };
+  auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:g_res_opts]; };
   ax_=L(AH*4); aqr_=L(AQLORA*4); aqf_=L(AHQH*4); acomp_=L((AKVL+AROPE)*4);
   aqabs_=L((size_t)AHEADS*AKVL*4); aclat_=L((size_t)AHEADS*AKVL*4); actx_=L(AHVH*4); aout_=L(AH*4);
   aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
@@ -591,10 +594,10 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
   @autoreleasepool {
     int R = 0; for (int e=0;e<nb;e++) R += nr[e];
     if (R == 0 || !g_dev) return nullptr;
-    id<MTLBuffer> bxg=[g_dev newBufferWithLength:(size_t)R*D*4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bxg=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
+    id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
+    id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
+    id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
     id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
     if (!cb) return nullptr;
     ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
