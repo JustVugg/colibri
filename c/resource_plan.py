@@ -211,6 +211,8 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
+    if plan["policy"]["name"] == "balanced":
+        result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
 

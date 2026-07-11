@@ -124,6 +124,7 @@ typedef struct {
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
     uint32_t **eheat;                            /* calore recente per promotion/demotion live */
+    uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
     /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
@@ -758,6 +759,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
+    m->elast=calloc(NR,sizeof(uint32_t*));
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
@@ -788,6 +790,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
     }
@@ -833,6 +836,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eroute[i]=calloc(c->topk,sizeof(int));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
             #undef PM
         }
@@ -1243,6 +1247,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int kk=0;kk<Ke;kk++){
             m->eusage[layer][idx[kk]]++;
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
+            m->elast[layer][idx[kk]]=++m->eaccess_clock;
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
@@ -2060,7 +2065,8 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
         ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
         int np=m->npin[l]; if(np>4096) np=4096;
         for(int z=0;z<np;z++) ids[z]=P[z].eid;
-        if(!tier_pick_swap(m->eheat[l],c->n_experts,ids,np,&zp,&eu,&g)) continue;
+        if(!tier_pick_lfru(m->eheat[l],m->elast[l],m->eaccess_clock,
+                           c->n_experts,ids,np,&zp,&eu,&g)) continue;
         if(nb<maxc){ out[nb].gain=g; out[nb].l=l; out[nb].slot=zp; out[nb].eid=eu; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
                if(g>out[w].gain){ out[w].gain=g; out[w].l=l; out[w].slot=zp; out[w].eid=eu; } }
@@ -2333,6 +2339,7 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
+        repin_pass(m);                   /* safe request boundary: adapt session-local hot tier */
     }
     free(line); free(buf);
     usage_save(m);
