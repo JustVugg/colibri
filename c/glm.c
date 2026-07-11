@@ -1016,6 +1016,34 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
+#ifdef COLI_METAL
+    /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
+     * Only the S=1 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims. */
+    if(g_metal_enabled && S==1 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+       && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
+       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
+        int pos=pos_base;
+        int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos+1) > c->index_topk;
+        if(!sel_active){
+            if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index key for future selection */
+                float *kd=m->Ic[layer]+(int64_t)pos*c->index_hd;
+                matmul_qt(kd, x, &m->ix_wk[layer], 1);
+                layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], c->index_hd, 1e-6f);
+                rope_interleave(kd, pos, c);
+            }
+            #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
+            int ok = coli_metal_attn_decode(x,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->o), l->o.s, l->o.fmt,
+                m->Lc[layer], m->Rc[layer], pos, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
+            #undef WP_
+            if(ok){ m->t_attn += now_s()-ta0; return; }
+        }
+    }
+#endif
     float *ctx=falloc((int64_t)S*H*vh);
     float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
     float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
@@ -1437,7 +1465,11 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     KVState *k=m->kv;
-    if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){ free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
+    if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
+#ifdef COLI_METAL
+        if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
+#endif
+        free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
     if(m->has_dsa){
         k->Ic=calloc(c->n_layers,sizeof(float*));
@@ -1447,7 +1479,20 @@ static void kv_alloc(Model *m, int max_t){
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
     for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
-        k->Rc[i]=falloc((int64_t)max_t*c->qk_rope); }
+        k->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
+#ifdef COLI_METAL
+        /* page-align + register Lc/Rc for zero-copy GPU attention. falloc isn't 16K-aligned,
+         * so re-allocate aligned and register the exact byte length. */
+        if(g_metal_enabled){
+            size_t lb=(((size_t)max_t*c->kv_lora*sizeof(float))+16383)&~(size_t)16383;
+            size_t rb=(((size_t)max_t*c->qk_rope*sizeof(float))+16383)&~(size_t)16383;
+            free(k->Lc[i]); free(k->Rc[i]); void *lp,*rp;
+            if(posix_memalign(&lp,16384,lb)||posix_memalign(&rp,16384,rb)){fprintf(stderr,"OOM kv\n");exit(1);}
+            k->Lc[i]=lp; k->Rc[i]=rp;
+            coli_metal_register(k->Lc[i],lb); coli_metal_register(k->Rc[i],rb);
+        }
+#endif
+    }
     m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic; m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 

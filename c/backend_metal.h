@@ -51,6 +51,21 @@ size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 void coli_metal_register(void *base, size_t len);
 void coli_metal_unregister(void *base);
 
+/*
+ * Fused decode (S=1) attention for one layer, entirely on the GPU in one command buffer:
+ * q_a -> rmsnorm -> q_b -> RoPE ; kv_a -> latent rmsnorm@pos + krot RoPE@pos (cache write) ;
+ * MLA absorption core ; o_proj. Weights (q_a/q_b/kv_a/kv_b/o) and the Lc/Rc caches must be
+ * registered (page-aligned) for zero-copy resolve. GLM-5.2 dims compiled in. Handles st0==0
+ * full-range only. Returns 1 on success, 0 to signal CPU fallback.
+ */
+int coli_metal_attn_decode(const float *x,
+    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt,
+    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *o_w, const float *o_s, int o_fmt,
+    float *Lc, float *Rc, int pos, int st0, float eps, float theta, float ascale, float *out);
+
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
 void coli_metal_moe_times(double *setup, double *gpu, double *scatter);
