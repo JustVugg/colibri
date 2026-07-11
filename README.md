@@ -261,9 +261,13 @@ cross-compiling. Requesting CUDA with a CPU-only binary, an invalid device, or
 an unavailable runtime fails at startup instead of silently falling back.
 
 The normal `make` build and runtime behavior are unchanged. CUDA defaults to an
-expert-only accelerator: resident dense/attention tensors stay on CPU because
-fixture measurements show that moving them does not help while expert I/O is
-the bottleneck. `CUDA_DENSE=1` keeps the earlier all-resident experimental path.
+expert-only accelerator. `CUDA_DENSE=1` additionally distributes resident
+dense/attention projection tensors round-robin across the selected devices;
+their projected footprint is reserved before the expert tier is placed. On six
+RTX 5090s with a 150 GB expert tier, a warmed two-request/64-token GLM-5.2 run
+improved from 1.650 to 2.157 aggregate tok/s (+30.8%) while retaining the full
+expert tier. Treat this as an opt-in until the projected dense set and the 2 GB
+per-device runtime reserve fit the target GPUs.
 A measured `PIN` profile can promote its hottest experts into the persistent
 VRAM tier while keeping the rest in RAM:
 
@@ -273,7 +277,8 @@ COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 # multi-GPU expert tier, 150 GB total budget across six 32 GB devices
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
-PIN=stats.txt PIN_GB=280 RAM_GB=226 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+CUDA_DENSE=1 PIN=stats.txt PIN_GB=280 RAM_GB=226 \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
