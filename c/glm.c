@@ -27,7 +27,8 @@
 #include <unistd.h>
 #include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
-#include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
+#include <sys/mman.h>
+#include <sys/stat.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif
 #include "st.h"
 #include "tok.h"
@@ -884,6 +885,31 @@ static void embed_row(Model *m, int tok, float *x){
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
 
+/* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
+ * niente slab, niente copia: la page cache del kernel E' la cache). Le mappe sono
+ * registrate con Metal (newBufferWithBytesNoCopy su pagine file-backed, come llama.cpp),
+ * quindi la GPU legge gli stessi byte. Fallback allo slab path su disallineamento. */
+static int g_mmap=0;
+static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
+static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
+static void *map_of_fd(int fd){
+    pthread_mutex_lock(&g_map_mtx);
+    for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
+    void *base=NULL; struct stat st;
+    if(g_nmaps<512 && fstat(fd,&st)==0){
+        size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
+        void *p=mmap(NULL,len,PROT_READ,MAP_SHARED,fd,0);
+        if(p!=MAP_FAILED){
+            base=p; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=p; g_maps[g_nmaps].len=len; g_nmaps++;
+#ifdef COLI_METAL
+            if(g_metal_enabled) coli_metal_register(p,len);
+#endif
+        }
+    }
+    pthread_mutex_unlock(&g_map_mtx);
+    return base;
+}
+
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
  * file -> UNA pread coalescente da ~19 MB dentro `slab` (+ le scale in fslab); i QT sono
  * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
@@ -909,6 +935,24 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"manca %s\n",nm[k]); exit(1); }
+    }
+    if(g_mmap){
+        void *bw[3],*bq[3]; int okm=1;
+        for(int k=0;k<3;k++){
+            bw[k]=map_of_fd(tw[k]->fd); bq[k]=map_of_fd(tq[k]->fd);
+            if(!bw[k]||!bq[k]||((tw[k]->off)&3)||((tq[k]->off)&3)) okm=0;
+        }
+        if(okm){
+            QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+            for(int k=0;k<3;k++){
+                int64_t nb=tw[k]->nbytes;
+                int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+                qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
+                qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
+            }
+            s->eid=eid; return;
+        }
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
@@ -2570,6 +2614,8 @@ int main(int argc, char **argv){
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
+    g_mmap = getenv("COLI_MMAP")?atoi(getenv("COLI_MMAP")):0;
+    if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
