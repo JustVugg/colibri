@@ -267,6 +267,53 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
             y[(int64_t)s*O+o]=a*sc; } }
 }
+/* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
+ * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
+ * this keeps colibri dependency-free while removing one team launch/expert. */
+static void matmul_i4_pair(float *yg, float *yu, const float *x,
+                           const uint8_t *qg, const float *sg,
+                           const uint8_t *qu, const float *su, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int z=0;z<2*O;z++){
+        int o=z<O?z:z-O; const uint8_t *w=(z<O?qg:qu)+(int64_t)o*rb;
+        float a=0; int i=0;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        __m256 acc=_mm256_setzero_ps();
+        for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);
+            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i),w0,acc);
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),w1,acc); }
+        a=hsum256(acc);
+#elif defined(__ARM_NEON)
+        const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
+        float32x4_t ac0=vdupq_n_f32(0),ac1=vdupq_n_f32(0);
+        for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));
+            uint8x8x2_t n=vzip_u8(vand_u8(by,m4),vshr_n_u8(by,4));
+            int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(n.val[0]),b8));
+            int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(n.val[1]),b8));
+            ac0=vfmaq_f32(ac0,vld1q_f32(x+i),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+            ac1=vfmaq_f32(ac1,vld1q_f32(x+i+4),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+            ac0=vfmaq_f32(ac0,vld1q_f32(x+i+8),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+            ac1=vfmaq_f32(ac1,vld1q_f32(x+i+12),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
+        a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+        for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; a+=x[i]*(float)((b&15)-8)+x[i+1]*(float)((b>>4)-8); }
+        if(i<I) a+=x[i]*(float)((w[i>>1]&15)-8);
+        (z<O?yg:yu)[o]=a*(z<O?sg:su)[o];
+    }
+}
+
+static void matmul_qt(float *y,const float *x,QT *w,int S);
+static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
+    if(S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
+        matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
+    else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
+}
 /* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
     int rb=(I+3)/4;
@@ -1332,8 +1379,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
-            matmul_qt(gg, xg, &e->g, nr);
-            matmul_qt(uu, xg, &e->u, nr);
+            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
@@ -1373,7 +1419,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
-                        matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
+                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                         for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                         matmul_qt(hh,gg,&e->d,nr);
                     }
@@ -1402,7 +1448,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                     }
                 for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)rows[r]*D,D*sizeof(float));
                 double tc=now_s();
-                matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
+                expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                 for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                 matmul_qt(hh,gg,&e->d,nr);
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
