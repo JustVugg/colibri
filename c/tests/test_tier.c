@@ -17,6 +17,11 @@ int main(void){
 
     tier_decay(heat,6);
     if(heat[0]!=10 || heat[1]!=1 || heat[4]!=15) return fail("heat decay");
+
+    uint32_t freq[5]={10,10,2,18,18}, last[5]={10,90,95,20,99};
+    int live[2]={0,1};
+    if(!tier_pick_lfru(freq,last,100,5,live,2,&slot,&eid,&gain)) return fail("LFRU promotion");
+    if(slot!=0||eid!=4) return fail("LFRU did not prefer recent ties");
     puts("tier tests: ok");
     return 0;
 }
