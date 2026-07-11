@@ -196,6 +196,9 @@ extern "C" void coli_metal_moe_times(double *setup, double *gpu, double *scatter
   if(setup)*setup=g_t_setup; if(gpu)*gpu=g_t_gpu; if(scatter)*scatter=g_t_scatter;
 }
 extern "C" double coli_metal_moe_kernel_time(void){ return g_t_kernel; }
+static uint64_t g_attn_ok; static double g_attn_wall, g_attn_kernel;
+extern "C" void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel){
+  if(ok)*ok=g_attn_ok; if(wall)*wall=g_attn_wall; if(kernel)*kernel=g_attn_kernel; }
 
 // Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
@@ -399,8 +402,10 @@ extern "C" int coli_metal_attn_decode(const float* x,
     [e dispatchThreads:MTLSizeMake((size_t)AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     // o_proj
     bind_gemv(e,o_w,o_s,o_fmt,AHVH,AH,actx_,aout_);
+    double tc=mnow();
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
+    g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
     memcpy(out,[aout_ contents],AH*4);
   }
   return 1;

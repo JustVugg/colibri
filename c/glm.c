@@ -1818,6 +1818,8 @@ static void profile_print(Model *m, double elapsed){
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
+        { uint64_t aok=0; double aw=0,ak=0; coli_metal_attn_counts(&aok,&aw,&ak);
+          if(aok) printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs)\n",(unsigned long long)aok,aw,ak); }
         printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
                (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc); }
 #endif

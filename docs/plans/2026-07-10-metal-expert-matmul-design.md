@@ -152,13 +152,32 @@ ctx] absorption core → o_proj matmul.
       Attention weights uploaded+cached; Lc/Rc page-aligned + registered in kv_alloc.
 - [x] Integrated into attention() behind COLI_METAL (S=1 absorb, st0==0, no active DSA
       selection, GLM-5.2 int4 dims; else CPU fallback). DSA index-key stays on CPU.
-- [x] **Token-exact vs CPU** (identical greedy output). Attention 16.5s -> 10.5s
-      (~1.57x) with MTP on; end-to-end 0.20 -> 0.28 tok/s (~1.4x).
+- [x] **Token-exact vs CPU** (identical greedy output), verified.
 
-## Known limits / next
-- Fused path is **S=1 only** — with MTP on, S=4 verify forwards still use CPU attention.
-  Extending the kernels to S<=4 would cover MTP decode (bigger attention win).
-- Attention and experts are still separate command buffers with CPU glue between, so
-  the expert-block idle latency (~63% of GPU wall) is not yet reclaimed. Tighter
-  coupling (fewer syncs per layer) is the remaining latency lever.
-- prefill kv_b-reconstruction GEMM still CPU (a clean future offload).
+## Honest measured result (DRAFT=0, all-S=1 decode, ~60% hit, 8 tok)
+The fused attention **triggers correctly** (546 layer-calls = full decode coverage) but is
+**submit-latency-bound at short context and yields no speedup**:
+
+| | CPU | Metal |
+|---|---|---|
+| attention (t_attn) | 8.43 s | 7.93 s (~neutral) |
+| end-to-end | 0.30 tok/s | 0.31 tok/s |
+
+`METAL-ATTN: gpu-wall 3.70s (kernel 0.63s)` → **83% of the attention GPU time is idle
+latency** (546 sporadic command buffers × ~5.6 ms). The compute is genuinely fast (0.63 s),
+but the per-layer submit latency cancels the projection-matmul savings. The earlier
+"16.5 -> 10.5 (MTP on)" number was run-to-run variance, not the offload — corrected here.
+
+## Why, and the real lever
+Same wall as the experts: Metal's ~5 ms cold-GPU submit latency dominates sporadic,
+dependency-chained per-layer dispatches, and attention *adds* a submit per layer (2/layer
+total). The win needs **fewer submits / a hotter GPU**, not faster kernels:
+- Fuse attention + experts into one command buffer per layer (1 submit/layer, GPU stays hot).
+- Do the residual add / routing on GPU too so there's no CPU glue forcing a sync.
+- Or handle S<=4 to amortize (covers MTP verify) — but latency, not compute, is the ceiling.
+Fused attention should help at **long context** (kernel time grows past the fixed latency).
+
+## Status of the offload overall
+Expert matmul: real ~1.2-1.3x warm. Attention: correct + token-exact but latency-neutral
+at short context. Both are gated by Metal submit latency; reducing submit count is the
+single highest-leverage remaining work.

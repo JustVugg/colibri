@@ -58,6 +58,7 @@ void coli_metal_unregister(void *base);
  * registered (page-aligned) for zero-copy resolve. GLM-5.2 dims compiled in. Handles st0==0
  * full-range only. Returns 1 on success, 0 to signal CPU fallback.
  */
+void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 int coli_metal_attn_decode(const float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt,
