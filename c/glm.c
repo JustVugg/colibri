@@ -1162,7 +1162,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * nell'ordine (routed nel loro ordine di union, poi shared). */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
-    float *logit=falloc(E), *sig=falloc(E), *choice=falloc(E);
+    float *logit=falloc(E), *choice=falloc(E);
     int sI=c->moe_inter*c->n_shared;
     /* ---- FASE A: routing di tutte le S posizioni ---- */
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
@@ -1170,13 +1170,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
-        for(int e=0;e<E;e++){ sig[e]=sigmoidf(logit[e]); choice[e]=sig[e]+l->router_bias[e]; }
+        for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
                 if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-            idx[kk]=best; w[kk]=sig[best];
+            idx[kk]=best; w[kk]=logit[best];
         }
         int Ke=Ksel;
         if(g_topp>0 && g_topp<1.f){
@@ -1210,10 +1210,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
-    { char *seen=calloc(E,1);
-      for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){ int e=idxs[(int64_t)s*K+kk];
-          if(!seen[e]){ seen[e]=1; uniq[nu++]=e; } }
-      free(seen); }
+    unsigned char seen[E]; memset(seen,0,(size_t)E);
+    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
+        int e=idxs[(int64_t)s*K+kk];
+        if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
+    }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
@@ -1276,7 +1277,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
     matmul_qt(hh, sg, &l->sh_down, S);
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
-    free(logit); free(sig); free(choice); free(idxs); free(ws); free(keff); free(uniq);
+    free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
 }
 
