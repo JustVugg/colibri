@@ -226,3 +226,14 @@ expert block into two submits: (1) immediately submit the CB for RESIDENT expert
 parallel, then (3) submit the misses CB and combine. Overlaps ~8ms GPU compute with
 ~38ms disk per block: est. ~3s off a 32s run, and keeps the GPU warmer between submits.
 Needs: two-phase moe_block API (begin/end) + non-shared scratch (2-slot ring).
+
+## Iteration 3 result: disk/GPU overlap (begin/end two-phase moe_block)
+Resident experts (+fused shared) submit to GPU BEFORE the missed experts' preads;
+missed subset follows in a second submit. Token-exact. Warm 96GB:
+- expert-matmul 8.96 -> 4.92s (resident compute hidden inside the disk window)
+- expert idle latency ~5.7s -> ~0.9s (GPU no longer cold-starts after the load)
+- total 28.97s = 0.35 tok/s vs CPU 50.2s = **~1.73x end-to-end**
+Loop progression: 0.20 (CPU) -> 0.28 (iter1) -> 0.31 (iter2) -> 0.35 tok/s (iter3).
+Build gotcha: `make glm METAL=1` after a default build does not rebuild — touch/clean first.
+Remaining: attention CB still ~4s idle (submitted after CPU residual+rmsnorm+DSA-key with
+nothing to hide behind); disk ~16s is now the dominant cost and is true model streaming.
