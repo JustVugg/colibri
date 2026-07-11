@@ -195,7 +195,8 @@ make metal-test           # standalone kernel/attention correctness vs CPU refer
 COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
 ```
 
-Measured on an M4 Max (128 GB, warm cache, MTP on): **0.20 → 0.35 tok/s (~1.73×)**.
+Measured on an M4 Max (128 GB, warm cache, MTP on): CPU 0.30 → Metal **0.42 tok/s (~1.4×)**
+(best config adds `DIRECT=1`; ~3× vs this machine's first cold run).
 Key design points: Metal's ~5 ms submit latency makes per-matmul dispatch a loss —
 everything is batched into few command buffers per layer, and the resident experts'
 GPU work is submitted *before* the missed experts' disk reads so I/O and compute

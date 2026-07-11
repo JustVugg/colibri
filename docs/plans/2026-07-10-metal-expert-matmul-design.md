@@ -251,3 +251,19 @@ nothing to hide behind); disk ~16s is now the dominant cost and is true model st
   Slab path stays canonical; COLI_MMAP remains a documented negative result.
 - Remaining costs (Metal, 10 tok): disk 14.9-15.4s (dominant, true streaming),
   attention gpu-sched ~3.2s (spinner retest pending), expert kernel 3.5s, attn kernel 0.8s.
+
+## Iteration 12 (final experiments, idle machine)
+- Spinner (SPIN=1): no effect on gpu-sched → not clock ramp-down. Negative, kept env-gated.
+- Untracked hazards (COLI_METAL_UNTRACKED=1): no effect → not hazard tracking. Negative.
+  The ~10ms/CB attention delay is inherent empty-pipeline scheduler overhead; only a
+  full-layer-on-GPU redesign (routing on GPU) could remove that CB boundary.
+- **DIRECT=1 + COLI_METAL=1: best config — 24.0s / 0.42 tok/s** (disk 15.4→13.9s).
+
+## Loop conclusion (12 iterations)
+Same-session honest scoreboard: CPU 0.30 → Metal best 0.42 tok/s (~1.4x), token-exact
+throughout; from this machine's first-ever cold run (0.13-0.14): ~3x. The Metal side has
+converged: kernels at ~90% BW ceiling, expert-CB idle ~0.5s, attention sched at its floor,
+disk (~14s/10tok) dominant. Remaining levers are architectural (full layer resident on GPU:
+routing+residual+rmsnorm on GPU, one CB/layer — removes ~3s sched + enables persistent
+GPU occupancy) or hardware (faster/internal disk for streaming).
+Recommended config: `DIRECT=1 COLI_METAL=1 ./coli chat --ram 96`.
