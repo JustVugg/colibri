@@ -267,3 +267,27 @@ disk (~14s/10tok) dominant. Remaining levers are architectural (full layer resid
 routing+residual+rmsnorm on GPU, one CB/layer — removes ~3s sched + enables persistent
 GPU occupancy) or hardware (faster/internal disk for streaming).
 Recommended config: `DIRECT=1 COLI_METAL=1 ./coli chat --ram 96`.
+
+---
+
+# Phase 3: Full decode layer in ONE command buffer (post-loop project)
+
+`coli_metal_layer_decode`: in_ln -> attention -> residual -> post_ln -> shared expert ->
+router (f32 simdgroup matvec + sigmoid) -> exact phase-A top-K (serial-per-row kernel:
+CPU tie order, --topp, norm_topk, routed_scale). CPU per layer: read 8 expert IDs,
+resolve/load (disk/GPU overlap intact), expert CBs, scatter. moe() consumes precomputed
+routing via g_pre_* (usage counters preserved for the learning cache); ld() tensors
+registered; DSA keys on CPU from the new in-norm output; full CPU fallback per layer.
+
+**Token-exact** (identical greedy output, MTP on). 3-run perf (DIRECT=1, ~58% hit):
+26.6/26.3/23.4s — best 23.36s = **0.43 tok/s, new record**; typical parity with
+pre-redesign (disk 14-16s dominates everything). CPU-side "altro" 3.8s (CPU path) ->
+0.4-0.7s; layer-CB kernel 1.4-1.6s (norms/shared/router genuinely on GPU); attention
+gpu-sched 3.2 -> 2.1-2.9s. The remaining gpu-sched is unbreakable without speculation:
+layer L+1's CB needs L's expert scatter, so the GPU always idles across that boundary.
+
+## Final state of the Metal backend
+CPU per decode layer = disk streaming + expert-CB submit + scatter. Everything else on
+GPU, token-exact, regression-tested (make metal-test), CPU fallback at every level.
+Decode is disk-bound: further speed comes from storage or model-level changes
+(quantization, sparser routing), not from the GPU side.
