@@ -360,7 +360,10 @@ pthread pool. Workers are created once and reused for the process lifetime;
 the default remains OpenMP until hardware planning can select a topology-aware
 size. On a 2-socket Xeon Silver 4510, 48 workers reduced identical-output
 expert time from 51.61 s to 36.67 s and 16-token wall time from 129.42 s to
-113.73 s. Twenty-four workers were slightly slower (114.35 s wall time).
+113.73 s. Twenty-four workers were slightly slower (114.35 s wall time). The
+same pool also handles the q4 expert down projection: on that host it reduced
+expert time further from 36.67 s to 25.74 s and wall time to 105.07 s, with
+identical greedy output.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
