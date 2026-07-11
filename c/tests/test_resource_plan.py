@@ -118,6 +118,15 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertFalse(plan["policy"]["quality_preserving"])
         self.assertFalse(plan["policy"]["preserve_router"])
 
+    def test_balanced_policy_enables_lossless_live_repin(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[], policy="balanced")
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_POLICY"], "balanced")
+        self.assertEqual(env["REPIN"], "64")
+        explicit = environment_for_plan(plan, {"REPIN": "0"})
+        self.assertEqual(explicit["REPIN"], "0")
+
     def test_plan_explains_hot_warm_and_cold_placement(self):
         plan = build_plan(self.model, ram_gb=4, vram_gb=0,
                           available_memory=4 * GB, available_disk=1, gpus=[])
