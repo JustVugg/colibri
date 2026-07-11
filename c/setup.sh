@@ -15,7 +15,7 @@ Darwin)
     command -v clang >/dev/null || { echo "manca clang (xcode-select --install)"; exit 1; }
     echo "  clang: $(clang --version | head -1) · $(sysctl -n hw.ncpu) core"
     echo -n "  OpenMP: "
-    if brew --prefix libomp >/dev/null 2>&1; then echo "ok (libomp)"
+    if [ -f "$(brew --prefix libomp 2>/dev/null)/lib/libomp.dylib" ]; then echo "ok (libomp)"
     else echo "libomp assente -> build single-thread (consigliato: brew install libomp)"; fi
     ;;
 MINGW*|MSYS*)
