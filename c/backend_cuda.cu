@@ -1,6 +1,7 @@
 #include "backend_cuda.h"
 
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,8 @@ typedef struct {
     int device;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    uint8_t *qx; float *qscale;
+    size_t qx_cap, qscale_cap;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
 } DeviceContext;
@@ -63,10 +66,14 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     const uint8_t *q = base;
     if (fmt == 2) {
         uint8_t v = q[i >> 1];
-        return static_cast<float>(((i & 1) ? (v >> 4) : (v & 15)) - 8);
+        int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n&8?n-16:n);
     }
     uint8_t v = q[i >> 2];
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
+}
+
+__global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]^=0x88;
 }
 
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
@@ -97,6 +104,45 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
         float v = gate[i];
         gate[i] = (v / (1.0f + expf(-v))) * up[i];
     }
+}
+
+__global__ static void quantize_s4_rows(uint8_t *q,float *scale,const float *x,int S,int K){
+    int s=blockIdx.x; if(s>=S)return; const float *xs=x+(size_t)s*K;
+    float v=0; for(int i=threadIdx.x;i<K;i+=blockDim.x)v=fmaxf(v,fabsf(xs[i]));
+    __shared__ float m[256]; m[threadIdx.x]=v; __syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)m[threadIdx.x]=fmaxf(m[threadIdx.x],m[threadIdx.x+n]);__syncthreads();}
+    float sc=m[0]>0?m[0]/7.f:1.f; if(!threadIdx.x)scale[s]=sc;
+    uint8_t *dst=q+(size_t)s*((K+1)/2);
+    for(int b=threadIdx.x;b<(K+1)/2;b+=blockDim.x){
+        int i=b*2,a=__float2int_rn(xs[i]/sc),c=i+1<K?__float2int_rn(xs[i+1]/sc):0;
+        a=max(-8,min(7,a)); c=max(-8,min(7,c)); dst[b]=(uint8_t)((a&15)|((c&15)<<4));
+    }
+}
+
+__global__ static void grouped_s4_wmma(float *y,const uint8_t *x,const float *xscale,
+                                        const GroupDesc *desc,int K,int O,int which){
+#if __CUDA_ARCH__ >= 750
+    using namespace nvcuda;
+    int warp=threadIdx.x/32,lane=threadIdx.x%32,tile=blockIdx.x*8+warp,c=blockIdx.y;
+    if(tile*8>=O)return; GroupDesc d=desc[c];
+    const void *w=which==0?d.g:(which==1?d.u:d.d);
+    const float *ws=which==0?d.gs:(which==1?d.us:d.ds);
+    int fmt=which==0?d.gf:(which==1?d.uf:d.df);
+    if(fmt!=2)return;
+    wmma::fragment<wmma::accumulator,8,8,32,int> acc; wmma::fill_fragment(acc,0);
+    const uint8_t *a=x+(size_t)d.offset*((K+1)/2);
+    const uint8_t *b=(const uint8_t*)w+(size_t)(tile*8)*((K+1)/2);
+    for(int k=0;k<K;k+=32){
+        wmma::fragment<wmma::matrix_a,8,8,32,wmma::experimental::precision::s4,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,8,8,32,wmma::experimental::precision::s4,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,a+k/2,K);
+        wmma::load_matrix_sync(bf,b+k/2,K);
+        wmma::mma_sync(acc,af,bf,acc);
+    }
+    __shared__ int out[8][64]; wmma::store_matrix_sync(out[warp],acc,8,wmma::mem_row_major);
+    for(int i=lane;i<64;i+=32){int s=i/8,o=tile*8+i%8;
+        if(s<d.rows&&o<O)y[(size_t)(d.offset+s)*O+o]=(float)out[warp][i]*xscale[d.offset+s]*ws[o];}
+#endif
 }
 
 __global__ static void grouped_hidden(float *y,const float *x,const GroupDesc *desc,
@@ -174,9 +220,13 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->gate) cudaFree(ctx->gate);
         if (ctx->up) cudaFree(ctx->up);
+        if (ctx->qx) cudaFree(ctx->qx);
+        if (ctx->qscale) cudaFree(ctx->qscale);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
+        ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
+        ctx->qx_cap=ctx->qscale_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
@@ -230,6 +280,8 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         coli_cuda_tensor_free(t);
         return 0;
     }
+    if(fmt==2){offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+        if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
     if (fmt) {
         if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
@@ -302,12 +354,14 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
+    int all_s4=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,rows[c],total};
+        all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
@@ -324,11 +378,28 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert group input upload")) return 0;
     if(profile) cudaEventRecord(ev[1]);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-    dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-    grouped_hidden<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
-    grouped_hidden<<<hg,256>>>(ctx->up,ctx->x,dev,I,D,1);
-    silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
-    grouped_down<<<og,256>>>(ctx->y,ctx->gate,dev,D,I);
+    int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
+    tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
+    int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
+    for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
+    if(tc){
+        size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
+        if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
+           !reserve(&ctx->qscale,&ctx->qscale_cap,(size_t)(total+7)*sizeof(float)))return 0;
+        cudaMemset(ctx->qx,0,qb);
+        quantize_s4_rows<<<total,256>>>(ctx->qx,ctx->qscale,ctx->x,total,D);
+        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256>>>(ctx->gate,ctx->qx,ctx->qscale,dev,D,I,0);
+        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256>>>(ctx->up,ctx->qx,ctx->qscale,dev,D,I,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
+        quantize_s4_rows<<<total,256>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
+        grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
+    }else{
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
+        grouped_hidden<<<hg,256>>>(ctx->up,ctx->x,dev,I,D,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down<<<og,256>>>(ctx->y,ctx->gate,dev,D,I);
+    }
     if(profile) cudaEventRecord(ev[2]);
     if(!cuda_ok(cudaGetLastError(),"expert group launch")||
        !cuda_ok(cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost),"expert group output download")) return 0;

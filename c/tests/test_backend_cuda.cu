@@ -15,6 +15,12 @@ static int close_enough(const float *got, const float *want, int n) {
     return 1;
 }
 
+static int relative_rms(const float *got,const float *want,int n,float limit){
+    double err=0,ref=0; for(int i=0;i<n;i++){double d=got[i]-want[i];err+=d*d;ref+=(double)want[i]*want[i];}
+    float r=(float)std::sqrt(err/(ref+1e-20));
+    if(r>limit){std::fprintf(stderr,"relative RMS %.5f exceeds %.5f\n",r,limit);return 0;} return 1;
+}
+
 int main(int argc, char **argv) {
     int devices[COLI_CUDA_MAX_DEVICES], ndev = argc > 1 ? argc - 1 : 1;
     if (ndev > COLI_CUDA_MAX_DEVICES) return 2;
@@ -75,9 +81,32 @@ int main(int argc, char **argv) {
     int group_rows[2]={1,1}; float grouped[8];
     if (!coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,x) ||
         !close_enough(grouped,want_expert,8)) return 1;
+
+    /* Native s4 WMMA path: compare the quantized-activation result against the
+       existing FP32-activation/s4-weight grouped implementation. */
+    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], tensor4[64];
+    for(int i=0;i<(int)sizeof(w4);i++){
+        int lo=((i%15)-7)&15,hi=(((i*3)%15)-7)&15;
+        w4[i]=(uint8_t)(lo|(hi<<4));
+    }
+    for(int i=0;i<32;i++)ws4[i]=0.01f+(i%5)*0.002f;
+    for(int i=0;i<64;i++)gx4[i]=std::sin((float)(i+1)*0.17f)*2.f;
+    ColiCudaTensor *g4=nullptr,*u4=nullptr,*d4=nullptr;
+    if(!coli_cuda_tensor_upload(&g4,w4,ws4,2,32,32,d0)||
+       !coli_cuda_tensor_upload(&u4,w4,ws4,2,32,32,d0)||
+       !coli_cuda_tensor_upload(&d4,w4,ws4,2,32,32,d0))return 1;
+    ColiCudaTensor *gg4[2]={g4,g4},*ug4[2]={u4,u4},*dg4[2]={d4,d4};
+    if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,scalar4,gx4))return 1;
+    setenv("COLI_CUDA_TC_INT4","1",1);
+    setenv("COLI_CUDA_TC_MIN_ROWS","1",1);
+    if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,tensor4,gx4)||
+       !relative_rms(tensor4,scalar4,64,0.30f))return 1;
+    unsetenv("COLI_CUDA_TC_INT4");
+    unsetenv("COLI_CUDA_TC_MIN_ROWS");
+    coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    if(group_calls!=1||group_experts!=2||group_total_rows!=2) return 1;
+    if(group_calls!=3||group_experts!=6||group_total_rows!=6) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {
