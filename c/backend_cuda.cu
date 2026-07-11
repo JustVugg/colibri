@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 struct ColiCudaTensor {
     void *weights;
@@ -24,6 +25,7 @@ static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
+static std::mutex g_group_stats_mu;
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -300,10 +302,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         cudaEventRecord(ev[3]); cudaEventSynchronize(ev[3]); float a=0,b=0,c=0;
         cudaEventElapsedTime(&a,ev[0],ev[1]); cudaEventElapsedTime(&b,ev[1],ev[2]);
         cudaEventElapsedTime(&c,ev[2],ev[3]);
-        g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c;
+        { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+          g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c; }
         for(int i=0;i<4;i++) cudaEventDestroy(ev[i]);
     }
-    g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
     return 1;
 }
 
