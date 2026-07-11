@@ -2505,6 +2505,14 @@ int main(int argc, char **argv){
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    const char *policy=getenv("COLI_POLICY"); if(!policy) policy="quality";
+    int experimental=!strcmp(policy,"experimental-fast");
+    if(strcmp(policy,"quality")&&strcmp(policy,"balanced")&&!experimental){
+        fprintf(stderr,"COLI_POLICY non valida: quality, balanced o experimental-fast\n"); return 2;
+    }
+    if(!experimental&&(g_topk>0||g_topp>0)){
+        fprintf(stderr,"TOPK/TOPP modificano il router; usa COLI_POLICY=experimental-fast esplicitamente\n"); return 2;
+    }
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
