@@ -47,14 +47,35 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
+# METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
+# runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
+METAL     ?= 0
+METAL_OBJ  =
+METALXX    = clang++ -x objective-c++ -fobjc-arc -O3
+ifeq ($(METAL),1)
+ifneq ($(UNAME_S),Darwin)
+$(error METAL=1 is supported only on macOS)
+endif
+CFLAGS   += -DCOLI_METAL
+LDFLAGS  += -framework Metal -framework Foundation -lc++
+METAL_OBJ = backend_metal.o
+endif
+
 all: glm
 
-glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
+glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+
+backend_metal.o: backend_metal.mm backend_metal.h
+	$(METALXX) -c backend_metal.mm -o $@
+
+metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
+	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
+	./backend_metal_test
 
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -92,7 +113,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe glm backend_cuda.o backend_cuda_test $(TEST_BINS)
+	rm -f olmoe glm backend_cuda.o backend_cuda_test backend_metal.o backend_metal_test $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all cuda-test portable test-c test-python test check clean
