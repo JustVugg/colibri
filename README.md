@@ -250,9 +250,9 @@ VRAM tier while keeping the rest in RAM:
 STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
-# multi-GPU expert tier, 96 GB total budget across six devices
-COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=96 \
-PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# multi-GPU expert tier, 150 GB total budget across six 32 GB devices
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
+PIN=stats.txt PIN_GB=150 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -260,14 +260,26 @@ inference and the log reports their exact tensor footprint. The budget is clampe
 against free VRAM after reserving the projected dense resident set and 2 GB of
 runtime headroom per selected device. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
 total budget across the device set; experts are assigned whole to the
-least-loaded device that can hold them. A NUMA-local RAM backing store is not
-implemented yet.
+least-loaded device that can hold them. Multi-GPU runs also default to
+`PIN_FILL=1`: the measured hot set is placed first, then unused VRAM is filled
+with zero-heat experts. `CUDA_RELEASE_HOST=1` (the multi-GPU default) releases
+the RAM copy after a successful upload and reloads it from disk only if CUDA
+later fails. Set either variable to `0` to restore the conservative behavior.
+MTP speculation defaults off on CUDA because cold draft routes increase expert
+traffic; an explicit `DRAFT=n` still overrides the default.
+
+On six RTX 5090 32 GB cards with GLM-5.2 int4, a 150 GB hot-first tier sustained
+0.94 token/s over a 64-token varied prompt (87.8% expert hit rate), and reached
+1.64 token/s on a warmed short prompt (99.3% hit rate). The same capacity filled
+without routing heat managed only 0.29 token/s, so profile quality matters more
+than raw VRAM capacity. These are single-run engineering measurements, not a
+portable performance guarantee.
 
 Current limitations: devices use independent contexts and synchronous
-host-staged activation copies—there is no P2P/NCCL dependency yet. The kernels
-are correctness-first custom kernels rather than cuBLAS/Tensor Core kernels.
-This draft intentionally makes no end-to-end speedup claim before the full model
-is benchmarked.
+host-staged activation copies—there is no P2P/NCCL dependency yet. Independent
+expert groups execute concurrently across devices, but a single expert is not
+sharded. The kernels are correctness-first custom kernels rather than
+cuBLAS/Tensor Core kernels.
 
 For a reproducible backend A/B without the full checkpoint, generate the
 deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:
