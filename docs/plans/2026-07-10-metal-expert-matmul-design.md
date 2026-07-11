@@ -237,3 +237,17 @@ Loop progression: 0.20 (CPU) -> 0.28 (iter1) -> 0.31 (iter2) -> 0.35 tok/s (iter
 Build gotcha: `make glm METAL=1` after a default build does not rebuild — touch/clean first.
 Remaining: attention CB still ~4s idle (submitted after CPU residual+rmsnorm+DSA-key with
 nothing to hide behind); disk ~16s is now the dominant cost and is true model streaming.
+
+## Idle-machine suite (2026-07-11, iters 6-11 stacked, same-session interleaved)
+- **Metal 25.2-26.4s (0.38-0.40 tok/s) vs CPU 33.9s (0.30) = ~1.33x**, token-exact.
+- Expert path near latency-free: gpu-wall 3.9-4.1s vs kernel 3.4-3.5s (idle ~0.5s, was 5.7s).
+  Kernel rewrites (simdgroup-per-row) confirmed: expert-matmul 4.2-4.5s (was 8.96 in iter 2).
+- Attention latency named: cpu-sched 0.00s / **gpu-sched 3.1-3.3s** (~10ms GPU wake per call,
+  312 calls) — attention CB is submitted after CPU residual+routing, GPU has gone idle.
+- GEMM_MIN sweep: 8/16/off within noise at decode (helps only long prefill). Keep 16.
+- **mmap verdict: dead on Metal.** Pre-touch fixed the I/O (disk 10s < pread 14.5s) but
+  expert gpu-wall exploded to 530s: useResource on a whole 26GB file-backed mmap buffer
+  makes Metal wire the ENTIRE buffer per submit (residency is per-buffer, not per-range).
+  Slab path stays canonical; COLI_MMAP remains a documented negative result.
+- Remaining costs (Metal, 10 tok): disk 14.9-15.4s (dominant, true streaming),
+  attention gpu-sched ~3.2s (spinner retest pending), expert kernel 3.5s, attn kernel 0.8s.
