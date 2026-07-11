@@ -126,6 +126,7 @@ def resource_request(a, env):
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -146,7 +147,7 @@ def env_for(a):
         if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}piano risorse non valido:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -324,7 +325,7 @@ def cmd_plan(a):
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx deve essere positivo")
         if a.vram<0: raise ValueError("--vram non puo essere negativo")
-        plan=build_plan(a.model,ram,ctx,devices,vram)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}impossibile creare il piano:{C.r} {error}")
     if a.json:
@@ -498,6 +499,9 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none oppure lista device, es. 0,1")
     common.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
+    common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
+                        default=os.environ.get("COLI_POLICY","quality"),
+                        help="quality policy; only experimental-fast permits lossy routing")
     common.add_argument("--repin", type=int, default=0, help="adatta gli expert RAM/VRAM ogni N token")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
