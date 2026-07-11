@@ -57,9 +57,11 @@ class ResourcePlanTest(unittest.TestCase):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,
                  "free_bytes": 10 * GB}]
         plan = build_plan(self.model, ram_gb=16, context=32, vram_gb=20,
-                          available_memory=32 * GB, available_disk=100 * GB, gpus=gpus)
+                          available_memory=32 * GB, available_disk=100 * GB, gpus=gpus,
+                          physical_cpus=24)
         self.assertEqual(plan["version"], 2)
         self.assertEqual(plan["policy"]["name"], "quality")
+        self.assertEqual(plan["cpu"]["physical_cores"], 24)
         self.assertTrue(plan["policy"]["preserve_quantization"])
         self.assertFalse(plan["tiers"]["vram"]["requires_host_backing"])
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
@@ -96,8 +98,15 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "12")
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
+        self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
+        self.assertEqual(env["OMP_PROC_BIND"], "spread")
+        self.assertEqual(env["OMP_PLACES"], "cores")
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
 
+        explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
+                                                        "OMP_PROC_BIND": "close"})
+        self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
+        self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
     def test_cpu_binary_does_not_apply_gpu_tier(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
                           gpus=[{"index": 0, "name": "a", "total_bytes": 8 * GB,
