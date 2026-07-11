@@ -38,10 +38,12 @@ int main(int argc,char**argv){
     if(fd<0){perror("open");return 1;}
     off_t sz=lseek(fd,0,SEEK_END);
     if(sz<blk*2){fprintf(stderr,"file troppo piccolo\n");return 1;}
-    /* offset random pre-generati (stessi per ogni configurazione: srand fisso) */
+    /* offset random pre-generati (stessi per ogni configurazione: srand fisso).
+     * 30 bit di rand combinati: su Windows RAND_MAX=32767 e un singolo rand()*4096
+     * copre solo i primi 134 MB del file (tutti in page cache = misura falsa). */
     off_t *offs=malloc(n*sizeof(off_t)); srand(1234);
-    for(int i=0;i<n;i++){ off_t o=((off_t)rand()*4096)%(sz-blk); offs[i]=o&~4095L; }
-    double t0=now(); long tot=0;
+    for(int i=0;i<n;i++){ off_t r30=((off_t)rand()<<15)|rand(); off_t o=(r30*4096)%(sz-blk); offs[i]=o&~4095L; }
+    double t0=now(); int64_t tot=0;   /* long e' 32-bit su Windows (LLP64): >2GB andava in overflow */
     #pragma omp parallel num_threads(nth) reduction(+:tot)
     {
         void *buf; if(posix_memalign(&buf,4096,blk)){perror("memalign");exit(1);}
@@ -50,7 +52,7 @@ int main(int argc,char**argv){
             ssize_t r=pread(fd,buf,blk,offs[i]);
             if(r<0) perror("pread"); else tot+=r;
         }
-        free(buf);
+        compat_aligned_free(buf);   /* su Windows posix_memalign=_aligned_malloc: free() corrompe l'heap */
     }
     double dt=now()-t0;
     printf("%s x%d thread: %d letture x %ldMB = %.1f GB in %.2fs -> %.2f GB/s (%.1f ms/blocco effettivi)\n",
