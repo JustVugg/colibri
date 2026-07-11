@@ -145,11 +145,20 @@ Kernel plan (all one command buffer, barriers between): q_a matmul → rmsnorm �
 q_b matmul → rope → kv_a matmul → (cache write) → [qabs → score → softmax → clat →
 ctx] absorption core → o_proj matmul.
 
-## Validated so far
-- [x] **Absorption core kernel** (qabs/score/softmax/clat/ctx, 64 heads, int4 kv_b
-  row-gather): correct vs CPU (nerr ~1e-6) at T=128/512/2048; 0.37-0.68 ms/layer.
-  This was the novel/high-risk piece — de-risked.
-- [ ] rmsnorm + rope kernels (trivial) + projection matmuls (reuse expert kernel).
-- [ ] Assemble full fused decode attention (one command buffer) + CPU-ref microbench.
-- [ ] Integrate into attention() behind COLI_METAL (decode/absorb path only; prefill
-  and DSA-select stay CPU); token-exact validation; A/B for latency reclaim.
+## Done
+- [x] **Absorption core kernel** validated (nerr ~1e-6, 0.37-0.68 ms/layer).
+- [x] rmsnorm + RoPE + copy kernels; projection matmuls reuse mm_gemv.
+- [x] `coli_metal_attn_decode`: full S=1 decode attention in ONE command buffer.
+      Attention weights uploaded+cached; Lc/Rc page-aligned + registered in kv_alloc.
+- [x] Integrated into attention() behind COLI_METAL (S=1 absorb, st0==0, no active DSA
+      selection, GLM-5.2 int4 dims; else CPU fallback). DSA index-key stays on CPU.
+- [x] **Token-exact vs CPU** (identical greedy output). Attention 16.5s -> 10.5s
+      (~1.57x) with MTP on; end-to-end 0.20 -> 0.28 tok/s (~1.4x).
+
+## Known limits / next
+- Fused path is **S=1 only** — with MTP on, S=4 verify forwards still use CPU attention.
+  Extending the kernels to S<=4 would cover MTP decode (bigger attention win).
+- Attention and experts are still separate command buffers with CPU glue between, so
+  the expert-block idle latency (~63% of GPU wall) is not yet reclaimed. Tighter
+  coupling (fewer syncs per layer) is the remaining latency lever.
+- prefill kv_b-reconstruction GEMM still CPU (a clean future offload).
