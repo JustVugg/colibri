@@ -452,6 +452,33 @@ extern "C" int coli_metal_attn_decode(const float* x,
   return 1;
 }
 
+// Sync GEMM for large row-batches (prefill): y[S,O] = x[S,I] @ W^T * scale. Weights must be
+// registered (zero-copy); x/y go through grow-only shared scratch. Returns 0 -> CPU fallback.
+static id<MTLBuffer> g_gx, g_gy; static size_t g_gx_cap, g_gy_cap;
+extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const float *sp,
+                               int fmt, int S, int I, int O) {
+  if (!g_dev || (fmt!=1 && fmt!=2)) return 0;
+  @autoreleasepool {
+    uint64_t wa=0,sa=0; id<MTLBuffer> wb=resolve(wp,&wa), sb=resolve(sp,&sa);
+    if(!wb||!sb) return 0;
+    size_t woff=wa-(uint64_t)[wb gpuAddress], soff=sa-(uint64_t)[sb gpuAddress];
+    g_gx=ensure(g_gx,&g_gx_cap,(size_t)S*I*4); g_gy=ensure(g_gy,&g_gy_cap,(size_t)S*O*4);
+    memcpy([g_gx contents],x,(size_t)S*I*4);
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e useResource:wb usage:MTLResourceUsageRead]; [e useResource:sb usage:MTLResourceUsageRead];
+    [e setComputePipelineState:g_gemv];
+    [e setBuffer:wb offset:woff atIndex:0]; [e setBuffer:sb offset:soff atIndex:1];
+    [e setBuffer:g_gx offset:0 atIndex:2]; [e setBuffer:g_gy offset:0 atIndex:3];
+    [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
+    [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
+    [e dispatchThreadgroups:MTLSizeMake((size_t)O*S,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] gemm cmdbuf error (S=%d O=%d)\n",S,O); return 0; }
+    memcpy(y,[g_gy contents],(size_t)S*O*4);
+  }
+  return 1;
+}
+
 extern "C" void coli_metal_tensor_free(ColiMetalTensor *t) {
   if (!t) return;
   g_tensor_count--; g_tensor_bytes -= t->wbytes;

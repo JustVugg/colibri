@@ -38,7 +38,9 @@
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
+#include <omp.h>
 static int g_metal_enabled;
+static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -458,6 +460,15 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
 }
 
 static void matmul_qt(float *y, const float *x, QT *w, int S){
+#ifdef COLI_METAL
+    /* Large row-batches (prefill: kv_b reconstruction, o_proj, dense MLP, step_all logits)
+     * amortize Metal's ~5ms submit latency; small-S decode matmuls stay on CPU (NEON wins).
+     * Weights must be registered (all dense QT allocs are, via qalloc). */
+    if(g_metal_enabled && S>=g_metal_gemm_min && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
+        const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O)) return;
+    }
+#endif
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
      * Streaming expert slots are reused for different IDs and must never enter
@@ -2616,6 +2627,7 @@ int main(int argc, char **argv){
         if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend richiesto ma non disponibile\n"); return 2; }
         fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
         if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
+        if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
     }
 #else
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){

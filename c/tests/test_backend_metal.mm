@@ -192,6 +192,24 @@ int main(void) {
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
+  printf("Metal large-batch gemm test:\n");
+  { // registered int4 weights, S=64: coli_metal_gemm vs cpu_ref
+    srand(77); int O=2048,I=6144,S=64,rb=(I+1)/2;
+    size_t wb=(((size_t)O*rb)+16383)&~(size_t)16383, sb2=(((size_t)O*4)+16383)&~(size_t)16383;
+    uint8_t*W; float*Sc; posix_memalign((void**)&W,16384,wb); posix_memalign((void**)&Sc,16384,sb2);
+    for(size_t i=0;i<(size_t)O*rb;i++) W[i]=(uint8_t)(rand()&0xFF);
+    for(int i=0;i<O;i++) Sc[i]=0.01f+(rand()%50)/50000.f;
+    coli_metal_register(W,wb); coli_metal_register(Sc,sb2);
+    std::vector<float> x((size_t)S*I), yr((size_t)S*O), yg((size_t)S*O);
+    for(auto&v:x) v=((rand()%2000)-1000)/1000.f;
+    cpu_ref(I4,W,Sc,x.data(),yr.data(),S,I,O);
+    int ok=coli_metal_gemm(yg.data(),x.data(),W,Sc,2,S,I,O);
+    double ma=0,ym=0; for(size_t i=0;i<yr.size();i++){ ma=fmax(ma,fabs(yg[i]-yr[i])); ym=fmax(ym,fabs(yr[i])); }
+    int pass = ok && ma/(ym+1e-9)<1e-4;
+    printf("  gemm S=64 int4          nerr=%.2e  %s\n", ma/(ym+1e-9), pass?"ok":"*** MISMATCH");
+    fail |= !pass;
+    coli_metal_unregister(W); coli_metal_unregister(Sc); free(W); free(Sc);
+  }
   printf("Metal fused attention tests:\n");
   fail |= run_attn(1, 0,   "attn S=1 pos=0");
   fail |= run_attn(1, 37,  "attn S=1 pos=37");
