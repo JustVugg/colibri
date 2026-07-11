@@ -68,6 +68,7 @@ class GenerationScheduler:
         self.max_queue = max_queue
         self.queue_timeout = queue_timeout
         self.capacity = capacity
+        self.free_slots = set(range(capacity))
         self.condition = threading.Condition()
         self.queue = collections.deque()
         self.active = 0
@@ -79,7 +80,7 @@ class GenerationScheduler:
         self.cancelled = 0
 
     @contextlib.contextmanager
-    def admit(self, cancelled=None):
+    def admit(self, cancelled=None, slot=None):
         ticket = object()
         queued_at = time.monotonic()
         with self.condition:
@@ -98,7 +99,8 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
-                if self.active < self.capacity and self.queue[0] is ticket:
+                available = min(self.free_slots) if slot is None and self.free_slots else slot
+                if self.queue[0] is ticket and available in self.free_slots:
                     break
                 if cancelled and cancelled():
                     self.queue.remove(ticket)
@@ -114,14 +116,16 @@ class GenerationScheduler:
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
                 self.condition.wait(min(remaining, 0.25))
             self.queue.popleft()
+            self.free_slots.remove(available)
             self.active += 1
             self.admitted += 1
             wait_seconds = time.monotonic() - queued_at
         try:
-            yield wait_seconds
+            yield wait_seconds, available
         finally:
             with self.condition:
                 self.active -= 1
+                self.free_slots.add(available)
                 self.completed += 1
                 self.condition.notify_all()
 
@@ -558,8 +562,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def generation(self, body, prompt, request_id, chat):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
-        cache_slot = body.get("cache_slot", 0)
-        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots:
+        cache_slot = body.get("cache_slot")
+        if (cache_slot is not None and
+                (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
+                 not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
         stream = body.get("stream", False)
@@ -574,7 +580,8 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
 
-        with self.server.scheduler.admit(self.client_disconnected) as queue_wait:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []

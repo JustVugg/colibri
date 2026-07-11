@@ -109,8 +109,9 @@ class ProtocolTest(unittest.TestCase):
 class SchedulerTest(unittest.TestCase):
     def test_admits_up_to_capacity_without_serializing(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=1, capacity=2)
-        with scheduler.admit():
-            with scheduler.admit():
+        with scheduler.admit() as first:
+            with scheduler.admit() as second:
+                self.assertEqual({first[1], second[1]}, {0, 1})
                 self.assertEqual(scheduler.snapshot()["active"], 2)
 
     def test_rejects_when_waiting_queue_is_full(self):
