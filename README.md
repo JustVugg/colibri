@@ -110,7 +110,60 @@ sets the RAM budget and context immediately; the VRAM tier is enabled only when
 the current `glm` binary is linked with CUDA. Explicit flags and environment
 variables keep precedence over automatic values.
 
+Before loading the model, `coli doctor` performs a read-only readiness check and
+explains whether the selected Disk/RAM/VRAM placement is runnable:
+
+```bash
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor --gpu 0 --ram 128 --json
+```
+
+Doctor validates the model directory, config, tokenizer, safetensors headers,
+engine executable, available RAM, requested NVIDIA devices, CUDA linkage, and the
+same placement budget used by `coli plan`. It never starts `glm`, reads tensor
+payloads, imports a model framework, or creates a CUDA context. The versioned JSON
+report uses stable check IDs for automation. Warnings keep exit status 0; missing
+requirements or an unsafe RAM projection return 1, while invalid CLI values return 2.
+
 The engine at runtime is pure C — python is only used by the one-time converter.
+
+### Windows 11 (native, no WSL)
+
+colibrì builds and runs natively on Windows 11 x86-64 with MinGW-w64. The port adds
+a `_WIN32` compatibility layer in `c/compat.h` that maps POSIX I/O to the Windows API
+(pread → ReadFile+OVERLAPPED, posix_fadvise no-op, aligned allocation, MoveFileEx rename,
+GlobalMemoryStatusEx RAM detection). All platform differences stay in `compat.h`; the
+engine source is unchanged.
+
+**Toolchain:** GCC via [winlibs](https://winlibs.com/) or MSYS2 MinGW-w64. Tested with
+GCC 16.1.0 (x86_64-ucrt-posix-seh).
+
+```powershell
+# One-time toolchain install (pick one):
+scoop install mingw-winlibs                    # portable, no shell needed
+# or: pacman -S mingw-w64-x86_64-gcc make     # via MSYS2
+
+# Build (from c/ directory):
+make glm.exe            # GLM-5.2 engine (static, no DLL dependencies)
+make olmoe.exe          # OLMoE engine (same shims)
+make iobench.exe        # disk I/O benchmark
+make test-c             # run C tests
+make test-python        # run Python tests (requires python)
+
+# Verify (tiny model, 2.4 MB):
+pip install torch transformers safetensors huggingface_hub
+python tools/make_glm_oracle.py                # generate tiny oracle
+SNAP=./glm_tiny TF=1 ./glm.exe 64 16 16        # expect "32/32 posizioni"
+
+# Run with real model:
+SNAP=D:\glm52_i4 ./glm.exe 64 4 16            # batch inference
+python coli chat --model D:\glm52_i4            # interactive chat
+python coli serve --model D:\glm52_i4            # OpenAI-compatible API
+```
+
+**Status:** Phase 1 complete (compiles, correct, static-linked). O_DIRECT (Phase 2),
+GPU via `LoadLibrary` on `coli_cuda.dll` (Phases G0–G2), and full-model validation
+are separate workstreams. See `PORT_WINDOWS_PLAN.md` for the full plan.
 
 ### OpenAI-compatible API
 
@@ -302,7 +355,7 @@ thrashing. Persistent `.coli_usage` remains the long-term signal and is not deca
 
 ## Got a better machine? Try it — here's what to expect
 
-colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4 — never a network/9p mount).
+colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
 
 **How to test it, in order:**
 

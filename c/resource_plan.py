@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 from pathlib import Path
@@ -110,8 +111,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
-        fs = os.statvfs(info["path"])
-        available_disk = fs.f_bavail * fs.f_frsize
+        try:
+            usage = shutil.disk_usage(info["path"])
+            available_disk = usage.free
+        except OSError:
+            available_disk = 500 * GB
     gpus = discover_gpus() if gpus is None else gpus
     if gpu_indices is not None:
         wanted = set(gpu_indices)

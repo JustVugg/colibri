@@ -8,6 +8,7 @@ CLI per far girare GLM-5.2 (744B) in locale, su CPU, in ~15-26 GB di RAM.
   coli run "prompt"         generazione singola
   coli info                 stato: modello, RAM, disco, config
   coli plan                 piano risorse Disk / RAM / VRAM
+  coli doctor               diagnosi installazione e piano di esecuzione
   coli bench [task...]      benchmark di qualità (MMLU/HellaSwag/...)
   coli convert              converte GLM-5.2-FP8 -> int4 (streaming)
   coli build                compila il motore
@@ -21,9 +22,15 @@ Config via env o flag (validi anche dopo il sottocomando):
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
+# Windows: forza output UTF-8 (console cp1252 tronca Unicode box-drawing/emoji)
+if sys.platform == "win32":
+    for s in (sys.stdout, sys.stderr):
+        try: s.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError): pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "tools")
-GLM  = os.path.join(HERE, "glm")
+GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
@@ -299,8 +306,11 @@ def cmd_info(a):
         av=int(re.search(r'MemAvailable:\s+(\d+)',mi).group(1))/1e6
         row("RAM", f"{tot:.0f} GB totali · {av:.1f} GB disponibili")
     except Exception: pass
-    fs=os.statvfs(a.model if os.path.isdir(a.model) else HERE)
-    row("disco", f"{fs.f_bavail*fs.f_frsize/1e9:.0f} GB liberi")
+    try:
+        fs = shutil.disk_usage(a.model if os.path.isdir(a.model) else HERE)
+        row("disco", f"{fs.free/1e9:.0f} GB liberi")
+    except OSError:
+        row("disco", "? GB (non disponibile)")
     row("motore", "pronto ✓" if os.path.exists(GLM) else "da compilare (coli build)")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
@@ -324,6 +334,23 @@ def cmd_plan(a):
     banner("plan · Disk / RAM / VRAM")
     print(textwrap.indent(format_plan(plan),"  "))
     print()
+
+def cmd_doctor(a):
+    from doctor import exit_code, format_doctor, run_doctor
+    try:
+        ram,ctx,devices,vram=resource_request(a,os.environ)
+        if ctx<1: raise ValueError("--ctx deve essere positivo")
+        if ram<0: raise ValueError("--ram non puo essere negativo")
+        if vram<0: raise ValueError("--vram non puo essere negativo")
+    except ValueError as error:
+        report={"schema_version":1,"status":"error","model":os.path.abspath(a.model),
+                "checks":[{"id":"config.arguments","status":"fail","summary":str(error)}],
+                "plan":None}
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+        return 2
+    report=run_doctor(a.model,ram,ctx,devices,vram,engine_path=GLM)
+    print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+    return exit_code(report)
 
 def cmd_run(a):
     need_model(a.model)
@@ -447,7 +474,7 @@ def cmd_bench(a):
     need_model(a.model)
     banner("bench")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py=os.path.join(HERE,"mio_env","bin","python3")
+    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
@@ -466,7 +493,7 @@ def cmd_bench(a):
 def cmd_convert(a):
     banner("convert")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py=os.path.join(HERE,"mio_env","bin","python3")
+    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
     base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
@@ -498,6 +525,8 @@ def main():
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
+    pd=sub.add_parser("doctor",parents=[common])
+    pd.add_argument("--json",action="store_true",help="emette un report JSON versionato")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
     sub.add_parser("chat", parents=[common])
     ps=sub.add_parser("serve", parents=[common])
@@ -514,8 +543,11 @@ def main():
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="salta la testa MTP (niente draft speculativi)")
     a=ap.parse_args()
-    {"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
-     "convert":cmd_convert}.get(a.cmd, lambda _:(banner(),print(__doc__)))(a)
+    handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
+             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
+             "convert":cmd_convert}.get(a.cmd)
+    if handler: sys.exit(handler(a) or 0)
+    banner(); print(__doc__)
 
 if __name__=="__main__":
     signal.signal(signal.SIGINT, signal.default_int_handler)

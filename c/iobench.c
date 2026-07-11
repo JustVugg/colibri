@@ -12,6 +12,7 @@
 #include <time.h>
 #include <errno.h>
 #include <string.h>
+#include "compat.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif

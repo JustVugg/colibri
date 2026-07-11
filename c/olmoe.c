@@ -12,7 +12,9 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
+#endif
 #include "st.h"
 
 /* ---------- config ---------- */

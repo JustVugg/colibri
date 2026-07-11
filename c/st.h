@@ -76,11 +76,11 @@ static inline float f16_to_f32(uint16_t h) {
 
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, COMPAT_O_RDONLY);
     if (fd < 0) { perror(path); exit(1); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
-    S->dfds[S->nfd] = open(path, O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
+    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__)
     S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE ~ O_DIRECT */
 #else
