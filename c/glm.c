@@ -32,6 +32,7 @@
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
+#include "prefetch_queue.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -1303,24 +1304,39 @@ static void la_predict(Model *m, int target, const float *h, int kind){
  * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
  * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
  * (un hint perso non e' un errore). */
-static struct { int l,e; } pilot_q[4096];
-static volatile unsigned pilot_w=0, pilot_r=0;
-static Model *pilot_m=NULL;
+static ColiPrefetchQueue pilot_q;
+static Model *pilot_m=NULL; static pthread_t pilot_thread; static int pilot_started;
+static uint64_t pilot_queued,pilot_deduped,pilot_dropped,pilot_processed;
 static void *pilot_worker(void *arg){
     (void)arg;
-    for(;;){
-        unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
-        unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
-        if(r==w){ usleep(200); continue; }
-        expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
-        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+    ColiPrefetchItem item;
+    while(coli_prefetch_pop(&pilot_q,&item)){
+        expert_prefetch(pilot_m,item.layer,item.expert);
+        coli_prefetch_done(&pilot_q,item); pilot_processed++;
     }
     return NULL;
+}
+static void pilot_shutdown(void){
+    if(!pilot_started) return;
+    coli_prefetch_stop(&pilot_q); pthread_join(pilot_thread,NULL);
+    fprintf(stderr,"[PILOT] prefetch: %llu eseguiti, %llu accodati, %llu deduplicati, %llu scartati\n",
+        (unsigned long long)pilot_processed,(unsigned long long)pilot_queued,
+        (unsigned long long)pilot_deduped,(unsigned long long)pilot_dropped);
+    coli_prefetch_destroy(&pilot_q); pilot_started=0;
+}
+static int pilot_start(Model *m){
+    if(pilot_started) return 1;
+    if(!coli_prefetch_init(&pilot_q,m->c.n_layers+1,m->c.n_experts)) return 0;
+    pilot_m=m;
+    if(pthread_create(&pilot_thread,NULL,pilot_worker,NULL)){
+        coli_prefetch_destroy(&pilot_q); pilot_m=NULL; return 0;
+    }
+    pilot_started=1; atexit(pilot_shutdown); return 1;
 }
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
     int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
-    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    if(!pilot_start(m)) return;
     float *nrm=falloc(D), *ch=falloc(E);
     for(int s=0;s<S;s++){
         rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
@@ -1334,11 +1350,8 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             ESlot *Sl=m->ecache[lnext];
             for(int z=0;z<m->ecn[lnext] && !found;z++) if(Sl[z].eid==best) found=1;
             if(!found){
-                unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
-                if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
-                    pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
-                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
-                }
+                int rc=coli_prefetch_push(&pilot_q,lnext,best);
+                if(rc>0) pilot_queued++; else if(!rc) pilot_deduped++; else pilot_dropped++;
             }
         }
     }
