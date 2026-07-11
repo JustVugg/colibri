@@ -24,6 +24,8 @@
 #include <time.h>
 #include <limits.h>
 #include <pthread.h>                              /* thread I/O del PILOTA */
+#include <stdatomic.h>                            /* PIPE: ready-flags / job queue */
+#include <sched.h>                                /* PIPE: sched_yield nello spin */
 #include <unistd.h>
 #include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
@@ -942,6 +944,97 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     s->eid=eid;
 }
 
+/* ============================ PIPE: load ‖ matmul ============================
+ * Overlap NVMe expert-weight loads with expert matmul. A small persistent pool
+ * of I/O worker pthreads runs the misses' pread (expert_load) into distinct
+ * ws[] slabs and sets a per-slot `ready` flag; the MAIN thread walks the block's
+ * experts in order, waiting on ready[q] only for the expert it needs right now,
+ * and does all matmul_qt on itself (matmul_qt parallelises internally via OpenMP
+ * and checks !omp_in_parallel() for GPU dispatch — so it must stay off the omp
+ * team and off these I/O threads).
+ *
+ * Cross-generation safety is provided by a single generation-tagged, lock-free
+ * cursor `cur = (gen<<8) | index`. The main thread is the sole writer of `gen`
+ * (monotonic bump, so no ABA); workers grab jobs by CAS-advancing the low 8-bit
+ * index. THE INVARIANT: a worker reads eids[i]/layer only AFTER its winning CAS,
+ * and that CAS's comparand carries the generation — so if `cur`'s gen advanced
+ * (a new batch was published), the CAS fails and the worker re-reads, seeing the
+ * new generation. A straggler preempted anywhere (wake gap, post-cursor) can
+ * therefore NEVER grab a wrong-generation job or read torn batch state: its
+ * first act is a gen-checked CAS. dispatch publishes all batch state with
+ * relaxed stores and then RELEASE-stores `cur`; each worker ACQUIRE-loads `cur`,
+ * so the ready[] reset + eids[]/njobs/layer are visible before any worker acts.
+ * The per-expert pipe_wait(ready[q]) in the matmul loop makes every grabbed job
+ * complete before the block ends, so no grab outlives its generation — which is
+ * why the old `active` counter AND the end-of-block drain barrier are gone (both
+ * were redundant with those per-slot waits + the gen-tagged cursor). The mutex/
+ * condvar exist ONLY to park/wake idle workers, never for correctness. Gated
+ * behind PIPE=1; OFF => the original blocking-load + serial-matmul path runs
+ * byte-identically. */
+static int g_pipe=0;      /* PIPE=1: async expert-load pipeline (default OFF) */
+static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
+typedef struct {
+    _Atomic uint64_t cur;                         /* (gen<<8)|index; gen main-only, index 0..njobs (≤64) */
+    _Atomic int njobs;                            /* current batch job count */
+    _Atomic int eids[64];                         /* current batch expert ids */
+    _Atomic int layer;                            /* current batch layer */
+    _Atomic int ready[64];                        /* per-slot load-done flag */
+    pthread_mutex_t mx; pthread_cond_t cv;        /* ONLY for parking/waking idle workers */
+    Model *m;
+    pthread_t th[16]; int nw; int started;
+} PipePool;
+static PipePool g_pp;
+
+static void *pipe_worker(void *arg){
+    (void)arg; PipePool *p=&g_pp; uint64_t seen=0;
+    for(;;){
+        pthread_mutex_lock(&p->mx);
+        while((atomic_load_explicit(&p->cur,memory_order_relaxed)>>8)==seen)
+            pthread_cond_wait(&p->cv,&p->mx);
+        pthread_mutex_unlock(&p->mx);
+        for(;;){
+            uint64_t c=atomic_load_explicit(&p->cur,memory_order_acquire);
+            seen=c>>8;
+            uint32_t i=(uint32_t)(c & 0xFF);
+            if(i >= (uint32_t)atomic_load_explicit(&p->njobs,memory_order_relaxed))
+                break;                                /* batch drained → re-park */
+            if(atomic_compare_exchange_weak_explicit(&p->cur,&c,c+1,
+                    memory_order_acq_rel,memory_order_relaxed)){
+                int L  =atomic_load_explicit(&p->layer,memory_order_relaxed);
+                int eid=atomic_load_explicit(&p->eids[i],memory_order_relaxed); /* AFTER winning CAS */
+                expert_load(p->m,L,eid,&p->m->ws[i]);
+                atomic_store_explicit(&p->ready[i],1,memory_order_release);
+            }
+            /* CAS failed → another worker advanced index (or gen advanced): re-loop */
+        }
+    }
+    return NULL;
+}
+static void pipe_init(Model *m){
+    if(g_pp.started) return;
+    g_pp.m=m; g_pp.nw=g_pipe_nw; if(g_pp.nw>16) g_pp.nw=16; if(g_pp.nw<1) g_pp.nw=1;
+    atomic_store(&g_pp.cur,0); atomic_store(&g_pp.njobs,0);
+    pthread_mutex_init(&g_pp.mx,NULL); pthread_cond_init(&g_pp.cv,NULL);
+    for(int i=0;i<g_pp.nw;i++) pthread_create(&g_pp.th[i],NULL,pipe_worker,NULL);
+    g_pp.started=1;
+}
+/* enqueue `njobs` loads (slots ws[0..njobs)); returns immediately, workers run ahead.
+ * Order is load-bearing: write all batch state RELAXED, then RELEASE-store cur to
+ * publish it, then wake parked workers. */
+static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
+    g_pp.m=m;
+    atomic_store_explicit(&g_pp.njobs,njobs,memory_order_relaxed);
+    atomic_store_explicit(&g_pp.layer,layer,memory_order_relaxed);
+    for(int q=0;q<njobs;q++) atomic_store_explicit(&g_pp.eids[q],eids[q],memory_order_relaxed);
+    for(int q=0;q<njobs;q++) atomic_store_explicit(&g_pp.ready[q],0,memory_order_relaxed); /* reset BEFORE publish */
+    uint64_t g=(atomic_load_explicit(&g_pp.cur,memory_order_relaxed)>>8)+1;
+    atomic_store_explicit(&g_pp.cur,(g<<8),memory_order_release);                          /* PUBLISH */
+    pthread_mutex_lock(&g_pp.mx); pthread_cond_broadcast(&g_pp.cv); pthread_mutex_unlock(&g_pp.mx);
+}
+static inline void pipe_wait(int q){
+    while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
+}
+
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
  * cosi' le letture sincrone successive trovano la page-cache calda. */
 static void expert_prefetch(Model *m, int layer, int eid){
@@ -1203,18 +1296,26 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
-        ESlot *use[64]; int missk[64]; int nmiss=0;
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL;
+        ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
-            if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
-        if(nmiss){ double t0=now_s();
-            #pragma omp parallel for schedule(dynamic,1)
-            for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
-            m->t_edisk += now_s()-t0; }
+        if(nmiss){
+            if(g_pipe){                            /* PIPE: launch loads async, matmul overlaps them */
+                if(!g_pp.started) pipe_init(m);
+                double t0=now_s();
+                int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
+                pipe_dispatch(m,layer,eids,nmiss);
+                m->t_edisk += now_s()-t0;           /* dispatch only; real reads hide behind matmul */
+            } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
+                #pragma omp parallel for schedule(dynamic,1)
+                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
+                m->t_edisk += now_s()-t0; }
+        }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
         if(base+64<nu){
@@ -1228,6 +1329,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             }
         }
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+            /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
+             * dispatched slot must be waited before the end-of-block LRU swap can reuse
+             * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant. */
+            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk += now_s()-tw; }
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
@@ -1245,6 +1350,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
         }
+        /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
+         * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
+         * for this block, so they are complete before the LRU swap — and the gen-tagged
+         * cursor keeps any still-spinning worker off a wrong-generation slot. */
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -2397,6 +2506,9 @@ int main(int argc, char **argv){
     g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):8;
     if(g_pilot_k<1) g_pilot_k=1;
+    g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
+    g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
+    if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
