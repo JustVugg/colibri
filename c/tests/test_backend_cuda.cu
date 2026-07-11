@@ -82,6 +82,18 @@ int main(int argc, char **argv) {
     if (!coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,x) ||
         !close_enough(grouped,want_expert,8)) return 1;
 
+    const float aw[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    const float aq[4]={1,2,.5f,-.5f},al[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
+    const float ar[6]={1,0, 0,1, 1,1};float actx[2],aref[2];
+    ColiCudaTensor *at=nullptr;if(!coli_cuda_tensor_upload(&at,aw,nullptr,0,4,4,d0))return 1;
+    float score[3];for(int t=0;t<3;t++)score[t]=aq[0]*al[t*4]+aq[1]*al[t*4+1]+aq[2]*ar[t*2]+aq[3]*ar[t*2+1];
+    float mx=score[0],z=0;for(int t=1;t<3;t++)mx=score[t]>mx?score[t]:mx;
+    for(int t=0;t<3;t++){score[t]=std::exp(score[t]-mx);z+=score[t];}for(int t=0;t<3;t++)score[t]/=z;
+    for(int v=0;v<2;v++){aref[v]=0;for(int t=0;t<3;t++)aref[v]+=score[t]*al[t*4+2+v];}
+    if(!coli_cuda_attention_absorb(at,actx,aq,al,ar,1,2,2,2,4,3,1.f)||
+       !close_enough(actx,aref,2))return 1;
+    coli_cuda_tensor_free(at);
+
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */
     uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], tensor4[64];

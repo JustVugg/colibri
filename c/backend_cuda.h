@@ -54,6 +54,11 @@ int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            const int *rows, int count,
                            float *y, const float *x);
 
+/* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
+int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                               const float *latent,const float *rope,int H,int Q,
+                               int R,int V,int K,int T,float attention_scale);
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);

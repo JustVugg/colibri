@@ -148,6 +148,7 @@ typedef struct {
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
+    double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
 } Model;
 
@@ -1207,7 +1208,25 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * costo per step ~O(T·kv_lora) invece di O(T·H·(nope+vh)) del matmul kvb_all. */
     int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4);
     if(absorb && c->kv_lora<=512){
+        m->t_aproj+=now_s()-ta0; double tac=now_s();
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
+        int cuda_core=0;
+#ifdef COLI_CUDA
+        if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+           l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
+            cuda_core=1;
+            for(int s=0;s<S&&cuda_core;s++){
+                KVState *ks=kvs?kvs[s]:m->kv;int pos=positions?positions[s]:pos_base+s;
+                int st0=ks->kv_start[layer],nt=pos+1-st0;
+                if(dnsel&&dnsel[s]>0){cuda_core=0;break;}
+                cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                    Q+(int64_t)s*H*qh,coli_kv_row(ks->Lc[layer],st0,kvl),
+                    coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
+                    vh,kvl,nt,c->attn_scale);
+            }
+        }
+#endif
+        if(!cuda_core){
         #pragma omp parallel for collapse(2) schedule(static)
         for(int s=0;s<S;s++) for(int h=0;h<H;h++){
             KVState *ks=kvs?kvs[s]:m->kv;
@@ -1237,18 +1256,21 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
             free(sc);
         }
-        matmul_qt(out, ctx, &l->o, S);
+        }
+        m->t_acore+=now_s()-tac; double tao=now_s();
+        matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp);
         m->t_attn += now_s()-ta0;
         return;
     }
     /* 2) ricostruzione di k_nope+value per TUTTI i token 0..Tk-1 (un solo matmul su kv_b) */
-    double tk0=now_s();
+    m->t_aproj+=now_s()-ta0; double tk0=now_s();
     int stL=m->kv_start[layer];
     float *kvb_all=falloc((int64_t)Tk*kvb_dim);
     matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     m->t_kvb += now_s()-tk0;
     /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot */
+    double tac=now_s();
     #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int h=0;h<H;h++){
         int pos=pos_base+s;
@@ -1273,7 +1295,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
         free(sc);
     }
-    matmul_qt(out, ctx, &l->o, S);
+    m->t_acore+=now_s()-tac; double tao=now_s();
+    matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
     free(ctx); free(Q); free(QR); free(comp); free(kvb_all);
     m->t_attn += now_s()-ta0;
 }
@@ -2074,6 +2097,8 @@ static void profile_print(Model *m, double elapsed){
     printf("PROFILO: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
         m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+    printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
+        m->t_aproj,m->t_acore,m->t_aout);
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -2085,6 +2110,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     float *logit=step(m,full,np-1,0); free(logit);
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
     m->t_edisk=m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
+    m->t_aproj=m->t_acore=m->t_aout=0;
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         logit=step(m,full+i,1,i); free(logit); steps++;
