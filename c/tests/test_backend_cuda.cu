@@ -55,8 +55,25 @@ int main(int argc, char **argv) {
     ColiCudaTensor *tf = nullptr;
     if (!coli_cuda_matmul(&tf, got, x, wf, nullptr, 0, 1, 4, 2, d0) || !close_enough(got, wantf, 2)) return 1;
 
+    const float eg[8] = {1,0,0,0, 0,1,0,0};
+    const float eu[8] = {1,0,0,0, 0,1,0,0};
+    const float ed[8] = {1,0, 0,1, 1,1, 1,-1};
+    ColiCudaTensor *tg=nullptr,*tu=nullptr,*td=nullptr;
+    if (!coli_cuda_tensor_upload(&tg,eg,nullptr,0,4,2,d0) ||
+        !coli_cuda_tensor_upload(&tu,eu,nullptr,0,4,2,d0) ||
+        !coli_cuda_tensor_upload(&td,ed,nullptr,0,2,4,d0)) return 1;
+    float expert[8], want_expert[8];
+    for(int s=0;s<2;s++){
+        float a=x[s*4], b=x[s*4+1];
+        a=(a/(1.0f+std::exp(-a)))*a; b=(b/(1.0f+std::exp(-b)))*b;
+        want_expert[s*4]=a; want_expert[s*4+1]=b;
+        want_expert[s*4+2]=a+b; want_expert[s*4+3]=a-b;
+    }
+    if (!coli_cuda_expert_mlp(tg,tu,td,expert,x,2) ||
+        !close_enough(expert,want_expert,8)) return 1;
+
     coli_cuda_stats(-1, &count, &bytes);
-    if (count != 4 || bytes != 70) {
+    if (count != 7 || bytes != 166) {
         std::fprintf(stderr, "unexpected CUDA stats: %zu tensors, %zu bytes\n", count, bytes);
         return 1;
     }
@@ -64,15 +81,18 @@ int main(int argc, char **argv) {
         coli_cuda_tensor_device(t4) != d1 || coli_cuda_tensor_device(t2) != d1) return 1;
     coli_cuda_stats(d0, &count, &bytes);
     if (ndev > 1) {
-        if (count != 2 || bytes != 48) return 1;
+        if (count != 5 || bytes != 144) return 1;
         coli_cuda_stats(d1, &count, &bytes);
         if (count != 2 || bytes != 22) return 1;
-    } else if (count != 4 || bytes != 70) return 1;
+    } else if (count != 7 || bytes != 166) return 1;
 
     coli_cuda_tensor_free(t8);
     coli_cuda_tensor_free(t4);
     coli_cuda_tensor_free(t2);
     coli_cuda_tensor_free(tf);
+    coli_cuda_tensor_free(tg);
+    coli_cuda_tensor_free(tu);
+    coli_cuda_tensor_free(td);
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
     coli_cuda_shutdown();

@@ -38,6 +38,12 @@ int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device);
 
+/* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
+ * must already be resident on one device.  Activations cross PCIe once in
+ * each direction instead of once per matrix. */
+int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S);
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
