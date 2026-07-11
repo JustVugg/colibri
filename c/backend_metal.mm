@@ -331,23 +331,20 @@ static void attn_scratch_init(){
   aqabs_=L((size_t)AHEADS*AKVL*4); aclat_=L((size_t)AHEADS*AKVL*4); actx_=L(AHVH*4); aout_=L(AH*4);
   aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
 }
-// Cache of uploaded resident weights/scales (fixed dense tensors reused every token).
-// Attention runs serially (not under OpenMP), so no lock needed.
-static std::vector<std::pair<const void*,id<MTLBuffer>>> g_wcache;
-static id<MTLBuffer> wcache(const void* p, size_t bytes){
-  for(auto&kv:g_wcache) if(kv.first==p) return kv.second;
-  id<MTLBuffer> b=[g_dev newBufferWithBytes:p length:bytes options:MTLResourceStorageModeShared];
-  g_wcache.push_back({p,b}); return b;
-}
-// y[S,O] = quantized-weight(w) applied to xin[S,I]. Uploads+caches w and its scales.
-static void bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float* s, int fmt, int I, int O,
+// y[S,O] = quantized-weight(w) applied to xin[S,I]. Weights are registered (page-aligned,
+// zero-copy) at model load; resolve to (buffer,offset). Returns false to fall back to CPU.
+static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float* s, int fmt, int I, int O,
                       id<MTLBuffer> xin, id<MTLBuffer> yout, int S){
-  id<MTLBuffer> wb=wcache(w,fmt_bytes(fmt,I,O)); id<MTLBuffer> sb=wcache(s,(size_t)O*4);
+  uint64_t wa=0,sa=0; id<MTLBuffer> wb=resolve(w,&wa); id<MTLBuffer> sb=resolve(s,&sa);
+  if(!wb||!sb) return false;
+  size_t woff=wa-(uint64_t)[wb gpuAddress], soff=sa-(uint64_t)[sb gpuAddress];
+  [e useResource:wb usage:MTLResourceUsageRead]; [e useResource:sb usage:MTLResourceUsageRead];
   [e setComputePipelineState:g_gemv];
-  [e setBuffer:wb offset:0 atIndex:0]; [e setBuffer:sb offset:0 atIndex:1];
+  [e setBuffer:wb offset:woff atIndex:0]; [e setBuffer:sb offset:soff atIndex:1];
   [e setBuffer:xin offset:0 atIndex:2]; [e setBuffer:yout offset:0 atIndex:3];
   [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5]; [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
   [e dispatchThreadgroups:MTLSizeMake((size_t)O*S,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
+  return true;
 }
 
 extern "C" int coli_metal_attn_decode(const float* x,
@@ -362,12 +359,15 @@ extern "C" int coli_metal_attn_decode(const float* x,
   int T=pos_base+S;
   @autoreleasepool {
     attn_scratch_init();
-    // Lc/Rc caches are registered (page-aligned) -> zero-copy resolve. kv_b uploaded+cached.
-    uint64_t la=0,ra=0; id<MTLBuffer> Lb=resolve(Lc,&la), Rb=resolve(Rc,&ra);
-    if(!Lb||!Rb) return 0;
+    // Everything zero-copy: Lc/Rc caches and all weights are registered (page-aligned).
+    uint64_t la=0,ra=0,kva=0,ksa=0; id<MTLBuffer> Lb=resolve(Lc,&la), Rb=resolve(Rc,&ra);
+    id<MTLBuffer> kvbW=resolve(kvb_w,&kva), kvbS=resolve(kvb_s,&ksa);
+    if(!Lb||!Rb||!kvbW||!kvbS) return 0;
+    // pre-check the projection weights resolve (they always do; guards mid-encode fallback)
+    { uint64_t d; const void* ws[]={qa_w,qa_s,qb_w,qb_s,kva_w,kva_s,o_w,o_s};
+      for(auto p:ws) if(!resolve(p,&d)) return 0; }
     size_t loff=la-(uint64_t)[Lb gpuAddress], roff=ra-(uint64_t)[Rb gpuAddress];
-    id<MTLBuffer> kvbW=wcache(kvb_w,fmt_bytes(kvb_fmt,AKVL,AHEADS*AROWSH));
-    id<MTLBuffer> kvbS=wcache(kvb_s,(size_t)AHEADS*AROWSH*4);
+    size_t kvbwoff=kva-(uint64_t)[kvbW gpuAddress], kvbsoff=ksa-(uint64_t)[kvbS gpuAddress];
     ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
     memcpy([ax_ contents],x,(size_t)S*AH*4); memcpy([aqaln_ contents],qa_ln,AQLORA*4); memcpy([akvaln_ contents],kva_ln,AKVL*4);
     size_t Loff=loff+(size_t)pos_base*AKVL*4, Roff=roff+(size_t)pos_base*AROPE*4;   // new-token region
@@ -400,7 +400,7 @@ extern "C" int coli_metal_attn_decode(const float* x,
     rope(aqf_,0,ANOPE,AHQH,AQH,AHEADS); BAR();
     (void)zero;(void)one;
     // absorption core (S query rows)
-    [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:0 atIndex:0]; [e setBuffer:kvbS offset:0 atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
+    [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:Rb offset:roff atIndex:2]; [e setBuffer:aqf_ offset:0 atIndex:3]; [e setBuffer:ascore_ offset:0 atIndex:4];
     [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&pos_base length:4 atIndex:7];
@@ -409,7 +409,7 @@ extern "C" int coli_metal_attn_decode(const float* x,
     [e dispatchThreadgroups:MTLSizeMake((size_t)S*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_clat]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBytes:&T length:4 atIndex:3];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:0 atIndex:0]; [e setBuffer:kvbS offset:0 atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
+    [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     // o_proj (S rows)
     bind_gemv(e,o_w,o_s,o_fmt,AHVH,AH,actx_,aout_,S);

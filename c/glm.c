@@ -569,13 +569,24 @@ static int64_t la_hit[3], la_tot[3];
 static int la_pred[2][130][16]; static signed char la_val[2][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+/* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
+ * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
+static void *qalloc(size_t n){
+#ifdef COLI_METAL
+    if(g_metal_enabled){ void *p; size_t r=(n+16383)&~(size_t)16383;
+        if(posix_memalign(&p,16384,r)){fprintf(stderr,"OOM qalloc\n");exit(1);}
+        coli_metal_register(p,r); return p; }
+#endif
+    return malloc(n);
+}
+static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
-    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=malloc((int64_t)O*I); t->s=falloc(O); }
-    else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }
-    else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }
+    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
+    else if(bits>=3){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
+    else { t->fmt=3; t->q4=qalloc((int64_t)O*((I+3)/4)); t->s=qsalloc(O); }
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
@@ -682,8 +693,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
         int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
+        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
+        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
@@ -1253,6 +1264,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+    int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int nmiss=0;
@@ -1285,8 +1297,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
          * reading each expert's weights zero-copy from its RAM slab. Falls back to CPU on
          * any unresolved slab or unsupported fmt. Numerics = dequant->f32 MAC (like CUDA). */
         if(g_metal_enabled){
-            const void *MG[64],*MU[64],*MD[64]; const float *MGS[64],*MUS[64],*MDS[64];
-            int xoffb[64],nrb[64],nbb=0,Rtot=0,fmt=use[0]?use[0]->g.fmt:2;
+            const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
+            int xoffb[65],nrb[65],nbb=0,Rtot=0,fmt=use[0]?use[0]->g.fmt:2;
+            /* fuse the SHARED expert into the first block: identical shapes to a routed
+             * expert (gate/up [I,D], down [D,I]) applied to all S rows with weight 1.0.
+             * Removes 3 CPU matmuls/layer (Phase E) and fills the same GPU submit. */
+            int want_shared = (base==0 && c->n_shared==1 && sI==I &&
+                               l->sh_gate.fmt==fmt && l->sh_up.fmt==fmt && l->sh_down.fmt==fmt);
             for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0;
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                     if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; }
@@ -1296,6 +1313,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4;
                 MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s;
                 xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++;
+            }
+            if(want_shared){
+                MG[nbb]=fmt==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4;
+                MU[nbb]=fmt==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4;
+                MD[nbb]=fmt==1?(const void*)l->sh_down.q8:(const void*)l->sh_down.q4;
+                MGS[nbb]=l->sh_gate.s; MUS[nbb]=l->sh_up.s; MDS[nbb]=l->sh_down.s;
+                xoffb[nbb]=Rtot; nrb[nbb]=S; Rtot+=S; nbb++;
             }
             if(nbb==0) metal_done=1;
             else {
@@ -1307,10 +1331,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                             memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float));
                             mrows[p]=s; mrw[p]=ws[(int64_t)s*K+kk]; p++; break; }
                 }
+                if(want_shared) for(int s=0;s<S;s++){
+                    memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float));
+                    mrows[p]=s; mrw[p]=1.0f; p++; }
                 double t0=now_s();
                 metal_done=coli_metal_moe_block(nbb,D,I,fmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S);
                 m->t_emm += now_s()-t0;
                 free(mxg); free(mrows); free(mrw);
+                if(metal_done && want_shared) shared_on_gpu=1;
             }
         }
 #endif
@@ -1341,13 +1369,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
-    /* ---- FASE E: shared expert, un matmul a S righe ---- */
+    /* ---- FASE E: shared expert, un matmul a S righe (skipped se fuso nel blocco GPU) ---- */
     float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
-    matmul_qt(sg, x, &l->sh_gate, S);
-    matmul_qt(su, x, &l->sh_up,   S);
-    for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
-    matmul_qt(hh, sg, &l->sh_down, S);
-    for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    if(!shared_on_gpu){
+        matmul_qt(sg, x, &l->sh_gate, S);
+        matmul_qt(su, x, &l->sh_up,   S);
+        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+        matmul_qt(hh, sg, &l->sh_down, S);
+        for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    }
     free(logit); free(sig); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
 }
