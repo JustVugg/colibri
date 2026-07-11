@@ -119,7 +119,20 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
 static size_t g_tensor_count, g_tensor_bytes;
+static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
+static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
 static const int TG = 128;
+#include <mach/mach_time.h>
+static double mnow(){ static mach_timebase_info_data_t tb; if(tb.denom==0) mach_timebase_info(&tb);
+  return (double)mach_absolute_time()*tb.numer/tb.denom/1e9; }
+
+extern "C" void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *ex) {
+  if(ok)*ok=g_moe_ok; if(fb)*fb=g_moe_fb; if(ex)*ex=g_moe_experts;
+}
+extern "C" void coli_metal_moe_times(double *setup, double *gpu, double *scatter) {
+  if(setup)*setup=g_t_setup; if(gpu)*gpu=g_t_gpu; if(scatter)*scatter=g_t_scatter;
+}
+extern "C" double coli_metal_moe_kernel_time(void){ return g_t_kernel; }
 
 // Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
@@ -247,18 +260,19 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
   @autoreleasepool {
     int R = 0; for (int e=0;e<nb;e++) R += nr[e];
     if (R == 0) return 1;
+    double ts_start = mnow();
     // address + erow tables
     std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
     std::vector<id<MTLBuffer>> use; use.reserve(nb*2);
     auto add_use=[&](id<MTLBuffer> b){ for(auto&x:use) if(x==b) return; use.push_back(b); };
     for (int e=0;e<nb;e++) {
       id<MTLBuffer> b;
-      if(!(b=resolve(g[e],&ag[e]))) return 0; add_use(b);
-      if(!(b=resolve(u[e],&au[e]))) return 0; add_use(b);
-      if(!(b=resolve(d[e],&ad[e]))) return 0; add_use(b);
-      if(!(b=resolve(gs[e],&sgv[e]))) return 0; add_use(b);
-      if(!(b=resolve(us[e],&suv[e]))) return 0; add_use(b);
-      if(!(b=resolve(ds[e],&sdv[e]))) return 0; add_use(b);
+      if(!(b=resolve(g[e],&ag[e]))) {g_moe_fb++; return 0;} add_use(b);
+      if(!(b=resolve(u[e],&au[e]))) {g_moe_fb++; return 0;} add_use(b);
+      if(!(b=resolve(d[e],&ad[e]))) {g_moe_fb++; return 0;} add_use(b);
+      if(!(b=resolve(gs[e],&sgv[e]))) {g_moe_fb++; return 0;} add_use(b);
+      if(!(b=resolve(us[e],&suv[e]))) {g_moe_fb++; return 0;} add_use(b);
+      if(!(b=resolve(ds[e],&sdv[e]))) {g_moe_fb++; return 0;} add_use(b);
     }
     static int dbg=-1; if(dbg<0) dbg = getenv("COLI_METAL_DEBUG")?atoi(getenv("COLI_METAL_DEBUG")):0;
     if(dbg){ dbg=0; fprintf(stderr,"[metal dbg] moe_block nb=%d R=%d D=%d Iinter=%d fmt=%d | e0: wg=%p ag=0x%llx sg=0x%llx slabs=%zu\n",
@@ -289,17 +303,22 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
     [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
     [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     gemv(bad,bsd,g_gg,g_hh,D,Iinter,Iinter);                  // down
+    double ts_commit = mnow(); g_t_setup += ts_commit - ts_start;
     [e endEncoding];[cb commit];[cb waitUntilCompleted];
+    double ts_gpu = mnow(); g_t_gpu += ts_gpu - ts_commit;
+    g_t_kernel += [cb GPUEndTime] - [cb GPUStartTime];   // actual on-GPU execution window
     if (cb.status == MTLCommandBufferStatusError) {           // GPU fault -> fall back to CPU for this block
       fprintf(stderr, "[metal] moe_block cmdbuf error (nb=%d R=%d): %s\n", nb, R,
               cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
-      return 0;
+      g_moe_fb++; return 0;
     }
 
     // scatter-add: out[rows[gr]] += rw[gr] * hh[gr]
     const float *hh=(const float*)[g_hh contents];
     for(int gr=0;gr<R;gr++){ float *os=out+(size_t)rows[gr]*D, w=rw[gr]; const float *hr=hh+(size_t)gr*D;
       for(int dd=0;dd<D;dd++) os[dd]+=w*hr[dd]; }
+    g_t_scatter += mnow() - ts_gpu;
+    g_moe_ok++; g_moe_experts += nb;
   }
   return 1;
 }

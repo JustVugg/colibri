@@ -1770,6 +1770,12 @@ static void profile_print(Model *m, double elapsed){
     printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
            "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+#ifdef COLI_METAL
+    if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
+        coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
+        printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
+               (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc); }
+#endif
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then

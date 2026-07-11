@@ -51,6 +51,11 @@ size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 void coli_metal_register(void *base, size_t len);
 void coli_metal_unregister(void *base);
 
+/* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
+void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
+void coli_metal_moe_times(double *setup, double *gpu, double *scatter);
+double coli_metal_moe_kernel_time(void);
+
 /*
  * Batched routed-expert SwiGLU for one MoE block, in ONE command buffer.
  * For each expert e in [0,nb): computes hh_e[nr_e, D] = down( silu(gate(xg_e)) * up(xg_e) )
