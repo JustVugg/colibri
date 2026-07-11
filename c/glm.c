@@ -951,6 +951,19 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
+            /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
+             * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
+             * (measured catastrophic). madvise starts async readahead, the touch guarantees
+             * residency. This is pread's I/O without the copy and without the slab. */
+            for(int k=0;k<3;k++){
+                char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
+                madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+                volatile char acc=0;
+                for(size_t i=0;i<n;i+=4096) acc+=p[i];
+                acc+=p[n-1]; (void)acc;
+                char *q=(char*)bq[k]+tq[k]->off; size_t nq=(size_t)tq[k]->nbytes;
+                for(size_t i=0;i<nq;i+=4096) acc+=q[i];
+            }
             s->eid=eid; return;
         }
     }
