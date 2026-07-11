@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 struct ColiCudaTensor {
@@ -21,6 +22,8 @@ typedef struct {
     size_t x_cap, y_cap, gate_cap, up_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
+    float *host_x,*host_y; size_t host_x_cap,host_y_cap;
+    cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
 } DeviceContext;
@@ -211,6 +214,11 @@ static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
+static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
+    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
@@ -234,6 +242,9 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if (!select_ctx(ctx)) { g_nctx = 0; return 0; }
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
+        if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
+            g_nctx=0;return 0;
+        }
         g_nctx++;
         std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                      device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
@@ -251,11 +262,16 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->up) cudaFree(ctx->up);
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
+        if (ctx->host_x) cudaFreeHost(ctx->host_x);
+        if (ctx->host_y) cudaFreeHost(ctx->host_y);
+        if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
+        ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
+        ctx->host_x_cap=ctx->host_y_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
@@ -398,14 +414,22 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
        !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
-    if(!cuda_ok(cudaMemcpy(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice),
-                "expert group descriptors")) return 0;
+    int async=!getenv("COLI_CUDA_ASYNC")||atoi(getenv("COLI_CUDA_ASYNC"));
+    if(async&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+               !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)))return 0;
+    cudaError_t copy_desc=async?cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
+                                                cudaMemcpyHostToDevice,ctx->stream)
+                               :cudaMemcpy(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice);
+    if(!cuda_ok(copy_desc,"expert group descriptors"))return 0;
     int profile=getenv("COLI_CUDA_PROFILE")&&atoi(getenv("COLI_CUDA_PROFILE"));
     cudaEvent_t ev[4]={};
     if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")) profile=0;
-    if(profile) cudaEventRecord(ev[0]);
-    if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert group input upload")) return 0;
-    if(profile) cudaEventRecord(ev[1]);
+    if(profile) cudaEventRecord(ev[0],ctx->stream);
+    if(async)std::memcpy(ctx->host_x,x,xb);
+    cudaError_t copy_x=async?cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream)
+                            :cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice);
+    if(!cuda_ok(copy_x,"expert group input upload")) return 0;
+    if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
@@ -415,31 +439,35 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
            !reserve(&ctx->qscale,&ctx->qscale_cap,(size_t)(total+7)*sizeof(float)))return 0;
-        cudaMemset(ctx->qx,0,qb);
-        quantize_s4_rows<<<total,256>>>(ctx->qx,ctx->qscale,ctx->x,total,D);
-        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256>>>(ctx->gate,ctx->qx,ctx->qscale,dev,D,I,0);
-        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256>>>(ctx->up,ctx->qx,ctx->qscale,dev,D,I,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
-        quantize_s4_rows<<<total,256>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
-        grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
+        cudaMemsetAsync(ctx->qx,0,qb,ctx->stream);
+        quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->x,total,D);
+        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->gate,ctx->qx,ctx->qscale,dev,D,I,0);
+        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->up,ctx->qx,ctx->qscale,dev,D,I,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
+        grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_w4<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
-        grouped_hidden_w4<<<hg,256>>>(ctx->up,ctx->x,dev,I,D,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
-        grouped_down_w4<<<og,256>>>(ctx->y,ctx->gate,dev,D,I);
+        grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
+        grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
-        grouped_hidden<<<hg,256>>>(ctx->up,ctx->x,dev,I,D,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
-        grouped_down<<<og,256>>>(ctx->y,ctx->gate,dev,D,I);
+        grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
+        grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }
-    if(profile) cudaEventRecord(ev[2]);
-    if(!cuda_ok(cudaGetLastError(),"expert group launch")||
-       !cuda_ok(cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost),"expert group output download")) return 0;
+    if(profile) cudaEventRecord(ev[2],ctx->stream);
+    if(!async&&!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group synchronize"))return 0;
+    cudaError_t copy_y=async?cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream)
+                            :cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost);
+    if(!cuda_ok(cudaGetLastError(),"expert group launch")||!cuda_ok(copy_y,"expert group output download"))return 0;
+    if(async){if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group synchronize"))return 0;
+        std::memcpy(y,ctx->host_y,xb);}
     if(profile){
-        cudaEventRecord(ev[3]); cudaEventSynchronize(ev[3]); float a=0,b=0,c=0;
+        cudaEventRecord(ev[3],ctx->stream); cudaEventSynchronize(ev[3]); float a=0,b=0,c=0;
         cudaEventElapsedTime(&a,ev[0],ev[1]); cudaEventElapsedTime(&b,ev[1],ev[2]);
         cudaEventElapsedTime(&c,ev[2],ev[3]);
         { std::lock_guard<std::mutex> lock(g_group_stats_mu);
