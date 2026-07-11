@@ -111,47 +111,56 @@ kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buff
 // ===== Fused decode attention (GLM-5.2 dims, S=1) =====
 constant int A_HID=6144, A_H=64, A_QLORA=2048, A_KVL=512, A_NOPE=192, A_ROPE=64, A_VH=256;
 constant int A_QH=256 /*nope+rope*/, A_ROWSH=448 /*nope+vh*/;
-// in-place RMSNorm over n elems: out[i]=x[i]*rsqrt(mean(x^2)+eps)*w[i]. One threadgroup.
+// per-row in-place RMSNorm: row = threadgroup index, x[row*n + i]. grid = nrows threadgroups.
 kernel void a_rmsnorm(device float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                       constant int& n [[buffer(2)]], constant float& eps [[buffer(3)]],
-                      uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]) {
-  threadgroup float red[256]; float s=0; for(int i=lid;i<n;i+=tgsz) s+=x[i]*x[i];
+                      uint row [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]) {
+  device float* xr=x+(long)row*n; threadgroup float red[256];
+  float s=0; for(int i=lid;i<n;i+=tgsz) s+=xr[i]*xr[i];
   red[lid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);
   for(uint k=tgsz/2;k>0;k>>=1){ if(lid<k) red[lid]+=red[lid+k]; threadgroup_barrier(mem_flags::mem_threadgroup); }
   float r=rsqrt(red[0]/n+eps); threadgroup_barrier(mem_flags::mem_threadgroup);
-  for(int i=lid;i<n;i+=tgsz) x[i]=x[i]*r*w[i];
+  for(int i=lid;i<n;i+=tgsz) xr[i]=xr[i]*r*w[i];
 }
-// interleaved partial RoPE on a qk_rope vector at [base]; half=ROPE/2. grid = count*half.
+// interleaved partial RoPE. vv = v + base + s*rowstride + h*headstride, pos = PB+s. grid = S*nheads*(ROPE/2).
 kernel void a_rope(device float* v [[buffer(0)]], constant int& base [[buffer(1)]],
-                   constant int& stride [[buffer(2)]], constant int& pos [[buffer(3)]],
-                   constant float& theta [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
-  int hlf=A_ROPE/2; int u=gid/hlf, j=gid%hlf; device float* vv=v+(long)base+(long)u*stride;
+                   constant int& rowstride [[buffer(2)]], constant int& headstride [[buffer(3)]],
+                   constant int& nheads [[buffer(4)]], constant int& PB [[buffer(5)]],
+                   constant float& theta [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+  int hlf=A_ROPE/2; int idx=gid/hlf, j=gid%hlf; int s=idx/nheads, h=idx%nheads; int pos=PB+s;
+  device float* vv=v+(long)base+(long)s*rowstride+(long)h*headstride;
   float inv=pow(theta, -2.0f*j/A_ROPE); float ang=pos*inv, cs=cos(ang), sn=sin(ang);
   float a=vv[2*j], b=vv[2*j+1]; vv[j]=a*cs-b*sn; vv[hlf+j]=b*cs+a*sn;
 }
-// copy src[off..off+n) -> dst[0..n)
-kernel void a_copy(device const float* src [[buffer(0)]], constant int& off [[buffer(1)]],
-                   device float* dst [[buffer(2)]], uint i [[thread_position_in_grid]]) { dst[i]=src[off+i]; }
-// ---- absorption core (validated) ----
+// per-row copy: dst[s*dststride + i] = src[s*srcstride + off + i]. grid = S*n.
+kernel void a_copy(device const float* src [[buffer(0)]], constant int& off [[buffer(1)]], constant int& srcstride [[buffer(2)]],
+                   device float* dst [[buffer(3)]], constant int& dststride [[buffer(4)]], constant int& n [[buffer(5)]],
+                   uint gid [[thread_position_in_grid]]) { int s=gid/n, i=gid%n; dst[(long)s*dststride+i]=src[(long)s*srcstride+off+i]; }
+// ---- absorption core (S query rows, per-row causal). q:[S,H*QH]; qabs/clat:[S*H,KVL];
+//      sc:[S*H,T]; ctx:[S*H,VH]. Query row s (abs pos PB+s) attends keys [0, PB+s]. ----
+constant int A_QHH=A_H*A_QH;
 inline float a_deqrow(device const uchar* base, int row, int i, device const float* sc){
   device const uchar* w=base+(long)row*((A_KVL+1)/2); uchar b=w[i>>1]; int val=(i&1)?(b>>4):(b&0xF); return float(val-8)*sc[row]; }
 kernel void a_qabs(device const uchar* kvb [[buffer(0)]], device const float* sc [[buffer(1)]],
                    device const float* q [[buffer(2)]], device float* qabs [[buffer(3)]],
                    uint gid [[thread_position_in_grid]]) {
-  int h=gid/A_KVL, i=gid%A_KVL; int rbase=h*A_ROWSH; device const float* qp=q+(long)h*A_QH;
-  float a=0; for(int d=0;d<A_NOPE;d++) a+=qp[d]*a_deqrow(kvb,rbase+d,i,sc); qabs[(long)h*A_KVL+i]=a;
+  int s=gid/(A_H*A_KVL), r=gid%(A_H*A_KVL), h=r/A_KVL, i=r%A_KVL; int rbase=h*A_ROWSH;
+  device const float* qp=q+(long)s*A_QHH+(long)h*A_QH;
+  float a=0; for(int d=0;d<A_NOPE;d++) a+=qp[d]*a_deqrow(kvb,rbase+d,i,sc); qabs[(long)(s*A_H+h)*A_KVL+i]=a;
 }
 kernel void a_score(device const float* qabs [[buffer(0)]], device const float* Lc [[buffer(1)]],
                     device const float* Rc [[buffer(2)]], device const float* q [[buffer(3)]],
                     device float* sc [[buffer(4)]], constant int& T [[buffer(5)]], constant float& ascale [[buffer(6)]],
-                    uint gid [[thread_position_in_grid]]) {
-  int h=gid/T, t=gid%T; device const float* qa=qabs+(long)h*A_KVL; device const float* Lt=Lc+(long)t*A_KVL;
-  device const float* qr=q+(long)h*A_QH+A_NOPE; device const float* Rt=Rc+(long)t*A_ROPE;
-  float a=0; for(int i=0;i<A_KVL;i++) a+=qa[i]*Lt[i]; for(int d=0;d<A_ROPE;d++) a+=qr[d]*Rt[d]; sc[(long)h*T+t]=a*ascale;
+                    constant int& PB [[buffer(7)]], uint gid [[thread_position_in_grid]]) {
+  int s=gid/(A_H*T), r=gid%(A_H*T), h=r/T, t=r%T; long o=(long)(s*A_H+h)*T+t;
+  if(t > PB+s){ sc[o]=-1e30f; return; }                                 // causal mask
+  device const float* qa=qabs+(long)(s*A_H+h)*A_KVL; device const float* Lt=Lc+(long)t*A_KVL;
+  device const float* qr=q+(long)s*A_QHH+(long)h*A_QH+A_NOPE; device const float* Rt=Rc+(long)t*A_ROPE;
+  float a=0; for(int i=0;i<A_KVL;i++) a+=qa[i]*Lt[i]; for(int d=0;d<A_ROPE;d++) a+=qr[d]*Rt[d]; sc[o]=a*ascale;
 }
 kernel void a_smax(device float* sc [[buffer(0)]], constant int& T [[buffer(1)]],
-                   uint h [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]) {
-  device float* s=sc+(long)h*T; threadgroup float red[256];
+                   uint sh [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]) {
+  device float* s=sc+(long)sh*T; threadgroup float red[256];
   float m=-1e30f; for(int t=lid;t<T;t+=tgsz) m=max(m,s[t]); red[lid]=m; threadgroup_barrier(mem_flags::mem_threadgroup);
   for(uint k=tgsz/2;k>0;k>>=1){ if(lid<k) red[lid]=max(red[lid],red[lid+k]); threadgroup_barrier(mem_flags::mem_threadgroup);}
   float mx=red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -161,13 +170,13 @@ kernel void a_smax(device float* sc [[buffer(0)]], constant int& T [[buffer(1)]]
 }
 kernel void a_clat(device const float* sc [[buffer(0)]], device const float* Lc [[buffer(1)]],
                    device float* clat [[buffer(2)]], constant int& T [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
-  int h=gid/A_KVL, i=gid%A_KVL; device const float* s=sc+(long)h*T; float a=0;
-  for(int t=0;t<T;t++) a+=s[t]*Lc[(long)t*A_KVL+i]; clat[(long)h*A_KVL+i]=a;
+  int sh=gid/A_KVL, i=gid%A_KVL; device const float* s=sc+(long)sh*T; float a=0;
+  for(int t=0;t<T;t++) a+=s[t]*Lc[(long)t*A_KVL+i]; clat[(long)sh*A_KVL+i]=a;
 }
 kernel void a_ctx(device const uchar* kvb [[buffer(0)]], device const float* sc [[buffer(1)]],
                   device const float* clat [[buffer(2)]], device float* ctx [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
-  int h=gid/A_VH, j=gid%A_VH; int row=h*A_ROWSH+A_NOPE+j; device const float* cl=clat+(long)h*A_KVL;
-  float a=0; for(int i=0;i<A_KVL;i++) a+=cl[i]*a_deqrow(kvb,row,i,sc); ctx[(long)h*A_VH+j]=a;
+  int sh=gid/A_VH, j=gid%A_VH, h=sh%A_H; int row=h*A_ROWSH+A_NOPE+j; device const float* cl=clat+(long)sh*A_KVL;
+  float a=0; for(int i=0;i<A_KVL;i++) a+=cl[i]*a_deqrow(kvb,row,i,sc); ctx[(long)sh*A_VH+j]=a;
 }
 )METAL";
 
@@ -313,14 +322,14 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
 }
 
 // ---- fused decode attention scratch (GLM-5.2 dims) ----
-enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH };
+enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=4 };
 static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
 static void attn_scratch_init(){
   if(ax_) return;
-  auto L=[&](size_t n){ return [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared]; };
+  auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:MTLResourceStorageModeShared]; };
   ax_=L(AH*4); aqr_=L(AQLORA*4); aqf_=L(AHQH*4); acomp_=L((AKVL+AROPE)*4);
   aqabs_=L((size_t)AHEADS*AKVL*4); aclat_=L((size_t)AHEADS*AKVL*4); actx_=L(AHVH*4); aout_=L(AH*4);
-  aqaln_=L(AQLORA*4); akvaln_=L(AKVL*4);
+  aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
 }
 // Cache of uploaded resident weights/scales (fixed dense tensors reused every token).
 // Attention runs serially (not under OpenMP), so no lock needed.
@@ -330,16 +339,15 @@ static id<MTLBuffer> wcache(const void* p, size_t bytes){
   id<MTLBuffer> b=[g_dev newBufferWithBytes:p length:bytes options:MTLResourceStorageModeShared];
   g_wcache.push_back({p,b}); return b;
 }
-// y[O] = quantized-weight(w) applied to xin[I], S=1. Uploads+caches w and its scales.
+// y[S,O] = quantized-weight(w) applied to xin[S,I]. Uploads+caches w and its scales.
 static void bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float* s, int fmt, int I, int O,
-                      id<MTLBuffer> xin, id<MTLBuffer> yout){
+                      id<MTLBuffer> xin, id<MTLBuffer> yout, int S){
   id<MTLBuffer> wb=wcache(w,fmt_bytes(fmt,I,O)); id<MTLBuffer> sb=wcache(s,(size_t)O*4);
-  int S=1;
   [e setComputePipelineState:g_gemv];
   [e setBuffer:wb offset:0 atIndex:0]; [e setBuffer:sb offset:0 atIndex:1];
   [e setBuffer:xin offset:0 atIndex:2]; [e setBuffer:yout offset:0 atIndex:3];
   [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5]; [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
-  [e dispatchThreadgroups:MTLSizeMake((size_t)O,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
+  [e dispatchThreadgroups:MTLSizeMake((size_t)O*S,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)];
 }
 
 extern "C" int coli_metal_attn_decode(const float* x,
@@ -348,65 +356,67 @@ extern "C" int coli_metal_attn_decode(const float* x,
     const void* kva_w,const float* kva_s,int kva_fmt,const float* kva_ln,
     const void* kvb_w,const float* kvb_s,int kvb_fmt,
     const void* o_w,const float* o_s,int o_fmt,
-    float* Lc,float* Rc,int pos,int st0,float eps,float theta,float ascale,float* out){
+    float* Lc,float* Rc,int S,int pos_base,int st0,float eps,float theta,float ascale,float* out){
   if(!g_dev) return 0;
-  if(st0!=0) return 0;                       // partial-KV (MTP) not handled here -> CPU
-  int T=pos+1;
+  if(st0!=0 || S<1 || S>AMAXS) return 0;     // partial-KV / S>4 -> CPU
+  int T=pos_base+S;
   @autoreleasepool {
     attn_scratch_init();
     // Lc/Rc caches are registered (page-aligned) -> zero-copy resolve. kv_b uploaded+cached.
     uint64_t la=0,ra=0; id<MTLBuffer> Lb=resolve(Lc,&la), Rb=resolve(Rc,&ra);
     if(!Lb||!Rb) return 0;
     size_t loff=la-(uint64_t)[Lb gpuAddress], roff=ra-(uint64_t)[Rb gpuAddress];
-    id<MTLBuffer> kvbW=wcache(kvb_w,fmt_bytes(kvb_fmt,AKVL,AHEADS*AROWSH)); size_t kvbwoff=0;
-    id<MTLBuffer> kvbS=wcache(kvb_s,(size_t)AHEADS*AROWSH*4); size_t kvbsoff=0;
-    ascore_=ensure(ascore_,&ascore_cap,(size_t)AHEADS*T*4);
-    memcpy([ax_ contents],x,AH*4); memcpy([aqaln_ contents],qa_ln,AQLORA*4); memcpy([akvaln_ contents],kva_ln,AKVL*4);
+    id<MTLBuffer> kvbW=wcache(kvb_w,fmt_bytes(kvb_fmt,AKVL,AHEADS*AROWSH));
+    id<MTLBuffer> kvbS=wcache(kvb_s,(size_t)AHEADS*AROWSH*4);
+    ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
+    memcpy([ax_ contents],x,(size_t)S*AH*4); memcpy([aqaln_ contents],qa_ln,AQLORA*4); memcpy([akvaln_ contents],kva_ln,AKVL*4);
+    size_t Loff=loff+(size_t)pos_base*AKVL*4, Roff=roff+(size_t)pos_base*AROPE*4;   // new-token region
 
     id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-    // keep resolved resources resident (bindless-addressed cache/weights)
     [e useResource:Lb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rb usage:MTLResourceUsageRead|MTLResourceUsageWrite];
     [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
     auto BAR=[&]{ [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
-    // q path: q_a -> rmsnorm -> q_b -> rope
-    bind_gemv(e,qa_w,qa_s,qa_fmt,AH,AQLORA,ax_,aqr_); BAR();
+    int zero=0, one=1;
+    // q path: q_a -> rmsnorm(S rows) -> q_b -> rope(S*H heads)
+    bind_gemv(e,qa_w,qa_s,qa_fmt,AH,AQLORA,ax_,aqr_,S); BAR();
     { int n=AQLORA; [e setComputePipelineState:g_a_rms]; [e setBuffer:aqr_ offset:0 atIndex:0]; [e setBuffer:aqaln_ offset:0 atIndex:1];
       [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
-      [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; } BAR();
-    bind_gemv(e,qb_w,qb_s,qb_fmt,AQLORA,AHQH,aqr_,aqf_); BAR();
-    { int base=ANOPE, stride=AQH; [e setComputePipelineState:g_a_rope]; [e setBuffer:aqf_ offset:0 atIndex:0];
-      [e setBytes:&base length:4 atIndex:1]; [e setBytes:&stride length:4 atIndex:2]; [e setBytes:&pos length:4 atIndex:3]; [e setBytes:&theta length:4 atIndex:4];
-      [e dispatchThreads:MTLSizeMake((size_t)AHEADS*(AROPE/2),1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; } BAR();
-    // kv path: kv_a -> split -> latent rmsnorm@pos + krot rope@pos
-    bind_gemv(e,kva_w,kva_s,kva_fmt,AH,AKVL+AROPE,ax_,acomp_); BAR();
-    { int off=0; [e setComputePipelineState:g_a_copy]; [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1];
-      [e setBuffer:Lb offset:loff+(size_t)pos*AKVL*4 atIndex:2]; [e dispatchThreads:MTLSizeMake(AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; }
-    { int off=AKVL; [e setComputePipelineState:g_a_copy]; [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1];
-      [e setBuffer:Rb offset:roff+(size_t)pos*AROPE*4 atIndex:2]; [e dispatchThreads:MTLSizeMake(AROPE,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; } BAR();
-    { int n=AKVL; [e setComputePipelineState:g_a_rms]; [e setBuffer:Lb offset:loff+(size_t)pos*AKVL*4 atIndex:0]; [e setBuffer:akvaln_ offset:0 atIndex:1];
-      [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3]; [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; }
-    { int base=0, stride=AROPE; [e setComputePipelineState:g_a_rope]; [e setBuffer:Rb offset:roff+(size_t)pos*AROPE*4 atIndex:0];
-      [e setBytes:&base length:4 atIndex:1]; [e setBytes:&stride length:4 atIndex:2]; [e setBytes:&pos length:4 atIndex:3]; [e setBytes:&theta length:4 atIndex:4];
-      [e dispatchThreads:MTLSizeMake(AROPE/2,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)]; } BAR();
-    // absorption core
-    [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
-    [e dispatchThreads:MTLSizeMake((size_t)AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+      [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; } BAR();
+    bind_gemv(e,qb_w,qb_s,qb_fmt,AQLORA,AHQH,aqr_,aqf_,S); BAR();
+    { int base=ANOPE, rs=AHQH, hs=AQH, nh=AHEADS; [e setComputePipelineState:g_a_rope]; [e setBuffer:aqf_ offset:0 atIndex:0];
+      [e setBytes:&base length:4 atIndex:1]; [e setBytes:&rs length:4 atIndex:2]; [e setBytes:&hs length:4 atIndex:3]; [e setBytes:&nh length:4 atIndex:4]; [e setBytes:&pos_base length:4 atIndex:5]; [e setBytes:&theta length:4 atIndex:6];
+      [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*(AROPE/2),1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; } BAR();
+    // kv path: kv_a -> split(S rows) -> latent rmsnorm(S) + krot rope(S)
+    bind_gemv(e,kva_w,kva_s,kva_fmt,AH,AKVL+AROPE,ax_,acomp_,S); BAR();
+    { int off=0, ss=AKVL+AROPE, n=AKVL; [e setComputePipelineState:g_a_copy]; [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
+      [e setBuffer:Lb offset:Loff atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5]; [e dispatchThreads:MTLSizeMake((size_t)S*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; }
+    { int off=AKVL, ss=AKVL+AROPE, n=AROPE; [e setComputePipelineState:g_a_copy]; [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
+      [e setBuffer:Rb offset:Roff atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5]; [e dispatchThreads:MTLSizeMake((size_t)S*AROPE,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; } BAR();
+    { int n=AKVL; [e setComputePipelineState:g_a_rms]; [e setBuffer:Lb offset:Loff atIndex:0]; [e setBuffer:akvaln_ offset:0 atIndex:1];
+      [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3]; [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; }
+    { int base=0, rs=AROPE, hs=0, nh=1; [e setComputePipelineState:g_a_rope]; [e setBuffer:Rb offset:Roff atIndex:0];
+      [e setBytes:&base length:4 atIndex:1]; [e setBytes:&rs length:4 atIndex:2]; [e setBytes:&hs length:4 atIndex:3]; [e setBytes:&nh length:4 atIndex:4]; [e setBytes:&pos_base length:4 atIndex:5]; [e setBytes:&theta length:4 atIndex:6];
+      [e dispatchThreads:MTLSizeMake((size_t)S*(AROPE/2),1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)]; } BAR();
+    (void)zero;(void)one;
+    // absorption core (S query rows)
+    [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:0 atIndex:0]; [e setBuffer:kvbS offset:0 atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
+    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:Rb offset:roff atIndex:2]; [e setBuffer:aqf_ offset:0 atIndex:3]; [e setBuffer:ascore_ offset:0 atIndex:4];
-    [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6];
-    [e dispatchThreads:MTLSizeMake((size_t)AHEADS*T,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&pos_base length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*T,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_smax]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBytes:&T length:4 atIndex:1];
-    [e dispatchThreadgroups:MTLSizeMake(AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    [e dispatchThreadgroups:MTLSizeMake((size_t)S*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_clat]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBytes:&T length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake((size_t)AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
-    [e dispatchThreads:MTLSizeMake((size_t)AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    // o_proj
-    bind_gemv(e,o_w,o_s,o_fmt,AHVH,AH,actx_,aout_);
+    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:0 atIndex:0]; [e setBuffer:kvbS offset:0 atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
+    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    // o_proj (S rows)
+    bind_gemv(e,o_w,o_s,o_fmt,AHVH,AH,actx_,aout_,S);
     double tc=mnow();
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
     g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
-    memcpy(out,[aout_ contents],AH*4);
+    memcpy(out,[aout_ contents],(size_t)S*AH*4);
   }
   return 1;
 }

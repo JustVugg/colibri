@@ -65,7 +65,7 @@ int coli_metal_attn_decode(const float *x,
     const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
     const void *kvb_w, const float *kvb_s, int kvb_fmt,
     const void *o_w, const float *o_s, int o_fmt,
-    float *Lc, float *Rc, int pos, int st0, float eps, float theta, float ascale, float *out);
+    float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
