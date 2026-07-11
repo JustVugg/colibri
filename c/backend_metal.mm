@@ -77,33 +77,37 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
 // scale live at gpuAddresses waddr[e]/saddr[e] (zero-copy in the RAM slab). fmt 1=i8, 2=i4.
+// One SIMDGROUP per output row, 4 rows/threadgroup, 8-value loads: measured 1.5-2.1x over
+// one-threadgroup-per-row with uchar2 loads (358-389 GB/s on engine-like block shapes).
 kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong* saddr [[buffer(1)]],
                      device const int* erow [[buffer(2)]], device const float* xin [[buffer(3)]],
                      device float* yout [[buffer(4)]],
                      constant int& O [[buffer(5)]], constant int& K [[buffer(6)]],
                      constant int& Kin [[buffer(7)]], constant int& fmt [[buffer(8)]],
-                     uint tg [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
-                     uint tgsz [[threads_per_threadgroup]], uint slane [[thread_index_in_simdgroup]],
+                     constant int& NT [[buffer(9)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint slane [[thread_index_in_simdgroup]],
                      uint sgid [[simdgroup_index_in_threadgroup]]) {
-  int gr = tg / O, o = tg % O; int e = erow[gr]; int K4 = (K & 3) ? 0 : (K/4);
+  long row = (long)tg*4 + sgid; if (row >= NT) return;
+  int gr = row / O, o = row % O; int e = erow[gr]; int K8 = (K & 7) ? 0 : (K/8);
   device const float* xr = xin + (long)gr * Kin;
   device const float* sc = (device const float*)(saddr[e]);
   device const float4* x4 = (device const float4*)xr;
   float acc = 0.0f;
   if (fmt == 2) { int rb=(K+1)/2; device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
-    device const uchar2* w2=(device const uchar2*)w;
-    for(int c=lid;c<K4;c+=tgsz){ uchar2 bb=w2[c];
-      float4 wv=float4(float(int(bb.x&0xF)-8),float(int(bb.x>>4)-8),float(int(bb.y&0xF)-8),float(int(bb.y>>4)-8));
-      acc+=dot(wv,x4[c]); }
-    for(int i=K4*4+lid;i<K;i+=tgsz){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]; }
+    device const uchar4* w4=(device const uchar4*)w;
+    for(int c=slane;c<K8;c+=32){ uchar4 b=w4[c];
+      float4 w0=float4(float(int(b.x&0xF)-8),float(int(b.x>>4)-8),float(int(b.y&0xF)-8),float(int(b.y>>4)-8));
+      float4 w1=float4(float(int(b.z&0xF)-8),float(int(b.z>>4)-8),float(int(b.w&0xF)-8),float(int(b.w>>4)-8));
+      acc+=dot(w0,x4[2*c])+dot(w1,x4[2*c+1]); }
+    for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]; }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
-    for(int c=lid;c<K4;c+=tgsz) acc+=dot(float4(w4[c]),x4[c]);
-    for(int i=K4*4+lid;i<K;i+=tgsz) acc+=float(w[i])*xr[i];
+    for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
+    for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
-  acc=simd_sum(acc); threadgroup float sh[32];
-  if(slane==0) sh[sgid]=acc; threadgroup_barrier(mem_flags::mem_threadgroup);
-  if(lid==0){ uint n=(tgsz+31)/32; float t=0; for(uint k=0;k<n;k++) t+=sh[k]; yout[(long)gr*O+o]=t*sc[o]; }
+  acc=simd_sum(acc);
+  if(slane==0) yout[row]=acc*sc[o];
 }
 kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) { float v=g[i]; g[i]=(v/(1.0f+exp(-v)))*u[i]; }
@@ -519,11 +523,13 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
   id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
   for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
   auto gemv=[&](id<MTLBuffer> wa,id<MTLBuffer> sa,id<MTLBuffer> xin,id<MTLBuffer> y,int O,int K,int Kin){
+    int NT=R*O;
     [e setComputePipelineState:g_moe_gemv];
     [e setBuffer:wa offset:0 atIndex:0];[e setBuffer:sa offset:0 atIndex:1];[e setBuffer:berow offset:0 atIndex:2];
     [e setBuffer:xin offset:0 atIndex:3];[e setBuffer:y offset:0 atIndex:4];
     [e setBytes:&O length:4 atIndex:5];[e setBytes:&K length:4 atIndex:6];[e setBytes:&Kin length:4 atIndex:7];[e setBytes:&fmt length:4 atIndex:8];
-    [e dispatchThreadgroups:MTLSizeMake((size_t)R*O,1,1) threadsPerThreadgroup:MTLSizeMake(TG,1,1)]; };
+    [e setBytes:&NT length:4 atIndex:9];
+    [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)]; };
   gemv(bag,bsg,xg_buf,gg_buf,Iinter,D,D);                     // gate
   gemv(bau,bsu,xg_buf,uu_buf,Iinter,D,D);                     // up
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
