@@ -377,26 +377,27 @@ extern "C" int coli_metal_attn_decode(const float* x,
     [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
     auto BAR=[&]{ [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
     int zero=0, one=1;
-    // q path: q_a -> rmsnorm(S rows) -> q_b -> rope(S*H heads)
-    bind_gemv(e,qa_w,qa_s,qa_fmt,AH,AQLORA,ax_,aqr_,S); BAR();
-    { int n=AQLORA; [e setComputePipelineState:g_a_rms]; [e setBuffer:aqr_ offset:0 atIndex:0]; [e setBuffer:aqaln_ offset:0 atIndex:1];
-      [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
-      [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; } BAR();
-    bind_gemv(e,qb_w,qb_s,qb_fmt,AQLORA,AHQH,aqr_,aqf_,S); BAR();
-    { int base=ANOPE, rs=AHQH, hs=AQH, nh=AHEADS; [e setComputePipelineState:g_a_rope]; [e setBuffer:aqf_ offset:0 atIndex:0];
+    // Projections interleave the independent q-path and kv-path: 4 barriers instead of 7,
+    // so the GPU overlaps them. q: q_a->rmsnorm->q_b->rope ; kv: kv_a->copy->{rmsnorm,rope}.
+    auto rms=[&](id<MTLBuffer> b,size_t off,id<MTLBuffer> w,int n,int nrows){ [e setComputePipelineState:g_a_rms];
+      [e setBuffer:b offset:off atIndex:0]; [e setBuffer:w offset:0 atIndex:1]; [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
+      [e dispatchThreadgroups:MTLSizeMake(nrows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
+    auto rope=[&](id<MTLBuffer> b,size_t off,int base,int rs,int hs,int nh){ [e setComputePipelineState:g_a_rope]; [e setBuffer:b offset:off atIndex:0];
       [e setBytes:&base length:4 atIndex:1]; [e setBytes:&rs length:4 atIndex:2]; [e setBytes:&hs length:4 atIndex:3]; [e setBytes:&nh length:4 atIndex:4]; [e setBytes:&pos_base length:4 atIndex:5]; [e setBytes:&theta length:4 atIndex:6];
-      [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*(AROPE/2),1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; } BAR();
-    // kv path: kv_a -> split(S rows) -> latent rmsnorm(S) + krot rope(S)
+      [e dispatchThreads:MTLSizeMake((size_t)S*nh*(AROPE/2),1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; };
+    auto cpy=[&](int off,id<MTLBuffer> dst,size_t doff,int n){ int ss=AKVL+AROPE; [e setComputePipelineState:g_a_copy];
+      [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
+      [e setBuffer:dst offset:doff atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5];
+      [e dispatchThreads:MTLSizeMake((size_t)S*n,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; };
+    // A: q_a, kv_a (both read ax_)
+    bind_gemv(e,qa_w,qa_s,qa_fmt,AH,AQLORA,ax_,aqr_,S);
     bind_gemv(e,kva_w,kva_s,kva_fmt,AH,AKVL+AROPE,ax_,acomp_,S); BAR();
-    { int off=0, ss=AKVL+AROPE, n=AKVL; [e setComputePipelineState:g_a_copy]; [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
-      [e setBuffer:Lb offset:Loff atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5]; [e dispatchThreads:MTLSizeMake((size_t)S*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; }
-    { int off=AKVL, ss=AKVL+AROPE, n=AROPE; [e setComputePipelineState:g_a_copy]; [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
-      [e setBuffer:Rb offset:Roff atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5]; [e dispatchThreads:MTLSizeMake((size_t)S*AROPE,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; } BAR();
-    { int n=AKVL; [e setComputePipelineState:g_a_rms]; [e setBuffer:Lb offset:Loff atIndex:0]; [e setBuffer:akvaln_ offset:0 atIndex:1];
-      [e setBytes:&n length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3]; [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; }
-    { int base=0, rs=AROPE, hs=0, nh=1; [e setComputePipelineState:g_a_rope]; [e setBuffer:Rb offset:Roff atIndex:0];
-      [e setBytes:&base length:4 atIndex:1]; [e setBytes:&rs length:4 atIndex:2]; [e setBytes:&hs length:4 atIndex:3]; [e setBytes:&nh length:4 atIndex:4]; [e setBytes:&pos_base length:4 atIndex:5]; [e setBytes:&theta length:4 atIndex:6];
-      [e dispatchThreads:MTLSizeMake((size_t)S*(AROPE/2),1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)]; } BAR();
+    // B: rmsnorm(q), copy latent+krot
+    rms(aqr_,0,aqaln_,AQLORA,S); cpy(0,Lb,Loff,AKVL); cpy(AKVL,Rb,Roff,AROPE); BAR();
+    // C: q_b, latent rmsnorm, krot rope
+    bind_gemv(e,qb_w,qb_s,qb_fmt,AQLORA,AHQH,aqr_,aqf_,S); rms(Lb,Loff,akvaln_,AKVL,S); rope(Rb,Roff,0,AROPE,0,1); BAR();
+    // D: rope(q)
+    rope(aqf_,0,ANOPE,AHQH,AQH,AHEADS); BAR();
     (void)zero;(void)one;
     // absorption core (S query rows)
     [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:0 atIndex:0]; [e setBuffer:kvbS offset:0 atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
