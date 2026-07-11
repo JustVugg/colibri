@@ -1473,10 +1473,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     }
     /* ---- FASE E: shared expert, un matmul a S righe ---- */
     float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
-    matmul_qt(sg, x, &l->sh_gate, S);
-    matmul_qt(su, x, &l->sh_up,   S);
+    expert_gate_up(sg,su,x,&l->sh_gate,&l->sh_up,S);
     for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
-    matmul_qt(hh, sg, &l->sh_down, S);
+    expert_down(hh,sg,&l->sh_down,S);
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(logit); free(sig); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);

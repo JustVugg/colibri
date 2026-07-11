@@ -325,7 +325,9 @@ expert time from 51.61 s to 36.67 s and 16-token wall time from 129.42 s to
 113.73 s. Twenty-four workers were slightly slower (114.35 s wall time). The
 same pool also handles the q4 expert down projection: on that host it reduced
 expert time further from 36.67 s to 25.74 s and wall time to 105.07 s, with
-identical greedy output.
+identical greedy output. Routing the single-token shared expert through the
+same pool reduced the remaining non-profiled work from 23.05 s to 10.89 s and
+wall time again to 92.17 s.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
