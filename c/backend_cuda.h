@@ -44,6 +44,14 @@ int coli_cuda_matmul(ColiCudaTensor **tensor,
 int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
+ * consecutive [D] rows in call order. */
+int coli_cuda_expert_group(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x);
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
