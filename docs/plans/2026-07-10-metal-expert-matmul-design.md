@@ -93,7 +93,31 @@ cut. Wrap once per slot (stable address); contents change as experts load.
 
 ## Status
 - [x] Approach validated empirically (kernel + batched dispatch + correctness + throughput).
-- [ ] `backend_metal.{h,mm,metal}` + Makefile branch.
-- [ ] `moe()` batched integration + zero-copy slabs.
-- [ ] Kernel-correctness test + token-exact end-to-end validation.
-- [ ] A/B benchmark on the real model.
+- [x] `backend_metal.{h,mm}` + Makefile `METAL=1` branch (runtime-compiled shader).
+- [x] `moe()` batched integration + zero-copy slabs (page-aligned, mutex-guarded registry).
+- [x] Kernel-correctness test (`make metal-test`) + token-exact end-to-end (identical greedy output).
+- [x] A/B benchmark on the real model (below).
+
+## Measured results (M4 Max, 96 GB budget, warm cache ~55% hit, greedy, 10 tok)
+
+| | CPU | Metal | 
+|---|---|---|
+| end-to-end | 45.5 s (0.22 tok/s) | 36.4 s (0.27 tok/s), ~1.23x |
+| expert-matmul | 11.6 s | 8.5 s, ~1.34x |
+| experts on GPU | — | 100% (0 CPU fallback) |
+
+All routed experts (pinned + cached + streamed) run on the GPU. Token-exact vs CPU.
+
+**Key diagnostic:** of the ~8.3 s GPU wall-time, only ~3.1 s is actual GPU kernel
+execution — **~62% is idle/scheduling latency** (~13 ms/block over 396 sporadic
+submits). The GPU powers down between blocks because attention runs on the CPU
+each layer, forcing a sync. Expert-matmul FLOPs are not the bottleneck; submit
+latency and (still) disk streaming are.
+
+## Next levers (measured, in impact order)
+1. **Offload attention to the GPU** — removes the per-layer CPU sync so the GPU stays
+   hot; would reclaim most of the ~5 s latency AND move attention (5-10 s) off the CPU.
+   Biggest win; substantial (MLA + RoPE + softmax + DSA indexing on Metal).
+2. **Reduce per-block submit overhead** — persistent encoders / fewer command buffers;
+   partial help while attention stays on CPU.
+3. **Warm cache further** — disk streaming (~17 s) still co-dominates at ~55% hit.
