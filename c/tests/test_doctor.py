@@ -159,7 +159,8 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(Path(report["model"]), self.model.resolve())
         self.assertIn(report["status"], ("ok", "warning", "error"))
         self.assertNotIn("\033", run.stdout)
-        self.assertNotIn("colibr", run.stdout)
+        self.assertTrue(run.stdout.lstrip().startswith("{"))
+        self.assertTrue(run.stdout.rstrip().endswith("}"))
 
 
 if __name__ == "__main__":
