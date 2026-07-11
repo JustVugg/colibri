@@ -105,6 +105,19 @@ def discover_gpus():
     return devices
 
 
+def physical_cpu_count():
+    try:
+        result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
+                                capture_output=True, check=True, timeout=5)
+        cores = {tuple(map(int, line.split(","))) for line in result.stdout.splitlines()
+                 if line and not line.startswith("#")}
+        if cores:
+            return len(cores)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return os.cpu_count() or 1
+
+
 POLICIES = {
     "quality": {"preserve_quantization": True, "preserve_router": True},
     "balanced": {"preserve_quantization": True, "preserve_router": True},
@@ -114,10 +127,11 @@ POLICIES = {
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
-               policy="quality"):
+               policy="quality", physical_cpus=None):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
     info = analyze_model(model)
+    physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
@@ -186,6 +200,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "policy": {"name": policy, **POLICIES[policy],
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
+        "cpu": {"physical_cores": max(1, int(physical_cpus)),
+                "thread_policy": "physical-cores"},
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
@@ -211,6 +227,9 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
+    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
+    result.setdefault("OMP_PROC_BIND", "spread")
+    result.setdefault("OMP_PLACES", "cores")
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]

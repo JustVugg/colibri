@@ -324,6 +324,10 @@ default `--policy quality` and `--policy balanced` modes preserve checkpoint
 quantization and the original router decisions. Lossy `TOPK`/`TOPP` overrides
 require the explicit `--policy experimental-fast` opt-in.
 
+Auto-tier plans size OpenMP from physical cores and bind workers across cores.
+Memory-bound quantized kernels can regress sharply when SMT siblings compete
+for limited memory channels; explicit `OMP_*` settings always take precedence.
+
 ```bash
 coli plan --model /models/glm52_i4 --policy quality
 coli run --auto-tier --policy quality "Explain MoE offloading"
