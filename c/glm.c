@@ -1875,7 +1875,8 @@ static void profile_print(Model *m, double elapsed){
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
         { uint64_t aok=0; double aw=0,ak=0; coli_metal_attn_counts(&aok,&aw,&ak);
-          if(aok) printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs)\n",(unsigned long long)aok,aw,ak); }
+          if(aok){ double ks=0,gs=0; coli_metal_attn_lat(&ks,&gs);
+          printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs | cpu-sched %.2fs gpu-sched %.2fs)\n",(unsigned long long)aok,aw,ak,ks,gs); } }
         printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
                (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc); }
 #endif
@@ -2614,6 +2615,7 @@ int main(int argc, char **argv){
         g_metal_enabled = coli_metal_init();
         if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend richiesto ma non disponibile\n"); return 2; }
         fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
+        if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
     }
 #else
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){

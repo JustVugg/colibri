@@ -48,6 +48,8 @@ size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
  * address. Call after (re)allocating a slab; call unregister before freeing it.
  * base must be aligned to 16384 (Apple page) and len a multiple of it.
  */
+void coli_metal_spin_start(void);   /* COLI_METAL_SPIN=1 keep-alive experiment */
+void coli_metal_spin_stop(void);
 void coli_metal_register(void *base, size_t len);
 void coli_metal_unregister(void *base);
 
@@ -59,6 +61,7 @@ void coli_metal_unregister(void *base);
  * full-range only. Returns 1 on success, 0 to signal CPU fallback.
  */
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
+void coli_metal_attn_lat(double *ksched, double *gsched);
 int coli_metal_attn_decode(const float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt,

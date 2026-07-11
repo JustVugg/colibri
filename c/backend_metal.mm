@@ -205,9 +205,11 @@ extern "C" void coli_metal_moe_times(double *setup, double *gpu, double *scatter
   if(setup)*setup=g_t_setup; if(gpu)*gpu=g_t_gpu; if(scatter)*scatter=g_t_scatter;
 }
 extern "C" double coli_metal_moe_kernel_time(void){ return g_t_kernel; }
-static uint64_t g_attn_ok; static double g_attn_wall, g_attn_kernel;
+static uint64_t g_attn_ok; static double g_attn_wall, g_attn_kernel, g_attn_sched, g_attn_ksched;
 extern "C" void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel){
   if(ok)*ok=g_attn_ok; if(wall)*wall=g_attn_wall; if(kernel)*kernel=g_attn_kernel; }
+extern "C" void coli_metal_attn_lat(double *ksched, double *gsched){
+  if(ksched)*ksched=g_attn_ksched; if(gsched)*gsched=g_attn_sched; }
 
 // Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
@@ -281,7 +283,34 @@ static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
   return nil;
 }
 
-extern "C" void coli_metal_shutdown(void) { g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0; }
+// Keep-alive spinner (COLI_METAL_SPIN=1): keeps trivial GPU work in flight so the GPU
+// doesn't ramp its clock down between the engine's short per-layer bursts. Experiment to
+// quantify how much of the observed submit latency is clock ramp-down.
+#include <thread>
+#include <atomic>
+static std::atomic<bool> g_spin_run{false};
+static std::thread g_spin_thr;
+extern "C" void coli_metal_spin_start(void) {
+  if (!g_dev || g_spin_run.exchange(true)) return;
+  g_spin_thr = std::thread([]{
+    id<MTLCommandQueue> q = [g_dev newCommandQueue];       // own queue: never blocks real work
+    id<MTLBuffer> b = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+    while (g_spin_run.load()) {
+      @autoreleasepool {
+        id<MTLCommandBuffer> cb=[q commandBuffer];
+        id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+        [e setComputePipelineState:g_moe_silu];
+        [e setBuffer:b offset:0 atIndex:0]; [e setBuffer:b offset:0 atIndex:1];
+        [e dispatchThreads:MTLSizeMake(1024,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+      }
+    }
+  });
+  g_spin_thr.detach();               // never joinable at exit (joinable global -> std::terminate)
+}
+extern "C" void coli_metal_spin_stop(void) { g_spin_run.store(false); }
+
+extern "C" void coli_metal_shutdown(void) { coli_metal_spin_stop(); g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0; }
 extern "C" int  coli_metal_available(void) { return g_dev != nil; }
 extern "C" void coli_metal_stats(size_t *c, size_t *b) { if(c)*c=g_tensor_count; if(b)*b=g_tensor_bytes; }
 extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
@@ -417,6 +446,7 @@ extern "C" int coli_metal_attn_decode(const float* x,
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
     g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
+    g_attn_sched += [cb GPUStartTime]-[cb kernelStartTime]; g_attn_ksched += [cb kernelStartTime]-tc;
     memcpy(out,[aout_ contents],(size_t)S*AH*4);
   }
   return 1;
