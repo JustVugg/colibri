@@ -24,8 +24,8 @@
 #include <time.h>
 #include <limits.h>
 #include <pthread.h>                              /* thread I/O del PILOTA */
-#include <stdatomic.h>                            /* PIPE: ready-flags / job queue */
-#include <sched.h>                                /* PIPE: sched_yield nello spin */
+#include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
+#include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
@@ -597,6 +597,24 @@ static int64_t la_hit[3], la_tot[3];
 static int la_pred[2][130][16]; static signed char la_val[2][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer dentro ecache[L+1]
+                          * (non il semplice WILLNEED). Implica PILOT=1. Default OFF: hint-only. */
+/* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
+ *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
+ *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
+ *     aspetta l'eventuale load in volo su QUEL layer. Quindi NESSUNO slot mezzo-caricato viene
+ *     mai matmul-ato: il matmul e il pilota non toccano mai lo stesso layer contemporaneamente.
+ *  2) Percorso SCAN (pilot_prefetch, anch'esso sul MAIN): la scansione di residenza gira sul
+ *     layer FUTURO (lnext = layer corrente + 1), esattamente il layer che il pilota sta scrivendo
+ *     -> QUI i due thread toccano davvero la stessa ecache. Percio' quella scansione prende
+ *     g_pilot_mx (lo stesso lock del worker): letture e pubblicazione degli slot sono serializzate,
+ *     niente torn read di ecn[]/eid. Il pilota non altera MAI il valore di un expert, solo QUALE
+ *     expert e' residente: con un load andato a buon fine l'output resta byte-identico all'OFF. */
+static pthread_mutex_t g_pilot_mx=PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' entrato (per forward) */
+static _Atomic int g_pilot_inflight=-1;  /* layer che il worker sta REAL-caricando adesso (-1 = idle) */
+static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
+static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -894,7 +912,13 @@ static void embed_row(Model *m, int tok, float *x){
  * file -> UNA pread coalescente da ~19 MB dentro `slab` (+ le scale in fslab); i QT sono
  * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
  * THREAD-SAFE su slot distinti (pread posizionale, st_find read-only). */
-static void expert_load(Model *m, int layer, int eid, ESlot *s){
+/* Load one expert's weights into slot `s`. Returns 0 on success, -1 on failure.
+ * fatal=1 (all main / on-demand / REPIN / pin callers): preserve the original
+ * exit-on-error contract byte-for-byte — any missing tensor, OOM, short read or
+ * pread error aborts the process. fatal=0 (speculative pilot only): the same
+ * errors instead abandon the load and return -1 without touching s->eid, so a
+ * mispredicted cross-layer prefetch can never kill the server. */
+static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
@@ -904,17 +928,19 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
-    if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime */
+    if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime.
+                                                  * Reachable ONLY for unquantized models (no .qs);
+                                                  * GLM always has .qs, so the pilot never hits it. */
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
-        s->eid=eid; return;
+        s->eid=eid; return 0;
     }
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
-        if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
+        if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
@@ -922,10 +948,23 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
      * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
     if(!s->slab || wtot+8192 > s->slab_cap){
         compat_aligned_free(s->slab);
-        if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
+        if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
     }
-    if(!s->fslab || ftot > s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
+    if(!s->fslab || ftot > s->fslab_cap){
+        free(s->fslab);
+        if(fatal){ s->fslab=falloc(ftot); }          /* main path: byte-identical exit-on-OOM */
+        else {                                        /* speculative pilot: checked alloc, never exit() */
+            /* replicate falloc's anti-wrap guard + malloc (no zeroing/alignment) */
+            if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
+               !(s->fslab=malloc((size_t)ftot*sizeof(float)))){
+                fprintf(stderr,"OOM fslab\n");
+                free(s->slab); s->slab=NULL; s->slab_cap=0; /* leave a clean, hidden slot (eid stays -1) */
+                s->fslab=NULL; s->fslab_cap=0; return -1;
+            }
+        }
+        s->fslab_cap=ftot;
+    }
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
@@ -945,19 +984,19 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread(tw[ord[0]]->fd, s->slab, wtot, off0)!=wtot){ perror("pread expert"); exit(1); }
+            if(pread(tw[ord[0]]->fd, s->slab, wtot, off0)!=wtot){ perror("pread expert"); if(fatal) exit(1); return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
         }
     }
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off)!=tw[k]->nbytes){ perror("pread expert"); exit(1); }
+            if(pread(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off)!=tw[k]->nbytes){ perror("pread expert"); if(fatal) exit(1); return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off)!=tq[k]->nbytes){ perror("pread qs"); exit(1); }
+        if(pread(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off)!=tq[k]->nbytes){ perror("pread qs"); if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
                                                   * cache in pressione strangoli il throughput */
@@ -971,7 +1010,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
-    s->eid=eid;
+    s->eid=eid; return 0;
 }
 
 /* ============================ PIPE: load ‖ matmul ============================
@@ -1032,7 +1071,7 @@ static void *pipe_worker(void *arg){
                     memory_order_acq_rel,memory_order_relaxed)){
                 int L  =atomic_load_explicit(&p->layer,memory_order_relaxed);
                 int eid=atomic_load_explicit(&p->eids[i],memory_order_relaxed); /* AFTER winning CAS */
-                expert_load(p->m,L,eid,&p->m->ws[i]);
+                expert_load(p->m,L,eid,&p->m->ws[i],1);  /* needed-now load: fatal on I/O error (matches serial path) */
                 atomic_store_explicit(&p->ready[i],1,memory_order_release);
             }
             /* CAS failed → another worker advanced index (or gen advanced): re-loop */
@@ -1268,6 +1307,19 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
+    if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
+                         * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
+                         * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
+                         * per tutto il resolve/matmul/promozione qui sotto). */
+        for(;;){
+            pthread_mutex_lock(&g_pilot_mx);
+            atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
+            int inf=atomic_load_explicit(&g_pilot_inflight,memory_order_acquire);
+            pthread_mutex_unlock(&g_pilot_mx);
+            if(inf!=layer) break;
+            sched_yield();
+        }
+    }
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     float *logit=falloc(E), *choice=falloc(E);
     int sI=c->moe_inter*c->n_shared;
@@ -1332,7 +1384,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
         if(nmiss){
@@ -1344,7 +1396,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 m->t_edisk += now_s()-t0;           /* dispatch only; real reads hide behind matmul */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
+                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
                 m->t_edisk += now_s()-t0; }
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
@@ -1390,7 +1442,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
               else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
+              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
     /* ---- FASE E: shared expert, un matmul a S righe ---- */
@@ -1446,13 +1498,50 @@ static void la_predict(Model *m, int target, const float *h, int kind){
 static struct { int l,e; } pilot_q[4096];
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
+/* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
+ * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
+ * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
+static void pilot_realload(Model *m, int layer, int eid){
+    pthread_mutex_lock(&g_pilot_mx);
+    if(layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+        pthread_mutex_unlock(&g_pilot_mx); return;      /* il main possiede gia' questo layer */
+    }
+    ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
+    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+    for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
+    if(nn<m->ecap){ slot=nn; isnew=1; }
+    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0; }
+    ESlot *dst=&Sl[slot];
+    dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
+    atomic_store_explicit(&g_pilot_inflight,layer,memory_order_release);
+    pthread_mutex_unlock(&g_pilot_mx);
+
+    int rc=expert_load(m,layer,eid,dst,0);              /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server */
+
+    pthread_mutex_lock(&g_pilot_mx);
+    if(rc==0){
+        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+        if(isnew) m->ecn[layer]=slot+1;                 /* pubblica lo slot SOLO ora che eid e' valido */
+        atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load fallito: slot resta nascosto (eid=-1), mai pubblicato */
+    }
+    atomic_store_explicit(&g_pilot_inflight,-1,memory_order_release);
+    pthread_mutex_unlock(&g_pilot_mx);
+    if(rc!=0)                                            /* mai swallow silenzioso: logga (una riga) e prosegui */
+        fprintf(stderr,"[PILOT] load speculativo abbandonato: layer %d expert %d (I/O error/short read) — nessun impatto sull'output\n",layer,eid);
+}
 static void *pilot_worker(void *arg){
     (void)arg;
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
         if(r==w){ usleep(200); continue; }
-        expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        if(g_pilot_real) pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        else             expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
         __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
     }
     return NULL;
@@ -1469,10 +1558,20 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
-            int found=0; ESlot *P=m->pin[lnext];
+            /* Residency scan of the FUTURE layer lnext under g_pilot_mx: with
+             * PILOT_REAL=1 the pilot worker mutates ecache[lnext]/ecn[lnext]
+             * concurrently, so read them under the same lock (Option A). Decide
+             * under the lock, then enqueue AFTER unlocking — the pilot_q ring is
+             * lock-free (pilot_w/pilot_r atomics, not g_pilot_mx) so there is no
+             * re-entrant double-lock, and the worker re-checks residency under the
+             * lock anyway, making a racing redundant enqueue harmless. */
+            int found=0;
+            pthread_mutex_lock(&g_pilot_mx);
+            ESlot *P=m->pin[lnext];
             for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lnext];
             for(int z=0;z<m->ecn[lnext] && !found;z++) if(Sl[z].eid==best) found=1;
+            pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
@@ -1502,6 +1601,11 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
+    if(g_pilot_real){   /* nuovo forward: il possesso-layer riparte da -1 (i layer si rifanno da 0) */
+        pthread_mutex_lock(&g_pilot_mx);
+        atomic_store_explicit(&g_cur_moe_layer,-1,memory_order_release);
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
@@ -1986,6 +2090,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     profile_print(m,dt);
+    if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
+        (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
+        (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
     if(g_looka){
         const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
@@ -2046,7 +2153,7 @@ static void repin_pass(Model *m){
                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
 #endif
         double t0=now_s();
-        expert_load(m,cd[b].l,cd[b].eid,s);       /* disk -> RAM, same resident slot */
+        expert_load(m,cd[b].l,cd[b].eid,s,1);       /* disk -> RAM, same resident slot */
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
@@ -2435,7 +2542,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
         int li=r[a].l, slot;
         #pragma omp critical
         slot=m->npin[li]++;
-        expert_load(m,li,r[a].e,&m->pin[li][slot]);
+        expert_load(m,li,r[a].e,&m->pin[li][slot],1);
     }
     m->resident_bytes += (int64_t)npin*eb;
     fprintf(stderr,"[PIN] hot store: %d experts in RAM (%.1f GB) loaded in %.0fs from %s\n",
@@ -2645,7 +2752,13 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = misura predicibilita' routing */
     g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
-    g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):8;
+    g_pilot_real = getenv("PILOT_REAL")?atoi(getenv("PILOT_REAL")):0; /* default OFF: load VERI cross-layer (value-preserving prefetch); PILOT_REAL=1 opta in */
+    if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
+    /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
+     * Under PILOT_REAL the speculative loads are REAL and create LRU eviction
+     * pressure, so at ~28% mispredict a large K thrashes the cache — default to 6
+     * (best-measured this session) unless the user set PILOT_K explicitly. */
+    g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
