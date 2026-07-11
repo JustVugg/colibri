@@ -180,6 +180,30 @@ threaded HTTP is continuous batching. RAM admission accounts for every configure
 Use `COLI_KV_SLOTS=N` as the environment equivalent. Start with a small value: at the
 default 4096-token context, every slot costs hundreds of MB.
 
+### Experimental Metal backend (Apple Silicon)
+
+On Apple Silicon the decode profile is matmul-bound, and unified memory removes the
+PCIe copy tax that keeps CUDA's streaming experts on the CPU — so colibrì has an
+opt-in Metal backend that runs the **routed-expert SwiGLU (batched, zero-copy from
+the RAM slabs)**, the **fused decode attention** (full MLA layer in one command
+buffer, S≤4), and **prefill's large GEMMs** on the GPU. Token-exact vs the CPU path.
+
+```bash
+cd c
+make glm METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
+make metal-test           # standalone kernel/attention correctness vs CPU reference
+COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
+```
+
+Measured on an M4 Max (128 GB, warm cache, MTP on): **0.20 → 0.35 tok/s (~1.73×)**.
+Key design points: Metal's ~5 ms submit latency makes per-matmul dispatch a loss —
+everything is batched into few command buffers per layer, and the resident experts'
+GPU work is submitted *before* the missed experts' disk reads so I/O and compute
+overlap. `COLI_METAL_GEMM_MIN` tunes the prefill GEMM row threshold (default 16).
+Streaming, cache, MTP, DSA and the persistence formats are unchanged; every GPU
+path falls back to the CPU per-block on any fault. Numerics are dequant→f32-MAC
+(same as the CUDA tier); greedy outputs are byte-identical to the CPU engine.
+
 ### Experimental resident CUDA backend
 
 colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
