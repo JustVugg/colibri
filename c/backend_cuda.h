@@ -42,6 +42,19 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
+/*
+ * FFN di expert FUSA e ASINCRONA (Fase 2): out = down( silu(gate(x)) * up(x) ).
+ * Protocollo per blocco: begin (riserva i buffer per `rows` righe totali e apre lo
+ * stream) -> N enqueue (una per expert residente: x host [nr,D] -> *out_host pinned
+ * [nr,D], valido DOPO la sync) -> sync (attende lo stream; 0 = un lancio e' fallito).
+ * begin sincronizza prima di riallocare: gli out del blocco precedente restano validi
+ * solo fino alla begin successiva. Il chiamante puo' riusare x subito dopo l'enqueue.
+ */
+int coli_cuda_ffn_begin(int device, long long rows, int D, int I);
+int coli_cuda_ffn_enqueue(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down,
+                          const float *x, int nr, const float **out_host);
+int coli_cuda_ffn_sync(int device);
+
 #ifdef __cplusplus
 }
 #endif

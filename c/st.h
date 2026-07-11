@@ -12,8 +12,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
-#include <unistd.h>
+#if !defined(_WIN32) || defined(__MINGW32__)
+#include <unistd.h>                /* MSVC: pread/dirent arrivano da compat.h */
 #include <dirent.h>
+#endif
 #include "json.h"
 #include "compat.h"
 

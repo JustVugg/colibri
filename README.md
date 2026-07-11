@@ -129,11 +129,13 @@ The engine at runtime is pure C — python is only used by the one-time converte
 
 ### Windows 11 (native, no WSL)
 
-colibrì builds and runs natively on Windows 11 x86-64 with MinGW-w64. The port adds
-a `_WIN32` compatibility layer in `c/compat.h` that maps POSIX I/O to the Windows API
-(pread → ReadFile+OVERLAPPED, posix_fadvise no-op, aligned allocation, MoveFileEx rename,
-GlobalMemoryStatusEx RAM detection). All platform differences stay in `compat.h`; the
-engine source is unchanged.
+colibrì builds and runs natively on Windows 11 x86-64. The port adds a `_WIN32`
+compatibility layer in `c/compat.h` that maps POSIX I/O to the Windows API
+(pread → ReadFile+OVERLAPPED, posix_fadvise WILLNEED → dedicated readahead thread
+that keeps the async I/O/compute overlap alive, aligned allocation, MoveFileEx
+rename, GlobalMemoryStatusEx RAM detection; on the clang/MSVC target compat.h also
+supplies dirent/pthread/clock_gettime shims that MinGW has natively). All platform
+differences stay in `compat.h`; the engine source is unchanged.
 
 **Toolchain:** GCC via [winlibs](https://winlibs.com/) or MSYS2 MinGW-w64. Tested with
 GCC 16.1.0 (x86_64-ucrt-posix-seh).
@@ -161,9 +163,25 @@ python coli chat --model D:\glm52_i4            # interactive chat
 python coli serve --model D:\glm52_i4            # OpenAI-compatible API
 ```
 
-**Status:** Phase 1 complete (compiles, correct, static-linked). O_DIRECT (Phase 2),
-GPU via `LoadLibrary` on `coli_cuda.dll` (Phases G0–G2), and full-model validation
-are separate workstreams. See `PORT_WINDOWS_PLAN.md` for the full plan.
+**Alternative toolchain — clang + CUDA (GPU tier on Windows):** with LLVM/clang
+(MSVC target) and CUDA Toolkit 13.x, `build_win.ps1` builds the engine *with the
+VRAM expert tier* — nvcc's object links directly into the clang binary, no DLL
+needed. O_DIRECT is active on this path (`FILE_FLAG_NO_BUFFERING`). Validated
+token-exact (oracle TF 32/32, CPU and CUDA):
+
+```powershell
+cd c
+powershell -ExecutionPolicy Bypass -File build_win.ps1          # CPU engine + tests
+powershell -ExecutionPolicy Bypass -File build_win.ps1 -Cuda    # + VRAM tier (default sm_120)
+```
+
+Requires Visual Studio with an nvcc-supported MSVC toolset (v14.4x — the script
+selects it and runs nvcc inside `vcvars64` automatically). Tip: exclude the model
+directory from Windows Defender (Windows Security → Exclusions), or every expert
+read gets re-scanned.
+
+**Status:** MinGW path — Phase 1 complete (compiles, correct, static-linked), see
+`PORT_WINDOWS_PLAN.md`. clang path — CPU + CUDA both validated 32/32 on an RTX 5090.
 
 ### OpenAI-compatible API
 
@@ -255,11 +273,15 @@ cross-compiling. Requesting CUDA with a CPU-only binary, an invalid device, or
 an unavailable runtime fails at startup instead of silently falling back.
 
 The normal `make` build and runtime behavior are unchanged. CUDA defaults to an
-expert-only accelerator: resident dense/attention tensors stay on CPU because
-fixture measurements show that moving them does not help while expert I/O is
-the bottleneck. `CUDA_DENSE=1` keeps the earlier all-resident experimental path.
-A measured `PIN` profile can promote its hottest experts into the persistent
-VRAM tier while keeping the rest in RAM:
+expert-only accelerator; `CUDA_DENSE=1` also moves the resident dense tensors.
+The expert tier is a **heat-driven cascade over additive tiers**: the hottest
+experts go to VRAM (their host copy is freed — VRAM *adds* to RAM instead of
+mirroring it), the next band stays pinned in RAM (`PIN_GB`), the rest lives on
+LRU + disk. VRAM-resident experts run as a **fused FFN batched on an async
+stream per device**, overlapping with the CPU experts of the same block
+(`CUDA_FFN=0` restores the synchronous per-tensor path; measured +35–40% on the
+fixture's `cuda_pin` mode). On CUDA runtime failure a VRAM-only slot demotes
+loudly: reloaded from disk, recomputed on CPU — never silently wrong.
 
 ```bash
 STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
@@ -270,19 +292,27 @@ COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=96 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
-Selected experts are uploaded during startup, so capacity failures occur before
-inference and the log reports their exact tensor footprint. The budget is clamped
-against free VRAM after reserving the projected dense resident set and 2 GB of
-runtime headroom per selected device. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
-total budget across the device set; experts are assigned whole to the
-least-loaded device that can hold them. A NUMA-local RAM backing store is not
-implemented yet.
+Selected experts are uploaded during startup in blocks (parallel disk read,
+upload, host copy freed immediately — the transient RAM peak stays ~one block
+even on small machines), so capacity failures occur before inference. The budget
+is clamped against free VRAM after reserving the projected dense resident set
+and 2 GB of runtime headroom per selected device. With `COLI_GPUS`,
+`CUDA_EXPERT_GB` is a total budget across the device set; experts are assigned
+whole to the least-loaded device that can hold them. Because the VRAM tier
+needs no RAM backing, a small-RAM machine with a large GPU can now run a
+VRAM-only hot tier.
 
-Current limitations: devices use independent contexts and synchronous
-host-staged activation copies—there is no P2P/NCCL dependency yet. The kernels
-are correctness-first custom kernels rather than cuBLAS/Tensor Core kernels.
-This draft intentionally makes no end-to-end speedup claim before the full model
-is benchmarked.
+`COLI_PROFILE=<name>` (or `coli --profile <name>`) keeps a separate expert-usage
+history per usage domain (`.coli_usage.<name>`): coherent workloads (coding,
+writing, ...) route to coherent expert sets, so the cascade pre-loads the right
+experts from the first token. `MEMWATCH=0` disables the runtime RAM monitor
+(default on: at each turn boundary the LRU shrinks under memory pressure and
+grows when RAM frees up; the static auto-budget margin is 10%).
+
+Current limitations: devices use independent contexts (no P2P/NCCL); the dense
+path still uses synchronous copies; kernels are correctness-first custom kernels
+rather than cuBLAS/Tensor Core kernels. Fixture A/B numbers exist (see above);
+full-model end-to-end numbers are still to be measured.
 
 For a reproducible backend A/B without the full checkpoint, generate the
 deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:

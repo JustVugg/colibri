@@ -18,6 +18,17 @@ typedef struct {
     float *x, *y;
     size_t x_cap, y_cap;
     size_t tensor_count, tensor_bytes;
+    /* Fase 2: pool FFN fusa — uno stream per device, staging host pinned e buffer
+     * device dimensionati alla begin (mai riallocati con lavoro in volo). dm0/dm1
+     * (intermedi gate/up) sono condivisi tra gli expert del blocco: lo stream
+     * serializza i kernel, quindi il riuso a offset 0 e' sicuro. */
+    cudaStream_t stream;
+    float *hx, *hy;                 /* host pinned: input staging / output */
+    size_t hx_cap, hy_cap;
+    float *dx, *dy, *dm0, *dm1;     /* device: input, output, intermedi [rows,I] */
+    size_t dx_cap, dy_cap, dm0_cap, dm1_cap;
+    long long ffn_off;              /* righe gia' impegnate nel blocco corrente */
+    int ffn_D, ffn_I, ffn_err, ffn_open;
 } DeviceContext;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -91,6 +102,76 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     return 1;
 }
 
+static int reserve_pinned(float **ptr, size_t *cap, size_t bytes) {
+    if (*cap >= bytes) return 1;
+    if (*ptr) cudaFreeHost(*ptr);
+    *ptr = nullptr;
+    *cap = 0;
+    if (!cuda_ok(cudaHostAlloc(ptr, bytes, cudaHostAllocDefault), "pinned allocation")) return 0;
+    *cap = bytes;
+    return 1;
+}
+
+__global__ static void silu_mul(float *g, const float *u, long long n) {
+    long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i < n) { float v = g[i]; g[i] = v / (1.0f + expf(-v)) * u[i]; }
+}
+
+extern "C" int coli_cuda_ffn_begin(int device, long long rows, int D, int I) {
+    DeviceContext *ctx = find_ctx(device);
+    if (rows < 1 || D < 1 || I < 1 || !select_ctx(ctx)) return 0;
+    if (!ctx->stream && !cuda_ok(cudaStreamCreate(&ctx->stream), "stream create")) return 0;
+    /* gli out del blocco precedente puntano in hy: sincronizza PRIMA di riallocare */
+    if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "ffn begin sync")) return 0;
+    size_t xb = (size_t)rows * D * sizeof(float), mb = (size_t)rows * I * sizeof(float);
+    if (!reserve_pinned(&ctx->hx, &ctx->hx_cap, xb) || !reserve_pinned(&ctx->hy, &ctx->hy_cap, xb) ||
+        !reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, xb) ||
+        !reserve(&ctx->dm0, &ctx->dm0_cap, mb) || !reserve(&ctx->dm1, &ctx->dm1_cap, mb)) return 0;
+    ctx->ffn_off = 0; ctx->ffn_D = D; ctx->ffn_I = I;
+    ctx->ffn_err = 0; ctx->ffn_open = 1;
+    return 1;
+}
+
+extern "C" int coli_cuda_ffn_enqueue(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down,
+                                     const float *x, int nr, const float **out_host) {
+    if (!gate || !up || !down || !x || !out_host || nr < 1) return 0;
+    if (gate->device != up->device || up->device != down->device) return 0;
+    DeviceContext *ctx = find_ctx(gate->device);
+    if (!ctx || !ctx->ffn_open) return 0;
+    int D = ctx->ffn_D, I = ctx->ffn_I;
+    if (gate->I != D || gate->O != I || up->I != D || up->O != I || down->I != I || down->O != D) return 0;
+    size_t need = ((size_t)ctx->ffn_off + nr) * D * sizeof(float);
+    if (need > ctx->hx_cap || need > ctx->hy_cap) return 0;   /* begin sottodimensionata */
+    if (!select_ctx(ctx)) return 0;
+    long long off = ctx->ffn_off;
+    float *hx = ctx->hx + off * D, *hy = ctx->hy + off * D;
+    float *dx = ctx->dx + off * D, *dy = ctx->dy + off * D;
+    size_t xb = (size_t)nr * D * sizeof(float);
+    memcpy(hx, x, xb);                            /* il chiamante riusa x subito dopo */
+    cudaMemcpyAsync(dx, hx, xb, cudaMemcpyHostToDevice, ctx->stream);
+    quant_matmul<<<dim3((unsigned)I, (unsigned)nr), 256, 0, ctx->stream>>>(
+        ctx->dm0, dx, gate->weights, gate->scales, gate->fmt, nr, D, I, row_bytes(gate->fmt, D));
+    quant_matmul<<<dim3((unsigned)I, (unsigned)nr), 256, 0, ctx->stream>>>(
+        ctx->dm1, dx, up->weights, up->scales, up->fmt, nr, D, I, row_bytes(up->fmt, D));
+    long long n = (long long)nr * I;
+    silu_mul<<<(unsigned)((n + 255) / 256), 256, 0, ctx->stream>>>(ctx->dm0, ctx->dm1, n);
+    quant_matmul<<<dim3((unsigned)D, (unsigned)nr), 256, 0, ctx->stream>>>(
+        dy, ctx->dm0, down->weights, down->scales, down->fmt, nr, I, D, row_bytes(down->fmt, I));
+    cudaMemcpyAsync(hy, dy, xb, cudaMemcpyDeviceToHost, ctx->stream);
+    if (cudaGetLastError() != cudaSuccess) ctx->ffn_err = 1;
+    *out_host = hy;
+    ctx->ffn_off += nr;
+    return 1;
+}
+
+extern "C" int coli_cuda_ffn_sync(int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !ctx->ffn_open || !select_ctx(ctx)) return 0;
+    ctx->ffn_open = 0;
+    if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "ffn sync")) return 0;
+    return !ctx->ffn_err;
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
@@ -125,10 +206,16 @@ extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
+        if (ctx->stream) { cudaStreamSynchronize(ctx->stream); cudaStreamDestroy(ctx->stream); }
         if (ctx->x) cudaFree(ctx->x);
         if (ctx->y) cudaFree(ctx->y);
-        ctx->x = ctx->y = nullptr;
-        ctx->x_cap = ctx->y_cap = 0;
+        if (ctx->dx) cudaFree(ctx->dx);
+        if (ctx->dy) cudaFree(ctx->dy);
+        if (ctx->dm0) cudaFree(ctx->dm0);
+        if (ctx->dm1) cudaFree(ctx->dm1);
+        if (ctx->hx) cudaFreeHost(ctx->hx);
+        if (ctx->hy) cudaFreeHost(ctx->hy);
+        *ctx = {};
     }
     g_nctx = 0;
 }
@@ -159,13 +246,16 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
     DeviceContext *ctx = find_ctx(device);
-    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    if (!tensor || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!rb) return 0;
     if (*tensor) {
+        /* Riuso di una copia gia' residente: i dati host possono essere NULL
+         * (tier VRAM senza backing RAM — la copia host e' stata liberata). */
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
     }
+    if (!weights || (fmt && !scales)) return 0;  /* il PRIMO upload richiede i dati host */
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;

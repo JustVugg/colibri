@@ -76,6 +76,18 @@ def analyze_model(model):
 
 
 def memory_available():
+    if os.name == "nt":
+        import ctypes
+        class _MSX(ctypes.Structure):
+            _fields_ = ([("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32)] +
+                        [(n, ctypes.c_uint64) for n in (
+                            "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                            "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual",
+                            "ullAvailExtendedVirtual")])
+        ms = _MSX(); ms.dwLength = ctypes.sizeof(_MSX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return int(ms.ullAvailPhys)
+        return 0
     try:
         text = Path("/proc/meminfo").read_text()
         return int(re.search(r"MemAvailable:\s+(\d+)", text).group(1)) * 1024
@@ -145,8 +157,10 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         usable = max(0, gpu["free_bytes"] - reserve)
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
+    # Il tier VRAM non richiede piu' backing RAM (gli slot caricati liberano la copia
+    # host): il budget e' limitato solo dalla VRAM fisica, i tier sono additivi.
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
-    vram_budget = min(requested_vram, safe_vram, cache_bytes)
+    vram_budget = min(requested_vram, safe_vram)
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
@@ -155,7 +169,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
-        warnings.append("VRAM tier was clamped by free VRAM or its required RAM backing")
+        warnings.append("VRAM tier was clamped by free VRAM")
 
     return {
         "version": 1,

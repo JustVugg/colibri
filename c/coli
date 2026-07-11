@@ -107,7 +107,13 @@ def need_model(model):
         sys.exit(f"{C.yel}motore non compilato.{C.r} Esegui:  coli build")
 
 def cuda_binary():
-    if not os.path.exists(GLM) or sys.platform != "linux": return False
+    if not os.path.exists(GLM): return False
+    if sys.platform == "win32":
+        # niente ldd: la import table PE contiene "cudart64_*.dll" se linkato con CUDA
+        try:
+            with open(GLM, "rb") as f: return b"cudart" in f.read()
+        except OSError: return False
+    if sys.platform != "linux": return False
     try:
         linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
         return any("libcudart" in line and "not found" not in line
@@ -133,6 +139,7 @@ def env_for(a):
     if a.topk: e["TOPK"]=str(a.topk)
     if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
     if a.repin: e["REPIN"]=str(a.repin)
+    if a.profile: e["COLI_PROFILE"]=a.profile
     if a.ctx: e["CTX"]=str(a.ctx)
     if a.auto_tier:
         from resource_plan import build_plan, environment_for_plan, format_bytes
@@ -284,6 +291,10 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
+    if sys.platform == "win32" and not shutil.which("make"):
+        # senza MinGW make: build clang/nvcc via PowerShell (vedi build_win.ps1)
+        sys.exit(subprocess.call(["powershell","-ExecutionPolicy","Bypass",
+                                  "-File",os.path.join(HERE,"build_win.ps1")]))
     sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
 
 def cmd_info(a):
@@ -517,6 +528,8 @@ def main():
     common.add_argument("--gpu",default=None,help="auto, none oppure lista device, es. 0,1")
     common.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
     common.add_argument("--repin", type=int, default=0, help="adatta gli expert RAM/VRAM ogni N token")
+    common.add_argument("--profile", default=os.environ.get("COLI_PROFILE",""),
+                        help="storia expert separata per dominio d'uso (es. coding, scrittura)")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)

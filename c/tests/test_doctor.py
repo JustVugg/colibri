@@ -99,6 +99,7 @@ class DoctorTest(unittest.TestCase):
         self.assertIsNone(report["plan"])
         self.assertEqual(exit_code(report), 1)
 
+    @unittest.skipIf(sys.platform == "win32", "Windows non ha il bit di esecuzione: chmod 644 non rende un file non-eseguibile")
     def test_non_executable_engine_and_excessive_ram_budget_fail(self):
         self.engine.chmod(0o644)
         report = self.report(ram_gb=40)

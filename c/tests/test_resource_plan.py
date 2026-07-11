@@ -60,8 +60,10 @@ class ResourcePlanTest(unittest.TestCase):
                           available_memory=32 * GB, available_disk=100 * GB, gpus=gpus)
         self.assertEqual(plan["version"], 1)
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
-        self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
-        self.assertIn("required RAM backing", plan["warnings"][0])
+        # il tier VRAM e' limitato solo dalla VRAM libera (meno la riserva),
+        # NON dalla cache RAM: gli slot caricati liberano il backing host
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
+        self.assertIn("clamped by free VRAM", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
 
     def test_filters_requested_devices(self):

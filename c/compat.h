@@ -77,12 +77,95 @@ static inline int compat_open_direct(const char *path){
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <io.h>
 #include <process.h>
 #include <malloc.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#ifndef __MINGW32__
+/* ================= clang/MSVC (UCRT): cio' che MinGW ha nativo e MSVC no =================
+ * MinGW-w64 fornisce ssize_t/dirent/pthread(winpthreads)/clock_gettime/usleep;
+ * il target MSVC no: gli shim vivono qui e restano invisibili alla build MinGW. */
+#ifndef _SSIZE_T_DEFINED
+typedef intptr_t ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
+
+/* --- dirent: il minimo che serve a st_init (elenco *.safetensors) --- */
+struct dirent { char d_name[260]; };
+typedef struct { HANDLE h; WIN32_FIND_DATAA fd; int first; struct dirent ent; } DIR;
+static inline DIR *opendir(const char *path){
+    DIR *d = (DIR*)calloc(1, sizeof *d);
+    char pat[1024]; snprintf(pat, sizeof pat, "%s\\*", path);
+    d->h = FindFirstFileA(pat, &d->fd);
+    if(d->h==INVALID_HANDLE_VALUE){ free(d); return NULL; }
+    d->first = 1;
+    return d;
+}
+static inline struct dirent *readdir(DIR *d){
+    if(!d) return NULL;
+    if(d->first) d->first = 0;
+    else if(!FindNextFileA(d->h, &d->fd)) return NULL;
+    strncpy(d->ent.d_name, d->fd.cFileName, sizeof d->ent.d_name - 1);
+    d->ent.d_name[sizeof d->ent.d_name - 1] = 0;
+    return &d->ent;
+}
+static inline int closedir(DIR *d){
+    if(!d) return -1;
+    FindClose(d->h); free(d);
+    return 0;
+}
+
+/* --- tempo: CLOCK_MONOTONIC via QueryPerformanceCounter --- */
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+static inline int compat_clock_gettime(int id, struct timespec *ts){
+    (void)id;
+    static LARGE_INTEGER freq;                   /* race benigna: scrittori identici */
+    LARGE_INTEGER c;
+    if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    ts->tv_sec  = (time_t)(c.QuadPart / freq.QuadPart);
+    ts->tv_nsec = (long)((c.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
+    return 0;
+}
+#define clock_gettime compat_clock_gettime
+
+static inline int compat_usleep(long us){ Sleep(us >= 1000 ? (DWORD)(us/1000) : 1); return 0; }
+#define usleep compat_usleep
+
+/* --- pthread: il motore usa solo create+detach (thread PILOT) --- */
+typedef HANDLE pthread_t;
+typedef struct { int unused; } pthread_attr_t;
+typedef struct { void *(*fn)(void*); void *arg; } coli_thr_tramp_t;
+static unsigned __stdcall coli_thr_entry(void *p){
+    coli_thr_tramp_t t = *(coli_thr_tramp_t*)p; free(p);
+    t.fn(t.arg);
+    return 0;
+}
+static inline int pthread_create(pthread_t *t, const pthread_attr_t *attr,
+                                 void *(*fn)(void*), void *arg){
+    (void)attr;
+    coli_thr_tramp_t *tr = (coli_thr_tramp_t*)malloc(sizeof *tr);
+    if(!tr) return -1;
+    tr->fn = fn; tr->arg = arg;
+    uintptr_t h = _beginthreadex(NULL, 0, coli_thr_entry, tr, 0, NULL);
+    if(!h){ free(tr); return -1; }
+    *t = (HANDLE)h;
+    return 0;
+}
+#endif /* !__MINGW32__ */
 
 /* --- O_BINARY: belt-and-braces vs CRT text-mode (0x0A byte corruption) --- */
 #ifndef O_BINARY
@@ -94,22 +177,13 @@ static inline int compat_open_direct(const char *path){
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
 
-/* --- posix_fadvise: no-op (advisory only; safe to ignore) --- */
-#ifndef POSIX_FADV_NORMAL
-#define POSIX_FADV_NORMAL      0
-#define POSIX_FADV_RANDOM      1
-#define POSIX_FADV_SEQUENTIAL  2
-#define POSIX_FADV_WILLNEED    3
-#define POSIX_FADV_DONTNEED    4
-#define POSIX_FADV_NOREUSE     5
-#endif
-#define posix_fadvise(fd,off,len,advice) do{(void)(fd);(void)(off);(void)(len);(void)(advice);}while(0)
-
 /* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
  * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
- * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
-static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
+ * MB-centinaia di MB, il wrapper e' robusto per ogni taglia).
+ * NB: offset `long long`, non off_t — sul target MSVC off_t e' long a 32 bit
+ * e _FILE_OFFSET_BITS non lo allarga: con off_t il wrap era silenzioso. */
+static inline ssize_t compat_pread(int fd, void *buf, size_t n, long long off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
     HANDLE h = (HANDLE)osfh;
@@ -118,8 +192,8 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
         size_t chunk = n - total;
         DWORD chunk32 = (chunk > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)chunk;
         OVERLAPPED ov = {0};
-        ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
-        ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
+        ov.Offset     = (DWORD)( (off + (long long)total)        & 0xFFFFFFFFULL);
+        ov.OffsetHigh = (DWORD)(((off + (long long)total) >> 32) & 0xFFFFFFFFULL);
         DWORD rd = 0;
         if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
             DWORD err = GetLastError();
@@ -134,6 +208,69 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     return (ssize_t)total;
 }
 #define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)
+
+/* --- posix_fadvise: WILLNEED = readahead da un thread dedicato ---
+ * Windows non ha un equivalente advisory per-range su fd; il no-op perdeva
+ * l'overlap I/O-calcolo del readahead (expert del blocco successivo + PILOT).
+ * Qui un worker legge il range a blocchi in un buffer di scarto sul fd
+ * BUFFERIZZATO: le pagine restano nella system cache e le pread sincrone
+ * successive le trovano calde — stessa semantica del WILLNEED del kernel.
+ * Ring MPSC advisory: pieno = scarta (un hint perso non e' un errore,
+ * stessa scelta del ring del PILOT in glm.c). DONTNEED resta no-op. */
+#ifndef POSIX_FADV_NORMAL
+#define POSIX_FADV_NORMAL      0
+#define POSIX_FADV_RANDOM      1
+#define POSIX_FADV_SEQUENTIAL  2
+#define POSIX_FADV_WILLNEED    3
+#define POSIX_FADV_DONTNEED    4
+#define POSIX_FADV_NOREUSE     5
+#endif
+typedef struct { int fd; long long off, len; } coli_pf_req_t;
+static coli_pf_req_t coli_pf_q[1024];
+static volatile unsigned coli_pf_w, coli_pf_r;
+static CRITICAL_SECTION coli_pf_cs;
+static HANDLE coli_pf_sem;
+static INIT_ONCE coli_pf_once = INIT_ONCE_STATIC_INIT;
+static unsigned __stdcall coli_pf_worker(void *arg){
+    (void)arg;
+    static char coli_pf_buf[1u<<21];             /* 2 MB di scarto, un solo worker */
+    for(;;){
+        WaitForSingleObject(coli_pf_sem, INFINITE);
+        coli_pf_req_t rq; int have = 0;
+        EnterCriticalSection(&coli_pf_cs);
+        if(coli_pf_r != coli_pf_w){ rq = coli_pf_q[coli_pf_r & 1023]; coli_pf_r++; have = 1; }
+        LeaveCriticalSection(&coli_pf_cs);
+        if(!have) continue;
+        for(long long o = 0; o < rq.len; o += (long long)sizeof coli_pf_buf){
+            long long nb = rq.len - o; if(nb > (long long)sizeof coli_pf_buf) nb = (long long)sizeof coli_pf_buf;
+            if(compat_pread(rq.fd, coli_pf_buf, (size_t)nb, rq.off + o) <= 0) break;
+        }
+    }
+    return 0;
+}
+static BOOL CALLBACK coli_pf_init(PINIT_ONCE io, PVOID p, PVOID *ctx){
+    (void)io; (void)p; (void)ctx;
+    InitializeCriticalSection(&coli_pf_cs);
+    coli_pf_sem = CreateSemaphoreA(NULL, 0, 1u<<20, NULL);
+    _beginthreadex(NULL, 0, coli_pf_worker, NULL, 0, NULL);
+    return TRUE;
+}
+static inline int compat_fadvise(int fd, long long off, long long len, int advice){
+    if(advice != POSIX_FADV_WILLNEED || len <= 0) return 0;
+    InitOnceExecuteOnce(&coli_pf_once, coli_pf_init, NULL, NULL);
+    int queued = 0;
+    EnterCriticalSection(&coli_pf_cs);
+    if(coli_pf_w - coli_pf_r < 1024){
+        coli_pf_q[coli_pf_w & 1023].fd = fd;
+        coli_pf_q[coli_pf_w & 1023].off = off;
+        coli_pf_q[coli_pf_w & 1023].len = len;
+        coli_pf_w++; queued = 1;
+    }
+    LeaveCriticalSection(&coli_pf_cs);
+    if(queued) ReleaseSemaphore(coli_pf_sem, 1, NULL);
+    return 0;
+}
+#define posix_fadvise(fd,off,len,advice) compat_fadvise(fd,off,len,advice)
 
 /* --- posix_memalign -> _aligned_malloc ---
  * ATTN: memoria allocata con _aligned_malloc DEVE essere liberata con
@@ -215,10 +352,14 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
 }
 #define getline(lineptr,n,stream) compat_getline(lineptr,n,stream)
 
-/* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
+/* --- setenv -> _putenv_s (POSIX setenv assente su Windows) ---
+ * NON SetEnvironmentVariableA: quella aggiorna solo l'ambiente Win32, non la
+ * copia CRT letta da getenv() — e libomp legge OMP_WAIT_POLICY via getenv,
+ * quindi il setenv di glm.c verrebbe silenziosamente ignorato dal runtime OMP.
+ * _putenv_s aggiorna entrambe (CRT + processo). */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){
     if(!overwrite && getenv(name)) return 0;
-    return SetEnvironmentVariableA(name, value) ? 0 : -1;
+    return _putenv_s(name, value);
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 

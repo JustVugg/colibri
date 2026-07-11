@@ -2,6 +2,7 @@
  * build da c/: gcc -O2 tests/test_tok.c -o tok_test
  * uso:  ./tok_test <tokenizer.json>   (legge righe "TEXT\tID,ID,.." da stdin) */
 #define _GNU_SOURCE
+#include "../compat.h"   /* Windows: getline/ssize_t; Linux/macOS: no-op */
 #include "../tok.h"
 
 int main(int argc, char **argv){

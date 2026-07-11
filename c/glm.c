@@ -23,8 +23,10 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
-#include <pthread.h>                              /* thread I/O del PILOTA */
+#if !defined(_WIN32) || defined(__MINGW32__)
+#include <pthread.h>                              /* thread I/O del PILOTA (MSVC: shim in compat.h) */
 #include <unistd.h>
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -98,7 +100,8 @@ typedef struct {
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+                 int64_t slab_cap, fslab_cap; uint64_t used;
+                 int vram_only; } ESlot;   /* 1 = pesi SOLO in VRAM, backing host liberato */
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -482,6 +485,12 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         w->cuda_failed=1;
         fprintf(stderr,"[CUDA] tensor [%d,%d] su device %d disabilitato dopo errore; fallback CPU\n",
             w->O,w->I,w->cuda_device);
+    }
+    if(!w->qf && !w->q8 && !w->q4){
+        /* slot VRAM-only col CUDA appena fallito: nessun peso host. Output azzerato;
+         * il chiamante (moe) vede cuda_failed, rimaterializza da disco e ricalcola. */
+        memset(y,0,(size_t)S*w->O*sizeof(float));
+        return;
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -892,7 +901,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
-        s->eid=eid; return;
+        s->eid=eid; s->vram_only=0; return;
     }
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
@@ -955,7 +964,71 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
-    s->eid=eid;
+    s->eid=eid; s->vram_only=0;
+}
+
+#ifdef COLI_CUDA
+/* ---- Fase 1: tier VRAM SENZA backing RAM ----
+ * Dopo l'upload in VRAM il backing host dello slot pinnato viene liberato: i tier
+ * diventano ADDITIVI (VRAM + RAM), non un mirror. I QT restano con i puntatori host
+ * a NULL; se CUDA fallisce a runtime, vram_slot_demote() rimaterializza da disco. */
+static int64_t eslot_host_bytes(ESlot *s){
+    if(s->slab) return s->slab_cap + s->fslab_cap*(int64_t)sizeof(float);
+    return qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+}
+static void eslot_host_free(ESlot *s){
+    QT *q[3]={&s->g,&s->u,&s->d};
+    if(s->slab){                                 /* container pre-quantizzato: g/u/d sono VISTE nello slab */
+        compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
+        free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
+        for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+    } else {                                     /* fallback (oracolo/tiny): buffer propri per-tensore */
+        for(int k=0;k<3;k++){
+            free(q[k]->qf); free(q[k]->q8); free(q[k]->q4); free(q[k]->s);
+            q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL;
+        }
+    }
+    s->vram_only=1;
+}
+/* CUDA morto sotto uno slot VRAM-only: libera i tensori device, ricarica i pesi da
+ * disco nello stesso slot e degrada a RAM. Percorso raro (driver reset): rumoroso. */
+static void vram_slot_demote(Model *m, int layer, ESlot *s){
+    int64_t old=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+               +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+               +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+    if(m->gpu_expert_count) m->gpu_expert_count--;
+    m->gpu_expert_bytes-=old;
+    s->vram_only=0;
+    expert_load(m,layer,s->eid,s);
+    m->resident_bytes += eslot_host_bytes(s);
+    fprintf(stderr,"[CUDA] slot VRAM-only degradato: expert %d layer %d ricaricato in RAM\n",s->eid,layer);
+}
+/* Fase 2: uno slot e' batchabile sulla FFN fusa solo se TUTTI e tre i tensori
+ * sono gia' residenti sul device e senza errori pregressi. */
+static int eslot_gpu_ready(ESlot *e){
+    return e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible
+        && !e->g.cuda_failed && !e->u.cuda_failed && !e->d.cuda_failed
+        && e->g.cuda && e->u.cuda && e->d.cuda;
+}
+static int cuda_dev_index(int device){
+    for(int i=0;i<g_cuda_ndev;i++) if(g_cuda_devices[i]==device) return i;
+    return -1;
+}
+static int g_ffn=1;      /* CUDA_FFN=0 -> path sincrono per-tensore (A/B) */
+#endif
+
+/* righe del batch che instradano su eid; rows/rw NULL = solo conteggio */
+static int moe_rows(const int *idxs, const int *keff, const float *wsr,
+                    int S, int K, int eid, int *rows, float *rw){
+    int nr=0;
+    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+        if(idxs[(int64_t)s*K+kk]==eid){
+            if(rows){ rows[nr]=s; rw[nr]=wsr[(int64_t)s*K+kk]; }
+            nr++; break;
+        }
+    return nr;
 }
 
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
@@ -1244,10 +1317,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
+#ifdef COLI_CUDA
+        /* ---- Fase 2: batching asincrono degli expert VRAM-residenti ----
+         * FFN fusa (gate -> SiLU*up -> down) accodata su uno stream per device;
+         * la CPU calcola i propri expert MENTRE la GPU lavora; UNA sync per
+         * device a fine blocco. CUDA_FFN=0 ripristina il path sincrono. */
+        char gbat[64]={0}; const float *gout[64]={0};
+        int ffn_used[COLI_CUDA_MAX_DEVICES]={0}, ffn_ok[COLI_CUDA_MAX_DEVICES]={0};
+        int ngb=0;
+        if(g_cuda_enabled && g_ffn && !omp_in_parallel()){
+            long long rows_dev[COLI_CUDA_MAX_DEVICES]={0};
+            for(int j=0;j<nb;j++){ ESlot *e=use[j];
+                if(!eslot_gpu_ready(e)) continue;
+                int di=cuda_dev_index(e->g.cuda_device); if(di<0) continue;
+                int nr=moe_rows(idxs,keff,ws,S,K,uniq[base+j],NULL,NULL);
+                if(nr){ rows_dev[di]+=nr; ffn_used[di]=1; }
+            }
+            for(int i=0;i<g_cuda_ndev;i++) if(ffn_used[i])
+                ffn_ok[i]=coli_cuda_ffn_begin(g_cuda_devices[i],rows_dev[i],D,I);
+            for(int j=0;j<nb;j++){ ESlot *e=use[j];
+                if(!eslot_gpu_ready(e)) continue;
+                int di=cuda_dev_index(e->g.cuda_device);
+                if(di<0 || !ffn_ok[di]) continue;
+                int nr=moe_rows(idxs,keff,ws,S,K,uniq[base+j],rows,rw);
+                if(!nr) continue;
+                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                if(coli_cuda_ffn_enqueue(e->g.cuda,e->u.cuda,e->d.cuda,xg,nr,&gout[j])){
+                    gbat[j]=1; ngb++;
+                }
+            }
+        }
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
-            int nr=0;                                 /* righe (posizioni) che usano questo expert */
-            for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+#ifdef COLI_CUDA
+            if(gbat[j]) continue;                     /* in volo sulla GPU: raccolto dopo */
+#endif
+            int nr=moe_rows(idxs,keff,ws,S,K,eid,rows,rw);
             if(!nr) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
@@ -1258,10 +1363,49 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             matmul_qt(uu, xg, &e->u, nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
+#ifdef COLI_CUDA
+            if(e->vram_only && (e->g.cuda_failed||e->u.cuda_failed||e->d.cuda_failed)){
+                vram_slot_demote(m,layer,e);     /* host rimaterializzato: ricalcolo CPU pulito */
+                matmul_qt(gg, xg, &e->g, nr);
+                matmul_qt(uu, xg, &e->u, nr);
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(hh, gg, &e->d, nr);
+            }
+#endif
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
         }
+#ifdef COLI_CUDA
+        if(ngb){                                      /* raccolta del lavoro GPU in volo */
+            double t0=now_s();
+            int sync_ok[COLI_CUDA_MAX_DEVICES]={0};
+            for(int i=0;i<g_cuda_ndev;i++) if(ffn_used[i]&&ffn_ok[i])
+                sync_ok[i]=coli_cuda_ffn_sync(g_cuda_devices[i]);
+            for(int j=0;j<nb;j++){ if(!gbat[j]) continue;
+                ESlot *e=use[j]; int eid=uniq[base+j];
+                int nr=moe_rows(idxs,keff,ws,S,K,eid,rows,rw);
+                int di=cuda_dev_index(e->g.cuda_device);
+                if(di>=0 && sync_ok[di]){
+                    const float *hr=gout[j];
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D; float wgt=rw[r];
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[(int64_t)r*D+d]; }
+                    m->gpu_expert_calls++;
+                } else {                              /* stream fallito: demozione rumorosa + CPU */
+                    e->g.cuda_failed=e->u.cuda_failed=e->d.cuda_failed=1;
+                    if(e->vram_only) vram_slot_demote(m,layer,e);
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                    matmul_qt(gg, xg, &e->g, nr);
+                    matmul_qt(uu, xg, &e->u, nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                }
+            }
+            m->t_emm += now_s()-t0;
+        }
+#endif
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -1857,10 +2001,12 @@ static void repin_pass(Model *m){
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
                 m->gpu_expert_bytes+=now_gpu-old_gpu; tier="VRAM";
+                eslot_host_free(s);               /* Fase 1: il nuovo expert resta VRAM-only */
             } else {
                 qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
                 m->gpu_expert_count--; m->gpu_expert_bytes-=old_gpu;
+                s->vram_only=0;                   /* host appena rimaterializzato da expert_load */
                 fprintf(stderr,"[REPIN] upload VRAM fallito; slot degradato a RAM\n");
             }
         }
@@ -1869,6 +2015,63 @@ static void repin_pass(Model *m){
             tier,cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
+}
+
+/* ---- Fase 4: RAM DINAMICA a runtime ----
+ * Il budget non e' piu' una fotografia del boot: a ogni confine di turno si rimisura
+ * MemAvailable e la LRU si adatta — si RESTRINGE sotto pressione (altri processi
+ * hanno preso RAM: liberare slot batte swap/OOM-kill) e si ALLARGA quando la RAM
+ * torna libera. Banda morta 3.5-6 GB liberi contro il churn. E' questa rete di
+ * sicurezza che permette i margini statici piu' aggressivi (90% del boot, autopin
+ * 85%). MEMWATCH=0 disattiva. */
+static int g_memwatch=1;
+static double mem_available_gb(void);
+static int64_t expert_bytes_probe(Model *m, int ebits);
+static void eslot_release(ESlot *s){          /* libera il backing host di uno slot LRU */
+    QT *q[3]={&s->g,&s->u,&s->d};
+    if(s->slab){ compat_aligned_free(s->slab); free(s->fslab); }
+    else for(int k=0;k<3;k++){ free(q[k]->qf); free(q[k]->q8); free(q[k]->q4); free(q[k]->s); }
+    memset(s,0,sizeof(*s));
+}
+static void mem_watch_pass(Model *m){
+    if(!g_memwatch) return;
+    double avail=mem_available_gb(); if(avail<=0) return;
+    Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
+    if(m->has_mtp) nsp+=2;
+    if(nsp<1) return;
+    int64_t eb=expert_bytes_probe(m,m->ebits);
+    double slot_gb=(double)nsp*eb/1e9;        /* costo di +-1 cap su tutti i layer */
+    if(slot_gb<=0) return;
+    if(avail<3.5){                            /* pressione: riserva page-cache+OS a rischio */
+        int drop=(int)((3.5-avail)/slot_gb)+1;
+        int newcap=m->ecap-drop; if(newcap<1) newcap=1;
+        if(newcap>=m->ecap) return;
+        for(int i=0;i<=c->n_layers;i++){
+            if(!m->ecache[i]) continue;
+            while(m->ecn[i]>newcap){          /* evict LRU: la RAM va liberata DAVVERO */
+                int lru=0;
+                for(int z=1;z<m->ecn[i];z++) if(m->ecache[i][z].used<m->ecache[i][lru].used) lru=z;
+                eslot_release(&m->ecache[i][lru]);
+                m->ecache[i][lru]=m->ecache[i][m->ecn[i]-1];
+                memset(&m->ecache[i][m->ecn[i]-1],0,sizeof(ESlot));
+                m->ecn[i]--;
+            }
+        }
+        fprintf(stderr,"[RAM] pressione: %.1f GB liberi -> cap %d->%d (slot LRU liberati)\n",
+            avail,m->ecap,newcap);
+        m->ecap=newcap;
+    } else if(avail>6.0 && m->ecap<c->n_experts){   /* margine: la LRU puo' crescere */
+        int grow=(int)((avail-6.0)*0.90/slot_gb);
+        if(grow<1) return;
+        int newcap=m->ecap+grow; if(newcap>c->n_experts) newcap=c->n_experts;
+        for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
+            m->ecache[i]=realloc(m->ecache[i],(size_t)newcap*sizeof(ESlot));
+            memset(m->ecache[i]+m->ecap,0,(size_t)(newcap-m->ecap)*sizeof(ESlot));
+        }
+        fprintf(stderr,"[RAM] margine: %.1f GB liberi -> cap ALZATO %d->%d (MEMWATCH=0 disattiva)\n",
+            avail,m->ecap,newcap);
+        m->ecap=newcap;
+    }
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
@@ -2015,7 +2218,7 @@ static void run_serve(Model *m, const char *snap){
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
-            fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
+            fflush(stdout); kv_disk_append(m,hist,len); mem_watch_pass(m); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         /* API mode: an exact, length-prefixed prompt. Unlike the interactive
          * line protocol this accepts newlines. The tokenized prompt is matched
@@ -2224,27 +2427,17 @@ static void pin_load(Model *m, const char *statspath, double gb){
         if(a>4095) break;                                    /* bastano i top ~4k */
     }
     int64_t eb=expert_bytes_probe(m,m->ebits);
-    int npin=(int)(gb*1e9/eb); if(npin>n) npin=n; if(npin>4096) npin=4096;
-    if(npin<1){ free(r); return; }
-    int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
-    for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
-    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
-    double t0=now_s();
-    #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<npin;a++){
-        int li=r[a].l, slot;
-        #pragma omp critical
-        slot=m->npin[li]++;
-        expert_load(m,li,r[a].e,&m->pin[li][slot]);
-    }
-    m->resident_bytes += (int64_t)npin*eb;
-    fprintf(stderr,"[PIN] hot-store: %d expert in RAM (%.1f GB) in %.0fs da %s\n",
-        npin, npin*eb/1e9, now_s()-t0, statspath);
+    /* ---- Fase 3: allocatore a CASCATA guidato dal calore ----
+     * La lista ordinata per frequenza scende sui tier dal piu' veloce al piu' lento:
+     * banda VRAM (upload a blocchi, backing host liberato subito: il picco RAM
+     * transitorio resta ~un blocco), poi banda RAM fino a `gb`; il resto vive di
+     * LRU+disco. `gb` e' il SOLO budget RAM: la capienza VRAM si AGGIUNGE. */
+    double vram_budget=0;
 #ifdef COLI_CUDA
+    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    int placed_n[COLI_CUDA_MAX_DEVICES]={0};
     if(g_cuda_enabled && g_cuda_expert_gb>0){
-        double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
-        int placed_n[COLI_CUDA_MAX_DEVICES]={0};
-        double budget=g_cuda_expert_gb*1e9, safe_total=0;
+        double safe_total=0;
         for(int i=0;i<g_cuda_ndev;i++){
             size_t free_b=0,total_b=0;
             if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
@@ -2255,43 +2448,90 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 safe_total+=remaining[i];
             }
         }
-        if(budget>safe_total) budget=safe_total;
-        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
-            int li=r[a].l;
-            for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
-                ESlot *s=&m->pin[li][z];
-                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
-                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
-                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
-                    int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
-                    if(best<0) break;
-                    tried[best]=1;
-                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
-                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
-                        placed=1;
-                    } else {
-                        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
-                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                        remaining[best]=0;             /* device rejected its projected capacity */
-                    }
-                }
-                break;
-            }
-        }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget totale %.1f GB)\n",
-            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
-        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d expert, %.2f GB\n",
-            g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+        vram_budget=g_cuda_expert_gb*1e9;
+        if(vram_budget>safe_total) vram_budget=safe_total;
     }
+#endif
+    int nram_max=(int)(gb*1e9/eb), nvram_max=(int)(vram_budget/eb);
+    int npin=nram_max+nvram_max;
+    if(npin>n) npin=n; if(npin>4096) npin=4096;
+    if(npin<1){ free(r); return; }
+    int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
+    for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
+    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+    double t0=now_s();
+    int64_t ram_bytes=0, freed_host=0; int nvram=0, a0=0;
+#ifdef COLI_CUDA
+    /* banda VRAM: blocchi di 32 — load parallelo dal disco, upload+free seriale.
+     * Doppio tetto (byte reali E conteggio da stima eb): cosi' la banda RAM riceve
+     * la sua quota anche quando eb sovrastima la taglia reale degli expert. */
+    while(a0<npin && vram_budget>0 && nvram<nvram_max &&
+          (double)m->gpu_expert_bytes+eb<=vram_budget){
+        int blk = npin-a0<32 ? npin-a0 : 32;
+        int slot_of[32];
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int b=0;b<blk;b++){
+            int li=r[a0+b].l, slot;
+            #pragma omp critical
+            { slot=m->npin[li]++; slot_of[b]=slot; }
+            expert_load(m,li,r[a0+b].e,&m->pin[li][slot]);
+        }
+        for(int b=0;b<blk;b++){
+            ESlot *s=&m->pin[r[a0+b].l][slot_of[b]];
+            int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(nvram>=nvram_max || (double)m->gpu_expert_bytes+need>vram_budget){
+                ram_bytes+=eslot_host_bytes(s); continue; }
+            int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
+            for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
+                int best=-1;
+                for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+                    (best<0||placed_b[i]<placed_b[best])) best=i;
+                if(best<0) break;
+                tried[best]=1;
+                s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                    int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                                  +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                                  +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                    m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                    remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                    placed=1; nvram++;
+                    freed_host+=eslot_host_bytes(s);
+                    eslot_host_free(s);              /* Fase 1: niente mirror in RAM */
+                } else {
+                    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                    remaining[best]=0;               /* device rejected its projected capacity */
+                }
+            }
+            if(!placed) ram_bytes+=eslot_host_bytes(s);   /* resta in RAM: e' comunque caldo */
+        }
+        a0+=blk;
+        double left=0; for(int i=0;i<g_cuda_ndev;i++) left+=remaining[i];
+        if(left<eb) break;                           /* VRAM fisicamente esaurita */
+    }
+#endif
+    /* banda RAM: si prosegue lungo la lista fino al budget RAM residuo */
+    int nram_left = nram_max-(int)(ram_bytes/eb);
+    int a_end = a0 + (nram_left>0 ? nram_left : 0);
+    if(a_end>npin) a_end=npin;
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int a=a0;a<a_end;a++){
+        int li=r[a].l, slot;
+        #pragma omp critical
+        slot=m->npin[li]++;
+        expert_load(m,li,r[a].e,&m->pin[li][slot]);
+    }
+    ram_bytes += (int64_t)(a_end-a0)*eb;
+    m->resident_bytes += ram_bytes;
+    fprintf(stderr,"[PIN] cascata: %d expert in VRAM (%.2f GB, host liberato %.2f GB) + "
+        "%d in RAM (%.1f GB) in %.0fs da %s\n",
+        nvram, m->gpu_expert_bytes/1e9, freed_host/1e9,
+        a_end-nvram, ram_bytes/1e9, now_s()-t0, statspath);
+#ifdef COLI_CUDA
+    if(nvram) for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,
+        "[CUDA]   device %d: %d expert, %.2f GB\n", g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
 #endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l);
@@ -2337,7 +2577,7 @@ static double kv_pool_bytes(Model *m, int max_ctx){
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
-    if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
+    if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.90; if(ram_gb<4) ram_gb=8; }   /* Fase 4: margine 10%, il monitor runtime fa da rete */
     double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb
         + kv_pool_bytes(m,max_ctx)
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
@@ -2345,14 +2585,16 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
 }
 
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
- * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
- * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
+ * ram_gb<=0 -> budget AUTO = 90% della RAM disponibile adesso (lascia respiro a OS+wrapper:
+ * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola.
+ * Fase 4: il margine statico e' sceso da 12% a 10% perche' mem_watch_pass rimisura la
+ * pressione a ogni turno e restringe la LRU PRIMA che il kernel debba intervenire). */
 static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     if(m->has_mtp) nsp+=2;                       /* riga cache MTP: conta ~doppia (expert int8 = 2x int4) */
     int64_t eb=expert_bytes_probe(m,ebits);
     int auto_b = ram_gb<=0;
-    if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
+    if(auto_b){ ram_gb = g_mem_avail_boot*0.90;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
         if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable illeggibile/troppo bassa, assumo 8 GB\n"); ram_gb=8; } }
     /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):
@@ -2421,6 +2663,7 @@ int main(int argc, char **argv){
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    g_memwatch = getenv("MEMWATCH")?atoi(getenv("MEMWATCH")):1;   /* Fase 4: adattamento RAM a ogni turno */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
@@ -2446,6 +2689,7 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_ffn=getenv("CUDA_FFN")?atoi(getenv("CUDA_FFN")):1;   /* Fase 2: batching FFN (0 = A/B sincrono) */
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) richiede COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE richiede COLI_CUDA=1\n"); return 2; }
@@ -2481,17 +2725,29 @@ int main(int argc, char **argv){
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
-      snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
+      /* Fase 3: PROFILI DI DOMINIO — usi coerenti (coding, scrittura, ...) hanno
+       * routing coerente: una storia separata per profilo pre-carica in VRAM/RAM
+       * gli expert giusti dal primo token. COLI_PROFILE=<nome> la seleziona. */
+      const char *prof=getenv("COLI_PROFILE");
+      if(prof && *prof) snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage.%s",snap,prof);
+      else snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){
           /* quota pin proporzionale alla FIDUCIA nella storia: con pochi dati il pin
            * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
-           * qualche ora di chat) arriva a meta' del budget expert. */
+           * qualche ora di chat) arriva all'85% del budget expert (Fase 4: prima era
+           * il 50% — il monitor runtime e il repin fanno da rete di sicurezza). */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
-          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
-          if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
+          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.85*conf/1e9;
+          int vram_tier=0;
+#ifdef COLI_CUDA
+          /* Fase 3: la cascata riempie la VRAM anche quando la RAM libera e' poca
+           * (macchina piccola + GPU grande): il tier VRAM non richiede backing. */
+          vram_tier = g_cuda_enabled && g_cuda_expert_gb>0;
+#endif
+          if(pin_gb>=0.5 || vram_tier) pin_load(&m, g_usage_path, pin_gb>=0.5?pin_gb:0);
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
