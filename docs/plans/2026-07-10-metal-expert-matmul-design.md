@@ -198,3 +198,18 @@ DRAFT=0 and contention both mislead.
 Expert matmul: real ~1.2-1.3x warm. Attention: correct + token-exact but latency-neutral
 at short context. Both are gated by Metal submit latency; reducing submit count is the
 single highest-leverage remaining work.
+
+## Iteration 2 (loop, 2026-07-11)
+- Interleaved attention q/kv paths, 7->4 barriers: attn gpu-wall 3.04->2.73s. Committed.
+- PILOT=1 router-lookahead prefetch: NO effect with Metal (disk 19.5 vs 19.8s) — SPEC=1
+  readahead already covers it; the residual disk cost is the CPU pread/slab copy.
+- User observation confirmed: GPU sits at idle clock (338 MHz, 23%, 0.56W) — fed in short
+  sporadic bursts while CPU streams experts. Structural for a disk-streaming MoE.
+- Swap (~46 GB) is normal idle-app paging per user; model is on a separate volume.
+- **Zero-copy attention weights** (qalloc: page-align+register all dense QT weights):
+  removes ~6 GB GPU-side duplication + upload copies. Token-exact, RSS -3 GB,
+  35.1s -> 29.7s (0.34 tok/s) warm — best number yet.
+- **Shared-expert fusion**: Phase E folded into the first Metal moe_block as an extra
+  expert (rw=1.0, all S rows) — 3 fewer CPU matmuls/layer, bigger GPU submits.
+- Next candidate: router on GPU (score matmul + sigmoid + top-8 of 256) to merge the
+  attention and expert command buffers into ONE per layer (halves submit count).
