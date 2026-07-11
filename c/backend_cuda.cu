@@ -18,8 +18,14 @@ typedef struct {
     int device;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
 } DeviceContext;
+
+typedef struct {
+    const void *g,*u,*d; const float *gs,*us,*ds;
+    int gf,uf,df,rows,offset;
+} GroupDesc;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
@@ -42,7 +48,7 @@ static int select_ctx(DeviceContext *ctx) {
     return ctx && cuda_ok(cudaSetDevice(ctx->device), "select device");
 }
 
-static size_t row_bytes(int fmt, int I) {
+__host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 0) return (size_t)I * sizeof(float);
     if (fmt == 1) return (size_t)I;
     if (fmt == 2) return (size_t)(I + 1) / 2;
@@ -93,6 +99,28 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+__global__ static void grouped_hidden(float *y,const float *x,const GroupDesc *desc,
+                                      int I,int D,int which){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z; GroupDesc d=desc[c];
+    if(s>=d.rows) return;
+    const void *w=which?d.u:d.g; const float *sc=which?d.us:d.gs; int fmt=which?d.uf:d.gf;
+    size_t rb=row_bytes(fmt,D),row=(size_t)o*rb; const float *xs=x+(size_t)(d.offset+s)*D;
+    float sum=0; for(int i=threadIdx.x;i<D;i+=blockDim.x) sum+=xs[i]*weight_at(w,fmt,row,i);
+    __shared__ float p[256]; p[threadIdx.x]=sum; __syncthreads();
+    for(int n=128;n;n>>=1){ if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n]; __syncthreads(); }
+    if(!threadIdx.x) y[(size_t)(d.offset+s)*I+o]=p[0]*(fmt?sc[o]:1.f);
+}
+
+__global__ static void grouped_down(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z; GroupDesc d=desc[c];
+    if(s>=d.rows) return;
+    size_t rb=row_bytes(d.df,I),row=(size_t)o*rb; const float *xs=x+(size_t)(d.offset+s)*I;
+    float sum=0; for(int i=threadIdx.x;i<I;i+=blockDim.x) sum+=xs[i]*weight_at(d.d,d.df,row,i);
+    __shared__ float p[256]; p[threadIdx.x]=sum; __syncthreads();
+    for(int n=128;n;n>>=1){ if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n]; __syncthreads(); }
+    if(!threadIdx.x) y[(size_t)(d.offset+s)*D+o]=p[0]*(d.df?d.ds[o]:1.f);
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -101,6 +129,11 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) return 0;
     *cap = bytes;
     return 1;
+}
+
+static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
+    if(*cap>=bytes) return 1; if(*ptr) cudaFree(*ptr); *ptr=nullptr; *cap=0;
+    if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
@@ -141,8 +174,10 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->gate) cudaFree(ctx->gate);
         if (ctx->up) cudaFree(ctx->up);
+        if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
+        ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
 }
@@ -265,36 +300,35 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
-    int device=first->device,D=first->I,I=first->O,total=0;
+    int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
+    GroupDesc host[64]; if(count>64) return 0;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
-        total+=rows[c];
+        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
+                 g->fmt,u->fmt,d->fmt,rows[c],total};
+        total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
+    if(!cuda_ok(cudaMemcpy(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice),
+                "expert group descriptors")) return 0;
     int profile=getenv("COLI_CUDA_PROFILE")&&atoi(getenv("COLI_CUDA_PROFILE"));
     cudaEvent_t ev[4]={};
     if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")) profile=0;
     if(profile) cudaEventRecord(ev[0]);
     if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert group input upload")) return 0;
     if(profile) cudaEventRecord(ev[1]);
-    int base=0;
-    for(int c=0;c<count;c++){
-        int S=rows[c]; ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
-        float *dx=ctx->x+(size_t)base*D,*dg=ctx->gate+(size_t)base*I;
-        float *du=ctx->up+(size_t)base*I,*dy=ctx->y+(size_t)base*D;
-        dim3 hg((unsigned)I,(unsigned)S),og((unsigned)D,(unsigned)S);
-        quant_matmul<<<hg,256>>>(dg,dx,g->weights,g->scales,g->fmt,S,D,I,row_bytes(g->fmt,D));
-        quant_matmul<<<hg,256>>>(du,dx,u->weights,u->scales,u->fmt,S,D,I,row_bytes(u->fmt,D));
-        size_t n=(size_t)S*I;
-        silu_mul<<<(unsigned)((n+255)/256),256>>>(dg,du,n);
-        quant_matmul<<<og,256>>>(dy,dg,d->weights,d->scales,d->fmt,S,I,D,row_bytes(d->fmt,I));
-        base+=S;
-    }
+    GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+    dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+    grouped_hidden<<<hg,256>>>(ctx->gate,ctx->x,dev,I,D,0);
+    grouped_hidden<<<hg,256>>>(ctx->up,ctx->x,dev,I,D,1);
+    silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256>>>(ctx->gate,ctx->up,(size_t)total*I);
+    grouped_down<<<og,256>>>(ctx->y,ctx->gate,dev,D,I);
     if(profile) cudaEventRecord(ev[2]);
     if(!cuda_ok(cudaGetLastError(),"expert group launch")||
        !cuda_ok(cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost),"expert group output download")) return 0;
