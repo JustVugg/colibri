@@ -335,6 +335,11 @@ Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output
 quality does not.
 
+When `CUDA_DENSE=1` is explicitly requested, the hardware planner reserves its
+projected VRAM footprint before assigning the remainder to hot routed experts.
+Dense CUDA remains opt-in because single-token decode can lose to CPU execution
+when transfer and kernel-launch overhead dominate.
+
 Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
 while missing experts are loaded in a bounded background I/O pool, then the
 cold results join before the layer completes. The phase-aware defaults use at

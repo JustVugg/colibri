@@ -62,6 +62,8 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(plan["policy"]["name"], "quality")
         self.assertTrue(plan["policy"]["preserve_quantization"])
         self.assertFalse(plan["tiers"]["vram"]["requires_host_backing"])
+        self.assertEqual(plan["tiers"]["vram"]["dense_candidate_bytes"], 300)
+        self.assertEqual(plan["tiers"]["vram"]["expert_budget_bytes"], 420)
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
         self.assertIn("clamped", plan["warnings"][0])
@@ -96,7 +98,11 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "12")
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
+        self.assertNotIn("CUDA_DENSE", env)
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
+
+        dense = environment_for_plan(plan, {"CUDA_DENSE": "1"})
+        self.assertEqual(dense["CUDA_DENSE"], "1")
 
     def test_cpu_binary_does_not_apply_gpu_tier(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,

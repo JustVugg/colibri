@@ -158,8 +158,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
     # VRAM-resident experts do not need duplicate RAM backing: the checkpoint is
     # their recovery source. RAM is therefore an independent warm compute tier.
-    vram_budget = min(requested_vram, safe_vram, info["expert_bytes"])
-    vram_experts = int(vram_budget // typical) if typical else 0
+    vram_budget = min(requested_vram, safe_vram,
+                      info["dense_bytes"] + info["expert_bytes"])
+    dense_vram = min(info["dense_bytes"], vram_budget)
+    expert_vram = vram_budget
+    vram_experts = int(expert_vram // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
     warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), cache_bytes)
     cold_bytes = max(0, info["expert_bytes"] - hot_bytes - warm_bytes)
@@ -194,7 +197,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "runtime_bytes": runtime_bytes, "expert_cache_bytes": cache_bytes,
                     "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
-                     "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,
+                     "budget_bytes": vram_budget, "dense_candidate_bytes": dense_vram,
+                     "expert_budget_bytes": expert_vram, "hot_expert_bytes": hot_bytes,
                      "expert_capacity": vram_experts, "requires_host_backing": False},
         },
         "expected_bottleneck": bottleneck,
@@ -227,7 +231,10 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     if "COLI_GPU" not in result and "COLI_GPUS" not in result:
         key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
         result[key] = ",".join(map(str, devices))
-    result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    expert_budget = vram["budget_bytes"]
+    if result.get("CUDA_DENSE") == "1":
+        expert_budget = max(0, expert_budget - vram.get("dense_candidate_bytes", 0))
+    result.setdefault("CUDA_EXPERT_GB", f"{expert_budget / GB:.3f}")
     if result.get("PIN"):
         result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
     return result

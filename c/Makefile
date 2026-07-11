@@ -70,7 +70,9 @@ endif
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
+ifneq ($(IS_WIN),)
 glm: glm$(EXE)
+endif
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h cpu_pool.h io_policy.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
