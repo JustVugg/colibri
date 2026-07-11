@@ -5,6 +5,7 @@
 #include "backend_metal.h"
 #include <cstring>
 #include <vector>
+#include <mutex>
 
 // ---- shader: general quantized GEMV, one threadgroup per output element (o,si) ----
 // y[si,o] = (sum_i dequant(W[o,i]) * x[si,i]) * scale[o]. fmt: 0=f32 1=i8 2=i4 3=i2.
@@ -123,6 +124,7 @@ static const int TG = 128;
 // Registry of page-aligned host slabs wrapped zero-copy for the batched MoE path.
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
 static std::vector<Slab> g_slabs;
+static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel OpenMP threads
 // Persistent scratch buffers (grow-only) for the MoE pipeline.
 static id<MTLBuffer> g_gg, g_uu, g_hh, g_xg; static size_t g_gg_cap, g_uu_cap, g_hh_cap, g_xg_cap;
 static id<MTLBuffer> ensure(id<MTLBuffer> b, size_t *cap, size_t need) {
@@ -166,16 +168,20 @@ extern "C" int coli_metal_init(void) {
 
 extern "C" void coli_metal_register(void *base, size_t len) {
   if (!g_dev || !base) return;
-  for (auto &s : g_slabs) if (s.base == base) { s.len = len; return; }  // already registered
   id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
                               options:MTLResourceStorageModeShared deallocator:nil];
-  if (b) g_slabs.push_back({base, len, b});
+  if (!b) return;
+  std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
+  for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; return; }
+  g_slabs.push_back({base, len, b});
 }
 extern "C" void coli_metal_unregister(void *base) {
+  std::lock_guard<std::mutex> lk(g_slab_mtx);
   for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) { g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); return; }
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
+  std::lock_guard<std::mutex> lk(g_slab_mtx);
   uintptr_t u=(uintptr_t)p;
   for (auto &s : g_slabs) { uintptr_t b=(uintptr_t)s.base;
     if (u>=b && u<b+s.len) { *addr = (uint64_t)[s.buf gpuAddress] + (u-b); return s.buf; } }
@@ -254,6 +260,9 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
       if(!(b=resolve(us[e],&suv[e]))) return 0; add_use(b);
       if(!(b=resolve(ds[e],&sdv[e]))) return 0; add_use(b);
     }
+    static int dbg=-1; if(dbg<0) dbg = getenv("COLI_METAL_DEBUG")?atoi(getenv("COLI_METAL_DEBUG")):0;
+    if(dbg){ dbg=0; fprintf(stderr,"[metal dbg] moe_block nb=%d R=%d D=%d Iinter=%d fmt=%d | e0: wg=%p ag=0x%llx sg=0x%llx slabs=%zu\n",
+             nb,R,D,Iinter,fmt,g[0],(unsigned long long)ag[0],(unsigned long long)sgv[0],g_slabs.size()); }
     std::vector<int> erow(R); for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++) erow[xoff[e]+r]=e;
     auto shb=[&](const void*p,size_t n){ return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared]; };
     id<MTLBuffer> bag=shb(ag.data(),nb*8), bau=shb(au.data(),nb*8), bad=shb(ad.data(),nb*8);
@@ -281,6 +290,11 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
     [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     gemv(bad,bsd,g_gg,g_hh,D,Iinter,Iinter);                  // down
     [e endEncoding];[cb commit];[cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {           // GPU fault -> fall back to CPU for this block
+      fprintf(stderr, "[metal] moe_block cmdbuf error (nb=%d R=%d): %s\n", nb, R,
+              cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
+      return 0;
+    }
 
     // scatter-add: out[rows[gr]] += rw[gr] * hh[gr]
     const float *hh=(const float*)[g_hh contents];

@@ -36,6 +36,10 @@
 #include <omp.h>
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_METAL
+#include "backend_metal.h"
+static int g_metal_enabled;
+#endif
 #ifdef __AVX2__
 #include <immintrin.h>
 static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
@@ -889,11 +893,32 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
      * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
     if(!s->slab || wtot+8192 > s->slab_cap){
+#ifdef COLI_METAL
+        /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
+        if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
+        free(s->slab);
+        size_t need=((size_t)wtot+8192+16383)&~(size_t)16383;
+        if(posix_memalign((void**)&s->slab,16384,need)){fprintf(stderr,"OOM slab\n");exit(1);}
+        s->slab_cap=need;
+        if(g_metal_enabled) coli_metal_register(s->slab,need);
+#else
         free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
         s->slab_cap=wtot+8192;
+#endif
     }
-    if(!s->fslab || ftot > s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
+    if(!s->fslab || ftot > s->fslab_cap){
+#ifdef COLI_METAL
+        if(s->fslab && g_metal_enabled) coli_metal_unregister(s->fslab);
+        free(s->fslab);
+        size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
+        if(posix_memalign((void**)&s->fslab,16384,fb)){fprintf(stderr,"OOM fslab\n");exit(1);}
+        s->fslab_cap=ftot;
+        if(g_metal_enabled) coli_metal_register(s->fslab,fb);
+#else
+        free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot;
+#endif
+    }
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
@@ -1227,6 +1252,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
+        int metal_done=0;
+#ifdef COLI_METAL
+        /* Batched GPU path: gate/up/silu/down for the whole block in ONE command buffer,
+         * reading each expert's weights zero-copy from its RAM slab. Falls back to CPU on
+         * any unresolved slab or unsupported fmt. Numerics = dequant->f32 MAC (like CUDA). */
+        if(g_metal_enabled){
+            const void *MG[64],*MU[64],*MD[64]; const float *MGS[64],*MUS[64],*MDS[64];
+            int xoffb[64],nrb[64],nbb=0,Rtot=0,fmt=use[0]?use[0]->g.fmt:2;
+            for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0;
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; }
+                if(!cnt) continue;
+                MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4;
+                MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4;
+                MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4;
+                MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s;
+                xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++;
+            }
+            if(nbb==0) metal_done=1;
+            else {
+                float *mxg=falloc((int64_t)Rtot*D); int *mrows=malloc(Rtot*sizeof(int)); float *mrw=malloc(Rtot*sizeof(float));
+                int p=0;
+                for(int j=0;j<nb;j++){ int eid=uniq[base+j];
+                    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                        if(idxs[(int64_t)s*K+kk]==eid){
+                            memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float));
+                            mrows[p]=s; mrw[p]=ws[(int64_t)s*K+kk]; p++; break; }
+                }
+                double t0=now_s();
+                metal_done=coli_metal_moe_block(nbb,D,I,fmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S);
+                m->t_emm += now_s()-t0;
+                free(mxg); free(mrows); free(mrw);
+            }
+        }
+#endif
+        if(!metal_done)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
@@ -2436,6 +2497,18 @@ int main(int argc, char **argv){
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
        (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
         fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
+        return 2;
+    }
+#endif
+#ifdef COLI_METAL
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+        g_metal_enabled = coli_metal_init();
+        if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend richiesto ma non disponibile\n"); return 2; }
+        fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
+    }
+#else
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+        fprintf(stderr,"METAL richiesto ma questo binario non ha il backend; ricompila con: make METAL=1\n");
         return 2;
     }
 #endif
