@@ -75,6 +75,9 @@ int main(int argc, char **argv) {
     int group_rows[2]={1,1}; float grouped[8];
     if (!coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,x) ||
         !close_enough(grouped,want_expert,8)) return 1;
+    uint64_t group_calls=0,group_experts=0,group_total_rows=0;
+    coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
+    if(group_calls!=1||group_experts!=2||group_total_rows!=2) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {

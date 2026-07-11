@@ -22,6 +22,8 @@ typedef struct {
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
+static uint64_t g_group_calls,g_group_experts,g_group_rows;
+static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -165,6 +167,13 @@ extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor
     if (tensor_bytes) *tensor_bytes = bytes;
 }
 
+extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
+                                        double *h2d_ms, double *kernel_ms, double *d2h_ms) {
+    if(calls) *calls=g_group_calls; if(experts) *experts=g_group_experts; if(rows) *rows=g_group_rows;
+    if(h2d_ms) *h2d_ms=g_group_h2d_ms; if(kernel_ms) *kernel_ms=g_group_kernel_ms;
+    if(d2h_ms) *d2h_ms=g_group_d2h_ms;
+}
+
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -265,7 +274,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    int profile=getenv("COLI_CUDA_PROFILE")&&atoi(getenv("COLI_CUDA_PROFILE"));
+    cudaEvent_t ev[4]={};
+    if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")) profile=0;
+    if(profile) cudaEventRecord(ev[0]);
     if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert group input upload")) return 0;
+    if(profile) cudaEventRecord(ev[1]);
     int base=0;
     for(int c=0;c<count;c++){
         int S=rows[c]; ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -279,8 +293,17 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         quant_matmul<<<og,256>>>(dy,dg,d->weights,d->scales,d->fmt,S,I,D,row_bytes(d->fmt,I));
         base+=S;
     }
+    if(profile) cudaEventRecord(ev[2]);
     if(!cuda_ok(cudaGetLastError(),"expert group launch")||
        !cuda_ok(cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost),"expert group output download")) return 0;
+    if(profile){
+        cudaEventRecord(ev[3]); cudaEventSynchronize(ev[3]); float a=0,b=0,c=0;
+        cudaEventElapsedTime(&a,ev[0],ev[1]); cudaEventElapsedTime(&b,ev[1],ev[2]);
+        cudaEventElapsedTime(&c,ev[2],ev[3]);
+        g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c;
+        for(int i=0;i<4;i++) cudaEventDestroy(ev[i]);
+    }
+    g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
     return 1;
 }
 
