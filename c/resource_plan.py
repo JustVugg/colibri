@@ -128,6 +128,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
+    pin_bytes = int(cache_bytes * 0.25)
     per_cap = info["per_cap_bytes"]
     configured_experts = int(cfg.get("n_routed_experts", 0))
     cap = int(cache_bytes // per_cap) if per_cap else 0
@@ -142,7 +143,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
-    vram_budget = min(requested_vram, safe_vram, cache_bytes)
+    vram_budget = min(requested_vram, safe_vram, pin_bytes)
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
@@ -162,6 +163,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             "ram": {"role": "resident+cache", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
                     "runtime_bytes": runtime_bytes, "expert_cache_bytes": cache_bytes,
+                    "pin_budget_bytes": pin_bytes,
                     "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "budget_bytes": vram_budget, "expert_capacity": vram_experts},
@@ -189,7 +191,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         result[key] = ",".join(map(str, devices))
     result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
     if result.get("PIN"):
-        result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        result.setdefault("PIN_GB", f"{ram['pin_budget_bytes'] / GB:.3f}")
     return result
 
 
@@ -204,6 +206,7 @@ def format_plan(plan):
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
              f"{format_bytes(tiers['ram']['dense_bytes'])} dense · "
              f"{format_bytes(tiers['ram']['runtime_bytes'])} runtime · "
+             f"{format_bytes(tiers['ram']['pin_budget_bytes'])} fixed hot tier · "
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:

@@ -32,6 +32,7 @@
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
+#include "memory_pressure.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -1800,7 +1801,59 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * persistent .coli_usage intact while adapting to the current workload. */
 static int g_repin=0;
 static uint64_t g_last_repin=0;
+static double g_mem_avail_boot, g_swap_free_mark=-1;
+static void mem_pressure_sample(double *available, double *swap_free);
+static int64_t expert_bytes_probe(Model *m, int ebits);
 typedef struct { long gain; int l, slot, eid; } RepinCand;
+
+static void pin_slot_release(Model *m, ESlot *s){
+#ifdef COLI_CUDA
+    if(s->g.cuda_eligible){
+        int64_t bytes=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                     +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                     +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+        if(m->gpu_expert_count>0) m->gpu_expert_count--;
+        m->gpu_expert_bytes-=bytes; if(m->gpu_expert_bytes<0) m->gpu_expert_bytes=0;
+    }
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+    if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
+    if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#endif
+    free(s->slab); free(s->fslab); memset(s,0,sizeof(*s)); s->eid=-1;
+}
+
+static int pressure_demote(Model *m){
+    double available,swap_free; mem_pressure_sample(&available,&swap_free);
+    double reserve=getenv("RAM_RESERVE_GB")?atof(getenv("RAM_RESERVE_GB"))*1e9
+                  : (g_mem_avail_boot*.05>4.0?g_mem_avail_boot*.05:4.0)*1e9;
+    double tolerance=1e9;
+    if(g_swap_free_mark<0) g_swap_free_mark=swap_free;
+    if(!coli_memory_pressure(available,reserve,swap_free,g_swap_free_mark,tolerance)) return 0;
+    double reclaim=available<reserve?reserve-available:0;
+    if(swap_free>=0 && g_swap_free_mark>=0 && swap_free<g_swap_free_mark)
+        reclaim+=g_swap_free_mark-swap_free;
+    int64_t eb=expert_bytes_probe(m,m->ebits);
+    int target=eb>0?(int)(reclaim/eb)+1:4; if(target<4) target=4; if(target>64) target=64;
+    int removed=0;
+    while(removed<target){
+        int bl=-1,bz=-1; uint32_t heat=UINT32_MAX;
+        for(int l=0;l<=m->c.n_layers;l++) for(int z=0;z<m->npin[l];z++){
+            int eid=m->pin[l][z].eid; uint32_t h=m->eheat[l]?m->eheat[l][eid]:0;
+            if(bl<0||h<heat){ bl=l; bz=z; heat=h; }
+        }
+        if(bl<0) break;
+        int last=--m->npin[bl]; pin_slot_release(m,&m->pin[bl][bz]);
+        if(bz!=last){ m->pin[bl][bz]=m->pin[bl][last]; memset(&m->pin[bl][last],0,sizeof(ESlot)); }
+        m->resident_bytes-=eb; removed++;
+    }
+    fprintf(stderr,"[RAM] pressione: disponibili %.1f/%.1f GB, swap cresciuto %.1f GB; "
+        "demossi %d expert RAM/VRAM\n",available/1e9,reserve/1e9,
+        (swap_free>=0&&g_swap_free_mark>=0?(g_swap_free_mark-swap_free)/1e9:0),removed);
+    g_swap_free_mark=swap_free;
+    return removed>0;
+}
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
     for(int l=0;l<c->n_layers;l++){
@@ -1816,6 +1869,7 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     return nb;
 }
 static void repin_pass(Model *m){
+    if(pressure_demote(m)) return;
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
@@ -2078,6 +2132,7 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
+        repin_pass(m);                   /* safe point: adapt tiers only after the forward is complete */
     }
     free(line); free(buf);
     usage_save(m);
@@ -2280,7 +2335,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(r); free(cnt_l);
 }
 
-static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
+/* MemAvailable all'avvio, prima di caricare il modello. */
 /* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
  * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
  * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
@@ -2297,6 +2352,16 @@ static double mem_available_gb(void){
     char ln[256]; double kb=0;
     while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
     fclose(f); return kb/1e6;
+#endif
+}
+
+static void mem_pressure_sample(double *available, double *swap_free){
+    *available=mem_available_gb()*1e9; *swap_free=-1;
+#if defined(__linux__)
+    FILE *f=fopen("/proc/meminfo","r"); if(!f) return;
+    char ln[256]; double kb=0;
+    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"SwapFree: %lf",&kb)==1){ *swap_free=kb*1024.0; break; }
+    fclose(f);
 #endif
 }
 
@@ -2452,14 +2517,25 @@ int main(int argc, char **argv){
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"ATTENZIONE: il modello e' su %s (filesystem 9p/Windows, lento e fadvise inefficace).\n"
                        "            Per RAM e velocita' tienilo su ext4 (es. /home/...).\n", snap);
-    /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
-     * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
-    if(getenv("PIN")) pin_load(&m, getenv("PIN"), getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
+    double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
+    int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;
+    /* Explicit PIN used to bypass the planner. Clamp it to a share of the
+     * expert budget so LRU adaptation and buffered disk I/O keep headroom. */
+    if(getenv("PIN")){
+        double requested=(getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0)*1e9;
+        double fraction=getenv("PIN_FRACTION")?atof(getenv("PIN_FRACTION")):0.25;
+        double budget=expert_avail(&m,ram_env,ebits,est_ctx);
+        double safe=coli_safe_pin_bytes(requested,budget,fraction);
+        if(safe+1e6<requested) fprintf(stderr,
+            "[PIN] richiesta %.1f GB limitata a %.1f GB (%.0f%% del budget expert %.1f GB); "
+            "PIN_FRACTION=1 forza il comportamento precedente\n",
+            requested/1e9,safe/1e9,fraction*100.0,budget/1e9);
+        if(safe>=0.5e9) pin_load(&m,getenv("PIN"),safe/1e9);
+    }
     /* CACHE CHE IMPARA: l'uso degli expert si accumula in <SNAP>/.coli_usage tra le sessioni;
      * all'avvio i piu' usati vengono auto-pinnati in RAM (meta' del budget expert: il pin
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
-    { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
-      int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
+    {
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
