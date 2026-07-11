@@ -323,12 +323,20 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
         for(int z=0;z<2*O;z++) matmul_i4_pair_rows(&job,z,z+1);
     }
 }
+static void matmul_i4_pool(float *y,const float *x,const uint8_t *q,const float *s,int I,int O){
+    I4PairJob job={y,NULL,x,q,NULL,s,NULL,I,O,(I+1)/2};
+    cpu_pool_for(&g_cpu_pool,O,matmul_i4_pair_rows,&job);
+}
 
 static void matmul_qt(float *y,const float *x,QT *w,int S);
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
+}
+static void expert_down(float *y,const float *x,QT *w,int S){
+    if(g_cpu_pool_enabled&&S==1&&w->fmt==2) matmul_i4_pool(y,x,w->q4,w->s,w->I,w->O);
+    else matmul_qt(y,x,w,S);
 }
 /* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
@@ -1380,7 +1388,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            matmul_qt(hh, gg, &e->d, nr);
+            expert_down(hh,gg,&e->d,nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
@@ -1420,7 +1428,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                         for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        matmul_qt(hh,gg,&e->d,nr);
+                        expert_down(hh,gg,&e->d,nr);
                     }
                 }
                 float *src=dev_ok[di]?group_y+(int64_t)off*D:hh;
@@ -1449,7 +1457,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 double tc=now_s();
                 expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                 for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                matmul_qt(hh,gg,&e->d,nr);
+                expert_down(hh,gg,&e->d,nr);
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 m->t_emm+=now_s()-tc;
