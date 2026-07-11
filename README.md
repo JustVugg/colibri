@@ -257,7 +257,7 @@ COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 # multi-GPU expert tier, 150 GB total budget across six 32 GB devices
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
-PIN=stats.txt PIN_GB=150 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+PIN=stats.txt PIN_GB=280 RAM_GB=226 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -270,6 +270,12 @@ least-loaded device that can hold them. Multi-GPU runs also default to
 with zero-heat experts. `CUDA_RELEASE_HOST=1` (the multi-GPU default) releases
 the RAM copy after a successful upload and reloads it from disk only if CUDA
 later fails. Set either variable to `0` to restore the conservative behavior.
+When host backing is released, placement is disjoint and staged: the hottest
+prefix is loaded, uploaded to VRAM, and freed before the next-ranked suffix is
+loaded into RAM. `PIN_GB` therefore describes the combined ranked set rather
+than duplicate RAM and VRAM copies. On a 256 GB dual-socket host, a 150 GB VRAM
++ 130 GB RAM placement raised expert hit rate from 91.2% to 94.8% and q4 decode
+from 0.95 to 1.13 tok/s while keeping at least 97 GB MemAvailable during startup.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
 

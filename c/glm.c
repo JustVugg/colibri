@@ -2440,37 +2440,38 @@ static void pin_load(Model *m, const char *statspath, double gb){
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
     for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+    int *slot_of=malloc((size_t)npin*sizeof(int)), *next=calloc(c->n_layers+1,sizeof(int));
+    for(int a=0;a<npin;a++) slot_of[a]=next[r[a].l]++;
+    for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
     double t0=now_s();
-    #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<npin;a++){
-        int li=r[a].l, slot;
-        #pragma omp critical
-        slot=m->npin[li]++;
-        expert_load(m,li,r[a].e,&m->pin[li][slot]);
+#ifdef COLI_CUDA
+    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
+    double budget=g_cuda_expert_gb*1e9, safe_total=0;
+    if(g_cuda_enabled&&g_cuda_expert_gb>0) for(int i=0;i<g_cuda_ndev;i++){
+        size_t free_b=0,total_b=0;
+        if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+            if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
+        }
     }
-    m->resident_bytes += (int64_t)npin*eb;
-    fprintf(stderr,"[PIN] hot-store: %d expert in RAM (%.1f GB) in %.0fs da %s\n",
-        npin, npin*eb/1e9, now_s()-t0, statspath);
+    if(budget>safe_total) budget=safe_total;
+    if(g_cuda_enabled&&g_cuda_release_host&&budget>0){ gpu_prefix=(int)(budget/eb)+g_cuda_ndev; if(gpu_prefix>npin)gpu_prefix=npin; }
+#else
+    int gpu_prefix=0;
+#endif
+    /* Load the VRAM-ranked prefix first.  Once uploaded its host backing is
+     * released before the disjoint RAM-ranked suffix is allocated. */
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
+        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]]);
+    m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
 #ifdef COLI_CUDA
     if(g_cuda_enabled && g_cuda_expert_gb>0){
-        double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
-        int placed_n[COLI_CUDA_MAX_DEVICES]={0};
-        double budget=g_cuda_expert_gb*1e9, safe_total=0;
-        for(int i=0;i<g_cuda_ndev;i++){
-            size_t free_b=0,total_b=0;
-            if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-                /* Dense tensors are assigned round-robin and upload lazily.
-                 * Reserve their projected footprint plus 2 GB per device. */
-                remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
-                if(remaining[i]<0) remaining[i]=0;
-                safe_total+=remaining[i];
-            }
-        }
-        if(budget>safe_total) budget=safe_total;
-        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
+        int gpu_limit=gpu_prefix?gpu_prefix:npin;
+        for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
-            for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
-                ESlot *s=&m->pin[li][z];
+            { ESlot *s=&m->pin[li][slot_of[a]];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
                 if(m->gpu_expert_bytes+need>budget) break;
                 int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
@@ -2496,7 +2497,6 @@ static void pin_load(Model *m, const char *statspath, double gb){
                         remaining[best]=0;             /* device rejected its projected capacity */
                     }
                 }
-                break;
             }
         }
         fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget totale %.1f GB)\n",
@@ -2505,8 +2505,16 @@ static void pin_load(Model *m, const char *statspath, double gb){
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
 #endif
+    if(gpu_prefix>0&&gpu_prefix<npin){
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int a=gpu_prefix;a<npin;a++)
+            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]]);
+        m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
+    }
+    fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
+        m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
-    free(r); free(cnt_l);
+    free(r); free(cnt_l); free(slot_of); free(next);
 }
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
