@@ -165,6 +165,14 @@ static void cuda_stats_print(void){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensor, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
     }
+    uint64_t calls=0,experts=0,rows=0; double h2d=0,kernel=0,d2h=0;
+    coli_cuda_group_stats(&calls,&experts,&rows,&h2d,&kernel,&d2h);
+    if(calls) fprintf(stderr,"[CUDA] expert groups: %llu call, %llu expert, %llu righe "
+        "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
+        (unsigned long long)rows,(double)experts/calls,
+        getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
+    if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
+        "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
