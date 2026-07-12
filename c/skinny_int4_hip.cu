@@ -266,4 +266,93 @@ extern "C" void coli_hip_f16_to_f32(float* dst, const half* src, size_t n,
   f16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(dst, src, n);
 }
 
+// ---- WMMA batched int4 GEMM (RDNA3 matrix cores), for rows in [~8,64] ----
+// C[rows,Nout] = A[rows,K] @ dequant(W)^T. W is colibri signed-s4 [Nout,K/2]
+// (after the upload XOR); the per-channel fp32 scale is applied after the
+// accumulate, so dequant is just nibble->fp16 of a small signed int (exact).
+// One workgroup (one wave32) owns a 16-wide output tile and loops K once,
+// reusing each weight tile across up to 4 row-subtiles -> weights streamed once
+// per output tile (unlike the skinny kernel, which re-streams per <=8-row chunk).
+#if defined(__HIP__GFX1X__)
+#include <rocwmma/rocwmma.hpp>
+namespace rw = rocwmma;
+
+template <int MT>
+__global__ void wmma_int4(const int Nout, const int K, const int rows,
+                          const uint8_t* __restrict__ W,
+                          const half* __restrict__ A,
+                          const float* __restrict__ scale, half* C) {
+  const int nbase = blockIdx.x * 16;   // output-channel tile
+  const int Kp = K / 2;
+  const int lane = threadIdx.x;        // one wave, 0..31
+  __shared__ rw::float16_t lB[16 * 16];
+  __shared__ rw::float16_t lA[MT][16 * 16];
+  __shared__ float lC[MT][16 * 16];
+
+  rw::fragment<rw::accumulator, 16, 16, 16, float> acc[MT];
+  for (int mt = 0; mt < MT; mt++) rw::fill_fragment(acc[mt], 0.0f);
+
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    for (int idx = lane; idx < 256; idx += 32) {   // B tile [k][n] = W[nbase+n][k0+k]
+      int k = idx >> 4, n = idx & 15;
+      int out = nbase + n, kk = k0 + k;
+      uint8_t byte = W[(size_t)out * Kp + (kk >> 1)];
+      int n4 = (kk & 1) ? (byte >> 4) : (byte & 15);
+      lB[idx] = (rw::float16_t)(float)((n4 & 8) ? n4 - 16 : n4);
+    }
+    for (int mt = 0; mt < MT; mt++)
+      for (int idx = lane; idx < 256; idx += 32) {   // A tile [m][k]
+        int m = idx >> 4, k = idx & 15, row = mt * 16 + m;
+        lA[mt][idx] = (row < rows) ? (rw::float16_t)A[(size_t)row * K + k0 + k]
+                                   : (rw::float16_t)0.0f;
+      }
+    __syncthreads();
+    rw::fragment<rw::matrix_b, 16, 16, 16, rw::float16_t, rw::row_major> bfrag;
+    rw::load_matrix_sync(bfrag, lB, 16);
+    for (int mt = 0; mt < MT; mt++) {
+      rw::fragment<rw::matrix_a, 16, 16, 16, rw::float16_t, rw::row_major> afrag;
+      rw::load_matrix_sync(afrag, lA[mt], 16);
+      rw::mma_sync(acc[mt], afrag, bfrag, acc[mt]);
+    }
+    __syncthreads();
+  }
+
+  for (int mt = 0; mt < MT; mt++)
+    rw::store_matrix_sync(lC[mt], acc[mt], 16, rw::mem_row_major);
+  __syncthreads();
+  for (int mt = 0; mt < MT; mt++)
+    for (int idx = lane; idx < 256; idx += 32) {
+      int m = idx >> 4, n = idx & 15, row = mt * 16 + m;
+      if (row < rows) C[(size_t)row * Nout + nbase + n] =
+          (half)(lC[mt][idx] * scale[nbase + n]);
+    }
+}
+#else
+template <int MT>
+__global__ void wmma_int4(const int, const int, const int, const uint8_t*,
+                          const half*, const float*, half*) {}
+#endif
+
+// Returns 1 if launched, 0 if the shape is unsupported (caller falls back).
+// Handles any rows>0 by tiling the row dimension in blocks of 64 (MT=4).
+extern "C" int coli_hip_int4_wmma(half* C, const half* A, const uint8_t* W,
+                                  const float* scale, int Nout, int K, int rows,
+                                  hipStream_t stream) {
+  if (K % 16 || Nout % 16 || rows < 1) return 0;
+  dim3 grid(Nout / 16), block(32);
+  for (int r = 0; r < rows; r += 64) {
+    int nr = rows - r < 64 ? rows - r : 64;
+    int mt = (nr + 15) / 16;
+    const half* Ar = A + (size_t)r * K;
+    half* Cr = C + (size_t)r * Nout;
+    switch (mt) {
+      case 1: wmma_int4<1><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
+      case 2: wmma_int4<2><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
+      case 3: wmma_int4<3><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
+      default: wmma_int4<4><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
+    }
+  }
+  return 1;
+}
+
 #endif  // COLI_HIP

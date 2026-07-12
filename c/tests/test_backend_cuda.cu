@@ -193,6 +193,14 @@ int main(int argc, char **argv) {
         if (!coli_cuda_expert_group(EG, EU, EDn, egr, 2, gghot, eex)) return 1;
         unsetenv("COLI_HIP_SKINNY");
         if (!relative_rms(gghot, ggref, ED * etot, 0.03f)) return 1;
+        /* WMMA matrix-core path (opt-in) for the >8-row experts. */
+        static float ggwm[64 * 16];
+        setenv("COLI_HIP_SKINNY", "1", 1);
+        setenv("COLI_HIP_WMMA", "1", 1);
+        if (!coli_cuda_expert_group(EG, EU, EDn, egr, 2, ggwm, eex)) return 1;
+        unsetenv("COLI_HIP_WMMA");
+        unsetenv("COLI_HIP_SKINNY");
+        if (!relative_rms(ggwm, ggref, ED * etot, 0.03f)) return 1;
         coli_cuda_tensor_free(eg);
         coli_cuda_tensor_free(eu);
         coli_cuda_tensor_free(edn);

@@ -2,8 +2,9 @@
 
 Status: steps 1-5 landed (kernel ported to `c/skinny_int4_hip.cu`, repack +
 fp16 glue, wired into matmul & fused expert paths behind `COLI_HIP_SKINNY=1`, validated
-by `make cuda-test HIP=1`). Step 6 (
-batched-WMMA grouped path for rows>8) remains. Colibri's GPU expert matmul on AMD works
+by `make cuda-test HIP=1`). Step 6 (WMMA path) is implemented and validated but opt-in (needs perf work); rows>8 defaults to chunked skinny.
+
+Colibri's GPU expert matmul on AMD works
 correctly but is bandwidth-inefficient. This is the plan to close the gap by
 reusing the tuned kernel work from the vLLM ROCm fork.
 
@@ -82,8 +83,34 @@ Steps 1-4 done; 5-6 remain.
 5. [done] Tuned YTILE/UNRL for gfx1100 (multiProcessorCount reports 48, not 96 —
    the plan's WGP note was right). Sweep confirms YTILE=4/UNRL=2 as the default;
    see results below.
-6. [todo] Later (optional): the batched M=8-64 matrix-core path via the WMMA intrinsics,
-   for #80's grouped-expert continuous-batching path.
+6. [partial] Batched WMMA (RDNA3 matrix-core) path for rows>8, in
+   `c/skinny_int4_hip.cu` (`wmma_int4` via rocWMMA, dequants straight from the
+   signed-s4 weights + fp32 scale, no repack). Correct and validated, but the
+   first-correct version is occupancy/latency-bound and slower than chunked
+   skinny at real shapes, so it is opt-in (`COLI_HIP_WMMA=1`); see below.
+
+## Result (step 6: WMMA, opt-in)
+
+`coli_hip_int4_wmma` computes C[rows,Nout]=A@dequant(W)^T with rocWMMA
+16x16x16 f16 tiles, one wave per output tile looping K once. It is numerically
+correct (relRMS ~2e-4 vs a CPU reference; wired path matches naive within fp16
+tolerance) but not yet fast. Pure-kernel time vs chunked skinny (RX 7900 XTX):
+
+    Nout=2048 K=6144 rows=16/32/64 : wmma 589/877/1740us  skinny 67/126/249us
+    Nout=6144 K=2048 rows=16/32/64 : wmma 199/300/572us   skinny 43/86/173us
+
+WMMA is 3-10x slower (~4-32 GB/s effective). Root causes and the work needed to
+reach the ~40% (~384 GB/s) the handoff targets:
+  - Occupancy: one wave per workgroup, and only Nout/16 output tiles of
+    parallelism (128 for Nout=2048). Needs split-K (partial sums + atomic add)
+    to expose more waves, and/or multiple waves per block sharing a staged
+    activation tile.
+  - Latency: a __syncthreads every 16 K-elements with no double-buffering, so
+    the int4 dequant (VALU) is fully exposed instead of overlapping the WMMA.
+  - Weight loads are byte-wise and uncoalesced; should be vectorized (uint4).
+  - Epilogue stages to LDS for the per-column scale; bounds-safe direct global
+    stores would cut LDS pressure.
+Until that lands, the rows>8 default stays chunked skinny (correct, ~3x naive).
 
 ## Result (steps 1-5)
 
@@ -121,8 +148,8 @@ S=1 is copy/launch-latency bound end to end (kernel-only gain is larger); the
 win grows with S because skinny batches N rows in one launch that reuses the
 LDS-staged activation, where the naive kernel does S separate grid launches.
 The single-tensor, fused-`expert_mlp`, and grouped-`expert_group` paths are all
-wired. Remaining: step 6 (batched M=8-64 matrix-core / WMMA path for grouped
-continuous batching with rows>8, which currently falls back).
+wired. Remaining: making the opt-in WMMA path (step 6, `COLI_HIP_WMMA=1`) beat
+chunked skinny via split-K + double-buffering + coalesced weight loads.
 
 ## Payoff and when to do it
 
