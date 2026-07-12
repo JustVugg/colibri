@@ -689,6 +689,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if reasoning_effort not in efforts:
             raise APIError(400, "`reasoning_effort` must be none, minimal, low, medium, high, or xhigh.",
                            "reasoning_effort")
+        # COLI_THINK=1 makes thinking the default when the client sends NEITHER reasoning_effort
+        # nor enable_thinking (a global switch, like the old server's --think). An explicit
+        # client value always wins. Default off => exact OpenAI-standard behavior.
+        if (reasoning_effort is None and "enable_thinking" not in body
+                and os.environ.get("COLI_THINK", "0") == "1"):
+            reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
