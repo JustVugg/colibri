@@ -63,6 +63,10 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
+/* Replace a resident tensor's contents without reallocating its device slot. */
+int coli_cuda_tensor_update(ColiCudaTensor *tensor,
+                            const void *weights, const float *scales);
+
 #ifdef __cplusplus
 }
 #endif

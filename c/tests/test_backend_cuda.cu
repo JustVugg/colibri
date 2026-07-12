@@ -42,6 +42,11 @@ int main(int argc, char **argv) {
     if (coli_cuda_tensor_upload(&t8, q8, s8, 1, 5, 2, d0)) return 1;
     if (ndev > 1 && coli_cuda_tensor_upload(&t8, q8, s8, 1, 4, 2, d1)) return 1;
     if (!coli_cuda_matmul(&t8, got, x, q8, s8, 1, 2, 4, 2, d0) || !close_enough(got, want8, 4)) return 1;
+    const int8_t q8b[8]={-1,-2,-3,-4, 1,-2,3,-4};
+    const float s8b[2]={1.f,.5f},want8b[4]={10.f,15.f,-3.f,-2.5f};
+    if(!coli_cuda_tensor_update(t8,q8b,s8b)||
+       !coli_cuda_matmul(&t8,got,x,q8b,s8b,1,2,4,2,d0)||
+       !close_enough(got,want8b,4))return 1;
 
     /* Rows [-8,-1,0,7] and [1,2,3,4], packed low nibble first. */
     const uint8_t q4[4] = {0x70, 0xf8, 0xa9, 0xcb};

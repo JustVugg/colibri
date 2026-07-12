@@ -378,6 +378,23 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
+extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
+                                          const void *weights,
+                                          const float *scales) {
+    if (!tensor || !weights || (tensor->fmt && !scales)) return 0;
+    DeviceContext *ctx=find_ctx(tensor->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
+                            cudaMemcpyHostToDevice),"tensor refresh")) return 0;
+    if(tensor->fmt==2){
+        offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256>>>(
+            (uint8_t*)tensor->weights,tensor->weight_bytes);
+        if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
+    }
+    return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
+        (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,

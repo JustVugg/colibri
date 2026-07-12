@@ -312,11 +312,13 @@ misses when the host budget permits it. The regular `RAM_GB` guard still clamps
 the per-layer working cache and rejects unsafe projections; this mode is intended
 for dedicated high-memory inference hosts, not desktops running other workloads.
 On a dedicated 251 GiB host with six RTX 5090s, this mode selected a 176.7 GB
-VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). A real
-64-token greedy GLM-5.2 generation measured **5.77 tok/s decode**, up from
+VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). The
+mode also adapts the VRAM tier every 16 emitted tokens by swapping hot RAM
+experts into existing GPU slots. A real 64-token greedy GLM-5.2 generation
+measured **6.00 tok/s decode**, up from
 2.20 tok/s end-to-end with the earlier 150 GB tier; expert hit rate was 100%
-and disk wait was zero. Prompt prefill remained separate at 13.49 s for 15
-tokens. This is a host-specific capacity result, not a portable default.
+and disk wait was zero. Prompt prefill is reported separately. This is a
+host-specific capacity result, not a portable default.
 
 Text-mode timing reports prefill separately from decode. The decode rate starts
 after the prompt KV is built, so it is comparable to `REPLAY` throughput without

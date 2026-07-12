@@ -153,6 +153,8 @@ typedef struct {
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
+static int g_repin;
+static uint64_t g_last_repin;
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -169,6 +171,11 @@ static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
+}
+static int qt_cuda_update(QT *t){
+    const void *weights=t->fmt==0?(const void*)t->qf:
+                        t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+    return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -1937,6 +1944,7 @@ static int pick_tok(const float *lo, int V, int ban){
 /* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
 static int g_stop[9], g_nstop=0;
+static void repin_pass(Model *m);
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
 static void stops_arm(const Cfg *c, int tok_eos){
     g_nstop=0;
@@ -2008,6 +2016,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
         kv += 1+k;                                      /* KV oltre kv e' stantia: verra' sovrascritta */
         logit=falloc(V); memcpy(logit, lo+(int64_t)k*V, V*sizeof(float)); free(lo);
+        repin_pass(m);                                  /* safe point: all device work is synchronized */
     }
     if(logit) free(logit);
     if(kv_out) *kv_out=kv;
@@ -2150,9 +2159,14 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double prefill_t=now_s();
     float *logit=step(m,pids,np,0);
+    if(g_repin>0){
+        m->n_emit=(uint64_t)g_repin;
+        repin_pass(m);                              /* prompt routing seeds the first GPU layout */
+    }
     prefill_t=now_s()-prefill_t;
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
     m->n_emit=m->n_fw=0;
+    g_last_repin=0;
     profile_reset(m);
     double t=now_s();
     EmitStream es={&T,m,t,0,0};
@@ -2204,21 +2218,38 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
  * ping-pong; max 4 swaps/pass (~20 MB disk each). A separate decaying heat map keeps
  * persistent .coli_usage intact while adapting to the current workload. */
-static int g_repin=0;
-static uint64_t g_last_repin=0;
-typedef struct { long gain; int l, slot, eid; } RepinCand;
+typedef struct { long gain; int l, slot, eid, gpu_swap; } RepinCand;
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
     for(int l=0;l<c->n_layers;l++){
         if(!m->npin || m->npin[l]<1 || !m->eheat[l]) continue;
+#ifdef COLI_CUDA
+        int cold=-1,hot=-1;
+        for(int z=0;z<m->npin[l];z++){
+            ESlot *s=&m->pin[l][z]; uint32_t heat=m->eheat[l][s->eid];
+            if(s->g.cuda_eligible){
+                if(cold<0||heat<m->eheat[l][m->pin[l][cold].eid]) cold=z;
+            }else if(hot<0||heat>m->eheat[l][m->pin[l][hot].eid]) hot=z;
+        }
+        if(cold>=0&&hot>=0){
+            uint32_t ch=m->eheat[l][m->pin[l][cold].eid],hh=m->eheat[l][m->pin[l][hot].eid];
+            if(hh>ch+1){
+                RepinCand v={(long)hh-(long)ch,l,cold,m->pin[l][hot].eid,1};
+                if(nb<maxc) out[nb++]=v;
+                else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain)w=b;
+                       if(v.gain>out[w].gain)out[w]=v; }
+                continue;
+            }
+        }
+#endif
         ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
         int np=m->npin[l]; if(np>4096) np=4096;
         for(int z=0;z<np;z++) ids[z]=P[z].eid;
         if(!tier_pick_lfru(m->eheat[l],m->elast[l],m->eaccess_clock,
                            c->n_experts,ids,np,&zp,&eu,&g)) continue;
-        if(nb<maxc){ out[nb].gain=g; out[nb].l=l; out[nb].slot=zp; out[nb].eid=eu; nb++; }
+        if(nb<maxc){ out[nb]=(RepinCand){g,l,zp,eu,0}; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
-               if(g>out[w].gain){ out[w].gain=g; out[w].l=l; out[w].slot=zp; out[w].eid=eu; } }
+               if(g>out[w].gain) out[w]=(RepinCand){g,l,zp,eu,0}; }
     }
     return nb;
 }
@@ -2226,12 +2257,49 @@ static void repin_pass(Model *m){
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
-    RepinCand cd[4]; int nb=repin_pick(m,cd,4);
+    double pass_t0=now_s(); int gpu_swaps=0;
+    RepinCand cd[32]; int nb=repin_pick(m,cd,32);
+#ifdef COLI_CUDA
+    /* Cold GPU slots have no host backing. Restore all demoted experts in
+     * parallel first; serial 20 MB reads made a 32-slot adaptation pass cost
+     * ~0.7 s on the six-GPU host. */
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
+        ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        expert_host_ensure(m,cd[b].l,s);
+    }
+    for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
+        ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        m->resident_bytes+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+    }
+#endif
     for(int b=0;b<nb;b++){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
         int old=s->eid;
         uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
 #ifdef COLI_CUDA
+        if(cd[b].gpu_swap){
+            ESlot *hot=NULL;
+            for(int z=0;z<m->npin[cd[b].l];z++)
+                if(m->pin[cd[b].l][z].eid==cd[b].eid){hot=&m->pin[cd[b].l][z];break;}
+            if(!hot||hot->g.cuda_eligible) continue;
+            double t0=now_s();
+            QT *cq[3]={&s->g,&s->u,&s->d},*hq[3]={&hot->g,&hot->u,&hot->d};
+            int ok=1;
+            for(int k=0;k<3;k++){
+                hq[k]->cuda=cq[k]->cuda; cq[k]->cuda=NULL;
+                hq[k]->cuda_device=cq[k]->cuda_device;
+                hq[k]->cuda_eligible=1; cq[k]->cuda_eligible=0;
+                if(!qt_cuda_update(hq[k])) ok=0;
+            }
+            if(!ok){ fprintf(stderr,"[REPIN] refresh VRAM fallito\n"); exit(1); }
+            if(g_cuda_release_host) expert_host_release(m,hot);
+            gpu_swaps++;
+            if(getenv("REPIN_VERBOSE")) fprintf(stderr,
+                "[REPIN] VRAM layer %d: esce/out %d (heat=%u) <- entra/in %d "
+                "(heat=%u) in %.0f ms\n",cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
+            continue;
+        }
         int gpu=s->g.cuda_eligible;
         int64_t old_gpu=gpu ? (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
@@ -2259,6 +2327,8 @@ static void repin_pass(Model *m){
         fprintf(stderr,"[REPIN] %s layer %d: esce/out %d (heat=%u) <- entra/in %d (heat=%u) in %.0f ms\n",
             tier,cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
+    if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d expert scambiati/swapped in %.0f ms\n",
+        gpu_swaps,(now_s()-pass_t0)*1e3);
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
@@ -3006,6 +3076,8 @@ int main(int argc, char **argv){
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
+    if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
+       !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) richiede COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE richiede COLI_CUDA=1\n"); return 2; }
