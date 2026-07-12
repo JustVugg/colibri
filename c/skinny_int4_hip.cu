@@ -395,12 +395,13 @@ static float* wmma_scratch(size_t n) {
   return g_wmma_cf;
 }
 
-// Returns 1 if launched, 0 if the shape is unsupported (caller falls back).
-extern "C" int coli_hip_int4_wmma(half* C, const half* A, const uint8_t* W,
-                                  const float* scale, int Nout, int K, int rows,
-                                  hipStream_t stream) {
-  constexpr int WV = 4, BK = 32;
-  if (K % BK || Nout % (16 * WV) || rows < 1) return 0;
+// One WMMA launch for a fixed WV (BK=32). Split-K only when the output grid is
+// too small to fill the GPU.
+template <int WV>
+static int wmma_launch(half* C, const half* A, const uint8_t* W, const float* scale,
+                       int Nout, int K, int rows, hipStream_t stream) {
+  constexpr int BK = 32;
+  if (Nout % (16 * WV)) return 0;
   const int base = Nout / (16 * WV);
   const int rowtiles = (rows + 15) / 16;
   int blocks0 = base * rowtiles;
@@ -420,6 +421,22 @@ extern "C" int coli_hip_int4_wmma(half* C, const half* A, const uint8_t* W,
     wmma_scale_cols<<<(unsigned)((nn + 255) / 256), 256, 0, stream>>>(C, Cf, scale, nn, Nout);
   }
   return 1;
+}
+
+// Returns 1 if launched, 0 if the shape is unsupported (caller falls back).
+extern "C" int coli_hip_int4_wmma(half* C, const half* A, const uint8_t* W,
+                                  const float* scale, int Nout, int K, int rows,
+                                  hipStream_t stream) {
+  if (K % 32 || rows < 1) return 0;
+  // Tuned default: WV=8 for large-K projections (more activation reuse per
+  // block), WV=4 for small-K. COLI_WMMA_WV overrides. Wider WV needs
+  // Nout % (16*WV) == 0, so fall through to a smaller WV when it doesn't divide.
+  const char* e = getenv("COLI_WMMA_WV");
+  int wv = e ? atoi(e) : (K >= 4096 ? 8 : 4);
+  if (wv == 8 && wmma_launch<8>(C, A, W, scale, Nout, K, rows, stream)) return 1;
+  if (wv >= 4 && wmma_launch<4>(C, A, W, scale, Nout, K, rows, stream)) return 1;
+  if (wmma_launch<2>(C, A, W, scale, Nout, K, rows, stream)) return 1;
+  return wmma_launch<1>(C, A, W, scale, Nout, K, rows, stream);
 }
 
 #endif  // COLI_HIP
