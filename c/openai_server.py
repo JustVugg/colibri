@@ -599,6 +599,7 @@ class APIHandler(BaseHTTPRequestHandler):
             last_write = [time.time()]
             ka_stop = threading.Event()
             KA_GAP = 10.0
+            dbg_echo = os.environ.get("COLI_DEBUG", "0") == "1"   # tee decoded tokens to stderr
 
             def event(choices, usage_marker=False):
                 nonlocal connected
@@ -647,6 +648,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw = []
                 def emit_tools(chunk):
                     raw.append(chunk)
+                    if dbg_echo:
+                        sys.stderr.write(chunk); sys.stderr.flush()
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
@@ -673,8 +676,12 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             else:
+                def emit_plain(chunk):
+                    if dbg_echo:
+                        sys.stderr.write(chunk); sys.stderr.flush()
+                    emit(chunk)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_plain, cache_slot)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
