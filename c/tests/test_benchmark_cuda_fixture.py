@@ -5,7 +5,7 @@ from tools.benchmark_cuda_fixture import parse_output
 
 SAMPLE = """
 REPLAY decode: 4 tokens | 12.34 tok/s
-PROFILO: expert-disk 1.25s | expert-matmul 2.50s | attention 0.75s | lm_head 0.10s | altro -0.05s
+PROFILE: expert-disk 1.25s | expert-matmul 2.50s | attention 0.75s | lm_head 0.10s | other -0.05s
 """
 
 
