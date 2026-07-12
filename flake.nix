@@ -71,7 +71,7 @@
             description = "Run GLM-5.2 (744B MoE) on a consumer machine with ~25 GB RAM";
             homepage = "https://github.com/JustVugg/colibri";
             license = licenses.asl20;
-            platforms = platforms.linux;
+            platforms = platforms.linux ++ platforms.darwin;
             mainProgram = "glm";
           };
         };
