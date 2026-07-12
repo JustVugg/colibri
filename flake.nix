@@ -15,6 +15,7 @@
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           torch
           safetensors
+          transformers
           huggingface-hub
           numpy
         ]);
