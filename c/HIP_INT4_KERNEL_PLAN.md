@@ -106,6 +106,9 @@ latency-bound at ~11 GB/s):
     the barrier over two WMMA-K steps; the K-loop is double-buffered (two LDS
     buffers + register prefetch) so the next tile's global load and int4 dequant
     overlap the current tile's matrix-core mma.
+  - Weights load as 64-bit (uint2) transactions, two lanes per output row so all
+    32 lanes stay busy while coalescing (a 128-bit/uint4 per-row load used only
+    16 lanes and was slower).
   - Split-K over blockIdx.z (G slices, fp32 atomic accumulate + a scale pass)
     only when the output grid is too small to fill the GPU (blocks < 256);
     otherwise a single slice stores straight to C (no atomic/scale overhead).
@@ -113,8 +116,8 @@ latency-bound at ~11 GB/s):
 Pure-kernel time vs chunked skinny (RX 7900 XTX, weights = 6.3 MB, part
 cache-resident so GB/s is relative-only):
 
-    Nout=2048 K=6144 rows=16/32/64 : wmma 61/80/143us  skinny 83/119/234us  1.35/1.48/1.63x
-    Nout=6144 K=2048 rows=16/32/64 : wmma 51/78/115us  skinny 40/80/159us   0.79/1.03/1.38x
+    Nout=2048 K=6144 rows=16/32/64 : wmma 58/69/131us  skinny 85/119/235us  1.47/1.73/1.80x
+    Nout=6144 K=2048 rows=16/32/64 : wmma 48/73/103us  skinny 40/81/159us   0.84/1.11/1.55x
 
 WMMA wins across all batch sizes on the large-K projections (gate/up, K=6144)
 and from rows~32 up on small-K (down, K=2048); it loses to skinny only on
@@ -122,8 +125,13 @@ small-K wide-output at low rows. So the wired dispatch uses WMMA for rows>8 when
 (K>=4096 || rows>=32), else chunked skinny; `COLI_HIP_WMMA=0/1` forces the
 choice. rows<=8 always uses skinny.
 
-Not yet done (would push further toward the handoff's ~3x): vectorized (uint4)
-coalesced weight loads, and BK/WV autotuning per shape.
+Note: the microbench weights (6.3 MB) are Infinity-Cache-resident, so it cannot
+reward better DRAM coalescing directly; the uint2 win here is from parallelism
+(all 32 lanes) and fewer LDS transactions. A DRAM-cold, many-expert workload
+should benefit more from the coalescing.
+
+Not yet done (would push further toward the handoff's ~3x): BK/WV autotuning per
+shape, and overlapping the fp32 split-K epilogue.
 
 ## Result (steps 1-5)
 

@@ -300,13 +300,16 @@ __global__ void __launch_bounds__(WV * 32)
   __shared__ float lC[WV][16 * 16];
 
   constexpr int APT = (16 * BK + WV * 32 - 1) / (WV * 32);  // A elems / thread
-  constexpr int BPT = (BK * 16 + 31) / 32;                  // B elems / lane
-  rw::float16_t rA[APT], rB[BPT];
+  static_assert(BK == 32, "coalesced weight load assumes BK == 32");
+  rw::float16_t rA[APT], rB[16];   // rB: each lane holds 8 bytes -> 16 nibbles
 
   rw::fragment<rw::accumulator, 16, 16, 16, float> acc;
   rw::fill_fragment(acc, 0.0f);
 
-  // Read one K-tile (A load + int4 weight dequant) into registers.
+  // Read one K-tile: A load (coalesced fp16) + int4 weights as one 64-bit load
+  // per lane (2 lanes per output row, all 32 lanes busy), unpacked -> registers.
+  const int bn = lane >> 1;        // this lane's output column within the tile
+  const int bh = lane & 1;         // which 8-byte half of the row (k 0..15 / 16..31)
 #define WMMA_LOAD_REG(k0)                                                     \
   do {                                                                        \
     for (int j = 0; j < APT; j++) {                                           \
@@ -317,14 +320,12 @@ __global__ void __launch_bounds__(WV * 32)
                              : (rw::float16_t)0.0f;                           \
       }                                                                       \
     }                                                                         \
-    for (int j = 0; j < BPT; j++) {                                           \
-      int idx = lane + j * 32;                                                \
-      if (idx < BK * 16) {                                                    \
-        int k = idx >> 4, n = idx & 15, out = nbase + n, kk = (k0) + k;       \
-        uint8_t byte = W[(size_t)out * Kp + (kk >> 1)];                       \
-        int n4 = (kk & 1) ? (byte >> 4) : (byte & 15);                        \
-        rB[j] = (rw::float16_t)(float)((n4 & 8) ? n4 - 16 : n4);              \
-      }                                                                       \
+    uint2 pk = *(const uint2*)(W + (size_t)(nbase + bn) * Kp + ((k0) >> 1) + bh * 8); \
+    const uint8_t* pb = (const uint8_t*)&pk;                                  \
+    _Pragma("unroll") for (int b = 0; b < 8; b++) {                           \
+      int lo = pb[b] & 15, hi = pb[b] >> 4;                                   \
+      rB[2 * b] = (rw::float16_t)(float)((lo & 8) ? lo - 16 : lo);            \
+      rB[2 * b + 1] = (rw::float16_t)(float)((hi & 8) ? hi - 16 : hi);        \
     }                                                                         \
   } while (0)
 #define WMMA_STORE_REG(buf)                                                   \
@@ -333,10 +334,8 @@ __global__ void __launch_bounds__(WV * 32)
       int idx = threadIdx.x + j * WV * 32;                                    \
       if (idx < 16 * BK) lA[buf][idx] = rA[j];                                \
     }                                                                         \
-    for (int j = 0; j < BPT; j++) {                                           \
-      int idx = lane + j * 32;                                                \
-      if (idx < BK * 16) lB[buf][wave][idx] = rB[j];                          \
-    }                                                                         \
+    _Pragma("unroll") for (int k = 0; k < 16; k++)                            \
+      lB[buf][wave][(bh * 16 + k) * 16 + bn] = rB[k];                         \
   } while (0)
 
   const int nsteps = (kend - kstart + BK - 1) / BK;
