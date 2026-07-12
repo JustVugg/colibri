@@ -1998,7 +1998,8 @@ static int pick_tok(const float *lo, int V, int ban){
 /* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
 static int g_stop[9], g_nstop=0;
-static void repin_pass(Model *m);
+static void repin_pass_limit(Model *m,int limit);
+static void repin_pass(Model *m){ repin_pass_limit(m,32); }
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
 static void stops_arm(const Cfg *c, int tok_eos){
     g_nstop=0;
@@ -2215,7 +2216,11 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     float *logit=step(m,pids,np,0);
     if(g_repin>0){
         m->n_emit=(uint64_t)g_repin;
-        repin_pass(m);                              /* prompt routing seeds the first GPU layout */
+        int limit=32;
+#ifdef COLI_CUDA
+        if(m->gpu_expert_count) limit=m->c.n_layers;
+#endif
+        repin_pass_limit(m,limit);                  /* prompt routing seeds every GPU layer */
     }
     prefill_t=now_s()-prefill_t;
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
@@ -2307,12 +2312,14 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     }
     return nb;
 }
-static void repin_pass(Model *m){
+static void repin_pass_limit(Model *m,int limit){
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
     double pass_t0=now_s(); int gpu_swaps=0;
-    RepinCand cd[32]; int nb=repin_pick(m,cd,32);
+    RepinCand cd[130];
+    if(limit<1) limit=1; if(limit>130) limit=130;
+    int nb=repin_pick(m,cd,limit);
 #ifdef COLI_CUDA
     /* Cold GPU slots have no host backing. Restore all demoted experts in
      * parallel first; serial 20 MB reads made a 32-slot adaptation pass cost
