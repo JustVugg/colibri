@@ -240,15 +240,20 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         effort = "High" if reasoning_effort == "high" else "Max"
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
-        decl = ["<|system|>Available tools. To call a tool, emit exactly:",
-                "<tool_call>{function-name}<arg_key>{arg-key}</arg_key>"
-                "<arg_value>{arg-value}</arg_value></tool_call>"]
+        # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
+        # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
+        # preamble makes it hallucinate other frameworks' syntax (e.g. `end_action`).
+        prompt.append("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the "
+                      "user query.\n\nYou are provided with function signatures within <tools></tools> "
+                      "XML tags:\n<tools>\n")
         for tool in tools:
             fn = tool.get("function", tool) if isinstance(tool, dict) else {}
-            clean = {"name": fn.get("name"), "description": fn.get("description", ""),
-                     "parameters": fn.get("parameters", {})}
-            decl.append(json.dumps(clean, ensure_ascii=False))
-        prompt.append("\n".join(decl))
+            clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+            prompt.append(json.dumps(clean, ensure_ascii=False) + "\n")
+        prompt.append("</tools>\n\nFor each function call, output the function name and arguments "
+                      "within the following XML format:\n<tool_call>{function-name}"
+                      "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+                      "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
     prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
