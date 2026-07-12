@@ -14,7 +14,7 @@ ifneq ($(OMPDIR),)
 OMPC    = -Xclang -fopenmp -I$(OMPDIR)/include
 OMPL    = -L$(OMPDIR)/lib -lomp
 else
-$(warning libomp non trovato: build SINGLE-THREAD. Per il multithread: brew install libomp)
+$(warning libomp not found: building single-threaded. For multithreading: brew install libomp)
 OMPC    =
 OMPL    =
 endif

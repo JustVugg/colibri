@@ -11,8 +11,8 @@ from pathlib import Path
 
 SPEED_RE = re.compile(r"REPLAY decode:.*\| ([0-9.]+) tok/s")
 PROFILE_RE = re.compile(
-    r"PROFILO: expert-disk ([0-9.]+)s \| expert-matmul ([0-9.]+)s "
-    r"\| attention ([0-9.]+)s .* lm_head ([0-9.]+)s \| altro ([0-9.-]+)s"
+    r"PROFILE: expert-disk ([0-9.]+)s \| expert-matmul ([0-9.]+)s "
+    r"\| attention ([0-9.]+)s .* lm_head ([0-9.]+)s \| other ([0-9.-]+)s"
 )
 PROFILE_KEYS = ("disk", "expert_matmul", "attention", "lm_head", "other")
 

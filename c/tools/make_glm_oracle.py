@@ -53,7 +53,7 @@ with torch.no_grad():
             layer.mlp.gate.e_score_correction_bias.copy_(
                 torch.linspace(-0.1, 0.1, cfg.n_routed_experts))
 
-print("=== tensori dello state_dict (nomi per il loader C) ===")
+print("=== state_dict tensors (names used by the C loader) ===")
 for n, p in model.state_dict().items():
     print(f"  {n:60s} {tuple(p.shape)}")
 
@@ -76,4 +76,4 @@ print("tf_pred:", tf_pred)
 model.save_pretrained("glm_tiny", safe_serialization=True)
 json.dump(cfg.to_dict(), open("glm_tiny/config.json", "w"))
 json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred}, open("ref_glm.json", "w"))
-print("\nsalvato: glm_tiny/ (pesi+config) e ref_glm.json")
+print("\nsaved: glm_tiny/ (weights + config) and ref_glm.json")

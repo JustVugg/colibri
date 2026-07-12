@@ -139,11 +139,12 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mtp", action="store_true",
-        help="scarica/converte SOLO la testa MTP (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
+        help="download and convert ONLY the MTP head (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
     ap.add_argument("--indexer", action="store_true",
-        help="estrae SOLO i pesi del DSA lightning indexer -> out-idx-*.safetensors. ATTENZIONE: "
-             "i tensori indexer sono sparsi su ~tutti gli shard: ri-scarica l'intero repo (~756 GB "
-             "di traffico) per tenerne pochi GB. Resumabile shard per shard. Consigliato --ebits 8.")
+        help="extract ONLY the DSA lightning-indexer weights -> out-idx-*.safetensors. WARNING: "
+             "indexer tensors are spread across nearly every shard, so this re-downloads the whole "
+             "repository (~756 GB of traffic) to retain only a few GB. Resumable per shard. "
+             "Recommended: --ebits 8.")
     a = ap.parse_args()
     if a.ebits is None:
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
@@ -163,8 +164,8 @@ def main():
         q = (w / sc.repeat_interleave(bs,0).repeat_interleave(bs,1)).to(torch.float8_e4m3fn)
         deq = (q.to(torch.float32) * sc.repeat_interleave(bs,0).repeat_interleave(bs,1))
         rel = (deq - w).abs().mean() / w.abs().mean()
-        print(f"[selftest fp8 block-dequant] errore relativo medio = {rel:.4f}  "
-              f"({'OK' if rel < 0.05 else 'ALTO'})")
+        print(f"[selftest fp8 block-dequant] mean relative error = {rel:.4f}  "
+              f"({'OK' if rel < 0.05 else 'HIGH'})")
         return
 
     os.makedirs(a.outdir, exist_ok=True)
@@ -178,7 +179,7 @@ def main():
         for fn in ["config.json"]:
             src = os.path.join(a.indir, fn)
             if os.path.exists(src): shutil.copy(src, a.outdir)
-        print(f"convertito {len(shards)} shard -> {a.outdir}")
+        print(f"converted {len(shards)} shards -> {a.outdir}")
         return
 
     # reale: scarica shard per shard, converte, cancella
@@ -211,7 +212,7 @@ def main():
     lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
     try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("ERRORE: un altro convertitore sta gia' lavorando su questa outdir. Esco."); return
+        print("ERROR: another converter is already using this output directory. Exiting."); return
 
     # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
     # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
@@ -280,13 +281,13 @@ def main():
                 except Exception as ex:
                     with log_lock:
                         nres[0] += 1
-                        print(f"    [dl] s{t}: {type(ex).__name__} a/at {(s0+done[t])/1e9:.2f} GB: "
-                              f"riprendo/resuming (#{nres[0]})", flush=True)
+                        print(f"    [dl] s{t}: {type(ex).__name__} at {(s0+done[t])/1e9:.2f} GB: "
+                              f"resuming (#{nres[0]})", flush=True)
                     _t.sleep(min(15, 1 + nres[0] // NS))
         th = [threading.Thread(target=worker, args=(t,), daemon=True) for t in range(NS)]
         for x in th: x.start()
-        print(f"    [dl {_t.strftime('%H:%M:%S')}] connesso/connected: {NS} stream, "
-              f"{sum(done)/1e9:.2f} di/of {expected/1e9:.2f} GB", flush=True)
+        print(f"    [dl {_t.strftime('%H:%M:%S')}] connected: {NS} streams, "
+              f"{sum(done)/1e9:.2f} of {expected/1e9:.2f} GB", flush=True)
         mark = sum(done); tmark = t0
         while any(x.is_alive() for x in th):
             _t.sleep(5)
@@ -309,7 +310,7 @@ def main():
         os.replace(part, out)
         dt = max(_t.time() - t0, 1e-9)
         print(f"    [dl] {fn}: {expected/1e9:.2f} GB in {dt/60:.1f} min "
-              f"({expected/dt/1e6:.1f} MB/s medi/avg, {NS} stream, {nres[0]} riprese/resumes)", flush=True)
+              f"({expected/dt/1e6:.1f} MB/s avg, {NS} streams, {nres[0]} resumes)", flush=True)
         return out
 
     def _download_single(url, fn, out, part, expected):
@@ -335,9 +336,9 @@ def main():
                         cl = r.headers.get("Content-Length")
                         if cl: expected = have + int(cl)
                     if have == 0 or nres:                 # segnale di vita subito / immediate sign of life
-                        print(f"    [dl {_t.strftime('%H:%M:%S')}] connesso/connected"
+                        print(f"    [dl {_t.strftime('%H:%M:%S')}] connected"
                               f"{f' @ {have/1e9:.2f} GB' if have else ''}"
-                              f"{f' di/of {expected/1e9:.2f} GB' if expected else ''}", flush=True)
+                              f"{f' of {expected/1e9:.2f} GB' if expected else ''}", flush=True)
                     with open(part, "ab" if have else "wb") as f:
                         if not have: f.truncate(0)
                         while True:
@@ -357,16 +358,16 @@ def main():
             except urllib.error.HTTPError as ex:
                 if ex.code == 416: break                  # gia' completo / already complete
                 nres += 1
-                print(f"    [dl] HTTP {ex.code} a/at {have/1e9:.2f} GB: riprendo/resuming (#{nres})", flush=True)
+                print(f"    [dl] HTTP {ex.code} at {have/1e9:.2f} GB: resuming (#{nres})", flush=True)
                 _t.sleep(min(15, 1 + nres))
             except Exception as ex:
                 nres += 1
-                print(f"    [dl] {type(ex).__name__} a/at {have/1e9:.2f} GB: riprendo/resuming (#{nres})", flush=True)
+                print(f"    [dl] {type(ex).__name__} at {have/1e9:.2f} GB: resuming (#{nres})", flush=True)
                 _t.sleep(min(15, 1 + nres))
         os.replace(part, out)
         dt = max(_t.time() - t0, 1e-9); sz = os.path.getsize(out)
         print(f"    [dl] {fn}: {sz/1e9:.2f} GB in {dt/60:.1f} min "
-              f"({sz/dt/1e6:.1f} MB/s medi/avg, {nres} riprese/resumes)", flush=True)
+              f"({sz/dt/1e6:.1f} MB/s avg, {nres} resumes)", flush=True)
         return out
 
     from safetensors.numpy import save_file
@@ -380,7 +381,7 @@ def main():
             break
         except KeyboardInterrupt: raise
         except Exception as ex:
-            w = min(60, 5*(att+1)); print(f"repo_info KO ({type(ex).__name__}): riprovo tra {w}s", flush=True); _t.sleep(w)
+            w = min(60, 5*(att+1)); print(f"repo_info failed ({type(ex).__name__}); retrying in {w}s", flush=True); _t.sleep(w)
     shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
     for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
@@ -392,19 +393,19 @@ def main():
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
         pref = f"model.layers.{a.n_layers}."
         mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
-        print(f"[MTP] testa nel layer {a.n_layers}: {len(mtp_shards)} shard da processare: {mtp_shards}")
+        print(f"[MTP] head at layer {a.n_layers}: {len(mtp_shards)} shards to process: {mtp_shards}")
         for i, sh in enumerate(mtp_shards):
             outp = os.path.join(a.outdir, f"out-mtp-{i:05d}.safetensors")
-            if os.path.exists(outp): print(f"[MTP] {outp} gia' fatto"); continue
-            print(f"[MTP {i+1}/{len(mtp_shards)}] scarico {sh}...", flush=True)
+            if os.path.exists(outp): print(f"[MTP] {outp} already done"); continue
+            print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True)
             save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
-            print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensori)", flush=True)
-        shutil.rmtree(tmp, ignore_errors=True); print("[MTP] FATTO."); return
+            print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensors)", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True); print("[MTP] DONE."); return
     if a.indexer:
         import urllib.request
         idx = json.loads(urllib.request.urlopen(
@@ -412,25 +413,25 @@ def main():
         idx_shards = sorted(set(v for k, v in idx.items()
                                 if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
         tot_gb = len(idx_shards) * 5.4
-        print(f"[IDX] pesi indexer su {len(idx_shards)} shard (~{tot_gb:.0f} GB di download totale, resumabile)")
+        print(f"[IDX] indexer weights across {len(idx_shards)} shards (~{tot_gb:.0f} GB total download, resumable)")
         for i, sh in enumerate(idx_shards):
             outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
             if os.path.exists(outp): continue             # gia' fatto -> ripartibile
-            print(f"[IDX {i+1}/{len(idx_shards)}] scarico {sh}...", flush=True)
+            print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
             if out: save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
-            print(f"    -> {os.path.basename(outp)} ({len(out)} tensori)", flush=True)
-        shutil.rmtree(tmp, ignore_errors=True); print("[IDX] FATTO."); return
+            print(f"    -> {os.path.basename(outp)} ({len(out)} tensors)", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True); print("[IDX] DONE."); return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
-            print(f"STOP: spazio libero < {a.min_free_gb} GB. Libera spazio e rilancia (riprende)."); break
+            print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
         outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
-        print(f"[{i+1}/{len(shards)}] scarico {sh} (libero {free_gb(a.outdir):.0f} GB)...", flush=True)
+        print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
         save_file(out, outp)
@@ -439,7 +440,7 @@ def main():
             if os.path.isfile(blob): os.remove(blob)
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
     shutil.rmtree(tmp, ignore_errors=True)
-    print("FATTO." if i == len(shards)-1 else "INTERROTTO (rilancia per riprendere).")
+    print("DONE." if i == len(shards)-1 else "INTERRUPTED (rerun to resume).")
 
 if __name__ == "__main__":
     main()

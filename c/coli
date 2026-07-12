@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-colibrì — piccolo motore, modello immenso.
-CLI per far girare GLM-5.2 (744B) in locale, su CPU, in ~15-26 GB di RAM.
+colibrì — tiny engine, immense model.
+Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
-  coli chat                 chat interattiva (carica il modello UNA volta)
-  coli serve                API HTTP compatibile OpenAI (motore persistente)
-  coli run "prompt"         generazione singola
-  coli info                 stato: modello, RAM, disco, config
-  coli plan                 piano risorse Disk / RAM / VRAM
-  coli doctor               diagnosi installazione e piano di esecuzione
-  coli bench [task...]      benchmark di qualità (MMLU/HellaSwag/...)
-  coli convert              converte GLM-5.2-FP8 -> int4 (streaming)
-  coli build                compila il motore
+  coli chat                 interactive chat (loads the model once)
+  coli serve                OpenAI-compatible HTTP API (persistent engine)
+  coli run "prompt"         one-shot generation
+  coli info                 model, RAM, disk, and configuration status
+  coli plan                 Disk / RAM / VRAM resource plan
+  coli doctor               installation and execution-plan diagnostics
+  coli bench [task...]      quality benchmarks (MMLU/HellaSwag/...)
+  coli convert              convert GLM-5.2-FP8 to int4, one shard at a time
+  coli build                build the engine
 
-Config via env o flag (validi anche dopo il sottocomando):
-  COLI_MODEL=<dir>   modello (default /home/vincenzo/glm52_i4)
-  --ram N            budget RAM in GB (auto-cap cache expert)
-  --repin N          adatta gli expert RAM/VRAM ogni N token
-  --topp P           top-p adattivo sugli expert     --topk N   top-k fisso
-  --ngen N           token massimi per risposta      --cap N    slot cache/layer
+Configuration through environment variables or flags (also valid after the subcommand):
+  COLI_MODEL=<dir>   model directory (default /home/vincenzo/glm52_i4)
+  --ram N            RAM budget in GB (automatically sizes the expert cache)
+  --repin N          adapt RAM/VRAM experts every N tokens
+  --topp P           adaptive expert top-p             --topk N   fixed top-k
+  --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
@@ -82,7 +82,7 @@ def banner(sub=""):
     sp=sprite_lines()
     txt=[
         f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
-        f"{C.dim}piccolo motore, modello immenso{C.r}",
+        f"{C.dim}tiny engine, immense model{C.r}",
         f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
         "",
@@ -100,11 +100,11 @@ def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 
 def need_model(model):
     if not os.path.isdir(model):
-        sys.exit(f"{C.yel}modello non trovato:{C.r} {model}\n  imposta COLI_MODEL o usa --model")
+        sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
     if not os.path.exists(os.path.join(model,"tokenizer.json")):
-        sys.exit(f"{C.yel}manca tokenizer.json in {model}{C.r}")
+        sys.exit(f"{C.yel}tokenizer.json is missing from {model}{C.r}")
     if not os.path.exists(GLM):
-        sys.exit(f"{C.yel}motore non compilato.{C.r} Esegui:  coli build")
+        sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
 def cuda_binary():
     if not os.path.exists(GLM) or sys.platform != "linux": return False
@@ -149,7 +149,7 @@ def env_for(a):
             ram,ctx,devices,vram=resource_request(a,e)
             plan=build_plan(a.model,ram,ctx,devices,vram)
         except (OSError,ValueError,json.JSONDecodeError) as error:
-            sys.exit(f"{C.yel}piano risorse non valido:{C.r} {error}")
+            sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
         e=environment_for_plan(plan,e,has_cuda)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
@@ -292,26 +292,26 @@ def cmd_info(a):
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
-        row("modello", a.model)
+        row("model", a.model)
         row("arch", f"hidden {c.get('hidden_size')} · {c.get('num_hidden_layers')} layer · "
                     f"{c.get('n_routed_experts')} expert/layer · top-{c.get('num_experts_per_tok')}")
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
-        row("shard", f"{len(sts)} file · {sz/1e9:.0f} GB su disco")
+        row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
     else:
-        print(f"   {C.yel}config.json non presente (conversione incompleta?){C.r}")
+        print(f"   {C.yel}config.json is missing (incomplete conversion?){C.r}")
     try:
         mi=open('/proc/meminfo').read()
         tot=int(re.search(r'MemTotal:\s+(\d+)',mi).group(1))/1e6
         av=int(re.search(r'MemAvailable:\s+(\d+)',mi).group(1))/1e6
-        row("RAM", f"{tot:.0f} GB totali · {av:.1f} GB disponibili")
+        row("RAM", f"{tot:.0f} GB total · {av:.1f} GB available")
     except Exception: pass
     try:
         fs = shutil.disk_usage(a.model if os.path.isdir(a.model) else HERE)
-        row("disco", f"{fs.free/1e9:.0f} GB liberi")
+        row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
-        row("disco", "? GB (non disponibile)")
-    row("motore", "pronto ✓" if os.path.exists(GLM) else "da compilare (coli build)")
+        row("disk", "? GB (unavailable)")
+    row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -323,11 +323,11 @@ def cmd_plan(a):
     from resource_plan import build_plan, format_plan
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
-        if ctx<1: raise ValueError("--ctx deve essere positivo")
-        if a.vram<0: raise ValueError("--vram non puo essere negativo")
+        if ctx<1: raise ValueError("--ctx must be positive")
+        if a.vram<0: raise ValueError("--vram cannot be negative")
         plan=build_plan(a.model,ram,ctx,devices,vram)
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        sys.exit(f"{C.yel}impossibile creare il piano:{C.r} {error}")
+        sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
         print(json.dumps(plan,indent=2))
         return
@@ -339,9 +339,9 @@ def cmd_doctor(a):
     from doctor import exit_code, format_doctor, run_doctor
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
-        if ctx<1: raise ValueError("--ctx deve essere positivo")
-        if ram<0: raise ValueError("--ram non puo essere negativo")
-        if vram<0: raise ValueError("--vram non puo essere negativo")
+        if ctx<1: raise ValueError("--ctx must be positive")
+        if ram<0: raise ValueError("--ram cannot be negative")
+        if vram<0: raise ValueError("--vram cannot be negative")
     except ValueError as error:
         report={"schema_version":1,"status":"error","model":os.path.abspath(a.model),
                 "checks":[{"id":"config.arguments","status":"fail","summary":str(error)}],
@@ -354,7 +354,7 @@ def cmd_doctor(a):
 
 def cmd_run(a):
     need_model(a.model)
-    prompt=" ".join(a.prompt) if a.prompt else sys.exit('uso: coli run "il tuo prompt"')
+    prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink)
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
@@ -367,24 +367,24 @@ def cmd_chat(a):
     e=env_for(a); e["SERVE"]="1"
     p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=errlog, bufsize=0)
-    sp=Spinner("sveglio il gigante (744B)…"); sp.start()
+    sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
-        errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("il motore è uscito durante il load")
+        errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
     errlog.flush()
     try:
         elog=open(errlog.name).read()
-        mload=re.search(r"caricato in ([0-9.]+)s \| densa residente: ([0-9.]+) MB", elog)
-        if mload: print(f"  {C.grn}✓{C.r} pronto in {mload.group(1)}s {C.dim}· residente {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
+        mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
+        if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
             if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
-                l=re.sub(r" da$| in$","",l)
+                l=re.sub(r" from$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
                     print(f"  {C.dgray}{chunk}{C.r}")
     except Exception: pass
-    print(f"  {C.dim}scrivi e premi invio · :piu continua risposta · :reset memoria · :q esci{C.r}\n")
+    print(f"  {C.dim}type and press Enter · :more continues · :reset clears memory · :q exits{C.r}\n")
     w=term_w()-4
     def user_box(msg):
         """ri-disegna il messaggio dentro una box che si ADATTA su piu' righe:
@@ -415,7 +415,7 @@ def cmd_chat(a):
             if msg==":reset":
                 p.stdin.write(b"\x02RESET\n"); p.stdin.flush()
                 stream_turn(p, END, lambda b: None)
-                print(f"  {C.dim}✦ memoria azzerata{C.r}\n"); continue
+                print(f"  {C.dim}✦ memory cleared{C.r}\n"); continue
             if msg in (":piu",":più",":more",":continua"):
                 p.stdin.write(b"\x02MORE\n"); p.stdin.flush()
             else:
@@ -430,7 +430,7 @@ def cmd_chat(a):
                     pl=[l for l in tail.splitlines() if l.startswith("[prefill]")]
                     return pl[-1].replace("[prefill] ","prefill ") if pl else ""
                 except Exception: return ""
-            sp2=Spinner("pensa…", tick=prefill_tick); sp2.start()
+            sp2=Spinner("thinking…", tick=prefill_tick); sp2.start()
             md=MDStream("  ")            # markdown -> terminale, in streaming
             raw=os.environ.get("COLI_RAW")=="1"
             def echo(bs, _dec=dec, _st=state):
@@ -445,23 +445,23 @@ def cmd_chat(a):
             st=stream_turn(p, END, echo)
             if not raw: md.close()
             sp2.stop()
-            if st is None: print(f"\n  {C.yel}[motore terminato]{C.r}"); break
+            if st is None: print(f"\n  {C.yel}[engine terminated]{C.r}"); break
             el=time.time()-t0
             if st.get("tok"):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
                 if st["tok"]>=a.ngen:
-                    print(f"  {C.yel}…troncato al limite --ngen ({a.ngen}): scrivi :piu per far continuare la risposta{C.r}")
+                    print(f"  {C.yel}…stopped at --ngen ({a.ngen}); type :more to continue the response{C.r}")
                 print()
             else:
                 print()
     except KeyboardInterrupt:
-        print(f"\n  {C.dim}interrotto{C.r}")
+        print(f"\n  {C.dim}interrupted{C.r}")
     finally:
         try: p.stdin.close(); p.terminate()
         except Exception: pass
         try: os.unlink(errlog.name)
         except Exception: pass
-    print(f"  {C.teal}ciao{C.r} {C.dim}— il colibrì torna al nido{C.r} 🐦\n")
+    print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
 def cmd_serve(a):
     need_model(a.model)
@@ -480,14 +480,14 @@ def cmd_bench(a):
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
     missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
     if missing:
-        print(f"  {C.dim}scarico i dataset mancanti: {', '.join(missing)}{C.r}")
+        print(f"  {C.dim}downloading missing datasets: {', '.join(missing)}{C.r}")
         subprocess.call([py, os.path.join(TOOLS,"fetch_benchmarks.py"),
                          "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
     cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
     e=env_for(a)
-    print(f"  {C.dim}decode disk-bound: su hardware lento questo richiede ORE. Alza --limit su macchine veloci.{C.r}\n")
+    print(f"  {C.dim}decode is disk-bound: this takes HOURS on slow hardware. Raise --limit on faster machines.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
 def cmd_convert(a):
@@ -499,34 +499,34 @@ def cmd_convert(a):
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
     if a.xbits: base+=["--xbits",str(a.xbits)]
     # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
-    print(f"  {C.dim}[1/2] modello: {' '.join(base)}{C.r}")
+    print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
     rc=subprocess.call(base)
     if rc!=0: sys.exit(rc)
     if a.no_mtp: sys.exit(0)
     # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
     # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
     mtp_cmd=list(base); i=mtp_cmd.index("--ebits"); mtp_cmd[i+1]=str(max(8,a.ebits))
-    print(f"  {C.dim}[2/2] testa MTP a int8 (draft speculativi){C.r}")
+    print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
 
 def main():
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
-    common.add_argument("--auto-tier",action="store_true",help="applica automaticamente il piano RAM/VRAM")
+    common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
     common.add_argument("--ctx",type=int,default=0)
-    common.add_argument("--gpu",default=None,help="auto, none oppure lista device, es. 0,1")
-    common.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
-    common.add_argument("--repin", type=int, default=0, help="adatta gli expert RAM/VRAM ogni N token")
+    common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
+    common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
+    common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
-    ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — GLM-5.2 in locale")
+    ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
     pd=sub.add_parser("doctor",parents=[common])
-    pd.add_argument("--json",action="store_true",help="emette un report JSON versionato")
+    pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
     sub.add_parser("chat", parents=[common])
     ps=sub.add_parser("serve", parents=[common])
@@ -541,7 +541,7 @@ def main():
     pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
-    pc.add_argument("--no-mtp",action="store_true",help="salta la testa MTP (niente draft speculativi)")
+    pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
