@@ -588,6 +588,17 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_cors_headers()
             self.end_headers()
             connected = True
+            # KEEPALIVE: engine.generate() blocks SILENTLY during the (minutes-long) cold
+            # prefill, and the client drops the socket after its idle timeout. A background pump
+            # emits a reasoning_content "." delta (the channel that reliably resets the client's
+            # timer and lands in the thinking panel, so answer content stays clean) whenever no
+            # event has been written for KA_GAP seconds. All wfile writes share ka_lock so the
+            # pump and event() never interleave; last_write gates the pump so it stays quiet
+            # while real tokens are flowing (e.g. during decode).
+            ka_lock = threading.Lock()
+            last_write = [time.time()]
+            ka_stop = threading.Event()
+            KA_GAP = 10.0
 
             def event(choices, usage_marker=False):
                 nonlocal connected
@@ -597,12 +608,23 @@ class APIHandler(BaseHTTPRequestHandler):
                               "model": self.server.model_id, "choices": choices}
                 if include_usage:
                     event_body["usage"] = None if not usage_marker else usage_marker
-                try:
-                    data = json.dumps(event_body, ensure_ascii=False, separators=(",", ":"))
-                    self.wfile.write(f"data: {data}\n\n".encode())
-                    self.wfile.flush()
-                except OSError:
-                    connected = False
+                data = json.dumps(event_body, ensure_ascii=False, separators=(",", ":"))
+                with ka_lock:
+                    try:
+                        self.wfile.write(f"data: {data}\n\n".encode())
+                        self.wfile.flush()
+                        last_write[0] = time.time()
+                    except OSError:
+                        connected = False
+
+            def _keepalive():
+                ping = [{"index": 0, "delta": ({"reasoning_content": "."} if chat else {"content": ""}),
+                         "logprobs": None, "finish_reason": None}]
+                while not ka_stop.wait(1.0):
+                    if not connected:
+                        return
+                    if time.time() - last_write[0] >= KA_GAP:
+                        event(ping)
 
             if chat:
                 event([{"index": 0, "delta": {"role": "assistant", "content": ""},
@@ -614,6 +636,8 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
+            ka_thread = threading.Thread(target=_keepalive, daemon=True)
+            ka_thread.start()
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -652,6 +676,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit, cache_slot)
                 finish = "length" if stats["length_limited"] else "stop"
+            ka_stop.set()                          # generation done: stop the keepalive pump
+            ka_thread.join(timeout=2)
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
                                           "finish_reason": finish})
