@@ -597,6 +597,20 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
     return 1;
 }
 
+extern "C" int coli_cuda_tensor_download(const ColiCudaTensor *tensor, void *weights, float *scales) {
+    if (!tensor || !weights) return 0;
+    DeviceContext *ctx = find_ctx(tensor->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaMemcpy(weights, tensor->weights, tensor->weight_bytes,
+                            cudaMemcpyDeviceToHost), "tensor download")) return 0;
+    if (tensor->fmt && tensor->scales) {
+        if (!scales) return 0;
+        if (!cuda_ok(cudaMemcpy(scales, tensor->scales, (size_t)tensor->O * sizeof(float),
+                                cudaMemcpyDeviceToHost), "scale download")) return 0;
+    }
+    return 1;
+}
+
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (!tensor) return;
     DeviceContext *ctx = find_ctx(tensor->device);

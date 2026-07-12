@@ -1210,6 +1210,43 @@ static void expert_host_release(Model *m, ESlot *s){
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
     if(!s->slab) expert_load(m,layer,s->eid,s);
 }
+/* Weight bytes of one quantized proj (no scales), matching the CUDA backend row layout. */
+static int64_t qt_weight_bytes(const QT *t){
+    int64_t rb = t->fmt==0 ? (int64_t)t->I*4
+               : t->fmt==1 ? (int64_t)t->I
+               : t->fmt==3 ? (int64_t)((t->I+3)/4)
+                           : (int64_t)((t->I+1)/2);
+    return rb*(int64_t)t->O;
+}
+/* Restore a demoted expert's host backing. If it is still VRAM-resident, copy the
+ * quantized weights + scales device->host into a fresh slab (no disk); the caller
+ * (repin tier swap) then repurposes the VRAM tensor for the promoted expert. Falls
+ * back to a disk reload if the tensor is absent or the download fails. */
+static void expert_host_restore(Model *m, int layer, ESlot *s){
+    if(s->slab) return;
+#ifdef COLI_CUDA
+    if(s->g.cuda && s->u.cuda && s->d.cuda){
+        QT *qt[3]={&s->g,&s->u,&s->d};
+        int64_t wb[3], wtot=0, ftot=0;
+        for(int k=0;k<3;k++){ wb[k]=qt_weight_bytes(qt[k]); wtot+=wb[k]; if(qt[k]->fmt) ftot+=qt[k]->O; }
+        uint8_t *slab=NULL;
+        if(!posix_memalign((void**)&slab,4096,(size_t)wtot+8192)){
+            float *fslab = ftot? falloc(ftot) : NULL;
+            int64_t wo=0, fo=0, ok=1;
+            for(int k=0;k<3 && ok;k++){
+                float *sc = qt[k]->fmt ? fslab+fo : NULL;
+                if(!coli_cuda_tensor_download(qt[k]->cuda, slab+wo, sc)){ ok=0; break; }
+                qt[k]->qf = qt[k]->fmt? NULL : (float*)(slab+wo);
+                qt[k]->q8 = (int8_t*)(slab+wo); qt[k]->q4 = slab+wo; qt[k]->s = sc;
+                wo+=wb[k]; if(qt[k]->fmt) fo+=qt[k]->O;
+            }
+            if(ok){ s->slab=slab; s->slab_cap=(int64_t)wtot+8192; s->fslab=fslab; s->fslab_cap=ftot; return; }
+            compat_aligned_free(slab); free(fslab);
+        }
+    }
+#endif
+    expert_load(m,layer,s->eid,s);   /* fallback: disk */
+}
 #endif
 
 typedef struct {
@@ -2419,7 +2456,7 @@ static void repin_pass_limit(Model *m,int limit){
     #pragma omp parallel for schedule(dynamic,1)
     for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
-        expert_host_ensure(m,cd[b].l,s);
+        expert_host_restore(m,cd[b].l,s);   /* disk-free device->host when still VRAM-resident */
     }
     for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];

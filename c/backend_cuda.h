@@ -59,6 +59,10 @@ int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                const float *latent,const float *rope,int H,int Q,
                                int R,int V,int K,int T,float attention_scale);
 
+/* Copy a resident tensor device->host: weights (weight_bytes) and, when fmt!=0,
+ * O row scales. Lets a VRAM expert return to RAM without re-reading disk. */
+int coli_cuda_tensor_download(const ColiCudaTensor *tensor, void *weights, float *scales);
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
