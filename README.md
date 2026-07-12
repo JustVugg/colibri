@@ -4,6 +4,11 @@
 
 **Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
 
+Colibrì is a lightweight, quality-preserving MoE runtime that treats VRAM,
+RAM, and storage as one managed memory hierarchy. Insufficient fast memory may
+reduce speed, but the default policy never silently changes model precision or
+router semantics.
+
 ```
 $ ./coli chat
   🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
@@ -258,9 +263,13 @@ cross-compiling. Requesting CUDA with a CPU-only binary, an invalid device, or
 an unavailable runtime fails at startup instead of silently falling back.
 
 The normal `make` build and runtime behavior are unchanged. CUDA defaults to an
-expert-only accelerator: resident dense/attention tensors stay on CPU because
-fixture measurements show that moving them does not help while expert I/O is
-the bottleneck. `CUDA_DENSE=1` keeps the earlier all-resident experimental path.
+expert-only accelerator. `CUDA_DENSE=1` additionally distributes resident
+dense/attention projection tensors round-robin across the selected devices;
+their projected footprint is reserved before the expert tier is placed. On six
+RTX 5090s with a 150 GB expert tier, a warmed two-request/64-token GLM-5.2 run
+improved from 1.650 to 2.157 aggregate tok/s (+30.8%) while retaining the full
+expert tier. Treat this as an opt-in until the projected dense set and the 2 GB
+per-device runtime reserve fit the target GPUs.
 A measured `PIN` profile can promote its hottest experts into the persistent
 VRAM tier while keeping the rest in RAM:
 
@@ -268,9 +277,14 @@ VRAM tier while keeping the rest in RAM:
 STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
 PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
-# multi-GPU expert tier, 96 GB total budget across six devices
-COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=96 \
-PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# multi-GPU expert tier, 150 GB total budget across six 32 GB devices
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
+CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
+CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -278,14 +292,54 @@ inference and the log reports their exact tensor footprint. The budget is clampe
 against free VRAM after reserving the projected dense resident set and 2 GB of
 runtime headroom per selected device. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
 total budget across the device set; experts are assigned whole to the
-least-loaded device that can hold them. A NUMA-local RAM backing store is not
-implemented yet.
+least-loaded device that can hold them. Multi-GPU runs also default to
+`PIN_FILL=1`: the measured hot set is placed first, then unused VRAM is filled
+with zero-heat experts. `CUDA_RELEASE_HOST=1` (the multi-GPU default) releases
+the RAM copy after a successful upload and reloads it from disk only if CUDA
+later fails. Set either variable to `0` to restore the conservative behavior.
+When host backing is released, placement is disjoint and staged: the hottest
+prefix is loaded, uploaded to VRAM, and freed before the next-ranked suffix is
+loaded into RAM. `PIN_GB` therefore describes the combined ranked set rather
+than duplicate RAM and VRAM copies. On a 256 GB dual-socket host, moving from a
+150 GB VRAM + 130 GB RAM placement to 150 GB VRAM + 150 GB RAM raised fixed-token
+replay from 1.87 to 2.16 tok/s (+15.7%), reduced expert disk wait from 5.144s to
+3.948s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
+down automatically (54 to 40 in that run) so the larger pinned tier does not exceed
+the process budget. Start lower on hosts with less available RAM.
+
+`CUDA_EXPERT_GB=auto` fills each selected device only up to its measured free
+memory minus projected dense tensors and 2 GB of runtime headroom. `PIN_GB=all`
+then loads every remaining routed expert into RAM, eliminating decode-time disk
+misses when the host budget permits it. The regular `RAM_GB` guard still clamps
+the per-layer working cache and rejects unsafe projections; this mode is intended
+for dedicated high-memory inference hosts, not desktops running other workloads.
+On a dedicated 251 GiB host with six RTX 5090s, this mode selected a 176.7 GB
+VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). The
+mode also adapts the VRAM tier every 16 emitted tokens by swapping hot RAM
+experts into existing GPU slots. A real 64-token greedy GLM-5.2 generation
+measured **6.00 tok/s decode**, up from
+2.20 tok/s end-to-end with the earlier 150 GB tier; expert hit rate was 100%
+and disk wait was zero. Prompt prefill is reported separately. This is a
+host-specific capacity result, not a portable default.
+
+Text-mode timing reports prefill separately from decode. The decode rate starts
+after the prompt KV is built, so it is comparable to `REPLAY` throughput without
+hiding time-to-first-token.
+MTP speculation defaults off on CUDA because cold draft routes increase expert
+traffic; an explicit `DRAFT=n` still overrides the default.
+
+On six RTX 5090 32 GB cards with GLM-5.2 int4, a 150 GB hot-first tier sustained
+0.94 token/s over a 64-token varied prompt (87.8% expert hit rate), and reached
+1.64 token/s on a warmed short prompt (99.3% hit rate). The same capacity filled
+without routing heat managed only 0.29 token/s, so profile quality matters more
+than raw VRAM capacity. These are single-run engineering measurements, not a
+portable performance guarantee.
 
 Current limitations: devices use independent contexts and synchronous
-host-staged activation copies—there is no P2P/NCCL dependency yet. The kernels
-are correctness-first custom kernels rather than cuBLAS/Tensor Core kernels.
-This draft intentionally makes no end-to-end speedup claim before the full model
-is benchmarked.
+host-staged activation copies—there is no P2P/NCCL dependency yet. Independent
+expert groups execute concurrently across devices, but a single expert is not
+sharded. The kernels are correctness-first custom kernels rather than
+cuBLAS/Tensor Core kernels.
 
 For a reproducible backend A/B without the full checkpoint, generate the
 deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:
@@ -316,6 +370,49 @@ compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+
+### Resource policy
+
+`coli plan` reports the planned hot (VRAM), warm (RAM), and cold backing
+(disk) tiers, the reason for each placement, and the expected bottleneck. The
+default `--policy quality` and `--policy balanced` modes preserve checkpoint
+quantization and router decisions unless `--topk` or `--topp` is passed; those
+explicit lossy overrides print a warning and proceed.
+
+Auto-tier plans size OpenMP from physical cores and bind workers across cores.
+Memory-bound quantized kernels can regress sharply when SMT siblings compete
+for limited memory channels; explicit `OMP_*` settings always take precedence.
+
+```bash
+coli plan --model /models/glm52_i4 --policy quality
+coli run --auto-tier --policy quality "Explain MoE offloading"
+# Explicit research-only router reduction:
+coli run --policy experimental-fast --topk 4 "Benchmark prompt"
+```
+
+Disk is an immutable recovery source, not a normal decode target. If the plan
+leaves cold expert bytes on disk, speed depends on cache hit rate; output
+quality does not.
+
+Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
+while missing experts are loaded in a bounded background I/O pool, then the
+cold results join before the layer completes. `IO_THREADS=n` overrides the
+default eight loader threads when foreground work exists. Profiling reports
+both disk service time and the smaller foreground-visible wait time so overlap
+is explicit rather than credited as unexplained speedup.
+
+`--policy balanced` enables lossless live placement (`REPIN=64`). At safe
+request boundaries, a per-layer LFRU score combines decaying session frequency
+with recent access and replaces at most four sufficiently colder pinned
+experts. `--policy quality` leaves live replacement off by default; `REPIN=0`
+always disables it. Persistent `.coli_usage` history and session-local LFRU
+state remain separate.
+
+For single-token q4 CPU experts, gate and up projections share one OpenMP
+dispatch while retaining the same per-row AVX2/NEON arithmetic. This removes
+one thread-team launch per RAM expert without activation requantization or a
+lower-precision fallback. It is a stepping stone toward a persistent native
+CPU expert pool, not a replacement for one.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 

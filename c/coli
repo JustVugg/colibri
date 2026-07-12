@@ -127,6 +127,7 @@ def resource_request(a, env):
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -147,7 +148,7 @@ def env_for(a):
         if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -325,7 +326,7 @@ def cmd_plan(a):
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -516,6 +517,9 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
+    common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
+                        default=os.environ.get("COLI_POLICY","quality"),
+                        help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
