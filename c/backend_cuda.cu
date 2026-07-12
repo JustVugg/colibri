@@ -1,7 +1,42 @@
 #include "backend_cuda.h"
 
+#ifdef COLI_HIP
+/* asgard/AMD ROCm build: compile this CUDA backend under HIP by aliasing the
+   small runtime surface it uses. One source, dual target (nvcc or hipcc). */
+#include <hip/hip_runtime.h>
+#define cudaError_t             hipError_t
+#define cudaSuccess             hipSuccess
+#define cudaGetErrorString      hipGetErrorString
+#define cudaGetLastError        hipGetLastError
+#define cudaSetDevice           hipSetDevice
+#define cudaGetDeviceCount      hipGetDeviceCount
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaDeviceProp          hipDeviceProp_t
+#define cudaMalloc              hipMalloc
+#define cudaFree                hipFree
+#define cudaMemcpy              hipMemcpy
+#define cudaMemcpyHostToDevice  hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost  hipMemcpyDeviceToHost
+#define cudaMemGetInfo          hipMemGetInfo
+#define cudaMemcpyAsync         hipMemcpyAsync
+#define cudaMemsetAsync         hipMemsetAsync
+#define cudaStream_t            hipStream_t
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamDestroy       hipStreamDestroy
+#define cudaStreamSynchronize   hipStreamSynchronize
+#define cudaStreamNonBlocking   hipStreamNonBlocking
+#define cudaMallocHost          hipHostMalloc
+#define cudaFreeHost            hipHostFree
+#define cudaEvent_t             hipEvent_t
+#define cudaEventCreate         hipEventCreate
+#define cudaEventDestroy        hipEventDestroy
+#define cudaEventRecord         hipEventRecord
+#define cudaEventSynchronize    hipEventSynchronize
+#define cudaEventElapsedTime    hipEventElapsedTime
+#else
 #include <cuda_runtime.h>
 #include <mma.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -486,6 +521,9 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
+#ifdef COLI_HIP
+    tc=0;   /* nvcuda::wmma s4 tensor cores are NVIDIA-only; gfx1100 uses the packed int4 path */
+#endif
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;

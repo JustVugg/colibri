@@ -25,7 +25,8 @@ def cuda_linkage(engine_path):
                                 timeout=3, check=False)
     except (OSError, subprocess.SubprocessError):
         return {"linked": False, "missing": False}
-    lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
+    lines = [line for line in result.stdout.splitlines()
+             if ("libcudart" in line or "libamdhip64" in line)]
     return {"linked": any("not found" not in line for line in lines),
             "missing": any("not found" in line for line in lines)}
 
