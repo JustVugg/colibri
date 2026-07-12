@@ -228,16 +228,16 @@ static float *falloc(int64_t n){
 static int g_i4_acc512=1;
 static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
     const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
-    __m512 acc=_mm512_setzero_ps(); int i=0;
+    __m512 acc0=_mm512_setzero_ps(),acc1=_mm512_setzero_ps(); int i=0;
     for(;i+32<=I;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
         __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
         __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
         __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
         __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
-        acc=_mm512_fmadd_ps(_mm512_loadu_ps(x+i),w0,acc);
-        acc=_mm512_fmadd_ps(_mm512_loadu_ps(x+i+16),w1,acc);
+        acc0=_mm512_fmadd_ps(_mm512_loadu_ps(x+i),w0,acc0);
+        acc1=_mm512_fmadd_ps(_mm512_loadu_ps(x+i+16),w1,acc1);
     }
-    return _mm512_reduce_add_ps(acc);
+    return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
 }
 static int i4_acc512_selftest(void){
     enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
@@ -747,10 +747,18 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
+    typedef struct { int pos,qk,valid; float theta,cs[128],sn[128]; } RopeCache;
+    static _Thread_local RopeCache cache;
     int half = c->qk_rope/2; float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
+    if(!cache.valid||cache.pos!=pos||cache.qk!=c->qk_rope||cache.theta!=c->theta){
+        for(int j=0;j<half;j++){
+            float inv=powf(c->theta,-2.0f*j/c->qk_rope),ang=pos*inv;
+            cache.cs[j]=cosf(ang); cache.sn[j]=sinf(ang);
+        }
+        cache.pos=pos; cache.qk=c->qk_rope; cache.theta=c->theta; cache.valid=1;
+    }
     for(int j=0;j<half;j++){
-        float inv = powf(c->theta, -2.0f*j/c->qk_rope);
-        float ang = pos*inv, cs=cosf(ang), sn=sinf(ang);
+        float cs=cache.cs[j],sn=cache.sn[j];
         float a=in[2*j], b=in[2*j+1];
         v[j]      = a*cs - b*sn;
         v[half+j] = b*cs + a*sn;
