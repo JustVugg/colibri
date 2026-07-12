@@ -2955,7 +2955,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"COLI_POLICY non valida: quality, balanced o experimental-fast\n"); return 2;
     }
     if(!experimental&&(g_topk>0||g_topp>0)){
-        fprintf(stderr,"TOPK/TOPP modificano il router; usa COLI_POLICY=experimental-fast esplicitamente\n"); return 2;
+        fprintf(stderr,"[policy] --topp/--topk drop low-weight experts (~1.6x fewer reads, small quality cost)\n");
     }
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;

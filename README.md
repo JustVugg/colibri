@@ -351,8 +351,8 @@ Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 
 `coli plan` reports the planned hot (VRAM), warm (RAM), and cold backing
 (disk) tiers, the reason for each placement, and the expected bottleneck. The
 default `--policy quality` and `--policy balanced` modes preserve checkpoint
-quantization and the original router decisions. Lossy `TOPK`/`TOPP` overrides
-require the explicit `--policy experimental-fast` opt-in.
+quantization and router decisions unless `--topk` or `--topp` is passed; those
+explicit lossy overrides print a warning and proceed.
 
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete

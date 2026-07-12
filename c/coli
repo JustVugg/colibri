@@ -519,7 +519,7 @@ def main():
     common.add_argument("--vram",type=float,default=0,help="budget VRAM totale in GB (0=auto)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
                         default=os.environ.get("COLI_POLICY","quality"),
-                        help="quality policy; only experimental-fast permits lossy routing")
+                        help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adatta gli expert RAM/VRAM ogni N token")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
