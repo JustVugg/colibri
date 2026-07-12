@@ -1207,9 +1207,75 @@ static void expert_host_release(Model *m, ESlot *s){
     for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
 }
+#endif
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
     if(!s->slab) expert_load(m,layer,s->eid,s);
 }
+
+#ifdef COLI_CUDA
+/* COLI_GPU_ONLY: run RAM/disk-resident experts on the GPU too, via an on-demand
+ * VRAM LRU cache, instead of CPU matmul. RAM/disk stay a weight cache; all expert
+ * compute goes to the GPU. Opt-in and bounded by COLI_GPU_CACHE_GB (default 4). */
+static int g_gpu_only=0;
+typedef struct { int key; ColiCudaTensor *t[3]; int fmt[3],I[3],O[3]; uint64_t used; } GCache;
+static GCache *g_gc=NULL; static int g_gc_n=0,g_gc_cap=0; static uint64_t g_gc_clock=0,g_gc_hit=0,g_gc_miss=0;
+
+static int gc_upload(GCache*sl,int i,const QT*q,int dev){
+    const void*w=q->fmt==0?(const void*)q->qf:q->fmt==1?(const void*)q->q8:(const void*)q->q4;
+    if(sl->t[i]){
+        if(sl->fmt[i]==q->fmt&&sl->I[i]==q->I&&sl->O[i]==q->O) return coli_cuda_tensor_update(sl->t[i],w,q->s);
+        coli_cuda_tensor_free(sl->t[i]); sl->t[i]=NULL;
+    }
+    int ok=coli_cuda_tensor_upload(&sl->t[i],w,q->s,q->fmt,q->I,q->O,dev);
+    if(ok){ sl->fmt[i]=q->fmt; sl->I[i]=q->I; sl->O[i]=q->O; }
+    return ok;
+}
+
+/* Return this expert's VRAM-cached gate/up/down (uploading on miss, LRU evict). */
+static int gpu_cache_get(Model*m,int layer,ESlot*e,ColiCudaTensor**pg,ColiCudaTensor**pu,ColiCudaTensor**pd){
+    if(!g_gc_cap){
+        double gb=getenv("COLI_GPU_CACHE_GB")?atof(getenv("COLI_GPU_CACHE_GB")):4.0;
+        int64_t trip=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+        g_gc_cap=(int)((gb*1e9)/(double)(trip>0?trip:1)); if(g_gc_cap<1) g_gc_cap=1;
+        g_gc=calloc(g_gc_cap,sizeof(GCache));
+        if(!g_gc){ g_gc_cap=0; return 0; }
+        fprintf(stderr,"[GPU_ONLY] VRAM expert cache: %d slots (%.1f GB budget, %.1f MB/expert)\n",
+            g_gc_cap,gb,trip/1e6);
+    }
+    int key=layer*m->c.n_experts + e->eid;
+    for(int i=0;i<g_gc_n;i++) if(g_gc[i].key==key){
+        g_gc[i].used=++g_gc_clock; g_gc_hit++;
+        *pg=g_gc[i].t[0]; *pu=g_gc[i].t[1]; *pd=g_gc[i].t[2]; return 1; }
+    if(!e->slab) expert_host_ensure(m,layer,e);
+    GCache*sl;
+    if(g_gc_n<g_gc_cap) sl=&g_gc[g_gc_n++];
+    else { int lru=0; for(int i=1;i<g_gc_n;i++) if(g_gc[i].used<g_gc[lru].used) lru=i; sl=&g_gc[lru]; }
+    int dev=g_cuda_devices[g_cuda_rr++ % g_cuda_ndev];
+    const QT*qs[3]={&e->g,&e->u,&e->d};
+    for(int i=0;i<3;i++) if(!gc_upload(sl,i,qs[i],dev)) return 0;
+    sl->key=key; sl->used=++g_gc_clock; g_gc_miss++;
+    *pg=sl->t[0]; *pu=sl->t[1]; *pd=sl->t[2]; return 1;
+}
+#endif
+
+/* One expert FFN: hh[nr,D] = down(silu(gate(xg)) * up(xg)). Prefers the GPU
+ * (statically resident, else the GPU_ONLY VRAM cache), falls back to CPU. */
+static void expert_ffn(Model*m,int layer,ESlot*e,const float*xg,float*hh,float*gg,float*uu,int nr){
+    int I=m->c.moe_inter;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && !omp_in_parallel()){
+        if(e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
+           coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)) return;
+        if(g_gpu_only){ ColiCudaTensor *cg,*cu,*cd;
+            if(gpu_cache_get(m,layer,e,&cg,&cu,&cd) && coli_cuda_expert_mlp(cg,cu,cd,hh,xg,nr)) return; }
+    }
+#endif
+    if(!e->slab) expert_host_ensure(m,layer,e);
+    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+    matmul_qt(hh,gg,&e->d,nr);
+}
+#ifdef COLI_CUDA
 /* Weight bytes of one quantized proj (no scales), matching the CUDA backend row layout. */
 static int64_t qt_weight_bytes(const QT *t){
     int64_t rb = t->fmt==0 ? (int64_t)t->I*4
@@ -1619,19 +1685,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
-#ifdef COLI_CUDA
-            if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
-               e->d.cuda_eligible && !omp_in_parallel() &&
-               coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                m->t_emm+=now_s()-t0; continue;
-            }
-            if(!e->slab) expert_host_ensure(m,layer,e);
-#endif
-            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            matmul_qt(hh, gg, &e->d, nr);
+            expert_ffn(m,layer,e,xg,hh,gg,uu,nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
@@ -1668,10 +1722,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!dev_ok[di]){
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
-                        expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        matmul_qt(hh,gg,&e->d,nr);
+                        expert_ffn(m,layer,e,xg,hh,gg,uu,nr);
                     }
                 }
                 float *src=dev_ok[di]?group_y+(int64_t)off*D:hh;
@@ -1698,9 +1749,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                     }
                 for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)rows[r]*D,D*sizeof(float));
                 double tc=now_s();
-                expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                matmul_qt(hh,gg,&e->d,nr);
+                expert_ffn(m,layer,e,xg,hh,gg,uu,nr);
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 m->t_emm+=now_s()-tc;
@@ -3304,6 +3353,7 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_gpu_only=getenv("COLI_GPU_ONLY")?atoi(getenv("COLI_GPU_ONLY")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
@@ -3366,6 +3416,13 @@ int main(int argc, char **argv){
            * qualche ora di chat) arriva a meta' del budget expert. */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
           double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
+#ifdef COLI_CUDA
+          /* The auto-pin quota above is RAM-based and ignores the VRAM expert
+           * budget, so a large CUDA_EXPERT_GB leaves most of VRAM unused. Grow
+           * the pinned set to cover it (VRAM-resident experts release their host
+           * backing, so this fills GPU memory without extra RAM pressure). */
+          if(g_cuda_enabled && g_cuda_expert_gb > pin_gb) pin_gb = g_cuda_expert_gb;
+#endif
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
@@ -3452,6 +3509,9 @@ int main(int argc, char **argv){
     if(m.gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
+    if(g_gpu_only) fprintf(stderr,"[GPU_ONLY] VRAM expert cache: %llu hits, %llu misses (%.1f%% hit)\n",
+        (unsigned long long)g_gc_hit,(unsigned long long)g_gc_miss,
+        (g_gc_hit+g_gc_miss)?100.0*g_gc_hit/(g_gc_hit+g_gc_miss):0.0);
 #endif
     if(g_looka){
         const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
