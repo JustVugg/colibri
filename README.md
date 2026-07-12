@@ -43,6 +43,8 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 
 ## Honest numbers (WSL2, 12 cores, 25 GB RAM, NVMe via VHDX)
 
+Detailed GPU experiment: [GLM-5.2 on 6x RTX 5090](docs/experiments/glm52-6x5090-2026-07-12.md) — full expert residency across VRAM+RAM reaches 6.84 tok/s single-request decode.
+
 | metric | value |
 |---|---|
 | model on disk (int4 container) | ~370 GB |
