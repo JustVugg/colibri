@@ -295,36 +295,71 @@ __global__ void __launch_bounds__(WV * 32)
   const int Kp = K / 2;
   const int kstart = blockIdx.z * Kchunk;
   const int kend = min(kstart + Kchunk, K);
-  __shared__ rw::float16_t lA[16 * BK];
-  __shared__ rw::float16_t lB[WV][BK * 16];
+  __shared__ rw::float16_t lA[2][16 * BK];
+  __shared__ rw::float16_t lB[2][WV][BK * 16];
   __shared__ float lC[WV][16 * 16];
+
+  constexpr int APT = (16 * BK + WV * 32 - 1) / (WV * 32);  // A elems / thread
+  constexpr int BPT = (BK * 16 + 31) / 32;                  // B elems / lane
+  rw::float16_t rA[APT], rB[BPT];
 
   rw::fragment<rw::accumulator, 16, 16, 16, float> acc;
   rw::fill_fragment(acc, 0.0f);
 
-  for (int k0 = kstart; k0 < kend; k0 += BK) {
-    for (int idx = threadIdx.x; idx < 16 * BK; idx += WV * 32) {   // A[m][k] ld=BK
-      int m = idx / BK, k = idx % BK, row = row0 + m;
-      lA[idx] = (row < rows) ? (rw::float16_t)A[(size_t)row * K + k0 + k]
-                             : (rw::float16_t)0.0f;
-    }
-    for (int idx = lane; idx < BK * 16; idx += 32) {              // B[k][n] ld=16
-      int k = idx >> 4, n = idx & 15, out = nbase + n, kk = k0 + k;
-      uint8_t byte = W[(size_t)out * Kp + (kk >> 1)];
-      int n4 = (kk & 1) ? (byte >> 4) : (byte & 15);
-      lB[wave][idx] = (rw::float16_t)(float)((n4 & 8) ? n4 - 16 : n4);
-    }
-    __syncthreads();
+  // Read one K-tile (A load + int4 weight dequant) into registers.
+#define WMMA_LOAD_REG(k0)                                                     \
+  do {                                                                        \
+    for (int j = 0; j < APT; j++) {                                           \
+      int idx = threadIdx.x + j * WV * 32;                                    \
+      if (idx < 16 * BK) {                                                    \
+        int m = idx / BK, k = idx % BK, row = row0 + m;                       \
+        rA[j] = (row < rows) ? (rw::float16_t)A[(size_t)row * K + (k0) + k]   \
+                             : (rw::float16_t)0.0f;                           \
+      }                                                                       \
+    }                                                                         \
+    for (int j = 0; j < BPT; j++) {                                           \
+      int idx = lane + j * 32;                                                \
+      if (idx < BK * 16) {                                                    \
+        int k = idx >> 4, n = idx & 15, out = nbase + n, kk = (k0) + k;       \
+        uint8_t byte = W[(size_t)out * Kp + (kk >> 1)];                       \
+        int n4 = (kk & 1) ? (byte >> 4) : (byte & 15);                        \
+        rB[j] = (rw::float16_t)(float)((n4 & 8) ? n4 - 16 : n4);              \
+      }                                                                       \
+    }                                                                         \
+  } while (0)
+#define WMMA_STORE_REG(buf)                                                   \
+  do {                                                                        \
+    for (int j = 0; j < APT; j++) {                                           \
+      int idx = threadIdx.x + j * WV * 32;                                    \
+      if (idx < 16 * BK) lA[buf][idx] = rA[j];                                \
+    }                                                                         \
+    for (int j = 0; j < BPT; j++) {                                           \
+      int idx = lane + j * 32;                                                \
+      if (idx < BK * 16) lB[buf][wave][idx] = rB[j];                          \
+    }                                                                         \
+  } while (0)
+
+  const int nsteps = (kend - kstart + BK - 1) / BK;
+  WMMA_LOAD_REG(kstart);        // prologue: tile 0 -> registers -> buf 0
+  WMMA_STORE_REG(0);
+  __syncthreads();
+
+  for (int s = 0; s < nsteps; s++) {
+    int cur = s & 1;
+    if (s + 1 < nsteps) WMMA_LOAD_REG(kstart + (s + 1) * BK);  // prefetch next
 #pragma unroll
-    for (int kk = 0; kk < BK; kk += 16) {
+    for (int kk = 0; kk < BK; kk += 16) {                      // compute current
       rw::fragment<rw::matrix_a, 16, 16, 16, rw::float16_t, rw::row_major> af;
       rw::fragment<rw::matrix_b, 16, 16, 16, rw::float16_t, rw::row_major> bf;
-      rw::load_matrix_sync(af, lA + kk, BK);
-      rw::load_matrix_sync(bf, lB[wave] + kk * 16, 16);
+      rw::load_matrix_sync(af, lA[cur] + kk, BK);
+      rw::load_matrix_sync(bf, lB[cur][wave] + kk * 16, 16);
       rw::mma_sync(acc, af, bf, acc);
     }
+    if (s + 1 < nsteps) WMMA_STORE_REG((s + 1) & 1);          // stash next
     __syncthreads();
   }
+#undef WMMA_LOAD_REG
+#undef WMMA_STORE_REG
 
   rw::store_matrix_sync(lC[wave], acc, 16, rw::mem_row_major);
   __syncthreads();

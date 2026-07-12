@@ -103,7 +103,9 @@ latency-bound at ~11 GB/s):
     is the main lever -- the kernel is occupancy/latency-bound, not
     bandwidth-bound, so more resident waves beats fewer-waves-less-traffic.
   - WV=4 waves per block share the LDS-staged activation tile; BK=32 amortizes
-    the barrier over two WMMA-K steps.
+    the barrier over two WMMA-K steps; the K-loop is double-buffered (two LDS
+    buffers + register prefetch) so the next tile's global load and int4 dequant
+    overlap the current tile's matrix-core mma.
   - Split-K over blockIdx.z (G slices, fp32 atomic accumulate + a scale pass)
     only when the output grid is too small to fill the GPU (blocks < 256);
     otherwise a single slice stores straight to C (no atomic/scale overhead).
@@ -111,18 +113,17 @@ latency-bound at ~11 GB/s):
 Pure-kernel time vs chunked skinny (RX 7900 XTX, weights = 6.3 MB, part
 cache-resident so GB/s is relative-only):
 
-    Nout=2048 K=6144 rows=16/32/64 : wmma 74/96/177us  skinny 79/119/233us  1.08/1.23/1.32x
-    Nout=6144 K=2048 rows=16/32/64 : wmma 59/96/140us  skinny 40/80/159us   0.68/0.83/1.13x
+    Nout=2048 K=6144 rows=16/32/64 : wmma 61/80/143us  skinny 83/119/234us  1.35/1.48/1.63x
+    Nout=6144 K=2048 rows=16/32/64 : wmma 51/78/115us  skinny 40/80/159us   0.79/1.03/1.38x
 
 WMMA wins across all batch sizes on the large-K projections (gate/up, K=6144)
-and at high batch on small-K (down, K=2048); it loses to skinny on small-K
-wide-output at low rows. So the wired dispatch uses WMMA for rows>8 when
-(K>=4096 || rows>=48), else chunked skinny; `COLI_HIP_WMMA=0/1` forces the
+and from rows~32 up on small-K (down, K=2048); it loses to skinny only on
+small-K wide-output at low rows. So the wired dispatch uses WMMA for rows>8 when
+(K>=4096 || rows>=32), else chunked skinny; `COLI_HIP_WMMA=0/1` forces the
 choice. rows<=8 always uses skinny.
 
-Not yet done (would push past ~1.3x toward the handoff's ~3x): LDS
-double-buffering to overlap the int4 dequant (VALU) under the WMMA, vectorized
-(uint4) coalesced weight loads, and BK/WV autotuning per shape.
+Not yet done (would push further toward the handoff's ~3x): vectorized (uint4)
+coalesced weight loads, and BK/WV autotuning per shape.
 
 ## Result (steps 1-5)
 

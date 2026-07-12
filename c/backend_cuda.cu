@@ -510,7 +510,7 @@ static int expert_gemv_rows(ColiCudaTensor *t, half *C, const half *A, int rows,
     int M = t->O, K = t->I;
     const char *we = getenv("COLI_HIP_WMMA");
     int wmma = we ? atoi(we)                       /* explicit: force on/off */
-                  : (K >= 4096 || rows >= 48);     /* default: auto by shape */
+                  : (K >= 4096 || rows >= 32);     /* default: auto by shape */
     if (rows > 8 && wmma && M % 16 == 0 && K % 16 == 0 &&
         coli_hip_int4_wmma(C, A, (const uint8_t*)t->weights, t->scales, M, K, rows, ctx->stream))
         return 1;
