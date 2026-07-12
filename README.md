@@ -279,6 +279,10 @@ PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
+CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -300,6 +304,23 @@ replay from 1.87 to 2.16 tok/s (+15.7%), reduced expert disk wait from 5.144s to
 3.948s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
 down automatically (54 to 40 in that run) so the larger pinned tier does not exceed
 the process budget. Start lower on hosts with less available RAM.
+
+`CUDA_EXPERT_GB=auto` fills each selected device only up to its measured free
+memory minus projected dense tensors and 2 GB of runtime headroom. `PIN_GB=all`
+then loads every remaining routed expert into RAM, eliminating decode-time disk
+misses when the host budget permits it. The regular `RAM_GB` guard still clamps
+the per-layer working cache and rejects unsafe projections; this mode is intended
+for dedicated high-memory inference hosts, not desktops running other workloads.
+On a dedicated 251 GiB host with six RTX 5090s, this mode selected a 176.7 GB
+VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). A real
+64-token greedy GLM-5.2 generation measured **5.77 tok/s decode**, up from
+2.20 tok/s end-to-end with the earlier 150 GB tier; expert hit rate was 100%
+and disk wait was zero. Prompt prefill remained separate at 13.49 s for 15
+tokens. This is a host-specific capacity result, not a portable default.
+
+Text-mode timing reports prefill separately from decode. The decode rate starts
+after the prompt KV is built, so it is comparable to `REPLAY` throughput without
+hiding time-to-first-token.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
 
