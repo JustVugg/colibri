@@ -184,7 +184,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
-    vram_budget = min(requested_vram, safe_vram, cache_bytes)
+    # VRAM experts are disjoint from the RAM cache (they release their RAM slab),
+    # so the GPU tier is bounded by free VRAM only, not by leftover RAM.
+    vram_budget = min(requested_vram, safe_vram)
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
@@ -193,7 +195,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
-        warnings.append("VRAM tier was clamped by free VRAM or its required RAM backing")
+        warnings.append("VRAM tier was clamped by free VRAM")
 
     return {
         "version": 1,
@@ -231,7 +233,8 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         result[key] = ",".join(map(str, devices))
     result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
     if result.get("PIN"):
-        result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        # RAM pins and the VRAM tier are disjoint: size RAM pins to the RAM cache.
+        result.setdefault("PIN_GB", f"{ram['expert_cache_bytes'] / GB:.3f}")
     return result
 
 

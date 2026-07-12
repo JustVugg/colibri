@@ -37,6 +37,12 @@ int main(int argc, char **argv) {
     if (ndev > 1 && coli_cuda_tensor_upload(&t8, q8, s8, 1, 4, 2, d1)) return 1;
     if (!coli_cuda_matmul(&t8, got, x, q8, s8, 1, 2, 4, 2, d0) || !close_enough(got, want8, 4)) return 1;
 
+    /* device->host round-trip: bytes and scales must come back exactly (demote path). */
+    int8_t dq8[8]; float ds8[2];
+    if (!coli_cuda_tensor_download(t8, dq8, ds8)) return 1;
+    for (int i = 0; i < 8; i++) if (dq8[i] != q8[i]) { std::fprintf(stderr, "download w[%d] %d!=%d\n", i, dq8[i], q8[i]); return 1; }
+    for (int i = 0; i < 2; i++) if (ds8[i] != s8[i]) { std::fprintf(stderr, "download s[%d]\n", i); return 1; }
+
     /* Rows [-8,-1,0,7] and [1,2,3,4], packed low nibble first. */
     const uint8_t q4[4] = {0x70, 0xf8, 0xa9, 0xcb};
     const float s4[2] = {1.0f, 0.25f};

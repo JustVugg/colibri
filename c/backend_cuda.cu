@@ -179,13 +179,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
     DeviceContext *ctx = find_ctx(device);
-    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!tensor || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    /* Cache hit: the device already owns this tensor, so validate shape only.
+     * Host weights/scales are NOT required here -- a GPU-resident expert may have
+     * released its RAM copy (weights==NULL) and still reuse the uploaded copy. */
     if (*tensor) {
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
     }
+    /* First upload: source data must be present. */
+    size_t rb = row_bytes(fmt, I);
+    if (!weights || !rb || (fmt && !scales)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
@@ -224,6 +228,20 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_tensor_download(const ColiCudaTensor *tensor, void *weights, float *scales) {
+    if (!tensor || !weights) return 0;
+    DeviceContext *ctx = find_ctx(tensor->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaMemcpy(weights, tensor->weights, tensor->weight_bytes,
+                            cudaMemcpyDeviceToHost), "tensor download")) return 0;
+    if (tensor->fmt && tensor->scales) {
+        if (!scales) return 0;
+        if (!cuda_ok(cudaMemcpy(scales, tensor->scales, (size_t)tensor->O * sizeof(float),
+                                cudaMemcpyDeviceToHost), "scale download")) return 0;
+    }
     return 1;
 }
 

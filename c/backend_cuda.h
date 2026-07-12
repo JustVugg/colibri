@@ -38,6 +38,10 @@ int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device);
 
+/* Copy a resident tensor device->host: weights (weight_bytes) and, when fmt!=0,
+ * O row scales. Lets a VRAM expert return to RAM without re-reading disk. */
+int coli_cuda_tensor_download(const ColiCudaTensor *tensor, void *weights, float *scales);
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);

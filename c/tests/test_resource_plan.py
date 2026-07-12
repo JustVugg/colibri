@@ -61,7 +61,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(plan["version"], 1)
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
-        self.assertIn("required RAM backing", plan["warnings"][0])
+        self.assertIn("clamped by free VRAM", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
 
     def test_filters_requested_devices(self):
@@ -93,7 +93,8 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "12")
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
-        self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
+        self.assertEqual(env["PIN_GB"],
+                         f"{plan['tiers']['ram']['expert_cache_bytes'] / GB:.3f}")
 
     def test_cpu_binary_does_not_apply_gpu_tier(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
