@@ -1999,7 +1999,7 @@ static int pick_tok(const float *lo, int V, int ban){
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
 static int g_stop[9], g_nstop=0;
 static void repin_pass_limit(Model *m,int limit);
-static void repin_pass(Model *m){ repin_pass_limit(m,32); }
+static void repin_pass(Model *m){ repin_pass_limit(m,16); }
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
 static void stops_arm(const Cfg *c, int tok_eos){
     g_nstop=0;
