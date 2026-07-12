@@ -1,9 +1,9 @@
 # HIP int4 expert-matmul kernel: bandwidth port plan (gfx1100)
 
-Status: steps 1-4 landed (kernel ported to `c/skinny_int4_hip.cu`, repack +
-fp16 glue, wired into `coli_cuda_matmul` behind `COLI_HIP_SKINNY=1`, validated
-by `make cuda-test HIP=1`). Steps 5-6 (tuning sweep, grouped-expert +
-batched WMMA) remain. Colibri's GPU expert matmul on AMD works
+Status: steps 1-5 landed (kernel ported to `c/skinny_int4_hip.cu`, repack +
+fp16 glue, wired into matmul & fused expert paths behind `COLI_HIP_SKINNY=1`, validated
+by `make cuda-test HIP=1`). Step 6 (
+batched-WMMA grouped path for rows>8) remains. Colibri's GPU expert matmul on AMD works
 correctly but is bandwidth-inefficient. This is the plan to close the gap by
 reusing the tuned kernel work from the vLLM ROCm fork.
 
@@ -79,12 +79,35 @@ Steps 1-4 done; 5-6 remain.
 4. [done] Validate: `make cuda-test HIP=1` must stay green (extend it with an int4
    shape large enough to exercise the kernel), and diff outputs against the
    naive kernel within tolerance.
-5. [todo] Tune YTILE/UNRL/A_CHUNK for gfx1100 (96 CUs, WGP=48 — note the sYT heuristic
-   miscalibration called out in the handoff). Microbench each shape.
+5. [done] Tuned YTILE/UNRL for gfx1100 (multiProcessorCount reports 48, not 96 —
+   the plan's WGP note was right). Sweep confirms YTILE=4/UNRL=2 as the default;
+   see results below.
 6. [todo] Later (optional): the batched M=8-64 matrix-core path via the WMMA intrinsics,
    for #80's grouped-expert continuous-batching path.
 
-## Result (steps 1-4)
+## Result (steps 1-5)
+
+Wired: single-tensor `coli_cuda_matmul`, fused `coli_cuda_expert_mlp`, and
+grouped `coli_cuda_expert_group` (all behind `COLI_HIP_SKINNY=1`, fall back to
+`quant_matmul`/grouped kernels when a shape is ineligible: rows>8, K%16!=0, or
+the tile exceeds LDS). The grouped/fused paths reuse one skinny helper and cross
+PCIe once per MLP.
+
+Pure kernel time (device events, 500 iters, RX 7900 XTX, CuCount=48), swept over
+YTILE x UNRL. Weight bytes per call = O*K/2 = 6.3 MB (fits Infinity Cache, so
+absolute GB/s is optimistic vs a fully DRAM-resident stream; the ranking holds):
+
+    O=2048 K=6144 S=1 : YT=4 best, UN=4 7.7us / UN=2 7.8us  (~810 GB/s)
+    O=6144 K=2048 S=1 : YT=4 best, UN=4 6.8us / UN=2 7.1us  (~900 GB/s)
+    O=2048 K=6144 S=3 : YT=4 UN=2 12.8us  (~490 GB/s)
+    O=2048 K=6144 S=5 : YT=4 UN=2 18.1us  (~350 GB/s)
+
+YTILE=4 wins at every shape; UNRL=4 is marginally faster at S=1 but slower at
+S>=3, so the default stays YTILE=4/UNRL=2 (override via COLI_INT4_YTILE /
+COLI_INT4_UNRL). Naive baseline for the same shapes was ~110-140 GB/s, so the
+kernel-only speedup is ~6x.
+
+## End-to-end wall time (single-tensor path)
 
 End-to-end `coli_cuda_matmul` wall time, naive vs skinny (RX 7900 XTX, PCIe
 copy overhead identical on both paths):
@@ -97,8 +120,9 @@ copy overhead identical on both paths):
 S=1 is copy/launch-latency bound end to end (kernel-only gain is larger); the
 win grows with S because skinny batches N rows in one launch that reuses the
 LDS-staged activation, where the naive kernel does S separate grid launches.
-Only the single-tensor `coli_cuda_matmul` path is wired so far; `expert_mlp`
-and the grouped-expert path still use `quant_matmul` (follow-up).
+The single-tensor, fused-`expert_mlp`, and grouped-`expert_group` paths are all
+wired. Remaining: step 6 (batched M=8-64 matrix-core / WMMA path for grouped
+continuous batching with rows>8, which currently falls back).
 
 ## Payoff and when to do it
 

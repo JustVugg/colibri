@@ -61,6 +61,7 @@ typedef struct {
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
     void *xh, *yh; size_t xh_cap, yh_cap;   /* fp16 scratch for skinny path */
+    void *gh, *uh; size_t gh_cap, uh_cap;   /* fp16 gate/up scratch (skinny experts) */
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
@@ -343,7 +344,10 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->xh) cudaFree(ctx->xh);
         if (ctx->yh) cudaFree(ctx->yh);
+        if (ctx->gh) cudaFree(ctx->gh);
+        if (ctx->uh) cudaFree(ctx->uh);
         ctx->xh=ctx->yh=nullptr; ctx->xh_cap=ctx->yh_cap=0;
+        ctx->gh=ctx->uh=nullptr; ctx->gh_cap=ctx->uh_cap=0;
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
@@ -476,6 +480,61 @@ static int skinny_enabled(void) {
     const char *e = getenv("COLI_HIP_SKINNY");
     return e && atoi(e);
 }
+
+/* Eligibility for the skinny fused expert path: small row counts (kernel N<=8),
+   K multiples of 16, activation tiles fit LDS, and all three weights repackable. */
+static int expert_skinny_ok(ColiCudaTensor *g, ColiCudaTensor *u, ColiCudaTensor *d,
+                            int D, int I, int nrows, DeviceContext *ctx) {
+    const int lds = 32768;
+    if (nrows < 1 || nrows > 8) return 0;
+    if (D % 16 || I % 16) return 0;
+    if ((long)D * nrows > lds || (long)I * nrows > lds) return 0;
+    return ensure_skinny(g, ctx) && ensure_skinny(u, ctx) && ensure_skinny(d, ctx);
+}
+
+/* Fused y = down(silu(gate(x)) * up(x)) for one or more same-shaped experts,
+   using the skinny int4 kernel per expert. Activations for expert c occupy
+   rows[c] consecutive rows at its cumulative offset in ctx->x (fp32, [total,D]);
+   the result lands in ctx->y (fp32, [total,D]). Returns 1 when it ran, 0 to fall
+   back to the naive/grouped kernels (ctx->x is left intact for the fallback). */
+static int skinny_expert_fused(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
+                               ColiCudaTensor *const *downs, const int *rows, int count,
+                               int D, int I, int total, DeviceContext *ctx) {
+    if (!skinny_enabled()) return 0;
+    for (int c = 0; c < count; c++)
+        if (!expert_skinny_ok(gates[c], ups[c], downs[c], D, I, rows[c], ctx)) return 0;
+    size_t ihb = (size_t)total * I * sizeof(half);
+    if (!reserve_bytes(&ctx->xh, &ctx->xh_cap, (size_t)total * D * sizeof(half)) ||
+        !reserve_bytes(&ctx->gh, &ctx->gh_cap, ihb) ||
+        !reserve_bytes(&ctx->uh, &ctx->uh_cap, ihb) ||
+        !reserve_bytes(&ctx->yh, &ctx->yh_cap, (size_t)total * D * sizeof(half))) return 0;
+    half *xh = (half*)ctx->xh, *gh = (half*)ctx->gh, *uh = (half*)ctx->uh, *yh = (half*)ctx->yh;
+    coli_hip_f32_to_f16(xh, ctx->x, (size_t)total * D, ctx->stream);
+    int off = 0;
+    for (int c = 0; c < count; c++) {
+        if (!coli_hip_int4_gemv(gh + (size_t)off * I, xh + (size_t)off * D,
+                (const uint8_t*)gates[c]->w_skinny, (const half*)gates[c]->scale_h,
+                I, D, rows[c], ctx->cu_count, ctx->stream) ||
+            !coli_hip_int4_gemv(uh + (size_t)off * I, xh + (size_t)off * D,
+                (const uint8_t*)ups[c]->w_skinny, (const half*)ups[c]->scale_h,
+                I, D, rows[c], ctx->cu_count, ctx->stream)) return 0;
+        off += rows[c];
+    }
+    coli_hip_f16_to_f32(ctx->gate, gh, (size_t)total * I, ctx->stream);
+    coli_hip_f16_to_f32(ctx->up, uh, (size_t)total * I, ctx->stream);
+    silu_mul<<<(unsigned)(((size_t)total * I + 255) / 256), 256, 0, ctx->stream>>>(
+        ctx->gate, ctx->up, (size_t)total * I);
+    coli_hip_f32_to_f16(gh, ctx->gate, (size_t)total * I, ctx->stream);
+    off = 0;
+    for (int c = 0; c < count; c++) {
+        if (!coli_hip_int4_gemv(yh + (size_t)off * D, gh + (size_t)off * I,
+                (const uint8_t*)downs[c]->w_skinny, (const half*)downs[c]->scale_h,
+                D, I, rows[c], ctx->cu_count, ctx->stream)) return 0;
+        off += rows[c];
+    }
+    coli_hip_f16_to_f32(ctx->y, yh, (size_t)total * D, ctx->stream);
+    return cuda_ok(cudaGetLastError(), "skinny expert fused");
+}
 #endif
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
@@ -531,6 +590,16 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
         !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
+#ifdef COLI_HIP
+    {
+        ColiCudaTensor *gg[1]={gate}, *uu[1]={up}, *dd[1]={down}; int rr[1]={S};
+        if (skinny_expert_fused(gg,uu,dd,rr,1,D,I,S,ctx)) {
+            if (!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert MLP skinny sync") ||
+                !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
+            return 1;
+        }
+    }
+#endif
     dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
     quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
         gate->fmt,S,D,I,row_bytes(gate->fmt,D));
@@ -594,7 +663,13 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
-    if(tc){
+    int did_skinny=0;
+#ifdef COLI_HIP
+    did_skinny=skinny_expert_fused(gates,ups,downs,rows,count,D,I,total,ctx);
+#endif
+    if(did_skinny){
+        /* ctx->y already holds the fused result on ctx->stream. */
+    }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
            !reserve(&ctx->qscale,&ctx->qscale_cap,(size_t)(total+7)*sizeof(float)))return 0;

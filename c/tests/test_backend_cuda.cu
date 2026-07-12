@@ -160,6 +160,42 @@ int main(int argc, char **argv) {
         if (count != 2 || bytes != 22) return 1;
     } else if (count != 7 || bytes != 166) return 1;
 
+    {
+        /* Skinny fused expert path (HIP gfx1100): compare expert_mlp and
+           expert_group hot vs naive at eligible shapes (D,I mult of 16, rows<=8).
+           Placed after the strict stat assertions since it adds group calls. */
+        const int ED = 64, EI = 128, ES = 2;
+        static uint8_t egw[128 * 64 / 2], edw[64 * 128 / 2];
+        static float egs[128], eds[64], eex[64 * 2], enref[64 * 2], enhot[64 * 2];
+        for (int i = 0; i < EI * ED / 2; i++) egw[i] = (uint8_t)((i * 29 + 7) & 0xFF);
+        for (int i = 0; i < ED * EI / 2; i++) edw[i] = (uint8_t)((i * 13 + 5) & 0xFF);
+        for (int i = 0; i < EI; i++) egs[i] = 0.02f + (i % 5) * 0.001f;
+        for (int i = 0; i < ED; i++) eds[i] = 0.02f + (i % 5) * 0.001f;
+        for (int i = 0; i < ED * ES; i++) eex[i] = 0.05f * ((i % 13) - 6);
+        ColiCudaTensor *eg = nullptr, *eu = nullptr, *edn = nullptr;
+        if (!coli_cuda_tensor_upload(&eg, egw, egs, 2, ED, EI, d0) ||
+            !coli_cuda_tensor_upload(&eu, egw, egs, 2, ED, EI, d0) ||
+            !coli_cuda_tensor_upload(&edn, edw, eds, 2, EI, ED, d0)) return 1;
+        unsetenv("COLI_HIP_SKINNY");
+        if (!coli_cuda_expert_mlp(eg, eu, edn, enref, eex, ES)) return 1;
+        setenv("COLI_HIP_SKINNY", "1", 1);
+        if (!coli_cuda_expert_mlp(eg, eu, edn, enhot, eex, ES)) return 1;
+        unsetenv("COLI_HIP_SKINNY");
+        if (!relative_rms(enhot, enref, ED * ES, 0.03f)) return 1;
+        ColiCudaTensor *EG[2] = {eg, eg}, *EU[2] = {eu, eu}, *EDn[2] = {edn, edn};
+        int egr[2] = {1, 1};
+        static float ggref[64 * 2], gghot[64 * 2];
+        unsetenv("COLI_HIP_SKINNY");
+        if (!coli_cuda_expert_group(EG, EU, EDn, egr, 2, ggref, eex)) return 1;
+        setenv("COLI_HIP_SKINNY", "1", 1);
+        if (!coli_cuda_expert_group(EG, EU, EDn, egr, 2, gghot, eex)) return 1;
+        unsetenv("COLI_HIP_SKINNY");
+        if (!relative_rms(gghot, ggref, ED * 2, 0.03f)) return 1;
+        coli_cuda_tensor_free(eg);
+        coli_cuda_tensor_free(eu);
+        coli_cuda_tensor_free(edn);
+    }
+
     coli_cuda_tensor_free(t8);
     coli_cuda_tensor_free(t4);
     coli_cuda_tensor_free(t2);
