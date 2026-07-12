@@ -481,14 +481,28 @@ static int skinny_enabled(void) {
     return e && atoi(e);
 }
 
-/* Eligibility for the skinny fused expert path: small row counts (kernel N<=8),
-   K multiples of 16, activation tiles fit LDS, and all three weights repackable. */
+/* Launch the skinny GEMV over arbitrary row counts by tiling rows into chunks
+   the kernel accepts (N<=8 and K*N<=LDS). C is [rows,M] row-major, A is
+   [rows,K]; the kernel's C[n*M+m] output matches those row offsets. */
+static int skinny_gemv_rows(half *C, const half *A, const void *w, const void *scale,
+                            int M, int K, int rows, DeviceContext *ctx) {
+    int chunk = 32768 / K; if (chunk > 8) chunk = 8;
+    if (chunk < 1) return 0;
+    for (int r = 0; r < rows; r += chunk) {
+        int n = rows - r < chunk ? rows - r : chunk;
+        if (!coli_hip_int4_gemv(C + (size_t)r * M, A + (size_t)r * K,
+                (const uint8_t*)w, (const half*)scale, M, K, n, ctx->cu_count, ctx->stream))
+            return 0;
+    }
+    return 1;
+}
+
+/* Eligibility for the skinny fused expert path: K multiples of 16 within LDS
+   width, and all three weights repackable. Any row count is handled by tiling. */
 static int expert_skinny_ok(ColiCudaTensor *g, ColiCudaTensor *u, ColiCudaTensor *d,
                             int D, int I, int nrows, DeviceContext *ctx) {
-    const int lds = 32768;
-    if (nrows < 1 || nrows > 8) return 0;
-    if (D % 16 || I % 16) return 0;
-    if ((long)D * nrows > lds || (long)I * nrows > lds) return 0;
+    if (nrows < 1) return 0;
+    if (D % 16 || I % 16 || D > 32768 || I > 32768) return 0;
     return ensure_skinny(g, ctx) && ensure_skinny(u, ctx) && ensure_skinny(d, ctx);
 }
 
@@ -512,12 +526,10 @@ static int skinny_expert_fused(ColiCudaTensor *const *gates, ColiCudaTensor *con
     coli_hip_f32_to_f16(xh, ctx->x, (size_t)total * D, ctx->stream);
     int off = 0;
     for (int c = 0; c < count; c++) {
-        if (!coli_hip_int4_gemv(gh + (size_t)off * I, xh + (size_t)off * D,
-                (const uint8_t*)gates[c]->w_skinny, (const half*)gates[c]->scale_h,
-                I, D, rows[c], ctx->cu_count, ctx->stream) ||
-            !coli_hip_int4_gemv(uh + (size_t)off * I, xh + (size_t)off * D,
-                (const uint8_t*)ups[c]->w_skinny, (const half*)ups[c]->scale_h,
-                I, D, rows[c], ctx->cu_count, ctx->stream)) return 0;
+        if (!skinny_gemv_rows(gh + (size_t)off * I, xh + (size_t)off * D,
+                gates[c]->w_skinny, gates[c]->scale_h, I, D, rows[c], ctx) ||
+            !skinny_gemv_rows(uh + (size_t)off * I, xh + (size_t)off * D,
+                ups[c]->w_skinny, ups[c]->scale_h, I, D, rows[c], ctx)) return 0;
         off += rows[c];
     }
     coli_hip_f16_to_f32(ctx->gate, gh, (size_t)total * I, ctx->stream);
@@ -527,9 +539,8 @@ static int skinny_expert_fused(ColiCudaTensor *const *gates, ColiCudaTensor *con
     coli_hip_f32_to_f16(gh, ctx->gate, (size_t)total * I, ctx->stream);
     off = 0;
     for (int c = 0; c < count; c++) {
-        if (!coli_hip_int4_gemv(yh + (size_t)off * D, gh + (size_t)off * I,
-                (const uint8_t*)downs[c]->w_skinny, (const half*)downs[c]->scale_h,
-                D, I, rows[c], ctx->cu_count, ctx->stream)) return 0;
+        if (!skinny_gemv_rows(yh + (size_t)off * D, gh + (size_t)off * I,
+                downs[c]->w_skinny, downs[c]->scale_h, D, I, rows[c], ctx)) return 0;
         off += rows[c];
     }
     coli_hip_f16_to_f32(ctx->y, yh, (size_t)total * D, ctx->stream);
@@ -555,9 +566,8 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
         if (reserve_bytes(&ctx->xh, &ctx->xh_cap, xhb) &&
             reserve_bytes(&ctx->yh, &ctx->yh_cap, yhb)) {
             coli_hip_f32_to_f16((half*)ctx->xh, ctx->x, (size_t)S * I, ctx->stream);
-            if (coli_hip_int4_gemv((half*)ctx->yh, (const half*)ctx->xh,
-                                   (const uint8_t*)t->w_skinny, (const half*)t->scale_h,
-                                   O, I, S, ctx->cu_count, ctx->stream)) {
+            if (skinny_gemv_rows((half*)ctx->yh, (const half*)ctx->xh,
+                                 t->w_skinny, t->scale_h, O, I, S, ctx)) {
                 coli_hip_f16_to_f32(ctx->y, (const half*)ctx->yh, (size_t)S * O, ctx->stream);
                 if (cuda_ok(cudaGetLastError(), "skinny matmul") &&
                     cuda_ok(cudaStreamSynchronize(ctx->stream), "skinny sync") &&
