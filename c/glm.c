@@ -48,6 +48,11 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 }
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>                             /* Apple Silicon / aarch64: kernel NEON */
+#elif defined(__VSX__)
+#include <altivec.h>                              /* POWER8+ (ppc64le): kernel VSX */
+#undef vector                                     /* igiene: si usano __vector/__bool espliciti */
+#undef pixel
+#undef bool
 #endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
@@ -308,6 +313,8 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "avx2"
 #elif defined(__ARM_NEON)
 #define IDOT_KERNEL "neon"
+#elif defined(__VSX__)
+#define IDOT_KERNEL "vsx"
 #else
 #define IDOT_KERNEL "scalar"
 #endif
@@ -316,6 +323,11 @@ static int g_idot=1;
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
                        * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
                        * IDOT pays even at S=1 (decode); measured on Apple M-series. */
+#elif defined(__VSX__)
+static int g_i4s=1;   /* POWER8 vec_msum: qui il fallback f32 e' SCALARE, quindi l'IDOT
+                       * int4 conviene anche a S=1. Misurato su POWER8 S824 (vedi PR).
+                       * EN: on VSX the f32 fallback is plain scalar C, so int4 IDOT
+                       * pays even at S=1. Measured on a POWER8 S824 (see PR). */
 #else
 static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
                        * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
@@ -375,6 +387,25 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 #endif
     }
     sum=vaddvq_s32(acc);
+#elif defined(__VSX__)
+    /* POWER8: vec_msum (s8 x u8 -> s32) somma i prodotti byte DIRETTAMENTE in lane
+     * s32, 16 byte/iter: il bound anti-saturazione a 16 bit di maddubs qui non serve.
+     * Stesso trucco del segno (|w| u8 per x*sign(w) s8), ma |w| via select+sub MODULO
+     * e non vec_abs: -128 deve diventare 128 u8, non saturare a 127.
+     * EN: vec_msum accumulates byte products straight into s32 lanes; |w| is built
+     * with a modulo subtract select instead of vec_abs so w=-128 wraps to 128 (u8)
+     * rather than saturating to 127. |x|<=127 from qrow_i8, so x negation is safe. */
+    __vector signed int acc=vec_splats(0);
+    const __vector signed char vz=vec_splats((signed char)0);
+    for(;i+16<=I;i+=16){
+        __vector signed char wv=vec_xl(0,(const signed char*)(w+i));
+        __vector signed char xv=vec_xl(0,(const signed char*)(x+i));
+        __vector __bool char neg=vec_cmplt(wv,vz);
+        __vector signed char xs=vec_sel(xv,vec_sub(vz,xv),neg);
+        __vector unsigned char wa=(__vector unsigned char)vec_sel(wv,vec_sub(vz,wv),neg);
+        acc=vec_msum(xs,wa,acc);
+    }
+    sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
 #endif
     for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
     return sum;
@@ -437,6 +468,31 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 #endif
     }
     sum=vaddvq_s32(acc);
+#elif defined(__VSX__)
+    /* 16 byte = 32 nibble. vec_mergeh/vec_mergel su ppc64le (GCC) interallacciano come
+     * unpacklo/unpackhi x86 (verificato empiricamente su POWER8): i nibble escono in
+     * ordine di memoria. |w|<=8 dopo il -8, quindi stesso trucco del segno di dot_i8i8.
+     * EN: vec_mergeh/l on ppc64le interleave like x86 unpacklo/hi (verified on POWER8),
+     * so nibbles come out in memory order; then the same sign trick as dot_i8i8. */
+    const __vector unsigned char m4v=vec_splats((unsigned char)0x0F);
+    const __vector unsigned char sh4=vec_splats((unsigned char)4);
+    const __vector signed char b8v=vec_splats((signed char)8);
+    const __vector signed char vz=vec_splats((signed char)0);
+    __vector signed int acc=vec_splats(0);
+    for(;i+32<=I;i+=32){
+        __vector unsigned char by=vec_xl(0,w4+(i>>1));               /* 16 byte = 32 nibble */
+        __vector unsigned char lo=vec_and(by,m4v), hi=vec_sr(by,sh4);
+        __vector signed char w0=vec_sub((__vector signed char)vec_mergeh(lo,hi),b8v);
+        __vector signed char w1=vec_sub((__vector signed char)vec_mergel(lo,hi),b8v);
+        __vector signed char x0=vec_xl(0,(const signed char*)(x+i));
+        __vector signed char x1=vec_xl(0,(const signed char*)(x+i+16));
+        __vector __bool char n0=vec_cmplt(w0,vz), n1=vec_cmplt(w1,vz);
+        acc=vec_msum(vec_sel(x0,vec_sub(vz,x0),n0),
+                     (__vector unsigned char)vec_sel(w0,vec_sub(vz,w0),n0),acc);
+        acc=vec_msum(vec_sel(x1,vec_sub(vz,x1),n1),
+                     (__vector unsigned char)vec_sel(w1,vec_sub(vz,w1),n1),acc);
+    }
+    sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
 #endif
     for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
     if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
