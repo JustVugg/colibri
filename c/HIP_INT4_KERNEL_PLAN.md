@@ -1,6 +1,9 @@
 # HIP int4 expert-matmul kernel: bandwidth port plan (gfx1100)
 
-Status: documented, not started. Colibri's GPU expert matmul on AMD works
+Status: steps 1-4 landed (kernel ported to `c/skinny_int4_hip.cu`, repack +
+fp16 glue, wired into `coli_cuda_matmul` behind `COLI_HIP_SKINNY=1`, validated
+by `make cuda-test HIP=1`). Steps 5-6 (tuning sweep, grouped-expert +
+batched WMMA) remain. Colibri's GPU expert matmul on AMD works
 correctly but is bandwidth-inefficient. This is the plan to close the gap by
 reusing the tuned kernel work from the vLLM ROCm fork.
 
@@ -61,23 +64,41 @@ Colibri and the vLLM kernel differ on all three axes; a one-time re-encode at
 
 ## Port plan
 
-1. `c/skinny_int4_hip.cu` (hipcc-only, `#if defined(__HIP__GFX1X__)`): the two
+Steps 1-4 done; 5-6 remain.
+
+1. [done] `c/skinny_int4_hip.cu` (hipcc-only, `#if defined(__HIP__GFX1X__)`): the two
    `__global__` kernels + macros, `scalar_t` -> `half`, drop the torch/at::Tensor
    entry. Plain launcher `coli_hip_int4_gemv(half *C, const half *A,
    const uint8_t *Wrepacked, const half *scale, int Nout, int K, int Mrows)`.
    Add a Makefile rule to compile it under HIP=1 and link the object.
-2. `backend_cuda.cu`: in `coli_cuda_tensor_upload` for fmt==2 under HIP, store a
+2. [done] `backend_cuda.cu`: in `coli_cuda_tensor_upload` for fmt==2 under HIP, store a
    repacked+re-encoded weight buffer and fp16 scales alongside (or instead of)
    the raw tensor. Add fp32<->fp16 convert kernels around the call.
-3. Wire into the single-tensor and grouped-expert matmul paths, gated behind
+3. [done] Wire into the single-tensor and grouped-expert matmul paths, gated behind
    `COLI_HIP_SKINNY=1` (default off); fall back to `quant_matmul`.
-4. Validate: `make cuda-test HIP=1` must stay green (extend it with an int4
+4. [done] Validate: `make cuda-test HIP=1` must stay green (extend it with an int4
    shape large enough to exercise the kernel), and diff outputs against the
    naive kernel within tolerance.
-5. Tune YTILE/UNRL/A_CHUNK for gfx1100 (96 CUs, WGP=48 — note the sYT heuristic
+5. [todo] Tune YTILE/UNRL/A_CHUNK for gfx1100 (96 CUs, WGP=48 — note the sYT heuristic
    miscalibration called out in the handoff). Microbench each shape.
-6. Later (optional): the batched M=8-64 matrix-core path via the WMMA intrinsics,
+6. [todo] Later (optional): the batched M=8-64 matrix-core path via the WMMA intrinsics,
    for #80's grouped-expert continuous-batching path.
+
+## Result (steps 1-4)
+
+End-to-end `coli_cuda_matmul` wall time, naive vs skinny (RX 7900 XTX, PCIe
+copy overhead identical on both paths):
+
+    O=2048 I=6144 S=1 : 117 -> 85 us   1.38x
+    O=6144 I=2048 S=1 : 106 -> 73 us   1.45x
+    O=2048 I=6144 S=3 : 180 -> 61 us   2.95x
+    O=2048 I=6144 S=5 : 278 -> 74 us   3.74x
+
+S=1 is copy/launch-latency bound end to end (kernel-only gain is larger); the
+win grows with S because skinny batches N rows in one launch that reuses the
+LDS-staged activation, where the naive kernel does S separate grid launches.
+Only the single-tensor `coli_cuda_matmul` path is wired so far; `expert_mlp`
+and the grouped-expert path still use `quant_matmul` (follow-up).
 
 ## Payoff and when to do it
 

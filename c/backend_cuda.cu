@@ -4,6 +4,7 @@
 /* asgard/AMD ROCm build: compile this CUDA backend under HIP by aliasing the
    small runtime surface it uses. One source, dual target (nvcc or hipcc). */
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #define cudaError_t             hipError_t
 #define cudaSuccess             hipSuccess
 #define cudaGetErrorString      hipGetErrorString
@@ -49,12 +50,17 @@ struct ColiCudaTensor {
     size_t weight_bytes;
     int fmt, I, O, device;
     int tracked;
+    /* HIP skinny int4 path (built lazily on first COLI_HIP_SKINNY matmul). */
+    void *w_skinny;   /* repacked uint4b8 weights, kernel layout [O, I/2] */
+    void *scale_h;    /* fp16 per-row scales [O] */
 };
 
 typedef struct {
     int device;
+    int cu_count;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    void *xh, *yh; size_t xh_cap, yh_cap;   /* fp16 scratch for skinny path */
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
@@ -311,6 +317,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if (!select_ctx(ctx)) { g_nctx = 0; return 0; }
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
+        ctx->cu_count = prop.multiProcessorCount;
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             g_nctx=0;return 0;
         }
@@ -334,6 +341,9 @@ extern "C" void coli_cuda_shutdown(void) {
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
+        if (ctx->xh) cudaFree(ctx->xh);
+        if (ctx->yh) cudaFree(ctx->yh);
+        ctx->xh=ctx->yh=nullptr; ctx->xh_cap=ctx->yh_cap=0;
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
@@ -430,6 +440,44 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
         (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
 }
 
+#ifdef COLI_HIP
+/* Launchers defined in skinny_int4_hip.cu (compiled by hipcc). */
+extern "C" int coli_hip_int4_gemv(half *C, const half *A, const uint8_t *Wpacked,
+                                  const half *scale, int Nout, int K, int Mrows,
+                                  int cu_count, hipStream_t stream);
+extern "C" void coli_hip_int4_repack(uint8_t *dst, const uint8_t *src, int O,
+                                     int K, hipStream_t stream);
+extern "C" void coli_hip_f32_to_f16(half *dst, const float *src, size_t n,
+                                    hipStream_t stream);
+extern "C" void coli_hip_f16_to_f32(float *dst, const half *src, size_t n,
+                                    hipStream_t stream);
+
+/* Build (once) the repacked uint4b8 weights + fp16 scales the skinny kernel
+   needs. Returns 1 when the tensor is skinny-eligible and ready. */
+static int ensure_skinny(ColiCudaTensor *t, DeviceContext *ctx) {
+    if (t->fmt != 2 || t->I % 16 != 0) return 0;
+    if (t->w_skinny) return 1;
+    void *w = nullptr, *sc = nullptr;
+    if (!cuda_ok(cudaMalloc(&w, t->weight_bytes), "skinny weight alloc")) return 0;
+    if (!cuda_ok(cudaMalloc(&sc, (size_t)t->O * sizeof(half)), "skinny scale alloc")) {
+        cudaFree(w); return 0;
+    }
+    coli_hip_int4_repack((uint8_t*)w, (const uint8_t*)t->weights, t->O, t->I, ctx->stream);
+    coli_hip_f32_to_f16((half*)sc, t->scales, (size_t)t->O, ctx->stream);
+    if (!cuda_ok(cudaGetLastError(), "skinny repack") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->stream), "skinny repack sync")) {
+        cudaFree(w); cudaFree(sc); return 0;
+    }
+    t->w_skinny = w; t->scale_h = sc;
+    return 1;
+}
+
+static int skinny_enabled(void) {
+    const char *e = getenv("COLI_HIP_SKINNY");
+    return e && atoi(e);
+}
+#endif
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
@@ -442,6 +490,25 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+#ifdef COLI_HIP
+    if (skinny_enabled() && fmt == 2 && ensure_skinny(t, ctx)) {
+        size_t xhb = (size_t)S * I * sizeof(half), yhb = (size_t)S * O * sizeof(half);
+        if (reserve_bytes(&ctx->xh, &ctx->xh_cap, xhb) &&
+            reserve_bytes(&ctx->yh, &ctx->yh_cap, yhb)) {
+            coli_hip_f32_to_f16((half*)ctx->xh, ctx->x, (size_t)S * I, ctx->stream);
+            if (coli_hip_int4_gemv((half*)ctx->yh, (const half*)ctx->xh,
+                                   (const uint8_t*)t->w_skinny, (const half*)t->scale_h,
+                                   O, I, S, ctx->cu_count, ctx->stream)) {
+                coli_hip_f16_to_f32(ctx->y, (const half*)ctx->yh, (size_t)S * O, ctx->stream);
+                if (cuda_ok(cudaGetLastError(), "skinny matmul") &&
+                    cuda_ok(cudaStreamSynchronize(ctx->stream), "skinny sync") &&
+                    cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "skinny output"))
+                    return 1;
+                return 0;
+            }
+        }
+    }
+#endif
     dim3 grid((unsigned)O, (unsigned)S);
     quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
@@ -622,6 +689,10 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     }
     if (tensor->weights) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
+#ifdef COLI_HIP
+    if (tensor->w_skinny) cudaFree(tensor->w_skinny);
+    if (tensor->scale_h) cudaFree(tensor->scale_h);
+#endif
     std::free(tensor);
 }
 

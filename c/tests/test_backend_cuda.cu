@@ -31,6 +31,27 @@ int main(int argc, char **argv) {
     size_t count = 99, bytes = 99;
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
+
+    {
+        /* Skinny int4 kernel (HIP gfx1100): compare hot path vs naive on a real
+           shape (K multiple of 16, fits LDS). On CUDA the skinny path is
+           compiled out, so both runs are naive and this is a trivial pass. */
+        const int SO = 64, SI = 256;
+        static uint8_t sw[64 * 256 / 2];
+        static float ss[64], sx[256], sref[64], sgot[64];
+        for (int i = 0; i < SO * SI / 2; i++) sw[i] = (uint8_t)((i * 37 + 11) & 0xFF);
+        for (int i = 0; i < SO; i++) ss[i] = 0.01f + (i % 7) * 0.003f;
+        for (int i = 0; i < SI; i++) sx[i] = ((i % 11) - 5) * 0.1f;
+        ColiCudaTensor *sk_ref = nullptr, *sk_hot = nullptr;
+        unsetenv("COLI_HIP_SKINNY");
+        if (!coli_cuda_matmul(&sk_ref, sref, sx, sw, ss, 2, 1, SI, SO, d0)) return 1;
+        setenv("COLI_HIP_SKINNY", "1", 1);
+        if (!coli_cuda_matmul(&sk_hot, sgot, sx, sw, ss, 2, 1, SI, SO, d0)) return 1;
+        unsetenv("COLI_HIP_SKINNY");
+        if (!relative_rms(sgot, sref, SO, 0.02f)) return 1;
+        coli_cuda_tensor_free(sk_ref);
+        coli_cuda_tensor_free(sk_hot);
+    }
     const float x[8] = {1, -2, 3, -4, 2, 1, -1, 0.5f};
     float got[4];
 

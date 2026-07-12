@@ -90,7 +90,7 @@ GPU_TEST_DEVICES ?= 0
 ifeq ($(HIP),1)
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-CUDA_OBJ  = backend_cuda.o
+CUDA_OBJ  = backend_cuda.o skinny_int4_hip.o
 GPU_CC    = $(HIPCC) $(HIPCCFLAGS) -DCOLI_HIP -DCOLI_CUDA
 else
 GPU_CC    = $(NVCC) $(NVCCFLAGS)
@@ -107,8 +107,11 @@ glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	$(GPU_CC) -c backend_cuda.cu -o $@
 
-cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	$(GPU_CC) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+skinny_int4_hip.o: skinny_int4_hip.cu
+	$(GPU_CC) -c skinny_int4_hip.cu -o $@
+
+cuda-test: backend_cuda.cu backend_cuda.h skinny_int4_hip.cu tests/test_backend_cuda.cu
+	$(GPU_CC) backend_cuda.cu skinny_int4_hip.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE) $(GPU_TEST_DEVICES)
 
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
@@ -156,7 +159,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o skinny_int4_hip.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all glm cuda-test cuda-bench portable test-c test-python test check clean
