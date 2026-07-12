@@ -1,0 +1,74 @@
+#version 450
+// Quantized mat-vec/mat-mat mirroring colibri's CUDA quant_matmul:
+//   y[s,o] = ( sum_i x[s,i] * dequant(W[o,i]) ) * scale[o]
+// fmt: 1=int8, 2=int4 (packed 2/byte, nibble-8). Weights are a byte buffer
+// exposed as uint32 words; we extract bytes/nibbles manually (no 8-bit-storage
+// extension dependency). One workgroup per (o,s); threads reduce over I.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };   // row-major, row o at o*rowWords
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;   // 1=int8, 2=int4
+    int S, I, O;
+    int rowWords;  // uint32 words per weight row
+} p;
+
+shared float partial[256];
+
+// signed int8 from a uint32 word's byte lane
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+// int4 (value - 8) from a uint32 word's nibble lane (0..7)
+float i4(uint word, int lane) {
+    int nib = int((word >> (uint(lane) * 4u)) & 0xfu);
+    return float(nib - 8);
+}
+
+void main() {
+    int o = int(gl_WorkGroupID.x);
+    int s = int(gl_WorkGroupID.y);
+    int t = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+
+    uint rowBase = uint(o) * uint(p.rowWords);
+    int xbase = s * p.I;
+    float sum = 0.0;
+
+    if (p.fmt == 1) {
+        // 4 int8 weights per uint word; stride threads over words.
+        int words = (p.I + 3) / 4;
+        for (int wi = t; wi < words; wi += nth) {
+            uint packed = w[rowBase + uint(wi)];
+            int i0 = wi * 4;
+            for (int k = 0; k < 4; k++) {
+                int i = i0 + k;
+                if (i < p.I) sum += x[xbase + i] * i8(packed, k);
+            }
+        }
+    } else { // fmt == 2, int4
+        int words = (p.I + 7) / 8;
+        for (int wi = t; wi < words; wi += nth) {
+            uint packed = w[rowBase + uint(wi)];
+            int i0 = wi * 8;
+            for (int k = 0; k < 8; k++) {
+                int i = i0 + k;
+                if (i < p.I) sum += x[xbase + i] * i4(packed, k);
+            }
+        }
+    }
+
+    partial[t] = sum;
+    barrier();
+    for (int n = nth >> 1; n > 0; n >>= 1) {
+        if (t < n) partial[t] += partial[t + n];
+        barrier();
+    }
+    if (t == 0) y[s * p.O + o] = partial[0] * scale[o];
+}

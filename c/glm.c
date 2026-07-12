@@ -39,6 +39,10 @@
 #include <omp.h>
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_VULKAN
+#include <omp.h>
+#include "backend_vulkan.h"
+#endif
 #ifdef __AVX2__
 #include <immintrin.h>
 static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
@@ -75,6 +79,9 @@ typedef struct {
     ColiCudaTensor *cuda;
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+#ifdef COLI_VULKAN
+    ColiVkTensor *vk; int vk_eligible, vk_failed;  /* iGPU-resident copy (single device, no PCIe copy) */
+#endif
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -184,6 +191,48 @@ static int parse_cuda_devices(const char *list, int *out){
         if(!*p) return 0;
     }
     return n;
+}
+#endif
+#ifdef COLI_VULKAN
+/* Single iGPU (Strix Halo, RADV gfx1151). Weight "uploads" write into
+ * HOST_VISIBLE|DEVICE_LOCAL shared RAM — no PCIe copy — but the backend still
+ * allocates a padded Vulkan-owned copy, so VK_EXPERT_GB caps real RAM use. */
+static int g_vk_enabled;
+static double g_vk_expert_gb;
+static int g_vk_dense;
+static int g_vk_stream;   /* VK_STREAM=1: also run STREAMED/cached experts on the iGPU (not just
+                           * the VK_EXPERT_GB-pinned tier). Each streamed expert keeps BOTH its CPU
+                           * slab AND a Vulkan-owned copy (~2x RAM for the whole streaming cache,
+                           * bounded only by slot count) — and on a unified-memory APU the shared
+                           * bus makes it break-even-to-slower. So it is OFF by default; opt in
+                           * only on a host whose GPU has its own high-bandwidth VRAM. */
+static void qt_vk_reset(QT *t){
+    if(t->vk){ coli_vk_tensor_free(t->vk); t->vk=NULL; }
+    t->vk_failed=0;
+}
+/* Mark a freshly-(re)loaded expert QT eligible for the iGPU when streamed-GPU is on.
+ * Called from expert_load (possibly on a PIPE worker thread): a plain field write, no
+ * Vulkan call — the lazy upload happens later on the MAIN thread inside coli_vk_matmul.
+ * Only int8/int4 run on the shader; fmt 0/3 stay on CPU. vk_eligible persists across
+ * slab reuse (same eligibility every load); qt_vk_reset drops the stale device copy. */
+static inline void qt_vk_mark_stream(QT *t){
+    if(g_vk_enabled && g_vk_stream && (t->fmt==1||t->fmt==2)) t->vk_eligible=1;
+}
+/* No upload-only entry point in the backend: a 1-row matmul forces the resident
+ * copy and validates capacity, mirroring CUDA's fail-early tensor_upload. */
+static int qt_vk_upload(QT *t){
+    if(t->fmt!=1 && t->fmt!=2) return 0;
+    const void *weights = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    float *x=calloc((size_t)t->I,sizeof(float));
+    float *y=malloc((size_t)t->O*sizeof(float));
+    if(!x||!y){ free(x); free(y); return 0; }
+    int ok=coli_vk_matmul(&t->vk,y,x,weights,t->s,t->fmt,1,t->I,t->O);
+    free(x); free(y);
+    return ok;
+}
+static void vk_stats_print(void){
+    size_t used=0,n=0; coli_vk_mem_info(&used,&n);
+    fprintf(stderr,"[VK] resident set: %zu tensor, %.2f GB shared RAM\n",n,used/1e9);
 }
 #endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
@@ -487,6 +536,21 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
             w->O,w->I,w->cuda_device);
     }
 #endif
+#ifdef COLI_VULKAN
+    /* Same contract as the CUDA path: only model-resident / pinned tensors are
+     * eligible (a reused streaming slot must never enter the iGPU cache), and
+     * nested OpenMP calls stay on CPU because the backend owns one synchronous
+     * scratch + command buffer. Only int8/int4 run on the iGPU (fmt 0/3 -> CPU). */
+    if(g_vk_enabled && w->vk_eligible && !w->vk_failed && !omp_in_parallel()){
+        const void *weights = w->fmt==1 ? (const void*)w->q8
+                            : w->fmt==2 ? (const void*)w->q4 : NULL;
+        if(weights){
+            if(coli_vk_matmul(&w->vk,y,x,weights,w->s,w->fmt,S,w->I,w->O)) return;
+            w->vk_failed=1;
+            fprintf(stderr,"[VK] tensor [%d,%d] disabilitato dopo errore; fallback CPU\n",w->O,w->I);
+        }
+    }
+#endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
@@ -746,6 +810,9 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
     }
 #endif
+#ifdef COLI_VULKAN
+    if(g_vk_enabled&&g_vk_dense && (t.fmt==1||t.fmt==2)) t.vk_eligible=1;  /* iGPU supports int8/int4 only */
+#endif
     return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
@@ -924,6 +991,11 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
      * Keep its tier assignment, but invalidate the old device weights. */
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
+#ifdef COLI_VULKAN
+    /* A live REPIN reuses a GPU-enabled pinned slot for a different expert:
+     * drop the stale iGPU copy but keep vk_eligible so it re-uploads lazily. */
+    if(s->eid!=eid){ qt_vk_reset(&s->g); qt_vk_reset(&s->u); qt_vk_reset(&s->d); }
+#endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
@@ -934,6 +1006,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
+#ifdef COLI_VULKAN
+        qt_vk_mark_stream(&s->g); qt_vk_mark_stream(&s->u); qt_vk_mark_stream(&s->d);
+#endif
         s->eid=eid; return 0;
     }
     st_tensor *tw[3], *tq[3];
@@ -1009,6 +1084,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+#ifdef COLI_VULKAN
+        qt_vk_mark_stream(qt[k]);   /* streamed/cached expert -> iGPU when VK_STREAM on */
+#endif
     }
     s->eid=eid; return 0;
 }
@@ -1422,6 +1500,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             if(!nr) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+#endif
+#ifdef COLI_VULKAN
+            if(g_vk_enabled && e->g.vk_eligible) m->gpu_expert_calls++;
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
@@ -2048,6 +2129,12 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
+#ifdef COLI_VULKAN
+    if(m->gpu_expert_count || m->gpu_expert_calls)
+        printf("VK expert tier: %d pinned residenti (%.2f GB shared RAM)%s | %llu chiamate servite da iGPU\n",
+        m->gpu_expert_count,m->gpu_expert_bytes/1e9, g_vk_stream?" + streamed":"",(unsigned long long)m->gpu_expert_calls);
+    if(g_vk_enabled) vk_stats_print();
+#endif
 }
 
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
@@ -2088,6 +2175,12 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
+#endif
+#ifdef COLI_VULKAN
+    if(m->gpu_expert_count || m->gpu_expert_calls)
+        printf("VK expert tier: %d pinned residenti (%.2f GB shared RAM)%s | %llu chiamate servite da iGPU\n",
+        m->gpu_expert_count,m->gpu_expert_bytes/1e9, g_vk_stream?" + streamed":"",(unsigned long long)m->gpu_expert_calls);
+    if(g_vk_enabled) vk_stats_print();
 #endif
     profile_print(m,dt);
     if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
@@ -2152,6 +2245,12 @@ static void repin_pass(Model *m){
                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
 #endif
+#ifdef COLI_VULKAN
+        int vkgpu=s->g.vk_eligible;
+        int64_t old_vk=vkgpu ? (int64_t)coli_vk_tensor_bytes(s->g.vk)
+                              +(int64_t)coli_vk_tensor_bytes(s->u.vk)
+                              +(int64_t)coli_vk_tensor_bytes(s->d.vk) : 0;
+#endif
         double t0=now_s();
         expert_load(m,cd[b].l,cd[b].eid,s,1);       /* disk -> RAM, same resident slot */
         const char *tier="RAM";
@@ -2167,6 +2266,25 @@ static void repin_pass(Model *m){
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
                 m->gpu_expert_count--; m->gpu_expert_bytes-=old_gpu;
                 fprintf(stderr,"[REPIN] VRAM upload failed; slot downgraded to RAM\n");
+            }
+        }
+#endif
+#ifdef COLI_VULKAN
+        if(vkgpu){                                /* refresh the same iGPU slot now, not lazily */
+            if(qt_vk_upload(&s->g) && qt_vk_upload(&s->u) && qt_vk_upload(&s->d)){
+                int64_t now_vk=(int64_t)coli_vk_tensor_bytes(s->g.vk)
+                              +(int64_t)coli_vk_tensor_bytes(s->u.vk)
+                              +(int64_t)coli_vk_tensor_bytes(s->d.vk);
+                m->gpu_expert_bytes+=now_vk-old_vk; tier="iGPU";
+            } else {
+                qt_vk_reset(&s->g); qt_vk_reset(&s->u); qt_vk_reset(&s->d);
+                s->g.vk_eligible=s->u.vk_eligible=s->d.vk_eligible=0;
+                /* Only the VK_EXPERT_GB-pinned tier is counted in gpu_expert_count; a
+                 * streamed slot (VK_STREAM=1) is vk_eligible but uncounted, so guard the
+                 * decrement against underflow. */
+                if(m->gpu_expert_count) m->gpu_expert_count--;
+                m->gpu_expert_bytes-=old_vk;
+                fprintf(stderr,"[REPIN] upload iGPU fallito; slot degradato a RAM\n");
             }
         }
 #endif
@@ -2600,6 +2718,36 @@ static void pin_load(Model *m, const char *statspath, double gb){
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
 #endif
+#ifdef COLI_VULKAN
+    if(g_vk_enabled && g_vk_expert_gb>0){
+        /* Unified memory: no separate VRAM pool, but each eligible expert gets a
+         * padded Vulkan-owned copy, so the budget caps that extra shared RAM.
+         * Upload eagerly (1-row matmul) so capacity failures surface at startup. */
+        double budget=g_vk_expert_gb*1e9;
+        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
+            int li=r[a].l;
+            for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
+                ESlot *s=&m->pin[li][z];
+                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+                if(m->gpu_expert_bytes+need>budget) break;
+                s->g.vk_eligible=s->u.vk_eligible=s->d.vk_eligible=1;
+                if(qt_vk_upload(&s->g) && qt_vk_upload(&s->u) && qt_vk_upload(&s->d)){
+                    int64_t actual=(int64_t)coli_vk_tensor_bytes(s->g.vk)
+                                  +(int64_t)coli_vk_tensor_bytes(s->u.vk)
+                                  +(int64_t)coli_vk_tensor_bytes(s->d.vk);
+                    m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                } else {
+                    qt_vk_reset(&s->g); qt_vk_reset(&s->u); qt_vk_reset(&s->d);
+                    s->g.vk_eligible=s->u.vk_eligible=s->d.vk_eligible=0;
+                    fprintf(stderr,"[VK] upload expert fallito; slot resta su CPU\n");
+                }
+                break;
+            }
+        }
+        fprintf(stderr,"[VK] hot expert tier: %d/%d expert, shared RAM %.2f GB (budget %.1f GB)\n",
+            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_vk_expert_gb);
+    }
+#endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l);
 }
@@ -2805,6 +2953,35 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+#ifdef COLI_VULKAN
+    if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
+#ifdef COLI_CUDA
+        if(g_cuda_enabled){ fprintf(stderr,"COLI_VULKAN e COLI_CUDA sono mutuamente esclusivi\n"); return 2; }
+#endif
+        const char *spv=getenv("VK_SPV"); if(!spv||!*spv) spv="shaders/qmatmul.spv";
+        g_vk_enabled=coli_vk_init(spv);
+        if(!g_vk_enabled){ fprintf(stderr,"[VK] backend richiesto ma non disponibile\n"); return 2; }
+    }
+    g_vk_dense=getenv("VK_DENSE")?atoi(getenv("VK_DENSE")):0;
+    g_vk_expert_gb=getenv("VK_EXPERT_GB")?atof(getenv("VK_EXPERT_GB")):0;
+    /* streamed-expert iGPU offload: default OFF — it ~2x's expert-cache RAM (CPU slab +
+     * VK copy, uncapped) and is net-negative on unified memory. VK_STREAM=1 opts in for a
+     * discrete-VRAM host; the VK_EXPERT_GB-pinned tier is unaffected either way. */
+    g_vk_stream=getenv("VK_STREAM")?atoi(getenv("VK_STREAM")):0;
+    if(g_vk_dense&&!g_vk_enabled){ fprintf(stderr,"VK_DENSE richiede COLI_VULKAN=1\n"); return 2; }
+    if(g_vk_expert_gb>0 && !g_vk_enabled){ fprintf(stderr,"VK_EXPERT_GB richiede COLI_VULKAN=1\n"); return 2; }
+    if(g_vk_stream && !g_vk_enabled){ fprintf(stderr,"VK_STREAM richiede COLI_VULKAN=1\n"); return 2; }
+    if(g_vk_enabled) fprintf(stderr,"[VK] mode: routed experts%s | streamed-expert iGPU %s\n",
+        g_vk_dense?" + resident dense tensors":" only (resident dense on CPU)",
+        g_vk_stream?"ON (all experts)":"OFF (pinned tier only)");
+#else
+    if((getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))) ||
+       (getenv("VK_DENSE") && atoi(getenv("VK_DENSE"))) ||
+       (getenv("VK_EXPERT_GB") && atof(getenv("VK_EXPERT_GB"))>0)){
+        fprintf(stderr,"Vulkan richiesto ma questo binario e' CPU-only; ricompila con: make VK=1\n");
+        return 2;
+    }
+#endif
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
@@ -2900,6 +3077,9 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();
 #endif
+#ifdef COLI_VULKAN
+        if(g_vk_enabled) vk_stats_print();
+#endif
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
@@ -2918,6 +3098,11 @@ int main(int argc, char **argv){
     if(m.gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
+#endif
+#ifdef COLI_VULKAN
+    if(m.gpu_expert_count) printf("VK expert tier: %d residenti (%.2f GB shared RAM) | %llu chiamate servite da iGPU\n",
+        m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
+    if(g_vk_enabled) vk_stats_print();
 #endif
     if(g_looka){
         const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};

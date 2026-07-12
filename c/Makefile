@@ -80,13 +80,34 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
+# VK=1 adds an opt-in Vulkan compute backend for resident/pinned quantized
+# matmul, targeting the Strix Halo iGPU (RADV gfx1151). Independent of CUDA and
+# toggleable alongside it. The default build stays pure C. Runtime-gated by the
+# COLI_VULKAN=1 environment variable; shader path overridable via VK_SPV.
+VK        ?= 0
+GLSLC     ?= glslc
+VK_OBJ     =
+VK_SHADER  =
+ifeq ($(VK),1)
+CFLAGS    += -DCOLI_VULKAN
+LDFLAGS   += -lvulkan
+VK_OBJ     = backend_vulkan.o
+VK_SHADER  = shaders/qmatmul.spv
+endif
+
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SHADER)
+	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(VK_OBJ) -o glm$(EXE) $(LDFLAGS)
+
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+
+shaders/qmatmul.spv: shaders/qmatmul.comp
+	$(GLSLC) $< -o $@
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -134,7 +155,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_vulkan.o shaders/qmatmul.spv $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all glm cuda-test portable test-c test-python test check clean
