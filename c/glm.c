@@ -224,6 +224,38 @@ static float *falloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld fuori range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static int g_i4_acc512=1;
+static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+    __m512 acc=_mm512_setzero_ps(); int i=0;
+    for(;i+32<=I;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+        __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+        __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+        acc=_mm512_fmadd_ps(_mm512_loadu_ps(x+i),w0,acc);
+        acc=_mm512_fmadd_ps(_mm512_loadu_ps(x+i+16),w1,acc);
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+static int i4_acc512_selftest(void){
+    enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
+    for(int i=0;i<N;i++){
+        int q=((i*13+5)&15)-8;
+        if(!(i&1)) w[i>>1]=(uint8_t)(q+8);
+        else w[i>>1]|=(uint8_t)((q+8)<<4);
+        x[i]=(float)(((i*29+7)%101)-50)/37.f;
+    }
+    for(int n=32;n<=N;n+=32){
+        float ref=0; for(int i=0;i<n;i++) ref+=x[i]*(float)(((w[i>>1]>>((i&1)*4))&15)-8);
+        float got=dot_i4f_avx512(w,x,n),tol=2e-5f*(1.f+fabsf(ref));
+        if(fabsf(got-ref)>tol){ fprintf(stderr,"AVX512 i4 selftest n=%d: %.9g != %.9g\n",n,got,ref); return 0; }
+    }
+    return 1;
+}
+#endif
+
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
     #pragma omp parallel for schedule(static)
@@ -255,6 +287,10 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            if(g_i4_acc512){ a=dot_i4f_avx512(w,xs,I); i=I&~31; }
+            else {
+#endif
 #ifdef __AVX2__
             const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
             __m256 acc=_mm256_setzero_ps();
@@ -279,6 +315,9 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
             a=vaddvq_f32(vaddq_f32(ac0,ac1));
 #endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            }
+#endif
             for(;i+1<I;i+=2){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8, hi=(int)(byte>>4)-8;
                 a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
             if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
@@ -295,6 +334,10 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
     for(int z=0;z<2*O;z++){
         int o=z<O?z:z-O; const uint8_t *w=(z<O?qg:qu)+(int64_t)o*rb;
         float a=0; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        if(g_i4_acc512){ a=dot_i4f_avx512(w,x,I); i=I&~31; }
+        else {
+#endif
 #ifdef __AVX2__
         const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
         __m256 acc=_mm256_setzero_ps();
@@ -318,6 +361,9 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
             ac0=vfmaq_f32(ac0,vld1q_f32(x+i+8),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
             ac1=vfmaq_f32(ac1,vld1q_f32(x+i+12),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
         a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        }
 #endif
         for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; a+=x[i]*(float)((b&15)-8)+x[i+1]*(float)((b>>4)-8); }
         if(i<I) a+=x[i]*(float)((w[i>>1]&15)-8);
@@ -3024,6 +3070,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
 int main(int argc, char **argv){
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if(getenv("I4_ACC512")) g_i4_acc512=atoi(getenv("I4_ACC512"))!=0;
+    if(getenv("I4_ACC512_TEST")){
+        if(!i4_acc512_selftest()) return 1;
+        puts("AVX512 i4 selftest: ok"); return 0;
+    }
+#endif
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
