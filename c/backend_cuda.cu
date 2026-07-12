@@ -500,15 +500,18 @@ static int skinny_gemv_rows(half *C, const half *A, const void *w, const void *s
     return 1;
 }
 
-/* Per-tensor row GEMV. Default rows>8 path is the chunked skinny kernel, which
-   is bandwidth-tuned. The WMMA matrix-core kernel (COLI_HIP_WMMA=1) is correct
-   but currently occupancy/latency-bound and slower than skinny at these shapes;
-   it is opt-in until the split-K + double-buffering work lands (see the plan). */
+/* Per-tensor row GEMV. rows<=8 -> skinny (bandwidth-tuned). rows>8 -> WMMA
+   matrix cores when they win: large-K projections at any batch, or large batch.
+   WMMA loses to skinny on small-K wide-output shapes at low rows, so gate on
+   (K>=4096 || rows>=48); COLI_HIP_WMMA=0 forces skinny. The WMMA launcher also
+   self-rejects unsupported shapes (falls back). */
 static int expert_gemv_rows(ColiCudaTensor *t, half *C, const half *A, int rows,
                             DeviceContext *ctx) {
     int M = t->O, K = t->I;
-    int use_wmma = getenv("COLI_HIP_WMMA") && atoi(getenv("COLI_HIP_WMMA"));
-    if (rows > 8 && use_wmma && M % 16 == 0 && K % 16 == 0 &&
+    const char *we = getenv("COLI_HIP_WMMA");
+    int wmma = we ? atoi(we)                       /* explicit: force on/off */
+                  : (K >= 4096 || rows >= 48);     /* default: auto by shape */
+    if (rows > 8 && wmma && M % 16 == 0 && K % 16 == 0 &&
         coli_hip_int4_wmma(C, A, (const uint8_t*)t->weights, t->scales, M, K, rows, ctx->stream))
         return 1;
     return skinny_gemv_rows(C, A, t->w_skinny, t->scale_h, M, K, rows, ctx);

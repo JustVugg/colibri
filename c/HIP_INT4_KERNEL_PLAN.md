@@ -2,7 +2,7 @@
 
 Status: steps 1-5 landed (kernel ported to `c/skinny_int4_hip.cu`, repack +
 fp16 glue, wired into matmul & fused expert paths behind `COLI_HIP_SKINNY=1`, validated
-by `make cuda-test HIP=1`). Step 6 (WMMA path) is implemented and validated but opt-in (needs perf work); rows>8 defaults to chunked skinny.
+by `make cuda-test HIP=1`). Step 6 (split-K WMMA) beats skinny for rows>8 on large-K/high-batch shapes and is default-on there (COLI_HIP_WMMA overrides); more speedup needs double-buffering + coalesced loads.
 
 Colibri's GPU expert matmul on AMD works
 correctly but is bandwidth-inefficient. This is the plan to close the gap by
@@ -89,28 +89,40 @@ Steps 1-4 done; 5-6 remain.
    first-correct version is occupancy/latency-bound and slower than chunked
    skinny at real shapes, so it is opt-in (`COLI_HIP_WMMA=1`); see below.
 
-## Result (step 6: WMMA, opt-in)
+## Result (step 6: WMMA, default-on for rows>8 where it wins)
 
 `coli_hip_int4_wmma` computes C[rows,Nout]=A@dequant(W)^T with rocWMMA
-16x16x16 f16 tiles, one wave per output tile looping K once. It is numerically
-correct (relRMS ~2e-4 vs a CPU reference; wired path matches naive within fp16
-tolerance) but not yet fast. Pure-kernel time vs chunked skinny (RX 7900 XTX):
+16x16x16 f16 tiles. It dequants straight from the signed-s4 weights and applies
+the per-channel scale at store time (no repack). Numerically correct (relRMS
+~2e-4 vs a CPU reference; wired path matches naive within fp16 tolerance).
 
-    Nout=2048 K=6144 rows=16/32/64 : wmma 589/877/1740us  skinny 67/126/249us
-    Nout=6144 K=2048 rows=16/32/64 : wmma 199/300/572us   skinny 43/86/173us
+Structure that made it win (the first-correct one-wave-does-all-rows version was
+latency-bound at ~11 GB/s):
+  - One wave owns one 16x16 output tile (out-tile = blockIdx.x*WV+wave, row-tile
+    = blockIdx.y), so parallelism scales with both output width and rows. This
+    is the main lever -- the kernel is occupancy/latency-bound, not
+    bandwidth-bound, so more resident waves beats fewer-waves-less-traffic.
+  - WV=4 waves per block share the LDS-staged activation tile; BK=32 amortizes
+    the barrier over two WMMA-K steps.
+  - Split-K over blockIdx.z (G slices, fp32 atomic accumulate + a scale pass)
+    only when the output grid is too small to fill the GPU (blocks < 256);
+    otherwise a single slice stores straight to C (no atomic/scale overhead).
 
-WMMA is 3-10x slower (~4-32 GB/s effective). Root causes and the work needed to
-reach the ~40% (~384 GB/s) the handoff targets:
-  - Occupancy: one wave per workgroup, and only Nout/16 output tiles of
-    parallelism (128 for Nout=2048). Needs split-K (partial sums + atomic add)
-    to expose more waves, and/or multiple waves per block sharing a staged
-    activation tile.
-  - Latency: a __syncthreads every 16 K-elements with no double-buffering, so
-    the int4 dequant (VALU) is fully exposed instead of overlapping the WMMA.
-  - Weight loads are byte-wise and uncoalesced; should be vectorized (uint4).
-  - Epilogue stages to LDS for the per-column scale; bounds-safe direct global
-    stores would cut LDS pressure.
-Until that lands, the rows>8 default stays chunked skinny (correct, ~3x naive).
+Pure-kernel time vs chunked skinny (RX 7900 XTX, weights = 6.3 MB, part
+cache-resident so GB/s is relative-only):
+
+    Nout=2048 K=6144 rows=16/32/64 : wmma 74/96/177us  skinny 79/119/233us  1.08/1.23/1.32x
+    Nout=6144 K=2048 rows=16/32/64 : wmma 59/96/140us  skinny 40/80/159us   0.68/0.83/1.13x
+
+WMMA wins across all batch sizes on the large-K projections (gate/up, K=6144)
+and at high batch on small-K (down, K=2048); it loses to skinny on small-K
+wide-output at low rows. So the wired dispatch uses WMMA for rows>8 when
+(K>=4096 || rows>=48), else chunked skinny; `COLI_HIP_WMMA=0/1` forces the
+choice. rows<=8 always uses skinny.
+
+Not yet done (would push past ~1.3x toward the handoff's ~3x): LDS
+double-buffering to overlap the int4 dequant (VALU) under the WMMA, vectorized
+(uint4) coalesced weight loads, and BK/WV autotuning per shape.
 
 ## Result (steps 1-5)
 
@@ -148,8 +160,9 @@ S=1 is copy/launch-latency bound end to end (kernel-only gain is larger); the
 win grows with S because skinny batches N rows in one launch that reuses the
 LDS-staged activation, where the naive kernel does S separate grid launches.
 The single-tensor, fused-`expert_mlp`, and grouped-`expert_group` paths are all
-wired. Remaining: making the opt-in WMMA path (step 6, `COLI_HIP_WMMA=1`) beat
-chunked skinny via split-K + double-buffering + coalesced weight loads.
+wired. rows>8 uses WMMA where it beats skinny (large-K or high-batch) and
+chunked skinny elsewhere. Further WMMA speedup (toward ~3x) needs double-
+buffering + coalesced weight loads + BK/WV autotuning.
 
 ## Payoff and when to do it
 

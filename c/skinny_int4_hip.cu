@@ -266,91 +266,124 @@ extern "C" void coli_hip_f16_to_f32(float* dst, const half* src, size_t n,
   f16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(dst, src, n);
 }
 
-// ---- WMMA batched int4 GEMM (RDNA3 matrix cores), for rows in [~8,64] ----
+// ---- WMMA batched int4 GEMM (RDNA3 matrix cores), for rows>8 ----
 // C[rows,Nout] = A[rows,K] @ dequant(W)^T. W is colibri signed-s4 [Nout,K/2]
-// (after the upload XOR); the per-channel fp32 scale is applied after the
-// accumulate, so dequant is just nibble->fp16 of a small signed int (exact).
-// One workgroup (one wave32) owns a 16-wide output tile and loops K once,
-// reusing each weight tile across up to 4 row-subtiles -> weights streamed once
-// per output tile (unlike the skinny kernel, which re-streams per <=8-row chunk).
+// (after the upload XOR); the per-channel fp32 scale is applied at store time,
+// so dequant is just nibble->fp16 of a small signed int (exact).
+//
+// One wave owns one 16x16 output tile (out-tile blockIdx.x*WV+wave, row-tile
+// blockIdx.y) -> parallelism scales with both output width and rows, which is
+// what keeps the GPU busy (this kernel is occupancy/latency-bound, not
+// bandwidth-bound). When that grid is still too small (narrow output at low
+// rows) K is split across blockIdx.z (grid.z=G): each slice atomic-adds its
+// partial into an fp32 accumulator, scaled in a second pass. WV waves per block
+// share the LDS-staged activation; BK amortizes the barrier over several WMMA-K.
 #if defined(__HIP__GFX1X__)
 #include <rocwmma/rocwmma.hpp>
 namespace rw = rocwmma;
 
-template <int MT>
-__global__ void wmma_int4(const int Nout, const int K, const int rows,
-                          const uint8_t* __restrict__ W,
-                          const half* __restrict__ A,
-                          const float* __restrict__ scale, half* C) {
-  const int nbase = blockIdx.x * 16;   // output-channel tile
+template <int WV, int BK>
+__global__ void __launch_bounds__(WV * 32)
+    wmma_int4(const int Nout, const int K, const int rows, const int Kchunk,
+              const uint8_t* __restrict__ W, const half* __restrict__ A,
+              const float* __restrict__ scale, float* __restrict__ Cf,
+              half* __restrict__ C) {
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nbase = (blockIdx.x * WV + wave) * 16;
+  const int row0 = blockIdx.y * 16;
   const int Kp = K / 2;
-  const int lane = threadIdx.x;        // one wave, 0..31
-  __shared__ rw::float16_t lB[16 * 16];
-  __shared__ rw::float16_t lA[MT][16 * 16];
-  __shared__ float lC[MT][16 * 16];
+  const int kstart = blockIdx.z * Kchunk;
+  const int kend = min(kstart + Kchunk, K);
+  __shared__ rw::float16_t lA[16 * BK];
+  __shared__ rw::float16_t lB[WV][BK * 16];
+  __shared__ float lC[WV][16 * 16];
 
-  rw::fragment<rw::accumulator, 16, 16, 16, float> acc[MT];
-  for (int mt = 0; mt < MT; mt++) rw::fill_fragment(acc[mt], 0.0f);
+  rw::fragment<rw::accumulator, 16, 16, 16, float> acc;
+  rw::fill_fragment(acc, 0.0f);
 
-  for (int k0 = 0; k0 < K; k0 += 16) {
-    for (int idx = lane; idx < 256; idx += 32) {   // B tile [k][n] = W[nbase+n][k0+k]
-      int k = idx >> 4, n = idx & 15;
-      int out = nbase + n, kk = k0 + k;
+  for (int k0 = kstart; k0 < kend; k0 += BK) {
+    for (int idx = threadIdx.x; idx < 16 * BK; idx += WV * 32) {   // A[m][k] ld=BK
+      int m = idx / BK, k = idx % BK, row = row0 + m;
+      lA[idx] = (row < rows) ? (rw::float16_t)A[(size_t)row * K + k0 + k]
+                             : (rw::float16_t)0.0f;
+    }
+    for (int idx = lane; idx < BK * 16; idx += 32) {              // B[k][n] ld=16
+      int k = idx >> 4, n = idx & 15, out = nbase + n, kk = k0 + k;
       uint8_t byte = W[(size_t)out * Kp + (kk >> 1)];
       int n4 = (kk & 1) ? (byte >> 4) : (byte & 15);
-      lB[idx] = (rw::float16_t)(float)((n4 & 8) ? n4 - 16 : n4);
+      lB[wave][idx] = (rw::float16_t)(float)((n4 & 8) ? n4 - 16 : n4);
     }
-    for (int mt = 0; mt < MT; mt++)
-      for (int idx = lane; idx < 256; idx += 32) {   // A tile [m][k]
-        int m = idx >> 4, k = idx & 15, row = mt * 16 + m;
-        lA[mt][idx] = (row < rows) ? (rw::float16_t)A[(size_t)row * K + k0 + k]
-                                   : (rw::float16_t)0.0f;
-      }
     __syncthreads();
-    rw::fragment<rw::matrix_b, 16, 16, 16, rw::float16_t, rw::row_major> bfrag;
-    rw::load_matrix_sync(bfrag, lB, 16);
-    for (int mt = 0; mt < MT; mt++) {
-      rw::fragment<rw::matrix_a, 16, 16, 16, rw::float16_t, rw::row_major> afrag;
-      rw::load_matrix_sync(afrag, lA[mt], 16);
-      rw::mma_sync(acc[mt], afrag, bfrag, acc[mt]);
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      rw::fragment<rw::matrix_a, 16, 16, 16, rw::float16_t, rw::row_major> af;
+      rw::fragment<rw::matrix_b, 16, 16, 16, rw::float16_t, rw::row_major> bf;
+      rw::load_matrix_sync(af, lA + kk, BK);
+      rw::load_matrix_sync(bf, lB[wave] + kk * 16, 16);
+      rw::mma_sync(acc, af, bf, acc);
     }
     __syncthreads();
   }
 
-  for (int mt = 0; mt < MT; mt++)
-    rw::store_matrix_sync(lC[mt], acc[mt], 16, rw::mem_row_major);
+  rw::store_matrix_sync(lC[wave], acc, 16, rw::mem_row_major);
   __syncthreads();
-  for (int mt = 0; mt < MT; mt++)
-    for (int idx = lane; idx < 256; idx += 32) {
-      int m = idx >> 4, n = idx & 15, row = mt * 16 + m;
-      if (row < rows) C[(size_t)row * Nout + nbase + n] =
-          (half)(lC[mt][idx] * scale[nbase + n]);
+  for (int idx = lane; idx < 256; idx += 32) {
+    int m = idx >> 4, n = idx & 15, row = row0 + m;
+    if (row < rows) {
+      if (Cf) atomicAdd(&Cf[(size_t)row * Nout + nbase + n], lC[wave][idx]);
+      else C[(size_t)row * Nout + nbase + n] = (half)(lC[wave][idx] * scale[nbase + n]);
     }
+  }
+}
+
+__global__ static void wmma_scale_cols(half* C, const float* Cf,
+                                       const float* scale, size_t n, int Nout) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) C[i] = (half)(Cf[i] * scale[i - (i / Nout) * Nout]);
 }
 #else
-template <int MT>
-__global__ void wmma_int4(const int, const int, const int, const uint8_t*,
-                          const half*, const float*, half*) {}
+template <int WV, int BK>
+__global__ void wmma_int4(const int, const int, const int, const int,
+                          const uint8_t*, const half*, const float*, float*, half*) {}
+__global__ static void wmma_scale_cols(half*, const float*, const float*, size_t, int) {}
 #endif
 
+// fp32 split-K accumulator scratch (kernel-launch-serialized per stream).
+static float* g_wmma_cf = nullptr;
+static size_t g_wmma_cf_cap = 0;
+static float* wmma_scratch(size_t n) {
+  if (n > g_wmma_cf_cap) {
+    if (g_wmma_cf) hipFree(g_wmma_cf);
+    if (hipMalloc(&g_wmma_cf, n * sizeof(float)) != hipSuccess) { g_wmma_cf_cap = 0; g_wmma_cf = nullptr; return nullptr; }
+    g_wmma_cf_cap = n;
+  }
+  return g_wmma_cf;
+}
+
 // Returns 1 if launched, 0 if the shape is unsupported (caller falls back).
-// Handles any rows>0 by tiling the row dimension in blocks of 64 (MT=4).
 extern "C" int coli_hip_int4_wmma(half* C, const half* A, const uint8_t* W,
                                   const float* scale, int Nout, int K, int rows,
                                   hipStream_t stream) {
-  if (K % 16 || Nout % 16 || rows < 1) return 0;
-  dim3 grid(Nout / 16), block(32);
-  for (int r = 0; r < rows; r += 64) {
-    int nr = rows - r < 64 ? rows - r : 64;
-    int mt = (nr + 15) / 16;
-    const half* Ar = A + (size_t)r * K;
-    half* Cr = C + (size_t)r * Nout;
-    switch (mt) {
-      case 1: wmma_int4<1><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
-      case 2: wmma_int4<2><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
-      case 3: wmma_int4<3><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
-      default: wmma_int4<4><<<grid, block, 0, stream>>>(Nout, K, nr, W, Ar, scale, Cr); break;
-    }
+  constexpr int WV = 4, BK = 32;
+  if (K % BK || Nout % (16 * WV) || rows < 1) return 0;
+  const int base = Nout / (16 * WV);
+  const int rowtiles = (rows + 15) / 16;
+  int blocks0 = base * rowtiles;
+  int G = blocks0 >= 256 ? 1 : (256 + blocks0 - 1) / blocks0;
+  int maxG = K / BK; if (G > maxG) G = maxG; if (G < 1) G = 1;
+  int Kchunk = ((K / G + BK - 1) / BK) * BK;
+  G = (K + Kchunk - 1) / Kchunk;
+  dim3 grid((unsigned)base, (unsigned)rowtiles, (unsigned)G), block(WV * 32);
+  if (G == 1) {
+    wmma_int4<WV, BK><<<grid, block, 0, stream>>>(Nout, K, rows, Kchunk, W, A, scale, nullptr, C);
+  } else {
+    size_t nn = (size_t)rows * Nout;
+    float* Cf = wmma_scratch(nn);
+    if (!Cf) return 0;
+    hipMemsetAsync(Cf, 0, nn * sizeof(float), stream);
+    wmma_int4<WV, BK><<<grid, block, 0, stream>>>(Nout, K, rows, Kchunk, W, A, scale, Cf, nullptr);
+    wmma_scale_cols<<<(unsigned)((nn + 255) / 256), 256, 0, stream>>>(C, Cf, scale, nn, Nout);
   }
   return 1;
 }
