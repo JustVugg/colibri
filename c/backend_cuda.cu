@@ -1,6 +1,26 @@
 #include "backend_cuda.h"
 
+#ifdef COLI_HIP
+/* asgard/AMD ROCm build: compile this CUDA backend under HIP by aliasing the
+   small runtime surface it uses. One source, dual target (nvcc or hipcc). */
+#include <hip/hip_runtime.h>
+#define cudaError_t             hipError_t
+#define cudaSuccess             hipSuccess
+#define cudaGetErrorString      hipGetErrorString
+#define cudaGetLastError        hipGetLastError
+#define cudaSetDevice           hipSetDevice
+#define cudaGetDeviceCount      hipGetDeviceCount
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaDeviceProp          hipDeviceProp_t
+#define cudaMalloc              hipMalloc
+#define cudaFree                hipFree
+#define cudaMemcpy              hipMemcpy
+#define cudaMemcpyHostToDevice  hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost  hipMemcpyDeviceToHost
+#define cudaMemGetInfo          hipMemGetInfo
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>

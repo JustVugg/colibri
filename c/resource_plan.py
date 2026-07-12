@@ -84,6 +84,13 @@ def memory_available():
 
 
 def discover_gpus():
+    # NVIDIA first; fall back to ROCm/AMD (asgard: gfx1100) so the HIP engine build
+    # gets a VRAM tier instead of silently dropping to the CPU path.
+    devices = _discover_nvidia_gpus()
+    return devices if devices else _discover_amd_gpus()
+
+
+def _discover_nvidia_gpus():
     command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                "--format=csv,noheader,nounits"]
     try:
@@ -102,6 +109,37 @@ def discover_gpus():
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
                         "free_bytes": free * 1024 * 1024})
+    return devices
+
+
+def _discover_amd_gpus():
+    """Parse `rocm-smi --showmeminfo vram --csv`. Indices track HIP device ordinals;
+    tiny devices (integrated GPUs) are skipped so COLI_GPUS=0,1 maps to the dGPUs."""
+    for exe in ("/opt/rocm/bin/rocm-smi", "rocm-smi"):
+        try:
+            result = subprocess.run([exe, "--showmeminfo", "vram", "--csv"],
+                                    text=True, capture_output=True, check=True, timeout=5)
+            break
+        except (OSError, subprocess.SubprocessError):
+            result = None
+    if result is None:
+        return []
+    devices = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("device"):
+            continue
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) < 3:
+            continue
+        try:
+            total, used = int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        if total < (2 << 30):   # skip integrated / tiny GPUs
+            continue
+        devices.append({"index": len(devices), "name": "AMD GPU (ROCm)",
+                        "total_bytes": total, "free_bytes": max(0, total - used)})
     return devices
 
 

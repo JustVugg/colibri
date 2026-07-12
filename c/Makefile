@@ -67,6 +67,22 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
+# HIP=1 builds the same backend for AMD ROCm (asgard: gfx1100) via hipcc.
+HIP        ?= 0
+HIPCC      ?= /opt/rocm/bin/hipcc
+HIP_ARCH   ?= gfx1100
+ROCM_HOME  ?= /opt/rocm
+HIPCCFLAGS ?= -O3 -std=c++17 --offload-arch=$(HIP_ARCH) -I$(ROCM_HOME)/include -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -Wall -Wextra -Wno-unused-parameter
+GPU_TEST_DEVICES ?= 0
+ifeq ($(HIP),1)
+CFLAGS   += -DCOLI_CUDA
+LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
+CUDA_OBJ  = backend_cuda.o
+GPU_CC    = $(HIPCC) $(HIPCCFLAGS) -DCOLI_HIP -DCOLI_CUDA
+else
+GPU_CC    = $(NVCC) $(NVCCFLAGS)
+endif
+
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
@@ -76,13 +92,11 @@ glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+	$(GPU_CC) -c backend_cuda.cu -o $@
 
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
-	./backend_cuda_test$(EXE)
+	$(GPU_CC) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	./backend_cuda_test$(EXE) $(GPU_TEST_DEVICES)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
