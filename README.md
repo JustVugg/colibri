@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — piccolo motore, modello immenso">
+  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
 </p>
 
 **Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
@@ -7,7 +7,7 @@
 ```
 $ ./coli chat
   🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
-  ✓ pronto in 32s · residente 9.9 GB
+  ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
@@ -154,7 +154,7 @@ make test-python        # run Python tests (requires python)
 # Verify (tiny model, 2.4 MB):
 pip install torch transformers safetensors huggingface_hub
 python tools/make_glm_oracle.py                # generate tiny oracle
-SNAP=./glm_tiny TF=1 ./glm.exe 64 16 16        # expect "32/32 posizioni"
+SNAP=./glm_tiny TF=1 ./glm.exe 64 16 16        # expect "32/32 positions"
 
 # Run with real model:
 SNAP=D:\glm52_i4 ./glm.exe 64 4 16            # batch inference
@@ -313,7 +313,7 @@ works against the colibrì OpenAI-compatible server (in review, #21) or any othe
 compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
-Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
