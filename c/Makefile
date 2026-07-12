@@ -33,6 +33,18 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 LDFLAGS = -lm -fopenmp -static
 EXE     = .exe
 else
+UNAME_M := $(shell uname -m)
+ifneq (,$(filter ppc64le ppc64,$(UNAME_M)))
+# --- Linux PowerPC (POWER8/POWER9/POWER10) ---
+# PowerPC GCC uses -mcpu, not -march. ARCH=native works on gcc >= 4.7.
+# The AVX2/NEON kernels fall back to the portable scalar C path
+# (validated token-exact vs the transformers oracle on a POWER8 S824).
+CC      = gcc
+ARCH   ?= native
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp
+EXE     =
+else
 # --- Linux x86-64 (percorso originale, invariato) ---
 CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
@@ -42,6 +54,7 @@ ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp
 EXE     =
+endif
 endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
