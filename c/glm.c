@@ -101,7 +101,8 @@ typedef struct {
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+                 int64_t slab_cap, fslab_cap; uint64_t used;
+                 int vram_only; } ESlot;    /* CUDA_EXTEND: host copy freed, weights live on GPU only */
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -150,6 +151,7 @@ static void usage_save(Model *m);        /* cache che impara: definita accanto a
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
+static int g_cuda_extend;   /* CUDA_EXTEND=1: VRAM tier holds experts BEYOND the RAM pin */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -487,6 +489,13 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
             w->O,w->I,w->cuda_device);
     }
 #endif
+    if(!w->qf && !w->q8 && !w->q4){
+        /* VRAM-only tensor whose GPU path did not serve it (failure or nested
+         * parallelism): no host copy exists. Flag it and emit zeros; the expert
+         * loop repairs by reloading from disk, the pin lookup then skips it. */
+        w->cuda_failed=1;
+        memset(y,0,(size_t)S*w->O*sizeof(float)); return;
+    }
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
@@ -1330,7 +1339,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
             ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){
+                if(P[z].vram_only && (P[z].g.cuda_failed||P[z].u.cuda_failed||P[z].d.cuda_failed))
+                    break;               /* GPU lost this VRAM-only slot: stream it instead */
+                m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
@@ -1377,6 +1389,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             matmul_qt(uu, xg, &e->u, nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
+#ifdef COLI_CUDA
+            if(e->vram_only && (e->g.cuda_failed||e->u.cuda_failed||e->d.cuda_failed)){
+                /* the GPU refused a VRAM-only expert mid-run: reload from disk once and
+                 * redo the three matmuls on CPU; the pin lookup skips this slot from now on */
+                static ESlot rep;                     /* serial loop: no races; slab capacity reused */
+                expert_load(m,layer,eid,&rep);
+                e->g.cuda_failed=e->u.cuda_failed=e->d.cuda_failed=1;
+                matmul_qt(gg, xg, &rep.g, nr);
+                matmul_qt(uu, xg, &rep.u, nr);
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(hh, gg, &rep.d, nr);
+            }
+#endif
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
@@ -2037,6 +2062,7 @@ static void repin_pass(Model *m){
     RepinCand cd[4]; int nb=repin_pick(m,cd,4);
     for(int b=0;b<nb;b++){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        if(s->vram_only) continue;   /* GPU-only slot: no RAM slab to swap into (see CUDA_EXTEND) */
         int old=s->eid;
         uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
 #ifdef COLI_CUDA
@@ -2426,8 +2452,29 @@ static void pin_load(Model *m, const char *statspath, double gb){
     int64_t eb=expert_bytes_probe(m,m->ebits);
     int npin=(int)(gb*1e9/eb); if(npin>n) npin=n; if(npin>4096) npin=4096;
     if(npin<1){ free(r); return; }
+    int nvram=0;
+#ifdef COLI_CUDA
+    /* CUDA_EXTEND=1: the VRAM budget holds the NEXT experts in the frequency
+     * ranking, BEYOND the RAM pin — additional pinned capacity instead of a
+     * mirror of experts already resident. Host copies are freed after upload,
+     * so these slots cost VRAM, not RAM (resident_bytes untouched). */
+    double vrem[COLI_CUDA_MAX_DEVICES]={0};
+    if(g_cuda_enabled && g_cuda_expert_gb>0 && g_cuda_extend){
+        double budget=g_cuda_expert_gb*1e9, safe=0;
+        for(int i=0;i<g_cuda_ndev;i++){ size_t fb=0,tb=0;
+            if(coli_cuda_mem_info(g_cuda_devices[i],&fb,&tb)){
+                vrem[i]=(double)fb-(double)g_cuda_dense_projected[i]-2e9;
+                if(vrem[i]<0) vrem[i]=0; safe+=vrem[i];
+            } }
+        if(budget>safe) budget=safe;
+        nvram=(int)(budget/eb);
+        if(npin+nvram>n) nvram=n-npin;
+        if(npin+nvram>4096) nvram=4096-npin;   /* the ranking is only sorted this far */
+        if(nvram<0) nvram=0;
+    }
+#endif
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
-    for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
+    for(int a=0;a<npin+nvram;a++) cnt_l[r[a].l]++;
     for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
     double t0=now_s();
     #pragma omp parallel for schedule(dynamic,1)
@@ -2441,7 +2488,39 @@ static void pin_load(Model *m, const char *statspath, double gb){
     fprintf(stderr,"[PIN] hot store: %d experts in RAM (%.1f GB) loaded in %.0fs from %s\n",
         npin, npin*eb/1e9, now_s()-t0, statspath);
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && g_cuda_expert_gb>0){
+    if(nvram>0){
+        double t1=now_s(); int nx=0; int64_t xb=0;
+        for(int a=npin;a<npin+nvram;a++){
+            int li=r[a].l, best=-1;
+            for(int i=0;i<g_cuda_ndev;i++) if(vrem[i]>=(double)eb && (best<0||vrem[i]>vrem[best])) best=i;
+            if(best<0) break;
+            ESlot *s=&m->pin[li][m->npin[li]++];
+            expert_load(m,li,r[a].e,s);
+            s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
+            s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;   /* host copy off: VRAM-only */
+                free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
+                s->g.qf=NULL; s->g.q8=NULL; s->g.q4=NULL; s->g.s=NULL;
+                s->u.qf=NULL; s->u.q8=NULL; s->u.q4=NULL; s->u.s=NULL;
+                s->d.qf=NULL; s->d.q8=NULL; s->d.q4=NULL; s->d.s=NULL;
+                s->vram_only=1;
+                m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                vrem[best]-=actual; nx++; xb+=actual;
+            } else {   /* upload failed: keep it as a plain RAM pin slot, and account for it */
+                qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                m->resident_bytes += eb;
+                vrem[best]=0;                          /* device rejected its projected capacity */
+            }
+        }
+        fprintf(stderr,"[CUDA] vram-only extension: +%d experts (%.2f GB) beyond the %d-expert RAM pin in %.0fs\n",
+            nx, xb/1e9, npin, now_s()-t1);
+    }
+    if(g_cuda_enabled && g_cuda_expert_gb>0 && !g_cuda_extend){
         double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
         int placed_n[COLI_CUDA_MAX_DEVICES]={0};
         double budget=g_cuda_expert_gb*1e9, safe_total=0;
@@ -2679,6 +2758,8 @@ int main(int argc, char **argv){
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    g_cuda_extend=getenv("CUDA_EXTEND")?atoi(getenv("CUDA_EXTEND")):0;   /* 1 = VRAM holds the NEXT
+        experts in the frequency ranking (extra capacity); 0 = legacy mirror of the hottest pinned */
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }

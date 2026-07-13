@@ -158,14 +158,17 @@ extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
-    DeviceContext *ctx = find_ctx(device);
-    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!tensor) return 0;
     if (*tensor) {
+        /* Cached device copy: usable even when the caller freed the host
+         * weights afterwards (VRAM-only expert slots pass stale pointers). */
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
     }
+    DeviceContext *ctx = find_ctx(device);
+    if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    size_t rb = row_bytes(fmt, I);
+    if (!rb || (fmt && !scales)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;

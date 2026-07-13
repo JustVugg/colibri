@@ -36,6 +36,8 @@ int main(int argc, char **argv) {
     if (coli_cuda_tensor_upload(&t8, q8, s8, 1, 5, 2, d0)) return 1;
     if (ndev > 1 && coli_cuda_tensor_upload(&t8, q8, s8, 1, 4, 2, d1)) return 1;
     if (!coli_cuda_matmul(&t8, got, x, q8, s8, 1, 2, 4, 2, d0) || !close_enough(got, want8, 4)) return 1;
+    /* Cached tensor must stay callable without live host pointers (VRAM-only slots). */
+    if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) || !close_enough(got, want8, 4)) return 1;
 
     /* Rows [-8,-1,0,7] and [1,2,3,4], packed low nibble first. */
     const uint8_t q4[4] = {0x70, 0xf8, 0xa9, 0xcb};
