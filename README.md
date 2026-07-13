@@ -204,7 +204,12 @@ make cuda-dll CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.
 # links backend_loader.o instead of cudart):
 make glm.exe CUDA_DLL=1 ARCH=native
 
-# Run with the GPU expert tier (8 GB VRAM budget here; scale to your free VRAM):
+# Run: a CUDA_DLL=1 binary auto-detects the GPU when coli_cuda.dll is present
+# and sizes the expert budget from free VRAM. No env vars needed:
+python coli chat --model D:\glm52_i4 --topp 0.7
+
+# Optional overrides: COLI_CUDA=0 forces CPU, COLI_CUDA=1 makes GPU-init
+# failures fatal, CUDA_EXPERT_GB pins an explicit VRAM budget:
 $env:COLI_CUDA="1"; $env:COLI_GPU="0"; $env:CUDA_EXPERT_GB="8"
 python coli chat --model D:\glm52_i4 --topp 0.7
 ```
@@ -359,7 +364,11 @@ SNAP=/nvme/glm52_i4 ./glm 64 4 4
 Selected experts are uploaded during startup, so capacity failures occur before
 inference and the log reports their exact tensor footprint. The budget is clamped
 against free VRAM after reserving the projected dense resident set and 2 GB of
-runtime headroom per selected device. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
+runtime headroom per selected device. When `CUDA_EXPERT_GB` is unset the budget
+is auto-sized to that same clamp (everything free after dense + headroom); an
+explicit value — including `0` to disable the tier — always takes precedence.
+`COLI_CUDA` follows the same pattern: unset probes for a GPU and falls back to
+CPU quietly, `1` makes init failures fatal, `0` forces CPU. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
 total budget across the device set; experts are assigned whole to the
 least-loaded device that can hold them. Multi-GPU runs also default to
 `PIN_FILL=1`: the measured hot set is placed first, then unused VRAM is filled
