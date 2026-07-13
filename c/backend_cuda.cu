@@ -989,6 +989,25 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
+/* absorb per il DECODE con KV gia' residente: carica solo q (poche KB),
+ * latent/rope arrivano dall'ombra device. ctx torna a host (S piccolo). */
+extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,const float *q,
+        const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
+        float scale){
+    if(!w||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
+       w->I!=K||w->O!=H*(Q+V))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
+    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    attention_absorb_batch_kernel<<<dim3(H,1),256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
+        rope_dev,w->weights,w->scales,w->fmt,1,H,Q,R,V,K,T,scale);
+    if(!cuda_ok(cudaGetLastError(),"kvdev absorb launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev ctx download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev absorb sync"))return 0;
+    return 1;
+}
 extern "C" int coli_cuda_pipe_sync(int device){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaDeviceSynchronize(),"pipe sync");
