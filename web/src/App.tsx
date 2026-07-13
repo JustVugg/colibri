@@ -110,7 +110,7 @@ export default function App() {
   useEffect(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), [messages])
 
   useEffect(() => {                       // coli web: the server that sent this page IS the API
-    if (servedByEngine && !connected) void connect()
+    if (servedByEngine && !connected) { connect(); return undefined }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
