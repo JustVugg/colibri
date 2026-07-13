@@ -44,3 +44,8 @@ stats*.txt
 /quant_test.py
 /profile_run.py
 /sweep.py
+c/backend_metal.o
+c/backend_metal_test
+c/tests/test_tier
+c/mio_env/
+c/bench/
