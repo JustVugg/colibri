@@ -697,7 +697,16 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     *xq=g_qscratch.xq; *sx=g_qscratch.sx;
 }
 
-static void matmul_qt(float *y, const float *x, QT *w, int S){
+/* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
+ * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
+ * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
+ * ~+12% perplexity. Gli altri matmul del prefill (o_proj, kv_b, expert) tengono l'IDOT.
+ * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
+ * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
+ * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
+static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
+static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
+static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
     /* Large row-batches (prefill: kv_b reconstruction, o_proj, dense MLP, step_all logits)
      * amortize Metal's ~5ms submit latency; small-S decode matmuls stay on CPU (NEON wins).
@@ -728,7 +737,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
      * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
      * twin). Threshold configurable via I4S. */
-    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
+    if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
@@ -1540,23 +1549,38 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 #endif
     float *ctx=falloc((int64_t)S*H*vh);
     float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
-    float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
-    /* 1) per ogni token nuovo: query roped + latente normato e k_rot roped -> in cache.
-     * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA. */
+    int cw=c->kv_lora+c->qk_rope;
+    float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc((int64_t)S*cw);
+    /* 1) query roped + latente normato e k_rot roped -> in cache.
+     * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA.
+     *
+     * BATCH-ROWS: le tre proiezioni girano su tutte le S righe in un colpo solo, come gia' fa
+     * o_proj (matmul_qt(...,S) sotto) e come fa moe() con la batch-union. Una riga per volta
+     * il peso veniva ri-letto per OGNI token; a S righe si legge una volta sola.
+     * matmul_qt_ex(...,0): restano sul kernel int4 ESATTO. Con l'IDOT (che il gate S>=g_i4s
+     * abiliterebbe da solo appena S>1) il prefill sarebbe molto piu' veloce ma la qualita'
+     * cala: -5040.33 -> -5158.68 di log-lik su 1023 token (~+12% perplexity). Il batch da
+     * solo e' bit-identical all'originale; il kernel no. Vedi issue.
+     * EN: batch the three projections over all S rows, like o_proj below and moe()'s
+     * batch-union. matmul_qt_ex(...,0) keeps them on the EXACT int4 kernel: letting S>1 pull
+     * them into IDOT is much faster but costs ~12% perplexity (measured). Batching alone is
+     * bit-identical to upstream; the kernel switch is not. */
+    matmul_qt_ex(QR, x, &l->q_a, S, 0);
+    for(int s=0;s<S;s++){ float *qr=QR+(int64_t)s*c->q_lora;
+        rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b legge il residuo NORMATO */
+    matmul_qt_ex(Q, QR, &l->q_b, S, 0);
+    matmul_qt_ex(comp, x, &l->kv_a, S, 0);
     for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
-        const float *xs=x+(int64_t)s*D; int pos=positions?positions[s]:pos_base+s;
-        float *qresid=QR+(int64_t)s*c->q_lora;
-        matmul_qt(qresid, xs, &l->q_a, 1);
-        rmsnorm(qresid, qresid, l->q_a_ln, c->q_lora, c->eps);
-        float *qfull=Q+(int64_t)s*H*qh; matmul_qt(qfull, qresid, &l->q_b, 1);
+        int pos=positions?positions[s]:pos_base+s;
+        float *qfull=Q+(int64_t)s*H*qh;
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
-        matmul_qt(comp, xs, &l->kv_a, 1);
+        const float *cs=comp+(int64_t)s*cw;
         float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
         float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
-        memcpy(Ldst, comp, c->kv_lora*sizeof(float));
+        memcpy(Ldst, cs, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
-        memcpy(Rdst, comp+c->kv_lora, c->qk_rope*sizeof(float));
+        memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
         rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
     }
     /* ---- DSA lightning indexer ----
@@ -3723,6 +3747,11 @@ int main(int argc, char **argv){
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
+    /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
+     * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.
+     * EN: matmul_qt documents the int4 IDOT threshold as "configurable via I4S", but the
+     * getenv was missing, so the knob did nothing. I4S=<n> -> int4 IDOT only for S>=n. */
+    if(getenv("I4S")) g_i4s=atoi(getenv("I4S"));
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
