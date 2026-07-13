@@ -31,15 +31,30 @@
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
+#include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #endif
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "decode_batch.h"
+#ifdef _OPENMP
+#include <omp.h>                                  /* scratch per-thread nell'attention */
+#else
+static inline int omp_get_max_threads(void){ return 1; }
+static inline int omp_get_thread_num(void){ return 0; }
+#endif
 #ifdef COLI_CUDA
-#include <omp.h>
 #include "backend_cuda.h"
+#endif
+#ifdef COLI_METAL
+#include "backend_metal.h"
+#include <omp.h>
+static int g_metal_enabled;
+static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
+/* routing precalcolata dalla GPU (layer CB): moe() la usa e salta la FASE A */
+static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
+static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su GPU */
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -654,6 +669,15 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
 }
 
 static void matmul_qt(float *y, const float *x, QT *w, int S){
+#ifdef COLI_METAL
+    /* Large row-batches (prefill: kv_b reconstruction, o_proj, dense MLP, step_all logits)
+     * amortize Metal's ~5ms submit latency; small-S decode matmuls stay on CPU (NEON wins).
+     * Weights must be registered (all dense QT allocs are, via qalloc). */
+    if(g_metal_enabled && S>=g_metal_gemm_min && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
+        const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O)) return;
+    }
+#endif
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
      * Streaming expert slots are reused for different IDs and must never enter
@@ -778,6 +802,17 @@ static int64_t la_hit[3], la_tot[3];
 static int la_pred[2][130][16]; static signed char la_val[2][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+/* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
+ * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
+static void *qalloc(size_t n){
+#ifdef COLI_METAL
+    if(g_metal_enabled){ void *p; size_t r=(n+16383)&~(size_t)16383;
+        if(posix_memalign(&p,16384,r)){fprintf(stderr,"OOM qalloc\n");exit(1);}
+        coli_metal_register(p,r); return p; }
+#endif
+    return malloc(n);
+}
+static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
 static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer dentro ecache[L+1]
                           * (non il semplice WILLNEED). Implica PILOT=1. Default OFF: hint-only. */
 /* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
@@ -800,9 +835,9 @@ static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main 
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
-    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=malloc((int64_t)O*I); t->s=falloc(O); }
-    else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }
-    else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }
+    else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
+    else if(bits>=3){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
+    else { t->fmt=3; t->q4=qalloc((int64_t)O*((I+3)/4)); t->s=qsalloc(O); }
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
@@ -917,8 +952,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
         int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
+        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
+        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
@@ -939,7 +974,8 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
-    float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
+    float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
+    st_read_f32(&m->S,name,p,0); return p;
 }
 #ifdef COLI_CUDA
 static void qt_cuda_colocate(QT *dst,const QT *src){
@@ -1142,6 +1178,31 @@ static void embed_row(Model *m, int tok, float *x){
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
 
+/* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
+ * niente slab, niente copia: la page cache del kernel E' la cache). Le mappe sono
+ * registrate con Metal (newBufferWithBytesNoCopy su pagine file-backed, come llama.cpp),
+ * quindi la GPU legge gli stessi byte. Fallback allo slab path su disallineamento. */
+static int g_mmap=0;
+static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
+static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
+static void *map_of_fd(int fd){
+    pthread_mutex_lock(&g_map_mtx);
+    for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
+    void *base=NULL; struct stat st;
+    if(g_nmaps<512 && fstat(fd,&st)==0){
+        size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
+        void *p=mmap(NULL,len,PROT_READ,MAP_SHARED,fd,0);
+        if(p!=MAP_FAILED){
+            base=p; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=p; g_maps[g_nmaps].len=len; g_nmaps++;
+#ifdef COLI_METAL
+            if(g_metal_enabled) coli_metal_register(p,len);
+#endif
+        }
+    }
+    pthread_mutex_unlock(&g_map_mtx);
+    return base;
+}
+
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
  * file -> UNA pread coalescente da ~19 MB dentro `slab` (+ le scale in fslab); i QT sono
  * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
@@ -1176,16 +1237,73 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
     }
+    if(g_mmap){
+        void *bw[3],*bq[3]; int okm=1;
+        for(int k=0;k<3;k++){
+            bw[k]=map_of_fd(tw[k]->fd); bq[k]=map_of_fd(tq[k]->fd);
+            if(!bw[k]||!bq[k]||((tw[k]->off)&3)||((tq[k]->off)&3)) okm=0;
+        }
+        if(okm){
+            QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+            for(int k=0;k<3;k++){
+                int64_t nb=tw[k]->nbytes;
+                int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+                qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
+                qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
+            }
+            /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
+             * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
+             * (measured catastrophic). madvise starts async readahead, the touch guarantees
+             * residency. This is pread's I/O without the copy and without the slab. */
+            for(int k=0;k<3;k++){
+                char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
+                madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+                volatile char acc=0;
+                for(size_t i=0;i<n;i+=4096) acc+=p[i];
+                acc+=p[n-1]; (void)acc;
+                char *q=(char*)bq[k]+tq[k]->off; size_t nq=(size_t)tq[k]->nbytes;
+                for(size_t i=0;i<nq;i+=4096) acc+=q[i];
+            }
+            s->eid=eid; return 0;
+        }
+    }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
      * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
     if(!s->slab || wtot+8192 > s->slab_cap){
+#ifdef COLI_METAL
+        /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
+        if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
+        compat_aligned_free(s->slab);
+        size_t need=((size_t)wtot+8192+16383)&~(size_t)16383;
+        if(posix_memalign((void**)&s->slab,16384,need)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
+        s->slab_cap=need;
+        if(g_metal_enabled) coli_metal_register(s->slab,need);
+#else
         compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
+#endif
     }
     if(!s->fslab || ftot > s->fslab_cap){
+#ifdef COLI_METAL
+        /* page-align + register: the GPU reads the scales in place (unified memory).
+         * Honours `fatal` exactly like the CPU arm below — a speculative pilot load
+         * that hits OOM must unwind into a clean hidden slot, never exit(). */
+        if(s->fslab && g_metal_enabled) coli_metal_unregister(s->fslab);
+        free(s->fslab);
+        size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
+        if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
+           posix_memalign((void**)&s->fslab,16384,fb)){
+            fprintf(stderr,"OOM fslab\n"); if(fatal) exit(1);
+            compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;  /* clean, hidden slot (eid stays -1) */
+            s->fslab=NULL; s->fslab_cap=0; return -1;
+        }
+        s->fslab_cap=ftot;
+        if(g_metal_enabled) coli_metal_register(s->fslab,fb);
+#else
         free(s->fslab);
         if(fatal){ s->fslab=falloc(ftot); }          /* main path: byte-identical exit-on-OOM */
         else {                                        /* speculative pilot: checked alloc, never exit() */
@@ -1193,11 +1311,12 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
                !(s->fslab=malloc((size_t)ftot*sizeof(float)))){
                 fprintf(stderr,"OOM fslab\n");
-                free(s->slab); s->slab=NULL; s->slab_cap=0; /* leave a clean, hidden slot (eid stays -1) */
+                compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0; /* leave a clean, hidden slot (eid stays -1) */
                 s->fslab=NULL; s->fslab_cap=0; return -1;
             }
         }
         s->fslab_cap=ftot;
+#endif
     }
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
@@ -1546,6 +1665,33 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
+#ifdef COLI_METAL
+    /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
+     * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims. */
+    if(g_metal_enabled && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+       && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
+       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
+        int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
+        if(!sel_active){
+            if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index keys for future selection */
+                for(int s=0;s<S;s++){ int pos=pos_base+s; float *kd=m->Ic[layer]+(int64_t)pos*c->index_hd;
+                    matmul_qt(kd, x+(int64_t)s*D, &m->ix_wk[layer], 1);
+                    layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], c->index_hd, 1e-6f);
+                    rope_interleave(kd, pos, c); }
+            }
+            #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
+            int ok = coli_metal_attn_decode(x,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->o), l->o.s, l->o.fmt,
+                m->Lc[layer], m->Rc[layer], S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
+            #undef WP_
+            if(ok){ m->t_attn += now_s()-ta0; return; }
+        }
+    }
+#endif
     float *ctx=falloc((int64_t)S*H*vh);
     float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
     float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
@@ -1657,6 +1803,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     if(absorb && c->kv_lora<=512){
         m->t_aproj+=now_s()-ta0; double tac=now_s();
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
+        /* punteggi per-thread sul HEAP (vedi dev): cap Tk+1 copre anche il kv_start
+         * per-slot del percorso kvs (MTP: kv_start=-1 -> nt=Tk+1). */
+        int64_t sc_cap = (int64_t)Tk+1;
+        float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
         if(cuda_absorb&&l->n_kv_b_shard>1){
@@ -1712,11 +1862,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
+            float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
             int st0=ks->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
-            float *sc=falloc(nt);
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
@@ -1730,12 +1880,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
-            free(sc);
         }
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
-        if(!cuda_projected)matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
-        free(ctx); free(Q); free(QR); free(comp);
+        if(!cuda_projected){matmul_qt(out, ctx, &l->o, S);} m->t_aout+=now_s()-tao;
+        free(ctx); free(Q); free(QR); free(comp); free(sc_all);
         m->t_attn += now_s()-ta0;
         return;
     }
@@ -1745,18 +1894,21 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     float *kvb_all=falloc((int64_t)Tk*kvb_dim);
     matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     m->t_kvb += now_s()-tk0;
-    /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot */
+    /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
+     * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
+    int64_t sc_cap = Tk - stL;
+    float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
     double tac=now_s();
     #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int h=0;h<H;h++){
         int pos=pos_base+s;
         const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
         const float *qr=qp+c->qk_nope;
+        float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
         int st0=m->kv_start[layer];
         int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: lista top-k o range pieno */
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
-        float *sc=falloc(nt);
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
@@ -1769,11 +1921,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
-        free(sc);
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
     matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
-    free(ctx); free(Q); free(QR); free(comp); free(kvb_all);
+    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
     m->t_attn += now_s()-ta0;
 }
 
@@ -1808,7 +1959,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int *keff=malloc(S*sizeof(int));
     /* router in UN matmul batch: stessa matematica, via le S chiamate S=1 */
     float *logits_all=falloc((int64_t)S*E);
-    matmul(logits_all, x, l->router, S, D, E);
+    int pre_routed=0; (void)pre_routed;
+#ifdef COLI_METAL
+    if(g_pre_idx){                               /* routing gia' calcolata dal layer CB (GPU) */
+        memcpy(idxs,g_pre_idx,(size_t)S*K*sizeof(int));
+        memcpy(ws,g_pre_w,(size_t)S*K*sizeof(float));
+        memcpy(keff,g_pre_keff,(size_t)S*sizeof(int));
+        for(int s=0;s<S;s++){
+            m->ereq+=keff[s];
+            for(int kk=0;kk<keff[s];kk++){
+                m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
+                if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
+            }
+            for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
+        }
+        pre_routed=1;
+    }
+#endif
+    if(!pre_routed) matmul(logits_all, x, l->router, S, D, E);
+    if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
@@ -1870,6 +2039,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
+    int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
@@ -1880,6 +2050,67 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
+        int metal_done=0;
+#ifdef COLI_METAL
+        /* GPU/disk OVERLAP: submit the RESIDENT experts (pin/LRU hits, + shared expert on
+         * the first block) to the GPU BEFORE loading the missed experts from disk, so the
+         * preads run while the GPU computes; the missed subset follows in a second submit.
+         * Per-subset CPU fallback on unresolved slab / bad fmt / GPU fault. */
+        int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
+        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
+        const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
+        int xoffb[65],nrb[65];
+        float *mxg=NULL; int *mrows=NULL; float *mrw=NULL;
+        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH) */
+        #define MB_BUILD(WANTMISS, TRY_SH) do{ \
+            nbb=0; Rtot=0; mfmt=-1; sh_in=0; \
+            for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; \
+                int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0; \
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
+                    if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
+                if(!cnt) continue; \
+                if(mfmt<0) mfmt=e->g.fmt; \
+                MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
+                MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
+                MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \
+                MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s; \
+                xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++; \
+            } \
+            if(TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
+                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf){ \
+                    if(mfmt<0) mfmt=shf; \
+                    MG[nbb]=shf==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4; \
+                    MU[nbb]=shf==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4; \
+                    MD[nbb]=shf==1?(const void*)l->sh_down.q8:(const void*)l->sh_down.q4; \
+                    MGS[nbb]=l->sh_gate.s; MUS[nbb]=l->sh_up.s; MDS[nbb]=l->sh_down.s; \
+                    xoffb[nbb]=Rtot; nrb[nbb]=S; Rtot+=S; nbb++; sh_in=1; } } \
+            int p=0; \
+            for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; int eid=uniq[base+j]; \
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
+                    if(idxs[(int64_t)s*K+kk]==eid){ \
+                        memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float)); \
+                        mrows[p]=s; mrw[p]=ws[(int64_t)s*K+kk]; p++; break; } } \
+            if(sh_in) for(int s=0;s<S;s++){ \
+                memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float)); \
+                mrows[p]=s; mrw[p]=1.0f; p++; } \
+        }while(0)
+        if(g_metal_enabled){
+            for(int q=0;q<nmiss;q++) is_miss[missk[q]]=1;
+            mxg=falloc((int64_t)(nb+1)*S*D);
+            mrows=malloc((size_t)(nb+1)*S*sizeof(int)); mrw=malloc((size_t)(nb+1)*S*sizeof(float));
+            MB_BUILD(0, base==0 && !g_pre_sh);
+            if(nbb>0){
+                double t0=now_s();
+                mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
+                m->t_emm += now_s()-t0;
+                if(mh){ cpu_res=0; mh_shared=sh_in; }
+            } else cpu_res=0;
+        }
+#endif
+        /* Expert loads run HERE, after the resident-experts GPU submit above: under METAL the
+         * preads overlap the GPU compute (that submit is async). With METAL off the submit block
+         * is a no-op / compiled out, so this sits exactly where dev put it and CPU behaviour is
+         * unchanged. */
         if(nmiss){
             if(g_pipe){                            /* PIPE: launch loads async, matmul overlaps them */
                 if(!g_pp.started) pipe_init(m);
@@ -1907,11 +2138,47 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #ifdef COLI_CUDA
         ESlot *group_e[64]; int group_n[64]; int ngroup=0;
 #endif
+#ifdef COLI_METAL
+        if(g_metal_enabled){
+            /* PIPE drain. Two reasons this barrier is mandatory here, and not optional:
+             *  1) MB_BUILD(1) hands the missed experts' slabs straight to the GPU — a slot still
+             *     being pread by an I/O worker would be matmul-ed half-loaded.
+             *  2) PIPE's only drain barrier is the per-expert pipe_wait() in the CPU matmul loop
+             *     below, which metal_done SKIPS ENTIRELY. Without this, a still-writing worker
+             *     would race the end-of-block LRU swap that recycles ws[].
+             * pipe_wait() is an idempotent spin on ready[q], so the per-expert waits below stay
+             * correct (and free) when a subset falls back to the CPU. */
+            if(g_pipe && nmiss){ double tw=now_s();
+                for(int q=0;q<nmiss;q++) pipe_wait(q);
+                m->t_edisk += now_s()-tw; }
+            MB_BUILD(1, 0);                                   /* missed experts, now loaded */
+            if(nbb>0){
+                double t0=now_s();
+                if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
+                m->t_emm += now_s()-t0;
+            } else cpu_miss=0;
+            if(mh){ double t0=now_s();
+                if(coli_metal_moe_block_end(mh,out)){ if(mh_shared) shared_on_gpu=1; }
+                else cpu_res=1;
+                m->t_emm += now_s()-t0; mh=NULL; }
+            metal_done = (!cpu_res && !cpu_miss);
+            free(mxg); free(mrows); free(mrw);
+        }
+        #undef MB_BUILD
+#endif
+        if(!metal_done)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
              * dispatched slot must be waited before the end-of-block LRU swap can reuse
-             * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant. */
+             * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant.
+             * Stays ABOVE the METAL skip: a subset that fell back to the CPU still needs its
+             * slot drained here, and under METAL the block-level drain above already ran (this
+             * spin is then a no-op). */
             if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk += now_s()-tw; }
+#ifdef COLI_METAL
+            /* skip the subsets already computed on GPU */
+            if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
+#endif
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
@@ -2002,15 +2269,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
-    /* ---- FASE E: shared expert, un matmul a S righe (PIPE2: gia' sul device) ---- */
+    /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
     if(!with_shared) goto shared_done;
     {
     float *sg=NULL,*su=NULL;int shared_cuda=0;
+#ifdef COLI_METAL
+    if(g_pre_sh){ for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=g_pre_sh[z]; shared_on_gpu=1; }
+    if(shared_on_gpu) shared_cuda=2;             /* gia' sommato in out: salta calcolo e add */
+#endif
 #ifdef COLI_CUDA
     int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
         atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
     if(shared_min<16)shared_min=16;
-    if(S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
+    if(shared_cuda==0&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
        l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
        getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
        qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
@@ -2026,7 +2297,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
         matmul_qt(hh, sg, &l->sh_down, S);
     }
-    for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(sg); free(su);
     }
 shared_done:
@@ -2232,6 +2503,60 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
+#ifdef COLI_METAL
+    /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
+     * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
+     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto. */
+    if(g_metal_enabled && S<=4 && li<c->n_layers && l->sparse
+       && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
+       && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
+       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
+       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048){
+        int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
+        if(!sel_active){
+            static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
+            if(!linrm){ linrm=falloc(4*(int64_t)D); lnrm=falloc(4*(int64_t)D); lsh=falloc(4*(int64_t)D);
+                        lidx=malloc(4*8*sizeof(int)); lw=malloc(4*8*sizeof(float)); lkeff=malloc(4*sizeof(int)); }
+            int Ksel = g_topk>0 ? (g_topk<8?g_topk:8) : 8;
+            float tp = (g_topp>0 && g_topp<1.f) ? g_topp : 0.f;
+            double ta0=now_s();
+            #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
+            int ok = coli_metal_layer_decode(x, l->in_ln, l->post_ln,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->o), l->o.s, l->o.fmt,
+                WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt,
+                WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,
+                WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt,
+                l->router, l->router_bias,
+                c->n_experts, c->topk, Ksel, tp, c->norm_topk, c->routed_scale,
+                m->Lc[li], m->Rc[li], S, pos_base, m->kv_start[li],
+                c->eps, c->theta, c->attn_scale,
+                linrm, lnrm, lsh, lidx, lw, lkeff);
+            #undef WP_
+            if(ok){
+                m->t_attn += now_s()-ta0;
+                if(m->has_dsa && c->idx_type[li]){            /* index key per selezioni future */
+                    for(int s=0;s<S;s++){ int pos=pos_base+s;
+                        float *kd=m->Ic[li]+(int64_t)pos*c->index_hd;
+                        matmul_qt(kd, linrm+(int64_t)s*D, &m->ix_wk[li], 1);
+                        layernorm(kd, m->ix_knw[li], m->ix_knb[li], c->index_hd, 1e-6f);
+                        rope_interleave(kd, pos, c);
+                    }
+                }
+                if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
+                if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+                g_pre_idx=lidx; g_pre_w=lw; g_pre_keff=lkeff; g_pre_sh=lsh;
+                moe(m,l,li,lnrm,S,tmp);
+                g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; g_pre_sh=NULL;
+                for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+                return;
+            }
+        }
+    }
+#endif
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -2317,6 +2642,11 @@ static void kv_alloc(Model *m, int max_t){
     }
 #endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){ free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
+    if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
+#ifdef COLI_METAL
+        if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
+#endif
+        free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
     if(m->has_dsa){
         k->Ic=calloc(c->n_layers,sizeof(float*));
@@ -2326,7 +2656,20 @@ static void kv_alloc(Model *m, int max_t){
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
     for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
-        k->Rc[i]=falloc((int64_t)max_t*c->qk_rope); }
+        k->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
+#ifdef COLI_METAL
+        /* page-align + register Lc/Rc for zero-copy GPU attention. falloc isn't 16K-aligned,
+         * so re-allocate aligned and register the exact byte length. */
+        if(g_metal_enabled){
+            size_t lb=(((size_t)max_t*c->kv_lora*sizeof(float))+16383)&~(size_t)16383;
+            size_t rb=(((size_t)max_t*c->qk_rope*sizeof(float))+16383)&~(size_t)16383;
+            free(k->Lc[i]); free(k->Rc[i]); void *lp,*rp;
+            if(posix_memalign(&lp,16384,lb)||posix_memalign(&rp,16384,rb)){fprintf(stderr,"OOM kv\n");exit(1);}
+            k->Lc[i]=lp; k->Rc[i]=rp;
+            coli_metal_register(k->Lc[i],lb); coli_metal_register(k->Rc[i],rb);
+        }
+#endif
+    }
     m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic; m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 
@@ -2763,6 +3106,15 @@ static void profile_print(Model *m, double elapsed){
         m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
+#ifdef COLI_METAL
+    if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
+        coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
+        { uint64_t aok=0; double aw=0,ak=0; coli_metal_attn_counts(&aok,&aw,&ak);
+          if(aok){ double ks=0,gs=0; coli_metal_attn_lat(&ks,&gs);
+          printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs | cpu-sched %.2fs gpu-sched %.2fs)\n",(unsigned long long)aok,aw,ak,ks,gs); } }
+        printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
+               (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc); }
+#endif
 }
 
 static void profile_reset(Model *m){
@@ -3733,6 +4085,8 @@ int main(int argc, char **argv){
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
+    g_mmap = getenv("COLI_MMAP")?atoi(getenv("COLI_MMAP")):0;
+    if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     const char *policy=getenv("COLI_POLICY"); if(!policy) policy="quality";
@@ -3807,6 +4161,20 @@ int main(int argc, char **argv){
         (getenv("CUDA_EXPERT_GB") &&
         (!strcmp(getenv("CUDA_EXPERT_GB"),"auto")||atof(getenv("CUDA_EXPERT_GB"))>0))){
         fprintf(stderr,"CUDA was requested, but this binary is CPU-only; rebuild with: make CUDA=1\n");
+        return 2;
+    }
+#endif
+#ifdef COLI_METAL
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+        g_metal_enabled = coli_metal_init();
+        if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
+        fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
+        if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
+        if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
+    }
+#else
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+        fprintf(stderr,"METAL was requested, but this binary has no Metal backend; rebuild with: make METAL=1\n");
         return 2;
     }
 #endif
