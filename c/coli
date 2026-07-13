@@ -474,8 +474,8 @@ def cmd_serve(a):
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
     need_model(a.model)
-    dist = HERE.parent / "web" / "dist"
-    if not (dist / "index.html").exists():
+    dist = os.path.join(os.path.dirname(os.path.abspath(HERE)), "web", "dist")
+    if not os.path.exists(os.path.join(dist, "index.html")):
         print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
         print("serving the API anyway (the dashboard will 404 until built).")
     url = f"http://{a.host}:{a.port}/"
