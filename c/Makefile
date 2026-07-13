@@ -1,7 +1,18 @@
-UNAME_S := $(shell uname -s)
-MINGW    := $(findstring MINGW,$(UNAME_S))
-MSYS     := $(findstring MSYS,$(UNAME_S))
-IS_WIN   := $(MINGW)$(MSYS)
+# --- OS detection ---
+# On Windows the OS env var is 'Windows_NT' in EVERY shell (cmd, PowerShell,
+# MSYS2, Git-Bash), and GNU Make imports it. Detect Windows from it FIRST so
+# `make` works from a native PowerShell/CMD shell — there `uname` is not on
+# PATH, so the old uname-only check returned empty and fell through to the
+# Linux branch (no .exe, no -static). We only call `uname` when NOT on Windows.
+ifeq ($(OS),Windows_NT)
+IS_WIN   := 1
+UNAME_S  :=
+UNAME_M  :=
+else
+IS_WIN   :=
+UNAME_S  := $(shell uname -s)
+UNAME_M  := $(shell uname -m)
+endif
 
 ifeq ($(UNAME_S),Darwin)
 # --- macOS / Apple Silicon ---
