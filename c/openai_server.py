@@ -750,6 +750,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def generation(self, body, prompt, request_id, chat):
+        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
+        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
+        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+        if dbg >= 2:
+            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
+            sys.stderr.flush()
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
         if body.get("tool_choice") == "none":
@@ -819,7 +829,7 @@ class APIHandler(BaseHTTPRequestHandler):
             last_write = [time.time()]
             ka_stop = threading.Event()
             KA_GAP = 10.0
-            dbg_echo = os.environ.get("COLI_DEBUG", "0") == "1"   # tee decoded tokens to stderr
+            dbg_echo = dbg >= 1   # tee decoded tokens to stderr (COLI_DEBUG level parsed in generation())
 
             def event(choices, usage_marker=False):
                 nonlocal connected
