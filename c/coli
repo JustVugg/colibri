@@ -22,6 +22,17 @@ Configuration through environment variables or flags (also valid after the subco
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
+# The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
+if sys.platform != "win32":
+    try:
+        import resource
+        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        _want = min(65536 if _hard == resource.RLIM_INFINITY else _hard, 65536)
+        if _soft < _want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (_want, _hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
 # Windows: forza output UTF-8 (console cp1252 tronca Unicode box-drawing/emoji)
 if sys.platform == "win32":
     for s in (sys.stdout, sys.stderr):
