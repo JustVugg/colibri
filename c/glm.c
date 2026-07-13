@@ -246,6 +246,15 @@ static float *falloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
+/* ---- Accumulatore int4->float a 512 bit / 512-bit int4->float accumulator ----
+ * Stessa matematica lossless di matmul_i4 (nibble->f32, FMA), ma 32 pesi/iter su
+ * due catene FMA indipendenti. NON bit-identico al vecchio ordine: la riduzione
+ * ad albero accumula MENO errore della somma sequenziale (misurato 2-4x più
+ * vicino all'oracolo double sulle forme reali; perplexity invariata, +4-7% sul
+ * decode con routing CPU-heavy — vedi docs/experiments/glm52-6x5090-2026-07-12.md).
+ * EN: same lossless math as matmul_i4, 32 weights/iter on two independent FMA
+ * chains. Not bit-identical to the old order: tree reduction accumulates LESS
+ * rounding than sequential summation. I4_ACC512=0 restores the old order (A/B). */
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 static int g_i4_acc512=1;
 static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
@@ -261,6 +270,8 @@ static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
     }
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
 }
+/* selftest contro il riferimento scalare (I4_ACC512_TEST=1): copre l'ordine dei
+ * nibble e ogni multiplo di 32. / selftest vs the scalar reference. */
 static int i4_acc512_selftest(void){
     enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
     for(int i=0;i<N;i++){
