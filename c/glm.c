@@ -180,6 +180,7 @@ static void usage_save(Model *m);        /* cache che impara: definita accanto a
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
+static int g_cuda_expert_auto;  /* CUDA_EXPERT_GB unset: size budget from free VRAM at pin time */
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
@@ -3473,12 +3474,18 @@ static void pin_load(Model *m, const char *statspath, double gb){
     double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
     int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
-    if(g_cuda_enabled&&g_cuda_expert_gb>0) for(int i=0;i<g_cuda_ndev;i++){
+    if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
             remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
         }
+    }
+    if(g_cuda_expert_auto&&safe_total>0){
+        /* CUDA_EXPERT_GB unset: use everything the safety clamp below would
+         * allow anyway (free VRAM minus projected dense minus 2 GB/device). */
+        budget=safe_total; g_cuda_expert_gb=safe_total/1e9;
+        fprintf(stderr,"[CUDA] expert budget auto-sized: %.1f GB free after dense + headroom\n",g_cuda_expert_gb);
     }
     if(budget>safe_total) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){ gpu_prefix=(int)(budget/eb)+g_cuda_ndev; if(gpu_prefix>npin)gpu_prefix=npin; }
@@ -3747,6 +3754,10 @@ int main(int argc, char **argv){
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    /* CUDA_EXPERT_GB unset with the backend enabled: defer sizing to pin time,
+     * when the projected dense footprint per device is known.  An explicit
+     * CUDA_EXPERT_GB (including 0) always takes precedence. */
+    g_cuda_expert_auto=g_cuda_enabled&&!getenv("CUDA_EXPERT_GB");
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
