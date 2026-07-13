@@ -31,11 +31,22 @@ export interface TiersHealth {
   ram_gb: number
 }
 
+export interface HwinfoHealth {
+  cores: number
+  ram_total_gb: number
+  ram_avail_gb: number
+  gpus: number
+  vram_total_gb: number
+  cpu: string
+  gpu: string
+}
+
 export interface HealthResponse {
   status: string
   scheduler?: SchedulerHealth
   kv_slots?: number
   tiers?: TiersHealth
+  hwinfo?: HwinfoHealth
 }
 
 export interface TokenUsage {

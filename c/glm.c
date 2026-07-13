@@ -175,7 +175,8 @@ typedef struct {
 } Model;
 
 static void usage_save(Model *m);
-static void tiers_emit(Model *m);        /* cache che impara: definita accanto a stats_dump */
+static void tiers_emit(Model *m);
+static void hwinfo_emit(Model *m);        /* cache che impara: definita accanto a stats_dump */
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -2997,6 +2998,7 @@ static void mux_data(Tok *T, unsigned long long id, int token){
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
     double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
+    hwinfo_emit(m);
     tiers_emit(m);
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
@@ -3085,6 +3087,7 @@ static void run_serve_mux(Model *m, const char *snap){
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
     setvbuf(stdin,NULL,_IONBF,0);
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    hwinfo_emit(m);
     tiers_emit(m);
     int eof=0;
     for(;;){
@@ -3283,6 +3286,50 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
 /* TIERS: fotografia della piramide expert per la dashboard web —
  * "TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>" sul canale di protocollo.
  * ram = pinnati non-VRAM + LRU corrente; disk = tutto il resto. */
+/* HWINFO: hardware snapshot for the web dashboard — emitted once at READY. */
+static void hwinfo_emit(Model *m){
+    Cfg *c=&m->c;
+    /* CPU */
+    char cpu[256]=""; FILE *ci=fopen("/proc/cpuinfo","r");
+    if(ci){ char ln[256];
+        while(fgets(ln,sizeof(ln),ci)) if(!strncmp(ln,"model name",10)){
+            char *p=strchr(ln,':'); if(p){ p++; while(*p==' ')p++;
+            int n=(int)strlen(p); if(n>0&&p[n-1]=='\n')p[--n]=0;
+            snprintf(cpu,sizeof(cpu),"%s",p); } break; }
+        fclose(ci); }
+    int cores=0;
+#ifdef _SC_NPROCESSORS_ONLN
+    cores=(int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    /* RAM */
+    double ram_total=0,ram_avail=0;
+    FILE *mi=fopen("/proc/meminfo","r");
+    if(mi){ char ln[256]; double mt=0,ma=0;
+        while(fgets(ln,sizeof(ln),mi)){
+            if(sscanf(ln,"MemTotal: %lf",&mt)==1) ram_total=mt/1e6;
+            if(sscanf(ln,"MemAvailable: %lf",&ma)==1) ram_avail=ma/1e6;
+        } fclose(mi); }
+    /* GPU */
+    int ngpu=0; double vram_total=0;
+    char gpu_name[128]="";
+#ifdef COLI_CUDA
+    ngpu=g_cuda_ndev; vram_total=m->gpu_expert_bytes/1e9;
+    for(int i=0;i<g_cuda_ndev;i++){
+        size_t fr=0,to=0; coli_cuda_mem_info(g_cuda_devices[i],&fr,&to);
+        if(!i) vram_total=(double)to*g_cuda_ndev/1e9;
+    }
+    /* GPU name from the first device — already printed at init */
+    if(g_cuda_ndev>0){
+        /* We don't have a device-name API; parse from the init log line stored in stderr.
+         * Simpler: just read the nvidia driver sysfs or use a fixed label. */
+        snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+    }
+#endif
+    printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
+        cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
+    fflush(stdout);
+}
+
 static void tiers_emit(Model *m){
     Cfg *c=&m->c; int nsp=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;

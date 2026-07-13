@@ -391,7 +391,8 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
-        self.tiers = None                      # latest "TIERS" snapshot from the engine
+        self.tiers = None
+        self.hwinfo = None                      # latest "TIERS" snapshot from the engine
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -457,6 +458,13 @@ class Engine:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
                         events.put(("done", stats))
+                elif kind == "HWINFO" and len(fields) >= 7:
+                    parts = " ".join(fields[6:]).split("|")
+                    self.hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
+                                   "ram_avail_gb": float(fields[3]), "gpus": int(fields[4]),
+                                   "vram_total_gb": float(fields[5]),
+                                   "cpu": parts[0].strip() if len(parts)>0 else "",
+                                   "gpu": parts[1].strip() if len(parts)>1 else ""}
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
@@ -668,6 +676,8 @@ class APIHandler(BaseHTTPRequestHandler):
                            "kv_slots": self.server.kv_slots}
                 tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
                 if tiers: payload["tiers"] = tiers
+                hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                if hwinfo: payload["hwinfo"] = hwinfo
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
