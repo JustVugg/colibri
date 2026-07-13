@@ -4,15 +4,24 @@ import {
   ArrowUp,
   BrainCircuit,
   CircleStop,
+  Clock,
   Cpu,
+  Database,
   Feather,
+  Gauge,
+  HardDrive,
   KeyRound,
+  Layers,
   Link2,
   LoaderCircle,
+  MemoryStick,
   MessageSquareText,
+  MonitorDot,
   RefreshCw,
   SlidersHorizontal,
+  Timer,
   Trash2,
+  Zap,
 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -52,6 +61,11 @@ export default function App() {
   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
   const [draft, setDraft] = useState("")
   const [loading, setLoading] = useState(false)
+  const [streamStart, setStreamStart] = useState<number | null>(null)
+  const [tokenCount, setTokenCount] = useState(0)
+  const [tokPerSec, setTokPerSec] = useState<number | null>(null)
+  const [ttft, setTtft] = useState<number | null>(null)
+  const [totalTokens, setTotalTokens] = useState({ prompt: 0, completion: 0 })
   const [connecting, setConnecting] = useState(false)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState("")
@@ -155,6 +169,13 @@ export default function App() {
     setError("")
     updateMessages([...history, assistant])
     setLoading(true)
+    setStreamStart(null)
+    setTokenCount(0)
+    setTokPerSec(null)
+    setTtft(null)
+    const t0 = performance.now()
+    let firstToken = true
+    let count = 0
     const controller = new AbortController()
     abortRef.current = controller
     try {
@@ -168,11 +189,23 @@ export default function App() {
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
-        onDelta: (delta) =>
+        onDelta: (delta) => {
+          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
+          count++
+          setTokenCount(count)
+          const elapsed = (performance.now() - (firstToken ? t0 : t0)) / 1000
+          if (elapsed > 0.3) setTokPerSec(count / ((performance.now() - t0) / 1000))
           updateMessages((current) => current.map((item) =>
             item.id === assistant.id ? { ...item, content: item.content + delta } : item,
-          )),
+          ))
+        },
       })
+      const finalElapsed = (performance.now() - t0) / 1000
+      if (count > 0 && finalElapsed > 0) setTokPerSec(count / finalElapsed)
+      if (result.usage) setTotalTokens(prev => ({
+        prompt: prev.prompt + (result.usage?.prompt_tokens || 0),
+        completion: prev.completion + (result.usage?.completion_tokens || 0),
+      }))
       setLastRun(result)
       setConnected(true)
     } catch (cause) {
@@ -232,6 +265,9 @@ export default function App() {
                 </div>
               </div>
             })() : null}
+            {totalTokens.prompt + totalTokens.completion > 0 ? <div className="session-stats">
+              <span><Database className="size-3" /> Session: <strong>{totalTokens.prompt.toLocaleString()}</strong> prompt + <strong>{totalTokens.completion.toLocaleString()}</strong> completion</span>
+            </div> : null}
             <div className="runtime-foot"><span className="runtime-dot" /> Scheduler online <code>{kvSlots} KV</code></div>
           </> : <p className="runtime-unavailable">{connected ? (healthError || "Runtime metrics unavailable") : "Probe the server to inspect runtime state."}</p>}
         </section>
@@ -255,7 +291,15 @@ export default function App() {
       <main className="chat-panel">
         <header className="topbar">
           <div><span className="eyebrow">ACTIVE MODEL</span><strong>{model}</strong></div>
-          <div className="top-actions">{lastRun?.queueWaitMs != null ? <Badge>queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}<Badge><Activity className="size-3" /> slot {cacheSlot + 1}</Badge><Button variant="ghost" size="sm" onClick={() => updateMessages([])} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> Clear</Button></div>
+          <div className="top-actions">
+              {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {tokenCount} tokens</Badge> : null}
+              {!loading && tokPerSec != null ? <Badge className="badge-speed"><Gauge className="size-3" /> {tokPerSec.toFixed(1)} tok/s</Badge> : null}
+              {!loading && ttft != null ? <Badge><Timer className="size-3" /> TTFT {(ttft/1000).toFixed(1)}s</Badge> : null}
+              {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
+              {lastRun?.queueWaitMs != null ? <Badge><Clock className="size-3" /> queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}
+              <Badge><MonitorDot className="size-3" /> slot {cacheSlot + 1}</Badge>
+              <Button variant="ghost" size="sm" onClick={() => { updateMessages([]); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({prompt:0,completion:0}) }} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> Clear</Button>
+            </div>
         </header>
 
         <div className="conversation">

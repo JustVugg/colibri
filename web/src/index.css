@@ -99,3 +99,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .tier-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
 .tier-legend strong { font: 600 12px ui-monospace, SFMono-Regular, monospace; color: var(--foreground); }
 .tier-legend small { color: var(--muted-foreground); }
+
+/* ---- rich metrics badges & animations ---- */
+.badge-live { background: rgba(78,214,165,.15); border-color: rgba(78,214,165,.4); color: #4ed6a5; }
+.badge-speed { background: rgba(90,155,216,.12); border-color: rgba(90,155,216,.35); color: #5a9bd8; }
+.flash { animation: flash 0.6s ease infinite alternate; }
+@keyframes flash { from { opacity: 1; } to { opacity: 0.3; } }
+.top-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.top-actions .badge-live, .top-actions .badge-speed { font-variant-numeric: tabular-nums; }
+
+/* session stats row */
+.session-stats { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #7f8d92; padding: 2px 0; }
+.session-stats strong { font: 600 11px ui-monospace, SFMono-Regular, monospace; color: var(--foreground); }
+
+/* tier bar tweaks */
+.tier-bar { height: 12px; }
+.tier-bar span { transition: width 0.8s cubic-bezier(.4,0,.2,1); }
+.tier-legend strong { font-size: 13px; }
