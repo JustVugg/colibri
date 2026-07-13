@@ -243,6 +243,31 @@ threaded HTTP is continuous batching. RAM admission accounts for every configure
 Use `COLI_KV_SLOTS=N` as the environment equivalent. Start with a small value: at the
 default 4096-token context, every slot costs hundreds of MB.
 
+### Experimental Metal backend (Apple Silicon)
+
+On Apple Silicon the decode profile is matmul-bound, and unified memory removes the
+PCIe copy tax that keeps CUDA's streaming experts on the CPU — so colibrì has an
+opt-in Metal backend that runs the **routed-expert SwiGLU (batched, zero-copy from
+the RAM slabs)**, the **fused decode attention** (full MLA layer in one command
+buffer, S≤4), and **prefill's large GEMMs** on the GPU. Token-exact vs the CPU path.
+
+```bash
+cd c
+make glm METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
+make metal-test           # standalone kernel/attention correctness vs CPU reference
+COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
+```
+
+Measured on an M4 Max (128 GB, warm cache, MTP on): CPU 0.30 → Metal **0.42 tok/s (~1.4×)**
+(best config adds `DIRECT=1`; ~3× vs this machine's first cold run).
+Key design points: Metal's ~5 ms submit latency makes per-matmul dispatch a loss —
+everything is batched into few command buffers per layer, and the resident experts'
+GPU work is submitted *before* the missed experts' disk reads so I/O and compute
+overlap. `COLI_METAL_GEMM_MIN` tunes the prefill GEMM row threshold (default 16).
+Streaming, cache, MTP, DSA and the persistence formats are unchanged; every GPU
+path falls back to the CPU per-block on any fault. Numerics are dequant→f32-MAC
+(same as the CUDA tier); greedy outputs are byte-identical to the CPU engine.
+
 ### Experimental resident CUDA backend
 
 colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
@@ -484,6 +509,7 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | Apple M5 Max (18 cores) · macOS · 128 GB unified · internal SSD ([#4](https://github.com/JustVugg/colibri/issues/4), [#5](https://github.com/JustVugg/colibri/issues/5)) | ~4 GB/s cold (the 14.2 GB/s reading was cache-influenced — see note) | default, MTP off | **1.06 tok/s** · expert hit 23% · RSS 21.8 GB |
 | Apple M5 Max · macOS · 128 GB unified · 2 TB SSD · **Metal backend** ([#72](https://github.com/JustVugg/colibri/pull/72), [#87](https://github.com/JustVugg/colibri/issues/87)) | (macOS O_DIRECT figure unreliable — see note) | Metal on · `--ram 96` · 39.7 GB warm pin · MTP off | **1.83 tok/s** · expert hit 66% · warmed 1.11 → 1.83 over the run |
 | 〃 · 46.9 GB pin (2.94M-selection history) · `--ram 110`, 1024-token run ([#103](https://github.com/JustVugg/colibri/issues/103)) | 〃 | Metal on (experts + attention) · MTP off | **2.06 tok/s** · hit 72.5% · coherent output · fastest datapoint yet (still on the pre-rebase Metal branch) |
+| Mac Mini M4 Pro · macOS · **48 GB** unified · **Metal backend** ([#107](https://github.com/JustVugg/colibri/issues/107)) | 6.59 GB/s F_NOCACHE (fresh shard) | Metal on · `--ram 38` | **0.30 tok/s** (vs 0.18 CPU-only) — entry Apple Silicon on a third the RAM beats the 32-core 9950X row |
 | Epyc 9654 ES · Linux · 4x16GB DDR5-4800-rdimm · Samsung PCIe Gen3 x4 NVME SSD | — | `MTP=1 DIRECT=1` | 0.31 tok/s · expert hit 35% · RSS 21.52 GB |
 | Ryzen AI 9 HX 370 (Framework 13) · Arch Linux · 128 GB · WD SN850X, BTRFS zstd ([#12](https://github.com/JustVugg/colibri/issues/12)) | — | int8 MTP head · `--cap 32` · 46.7 GB auto-learned PIN | **0.37 tok/s** · expert hit 66% · MTP acceptance 52% (2.59 tok/fw) · RSS 105 GB |
 | Ryzen 9 9950X (32 threads) · Linux · 123 GB · Crucial P3 QLC Gen3 ([#31](https://github.com/JustVugg/colibri/issues/31)) | 1.51 GB/s buffered | default, 2 runs from cold | 0.10 tok/s · hit 53% · profile 66% disk |
@@ -497,16 +523,19 @@ Takeaways: with 24 GB of RAM the engine auto-caps the expert cache to 2 slots/la
 
 ## Quality benchmark — help wanted
 
-We have never measured how much the int4 quantization costs in accuracy — the harness is built and wired, but scoring is one forward per answer option, and on the dev box's ~1 GB/s disk a full run takes the better part of a day. **This is the single most valuable thing a faster machine can contribute.** The code is here and ready; one command runs it end to end (it auto-downloads the datasets on first use):
+**First measurement is in** ([#108](https://github.com/JustVugg/colibri/issues/108), thanks dnnspaul): the int4 container scored **62.5% mean acc_norm** on hellaswag/arc/mmlu (0-shot log-likelihood, n=40) — below the 85–95% published for full-precision GLM-5.2, but **the gap is not yet attributable to quantization.** Two confounds sit in the way: (1) 0-shot log-likelihood MC scoring badly underserves a *reasoning* model like GLM-5.2 (it never gets to think), so a large gap is expected even at fp16; (2) n=40 is ±14pp. The **decisive experiment** is the OLMoE fp16-vs-int4 A/B under this same harness (small enough to run both precisions) — that delta *is* the quantization cost with the scoring protocol cancelled out. Until it's run, 62.5% is a datapoint, not a verdict.
+
+The code is here and ready; one command runs it end to end (it auto-downloads the datasets on first use):
 
 ```bash
 cd c
+pip install tokenizers datasets                # in addition to the convert deps above
 ./coli bench                                   # hellaswag, arc_challenge, mmlu — 40 questions each
 ./coli bench hellaswag --limit 200             # one task, more questions
 ./coli bench mmlu arc_challenge --ram 100      # pick tasks, set a RAM budget
 ```
 
-It prints per-task accuracy (log-likelihood scoring, EleutherAI-harness style). Published full-precision GLM-5.2 scores on these tasks sit around 85–95%; if our int4 container lands within a few points, the quantization is validated — if it doesn't, we know to invest in mixed / grouped-scale quantization. **If you have the hardware to run this, please open an issue with the numbers** — it's the measurement the project is missing.
+It prints per-task accuracy (log-likelihood scoring, EleutherAI-harness style). **If you can run the OLMoE fp16-vs-int4 A/B (or a large-n GLM run), please open an issue with the numbers** — it's the measurement that turns 62.5% into either "int4 is fine, scoring artifact" or "quantization is the ceiling, grouped-scale is the priority."
 
 ## Supporting the project
 
