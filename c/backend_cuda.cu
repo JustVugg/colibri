@@ -25,7 +25,7 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
-    float *pipe_buf[16]; size_t pipe_cap[16];   /* scratch persistenti del resident pipeline */
+    float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -393,7 +393,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
-        for(int b=0;b<16;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
+        for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
@@ -836,7 +836,7 @@ __global__ static void pipe_rows_add(float *x,const float *partial,const int *ro
  * per layer (78 x ~10 alloc/richiesta erano puro churn). */
 extern "C" float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes){
     DeviceContext *ctx=find_ctx(device);
-    if(slot<0||slot>=16||!select_ctx(ctx)) return NULL;
+    if(slot<0||slot>=24||!select_ctx(ctx)) return NULL;
     if(!reserve(&ctx->pipe_buf[slot],&ctx->pipe_cap[slot],bytes)) return NULL;
     return ctx->pipe_buf[slot];
 }
@@ -973,6 +973,21 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
         proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch (dev out)"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe attention sync (dev out)");
+}
+/* absorb batch con TUTTO su device (q/latent/rope gia' residenti sulla scheda
+ * dello shard, ctx resta sul device): il cuore della attention head-shardata
+ * dentro il pipeline. Nessun trasferimento host. */
+extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx_dev,
+        const float *q_dev,const float *latent_dev,const float *rope_dev,
+        int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(!w||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+       K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx_dev,q_dev,latent_dev,
+        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
+    return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
 extern "C" int coli_cuda_pipe_sync(int device){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;

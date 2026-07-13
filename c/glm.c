@@ -1456,6 +1456,53 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
         memcpy(coli_kv_row(m->Rc[layer],pos_base+s,R),chost+(size_t)s*(kvl+R)+kvl,R*4);
     }
     m->t_aproj+=now_s()-t0; t0=now_s();
+#ifdef COLI_CUDA
+    /* Negativo (2026-07-13): P2P a stella dal device di casa serializza ~95MB/layer
+     * sul suo link PCIe — attention 26->41-44s. Resta opt-in per topologie NVLink. */
+    if(out_dev && l->n_kv_b_shard>1 &&
+       getenv("COLI_CUDA_PIPE_SHARD") && atoi(getenv("COLI_CUDA_PIPE_SHARD"))){
+        /* head-shard nel pipeline: q gia' sul device di casa. Per ogni scheda:
+         * slice di q (repack strided->contiguo), broadcast latent+rope via P2P,
+         * score parallelo sui rispettivi head, ctx slice riportata a casa e
+         * ricomposta, poi o_proj residente. */
+        int n=l->n_kv_b_shard, vh=c->v_head;
+        size_t ctxb=(size_t)S*H*vh*4;
+        size_t stage_one=(size_t)S*H*(size_t)(c->qk_head>vh?c->qk_head:vh)*4;
+        float *ctx_full=coli_cuda_pipe_scratch(dev,16,ctxb);
+        float *stage=coli_cuda_pipe_scratch(dev,17,stage_one*n);
+        int ok_sh=(ctx_full&&stage)?1:0;
+        if(ok_sh){
+            #pragma omp parallel for schedule(static) reduction(&:ok_sh)
+            for(int d2=0;d2<n;d2++){
+                int hn=l->shard_hn[d2], h0=l->shard_h0[d2];
+                int sdev=coli_cuda_tensor_device(l->kv_b_shard[d2]);
+                float *st=stage+(size_t)d2*(stage_one/4);
+                size_t qsb=(size_t)S*hn*qh*4, csb=(size_t)S*hn*vh*4;
+                float *qs_r=coli_cuda_pipe_scratch(sdev,18,qsb);
+                float *ld_r=coli_cuda_pipe_scratch(sdev,19,(size_t)T*kvl*4);
+                float *rr_r=coli_cuda_pipe_scratch(sdev,20,(size_t)T*R*4);
+                float *cx_r=coli_cuda_pipe_scratch(sdev,21,csb);
+                int okd=qs_r&&ld_r&&rr_r&&cx_r;
+                /* slice di q: [S,H,qh] -> [S,hn,qh] contigua sul device di casa */
+                okd=okd&&coli_cuda_pipe_copy2d(dev,st,hn*qh,qd+(size_t)h0*qh,H*qh,hn*qh,S);
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,qs_r,dev,st,qsb);
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,ld_r,dev,ld_,(size_t)T*kvl*4);
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,rr_r,dev,rd,(size_t)T*R*4);
+                okd=okd&&coli_cuda_attention_absorb_batch_dev(l->kv_b_shard[d2],cx_r,qs_r,ld_r,rr_r,
+                        S,hn,c->qk_nope,R,vh,kvl,T,c->attn_scale);
+                okd=okd&&coli_cuda_pipe_peer_copy(dev,st,sdev,cx_r,csb);
+                okd=okd&&coli_cuda_pipe_copy2d(dev,ctx_full+(size_t)h0*vh,H*vh,st,hn*vh,hn*vh,S);
+                ok_sh&=okd;
+            }
+        }
+        if(ok_sh){
+            ok=coli_cuda_pipe_gemm(l->o.cuda,out_dev,ctx_full,S)&&coli_cuda_pipe_sync(dev);
+        } else ok=0;
+        if(!ok)
+            ok=coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+    } else
+#endif
     ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
             S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
               :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,

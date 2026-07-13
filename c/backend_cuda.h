@@ -115,6 +115,9 @@ int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
 int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
+int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_dev,
+        const float *q_dev,const float *latent_dev,const float *rope_dev,
+        int S,int H,int Q,int R,int V,int K,int T,float scale);
 int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
                              const float *src,size_t bytes);
 int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
