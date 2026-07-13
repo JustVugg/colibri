@@ -90,8 +90,36 @@ int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                             const void *weights, const float *scales);
 
+/* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
+float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
+void *coli_cuda_pipe_alloc(int device,size_t bytes);
+void coli_cuda_pipe_free(int device,void *p);
+int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
+int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
+                           const float *w_dev,int S,int D,float eps);
+int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,
+                        int stride,int offset,int R,int heads,float theta);
+int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,size_t n);
+int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n);
+int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
+                            const int *rows_dev,int nrows,int D);
+int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
+int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_dev,
+                             const float *w_dev,int S,int D,float eps,
+                             int xstride,int ystride);
+int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
+                             int stride,int offset,int R,int heads,float theta);
+int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
+                          int spitch,int width,int height);
+int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+        float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
+        int S,int H,int Q,int R,int V,int K,int T,float scale);
+int coli_cuda_pipe_sync(int device);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif
+
