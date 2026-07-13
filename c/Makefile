@@ -67,6 +67,18 @@ NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE)
+# HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
+# compiled unchanged through backend_gpu_compat.h (one source, two vendors,
+# like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
+# machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
+HIP       ?= 0
+ROCM_HOME ?= /opt/rocm
+HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+HIP_ARCH  ?= native
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip --offload-arch=$(HIP_ARCH) -Wall -Wextra
+GPUCC      = $(NVCC)
+GPUFLAGS   = $(NVCCFLAGS)
+GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -75,9 +87,23 @@ ifneq ($(IS_WIN),)
 # GPU: stub only in Phase 1 (G0). G1 builds coli_cuda.dll with MSVC+nvcc.
 $(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see PORT_WINDOWS_PLAN.md §8))
 endif
+ifeq ($(HIP),1)
+$(error choose CUDA=1 or HIP=1, not both)
+endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
+endif
+ifeq ($(HIP),1)
+ifneq ($(UNAME_S),Linux)
+$(error HIP=1 is supported only on Linux)
+endif
+CFLAGS    += -DCOLI_CUDA
+LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
+CUDA_OBJ   = backend_cuda.o
+GPUCC      = $(HIPCC)
+GPUFLAGS   = $(HIPCCFLAGS)
+GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
 endif
 
 all: glm$(EXE)
@@ -88,14 +114,18 @@ glm: glm$(EXE)
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h
+	@command -v $(GPUCC) >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	$(GPUCC) $(GPUFLAGS) -c backend_cuda.cu -o $@
 
-cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
+	@command -v $(GPUCC) >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	$(GPUCC) $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
+
+# convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
+hip-test:
+	$(MAKE) cuda-test HIP=1
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -137,4 +167,4 @@ clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+.PHONY: all glm cuda-test hip-test portable test-c test-python test check clean

@@ -1,6 +1,6 @@
 #include "backend_cuda.h"
 
-#include <cuda_runtime.h>
+#include "backend_gpu_compat.h"
 
 #include <cstdio>
 #include <cstdlib>
