@@ -39,6 +39,7 @@
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
+#include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
@@ -2502,23 +2503,36 @@ static inline int argmax_v(const float *lo, int V){
  * gia' tokenizzato. Il confine di tokenizzazione non e' garantito coincidere con quello
  * del modello: la verifica assorbe la differenza (al peggio l'ultimo draft e' rifiutato). */
 static void grammar_setup(Tok *T){
-    const char *gf=getenv("GRAMMAR"); if(!gf||!*gf) return;
-    FILE *f=fopen(gf,"rb");
-    if(!f){ fprintf(stderr,"[GRAMMAR] cannot open %s\n",gf); return; }
+    /* GRAMMAR=<file.gbnf> takes precedence; SCHEMA=<file.json> compiles a JSON-Schema
+     * to GBNF (schema_gbnf.h) for the same draft source. Both fail soft: the engine
+     * runs without a grammar and output is unchanged. */
+    const char *gf=getenv("GRAMMAR");
+    const char *sf=(gf&&*gf)?NULL:getenv("SCHEMA");
+    if((!gf||!*gf)&&(!sf||!*sf)) return;
+    const char *path=(gf&&*gf)?gf:sf;
+    FILE *f=fopen(path,"rb");
+    if(!f){ fprintf(stderr,"[GRAMMAR] cannot open %s\n",path); return; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *txt=malloc((size_t)n+1);
     if(!txt || fread(txt,1,(size_t)n,f)!=(size_t)n){
-        fprintf(stderr,"[GRAMMAR] failed to read %s\n",gf); fclose(f); free(txt); return; }
+        fprintf(stderr,"[GRAMMAR] failed to read %s\n",path); fclose(f); free(txt); return; }
     fclose(f); txt[n]=0;
-    if(gr_parse(&g_gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",gf,g_gram.err); free(txt); return; }
+    if(sf){ /* schema -> GBNF, then the same gr_parse as the GRAMMAR path */
+        char serr[160];
+        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
+        free(txt);
+        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",sf,serr); return; }
+        txt=gbnf;
+    }
+    if(gr_parse(&g_gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",path,g_gram.err); free(txt); return; }
     free(txt);
     gr_state_init(&g_gst,&g_gram);
-    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",gf); return; }
+    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",path); return; }
     if(getenv("GRAMMAR_DRAFT")) g_gr_max=atoi(getenv("GRAMMAR_DRAFT"));
     if(g_gr_max<1) g_gr_max=1;
     if(g_gr_max>48) g_gr_max=48;
     g_gr_T=T; g_gr_on=1;
-    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",gf,g_gram.n,g_gr_max);
+    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g_gram.n,g_gr_max);
 }
 /* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
 static void grammar_reset(void){
