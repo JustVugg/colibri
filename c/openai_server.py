@@ -6,8 +6,10 @@ import codecs
 import collections
 import contextlib
 import json
+import math
 import os
 import select
+import queue
 import signal
 import socket
 import subprocess
@@ -54,18 +56,22 @@ def error_object(error):
 
 
 class GenerationScheduler:
-    """Bounded FIFO admission for the engine's single mutable KV context."""
+    """Bounded FIFO admission for the engine's independent KV contexts."""
 
-    def __init__(self, max_queue=8, queue_timeout=300):
+    def __init__(self, max_queue=8, queue_timeout=300, capacity=1):
         if max_queue < 0:
             raise ValueError("max_queue cannot be negative")
         if queue_timeout <= 0:
             raise ValueError("queue_timeout must be positive")
+        if capacity < 1:
+            raise ValueError("capacity must be positive")
         self.max_queue = max_queue
         self.queue_timeout = queue_timeout
+        self.capacity = capacity
+        self.free_slots = set(range(capacity))
         self.condition = threading.Condition()
         self.queue = collections.deque()
-        self.active = False
+        self.active = 0
         self.closed = False
         self.admitted = 0
         self.completed = 0
@@ -74,14 +80,14 @@ class GenerationScheduler:
         self.cancelled = 0
 
     @contextlib.contextmanager
-    def admit(self, cancelled=None):
+    def admit(self, cancelled=None, slot=None):
         ticket = object()
         queued_at = time.monotonic()
         with self.condition:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if (self.active or self.queue) and len(self.queue) >= self.max_queue:
+            if (self.active >= self.capacity or self.queue) and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
@@ -93,7 +99,8 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
-                if not self.active and self.queue[0] is ticket:
+                available = min(self.free_slots) if slot is None and self.free_slots else slot
+                if self.queue[0] is ticket and available in self.free_slots:
                     break
                 if cancelled and cancelled():
                     self.queue.remove(ticket)
@@ -109,20 +116,23 @@ class GenerationScheduler:
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
                 self.condition.wait(min(remaining, 0.25))
             self.queue.popleft()
-            self.active = True
+            self.free_slots.remove(available)
+            self.active += 1
             self.admitted += 1
             wait_seconds = time.monotonic() - queued_at
         try:
-            yield wait_seconds
+            yield wait_seconds, available
         finally:
             with self.condition:
-                self.active = False
+                self.active -= 1
+                self.free_slots.add(available)
                 self.completed += 1
                 self.condition.notify_all()
 
     def snapshot(self):
         with self.condition:
             return {"active": self.active, "queued": len(self.queue),
+                    "capacity": self.capacity,
                     "max_queue": self.max_queue, "queue_timeout_seconds": self.queue_timeout,
                     "admitted": self.admitted, "completed": self.completed,
                     "rejected": self.rejected, "timed_out": self.timed_out,
@@ -325,9 +335,11 @@ def generation_options(body, limit):
     top_p = 0.9 if top_p is None else top_p
     if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
         raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
-    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
+            not math.isfinite(temperature) or not 0 <= temperature <= 2):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
-    if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
+    if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
+            not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p)
 
@@ -363,17 +375,100 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 class Engine:
     def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
-        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", NGEN=str(max_tokens),
-                         KV_SLOTS=str(kv_slots))
+        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
+                         NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
             [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
         )
-        self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending = {}
+        self.next_request_id = 1
+        self.closed = False
+        self.dispatcher_error = None
         self.kv_slots = kv_slots
         read_engine_turn(self.process.stdout, READY, lambda _: None)
+        self.dispatcher = threading.Thread(target=self._dispatch_stdout,
+                                           name="colibri-stdout", daemon=True)
+        self.dispatcher.start()
 
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0):
+    @staticmethod
+    def _stats(fields):
+        if len(fields) < 5 or fields[0] != "STAT":
+            raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
+        return {
+            "completion_tokens": int(fields[1]),
+            "tokens_per_second": float(fields[2]),
+            "cache_hit_percent": float(fields[3]),
+            "rss_gb": float(fields[4]),
+            "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
+            "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+        }
+
+    def _fail_pending(self, error):
+        with self.pending_lock:
+            requests = list(self.pending.values())
+            self.pending.clear()
+        for events in requests:
+            events.put(("error", error))
+
+    def _read_exact(self, size):
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = self.process.stdout.read(remaining)
+            if chunk == b"":
+                raise RuntimeError("truncated engine DATA payload")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _dispatch_stdout(self):
+        try:
+            while True:
+                line = self.process.stdout.readline()
+                if line == b"":
+                    raise RuntimeError("colibri engine exited unexpectedly")
+                fields = line.decode("utf-8", "replace").strip().split()
+                if not fields:
+                    continue
+                kind = fields[0]
+                if kind == "DATA" and len(fields) == 3:
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine DATA size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DATA terminator")
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("data", data))
+                elif kind == "DONE" and len(fields) >= 7:
+                    request_id = fields[1]
+                    stats = self._stats(fields[2:])
+                    with self.pending_lock:
+                        events = self.pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("done", stats))
+                elif kind == "ERROR" and len(fields) >= 2:
+                    request_id = fields[1]
+                    message = " ".join(fields[2:]) or "engine request failed"
+                    with self.pending_lock:
+                        events = self.pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("error", RuntimeError(message)))
+                else:
+                    raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
+        except Exception as error:
+            if not self.closed:
+                self.dispatcher_error = error
+                self._fail_pending(error)
+
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -386,26 +481,66 @@ class Engine:
             if text:
                 on_text(text)
 
-        with self.lock:
+        events = queue.Queue()
+        with self.pending_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.dispatcher_error is not None:
+                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
-            header = (f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} "
-                      f"{top_p:.8g} {cache_slot}\n").encode()
-            self.process.stdin.write(header + payload + b"\n")
-            self.process.stdin.flush()
-            stats = read_engine_turn(self.process.stdout, END, decode)
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                on_text(tail)
-            return stats
+            request_id = str(self.next_request_id)
+            self.next_request_id += 1
+            self.pending[request_id] = events
+        header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
+                  f"{temperature:.8g} {top_p:.8g}\n").encode()
+        try:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    raise RuntimeError("colibri engine is not running")
+                self.process.stdin.write(header + payload + b"\n")
+                self.process.stdin.flush()
+        except Exception:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            raise
+
+        cancel_sent = False
+        while True:
+            kind, value = events.get()
+            if kind == "data":
+                if not cancel_sent:
+                    decode(value)
+                    if cancelled and cancelled():
+                        cancel_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
+            elif kind == "done":
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    on_text(tail)
+                return value
+            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+                raise ClientCancelled()
+            else:
+                raise value
 
     def close(self):
+        with self.pending_lock:
+            if self.closed:
+                return
+            self.closed = True
+        self._fail_pending(RuntimeError("colibri engine is shutting down"))
         if self.process.poll() is None:
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                self.process.wait(timeout=5)
+        if self.dispatcher is not threading.current_thread():
+            self.dispatcher.join(timeout=5)
 
 
 def model_object(model_id, created):
@@ -423,7 +558,7 @@ class APIServer(ThreadingHTTPServer):
         self.model_id = model_id
         self.api_key = api_key
         self.max_tokens = max_tokens
-        self.scheduler = GenerationScheduler(max_queue, queue_timeout)
+        self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
@@ -543,8 +678,10 @@ class APIHandler(BaseHTTPRequestHandler):
     def generation(self, body, prompt, request_id, chat):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
-        cache_slot = body.get("cache_slot", 0)
-        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots:
+        cache_slot = body.get("cache_slot")
+        if (cache_slot is not None and
+                (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
+                 not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
         stream = body.get("stream", False)
@@ -559,12 +696,14 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
 
-        with self.server.scheduler.admit(self.client_disconnected) as queue_wait:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, output.append, cache_slot)
+                    prompt, maximum, temperature, top_p, output.append, cache_slot,
+                    self.client_disconnected)
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
@@ -670,7 +809,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
+                    lambda: not connected)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = parse_tool_calls("".join(raw), tools)
@@ -686,7 +826,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     emit(chunk)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
+                    lambda: not connected)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
@@ -762,20 +903,25 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
-    runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins,
+    # Bind before starting the 744B engine. A stale/occupied port must fail in
+    # milliseconds rather than loading hundreds of GB and leaking a child.
+    server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots)
-    print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
+    runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     try:
+        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        server.engine = runtime
+        print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
+        signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         server.serve_forever()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
         server.server_close()
-        runtime.close()
+        if runtime is not None:
+            runtime.close()
 
 
 def main():

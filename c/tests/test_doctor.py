@@ -142,7 +142,7 @@ class DoctorTest(unittest.TestCase):
         output = format_doctor(self.report())
 
         self.assertIn("model.path", output)
-        self.assertIn("disk   backing store", output)
+        self.assertIn("disk   0.0 GB cold experts", output)
         self.assertTrue(output.endswith("result ok"))
 
     def test_cli_json_is_machine_readable_without_loading_model(self):

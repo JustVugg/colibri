@@ -66,7 +66,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -80,22 +80,48 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
+# METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
+# runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
+METAL     ?= 0
+METAL_OBJ  =
+METALXX    = clang++ -x objective-c++ -fobjc-arc -O3
+ifeq ($(METAL),1)
+ifneq ($(UNAME_S),Darwin)
+$(error METAL=1 is supported only on macOS)
+endif
+CFLAGS   += -DCOLI_METAL
+LDFLAGS  += -framework Metal -framework Foundation -lc++
+METAL_OBJ = backend_metal.o
+endif
+
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
+backend_metal.o: backend_metal.mm backend_metal.h
+	$(METALXX) -c backend_metal.mm -o $@
+
+metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
+	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
+	./backend_metal_test
+
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
+
+cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
+	./backend_cuda_bench$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -119,6 +145,9 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -140,7 +169,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+.PHONY: all glm cuda-test cuda-bench portable test-c test-python test check clean
