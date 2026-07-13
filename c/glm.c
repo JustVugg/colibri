@@ -27,7 +27,9 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
-#include <sys/select.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -1128,7 +1130,9 @@ static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
-    void *base=NULL; struct stat st;
+    void *base=NULL;
+#if defined(__APPLE__) || defined(__linux__)
+    struct stat st;
     if(g_nmaps<512 && fstat(fd,&st)==0){
         size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
         void *p=mmap(NULL,len,PROT_READ,MAP_SHARED,fd,0);
@@ -1139,6 +1143,7 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#endif
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
@@ -1198,7 +1203,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
              * residency. This is pread's I/O without the copy and without the slab. */
             for(int k=0;k<3;k++){
                 char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
+#if defined(__APPLE__) || defined(__linux__)
                 madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+#endif
                 volatile char acc=0;
                 for(size_t i=0;i<n;i+=4096) acc+=p[i];
                 acc+=p[n-1]; (void)acc;
@@ -3082,6 +3089,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 }
 
 static void run_serve_mux(Model *m, const char *snap){
+#if defined(__APPLE__) || defined(__linux__)
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
@@ -3123,9 +3131,33 @@ static void run_serve_mux(Model *m, const char *snap){
     usage_save(m);
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+#else
+    /* SERVE_BATCH (continuous batching) uses select() on stdin, a Unix-ism.
+     * Not yet ported to native Windows — fall back to the single-sequence
+     * serve path (run_serve). Remove this stub once select()-free polling
+     * (e.g. WaitForSingleObject on the stdin handle) is implemented. */
+    (void)snap;
+    fprintf(stderr,"[SERVE_BATCH] continuous-batching serve is not yet available on "
+                   "native Windows; use the default serve path (omit SERVE_BATCH).\n");
+#endif
 }
 
 static void run_serve(Model *m, const char *snap){
+    /* Serve mode speaks a byte protocol over BOTH stdout and stdin:
+     *   stdout: \x01\x01READY\x01\x01\n, STAT lines, \x01\x01END\x01\x01\n
+     *   stdin:  text lines plus \x02RESET / \x02MORE control bytes.
+     * 'coli' matches the sentinels with endswith() and a "^STAT ..." regex,
+     * so they must arrive byte-exact (LF, no CR). On Windows the CRT opens
+     * both handles in TEXT mode: stdout translates '\n'->'\r\n' (so the READY
+     * sentinel never matches and chat hangs at ~10 GB resident), and stdin
+     * translates '\r\n'->'\n' and rejects writes of raw bytes with EINVAL,
+     * breaking the control protocol. Put BOTH handles in BINARY mode so the
+     * protocol bytes are exact in both directions. No-op on Linux/macOS. */
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");

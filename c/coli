@@ -383,13 +383,38 @@ def cmd_chat(a):
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
+    # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
+    # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
+    # protocol coli reads one byte at a time) never flushes and chat hangs at
+    # ~10 GB resident. A PIPE whose read end nobody drains still works: the
+    # engine emits only ~400 bytes of status to stderr, which fits comfortably
+    # in the OS pipe buffer, so it never blocks. We snapshot stderr into errlog
+    # once the READY sentinel arrives, so the status-line display below works
+    # exactly as before. (Do NOT add a concurrent stderr drain thread: on
+    # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
     p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=errlog, bufsize=0)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
+        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        except (OSError, ValueError): pass
         errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
+    # READY received. Drain the child's stderr into errlog without blocking:
+    # the engine is still alive (blocked on stdin), so a plain read() would
+    # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
+    # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
+    _drain_box={"done":False}
+    def _drain():
+        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        except (OSError, ValueError): pass
+        _drain_box["done"]=True
+    threading.Thread(target=_drain, daemon=True).start()
+    _drain_box["th"]=threading.current_thread()
+    for _ in range(20):           # up to ~1s for the load-status lines
+        if _drain_box["done"]: break
+        time.sleep(0.05)
     errlog.flush()
     try:
         elog=open(errlog.name).read()
