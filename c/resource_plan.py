@@ -116,6 +116,30 @@ def memory_available():
                 return total_kb.value * 1024
         except OSError:
             pass
+    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
+    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
+    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
+            page_match = re.search(r"page size of (\d+) bytes", out)
+            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
+            pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                match = re.search(rf"{key}:\s+(\d+)\.", out)
+                if match:
+                    pages += int(match.group(1))
+            if pages:
+                return pages * page
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        try:
+            total = subprocess.run(["sysctl", "-n", "hw.memsize"], text=True,
+                                   capture_output=True, timeout=5).stdout.strip()
+            if total:
+                return int(total)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
     return 0
 
 
