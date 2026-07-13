@@ -472,6 +472,22 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     *xq=g_qscratch.xq; *sx=g_qscratch.sx;
 }
 
+/* Per-thread attention score scratch (mirrors g_qscratch). Holds one score per
+ * attended key; nt reaches the full context on layers without DSA selection, so
+ * a fixed sc[8192] stack array smashed the stack past ~8k tokens. A thread-local
+ * buffer that grows only when a longer context needs it avoids both that overflow
+ * and a malloc/free per (s,h) in the parallel attention loops. */
+static _Thread_local float *g_scscratch=NULL; static _Thread_local size_t g_scscratch_cap=0;
+static float *score_scratch(int nt){
+    size_t n = nt>0 ? (size_t)nt : 1;
+    if(n>g_scscratch_cap){
+        float *p=realloc(g_scscratch,n*sizeof(float));
+        if(!p){ fprintf(stderr,"OOM attention scores\n"); exit(1); }
+        g_scscratch=p; g_scscratch_cap=n;
+    }
+    return g_scscratch;
+}
+
 static void matmul_qt(float *y, const float *x, QT *w, int S){
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
@@ -1203,11 +1219,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
-            float sc[8192];
             int st0=m->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
+            float *sc = score_scratch(nt);   /* per-thread reused scratch (see score_scratch) */
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
                 const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
@@ -1239,11 +1255,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos=pos_base+s;
         const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
         const float *qr=qp+c->qk_nope;
-        float sc[8192];
         int st0=m->kv_start[layer];
         int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: lista top-k o range pieno */
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
+        float *sc = score_scratch(nt);   /* per-thread reused scratch (see score_scratch) */
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
