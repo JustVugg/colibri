@@ -156,6 +156,23 @@ def env_for(a):
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
+    else:
+        # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
+        # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
+        if a.gpu is not None:
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            if a.gpu=="none":
+                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+            else:
+                if not cuda_binary():
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                e["COLI_CUDA"]="1"
+                if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
+                e.setdefault("CUDA_DENSE","1")
+        if a.vram and a.gpu!="none":
+            if not cuda_binary():
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
