@@ -35,8 +35,13 @@
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
+#ifdef _OPENMP
+#include <omp.h>                                  /* scratch per-thread nell'attention */
+#else
+static inline int omp_get_max_threads(void){ return 1; }
+static inline int omp_get_thread_num(void){ return 0; }
+#endif
 #ifdef COLI_CUDA
-#include <omp.h>
 #include "backend_cuda.h"
 #endif
 #ifdef __AVX2__
@@ -1290,6 +1295,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int absorb = g_absorb==1 || (g_absorb<0 && S<=4);
     if(absorb && c->kv_lora<=512){
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
+        /* punteggi per-thread sul HEAP: un sc[8192] fisso sullo stack va in overflow quando
+         * il layer attende su tutto il contesto (nessuna selezione DSA: snapshot senza
+         * indexer, o layer MTP) e nt supera 8192 — scrittura oltre lo stack del worker
+         * OMP => segfault (e poco sotto il limite: corruzione SILENZIOSA dello stack). */
+        int64_t sc_cap = Tk - m->kv_start[layer]; /* nt massimo (kv_start=-1 del MTP: +1, ok) */
+        float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         #pragma omp parallel for collapse(2) schedule(static)
         for(int s=0;s<S;s++) for(int h=0;h<H;h++){
             int pos=pos_base+s;
@@ -1298,7 +1309,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
-            float sc[8192];
+            float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
             int st0=m->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
@@ -1318,7 +1329,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
         matmul_qt(out, ctx, &l->o, S);
-        free(ctx); free(Q); free(QR); free(comp);
+        free(ctx); free(Q); free(QR); free(comp); free(sc_all);
         m->t_attn += now_s()-ta0;
         return;
     }
@@ -1328,13 +1339,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float *kvb_all=falloc((int64_t)Tk*kvb_dim);
     matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     m->t_kvb += now_s()-tk0;
-    /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot */
+    /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
+     * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
+    int64_t sc_cap = Tk - stL;
+    float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
     #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int h=0;h<H;h++){
         int pos=pos_base+s;
         const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
         const float *qr=qp+c->qk_nope;
-        float sc[8192];
+        float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
         int st0=m->kv_start[layer];
         int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: lista top-k o range pieno */
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
@@ -1353,7 +1367,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     matmul_qt(out, ctx, &l->o, S);
-    free(ctx); free(Q); free(QR); free(comp); free(kvb_all);
+    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
     m->t_attn += now_s()-ta0;
 }
 
