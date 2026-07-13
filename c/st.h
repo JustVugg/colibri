@@ -52,7 +52,7 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
-    fprintf(stderr, "dtype non gestito: %s\n", s); exit(1);
+    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 
 static inline float bf16_to_f32(uint16_t h) {
@@ -108,7 +108,7 @@ static void st_init(shards *S, const char *snap_dir) {
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
         if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
-            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "troppi shard (>%d): alza ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
             snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
         }
     }
@@ -182,7 +182,7 @@ static void st_prefetch(shards *S, const char *name) {
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     void *raw = malloc(t->nbytes);
     if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
     if (t->dtype == 2) {
@@ -208,7 +208,7 @@ static int64_t st_nbytes(shards *S, const char *name) {
  * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
@@ -218,7 +218,7 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);

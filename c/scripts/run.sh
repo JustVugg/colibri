@@ -15,24 +15,24 @@ NGEN="${2:-64}"
 cd "$CODE"
 
 # 0) sanity: il modello deve stare su ext4, non su 9p/Windows
-case "$DIR" in /mnt/*) echo "ERRORE: $DIR e' su /mnt (9p/Windows). Mettilo su ext4."; exit 1;; esac
+case "$DIR" in /mnt/*) echo "ERROR: $DIR is on /mnt (9p/Windows). Move it to ext4."; exit 1;; esac
 
 # 1) se un rsync di spostamento e' ancora vivo, aspettalo
 while pgrep -f "rsync.*glm52_i4" >/dev/null 2>&1; do
-    echo "[1/4] attendo lo spostamento su ext4... ($(du -sh "$DIR" 2>/dev/null | cut -f1))"; sleep 20
+    echo "[1/4] waiting for the move to ext4... ($(du -sh "$DIR" 2>/dev/null | cut -f1))"; sleep 20
 done
-echo "[1/4] spostamento completato: $(du -sh "$DIR" | cut -f1), shard $(ls "$DIR"/*.safetensors 2>/dev/null | wc -l)"
+echo "[1/4] move complete: $(du -sh "$DIR" | cut -f1), shards $(ls "$DIR"/*.safetensors 2>/dev/null | wc -l)"
 
 # 2) riprende+completa la conversione (ripartibile: salta gli shard gia' fatti)
-echo "[2/4] conversione (riprende da dove era): output -> $DIR"
+echo "[2/4] conversion (resumes where it stopped): output -> $DIR"
 python3 tools/convert_fp8_to_int4.py --repo "$REPO" --outdir "$DIR" --ebits 4 --io-bits 8
 
 # 3) il motore richiede tokenizer.json + config.json nella dir del modello
 for f in config.json tokenizer.json; do
-    [ -f "$DIR/$f" ] || { echo "ERRORE: manca $DIR/$f"; exit 1; }
+    [ -f "$DIR/$f" ] || { echo "ERROR: missing $DIR/$f"; exit 1; }
 done
-echo "[3/4] compilo il motore"; make -s glm
+echo "[3/4] building the engine"; make -s glm
 
 # 4) generazione reale, con auto-cap dal budget RAM e heartbeat RSS su stderr
-echo "[4/4] genero (RAM_GB=$RAM_GB, NGEN=$NGEN)"; echo "------"
+echo "[4/4] generating (RAM_GB=$RAM_GB, NGEN=$NGEN)"; echo "------"
 SNAP="$DIR" RAM_GB="$RAM_GB" PROMPT="$PROMPT" NGEN="$NGEN" ./glm 64

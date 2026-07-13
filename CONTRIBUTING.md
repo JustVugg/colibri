@@ -2,6 +2,17 @@
 
 Keep changes focused and preserve Colibri's dependency-free default CPU path.
 
+## Branches
+
+- **`main`** is the stable branch. It's what users clone, and it stays known-good
+  (engine always passes the token-exact oracle: `SNAP=./glm_tiny TF=1 ./glm 64 16 16`).
+- **`dev`** is the integration branch. **Open your PR against `dev`.** Reviewed PRs
+  land there first; once a batch is tested and stable, the maintainer fast-forwards
+  it into `main`. This keeps `main` clean instead of taking every PR one at a time.
+
+Every PR — on either branch — is reviewed for a clean build (0 warnings), the oracle
+(32/32 TF + 20/20 greedy), and its own targeted validation before merge.
+
 ## Local checks
 
 Run the lightweight checks locally:

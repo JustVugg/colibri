@@ -18,26 +18,26 @@
 #endif
 static double now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 int main(int argc,char**argv){
-    if(argc<2){fprintf(stderr,"uso: %s file [blkMB] [n] [threads] [direct 0/1]\n",argv[0]);return 1;}
+    if(argc<2){fprintf(stderr,"usage: %s file [blkMB] [n] [threads] [direct 0/1]\n",argv[0]);return 1;}
     long blk=(argc>2?atol(argv[2]):19)*1024*1024;
     int n=argc>3?atoi(argv[3]):64;
     int nth=argc>4?atoi(argv[4]):8;
     int direct=argc>5?atoi(argv[5]):1;
 #ifdef O_DIRECT
     int fd=open(argv[1],O_RDONLY|(direct?O_DIRECT:0));
-    if(fd<0 && direct){ fprintf(stderr,"O_DIRECT non disponibile (%s), uso buffered\n",strerror(errno));
+    if(fd<0 && direct){ fprintf(stderr,"O_DIRECT is unavailable (%s); using buffered I/O\n",strerror(errno));
         direct=0; fd=open(argv[1],O_RDONLY); }
 #else
     int fd=open(argv[1],O_RDONLY);                 /* macOS: F_NOCACHE ~ O_DIRECT */
 #ifdef __APPLE__
     if(direct && fd>=0) fcntl(fd,F_NOCACHE,1);
 #else
-    if(direct){ fprintf(stderr,"O_DIRECT non disponibile, uso buffered\n"); direct=0; }
+    if(direct){ fprintf(stderr,"O_DIRECT is unavailable; using buffered I/O\n"); direct=0; }
 #endif
 #endif
     if(fd<0){perror("open");return 1;}
     off_t sz=lseek(fd,0,SEEK_END);
-    if(sz<blk*2){fprintf(stderr,"file troppo piccolo\n");return 1;}
+    if(sz<blk*2){fprintf(stderr,"file is too small\n");return 1;}
     /* offset random pre-generati (stessi per ogni configurazione: srand fisso).
      * 30 bit di rand combinati: su Windows RAND_MAX=32767 e un singolo rand()*4096
      * copre solo i primi 134 MB del file (tutti in page cache = misura falsa). */
@@ -55,7 +55,7 @@ int main(int argc,char**argv){
         compat_aligned_free(buf);   /* su Windows posix_memalign=_aligned_malloc: free() corrompe l'heap */
     }
     double dt=now()-t0;
-    printf("%s x%d thread: %d letture x %ldMB = %.1f GB in %.2fs -> %.2f GB/s (%.1f ms/blocco effettivi)\n",
+    printf("%s x%d threads: %d reads x %ldMB = %.1f GB in %.2fs -> %.2f GB/s (%.1f effective ms/block)\n",
         direct?"O_DIRECT":"buffered", nth, n, blk/1024/1024, tot/1e9, dt, tot/1e9/dt, dt/n*1000);
     close(fd); free(offs); return 0;
 }

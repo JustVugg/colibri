@@ -124,12 +124,12 @@ static int gr__lit(Grammar *G, int ri, int ai, const char **pp){
     while(*p && *p!='"'){
         int b;
         if(*p=='\\'){ p++; b=gr__esc(&p);
-            if(b<0){ snprintf(G->err,sizeof G->err,"escape non valido nel letterale"); return -1; } }
+            if(b<0){ snprintf(G->err,sizeof G->err,"invalid escape in literal"); return -1; } }
         else b=(unsigned char)*p++;
         GrSym s; memset(&s,0,sizeof s); s.t=GR_CLS; s.c.bits[b>>3]|=(uint8_t)(1u<<(b&7));
-        if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"memoria esaurita"); return -1; }
+        if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
     }
-    if(*p!='"'){ snprintf(G->err,sizeof G->err,"letterale non chiuso"); return -1; }
+    if(*p!='"'){ snprintf(G->err,sizeof G->err,"unterminated literal"); return -1; }
     *pp=p+1; return 0;
 }
 static int gr__cls(Grammar *G, int ri, int ai, const char **pp){
@@ -139,22 +139,22 @@ static int gr__cls(Grammar *G, int ri, int ai, const char **pp){
     while(*p && *p!=']'){
         int lo, hi;
         if(*p=='\\'){ p++; lo=gr__esc(&p);
-            if(lo<0){ snprintf(G->err,sizeof G->err,"escape non valido nella classe"); return -1; } }
+            if(lo<0){ snprintf(G->err,sizeof G->err,"invalid escape in character class"); return -1; } }
         else lo=(unsigned char)*p++;
         hi=lo;
         if(*p=='-' && p[1] && p[1]!=']'){
             p++;
             if(*p=='\\'){ p++; hi=gr__esc(&p);
-                if(hi<0){ snprintf(G->err,sizeof G->err,"escape non valido nella classe"); return -1; } }
+                if(hi<0){ snprintf(G->err,sizeof G->err,"invalid escape in character class"); return -1; } }
             else hi=(unsigned char)*p++;
         }
         if(hi<lo){ int t=lo; lo=hi; hi=t; }
         for(int b=lo;b<=hi;b++) s.c.bits[b>>3]|=(uint8_t)(1u<<(b&7));
     }
-    if(*p!=']'){ snprintf(G->err,sizeof G->err,"classe non chiusa"); return -1; }
+    if(*p!=']'){ snprintf(G->err,sizeof G->err,"unterminated character class"); return -1; }
     if(neg) for(int i=0;i<32;i++) s.c.bits[i]=(uint8_t)~s.c.bits[i];
     *pp=p+1;
-    if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"memoria esaurita"); return -1; }
+    if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
     return 0;
 }
 /* postfisso ? * + sull'ITEM appena letto (simboli [n0, n) dell'alternate corrente).
@@ -179,28 +179,28 @@ static int gr__postfix(Grammar *G, int ri, int ai, int n0, char op){
     if(gr__push(G,ri,ai,&R)) goto full;                   /* l'item nell'alternate diventa R */
     return 0;
 full:
-    snprintf(G->err,sizeof G->err,"grammatica troppo grande");
+    snprintf(G->err,sizeof G->err,"grammar is too large");
     return -1;
 }
 static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group){
-    if(depth>32){ snprintf(G->err,sizeof G->err,"gruppi troppo annidati"); return -1; }
+    if(depth>32){ snprintf(G->err,sizeof G->err,"groups are nested too deeply"); return -1; }
     const char *p=*pp;
     int ai=gr__alt_new(G,ri);
-    if(ai<0){ snprintf(G->err,sizeof G->err,"memoria esaurita"); return -1; }
+    if(ai<0){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
     for(;;){
         p=gr__ws(p);
         if(!*p){
-            if(in_group){ snprintf(G->err,sizeof G->err,"manca ')'"); return -1; }
+            if(in_group){ snprintf(G->err,sizeof G->err,"missing ')'"); return -1; }
             break;
         }
         if(*p==')'){
-            if(!in_group){ snprintf(G->err,sizeof G->err,"')' inatteso"); return -1; }
+            if(!in_group){ snprintf(G->err,sizeof G->err,"unexpected ')'"); return -1; }
             break;
         }
         if(*p=='|'){
             p++;
             ai=gr__alt_new(G,ri);
-            if(ai<0){ snprintf(G->err,sizeof G->err,"memoria esaurita"); return -1; }
+            if(ai<0){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
             continue;
         }
         int n0=G->r[ri].a[ai].n;
@@ -211,24 +211,24 @@ static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group
         } else if(*p=='('){
             p++;
             int gi=gr__anon(G);
-            if(gi<0){ snprintf(G->err,sizeof G->err,"grammatica troppo grande"); return -1; }
+            if(gi<0){ snprintf(G->err,sizeof G->err,"grammar is too large"); return -1; }
             if(gr__alts(G,gi,&p,depth+1,1)) return -1;
             p=gr__ws(p);
-            if(*p!=')'){ snprintf(G->err,sizeof G->err,"manca ')'"); return -1; }
+            if(*p!=')'){ snprintf(G->err,sizeof G->err,"missing ')'"); return -1; }
             p++;
             GrSym s; memset(&s,0,sizeof s); s.t=GR_REF; s.ref=(int16_t)gi;
-            if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"memoria esaurita"); return -1; }
+            if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
         } else if(gr__idch(*p)){
             int nl=gr__idlen(p);
             const char *after=gr__ws(p+nl);
             if(!in_group && !strncmp(after,"::=",3)) break;   /* inizia la prossima regola */
             int ref=gr__rule(G,p,nl);
-            if(ref<0){ snprintf(G->err,sizeof G->err,"troppe regole"); return -1; }
+            if(ref<0){ snprintf(G->err,sizeof G->err,"too many rules"); return -1; }
             p+=nl;
             GrSym s; memset(&s,0,sizeof s); s.t=GR_REF; s.ref=(int16_t)ref;
-            if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"memoria esaurita"); return -1; }
+            if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
         } else {
-            snprintf(G->err,sizeof G->err,"carattere inatteso '%c'",*p); return -1;
+            snprintf(G->err,sizeof G->err,"unexpected character '%c'",*p); return -1;
         }
         p=gr__ws(p);
         if(*p=='?'||*p=='*'||*p=='+'){ if(gr__postfix(G,ri,ai,n0,*p)) return -1; p++; }
@@ -244,21 +244,21 @@ static int gr_parse(Grammar *G, const char *src){
         p=gr__ws(p);
         if(!*p) break;
         int nl=gr__idlen(p);
-        if(nl<=0){ snprintf(G->err,sizeof G->err,"attesa una regola, trovato '%c'",*p); return -1; }
+        if(nl<=0){ snprintf(G->err,sizeof G->err,"expected a rule, found '%c'",*p); return -1; }
         const char *name=p;
         const char *q=gr__ws(p+nl);
-        if(strncmp(q,"::=",3)){ snprintf(G->err,sizeof G->err,"atteso '::=' dopo '%.*s'",nl,name); return -1; }
+        if(strncmp(q,"::=",3)){ snprintf(G->err,sizeof G->err,"expected '::=' after '%.*s'",nl,name); return -1; }
         p=q+3;
         int ri=gr__rule(G,name,nl);
-        if(ri<0){ snprintf(G->err,sizeof G->err,"troppe regole"); return -1; }
-        if(G->r[ri].n>0){ snprintf(G->err,sizeof G->err,"regola '%.*s' duplicata",nl,name); return -1; }
+        if(ri<0){ snprintf(G->err,sizeof G->err,"too many rules"); return -1; }
+        if(G->r[ri].n>0){ snprintf(G->err,sizeof G->err,"duplicate rule '%.*s'",nl,name); return -1; }
         if(gr__alts(G,ri,&p,0,0)) return -1;
     }
     for(int i=0;i<G->n;i++){
         if(!strcmp(G->r[i].name,"root")) G->root=i;
-        if(G->r[i].n==0){ snprintf(G->err,sizeof G->err,"regola '%s' usata ma mai definita",G->r[i].name); return -1; }
+        if(G->r[i].n==0){ snprintf(G->err,sizeof G->err,"rule '%s' is used but never defined",G->r[i].name); return -1; }
     }
-    if(G->root<0){ snprintf(G->err,sizeof G->err,"manca la regola 'root'"); return -1; }
+    if(G->root<0){ snprintf(G->err,sizeof G->err,"missing 'root' rule"); return -1; }
     return 0;
 }
 static void gr_free(Grammar *G){

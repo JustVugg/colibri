@@ -97,7 +97,7 @@ static void tok_load(Tok *T, const char *path){
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: manca model.vocab/merges\n"); exit(1); }
+    if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
     /* id massimo per dimensionare id2str */
     int maxid=0;
