@@ -3742,15 +3742,27 @@ int main(int argc, char **argv){
         fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2;
     }
 #ifdef COLI_CUDA
-    if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
-        const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
-        if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
-        if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
-        else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
-        else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
-        if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
-        g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
-        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+    /* COLI_CUDA=1 requests the backend explicitly (init failure is fatal).
+     * COLI_CUDA unset probes coli_cuda_init and falls back to CPU quietly —
+     * on Windows this makes a CUDA_DLL=1 binary use the GPU automatically
+     * when coli_cuda.dll is present and stay CPU-only when it is not.
+     * COLI_CUDA=0 forces CPU even with a GPU available. */
+    {
+        const char *cc=getenv("COLI_CUDA");
+        int cuda_req=cc?atoi(cc):-1;                  /* -1 unset, 0 off, 1 on */
+        if(cuda_req!=0){
+            const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
+            if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
+            if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
+            else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
+            else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
+            if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
+            g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
+            if(!g_cuda_enabled){
+                if(cuda_req==1){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+                fprintf(stderr,"[CUDA] auto-detect: backend unavailable; running CPU-only (COLI_CUDA=0 silences this)\n");
+            }
+        }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
