@@ -174,7 +174,8 @@ typedef struct {
     int64_t resident_bytes;
 } Model;
 
-static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
+static void usage_save(Model *m);
+static void tiers_emit(Model *m);        /* cache che impara: definita accanto a stats_dump */
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -2996,6 +2997,7 @@ static void mux_data(Tok *T, unsigned long long id, int token){
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
     double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
+    tiers_emit(m);
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
@@ -3083,6 +3085,7 @@ static void run_serve_mux(Model *m, const char *snap){
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
     setvbuf(stdin,NULL,_IONBF,0);
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    tiers_emit(m);
     int eof=0;
     for(;;){
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
@@ -3139,6 +3142,7 @@ static void run_serve(Model *m, const char *snap){
     #define first (sc->first)
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
+    tiers_emit(m);
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
@@ -3274,6 +3278,26 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
     }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
     return eb;
+}
+
+/* TIERS: fotografia della piramide expert per la dashboard web —
+ * "TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>" sul canale di protocollo.
+ * ram = pinnati non-VRAM + LRU corrente; disk = tutto il resto. */
+static void tiers_emit(Model *m){
+    Cfg *c=&m->c; int nsp=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
+    int total=(nsp+(m->has_mtp?1:0))*c->n_experts;
+    int pinned=0,lru=0;
+    for(int i=0;i<=c->n_layers;i++){ pinned+=m->npin?m->npin[i]:0; lru+=m->ecn?m->ecn[i]:0; }
+    int vram=0; double vram_gb=0;
+#ifdef COLI_CUDA
+    vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
+#endif
+    int ram=pinned-vram+lru; if(ram<0) ram=0;
+    int disk=total-vram-ram; if(disk<0) disk=0;
+    double eb=(double)expert_bytes_probe(m,m->ebits);
+    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
+    fflush(stdout);
 }
 
 /* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN).

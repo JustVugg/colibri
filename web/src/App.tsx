@@ -200,6 +200,22 @@ export default function App() {
               <div><span>Completed</span><strong>{health.scheduler.completed}</strong></div>
               <div><span>Failures</span><strong>{failures}</strong></div>
             </div>
+            {health.tiers ? (() => {
+              const t = health.tiers
+              const total = Math.max(t.vram + t.ram + t.disk, 1)
+              return <div className="tier-panel">
+                <div className="tier-bar" role="img" aria-label={`Experts: ${t.vram} VRAM, ${t.ram} RAM, ${t.disk} disk`}>
+                  <span className="tier-vram" style={{ width: `${(100 * t.vram) / total}%` }} />
+                  <span className="tier-ram" style={{ width: `${(100 * t.ram) / total}%` }} />
+                  <span className="tier-disk" style={{ width: `${(100 * t.disk) / total}%` }} />
+                </div>
+                <div className="tier-legend">
+                  <span><i className="tier-vram" />VRAM <strong>{t.vram.toLocaleString()}</strong><small>{t.vram_gb.toFixed(1)} GB</small></span>
+                  <span><i className="tier-ram" />RAM <strong>{t.ram.toLocaleString()}</strong><small>{t.ram_gb.toFixed(1)} GB</small></span>
+                  <span><i className="tier-disk" />Disk <strong>{t.disk.toLocaleString()}</strong></span>
+                </div>
+              </div>
+            })() : null}
             <div className="runtime-foot"><span className="runtime-dot" /> Scheduler online <code>{kvSlots} KV</code></div>
           </> : <p className="runtime-unavailable">{connected ? (healthError || "Runtime metrics unavailable") : "Probe the server to inspect runtime state."}</p>}
         </section>

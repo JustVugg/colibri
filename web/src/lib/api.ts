@@ -23,10 +23,19 @@ export interface SchedulerHealth {
   cancelled: number
 }
 
+export interface TiersHealth {
+  vram: number
+  ram: number
+  disk: number
+  vram_gb: number
+  ram_gb: number
+}
+
 export interface HealthResponse {
   status: string
   scheduler?: SchedulerHealth
   kv_slots?: number
+  tiers?: TiersHealth
 }
 
 export interface TokenUsage {

@@ -7,6 +7,7 @@ import collections
 import contextlib
 import json
 import math
+import mimetypes
 import os
 import select
 import queue
@@ -388,6 +389,7 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        self.tiers = None                      # latest "TIERS" snapshot from the engine
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -453,6 +455,10 @@ class Engine:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
                         events.put(("done", stats))
+                elif kind == "TIERS" and len(fields) >= 6:
+                    self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
+                                  "disk": int(fields[3]), "vram_gb": float(fields[4]),
+                                  "ram_gb": float(fields[5])}
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -622,13 +628,47 @@ class APIHandler(BaseHTTPRequestHandler):
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
+    WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+
+    def serve_static(self, path):
+        """Serve the built web UI (web/dist) so `coli web` is one process.
+        Read-only, no auth (same trust level as /health), traversal-safe."""
+        if path.startswith("/v1/") or path == "/health":
+            return False
+        base = self.WEB_DIST
+        if not base.is_dir():
+            return False
+        rel = unquote(path).lstrip("/") or "index.html"
+        target = (base / rel).resolve()
+        if not str(target).startswith(str(base)) or not target.is_file():
+            if path == "/" or "." not in rel:      # SPA fallback
+                target = base / "index.html"
+                if not target.is_file():
+                    return False
+            else:
+                return False
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(data)
+        return True
+
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
             path = urlsplit(self.path).path
             if path == "/health":
-                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
-                                     "kv_slots": self.server.kv_slots}, request_id)
+                payload = {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
+                           "kv_slots": self.server.kv_slots}
+                tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                if tiers: payload["tiers"] = tiers
+                self.send_json(200, payload, request_id)
+                return
+            if self.serve_static(path):
                 return
             self.require_auth()
             if path == "/v1/models":

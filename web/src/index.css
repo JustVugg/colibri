@@ -86,3 +86,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 @media (max-width: 560px) { .sidebar { grid-template-columns: 1fr; }.brand-row, .sidebar-foot { grid-column: auto; }.empty-state h2 { font-size: 36px; }.message-list { width: calc(100% - 28px); }.composer-foot > span { display: none; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
+
+/* expert tier pyramid: where the 19k experts live right now */
+.tier-panel { display: grid; gap: 7px; }
+.tier-bar { display: flex; height: 10px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); background: var(--card); }
+.tier-bar span { display: block; min-width: 0; transition: width .6s ease; }
+.tier-vram { background: var(--primary); }
+.tier-ram { background: #5a9bd8; }
+.tier-disk { background: #3a4750; }
+.tier-legend { display: flex; gap: 12px; font-size: 10px; color: #839197; flex-wrap: wrap; }
+.tier-legend span { display: flex; align-items: center; gap: 5px; }
+.tier-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.tier-legend strong { font: 600 12px ui-monospace, SFMono-Regular, monospace; color: var(--foreground); }
+.tier-legend small { color: var(--muted-foreground); }
