@@ -44,3 +44,9 @@ stats*.txt
 /quant_test.py
 /profile_run.py
 /sweep.py
+
+# local: model + scratch (never push)
+model_weights/
+questions.txt
+verify_colibri.sh
+c/tests/test_tier
