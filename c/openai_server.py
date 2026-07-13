@@ -196,23 +196,62 @@ def _tool_param_order(tools):
     return out
 
 
+def _tool_param_types(tools):
+    """name -> {param: declared JSON-schema type}. The model emits every argument as text;
+    without the schema a string-typed value that happens to look numeric ("12345" for an
+    order id, an SKU, a phone number) would be json.loads()'d into an int and the tool would
+    receive the wrong type."""
+    out = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        types = {}
+        for key, spec in props.items():
+            if isinstance(spec, dict):
+                t = spec.get("type")
+                if isinstance(t, list):          # {"type": ["string", "null"]}
+                    t = next((x for x in t if x != "null"), None)
+                types[key] = t
+        out[name] = types
+    return out
+
+
+def _coerce_arg(value, declared):
+    """Decode a raw <arg_value> according to the declared schema type.
+
+    A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
+    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    if declared == "string":
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+    if declared in ("integer", "number") and isinstance(parsed, bool):
+        return value                              # `true` is not a number
+    if declared and declared not in ("integer", "number", "boolean", "object", "array"):
+        return value
+    return parsed
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
     param_order = _tool_param_order(tools)
+    param_types = _tool_param_types(tools)
     calls, salvaged = [], []
     for match in _BOX_RE.finditer(reply):
         inner = match.group(1)
         name_match = _NAME_RE.match(inner)
         name = name_match.group(1) if name_match else inner.strip()
         args = {}
+        types = param_types.get(name, {})
         for arg in _ARG_RE.finditer(inner):
             key, value = arg.group(1), arg.group(2)
-            try:
-                value = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            args[key] = value
+            args[key] = _coerce_arg(value, types.get(key))
         if not args and _SALVAGE:
             rest = inner[name_match.end():] if name_match else ""
             payload = _TAG_RE.sub("", rest).strip()
@@ -241,7 +280,8 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None):
+def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
@@ -249,6 +289,15 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     if enable_thinking:
         effort = "High" if reasoning_effort == "high" else "Max"
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
     if tools:
         # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
         # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
@@ -264,6 +313,10 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                       "within the following XML format:\n<tool_call>{function-name}"
                       "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
                       "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
+        if forced:
+            prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
     prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -309,6 +362,27 @@ def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
+    choice = body.get("tool_choice")
+    if choice is not None:
+        if isinstance(choice, str):
+            if choice not in ("auto", "none", "required"):
+                raise APIError(400, "`tool_choice` must be one of \"auto\", \"none\", \"required\", "
+                                    "or a function object.", "tool_choice", "unsupported_value")
+        elif isinstance(choice, dict):
+            name = (choice.get("function") or {}).get("name") or choice.get("name")
+            if not name:
+                raise APIError(400, "`tool_choice` function object must include a name.",
+                               "tool_choice", "invalid_value")
+            declared = [(t.get("function", t) if isinstance(t, dict) else {}).get("name")
+                        for t in (body.get("tools") or body.get("functions") or [])]
+            if name not in declared:
+                raise APIError(400, f"`tool_choice` names {name!r}, which is not in `tools`.",
+                               "tool_choice", "invalid_value")
+        else:
+            raise APIError(400, "`tool_choice` must be a string or a function object.",
+                           "tool_choice", "invalid_value")
+        if choice != "none" and not (body.get("tools") or body.get("functions")):
+            raise APIError(400, "`tool_choice` requires `tools`.", "tool_choice", "invalid_value")
     if body.get("stop") is not None:
         raise APIError(400, "Custom stop sequences are not supported yet.", "stop", "unsupported_parameter")
     if body.get("logprobs"):
@@ -678,6 +752,8 @@ class APIHandler(BaseHTTPRequestHandler):
     def generation(self, body, prompt, request_id, chat):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
+        if body.get("tool_choice") == "none":
+            tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -878,7 +954,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools)
+        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                             body.get("tool_choice"))
         self.generation(body, prompt, request_id, True)
 
     def completion(self, body, request_id):
