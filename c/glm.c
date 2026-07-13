@@ -88,6 +88,11 @@ typedef struct {
     float *in_ln, *post_ln;
     /* MLA (densa, quantizzata) */
     QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
+#ifdef COLI_CUDA
+    ColiCudaTensor *kv_b_shard[COLI_CUDA_MAX_DEVICES];
+    int shard_h0[COLI_CUDA_MAX_DEVICES],shard_hn[COLI_CUDA_MAX_DEVICES],n_kv_b_shard;
+    int shared_w4a16_failed;
+#endif
     int sparse;
     /* dense mlp (sparse==0) */
     QT gate_proj, up_proj, down_proj;
@@ -859,6 +864,33 @@ static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (nor
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"manca %s\n",name);exit(1);}
     float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
 }
+#ifdef COLI_CUDA
+static void qt_cuda_colocate(QT *dst,const QT *src){
+    if(!g_cuda_enabled||!g_cuda_dense||!dst->cuda_eligible||!src->cuda_eligible||
+       dst->cuda_device==src->cuda_device)return;
+    int old=-1,now=-1;for(int i=0;i<g_cuda_ndev;i++){
+        if(g_cuda_devices[i]==dst->cuda_device)old=i;if(g_cuda_devices[i]==src->cuda_device)now=i;
+    }
+    if(old>=0)g_cuda_dense_projected[old]-=qt_bytes(dst);
+    if(now>=0)g_cuda_dense_projected[now]+=qt_bytes(dst);
+    dst->cuda_device=src->cuda_device;
+}
+static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
+    if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0)return;
+    int rb=l->kv_b.fmt==1?l->kv_b.I:(l->kv_b.fmt==2?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4);
+    const uint8_t *weights=l->kv_b.fmt==1?(const uint8_t*)l->kv_b.q8:l->kv_b.q4;
+    for(int d=0,h0=0;d<g_cuda_ndev;d++){
+        int hn=H/g_cuda_ndev+(d<H%g_cuda_ndev),rows=hn*(Q+V);
+        const void *part=weights+(int64_t)h0*(Q+V)*rb;
+        const float *scale=l->kv_b.s+(int64_t)h0*(Q+V);
+        if(!coli_cuda_tensor_upload(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d]))return;
+        l->shard_h0[d]=h0;l->shard_hn[d]=hn;l->n_kv_b_shard++;h0+=hn;
+    }
+    int old=-1;for(int i=0;i<g_cuda_ndev;i++)if(g_cuda_devices[i]==l->kv_b.cuda_device)old=i;
+    if(old>=0)g_cuda_dense_projected[old]-=qt_bytes(&l->kv_b);
+    l->kv_b.cuda_eligible=0;
+}
+#endif
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
@@ -891,6 +923,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
         l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
         l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+#ifdef COLI_CUDA
+        qt_cuda_colocate(&l->o,&l->kv_b);
+        if(getenv("COLI_CUDA_ATTN_SHARD")&&atoi(getenv("COLI_CUDA_ATTN_SHARD")))
+            layer_cuda_shard_kvb(l,H,c->qk_nope,c->v_head);
+#endif
         l->sparse = (i >= c->first_dense);
         if(!l->sparse){
             l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
@@ -903,6 +940,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
+#ifdef COLI_CUDA
+            if(l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
+               getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))){
+                qt_cuda_colocate(&l->sh_up,&l->sh_gate);
+                qt_cuda_colocate(&l->sh_down,&l->sh_gate);
+            }
+#endif
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -1268,13 +1312,40 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * k/v per ogni token del contesto. Per linearita':
      *   q·k_nope_t = (W_K^hT q_nope)·L_t      ctx^h = W_V^h (Σ_t a_t L_t)
      * costo per step ~O(T·kv_lora) invece di O(T·H·(nope+vh)) del matmul kvb_all. */
-    int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4);
+    int cuda_absorb=0;
+#ifdef COLI_CUDA
+    cuda_absorb=layer<c->n_layers&&!kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&
+                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512;
+#endif
+    int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4) || cuda_absorb;
     if(absorb && c->kv_lora<=512){
         m->t_aproj+=now_s()-ta0; double tac=now_s();
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
-        int cuda_core=0;
+        int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
-        if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+        if(cuda_absorb&&l->n_kv_b_shard>1){
+            int n=l->n_kv_b_shard,st0=m->kv_start[layer],nt=pos_base+S-st0,ok=1;
+            float *qs=falloc((int64_t)S*H*qh),*cs=falloc((int64_t)S*H*vh);
+            for(int d=0;d<n;d++)for(int s=0;s<S;s++)memcpy(
+                qs+(int64_t)l->shard_h0[d]*S*qh+(int64_t)s*l->shard_hn[d]*qh,
+                Q+((int64_t)s*H+l->shard_h0[d])*qh,(size_t)l->shard_hn[d]*qh*sizeof(float));
+            #pragma omp parallel for schedule(static) reduction(&:ok)
+            for(int d=0;d<n;d++)ok&=coli_cuda_attention_absorb_batch(l->kv_b_shard[d],
+                cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
+                coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
+                S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+            if(ok)for(int d=0;d<n;d++)for(int s=0;s<S;s++)memcpy(
+                ctx+((int64_t)s*H+l->shard_h0[d])*vh,
+                cs+(int64_t)l->shard_h0[d]*S*vh+(int64_t)s*l->shard_hn[d]*vh,
+                (size_t)l->shard_hn[d]*vh*sizeof(float));
+            free(qs);free(cs);cuda_core=ok;
+        } else if(cuda_absorb&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+           qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
+            int st0=m->kv_start[layer],nt=pos_base+S-st0;
+            cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
+                coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
+                S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+        } else if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
             cuda_core=1;
             for(int s=0;s<S&&cuda_core;s++){
@@ -1320,7 +1391,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
-        matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
+        if(!cuda_projected)matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp);
         m->t_attn += now_s()-ta0;
         return;
@@ -1586,16 +1657,33 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         }
     }
     /* ---- FASE E: shared expert, un matmul a S righe ---- */
-    float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
-    matmul_qt(sg, x, &l->sh_gate, S);
-    matmul_qt(su, x, &l->sh_up,   S);
-    for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
-    matmul_qt(hh, sg, &l->sh_down, S);
+    float *sg=NULL,*su=NULL;int shared_cuda=0;
+#ifdef COLI_CUDA
+    int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
+        atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
+    if(shared_min<16)shared_min=16;
+    if(S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
+       l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
+       getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
+       qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
+        shared_cuda=coli_cuda_shared_mlp_w4a16(l->sh_gate.cuda,l->sh_up.cuda,
+                                               l->sh_down.cuda,hh,x,S);
+        if(!shared_cuda)l->shared_w4a16_failed=1;
+    }
+#endif
+    if(!shared_cuda){
+        sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
+        matmul_qt(sg, x, &l->sh_gate, S);
+        matmul_qt(su, x, &l->sh_up,   S);
+        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+        matmul_qt(hh, sg, &l->sh_down, S);
+    }
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
 #ifdef COLI_CUDA
-    free(group_x); free(group_y); free(group_row); free(group_weight);
+    free(group_x);free(group_y);
+    free(group_row); free(group_weight);
 #endif
 }
 

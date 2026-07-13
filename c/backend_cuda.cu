@@ -18,6 +18,7 @@ struct ColiCudaTensor {
 
 typedef struct {
     int device;
+    int compute_major,compute_minor;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
     uint8_t *qx; float *qscale;
@@ -108,6 +109,68 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
         float v = gate[i];
         gate[i] = (v / (1.0f + expf(-v))) * up[i];
     }
+}
+
+/* Four warps share one A tile and compute 16x64 outputs.  This matters for
+ * prefill: the first prototype reloaded/converter A once per 16 output cols. */
+__global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
+                                    const float *scale,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    size_t rb=(size_t)(K+1)/2;
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
+        }
+        for(int z=lane;z<256;z+=32){
+            int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
+                v=(float)(a&8?a-16:a)*scale[gn];}
+            bh[warp][z]=__float2half(v);           /* [Ntile,Ktile] == B col-major */
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
+#endif
+}
+
+/* Gate and up use the same input.  Eight warps compute both 16x64 projections
+ * while sharing the FP32->FP16 conversion of A. */
+__global__ static void w4a16_gate_up(float *gate,float *up,const float *x,
+        const uint8_t *gw,const uint8_t *uw,const float *gs,const float *us,
+        int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;const uint8_t *w=which?uw:gw;
+    const float *scale=which?us:gs;float *y=which?up:gate;size_t rb=(size_t)(K+1)/2;
+    __shared__ __half ah[256],bh[8][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
+                v=(float)(a&8?a-16:a)*scale[gn];}bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
+#endif
 }
 
 __global__ static void quantize_s4_rows(uint8_t *q,float *scale,const float *x,int S,int K){
@@ -233,6 +296,37 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+__global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
+        const float *latent,const float *rope,const void *weights,const float *wscale,
+        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
+    if(s>=S||nt<1)return;
+    extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
+    const float *qs=q+((size_t)s*H+h)*(Q+R);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+    __syncthreads();
+    for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=latent+(size_t)t*K;
+        const float *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
+        for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[t]=a*scale;}
+    __syncthreads();
+    float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)
+        a+=scores[t]*latent[(size_t)t*K+k];cl[k]=a;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -276,6 +370,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if (!select_ctx(ctx)) { g_nctx = 0; return 0; }
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
+        ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             g_nctx=0;return 0;
         }
@@ -443,6 +538,34 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     return 1;
 }
 
+extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S){
+    if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=2||up->fmt!=2||down->fmt!=2||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "shared w4a16 input upload"))return 0;
+    dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+    dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+    w4a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
+        (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
+    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+    w4a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
+    if(!cuda_ok(cudaGetLastError(),"shared w4a16 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "shared w4a16 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"shared w4a16 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *ups,
                                         ColiCudaTensor *const *downs,
@@ -537,6 +660,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     return 1;
 }
 
+
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,
                                             int R,int V,int K,int T,float scale){
@@ -557,6 +681,49 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"attention context download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"attention synchronize"))return 0;
     return 1;
+}
+
+static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
+        const float *q,const float *latent,const float *rope,int S,int H,int Q,int R,int V,
+        int K,int T,float scale){
+    if(!w||!out||!q||!latent||!rope||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
+       T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
+    if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
+    size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)S*H*V*sizeof(float);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
+       !reserve(&dc->ar,&dc->ar_cap,rb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"attention batch q upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention batch latent upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope upload"))return 0;
+    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
+        dc->ar,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!cuda_ok(cudaGetLastError(),"attention batch launch"))return 0;
+    const float *src=dc->ac;size_t ob=cb;
+    if(proj){
+        ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
+        quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
+            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
+    }
+    if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
+                               proj?"attention projected output download":"attention batch context download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"attention batch synchronize"))return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,const float *q,
+        const float *latent,const float *rope,int S,int H,int Q,int R,int V,int K,int T,
+        float scale){
+    return attention_absorb_batch_run(w,nullptr,ctx,q,latent,rope,S,H,Q,R,V,K,T,scale);
+}
+
+extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTensor *proj,
+        float *out,const float *q,const float *latent,const float *rope,int S,int H,int Q,
+        int R,int V,int K,int T,float scale){
+    return attention_absorb_batch_run(w,proj,out,q,latent,rope,S,H,Q,R,V,K,T,scale);
 }
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {

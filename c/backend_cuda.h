@@ -46,6 +46,14 @@ int coli_cuda_matmul(ColiCudaTensor **tensor,
 int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Prefill-oriented shared expert path.  INT4 weights stay packed in global
+ * memory, activations are converted to FP16 per tile, and Tensor Cores
+ * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the
+ * activation to INT4. */
+int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up,
+                               ColiCudaTensor *down, float *y,
+                               const float *x, int S);
+
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
 int coli_cuda_expert_group(ColiCudaTensor *const *gates,
@@ -58,6 +66,21 @@ int coli_cuda_expert_group(ColiCudaTensor *const *gates,
 int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                const float *latent,const float *rope,int H,int Q,
                                int R,int V,int K,int T,float attention_scale);
+
+/* Causal MLA absorption for S contiguous rows from one sequence.  The KV
+ * arrays contain T rows ending at the final query; query s attends T-S+s+1
+ * rows.  One transfer and one launch replace S host round-trips. */
+int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                                     const float *latent,const float *rope,int S,
+                                     int H,int Q,int R,int V,int K,int T,
+                                     float attention_scale);
+
+/* Same attention batch followed immediately by resident o_proj on the same
+ * device.  Only the final [S,D] tensor crosses back to the host. */
+int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+                                      float *out,const float *q,const float *latent,
+                                      const float *rope,int S,int H,int Q,int R,
+                                      int V,int K,int T,float attention_scale);
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
