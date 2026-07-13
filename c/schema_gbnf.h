@@ -111,7 +111,7 @@ static void sgb_object(SgbCtx *C, jval *sc, int depth){
     jval *props = json_get(sc, "properties");
     jval *req   = json_get(sc, "required");
     if (!props || props->t != J_OBJ){ sgb_fail(C, "object without properties"); return; }
-    if (props->len == 0){ sgb_put(C, "\"{}\""); return; }
+    if (props->len == 0){ sgb_put(C, "\"{\" jws \"}\""); return; }
     if (req){
         if (req->t != J_ARR){ sgb_fail(C, "required not an array"); return; }
         /* strict semantics: every property must be required (OpenAI structured
@@ -125,12 +125,19 @@ static void sgb_object(SgbCtx *C, jval *sc, int depth){
             if (!found){ sgb_fail(C, "property not in required (strict)"); return; }
         }
     }
-    sgb_put(C, "\"{\" ");
+    /* jws at every separator: whitespace tolerance is strictly acceptance-positive
+     * for a DRAFT-source grammar — a compact-only grammar dies (desyncs) at the
+     * first stray space and forfeits every span after it, while jws points merely
+     * aren't forced themselves (two legal bytes) and the multi-byte spans around
+     * them keep drafting. Measured on GLM-5.2 current main: the sloppy-JSON
+     * continuation costs a compact grammar most of its spans. */
+    sgb_put(C, "\"{\" jws ");
     for (int i = 0; i < props->len && !C->fail; i++){
-        if (i) sgb_put(C, " \",\" ");
+        if (i) sgb_put(C, " \",\" jws ");
         sgb_put_json_string_lit(C, props->keys[i]);
-        sgb_put(C, " \":\" ");
+        sgb_put(C, " jws \":\" jws ");
         sgb_value(C, props->kids[i], depth + 1);
+        sgb_put(C, " jws");
     }
     sgb_put(C, " \"}\"");
 }
@@ -142,17 +149,17 @@ static void sgb_array(SgbCtx *C, jval *sc, int depth){
     if (mi && mi->t == J_NUM && mi->num > 1){ sgb_fail(C, "minItems > 1"); return; }
     if (!items){ sgb_fail(C, "array without items"); return; }
     if (min1){
-        sgb_put(C, "\"[\" ");
+        sgb_put(C, "\"[\" jws ");
         sgb_value(C, items, depth + 1);
-        sgb_put(C, " ( \",\" ");
+        sgb_put(C, " jws ( \",\" jws ");
         sgb_value(C, items, depth + 1);
-        sgb_put(C, " )* \"]\"");
+        sgb_put(C, " jws )* \"]\"");
     } else {
-        sgb_put(C, "\"[\" ( ");
+        sgb_put(C, "\"[\" jws ( ");
         sgb_value(C, items, depth + 1);
-        sgb_put(C, " ( \",\" ");
+        sgb_put(C, " jws ( \",\" jws ");
         sgb_value(C, items, depth + 1);
-        sgb_put(C, " )* )? \"]\"");
+        sgb_put(C, " jws )* )? \"]\"");
     }
 }
 
@@ -215,9 +222,10 @@ static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
     jval *sc = json_parse(schema_json, NULL);
     if (!sc){ if (err) snprintf(err, errsz, "schema: json parse failed"); return NULL; }
 
-    sgb_put(&C, "root ::= ");
+    sgb_put(&C, "root ::= jws ");
     sgb_value(&C, sc, 0);
-    sgb_put(&C, "\n");
+    sgb_put(&C, " jws\n");
+    sgb_put(&C, "jws ::= ( \" \" | \"\\t\" | \"\\n\" | \"\\r\" )*\n");
     if (C.use_str)
         sgb_put(&C, "jstr ::= \"\\\"\" jchar* \"\\\"\"\n"
                     "jchar ::= [^\"\\\\\\x00-\\x1f] | \"\\\\\" ( [\"\\\\/bfnrt] | \"u\" jhex jhex jhex jhex )\n"

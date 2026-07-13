@@ -31,7 +31,8 @@ static int walk(GrState *S, const char *bytes){
 }
 
 int main(void){
-    /* 1. simple strict object: forced prefix + full-instance walk */
+    /* 1. simple strict object: forced spans resume inside literals (jws points
+     *    themselves are not forced), compact AND sloppy instances both walk */
     {
         Grammar G; GrState S;
         const char *sc = "{\"type\":\"object\",\"properties\":{"
@@ -40,10 +41,19 @@ int main(void){
         CHECK(compile(sc, &G, NULL, 0) == 0);
         gr_state_init(&S, &G);
         char f[256]; int n = gr_forced(&S, f, sizeof f);
-        CHECK(n > 0 && strncmp(f, "{\"score\":", 9) == 0);   /* long forced span */
-        const char *inst = "{\"score\":-42,\"verdict\":\"no_fit\"}";
-        CHECK(walk(&S, inst) == (int)strlen(inst));
+        CHECK(n == 0);                                       /* jws: start not forced */
+        CHECK(walk(&S, "{\"") == 2);
+        n = gr_forced(&S, f, sizeof f);
+        CHECK(n > 0 && strncmp(f, "score\"", 6) == 0);       /* key body still forces */
+        const char *rest = "score\":-42,\"verdict\":\"no_fit\"}";
+        CHECK(walk(&S, rest) == (int)strlen(rest));
         unsigned char mask[32]; int can_end = 0;
+        gr_admissible(&S, mask, &can_end);
+        CHECK(can_end == 1);
+        /* the whole point of jws: a sloppy instance no longer kills the walker */
+        gr_state_init(&S, &G);
+        const char *sloppy = "{ \"score\" : -42 ,\n  \"verdict\" : \"no_fit\" }";
+        CHECK(walk(&S, sloppy) == (int)strlen(sloppy));
         gr_admissible(&S, mask, &can_end);
         CHECK(can_end == 1);
         gr_free(&G);
@@ -57,11 +67,10 @@ int main(void){
             "\"required\":[\"fit\"]}";
         CHECK(compile(sc, &G, NULL, 0) == 0);
         gr_state_init(&S, &G);
-        char f[256]; int n = gr_forced(&S, f, sizeof f);
-        CHECK(n > 0 && strncmp(f, "{\"fit\":\"", 8) == 0);
+        char f[256]; int n;
         CHECK(walk(&S, "{\"fit\":\"p") == 9);               /* 'p' picks partial_fit */
         n = gr_forced(&S, f, sizeof f);
-        CHECK(n > 0 && strncmp(f, "artial_fit\"}", 12) == 0); /* rest is forced */
+        CHECK(n > 0 && strncmp(f, "artial_fit\"", 11) == 0); /* enum tail is forced (jws stops before }) */
         gr_free(&G);
     }
 
