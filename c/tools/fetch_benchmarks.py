@@ -48,7 +48,7 @@ def main():
     from datasets import load_dataset
     os.makedirs(a.out, exist_ok=True)
     for t in [x.strip() for x in a.tasks.split(",") if x.strip()]:
-        if t not in TASKS: print("task ignoto:", t); continue
+        if t not in TASKS: print("unknown task:", t); continue
         path, cfg, split, fn = TASKS[t]
         ds = load_dataset(path, cfg, split=split)
         idx = list(range(len(ds))); random.Random(a.seed).shuffle(idx)

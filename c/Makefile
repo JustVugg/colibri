@@ -14,7 +14,7 @@ ifneq ($(OMPDIR),)
 OMPC    = -Xclang -fopenmp -I$(OMPDIR)/include
 OMPL    = -L$(OMPDIR)/lib -lomp
 else
-$(warning libomp non trovato: build SINGLE-THREAD. Per il multithread: brew install libomp)
+$(warning libomp not found: building single-threaded. For multithreading: brew install libomp)
 OMPC    =
 OMPL    =
 endif
@@ -33,6 +33,18 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 LDFLAGS = -lm -fopenmp -static
 EXE     = .exe
 else
+UNAME_M := $(shell uname -m)
+ifneq (,$(filter ppc64le ppc64,$(UNAME_M)))
+# --- Linux PowerPC (POWER8/POWER9/POWER10) ---
+# PowerPC GCC uses -mcpu, not -march. ARCH=native works on gcc >= 4.7.
+# The AVX2/NEON kernels fall back to the portable scalar C path
+# (validated token-exact vs the transformers oracle on a POWER8 S824).
+CC      = gcc
+ARCH   ?= native
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp
+EXE     =
+else
 # --- Linux x86-64 (percorso originale, invariato) ---
 CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
@@ -42,6 +54,7 @@ ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp
 EXE     =
+endif
 endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
@@ -53,7 +66,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -112,6 +125,9 @@ tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)

@@ -43,7 +43,7 @@ def load_docs(task, data_dir, limit, seed):
         return SMOKE[:limit] if limit else SMOKE
     path = os.path.join(data_dir, task + ".jsonl")
     if not os.path.exists(path):
-        sys.exit(f"manca {path} — generalo con: python3 tools/fetch_benchmarks.py --out {data_dir} --tasks {task}")
+        sys.exit(f"missing {path} — generate it with: python3 tools/fetch_benchmarks.py --out {data_dir} --tasks {task}")
     docs = [json.loads(l) for l in open(path) if l.strip()]
     random.Random(seed).shuffle(docs)
     return docs[:limit] if limit else docs
@@ -84,9 +84,9 @@ def score_accuracy(tasks, meta, perq, lp):
         print(f"{t:<18} {n:>4} {100*acc/n:>6.1f}% {100*accn/n:>8.1f}%")
         overall.append(100 * accn / n)
         for mdl, sc in REFERENCE.get(t, {}).items():
-            if sc is not None: print(f"{'  rif '+mdl:<18} {'':>4} {'':>7} {sc:>8.1f}%")
+            if sc is not None: print(f"{'  ref '+mdl:<18} {'':>4} {'':>7} {sc:>8.1f}%")
     if overall:
-        print(f"\nMEDIA acc_norm: {sum(overall)/len(overall):.1f}% su {len(overall)} task")
+        print(f"\nMEAN acc_norm: {sum(overall)/len(overall):.1f}% across {len(overall)} tasks")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -99,8 +99,8 @@ def main():
     ap.add_argument("--cap", type=int, default=64)
     ap.add_argument("--bits", default="")
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--dry", action="store_true", help="costruisci le richieste e fermati (no motore)")
-    ap.add_argument("--selftest", action="store_true", help="verifica la matematica dello scoring")
+    ap.add_argument("--dry", action="store_true", help="build requests and stop without running the engine")
+    ap.add_argument("--selftest", action="store_true", help="verify the scoring calculations")
     a = ap.parse_args()
 
     if a.selftest:                                   # acc/acc_norm con logprob sintetici
@@ -113,32 +113,32 @@ def main():
     tk = Tokenizer.from_file(os.path.join(a.snap, "tokenizer.json"))
     tasks = [t.strip() for t in a.tasks.split(",") if t.strip()]
     docs_by_task = {t: load_docs(t, a.data, a.limit, a.seed) for t in tasks}
-    for t, d in docs_by_task.items(): print(f"[{t}] {len(d)} domande", file=sys.stderr)
+    for t, d in docs_by_task.items(): print(f"[{t}] {len(d)} questions", file=sys.stderr)
 
     reqs, meta, perq = build_requests(tk, docs_by_task)
-    print(f"richieste totali: {len(reqs)} (opzioni)", file=sys.stderr)
+    print(f"total requests: {len(reqs)} (answer options)", file=sys.stderr)
     if a.dry:
-        for r in reqs[:3]: print("  esempio req:", r[:80], "...", file=sys.stderr)
-        print("DRY: meccanica ok (tokenizzazione+richieste). Niente motore.", file=sys.stderr); return
+        for r in reqs[:3]: print("  example request:", r[:80], "...", file=sys.stderr)
+        print("DRY: request construction and tokenization passed. Engine was not run.", file=sys.stderr); return
 
     req_path = tempfile.mktemp(suffix=".txt")
     open(req_path, "w").write("\n".join(reqs) + "\n")
     env = dict(os.environ, SNAP=a.snap, SCORE=req_path)
     if a.ram: env["RAM_GB"] = str(a.ram)
     cmd = [a.glm, str(a.cap)] + a.bits.split()
-    print("eseguo:", " ".join(cmd), file=sys.stderr)
+    print("running:", " ".join(cmd), file=sys.stderr)
     t0 = time.time()
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
-        print("ERRORE motore:\n", proc.stderr[-2000:], file=sys.stderr); sys.exit(1)
+        print("ENGINE ERROR:\n", proc.stderr[-2000:], file=sys.stderr); sys.exit(1)
     lines = [l for l in proc.stdout.strip().splitlines() if l and l[0] in "-0123456789"]
     if len(lines) != len(reqs):
-        print(f"ATTENZIONE: {len(lines)} output vs {len(reqs)} richieste", file=sys.stderr)
+        print(f"WARNING: {len(lines)} outputs for {len(reqs)} requests", file=sys.stderr)
     lp = [float(l.split()[0]) for l in lines]
-    print(f"(motore: {time.time()-t0:.0f}s){proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ''}", file=sys.stderr)
+    print(f"(engine: {time.time()-t0:.0f}s){proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ''}", file=sys.stderr)
     score_accuracy(tasks, meta, perq, lp)
-    print("\nNB: confronta acc_norm col punteggio PUBBLICATO di GLM-5.2 (model card). Se vicino,"
-          "\n    la quantizzazione int4 ha preservato il modello. (riempi REFERENCE in tools/eval_glm.py)")
+    print("\nNOTE: compare acc_norm with GLM-5.2's PUBLISHED model-card score. A close result"
+          "\n      indicates that int4 quantization preserved quality. (Fill REFERENCE in tools/eval_glm.py.)")
     os.remove(req_path)
 
 if __name__ == "__main__":
