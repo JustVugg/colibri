@@ -1020,11 +1020,9 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
 #ifdef COLI_CUDA
-            if(l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
-               getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))){
-                qt_cuda_colocate(&l->sh_up,&l->sh_gate);
-                qt_cuda_colocate(&l->sh_down,&l->sh_gate);
-            }
+            qt_cuda_colocate(&l->sh_gate,&l->kv_b);  /* PIPE2: shared chain on the layer home device */
+            qt_cuda_colocate(&l->sh_up,&l->sh_gate);
+            qt_cuda_colocate(&l->sh_down,&l->sh_gate);
 #endif
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
@@ -1411,8 +1409,8 @@ static int cmp_fdesc(const void *a,const void *b){
  * attention e o_proj girano sulla scheda di kv_b; scaricano solo out [S,D],
  * i nuovi record KV [S,kvl+R] e nulla altro. Ritorna 0 su qualsiasi errore:
  * il chiamante riesegue il percorso CPU (idempotente). */
-static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x,
-                             int S, int pos_base, float *out){
+static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int x_is_dev,
+                             int S, int pos_base, float *out, float *out_dev){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head;
     int kvl=c->kv_lora, R=c->qk_rope, ql=c->q_lora;
     int dev=l->kv_b.cuda_device;
@@ -1425,14 +1423,15 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x,
     size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*4, rb=(size_t)T*R*4;
     float *chost=NULL; int ok=0;
     /* scratch persistenti (slot fissi per device): zero churn di cudaMalloc */
-    float *xd =coli_cuda_pipe_scratch(dev,0,xb),  *qrd=coli_cuda_pipe_scratch(dev,1,qrb);
+    float *xd =x_is_dev?(float*)x:coli_cuda_pipe_scratch(dev,0,xb);
+    float *qrd=coli_cuda_pipe_scratch(dev,1,qrb);
     float *qd =coli_cuda_pipe_scratch(dev,2,qb),  *cd =coli_cuda_pipe_scratch(dev,3,cb);
     float *ld_=coli_cuda_pipe_scratch(dev,4,lb),  *rd =coli_cuda_pipe_scratch(dev,5,rb);
     float *w1 =coli_cuda_pipe_scratch(dev,6,(size_t)ql*4);
     float *w2 =coli_cuda_pipe_scratch(dev,7,(size_t)kvl*4);
     chost=(float*)malloc(cb);
     if(!xd||!qrd||!qd||!cd||!ld_||!rd||!w1||!w2||!chost) goto done;
-    if(!coli_cuda_pipe_upload(dev,xd,x,xb)||
+    if((!x_is_dev&&!coli_cuda_pipe_upload(dev,xd,x,xb))||
        !coli_cuda_pipe_upload(dev,w1,l->q_a_ln,(size_t)ql*4)||
        !coli_cuda_pipe_upload(dev,w2,l->kv_a_ln,(size_t)kvl*4)) goto done;
     /* proiezioni + norme + rope, tutto sul device */
@@ -1457,8 +1456,10 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x,
         memcpy(coli_kv_row(m->Rc[layer],pos_base+s,R),chost+(size_t)s*(kvl+R)+kvl,R*4);
     }
     m->t_aproj+=now_s()-t0; t0=now_s();
-    ok=coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
-        S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+    ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+            S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
+              :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
+            S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
     m->t_acore+=now_s()-t0;
 done:
     free(chost);                              /* gli scratch device restano al contesto */
@@ -1484,7 +1485,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
        l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
        qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
        qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o))
-        pipe_done=attn_pipe_prefill(m,l,layer,x,S,pos_base,out);
+        pipe_done=attn_pipe_prefill(m,l,layer,x,0,S,pos_base,out,NULL);
 #endif
     if(!pipe_done) for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
@@ -1700,7 +1701,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
                          * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
@@ -1916,7 +1917,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
-    /* ---- FASE E: shared expert, un matmul a S righe ---- */
+    /* ---- FASE E: shared expert, un matmul a S righe (PIPE2: gia' sul device) ---- */
+    if(!with_shared) goto shared_done;
+    {
     float *sg=NULL,*su=NULL;int shared_cuda=0;
 #ifdef COLI_CUDA
     int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
@@ -1939,8 +1942,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         matmul_qt(hh, sg, &l->sh_down, S);
     }
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    free(sg); free(su);
+    }
+shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
-    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
+    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);
@@ -2076,6 +2082,65 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 }
 
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
+#ifdef COLI_CUDA
+/* Inc.2a — intero layer SPARSO residente sul device del layer. x_dev entra e resta;
+ * lasciano il device solo: nrm post-attention (router + expert CPU + gather dei
+ * gruppi), i nuovi record KV, e la nrm pre-attention sui layer con indexer DSA.
+ * Ritorna 0 su errore: il chiamante ripristina lo snapshot e rifa' il layer su CPU. */
+static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, int pos_base,
+                             float *nrm_host, float *out_host){
+    Cfg *c=&m->c; int D=c->hidden, dev=l->kv_b.cuda_device;
+    int sI=c->moe_inter*c->n_shared;
+    size_t xb=(size_t)S*D*4;
+    if(!l->sh_gate.cuda_eligible||!l->sh_up.cuda_eligible||!l->sh_down.cuda_eligible||
+       !qt_cuda_upload(&l->sh_gate)||!qt_cuda_upload(&l->sh_up)||!qt_cuda_upload(&l->sh_down)||
+       l->sh_gate.cuda_device!=dev||l->sh_up.cuda_device!=dev||l->sh_down.cuda_device!=dev) return 0;
+    float *w_in =coli_cuda_pipe_scratch(dev,8,(size_t)D*4);
+    float *w_post=coli_cuda_pipe_scratch(dev,9,(size_t)D*4);
+    float *nrm_d=coli_cuda_pipe_scratch(dev,10,xb);
+    float *y_d  =coli_cuda_pipe_scratch(dev,11,xb);
+    float *sg_d =coli_cuda_pipe_scratch(dev,12,(size_t)S*sI*4);
+    float *su_d =coli_cuda_pipe_scratch(dev,13,(size_t)S*sI*4);
+    float *snap =coli_cuda_pipe_scratch(dev,14,xb);
+    if(!w_in||!w_post||!nrm_d||!y_d||!sg_d||!su_d||!snap) return 0;
+    if(!coli_cuda_pipe_peer_copy(dev,snap,dev,x_dev,xb)) return 0;   /* snapshot per il fallback */
+    if(!coli_cuda_pipe_upload(dev,w_in,l->in_ln,(size_t)D*4)||
+       !coli_cuda_pipe_upload(dev,w_post,l->post_ln,(size_t)D*4)) return 0;
+    double ta=now_s();
+    if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_in,S,D,c->eps)) return 0;
+    /* DSA: i layer con indexer FULL cachano k_idx dalla nrm pre-attention (CPU, piccolo) */
+    if(m->has_dsa && li<c->n_layers && m->kv_start[li]==0 && c->idx_type[li]){
+        if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
+        int nh=c->index_nh, hd=c->index_hd; (void)nh;
+        for(int s=0;s<S;s++){
+            int pos=pos_base+s;
+            float *kd=coli_kv_row(m->kv->Ic[li],pos,hd);
+            matmul_qt(kd, nrm_host+(int64_t)s*D, &m->ix_wk[li], 1);
+            layernorm(kd, m->ix_knw[li], m->ix_knb[li], hd, 1e-6f);
+            rope_interleave(kd, pos, c);
+        }
+    }
+    if(!attn_pipe_prefill(m,l,li,nrm_d,1,S,pos_base,NULL,y_d)) return 0;
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;         /* prima mutazione */
+    if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_post,S,D,c->eps)) return 0;
+    if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
+    m->t_attn+=now_s()-ta;
+    /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
+    moe(m,l,li,nrm_host,S,out_host,0);
+    double te=now_s();
+    if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
+    if(!coli_cuda_pipe_gemm(l->sh_gate.cuda,sg_d,nrm_d,S)) return 0;
+    if(!coli_cuda_pipe_gemm(l->sh_up.cuda,su_d,nrm_d,S)) return 0;
+    if(!coli_cuda_pipe_silu_mul(dev,sg_d,su_d,(size_t)S*sI)) return 0;
+    if(!coli_cuda_pipe_gemm(l->sh_down.cuda,y_d,sg_d,S)) return 0;
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
+    if(!coli_cuda_pipe_sync(dev)) return 0;
+    m->t_emm+=now_s()-te;
+    return 1;
+}
+#endif
+
 static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int pos_base,
                                KVState *const *kvs, const int *positions, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
@@ -2088,7 +2153,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
-    if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
@@ -2103,13 +2168,53 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
         pthread_mutex_unlock(&g_pilot_mx);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
+#ifdef COLI_CUDA
+    /* PIPE2 (Inc.2a): il residuo resta sul device del layer, saltando tra le schede
+     * ai confini di layer. x host diventa STALE finche' la residenza e' attiva. */
+    float *x_dev=NULL; int x_dev_on=-1;
+    size_t xb=(size_t)S*(size_t)D*4;
+    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=8 && g_cuda_enabled && c->kv_lora<=512 &&
+                !(m->has_dsa && pos_base+S>c->index_topk);
+#endif
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+#ifdef COLI_CUDA
+        Layer *l=&m->L[i];
+        if(pipe2 && l->sparse && i<c->n_layers &&
+           l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
+           l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+           qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
+           qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)&&
+           l->q_a.cuda_device==l->kv_b.cuda_device&&l->q_b.cuda_device==l->kv_b.cuda_device&&
+           l->kv_a.cuda_device==l->kv_b.cuda_device&&l->o.cuda_device==l->kv_b.cuda_device){
+            int dev=l->kv_b.cuda_device, ok=1;
+            float *dst=coli_cuda_pipe_scratch(dev,15,xb);
+            if(dst){
+                if(x_dev_on<0) ok=coli_cuda_pipe_upload(dev,dst,x,xb);
+                else if(x_dev_on!=dev){ ok=coli_cuda_pipe_peer_copy(dev,dst,x_dev_on,x_dev,xb); }
+                else dst=x_dev;
+                if(ok){
+                    x_dev=dst; x_dev_on=dev;
+                    if(pipe_layer_sparse(m,l,i,x_dev,S,pos_base,nrm,tmp)) continue;
+                    /* fallback: snapshot -> host, layer rifatto sul percorso CPU */
+                    coli_cuda_pipe_peer_copy(dev,x_dev,dev,coli_cuda_pipe_scratch(dev,14,xb),xb);
+                    coli_cuda_pipe_download(dev,x_dev,x,xb);
+                    x_dev_on=-1;
+                }else x_dev_on=-1;
+            }
+        } else if(x_dev_on>=0){                 /* layer fuori pipe: il residuo torna a casa */
+            coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
+            x_dev_on=-1;
+        }
+#endif
         layer_forward_rows(m,&m->L[i],i,x,S,pos_base,kvs,positions,nrm,tmp);
     }
+#ifdef COLI_CUDA
+    if(x_dev_on>=0) coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
+#endif
     free(nrm); free(tmp);
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
