@@ -3142,10 +3142,20 @@ static void run_serve_mux(Model *m, const char *snap){
     int eof=0;
     for(;;){
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+#ifndef _WIN32
         fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
         struct timeval tv={0,0}, *ptv=active?&tv:NULL;
         int ready=eof?0:select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
         if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds)) if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+#else
+        /* Native Windows: MinGW resolves select() to winsock, which needs WSAStartup and
+         * only accepts sockets — polling STDIN_FILENO returns SOCKET_ERROR every time, so
+         * the loop spins and no request is ever read (#139). Fall back to a BLOCKING
+         * submit whenever no slot is decoding: sequential serve, POSIX path untouched.
+         * (A WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE)) poll can restore
+         * submit-while-decoding later.) */
+        if(!eof && !active) if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+#endif
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[16]; int slots[16], S=0;
