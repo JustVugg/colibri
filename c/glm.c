@@ -3506,7 +3506,12 @@ int main(int argc, char **argv){
      * re-exec + tuning path (distinct from the internal COLI_OMP_TUNED sentinel).
      *
      * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
-    if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")){
+    /* CUDA runs skip the hot-thread tuning: active-spin workers contend with
+     * the CUDA dispatch threads (measured on 6x RTX 5090 full residency:
+     * ~4x slower prefill, CPU stuck near 1.8 cores). The tuning's win was
+     * measured on CPU-only builds and stays default there. */
+    int omp_tune_ok = !(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA")));
+    if(omp_tune_ok && !getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
