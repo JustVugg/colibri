@@ -28,6 +28,8 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 DEFAULT_CORS_ORIGINS = (
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "http://tauri.localhost",

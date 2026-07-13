@@ -27,7 +27,18 @@ import { cn } from "@/lib/utils"
 const message = (role: ChatMessage["role"], content: string): ChatMessage => ({ id: crypto.randomUUID(), role, content })
 
 export default function App() {
-  const [baseUrl, setBaseUrl] = useState(() => stored(localStorage, "colibri.baseUrl", "http://127.0.0.1:8000/v1"))
+  // When the page is served by the engine itself (coli web), same-origin is the
+  // right default: no CORS, no manual endpoint editing. The Vite dev server
+  // (port 5173) keeps the classic default.
+  const servedByEngine = typeof window !== "undefined" && window.location.port !== "5173" && window.location.protocol.startsWith("http")
+  const defaultBase = servedByEngine ? `${window.location.origin}/v1` : "http://127.0.0.1:8000/v1"
+  const [baseUrl, setBaseUrl] = useState(() => {
+    const saved = stored(localStorage, "colibri.baseUrl", defaultBase)
+    // migrate: a stored FACTORY default pointing at another origin would trip CORS
+    // when the page is engine-served — upgrade it to same-origin once.
+    if (servedByEngine && saved === "http://127.0.0.1:8000/v1" && defaultBase !== saved) return defaultBase
+    return saved
+  })
   const [apiKey, setApiKey] = useState("")
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
@@ -97,6 +108,11 @@ export default function App() {
   useEffect(() => setLastRun(null), [cacheSlot])
 
   useEffect(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), [messages])
+
+  useEffect(() => {                       // coli web: the server that sent this page IS the API
+    if (servedByEngine && !connected) void connect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const connect = async () => {
     probeRef.current?.abort()
