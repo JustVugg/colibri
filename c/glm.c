@@ -1581,9 +1581,20 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     if(absorb && c->kv_lora<=512){
         m->t_aproj+=now_s()-ta0; double tac=now_s();
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
-        /* punteggi per-thread sul HEAP (vedi dev): cap Tk+1 copre anche il kv_start
-         * per-slot del percorso kvs (MTP: kv_start=-1 -> nt=Tk+1). */
-        int64_t sc_cap = (int64_t)Tk+1;
+        /* Punteggi per-thread sul HEAP. Il cap DEVE essere il massimo nt effettivo del
+         * batch, non Tk+1: Tk=pos_base+S vale solo quando pos==pos_base+s. Il percorso
+         * batched (step_decode_batch da run_serve_mux) passa positions[] e kv_start
+         * per-slot, quindi nt=pos+1-st0 puo' superare Tk+1 -> heap-buffer-overflow su
+         * sc[jj]. Si conta esattamente come il loop sotto. */
+        int64_t sc_cap = 1;
+        for(int s=0;s<S;s++){
+            KVState *ks=kvs?kvs[s]:m->kv;
+            int pos=positions?positions[s]:pos_base+s;
+            int st0=ks->kv_start[layer];
+            int ns=(dnsel && dnsel[s]>0)?dnsel[s]:0;      /* DSA: top-k, altrimenti range pieno */
+            int64_t nt = ns ? (int64_t)ns : (int64_t)pos+1-st0;
+            if(nt>sc_cap) sc_cap=nt;
+        }
         float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         int cuda_core=0;
 #ifdef COLI_CUDA
