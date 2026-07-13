@@ -137,7 +137,7 @@ static void load_cfg(Cfg *c, const char *snap) {
 
 static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "manca %s\n", name); exit(1); }
+    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
     float *p = falloc(n);
     st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
     return p;
@@ -357,7 +357,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "imposta SNAP=<dir snapshot>\n"); return 1; }
+    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     int cap  = argc > 1 ? atoi(argv[1]) : 16;
     int bits = argc > 2 ? atoi(argv[2]) : 8;
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
@@ -369,9 +369,9 @@ int main(int argc, char **argv) {
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
-    printf("== Motore C streaming, cache = %d expert/layer, expert @ %d-bit ==\n", cap, bits);
+    printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
     Model m; model_init(&m, snap, cap, bits);
-    printf("densa caricata in %.1fs | RSS dopo load densa: %.2f GB\n", m.dense_load_s, rss_gb());
+    printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     int *out = malloc((np + n_new) * sizeof(int));
     double t = now_s();
@@ -379,14 +379,14 @@ int main(int argc, char **argv) {
     double dt = now_s() - t;
 
     int match = 0;
-    printf("\nRiferimento: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
-    printf("\nMotore C   : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
-    printf("\nToken coincidenti: %d/%d\n", match, n_new);
+    printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
+    printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
+    printf("\nMatching tokens: %d/%d\n", match, n_new);
     double tot = m.hits + m.miss;
-    printf("\nRSS PICCO: %.2f GB\n", rss_gb());
-    printf("Hit-rate cache expert: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+    printf("\nPEAK RSS: %.2f GB\n", rss_gb());
+    printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
-    printf("Velocita': %.2f tok/s (%.1fs per %d token)\n", n_new/dt, dt, n_new);
+    printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     return 0;
 }

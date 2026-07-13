@@ -5,10 +5,10 @@
 #include "../tok.h"
 
 int main(int argc, char **argv){
-    if(argc<2){ fprintf(stderr,"uso: %s tokenizer.json < casi\n",argv[0]); return 1; }
+    if(argc<2){ fprintf(stderr,"usage: %s tokenizer.json < cases\n",argv[0]); return 1; }
     Tok T;
     tok_load(&T, argv[1]);
-    fprintf(stderr,"caricato: vocab_ids=%d specials=%d\n", T.n_ids, T.nsp);
+    fprintf(stderr,"loaded: vocab_ids=%d specials=%d\n", T.n_ids, T.nsp);
     char *line=NULL; size_t cap=0; ssize_t nr;
     int pass=0, tot=0, dpass=0;
     while((nr=getline(&line,&cap,stdin))>=0){
