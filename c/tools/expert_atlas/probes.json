@@ -1,0 +1,54 @@
+{
+  "_comment": "Probe set for the GLM-5.2 Expert Atlas (#175). 10 categories x 3 prompts. Prompts are deliberately varied in phrasing within a category so the affinity vector reflects the TOPIC, not one prompt's surface form. Lengths are kept within a narrow band across categories: prefill routes the prompt tokens too, so a long prompt in one category would inflate its counts.",
+
+  "code_python": [
+    "Write a Python function that merges two sorted lists into one sorted list.",
+    "In Python, explain the difference between a generator and a list comprehension.",
+    "Refactor this Python snippet to avoid a nested loop: for a in xs: for b in ys: if a==b: out.append(a)"
+  ],
+  "code_sql": [
+    "Write a SQL query that returns the top 5 customers by total order value.",
+    "Explain what a LEFT JOIN does differently from an INNER JOIN in SQL.",
+    "Write SQL to add an index on the email column of a users table and explain when it helps."
+  ],
+  "math_proof": [
+    "Prove that the square root of 2 is irrational.",
+    "Show that the sum of the first n odd numbers equals n squared.",
+    "Explain why the derivative of e^x is e^x."
+  ],
+  "chinese": [
+    "请用三句话解释什么是机器学习。",
+    "写一首关于秋天的短诗。",
+    "中国的四大发明是什么？请简要说明。"
+  ],
+  "german": [
+    "Erkläre in drei Sätzen, wie ein Verbrennungsmotor funktioniert.",
+    "Schreibe eine kurze formelle E-Mail, in der du einen Termin absagst.",
+    "Was ist der Unterschied zwischen Dativ und Akkusativ im Deutschen?"
+  ],
+  "poetry": [
+    "Write a short poem about the sea at night.",
+    "Compose four lines of verse about an empty train station.",
+    "Write a haiku about the first snow of winter."
+  ],
+  "law": [
+    "Explain in plain terms what consideration means in contract law.",
+    "What is the difference between a misdemeanor and a felony?",
+    "Summarize what the term 'force majeure' covers in a commercial contract."
+  ],
+  "medicine": [
+    "Explain the difference between type 1 and type 2 diabetes.",
+    "What are the common symptoms of iron deficiency anemia?",
+    "Describe how a vaccine produces immunity."
+  ],
+  "json_format": [
+    "Return a JSON object with keys name, age, and email for a fictional user. Output only JSON.",
+    "Convert this to JSON: name Alice, roles admin and editor, active true. Output only JSON.",
+    "Write a JSON schema for an object with a required string field 'id' and an optional integer 'count'."
+  ],
+  "casual_chat": [
+    "Hey, what's a good way to spend a rainy Sunday afternoon?",
+    "I'm feeling pretty tired today. Any tips to get through the afternoon?",
+    "What's your favourite kind of weather, and why?"
+  ]
+}
