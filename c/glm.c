@@ -3375,6 +3375,16 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
  * Include la riga MTP (layer n_layers). Scrittura atomica (tmp+rename): viene chiamata
  * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
 static void stats_dump_q(Model *m, const char *path, int quiet){
+    /* Callers must pass a canonical file path (either g_usage_path — built
+     * inside the resolved SNAP directory — or a STATS env value already run
+     * through realpath by main). Defensive reject-and-return covers the case
+     * where a future caller forgets: no traversal fragments, no embedded CR/LF
+     * that would let a crafted path split filesystem-level logging elsewhere. */
+    if(!path || !*path || strstr(path,"..") ||
+       strchr(path,'\n') || strchr(path,'\r')){
+        if(!quiet) fprintf(stderr,"stats_dump: rejecting non-canonical path\n");
+        return;
+    }
     char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC,0600);
     if(fd<0){ if(!quiet) perror(tmp); return; }
