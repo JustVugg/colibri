@@ -27,10 +27,10 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
 #endif
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
@@ -1283,7 +1283,7 @@ static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
     void *base=NULL;
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     struct stat st;
     if(g_nmaps<512 && fstat(fd,&st)==0){
         size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
@@ -1355,7 +1355,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
              * residency. This is pread's I/O without the copy and without the slab. */
             for(int k=0;k<3;k++){
                 char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
                 madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
 #endif
                 volatile char acc=0;
@@ -1559,7 +1559,7 @@ static inline void pipe_wait(int q){
 #ifdef COLI_CUDA
 static void expert_host_release(Model *m, ESlot *s){
     if(!s->slab&&!s->fslab) return;
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
     if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
 #elif defined(_WIN32)
@@ -3822,7 +3822,7 @@ static void run_serve_mux(Model *m, const char *snap){
          * the Windows equivalent: it reports bytes available without reading. */
         int ready=0;
         if(!eof){
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) ||	defined(__FreeBSD__)
             fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
             struct timeval tv={0,0}, *ptv=active?&tv:NULL;
             ready=select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
@@ -4231,7 +4231,7 @@ static int mem_should_wire(void){
 /* Inchioda [addr,addr+len) in RAM fisica. No-op fuori da POSIX (Windows ecc.).
  * EN: wire [addr,addr+len) into physical RAM. No-op off POSIX (Windows, etc.). */
 static int mem_wire(void *addr, size_t len){
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     return mlock(addr, len);
 #elif defined(_WIN32)
     return compat_mlock(addr, len);   /* VirtualLock + working-set growth */
@@ -4504,6 +4504,11 @@ int main(int argc, char **argv){
 #ifdef __linux__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
+        perror("[OMP] execv self-reexec failed, running untuned");
+#endif
+#ifdef __FreeBSD__
+        fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        execv("/proc/curproc/file", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
