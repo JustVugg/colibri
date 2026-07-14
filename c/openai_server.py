@@ -731,12 +731,16 @@ class APIHandler(BaseHTTPRequestHandler):
         Read-only, no auth (same trust level as /health), traversal-safe."""
         if path.startswith("/v1/") or path == "/health":
             return False
-        base = self.WEB_DIST
+        base = self.WEB_DIST.resolve()
         if not base.is_dir():
             return False
         rel = unquote(path).lstrip("/") or "index.html"
         target = (base / rel).resolve()
-        if not str(target).startswith(str(base)) or not target.is_file():
+        try:
+            target.relative_to(base)
+        except ValueError:
+            target = None
+        if target is None or not target.is_file():
             if path == "/" or "." not in rel:      # SPA fallback
                 target = base / "index.html"
                 if not target.is_file():
@@ -1045,6 +1049,8 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
+        if not prompt:
+            raise APIError(400, "`prompt` must not be empty.", "prompt")
         self.generation(body, prompt, request_id, False)
 
 
