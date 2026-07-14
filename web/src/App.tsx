@@ -69,6 +69,7 @@ export default function App() {
   const [connecting, setConnecting] = useState(false)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState("")
+  const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
   const probeRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -84,21 +85,25 @@ export default function App() {
       [cacheSlot]: typeof next === "function" ? next(current[cacheSlot] || []) : next,
     }))
 
+  // EFFECT #1
   useEffect(() => {
     persistPublicSettings(localStorage, baseUrl, model)
   }, [baseUrl, model])
 
+  // EFFECT #2
   useEffect(() => {
     setConnected(false)
     setHealth(null)
     setHealthError("")
   }, [baseUrl, apiKey])
 
+  // EFFECT #3
   useEffect(() => () => {
     probeRef.current?.abort()
     abortRef.current?.abort()
   }, [])
 
+  // EFFECT #4
   useEffect(() => {
     if (!connected) return
     let disposed = false
@@ -115,18 +120,16 @@ export default function App() {
     return () => { disposed = true; window.clearInterval(timer) }
   }, [apiKey, baseUrl, connected])
 
+  // EFFECT #5
   useEffect(() => {
     if (cacheSlot >= kvSlots) setCacheSlot(0)
   }, [cacheSlot, kvSlots])
 
-  useEffect(() => setLastRun(null), [cacheSlot])
+  // EFFECT #6
+  useEffect(() => { setLastRun(null) }, [cacheSlot])
 
-  useEffect(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), [messages])
-
-  useEffect(() => {                       // coli web: the server that sent this page IS the API
-    if (servedByEngine && !connected) { connect(); return undefined }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // EFFECT #7
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
 
   const connect = async () => {
     probeRef.current?.abort()
@@ -155,6 +158,11 @@ export default function App() {
     } finally {
       if (probeRef.current === controller) { probeRef.current = null; setConnecting(false) }
     }
+  }
+
+  if (servedByEngine && !autoConnected.current && !connected) {
+    autoConnected.current = true
+    setTimeout(() => connect(), 0)
   }
 
   const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
