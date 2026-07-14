@@ -32,7 +32,7 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 - **MLA attention** (q/kv-LoRA, interleaved partial RoPE) with **compressed KV-cache**: 576 floats/token instead of 32,768 (57× smaller — GLM-5.2 has 64 heads and no GQA).
 - **DeepSeek-V3-style sigmoid router** (noaux_tc, routed_scaling_factor), shared expert, first-3-dense layers.
 - **Native MTP speculative decoding** — GLM-5.2's own multi-token-prediction head (layer 78) drafts tokens that the main model verifies in one batched forward. **The head must be int8** (the converter does this by default): at int4 draft acceptance collapses to 0–4% and speculation never engages; at int8 it's 39–59% acceptance, **2.2–2.8 tokens/forward** (community-measured, [#8](https://github.com/JustVugg/colibri/issues/8)). Lossless *in exact arithmetic* — but **not byte-identical to non-speculative greedy in practice** ([#100](https://github.com/JustVugg/colibri/issues/100)). This isn't MTP-specific: colibrì's quantized integer kernels are shape-dependent, so any batched (S>1) or GPU forward rounds slightly differently from the single-token path, and int4 GLM-5.2 sits close enough to argmax ties that such a rounding change can flip a token. MTP, the CUDA expert tier, and batched prefill are three different ways to trip the same sensitivity (community-confirmed in #100: swapping only the kernel family forks greedy output on 3/5 prompts, with **zero speculation**). Every emitted token is still the argmax of a *valid* forward — the continuation stays correct — it just isn't the same stream. For byte-exact reproducibility: `DRAFT=0` (no speculation), plus `IDOT=0 COLI_CUDA=0` if you also want kernel-family/GPU independence. Under sampling, rejection sampling keeps the distribution correct. Honest caveat from the same measurement: on a **cold** cache each verified draft routes to extra experts (~660 → ~1100 expert-loads/token), so speculation can be a net *time* loss until the cache/pin warms up.
-- **Grammar-forced speculative drafts** (`GRAMMAR=file.gbnf`, [#48](https://github.com/JustVugg/colibri/issues/48)) — on constrained-output workloads (JSON/NDJSON, function calling, structured extraction) the grammar itself is a third draft source: wherever it admits exactly **one** legal byte (braces, quotes, key names, enum bodies), that forced span is tokenized and injected as pre-accepted drafts with ~1.0 acceptance — no draft head, no lookup table, and it engages even with the int4 MTP head from [#8](https://github.com/JustVugg/colibri/issues/8). It never constrains sampling: forced spans are verified in the same batch-union forward as any draft, so a wrong or out-of-sync grammar cannot change the output — worst case is rejected drafts, and an adaptive guard turns the source off below 50% acceptance. Byte-level GBNF subset (literals, char classes, `| ( ) ? * +`, comments); `GRAMMAR_DRAFT=n` caps the forced span per forward (default 24). Composes with `DRAFT`/MTP, which fill the free-text gaps between forced spans.
+- **Grammar-forced speculative drafts** (`GRAMMAR=file.gbnf`, [#48](https://github.com/JustVugg/colibri/issues/48)) — on constrained-output workloads (JSON/NDJSON, function calling, structured extraction) the grammar itself is a third draft source: wherever it admits exactly **one** legal byte (braces, quotes, key names, enum bodies), that forced span is tokenized and injected as pre-accepted drafts with ~1.0 acceptance — no draft head, no lookup table, and it engages even with the int4 MTP head from [#8](https://github.com/JustVugg/colibri/issues/8). It never constrains sampling: forced spans are verified in the same batch-union forward as any draft, so a wrong or out-of-sync grammar cannot change the output — worst case is rejected drafts, and an adaptive guard turns the source off below 50% acceptance. Byte-level GBNF subset (literals, char classes, `| ( ) ? * +`, comments); `GRAMMAR_DRAFT=n` caps the forced span per forward (default 24). Composes with `DRAFT`/MTP, which fill the free-text gaps between forced spans. Full reference — mechanism, measured A/Bs, when it pays, prior art: [docs/grammar-draft.md](docs/grammar-draft.md).
 - **True sampling** — temperature + nucleus, defaults tuned for int4 reality (0.7 / 0.90; the official 1.0 / 0.95 samples quantization noise from the tail).
 - **Integer-dot kernels** (Q8_0-style int8 activations, AVX2 `maddubs`): int8 matmuls 1.4–2.5× faster (119 GFLOP/s measured), int4 1.8× in batch — routing decided per shape by measurement (int4 single-row stays f32: it measured slower).
 - **MLA weight absorption** (DeepSeek trick) for decode: no per-token k/v reconstruction — the query absorbs `kv_b`, context is projected after attention. Validated exact: TF 32/32 and generation 20/20 with absorption forced everywhere.
@@ -160,6 +160,12 @@ make iobench.exe        # disk I/O benchmark
 make test-c             # run C tests
 make test-python        # run Python tests (requires python)
 
+# AVX-VNNI: Intel Alder Lake+ (and Meteor Lake+) CPUs have a 128-bit int8
+# dot-product instruction (VPDPBUSD) the engine can use for ~1.3x faster
+# quantized matmul. The x86-64-v3 default (portable AVX2) compiles it out;
+# build for THIS machine to enable it:
+make glm.exe ARCH=native                       # banner prints "idot: avx-vnni"
+
 # Verify (tiny model, 2.4 MB):
 pip install torch transformers safetensors huggingface_hub
 python tools/make_glm_oracle.py                # generate tiny oracle
@@ -171,9 +177,49 @@ python coli chat --model D:\glm52_i4            # interactive chat
 python coli serve --model D:\glm52_i4            # OpenAI-compatible API
 ```
 
-**Status:** Phase 1 complete (compiles, correct, static-linked). O_DIRECT (Phase 2),
-GPU via `LoadLibrary` on `coli_cuda.dll` (Phases G0–G2), and full-model validation
-are separate workstreams. See `PORT_WINDOWS_PLAN.md` for the full plan.
+**Warmup (overnight cache priming):** the engine's expert cache learns from
+your workload. The included `warmup.ps1` script runs `coli run` in a loop with
+diverse prompts to build the `.coli_usage` histogram unattended, so the next
+real session starts with a large, accurate hot-expert pin. Each run saves usage
+atomically on clean completion.
+
+```powershell
+.\warmup.ps1 -Rounds 1 -Ngen 32               # ~60-90 min, durable progress
+```
+
+**NVIDIA GPU (optional, via runtime DLL):** on Windows the engine is built with
+MinGW gcc but CUDA kernels require MSVC + nvcc. The split is clean: build the
+CUDA backend into a standalone `coli_cuda.dll` (nvcc + MSVC), then the host
+`glm.exe` loads it at runtime via `LoadLibrary` (`c/backend_loader.c`). The host
+never links cudart directly; if the DLL is absent the engine falls back to CPU
+without error.
+
+```powershell
+# Prerequisites: CUDA Toolkit + MSVC Build Tools (cl.exe) + nvcc on PATH.
+# Build the DLL from a shell with the MSVC environment set (vcvars64.bat or
+# "x64 Native Tools Command Prompt for VS"):
+make cuda-dll CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" CUDA_ARCH=sm_120
+
+# Build the host with the runtime loader (CUDA_DLL=1 adds -DCOLI_CUDA and
+# links backend_loader.o instead of cudart):
+make glm.exe CUDA_DLL=1 ARCH=native
+
+# Run with the GPU expert tier (8 GB VRAM budget here; scale to your free VRAM):
+$env:COLI_CUDA="1"; $env:COLI_GPU="0"; $env:CUDA_EXPERT_GB="8"
+python coli chat --model D:\glm52_i4 --topp 0.7
+```
+
+The DLL exports 11 `extern "C"` symbols (`coli_cuda_init`, `coli_cuda_matmul`,
+etc.); `backend_loader.c` resolves them via `GetProcAddress` on first use.
+`ColiCudaTensor*` is opaque to the host (stored, never dereferenced), so the
+MSVC-allocated struct is safe across the ABI boundary. `CUDA_ARCH` must match
+your GPU's compute capability (e.g. `sm_120` for Blackwell / RTX 50-series,
+`sm_89` for Ada / RTX 40-series).
+
+**Status:** Phase 1 complete (compiles, correct, static-linked). The Windows
+GPU tier (runtime `coli_cuda.dll` via `LoadLibrary`) is implemented and
+verified on RTX 50-series (sm_120). O_DIRECT (Phase 2) and full-model
+validation against the transformers oracle remain separate workstreams.
 
 ### OpenAI-compatible API
 
@@ -519,6 +565,10 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | Ryzen 7 9800X3D (16T) · WSL2 · 70 GB RAM · Samsung 9100 PRO PCIe 5.0 · RTX 5090 ([#101](https://github.com/JustVugg/colibri/issues/101)) | **10.51 GB/s** O_DIRECT | MTP off · learned pin 24 GB · hit 54% · OMP hot-team on | **0.41 tok/s** · disk-bound (36.5 s disk vs 24.0 s matmul) · **CUDA expert tier ≈ 0%** (AVX-512 CPU matches the 5090) · `--topp 0.7` → **0.52 tok/s** |
 | EPYC 7443 (24C/48T, Zen3 AVX2) · Linux · **430 GB RAM** · NVMe RAID-Z1 via TrueNAS VM ([#104](https://github.com/JustVugg/colibri/issues/104)) | ~1 GB/s (VM overhead) | 77.5 GB pin · cap auto-raised to 194/layer · MTP off | **1.00 tok/s** · **hit 98%** · disk eliminated → **RAM-bandwidth + matmul bound** (no AVX-512/VNNI on Zen3) |
 | Intel i5-12600K (10C/16T, AVX2) · **native Windows 11, no WSL** · 32 GB · MinGW GCC 16.1 ([#113](https://github.com/JustVugg/colibri/issues/113)) | buffered (no O_DIRECT on MinGW) | int8 MTP head · cold, small-RAM (cap ~2/layer) | **0.08 tok/s** · hit 3.7% · **MTP 57% acceptance** — first native-Windows datapoint, port validated |
+| Ryzen 9 9950X3D2 (16C/32T, avx512-vnni) · native Linux · 121 GB · Samsung 9100 PRO **PCIe Gen5** · RTX 5090 (28 GB expert tier, 1475 pinned) ([#120](https://github.com/JustVugg/colibri/issues/120)) | **11.48 GB/s** O_DIRECT | `MTP=0 DIRECT=1 PIPE_WORKERS=16 PREFETCH=1` | **1.23 tok/s** · MTP-off wins disk-bound · fastest x86 datapoint yet |
+| Ryzen AI Max+ 395 (Strix Halo, 16C/32T Zen5, avx512-vnni) · Arch Linux · 128 GB unified LPDDR5x · SK hynix P41 PCIe 4.0 ([#124](https://github.com/JustVugg/colibri/issues/124)) | — | `DIRECT=1 PIPE=1 --topp 0.7` · auto-pin | 0.06 cold → **1.10 tok/s** sustained · first Strix Halo / gfx1151 datapoint (unified memory: no discrete VRAM tier) |
+| Intel Core Ultra 9 185H (16C/22T, avx-vnni) · **native Windows 11, no WSL** · 32 GB · Crucial P3 QLC NTFS · RTX 5070 Ti (unused) ([#128](https://github.com/JustVugg/colibri/issues/128)) | — | int8 MTP head · **with [#131](https://github.com/JustVugg/colibri/pull/131) (pipe + RAM fixes), warm cache, no GPU** | 0.03 cold → **0.5 tok/s** warm (~7-prompt warmup) · cache-warming on native Windows once the portability blockers are fixed — stock main hung on the `\r\n` READY sentinel before #131 |
+| Dell Pro Max GB10 (DGX Spark: Grace 10×X925 + 10×A725, **aarch64 i8mm/sve2**) · Linux · 121 GB unified LPDDR5x · Dell OEM 4 TB NVMe · GB10 sm_121 ([#136](https://github.com/JustVugg/colibri/issues/136)) | **5.58 GB/s** O_DIRECT (NVIDIA-OEM unit in #76 was 10.74 — same platform, different SSD) | int8 MTP head · warm cache | 0.21 cold → **0.50 tok/s** warm · hit 83% · MTP 73% (3.20 tok/fw) · **matmul-bound** (matmul 130 s vs disk 58 s) — unified memory, CUDA placement tier neutral; the lever here is an i8mm compute kernel, not placement |
 
 Takeaways: with 24 GB of RAM the engine auto-caps the expert cache to 2 slots/layer, so decode stays cold even on a disk 2–2.7× faster than the dev box — **on small-RAM machines the RAM cap, not the disk, is the binding constraint**, exactly as the table above predicts; `--topp 0.7` alone bought a clean 1.6× end-to-end speedup. The M5 Max datapoint lands right on the table's second row: **~1 tok/s of a 744B model on a laptop SSD** — and its 14 GB/s disk shifts the bottleneck back to RAM budget and kernels. The Framework 13 rows are the cache thesis proven end-to-end on one machine: 0.29 → 0.37 tok/s (hit 28% → 66%, speculation finally engaging at 52% acceptance) just by giving the cache its RAM — int8 MTP head + a bigger cap + the learned pin. The cap part is now automatic (cap auto-raise, 2026-07-10). The 9950X pair is the cleanest bottleneck experiment yet — same machine, same history, only the disk swapped: ×5.8 disk bandwidth bought ×2.9 tokens, and the profile **flipped from 66% disk to 57% matmul**. But the crossover depends on the CPU kernel: the 9800X3D row ([#101](https://github.com/JustVugg/colibri/issues/101)) shows that with the OMP hot-team tuning on, the AVX-512 CPU matmul is fast enough that even a **10 GB/s NVMe stays disk-bound** — and there the **CUDA expert tier buys ≈ 0%**, because the CPU already matches the 5090 on expert matmul. The GPU tier earns its VRAM only when the CPU is the weak link, not by default. (Honest correction from #101: an earlier version of that report ran with the OMP tuning off, which manufactured a false matmul-bound crossover and a false +14% for CUDA — neither survived a clean re-run.)
 

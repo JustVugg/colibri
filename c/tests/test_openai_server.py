@@ -9,8 +9,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIError, APIServer, ClientCancelled, END, GenerationScheduler,
-                           READY, Engine, generation_options, read_engine_turn, render_chat,
-                           serve)
+                           READY, Engine, generation_options, parse_tool_calls,
+                           read_engine_turn, render_chat, serve)
 
 
 class FakeEngine:
@@ -537,6 +537,83 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertEqual(error["code"], "queue_full")
         self.engine.release.set(); first.join(2)
         self.assertEqual(first_errors, [])
+
+
+
+ORDER_TOOL = [{"type": "function", "function": {
+    "name": "lookup_order",
+    "parameters": {"type": "object", "properties": {
+        "order_id": {"type": "string"},
+        "qty": {"type": "integer"},
+        "express": {"type": "boolean"},
+    }, "required": ["order_id"]}}}]
+
+
+class ToolArgumentTypeTest(unittest.TestCase):
+    """The model emits every argument as text. Without the schema, a string-typed value that
+    happens to look numeric is json.loads()'d into an int and the tool gets the wrong type."""
+
+    def _args(self, reply, tools=ORDER_TOOL):
+        _, calls = parse_tool_calls(reply, tools)
+        self.assertEqual(len(calls), 1)
+        return json.loads(calls[0]["function"]["arguments"])
+
+    def test_string_parameter_holding_digits_stays_a_string(self):
+        args = self._args("<tool_call>lookup_order"
+                          "<arg_key>order_id</arg_key><arg_value>12345</arg_value></tool_call>")
+        self.assertEqual(args["order_id"], "12345")
+        self.assertIsInstance(args["order_id"], str)
+
+    def test_declared_numeric_and_boolean_parameters_are_decoded(self):
+        args = self._args("<tool_call>lookup_order"
+                          "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>"
+                          "<arg_key>qty</arg_key><arg_value>2</arg_value>"
+                          "<arg_key>express</arg_key><arg_value>true</arg_value></tool_call>")
+        self.assertEqual(args, {"order_id": "A-1", "qty": 2, "express": True})
+        self.assertIsInstance(args["qty"], int)
+        self.assertIs(args["express"], True)
+
+    def test_unknown_parameter_keeps_permissive_decoding(self):
+        args = self._args("<tool_call>lookup_order"
+                          "<arg_key>extra</arg_key><arg_value>7</arg_value></tool_call>")
+        self.assertEqual(args["extra"], 7)
+
+
+class ToolChoiceTest(unittest.TestCase):
+    def test_none_does_not_offer_the_tools(self):
+        prompt = render_chat([{"role": "user", "content": "hi"}], tools=ORDER_TOOL,
+                             tool_choice="none")
+        self.assertNotIn("<tools>", prompt)
+
+    def test_auto_offers_the_tools(self):
+        prompt = render_chat([{"role": "user", "content": "hi"}], tools=ORDER_TOOL,
+                             tool_choice="auto")
+        self.assertIn("<tools>", prompt)
+
+    def test_required_instructs_the_model_to_call_one(self):
+        prompt = render_chat([{"role": "user", "content": "hi"}], tools=ORDER_TOOL,
+                             tool_choice="required")
+        self.assertIn("<tools>", prompt)
+        self.assertIn("must call one of the functions", prompt)
+
+    def test_named_function_restricts_to_that_function(self):
+        tools = ORDER_TOOL + [{"type": "function", "function": {"name": "other", "parameters": {}}}]
+        prompt = render_chat([{"role": "user", "content": "hi"}], tools=tools,
+                             tool_choice={"type": "function", "function": {"name": "lookup_order"}})
+        self.assertIn("must call the function `lookup_order`", prompt)
+        self.assertNotIn('"other"', prompt)
+
+    def test_rejects_unknown_string_and_unknown_function(self):
+        with self.assertRaises(APIError):
+            generation_options({"messages": [], "tools": ORDER_TOOL, "tool_choice": "maybe"}, 128)
+        with self.assertRaises(APIError):
+            generation_options({"messages": [], "tools": ORDER_TOOL,
+                                "tool_choice": {"type": "function",
+                                                "function": {"name": "nope"}}}, 128)
+
+    def test_rejects_tool_choice_without_tools(self):
+        with self.assertRaises(APIError):
+            generation_options({"messages": [], "tool_choice": "required"}, 128)
 
 
 if __name__ == "__main__":

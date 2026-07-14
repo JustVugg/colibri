@@ -7,6 +7,7 @@ import collections
 import contextlib
 import json
 import math
+import mimetypes
 import os
 import select
 import queue
@@ -27,6 +28,8 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 DEFAULT_CORS_ORIGINS = (
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "http://tauri.localhost",
@@ -196,23 +199,62 @@ def _tool_param_order(tools):
     return out
 
 
+def _tool_param_types(tools):
+    """name -> {param: declared JSON-schema type}. The model emits every argument as text;
+    without the schema a string-typed value that happens to look numeric ("12345" for an
+    order id, an SKU, a phone number) would be json.loads()'d into an int and the tool would
+    receive the wrong type."""
+    out = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        types = {}
+        for key, spec in props.items():
+            if isinstance(spec, dict):
+                t = spec.get("type")
+                if isinstance(t, list):          # {"type": ["string", "null"]}
+                    t = next((x for x in t if x != "null"), None)
+                types[key] = t
+        out[name] = types
+    return out
+
+
+def _coerce_arg(value, declared):
+    """Decode a raw <arg_value> according to the declared schema type.
+
+    A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
+    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    if declared == "string":
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+    if declared in ("integer", "number") and isinstance(parsed, bool):
+        return value                              # `true` is not a number
+    if declared and declared not in ("integer", "number", "boolean", "object", "array"):
+        return value
+    return parsed
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
     param_order = _tool_param_order(tools)
+    param_types = _tool_param_types(tools)
     calls, salvaged = [], []
     for match in _BOX_RE.finditer(reply):
         inner = match.group(1)
         name_match = _NAME_RE.match(inner)
         name = name_match.group(1) if name_match else inner.strip()
         args = {}
+        types = param_types.get(name, {})
         for arg in _ARG_RE.finditer(inner):
             key, value = arg.group(1), arg.group(2)
-            try:
-                value = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            args[key] = value
+            args[key] = _coerce_arg(value, types.get(key))
         if not args and _SALVAGE:
             rest = inner[name_match.end():] if name_match else ""
             payload = _TAG_RE.sub("", rest).strip()
@@ -241,7 +283,8 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None):
+def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
@@ -249,6 +292,15 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     if enable_thinking:
         effort = "High" if reasoning_effort == "high" else "Max"
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
     if tools:
         # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
         # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
@@ -264,6 +316,10 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                       "within the following XML format:\n<tool_call>{function-name}"
                       "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
                       "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
+        if forced:
+            prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
     prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -309,6 +365,27 @@ def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
+    choice = body.get("tool_choice")
+    if choice is not None:
+        if isinstance(choice, str):
+            if choice not in ("auto", "none", "required"):
+                raise APIError(400, "`tool_choice` must be one of \"auto\", \"none\", \"required\", "
+                                    "or a function object.", "tool_choice", "unsupported_value")
+        elif isinstance(choice, dict):
+            name = (choice.get("function") or {}).get("name") or choice.get("name")
+            if not name:
+                raise APIError(400, "`tool_choice` function object must include a name.",
+                               "tool_choice", "invalid_value")
+            declared = [(t.get("function", t) if isinstance(t, dict) else {}).get("name")
+                        for t in (body.get("tools") or body.get("functions") or [])]
+            if name not in declared:
+                raise APIError(400, f"`tool_choice` names {name!r}, which is not in `tools`.",
+                               "tool_choice", "invalid_value")
+        else:
+            raise APIError(400, "`tool_choice` must be a string or a function object.",
+                           "tool_choice", "invalid_value")
+        if choice != "none" and not (body.get("tools") or body.get("functions")):
+            raise APIError(400, "`tool_choice` requires `tools`.", "tool_choice", "invalid_value")
     if body.get("stop") is not None:
         raise APIError(400, "Custom stop sequences are not supported yet.", "stop", "unsupported_parameter")
     if body.get("logprobs"):
@@ -388,6 +465,11 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        self.tiers = None
+        self.hwinfo = None
+        self.emap = None
+        self.hits = None
+        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -453,6 +535,22 @@ class Engine:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
                         events.put(("done", stats))
+                elif kind == "HWINFO" and len(fields) >= 7:
+                    parts = " ".join(fields[6:]).split("|")
+                    self.hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
+                                   "ram_avail_gb": float(fields[3]), "gpus": int(fields[4]),
+                                   "vram_total_gb": float(fields[5]),
+                                   "cpu": parts[0].strip() if len(parts)>0 else "",
+                                   "gpu": parts[1].strip() if len(parts)>1 else ""}
+                elif kind == "EMAP" and len(fields) == 4:
+                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
+                elif kind == "HITS" and len(fields) == 4:
+                    self.hits = fields[3]
+                    self.hits_seq += 1
+                elif kind == "TIERS" and len(fields) >= 6:
+                    self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
+                                  "disk": int(fields[3]), "vram_gb": float(fields[4]),
+                                  "ram_gb": float(fields[5])}
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -598,9 +696,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
 
     def require_auth(self):
-        if self.server.api_key and self.headers.get("Authorization") != f"Bearer {self.server.api_key}":
-            raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
-                           "authentication_error")
+        if self.server.api_key:
+            import hmac
+            provided = self.headers.get("Authorization", "")
+            expected = f"Bearer {self.server.api_key}"
+            if not hmac.compare_digest(provided, expected):
+                raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
+                               "authentication_error")
 
     def read_json(self):
         try:
@@ -622,13 +724,58 @@ class APIHandler(BaseHTTPRequestHandler):
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
+    WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+
+    def serve_static(self, path):
+        """Serve the built web UI (web/dist) so `coli web` is one process.
+        Read-only, no auth (same trust level as /health), traversal-safe."""
+        if path.startswith("/v1/") or path == "/health":
+            return False
+        base = self.WEB_DIST
+        if not base.is_dir():
+            return False
+        rel = unquote(path).lstrip("/") or "index.html"
+        target = (base / rel).resolve()
+        if not str(target).startswith(str(base)) or not target.is_file():
+            if path == "/" or "." not in rel:      # SPA fallback
+                target = base / "index.html"
+                if not target.is_file():
+                    return False
+            else:
+                return False
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(data)
+        return True
+
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
             path = urlsplit(self.path).path
             if path == "/health":
-                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
-                                     "kv_slots": self.server.kv_slots}, request_id)
+                payload = {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
+                           "kv_slots": self.server.kv_slots}
+                tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                if tiers: payload["tiers"] = tiers
+                hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                if hwinfo: payload["hwinfo"] = hwinfo
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/experts":
+                eng = self.server.engine
+                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
+                if eng and getattr(eng, "emap", None):
+                    payload.update(eng.emap)
+                    payload["hits"] = eng.hits or ""
+                    payload["seq"] = eng.hits_seq
+                self.send_json(200, payload, request_id)
+                return
+            if self.serve_static(path):
                 return
             self.require_auth()
             if path == "/v1/models":
@@ -676,8 +823,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def generation(self, body, prompt, request_id, chat):
+        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
+        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
+        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+        if dbg >= 2:
+            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
+            sys.stderr.flush()
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
+        if body.get("tool_choice") == "none":
+            tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -743,7 +902,7 @@ class APIHandler(BaseHTTPRequestHandler):
             last_write = [time.time()]
             ka_stop = threading.Event()
             KA_GAP = 10.0
-            dbg_echo = os.environ.get("COLI_DEBUG", "0") == "1"   # tee decoded tokens to stderr
+            dbg_echo = dbg >= 1   # tee decoded tokens to stderr (COLI_DEBUG level parsed in generation())
 
             def event(choices, usage_marker=False):
                 nonlocal connected
@@ -878,7 +1037,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools)
+        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                             body.get("tool_choice"))
         self.generation(body, prompt, request_id, True)
 
     def completion(self, body, request_id):
