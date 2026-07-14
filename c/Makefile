@@ -129,10 +129,16 @@ NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
 else
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 endif
-ifeq ($(IS_WIN),)
-PYTHON    ?= python3
-else
+# PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
+# so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
+# triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
+# mingw32-gcc ... on Linux) sets IS_WIN and picks `python`, breaking clean/test
+# on hosts where only `python3` exists. $(OS)=Windows_NT in every Windows shell
+# (the #129 signal) and is empty on Linux/macOS.
+ifeq ($(OS),Windows_NT)
 PYTHON    ?= python
+else
+PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
