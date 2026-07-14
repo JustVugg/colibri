@@ -53,6 +53,12 @@ Format: `VAR` — default — effect.
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
 | `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
+| `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
+| `ROUTE_J` | `2` | Sacred top ranks always taken when `CACHE_ROUTE=1`. |
+| `ROUTE_M` | `12` | Max-rank window for resident preference when `CACHE_ROUTE=1`. |
+| `ROUTE_P` | `0` | Cumulative mass window for CACHE_ROUTE (`0` = fixed M). |
+| `ROUTE_ALPHA` | `1` | Scale gate mass of substituted experts before renorm (`1` = off). |
+| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. |
 | `ABSORB` | `-1` (auto: absorbed for S≤4) | MLA attention absorption mode. |
 | `IDOT` | `1` | Integer dot-product kernel. `IDOT=0` uses exact f32 kernels (for A/B numerical checks). |
 | `COLI_POLICY` | `quality` | Resource policy: `quality`, `balanced`, or `experimental-fast`. |

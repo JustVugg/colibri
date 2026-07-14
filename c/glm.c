@@ -171,6 +171,9 @@ typedef struct {
     uint64_t eclock, hits, miss, ereq;
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
+    uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
+    uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
+    double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
@@ -809,6 +812,15 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+/* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
+ * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
+static int g_cache_route=0;
+static int g_route_j=2;      /* ROUTE_J: sacred top ranks (always take, even uncached) */
+static int g_route_m=12;     /* ROUTE_M: max-rank window for cache-preferring fill */
+static float g_route_p=0;    /* ROUTE_P: if >0, choose M from cumulative router mass instead */
+static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE substitutes before renorm (1=off) */
+static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
+static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
@@ -1779,6 +1791,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
+/* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
+static int expert_is_resident(Model *m, int layer, int eid){
+    ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
+    ESlot *Sl=m->ecache[layer];
+    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
+    return 0;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -1796,6 +1817,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     float *logit=falloc(E), *choice=falloc(E);
     int sI=c->moe_inter*c->n_shared;
+    /* Rank buffer for CACHE_ROUTE max-rank selection (up to all E experts). */
+    int *rank_buf=NULL; float *rank_w=NULL;
+    int do_cache_route = g_cache_route && E>0 && K>0;
+    int rank_cap = do_cache_route ? (g_route_m>K?g_route_m:K) : 0;
+    if(rank_cap>E) rank_cap=E;
+    if(do_cache_route){
+        rank_buf=malloc((size_t)rank_cap*sizeof(int));
+        rank_w=malloc((size_t)rank_cap*sizeof(float));
+        if(!rank_buf||!rank_w){ free(rank_buf); free(rank_w); rank_buf=NULL; rank_w=NULL; do_cache_route=0; }
+    }
     /* ---- FASE A: routing di tutte le S posizioni ---- */
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
@@ -1821,10 +1852,101 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
-        for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-            idx[kk]=best; w[kk]=logit[best];
+        if(do_cache_route){
+            /* Full ranking of top rank_cap experts by choice (bias-augmented). */
+            int Mwin=rank_cap;
+            if(g_route_p>0.f && g_route_p<1.f){
+                /* Cumulative-mass variant: grow M until mass covers ROUTE_P. */
+                int Mmax=g_route_m>Ksel*4?g_route_m:Ksel*4; if(Mmax>E) Mmax=E; if(Mmax>rank_cap) Mmax=rank_cap;
+                for(int kk=0;kk<Mmax;kk++){ int best=-1; float bv=-1e30f;
+                    for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
+                        if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                    rank_buf[kk]=best; rank_w[kk]=logit[best];
+                }
+                float tot=1e-20f; for(int kk=0;kk<Mmax;kk++) tot+=rank_w[kk]>0?rank_w[kk]:0;
+                float cum=0; Mwin=Ksel;
+                for(int kk=0;kk<Mmax;kk++){ cum+=rank_w[kk]>0?rank_w[kk]:0;
+                    if(cum>=g_route_p*tot){ Mwin=kk+1; break; } Mwin=kk+1; }
+                if(Mwin<Ksel) Mwin=Ksel;
+            } else {
+                for(int kk=0;kk<Mwin;kk++){ int best=-1; float bv=-1e30f;
+                    for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
+                        if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                    rank_buf[kk]=best; rank_w[kk]=logit[best];
+                }
+            }
+            int J=g_route_j; if(J<0) J=0; if(J>Ksel) J=Ksel;
+            int chosen=0;
+            /* Always take true top-J (even if uncached). */
+            for(int kk=0;kk<J && chosen<Ksel;kk++){
+                idx[chosen]=rank_buf[kk]; w[chosen]=rank_w[kk]; chosen++;
+            }
+            /* Remaining slots: prefer resident experts within top-Mwin. */
+            for(int r=J;r<Mwin && chosen<Ksel;r++){
+                int e=rank_buf[r]; int already=0;
+                for(int j=0;j<chosen;j++) if(idx[j]==e){already=1;break;}
+                if(already) continue;
+                if(expert_is_resident(m,layer,e)){
+                    idx[chosen]=e; w[chosen]=rank_w[r]; chosen++;
+                }
+            }
+            /* Fill remainder from true ranking order. */
+            for(int r=0;r<Mwin && chosen<Ksel;r++){
+                int e=rank_buf[r]; int already=0;
+                for(int j=0;j<chosen;j++) if(idx[j]==e){already=1;break;}
+                if(already) continue;
+                idx[chosen]=e; w[chosen]=rank_w[r]; chosen++;
+            }
+            /* Swap accounting vs true top-Ksel (rank_buf[0..Ksel)). */
+            m->route_slots+=(uint64_t)Ksel;
+            for(int kk=0;kk<Ksel;kk++){
+                int e=idx[kk], in_true=0;
+                for(int t=0;t<Ksel;t++) if(rank_buf[t]==e){in_true=1;break;}
+                if(!in_true) m->route_swaps++;
+            }
+            /* Pad if somehow short (shouldn't happen). */
+            while(chosen<Ksel){ idx[chosen]=rank_buf[chosen]; w[chosen]=rank_w[chosen]; chosen++; }
+            /* ROUTE_ALPHA: down-weight substituted experts' gate mass before renorm. */
+            if(g_route_alpha>0.f && g_route_alpha<1.f){
+                for(int kk=0;kk<Ksel;kk++){
+                    int e=idx[kk], in_true=0;
+                    for(int t=0;t<Ksel;t++) if(rank_buf[t]==e){in_true=1;break;}
+                    if(!in_true) w[kk]*=g_route_alpha;
+                }
+            }
+            /* ROUTE_AGREE: overlap + KL(true top-K mass || chosen mass). */
+            if(g_route_agree || g_cache_route){
+                int ov=0;
+                for(int kk=0;kk<Ksel;kk++){
+                    for(int t=0;t<Ksel;t++) if(idx[kk]==rank_buf[t]){ ov++; break; }
+                }
+                m->route_agree_hit+=(uint64_t)ov;
+                m->route_agree_tot+=(uint64_t)Ksel;
+                float tsum=1e-20f, csum=1e-20f;
+                for(int t=0;t<Ksel;t++) tsum+=rank_w[t]>0?rank_w[t]:0;
+                for(int kk=0;kk<Ksel;kk++) csum+=w[kk]>0?w[kk]:0;
+                double kl=0;
+                for(int t=0;t<Ksel;t++){
+                    double pt=(rank_w[t]>0?rank_w[t]:0)/tsum;
+                    if(pt<=0) continue;
+                    double pc=1e-12;
+                    for(int kk=0;kk<Ksel;kk++) if(idx[kk]==rank_buf[t]){
+                        pc=(w[kk]>0?w[kk]:0)/csum; break; }
+                    kl+=pt*log(pt/pc);
+                }
+                m->route_kl_sum+=kl; m->route_kl_n++;
+            }
+        } else {
+            for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
+                    if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                idx[kk]=best; w[kk]=logit[best];
+            }
+            if(g_route_agree){
+                m->route_agree_hit+=(uint64_t)Ksel;
+                m->route_agree_tot+=(uint64_t)Ksel;
+                m->route_kl_sum+=0; m->route_kl_n++;
+            }
         }
         int Ke=Ksel;
         if(g_topp>0 && g_topp<1.f){
@@ -1849,6 +1971,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         }
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
+    free(rank_buf); free(rank_w);
     if(g_route_fp) g_route_call++;
     if(g_couple && cp_pred && S<=8)
         for(int s2=0;s2<S;s2++) couple_prefetch(m,layer,idxs+(int64_t)s2*K,keff[s2]);
@@ -2811,9 +2934,17 @@ static void emit_stream(int t, void *ud){
     EmitStream *e=(EmitStream*)ud; char dec[64];
     int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
     if(!e->quiet && ++e->count%16==0){ double tt=e->m->hits+e->m->miss;
-        fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-            rss_gb(), tt?100.0*e->m->hits/tt:0.0, e->count/(now_s()-e->t0),
-            e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0); }
+        if(g_cache_route && e->m->route_slots){
+            double swap=100.0*e->m->route_swaps/e->m->route_slots;
+            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
+                rss_gb(), tt?100.0*e->m->hits/tt:0.0, swap, e->count/(now_s()-e->t0),
+                e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
+        } else {
+            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
+                rss_gb(), tt?100.0*e->m->hits/tt:0.0, e->count/(now_s()-e->t0),
+                e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
+        }
+    }
 }
 
 /* teacher-forcing: un solo forward su ids[S], argmax per posizione in pred[S] */
@@ -2950,10 +3081,21 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double dt=now_s()-t;
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    printf("\n---\n%d tokens in %.2fs (%.2f tok/s) | expert hit rate %.1f%% | RSS %.2f GB\n",
+    printf("\n---\n%d tokens in %.2fs (%.2f tok/s) | expert hit rate %.1f%% | RSS %.2f GB",
         produced, dt, produced/dt, tot?100.0*m->hits/tot:0.0, rss_gb());
-    printf("experts loaded/token: %.1f (per-layer %.2f across %d; baseline topk=%d) | TOPK=%d TOPP=%.2f\n",
+    if(g_cache_route && m->route_slots)
+        printf(" | swap %.1f%% (%llu/%llu)",
+            100.0*m->route_swaps/m->route_slots,
+            (unsigned long long)m->route_swaps,(unsigned long long)m->route_slots);
+    if(m->route_agree_tot)
+        printf(" | route_agree %.1f%% | route_kl %.4f",
+            100.0*m->route_agree_hit/m->route_agree_tot,
+            m->route_kl_n?m->route_kl_sum/(double)m->route_kl_n:0.0);
+    printf("\n");
+    printf("experts loaded/token: %.1f (per-layer %.2f across %d; baseline topk=%d) | TOPK=%d TOPP=%.2f",
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
+    if(g_cache_route) printf(" | CACHE_ROUTE J=%d M=%d P=%.2f alpha=%.2f", g_route_j, g_route_m, g_route_p, g_route_alpha);
+    printf("\n");
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
@@ -3447,7 +3589,11 @@ static void run_serve(Model *m, const char *snap){
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
         first=0;
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
-        uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
+        uint64_t h0=m->hits, ms0=m->miss;
+        uint64_t rs0=m->route_slots, rw0=m->route_swaps;
+        uint64_t agh0=m->route_agree_hit, agt0=m->route_agree_tot;
+        uint64_t kln0=m->route_kl_n; double kls0=m->route_kl_sum;
+        double tt0=now_s();
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
@@ -3458,9 +3604,21 @@ static void run_serve(Model *m, const char *snap){
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
         double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
+        uint64_t rslots=m->route_slots-rs0, rswaps=m->route_swaps-rw0;
+        double swap_pct=rslots?100.0*rswaps/rslots:0.0;
+        uint64_t ag_hit=m->route_agree_hit-agh0, ag_tot=m->route_agree_tot-agt0;
+        uint64_t kl_n=m->route_kl_n-kln0; double kl_sum=m->route_kl_sum-kls0;
+        double agree_pct=ag_tot?100.0*ag_hit/ag_tot:100.0;
+        double kl_mean=kl_n?kl_sum/(double)kl_n:0.0;
         printf("%s\x01\x01" "END" "\x01\x01\n",raw_mode?"":"\n");
-        printf("STAT %d %.2f %.1f %.2f %d %d\n", prod, prod/tdt,
+        printf("STAT %d %.2f %.1f %.2f %d %d", prod, prod/tdt,
             (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb(), prompt_tokens, prod>=cur);
+        if(g_cache_route || rslots || ag_tot)
+            printf(" swap_pct=%.1f route_swaps=%llu route_slots=%llu"
+                   " route_agree=%.1f route_kl=%.4f",
+                swap_pct,(unsigned long long)rswaps,(unsigned long long)rslots,
+                agree_pct,kl_mean);
+        printf("\n");
         fflush(stdout);
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
@@ -3979,6 +4137,24 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
+    g_route_j = getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
+    g_route_m = getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;
+    g_route_p = getenv("ROUTE_P")?atof(getenv("ROUTE_P")):0;
+    g_route_alpha = getenv("ROUTE_ALPHA")?atof(getenv("ROUTE_ALPHA")):1.f;
+    g_route_agree = getenv("ROUTE_AGREE")?atoi(getenv("ROUTE_AGREE")):0;
+    if(g_route_j<0) g_route_j=0;
+    if(g_route_m<1) g_route_m=1;
+    if(g_route_m>4096) g_route_m=4096;
+    if(g_route_alpha<=0.f) g_route_alpha=1.f;
+    if(g_route_alpha>1.f) g_route_alpha=1.f;
+    if(g_cache_route)
+        fprintf(stderr,"[CACHE_ROUTE] on J=%d M=%d P=%.2f alpha=%.2f (pin∪LRU prefer; never default)\n",
+                g_route_j,g_route_m,g_route_p,g_route_alpha);
+    if(g_route_agree)
+        fprintf(stderr,"[ROUTE_AGREE] telemetry on (overlap%% + mean KL vs true top-K)\n");
+    /* Auto-enable agree telemetry when CACHE_ROUTE is on (cheap quality leading indicator). */
+    if(g_cache_route && !getenv("ROUTE_AGREE")) g_route_agree=1;
     const char *policy=getenv("COLI_POLICY"); if(!policy) policy="quality";
     int experimental=!strcmp(policy,"experimental-fast");
     if(strcmp(policy,"quality")&&strcmp(policy,"balanced")&&!experimental){
