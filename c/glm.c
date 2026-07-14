@@ -1489,12 +1489,12 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
-            float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
+            float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=(double)acc*s; }
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-            if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
+            if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=(double)acc*s; }
         else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
-            for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
+            for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=(double)acc*s; }
         y[j]=(float)a;
     }
 }
@@ -2451,13 +2451,13 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         if(getenv("MTP_SWAP")){ memcpy(cat, h, D*sizeof(float)); memcpy(cat+D, x, D*sizeof(float)); }
         else { memcpy(cat, x, D*sizeof(float)); memcpy(cat+D, h, D*sizeof(float)); }
         matmul_qt(hx, cat, &m->eh_proj, 1);
-        double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
+        double n_eh=0; for(int d=0;d<D;d++) n_eh+=(double)hx[d]*hx[d];
         int dbg = getenv("MTP_DEBUG") && atoi(getenv("MTP_DEBUG"))>=2;
         int t_pre=-1;
         if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt(logit, row, &m->lm_head, 1);
                  t_pre=mtp_argmax(logit, c->vocab); }
         layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
-        double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
+        double n_post=0; for(int d=0;d<D;d++) n_post+=(double)hx[d]*hx[d];
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
         matmul_qt(logit, row, &m->lm_head, 1);
         int t2=mtp_argmax(logit, c->vocab);
@@ -2961,8 +2961,16 @@ static void kv_disk_append(Model *m, const int *hist, int len){
     if(!g_kvsave || len<=k->disk_nrec) return;
     Cfg *c=&m->c;
     FILE *f=fopen(k->disk_path,"r+b");
-    if(!f){ f=fopen(k->disk_path,"wb"); if(!f) return;
-        int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f); }
+    if(!f){
+        /* Create the KV cache mode 0600 explicitly: fopen("wb") would go through
+         * open(...,0666) & ~umask and land at 0644 on a default umask, which is
+         * still world-readable state for a file that mirrors user conversation. */
+        int fd=open(k->disk_path,O_WRONLY|O_CREAT|O_TRUNC,0600);
+        if(fd<0) return;
+        f=fdopen(fd,"wb");
+        if(!f){ close(fd); return; }
+        int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f);
+    }
     int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
     fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
@@ -3080,6 +3088,10 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     }
     ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
     if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
+    /* coli_submit_parse already rejects payloads over 16 MiB. Re-assert the same
+     * bound here so the malloc site stays trivially bounded even under later
+     * refactors and static analysis can prove the size is capped. */
+    if(sub.bytes > (16u << 20)){ printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(line); return 0; }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
@@ -3131,6 +3143,7 @@ static void run_serve_mux(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+    if(maxctx<1||maxctx>(1<<17)){ fprintf(stderr,"CTX must be between 1 and 131072 (got %d)\n",maxctx); exit(2); }
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>16){fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n");exit(2);}
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
@@ -3203,7 +3216,9 @@ static void run_serve(Model *m, const char *snap){
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
+    if(ngen<1||ngen>(1<<17)){ fprintf(stderr,"NGEN must be between 1 and 131072 (got %d)\n",ngen); exit(2); }
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+    if(maxctx<1||maxctx>(1<<17)){ fprintf(stderr,"CTX must be between 1 and 131072 (got %d)\n",maxctx); exit(2); }
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
     g_kvsave = getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
@@ -3361,7 +3376,10 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
  * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
 static void stats_dump_q(Model *m, const char *path, int quiet){
     char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
-    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
+    int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC,0600);
+    if(fd<0){ if(!quiet) perror(tmp); return; }
+    FILE *f=fdopen(fd,"w");
+    if(!f){ if(!quiet) perror(tmp); close(fd); return; }
     Cfg *c=&m->c; int64_t tot=0, nz=0;
     for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
         for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
@@ -3686,7 +3704,14 @@ int main(int argc, char **argv){
         puts("AVX512 i4 selftest: ok"); return 0;
     }
 #endif
-    const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    const char *snap_env=getenv("SNAP"); if(!snap_env){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    /* Normalise SNAP once: realpath collapses `..` and doubled separators before
+     * the path reaches any fopen/open, which both hardens against traversal
+     * from a hypothetical caller that would proxy env into the process and
+     * lets static analysis prove downstream file access sites are bounded. */
+    static char snap_buf[PATH_MAX];
+    if(!realpath(snap_env, snap_buf)){ perror(snap_env); return 1; }
+    const char *snap=snap_buf;
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
@@ -3731,6 +3756,12 @@ int main(int argc, char **argv){
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
+    /* cap sizes the per-layer expert cache; anything past ~1k is either a typo or
+     * an OOM. Clamping here also lets CodeQL prove the calloc(cap,...) at
+     * model_load stays in a bounded range. */
+    if(cap<1||cap>4096){ fprintf(stderr,"cap must be between 1 and 4096 (got %d)\n",cap); return 2; }
+    if(ebits<1||ebits>16){ fprintf(stderr,"ebits must be between 1 and 16 (got %d)\n",ebits); return 2; }
+    if(dbits<1||dbits>16){ fprintf(stderr,"dbits must be between 1 and 16 (got %d)\n",dbits); return 2; }
     if(getenv("SERVE") && (kv_slot_count()<1 || kv_slot_count()>16)){
         fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2;
     }
@@ -3804,6 +3835,7 @@ int main(int argc, char **argv){
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
+      if(est_ctx<1||est_ctx>(1<<17)){ fprintf(stderr,"CTX must be between 1 and 131072 (got %d)\n",est_ctx); return 2; }
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
@@ -3834,13 +3866,17 @@ int main(int argc, char **argv){
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
     if(getenv("PROMPT")){
         int ngen=getenv("NGEN")?atoi(getenv("NGEN")):64;
+        if(ngen<1||ngen>(1<<17)){ fprintf(stderr,"NGEN must be between 1 and 131072 (got %d)\n",ngen); return 2; }
         run_text(&m, snap, getenv("PROMPT"), ngen);
         if(stats) stats_dump(&m,stats);
         return 0;
     }
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
-    const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
+    const char *refpath_env=getenv("REF")?getenv("REF"):"ref_glm.json";
+    char refpath_buf[PATH_MAX];
+    if(!realpath(refpath_env, refpath_buf)){ perror(refpath_env); return 1; }
+    const char *refpath=refpath_buf;
     FILE *f=fopen(refpath,"rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f);

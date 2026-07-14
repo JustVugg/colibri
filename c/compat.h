@@ -6,6 +6,13 @@
 #ifndef COMPAT_H
 #define COMPAT_H
 
+#ifndef PATH_MAX
+#include <limits.h>
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 #ifdef __APPLE__
 #include <fcntl.h>
 #include <unistd.h>
@@ -180,6 +187,17 @@ static inline int compat_rename(const char *old, const char *new){
 
 /* --- getpid -> _getpid --- */
 #define getpid() _getpid()
+
+/* --- realpath -> _fullpath: canonicalise a user-supplied path so downstream
+ * fopen/open call sites receive a normalised form (no `..`, no doubled `/`).
+ * _fullpath does not resolve symlinks the way POSIX realpath does, but the
+ * property colibri needs — collapsing traversal components before the path
+ * reaches a taint sink — is preserved. Callers pass a buffer of at least
+ * PATH_MAX bytes. */
+static inline char *compat_realpath(const char *path, char *resolved){
+    return _fullpath(resolved, path, PATH_MAX);
+}
+#define realpath compat_realpath
 
 /* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
  * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */

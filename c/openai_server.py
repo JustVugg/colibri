@@ -658,11 +658,23 @@ class APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # A well-formed Origin header value: scheme://host[:port] with no CR/LF and no
+    # other control chars. We membership-check the value against the allow-list
+    # anyway, but sanitising before echoing is defence in depth against any HTTP
+    # response-splitting shape CodeQL cannot see through.
+    _ORIGIN_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*://[!-~]{1,253}\Z")
+
     def send_cors_headers(self):
         origin = self.headers.get("Origin")
         if not origin or ("*" not in self.server.cors_origins and origin not in self.server.cors_origins):
             return
-        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
+        if "*" in self.server.cors_origins:
+            echoed = "*"
+        else:
+            if not self._ORIGIN_RE.match(origin):
+                return
+            echoed = origin
+        self.send_header("Access-Control-Allow-Origin", echoed)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Expose-Headers",

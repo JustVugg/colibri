@@ -120,7 +120,12 @@ static void st_init(shards *S, const char *snap_dir) {
     }
     closedir(d);
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
-        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
+        if (strcmp(files[a], files[b]) > 0) {
+            char tmp[1024];
+            memcpy(tmp, files[a], sizeof(tmp));
+            memcpy(files[a], files[b], sizeof(tmp));
+            memcpy(files[b], tmp, sizeof(tmp));
+        }
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
