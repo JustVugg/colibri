@@ -585,7 +585,7 @@ def cmd_bench(a):
         print(f"  {C.dim}downloading missing datasets: {', '.join(missing)}{C.r}")
         subprocess.call([py, os.path.join(TOOLS,"fetch_benchmarks.py"),
                          "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
-    cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--snap",a.model,
+    cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--glm", GLM, "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
     e=env_for(a)
