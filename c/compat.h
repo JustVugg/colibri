@@ -57,6 +57,7 @@ static inline int compat_open_direct(const char *path){
  *                                  _read/_lseeki64 which are racy AND
  *                                  corrupt 0x0A bytes in binary files).
  * posix_fadvise -> no-op (advisory only; macOS already no-ops DONTNEED).
+ * mlock         -> compat_mlock  (VirtualLock + crescita working set).
  * posix_memalign->_aligned_malloc(free must be compat_aligned_free).
  * rename        -> compat_rename (MoveFileEx MOVEFILE_REPLACE_EXISTING;
  *                                  CRT rename fails EEXIST if dest exists,
@@ -134,6 +135,25 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     return (ssize_t)total;
 }
 #define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)
+
+/* --- mlock -> VirtualLock con crescita del working set ---
+ * VirtualLock fallisce oltre il working set MINIMO del processo (default ~qualche
+ * centinaio di KB): prima si allarga il working set di len + margine, poi si blocca.
+ * Best effort come mlock su Linux: -1 su fallimento, il chiamante decide (pin_wire
+ * lo tratta come non-fatale). SeIncreaseWorkingSetPrivilege e' concesso agli utenti
+ * standard di default. */
+static inline int compat_mlock(const void *addr, size_t len){
+    HANDLE p = GetCurrentProcess();
+    SIZE_T mn = 0, mx = 0;
+    if(GetProcessWorkingSetSize(p, &mn, &mx)){
+        SIZE_T need = len + (SIZE_T)(1u<<20);
+        SetProcessWorkingSetSize(p, mn + need, mx + need);   /* best effort */
+    }
+    return VirtualLock((LPVOID)addr, len) ? 0 : -1;
+}
+static inline int compat_munlock(const void *addr, size_t len){
+    return VirtualUnlock((LPVOID)addr, len) ? 0 : -1;
+}
 
 /* --- posix_memalign -> _aligned_malloc ---
  * ATTN: memoria allocata con _aligned_malloc DEVE essere liberata con
@@ -214,6 +234,35 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
     return (ssize_t)pos;
 }
 #define getline(lineptr,n,stream) compat_getline(lineptr,n,stream)
+
+/* --- O_DIRECT -> FILE_FLAG_NO_BUFFERING ---
+ * Apre il fd "gemello" senza cache del file system, come il twin O_DIRECT di
+ * st.h su Linux e F_NOCACHE su macOS. Stesso contratto: offset, lunghezza e
+ * buffer del chiamante devono essere allineati a 4K (gli slab expert usano
+ * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
+ * e len); richieste non allineate falliscono con -1, mai dati corrotti.
+ * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+static inline int compat_open_direct(const char *path){
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+    if(h == INVALID_HANDLE_VALUE) return -1;
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
+    if(fd < 0){ CloseHandle(h); return -1; }
+    return fd;
+}
+
+/* --- dimensione file da fd: GetFileSizeEx ---
+ * La lseek(SEEK_END) del CRT ritorna -1 sui fd NO_BUFFERING (misurato su
+ * UCRT): la dimensione si chiede direttamente al kernel. Funziona su
+ * qualsiasi fd (buffered o direct). -1 su errore. */
+static inline off_t compat_fsize(int fd){
+    intptr_t osfh = _get_osfhandle(fd);
+    if(osfh == -1 || osfh == -2) return -1;
+    LARGE_INTEGER li;
+    if(!GetFileSizeEx((HANDLE)osfh, &li)) return -1;
+    return (off_t)li.QuadPart;
+}
 
 /* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){

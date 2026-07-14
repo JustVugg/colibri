@@ -39,7 +39,7 @@ def analyze_model(model):
     config_path = model / "config.json"
     if not config_path.is_file():
         raise ValueError(f"missing config.json: {model}")
-    config = json.loads(config_path.read_text())
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
@@ -116,6 +116,30 @@ def memory_available():
                 return total_kb.value * 1024
         except OSError:
             pass
+    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
+    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
+    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
+            page_match = re.search(r"page size of (\d+) bytes", out)
+            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
+            pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                match = re.search(rf"{key}:\s+(\d+)\.", out)
+                if match:
+                    pages += int(match.group(1))
+            if pages:
+                return pages * page
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        try:
+            total = subprocess.run(["sysctl", "-n", "hw.memsize"], text=True,
+                                   capture_output=True, timeout=5).stdout.strip()
+            if total:
+                return int(total)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
     return 0
 
 
@@ -127,8 +151,9 @@ def discover_gpus():
     except (OSError, subprocess.SubprocessError):
         return []
     devices = []
-    for line in result.stdout.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
+    import csv
+    for fields in csv.reader(result.stdout.splitlines()):
+        fields = [f.strip() for f in fields]
         if len(fields) != 4:
             continue
         try:
@@ -185,15 +210,15 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if ram_budget < 4 * GB:
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
-    layers = int(cfg.get("num_hidden_layers", 0)) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
-                                   int(cfg.get("qk_rope_head_dim", 0))) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
-        int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
+    layers = int(cfg.get("num_hidden_layers") or 0) + 1
+    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
+                                   int(cfg.get("qk_rope_head_dim") or 0)) * 4
+    kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
+        int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts", 0))
+    configured_experts = int(cfg.get("n_routed_experts") or 0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
