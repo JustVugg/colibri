@@ -3375,17 +3375,35 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
  * Include la riga MTP (layer n_layers). Scrittura atomica (tmp+rename): viene chiamata
  * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
 static void stats_dump_q(Model *m, const char *path, int quiet){
-    /* Callers must pass a canonical file path (either g_usage_path — built
-     * inside the resolved SNAP directory — or a STATS env value already run
-     * through realpath by main). Defensive reject-and-return covers the case
-     * where a future caller forgets: no traversal fragments, no embedded CR/LF
-     * that would let a crafted path split filesystem-level logging elsewhere. */
-    if(!path || !*path || strstr(path,"..") ||
-       strchr(path,'\n') || strchr(path,'\r')){
-        if(!quiet) fprintf(stderr,"stats_dump: rejecting non-canonical path\n");
-        return;
+    if(!path || !*path){ if(!quiet) fprintf(stderr,"stats_dump: empty path\n"); return; }
+    /* Resolve the directory portion via realpath so the actual file path we
+     * hand to open() is rooted in a canonical directory. The file itself may
+     * not exist yet (first invocation), so we can't realpath the whole path. */
+    char work[PATH_MAX];
+    if(snprintf(work,sizeof(work),"%s",path) >= (int)sizeof(work)){
+        if(!quiet) fprintf(stderr,"stats_dump: path too long\n"); return;
     }
-    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    char *sep = strrchr(work,'/');
+#ifdef _WIN32
+    char *bsep = strrchr(work,'\\');
+    if(bsep && (!sep || bsep > sep)) sep = bsep;
+#endif
+    char dir_resolved[PATH_MAX], resolved[PATH_MAX];
+    const char *base;
+    if(sep){ *sep = 0; base = sep + 1;
+        if(!realpath(work, dir_resolved)){ if(!quiet) perror(work); return; } }
+    else   { base = work;
+        if(!realpath(".", dir_resolved)){ if(!quiet) perror("."); return; } }
+    if(!*base || strchr(base,'/') || strchr(base,'\n') || strchr(base,'\r')){
+        if(!quiet) fprintf(stderr,"stats_dump: invalid basename\n"); return;
+    }
+    if(snprintf(resolved,sizeof(resolved),"%s/%s",dir_resolved,base) >= (int)sizeof(resolved)){
+        if(!quiet) fprintf(stderr,"stats_dump: resolved path too long\n"); return;
+    }
+    char tmp[PATH_MAX];
+    if(snprintf(tmp,sizeof(tmp),"%s.tmp",resolved) >= (int)sizeof(tmp)){
+        if(!quiet) fprintf(stderr,"stats_dump: tmp path too long\n"); return;
+    }
     int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC,0600);
     if(fd<0){ if(!quiet) perror(tmp); return; }
     FILE *f=fdopen(fd,"w");
@@ -3393,8 +3411,8 @@ static void stats_dump_q(Model *m, const char *path, int quiet){
     Cfg *c=&m->c; int64_t tot=0, nz=0;
     for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
         for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
-    fclose(f); rename(tmp,path);
-    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,path);
+    fclose(f); rename(tmp,resolved);
+    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,resolved);
 }
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
