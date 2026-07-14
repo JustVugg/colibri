@@ -1447,6 +1447,9 @@ static void expert_host_release(Model *m, ESlot *s){
 #if defined(__APPLE__) || defined(__linux__)
     if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
     if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#elif defined(_WIN32)
+    if(s->slab) compat_munlock(s->slab,(size_t)s->slab_cap);
+    if(s->fslab) compat_munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
 #endif
     int64_t bytes=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
     free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
@@ -3408,6 +3411,8 @@ static int mem_should_wire(void){
 static int mem_wire(void *addr, size_t len){
 #if defined(__APPLE__) || defined(__linux__)
     return mlock(addr, len);
+#elif defined(_WIN32)
+    return compat_mlock(addr, len);   /* VirtualLock + working-set growth */
 #else
     (void)addr; (void)len; return 0;
 #endif
