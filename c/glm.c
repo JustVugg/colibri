@@ -3126,7 +3126,6 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 }
 
 static void run_serve_mux(Model *m, const char *snap){
-#if defined(__APPLE__) || defined(__linux__)
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
@@ -3142,10 +3141,34 @@ static void run_serve_mux(Model *m, const char *snap){
     int eof=0;
     for(;;){
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
-        struct timeval tv={0,0}, *ptv=active?&tv:NULL;
-        int ready=eof?0:select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
-        if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds)) if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+        /* Poll stdin for available input without blocking. On POSIX this is
+         * select(); on Windows, select() on a pipe handle routes to winsock
+         * and always returns -1 (SOCKET_ERROR), so the batch loop could never
+         * accept a request (#139). PeekNamedPipe on the stdin OS handle is
+         * the Windows equivalent: it reports bytes available without reading. */
+        int ready=0;
+        if(!eof){
+#if defined(__APPLE__) || defined(__linux__)
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+            struct timeval tv={0,0}, *ptv=active?&tv:NULL;
+            ready=select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
+            if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds))
+#elif defined(_WIN32)
+            HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
+            DWORD avail=0;
+            /* WaitForSingleObject(handle, 0) is non-blocking and works on both
+             * pipe and console handles; for pipes PeekNamedPipe gives the byte
+             * count. Either returns "data is there right now". When a decode
+             * is active we poll (timeout 0); when idle we block until input. */
+            if(active){
+                ready=(WaitForSingleObject(ih,0)==WAIT_OBJECT_0)?1:0;
+            } else {
+                ready=(WaitForSingleObject(ih,INFINITE)==WAIT_OBJECT_0)?1:0;
+            }
+            if(ready && PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)
+#endif
+                if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+        }
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[16]; int slots[16], S=0;
@@ -3168,15 +3191,6 @@ static void run_serve_mux(Model *m, const char *snap){
     usage_save(m);
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
-#else
-    /* SERVE_BATCH (continuous batching) uses select() on stdin, a Unix-ism.
-     * Not yet ported to native Windows — fall back to the single-sequence
-     * serve path (run_serve). Remove this stub once select()-free polling
-     * (e.g. WaitForSingleObject on the stdin handle) is implemented. */
-    (void)snap;
-    fprintf(stderr,"[SERVE_BATCH] continuous-batching serve is not yet available on "
-                   "native Windows; use the default serve path (omit SERVE_BATCH).\n");
-#endif
 }
 
 static void run_serve(Model *m, const char *snap){
