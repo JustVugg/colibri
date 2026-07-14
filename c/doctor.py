@@ -47,7 +47,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
     config = model / "config.json"
     try:
-        valid_config = isinstance(json.loads(config.read_text()), dict)
+        valid_config = isinstance(json.loads(config.read_text(encoding="utf-8")), dict)
     except (OSError, ValueError):
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
