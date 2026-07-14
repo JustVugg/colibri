@@ -39,7 +39,7 @@ typedef struct { Slot *slots; int n, cap; } LCache;
 typedef struct {
     Cfg c;
     shards S;
-    int quant_bits;        /* bit di quantizzazione degli expert (2..8); 16 = f32 */
+    int quant_bits;        /* bit di quantizzazione degli expert (2..8); storage int8, niente f32 (#134) */
     float *embed, *lm_head, *final_norm;
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -360,6 +360,10 @@ int main(int argc, char **argv) {
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     int cap  = argc > 1 ? atoi(argv[1]) : 16;
     int bits = argc > 2 ? atoi(argv[2]) : 8;
+    if (bits < 2 || bits > 8) {   /* expert storage is int8_t: bits>8 truncates in quantize_rows (#134). f32 mode is not implemented here — int8 is already token-exact vs the oracle. */
+        fprintf(stderr, "quant_bits must be 2..8 (got %d); OLMoE experts are int8-backed, no f32 mode\n", bits);
+        return 1;
+    }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}

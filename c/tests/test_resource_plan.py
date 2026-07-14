@@ -6,7 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from resource_plan import GB, analyze_model, build_plan, environment_for_plan, format_plan
+from resource_plan import (
+    GB,
+    analyze_model,
+    build_plan,
+    environment_for_plan,
+    format_plan,
+    memory_available,
+)
 
 
 def write_shard(path, tensors):
@@ -52,6 +59,12 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(info["expert_bytes"], 120)
         self.assertEqual(info["expert_count"], 2)
         self.assertEqual(info["per_cap_bytes"], 60)
+
+    def test_memory_available_is_positive(self):
+        # Regression: on native Windows CPython, /proc/meminfo does not exist,
+        # so the Linux-only path returned 0 and the expert cache was sized to
+        # 0 slots/layer. The value must be a sane positive number of bytes.
+        self.assertGreater(memory_available(), 0)
 
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,

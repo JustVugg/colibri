@@ -156,6 +156,23 @@ def env_for(a):
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
+    else:
+        # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
+        # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
+        if a.gpu is not None:
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            if a.gpu=="none":
+                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+            else:
+                if not cuda_binary():
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                e["COLI_CUDA"]="1"
+                if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
+                e.setdefault("CUDA_DENSE","1")
+        if a.vram and a.gpu!="none":
+            if not cuda_binary():
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -366,13 +383,38 @@ def cmd_chat(a):
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
+    # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
+    # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
+    # protocol coli reads one byte at a time) never flushes and chat hangs at
+    # ~10 GB resident. A PIPE whose read end nobody drains still works: the
+    # engine emits only ~400 bytes of status to stderr, which fits comfortably
+    # in the OS pipe buffer, so it never blocks. We snapshot stderr into errlog
+    # once the READY sentinel arrives, so the status-line display below works
+    # exactly as before. (Do NOT add a concurrent stderr drain thread: on
+    # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
     p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=errlog, bufsize=0)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
+        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        except (OSError, ValueError): pass
         errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
+    # READY received. Drain the child's stderr into errlog without blocking:
+    # the engine is still alive (blocked on stdin), so a plain read() would
+    # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
+    # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
+    _drain_box={"done":False}
+    def _drain():
+        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        except (OSError, ValueError): pass
+        _drain_box["done"]=True
+    threading.Thread(target=_drain, daemon=True).start()
+    _drain_box["th"]=threading.current_thread()
+    for _ in range(20):           # up to ~1s for the load-status lines
+        if _drain_box["done"]: break
+        time.sleep(0.05)
     errlog.flush()
     try:
         elog=open(errlog.name).read()

@@ -1,7 +1,18 @@
-UNAME_S := $(shell uname -s)
-MINGW    := $(findstring MINGW,$(UNAME_S))
-MSYS     := $(findstring MSYS,$(UNAME_S))
-IS_WIN   := $(MINGW)$(MSYS)
+# --- OS detection ---
+# On Windows the OS env var is 'Windows_NT' in EVERY shell (cmd, PowerShell,
+# MSYS2, Git-Bash), and GNU Make imports it. Detect Windows from it FIRST so
+# `make` works from a native PowerShell/CMD shell — there `uname` is not on
+# PATH, so the old uname-only check returned empty and fell through to the
+# Linux branch (no .exe, no -static). We only call `uname` when NOT on Windows.
+ifeq ($(OS),Windows_NT)
+IS_WIN   := 1
+UNAME_S  :=
+UNAME_M  :=
+else
+IS_WIN   :=
+UNAME_S  := $(shell uname -s)
+UNAME_M  := $(shell uname -m)
+endif
 
 ifeq ($(UNAME_S),Darwin)
 # --- macOS / Apple Silicon ---
@@ -24,9 +35,12 @@ EXE     =
 else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
 # GCC + libgomp + winpthreads: pthread, OpenMP, clock_gettime, opendir/readdir,
-# AVX2 intrinsics — tutto gratis, nessun porting.
-# ARCH default = x86-64-v3 (binario portabile con AVX2). Per max velocita'
-# su QUESTA macchina: make ARCH=native
+# AVX2 intrinsics - tutto gratis, nessun porting.
+# ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
+# machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
+# it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
+# which the x86-64-v3 baseline does not define. The #ifdef guards in glm.c mean
+# a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
@@ -59,7 +73,17 @@ endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
+#
+# Two paths:
+#   - Linux/macOS: CUDA=1 links backend_cuda.o directly (cudart via -l).
+#   - Windows:      CUDA_DLL=1 builds a standalone coli_cuda.dll (nvcc+MSVC),
+#                   then the host glm.exe loads it at runtime via backend_loader.c
+#                   (LoadLibrary/GetProcAddress). MinGW gcc cannot compile .cu
+#                   (nvcc needs cl.exe), and cross-linking MSVC objects into a
+#                   gcc binary is fragile — the DLL split keeps the toolchains
+#                   clean. See backend_loader.c and README "cuda-dll" below.
 CUDA      ?= 0
+CUDA_DLL  ?= 0
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
@@ -67,13 +91,23 @@ NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+
+# Windows CUDA DLL path: host links the loader, NOT cudart.
+ifneq ($(IS_WIN),)
+ifeq ($(CUDA_DLL),1)
+CFLAGS  += -DCOLI_CUDA
+CUDA_OBJ = backend_loader.o
+endif
+endif
+
+# Linux CUDA direct-link path (unchanged).
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
 endif
 ifneq ($(IS_WIN),)
-# GPU: stub only in Phase 1 (G0). G1 builds coli_cuda.dll with MSVC+nvcc.
-$(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see PORT_WINDOWS_PLAN.md §8))
+# On Windows use CUDA_DLL=1 (runtime DLL), not CUDA=1 (direct link).
+$(error On Windows use: make CUDA_DLL=1 cuda-dll  (see backend_loader.c))
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
@@ -101,6 +135,22 @@ glm: glm$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+
+# Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
+backend_loader.o: backend_loader.c backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -c backend_loader.c -o $@
+
+# Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
+# compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
+# shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
+# "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
+# __declspec(dllexport) so the 11 API symbols are exported.
+cuda-dll: backend_cuda.cu backend_cuda.h
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		-L"$(CUDA_HOME)/lib/x64" -lcudart \
+		backend_cuda.cu -o coli_cuda.dll
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -169,7 +219,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test cuda-bench portable test-c test-python test check clean
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean

@@ -7,6 +7,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -76,11 +77,46 @@ def analyze_model(model):
 
 
 def memory_available():
+    # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
     try:
         text = Path("/proc/meminfo").read_text()
         return int(re.search(r"MemAvailable:\s+(\d+)", text).group(1)) * 1024
     except (OSError, AttributeError):
-        return 0
+        pass
+    # Windows native CPython: GlobalMemoryStatusEx -> ullAvailPhys.
+    # Same definition the C engine uses (compat_meminfo in compat.h):
+    # standby/free/zero pages, i.e. reclaimable without swapping.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalMemoryStatusEx.restype = ctypes.c_int
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) and stat.ullAvailPhys:
+                return stat.ullAvailPhys
+            # Fallback (e.g. sandboxed callers where GlobalMemoryStatusEx reports
+            # nothing): total installed RAM in KB. Less precise than ullAvailPhys
+            # — it ignores standby/reclaimable pages — but never returns 0 on a
+            # real machine, which keeps the expert cache from being mis-sized.
+            total_kb = ctypes.c_ulonglong(0)
+            kernel32.GetPhysicallyInstalledSystemMemory.argtypes = [ctypes.c_void_p]
+            kernel32.GetPhysicallyInstalledSystemMemory.restype = ctypes.c_int
+            if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(total_kb)):
+                return total_kb.value * 1024
+        except OSError:
+            pass
+    return 0
 
 
 def discover_gpus():
