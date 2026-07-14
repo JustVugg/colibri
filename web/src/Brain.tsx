@@ -4,6 +4,7 @@ import { BrainCircuit, Flame, Layers } from "lucide-react"
 import { endpoint } from "@/lib/api"
 
 interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
+interface AtlasEntry { affinity: Record<string, number>; entropy: number; top: string; label: string }
 
 const TIER_NAME = ["Disk", "RAM", "VRAM"]
 const TIER_RGB: [number, number, number][] = [[58, 71, 80], [90, 155, 216], [78, 214, 165]]
@@ -26,10 +27,18 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
   const wrapRef = useRef<HTMLDivElement>(null)
   const [wrapSize, setWrapSize] = useState({ w: 1200, h: 700 })
   const [data, setData] = useState<ExpertMap | null>(null)
+  const [atlas, setAtlas] = useState<Record<string, AtlasEntry> | null>(null)
   const [tip, setTip] = useState<{ x: number; y: number; row: number; col: number; tier: number; heat: number } | null>(null)
   const pulseRef = useRef<Float32Array | null>(null)   // per-expert pulse intensity 0..1
   const lastSeq = useRef(0)
   const rafRef = useRef(0)
+
+  // load the expert atlas if published (measured topic affinity, #175)
+  useEffect(() => {
+    fetch("/experts.json").then(r => r.ok ? r.json() : null).then(d => {
+      if (d?.experts) setAtlas(d.experts)
+    }).catch(() => {})
+  }, [])
 
   // track container size for responsive cell sizing
   useEffect(() => {
@@ -146,14 +155,26 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
         <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setTip(null)} />
         {!connected && <p className="runtime-unavailable">Connect to the engine to see the cortex.</p>}
       </div>
-      {tip && data && (
+      {tip && data && (() => {
+        const isMtp = tip.row === data.rows - 1
+        const realLayer = isMtp ? 78 : tip.row + 3
+        const entry = atlas?.[`${realLayer}:${tip.col}`]
+        return (
         <div className="brain-tip" style={{ left: tip.x + 14, top: tip.y + 14 }}>
-          <div className="brain-tip-title"><Layers className="size-3" /> Layer row {tip.row}{tip.row === data.rows - 1 ? " (MTP)" : ""} · Expert {tip.col}</div>
+          <div className="brain-tip-title"><Layers className="size-3" /> Layer {realLayer}{isMtp ? " (MTP)" : ""} · Expert {tip.col}</div>
           <div>Tier: <strong style={{ color: ["#8b9aa3", "#5a9bd8", "#4ed6a5"][tip.tier] }}>{TIER_NAME[tip.tier]}</strong></div>
           <div>Heat: <strong>{tip.heat === 0 ? "never routed" : `~2^${tip.heat} selections`}</strong></div>
-          <div className="brain-tip-role">{depthRole(tip.row, data.rows, tip.row === data.rows - 1)}</div>
+          {entry ? <>
+            <div className={entry.label.startsWith("specialist") ? "brain-tip-spec" : undefined}>
+              {entry.label.startsWith("specialist") ? `⭐ Specialist: ${entry.top}` : "Generalist"}
+              <small> (entropy {entry.entropy})</small>
+            </div>
+            <div className="brain-tip-aff">{Object.entries(entry.affinity).sort((a, b) => b[1] - a[1]).slice(0, 3)
+              .map(([c, p]) => `${c} ${Math.round(p * 100)}%`).join(" · ")}</div>
+          </> : <div className="brain-tip-role">{depthRole(tip.row, data.rows, isMtp)}</div>}
         </div>
-      )}
+        )
+      })()}
     </div>
   )
 }
