@@ -819,6 +819,26 @@ static int g_gr_on=0;     /* grammatica caricata e walker vivo */
 static int g_gr_armed=0;  /* lazy: parte dal primo byte ammesso dalla radice (salta i preamboli) */
 static int g_gr_max=24;
 static uint64_t g_gr_prop=0, g_gr_acc=0;
+static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
+                               * per layer — offline co-activation / coupling analysis. Zero
+                               * effect on computation; measurement only. */
+static int g_route_call=0;
+/* COUPLE=<.coli_pairs>: coupling-scored cross-layer prefetch. The routing of layer L
+ * strongly constrains the routing of L+1/L+2 (measured: median co-activation lift 1.8x
+ * over independence, p99 40x, and the structure TRANSFERS across workloads — it is a
+ * property of the model, not the session). An offline table (tools/route_pairs.py,
+ * built from ROUTE_TRACE dumps) maps (layer, expert) -> top co-activated experts of the
+ * next layer(s); after FASE A routing we score candidates by summing counts over the
+ * position's routed set and enqueue the top COUPLE_K non-resident ones into the SAME
+ * pilot ring (worker, residency re-check, safety invariants unchanged). Unlike PILOT,
+ * no router matmul is needed — prediction is a table lookup on ids the layer just
+ * produced. Hints only: a wrong prediction costs bandwidth, never output. */
+#define CP_M 16
+static int g_couple=0, g_couple_k=8, g_couple_d=1;
+static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (-1 none) */
+static float   *cp_cnt=NULL;
+static long g_cp_enq=0;
+static void couple_prefetch(Model *m, int layer, const int *idx, int Ke);
 static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quanto il routing MoE
                           * e' predicibile IN ANTICIPO — la domanda che decide se un prefetch
                           * pilotato dal router puo' riempire i tempi morti del disco.
@@ -1802,8 +1822,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
+        if(g_route_fp){                       /* ROUTE_TRACE: one line per (position, layer) */
+            fprintf(g_route_fp,"%d %d %d",g_route_call,s,layer);
+            for(int kk=0;kk<Ke;kk++) fprintf(g_route_fp," %d:%.4f",idx[kk],w[kk]);
+            fputc('\n',g_route_fp);
+        }
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
+    if(g_route_fp) g_route_call++;
+    if(g_couple && cp_pred && S<=8)
+        for(int s2=0;s2<S;s2++) couple_prefetch(m,layer,idxs+(int64_t)s2*K,keff[s2]);
     if(g_looka && S==1 && layer<c->n_layers){
         int Ke=keff[0];
         if(m->enr[layer]>0){                       /* [0] vs routing del token precedente */
@@ -2173,6 +2201,77 @@ static void *pilot_worker(void *arg){
         __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
     }
     return NULL;
+}
+/* parse .coli_pairs (see tools/route_pairs.py): "COLIPAIRS 1 <n>" then
+ * "<L> <dL> <e> f:c f:c ..." lines. Needs c->n_experts/n_layers -> called post-init. */
+static void couple_load(Model *m, const char *path){
+    Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
+    FILE *f=fopen(path,"rb");
+    if(!f){ fprintf(stderr,"[COUPLE] cannot open %s\n",path); return; }
+    char magic[16]; int ver=0; long n=0;
+    if(fscanf(f,"%15s %d %ld",magic,&ver,&n)!=3 || strcmp(magic,"COLIPAIRS") || ver!=1){
+        fprintf(stderr,"[COUPLE] %s: bad header\n",path); fclose(f); return; }
+    size_t cells=(size_t)NL*2*E*CP_M;
+    cp_pred=malloc(cells*sizeof(int16_t)); cp_cnt=calloc(cells,sizeof(float));
+    if(!cp_pred||!cp_cnt){ fprintf(stderr,"[COUPLE] OOM\n"); free(cp_pred); free(cp_cnt); cp_pred=NULL; fclose(f); return; }
+    for(size_t i=0;i<cells;i++) cp_pred[i]=-1;
+    long used=0;
+    char *ln=NULL; size_t lcap=0;
+    while(getline(&ln,&lcap,f)>0){          /* line-based: a malformed line cannot eat the next */
+        char *p=ln; int L,dL,e; int nc=0;
+        if(sscanf(p,"%d %d %d%n",&L,&dL,&e,&nc)!=3) continue;
+        p+=nc;
+        if(L<0||L>=NL||(dL!=1&&dL!=2)||e<0||e>=E) continue;
+        size_t base=((size_t)(L*2+(dL-1))*E+e)*CP_M;
+        int j=0;
+        while(j<CP_M){
+            int fe; float fc;
+            if(sscanf(p," %d:%f%n",&fe,&fc,&nc)!=2) break;
+            p+=nc;
+            if(fe>=0&&fe<E){ cp_pred[base+j]=(int16_t)fe; cp_cnt[base+j]=fc; j++; }
+        }
+        if(j) used++;
+    }
+    free(ln);
+    fclose(f);
+    g_couple=1;
+    fprintf(stderr,"[COUPLE] %s: %ld conditioning entries, K=%d depth=%d\n",path,used,g_couple_k,g_couple_d);
+}
+/* score + enqueue: called from moe() after FASE A with the position's routed set */
+static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
+    Cfg *c=&m->c; int E=c->n_experts;
+    if(E>512) return;
+    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    for(int dL=1; dL<=g_couple_d; dL++){
+        int lt=layer+dL;
+        if(lt>=c->n_layers || !m->L[lt].sparse) continue;
+        float sc[512]; memset(sc,0,(size_t)E*sizeof(float));
+        for(int kk=0;kk<Ke;kk++){
+            size_t base=((size_t)(layer*2+(dL-1))*E+idx[kk])*CP_M;
+            for(int j=0;j<CP_M && cp_pred[base+j]>=0;j++) sc[cp_pred[base+j]]+=cp_cnt[base+j];
+        }
+        for(int kk=0;kk<g_couple_k;kk++){
+            int best=-1; float bv=0;
+            for(int e=0;e<E;e++) if(sc[e]>bv){bv=sc[e];best=e;}
+            if(best<0) break;
+            sc[best]=0;
+            int found=0;                            /* residency scan, same locking as pilot */
+            pthread_mutex_lock(&g_pilot_mx);
+            ESlot *P=m->pin[lt];
+            for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
+            ESlot *Sl=m->ecache[lt];
+            for(int z=0;z<m->ecn[lt] && !found;z++) if(Sl[z].eid==best) found=1;
+            pthread_mutex_unlock(&g_pilot_mx);
+            if(!found){
+                unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
+                if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
+                    pilot_q[w&4095].l=lt; pilot_q[w&4095].e=best;
+                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
+                    g_cp_enq++;
+                }
+            }
+        }
+    }
 }
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
@@ -2837,6 +2936,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
+    if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
     if(g_gr_prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
         100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
 #ifdef COLI_CUDA
@@ -3720,6 +3820,11 @@ int main(int argc, char **argv){
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
+        g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
+        if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
+        else fprintf(stderr,"[ROUTE_TRACE] logging routing to %s\n",getenv("ROUTE_TRACE"));
+    }
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
@@ -3799,6 +3904,13 @@ int main(int argc, char **argv){
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")) pin_load(&m, getenv("PIN"), getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
+    if(getenv("COUPLE")&&*getenv("COUPLE")){    /* coupling-scored cross-layer prefetch */
+        g_couple_k=getenv("COUPLE_K")?atoi(getenv("COUPLE_K")):8;
+        if(g_couple_k<1)g_couple_k=1; if(g_couple_k>32)g_couple_k=32;
+        g_couple_d=getenv("COUPLE_D")?atoi(getenv("COUPLE_D")):1;
+        if(g_couple_d<1)g_couple_d=1; if(g_couple_d>2)g_couple_d=2;
+        couple_load(&m, getenv("COUPLE"));
+    }
     /* CACHE CHE IMPARA: l'uso degli expert si accumula in <SNAP>/.coli_usage tra le sessioni;
      * all'avvio i piu' usati vengono auto-pinnati in RAM (meta' del budget expert: il pin
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
