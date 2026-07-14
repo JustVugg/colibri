@@ -71,6 +71,11 @@ EXE     =
 endif
 endif
 
+# --- install ---
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+INSTALL ?= install
+
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
 #
@@ -218,8 +223,16 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
+install: glm$(EXE)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(BINDIR)/glm$(EXE)
+	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/glm$(EXE) $(DESTDIR)$(BINDIR)/coli
+
 clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall
