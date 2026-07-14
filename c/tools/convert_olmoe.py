@@ -55,9 +55,13 @@ def main():
 
     if args.repo:
         from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
         print(f"Downloading {args.repo}...")
-        src_dir = snapshot_download(args.repo, local_files_only=True, max_workers=4)
-        if not any(Path(src_dir).glob("*.safetensors")):
+        try:
+            src_dir = snapshot_download(args.repo, local_files_only=True, max_workers=4)
+        except LocalEntryNotFoundError:
+            src_dir = None
+        if src_dir is None or not any(Path(src_dir).glob("*.safetensors")):
             print("Downloading safetensors...")
             src_dir = snapshot_download(args.repo, max_workers=4)
     else:

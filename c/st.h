@@ -81,8 +81,8 @@ static int st_open_fd(shards *S, const char *path) {
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
-#elif defined(__APPLE__)
-    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE ~ O_DIRECT */
+#elif defined(__APPLE__) || defined(_WIN32)
+    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
 #else
     S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
 #endif

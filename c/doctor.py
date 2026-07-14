@@ -2,6 +2,7 @@
 """Read-only installation diagnostics for colibri."""
 
 import os
+import sys
 import json
 import subprocess
 from pathlib import Path
@@ -47,7 +48,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
     config = model / "config.json"
     try:
-        valid_config = isinstance(json.loads(config.read_text()), dict)
+        valid_config = isinstance(json.loads(config.read_text(encoding="utf-8")), dict)
     except (OSError, ValueError):
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
@@ -63,7 +64,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("storage.persistence", "skip", "persistence requires a model directory"))
 
     engine = Path(engine_path)
-    if engine.is_file() and os.access(engine, os.X_OK):
+    # On Windows, os.access(X_OK) always returns True for any existing file
+    # (NTFS has no execute bit; executability is governed by file extension).
+    # So a chmod(0o644) "non-executable" scenario can't be detected via X_OK
+    # on Windows. Use a platform-aware check: on POSIX, honor the mode bits;
+    # on Windows, any existing file is treated as executable. (#141)
+    if sys.platform == "win32":
+        engine_ok = engine.is_file()
+    else:
+        engine_ok = engine.is_file() and os.access(engine, os.X_OK)
+    if engine_ok:
         checks.append(_check("engine.binary", "pass", "engine executable is ready", path=str(engine)))
     elif engine.is_file():
         checks.append(_check("engine.binary", "fail", "engine exists but is not executable", path=str(engine)))

@@ -27,6 +27,10 @@ int main(int argc,char**argv){
     int fd=open(argv[1],O_RDONLY|(direct?O_DIRECT:0));
     if(fd<0 && direct){ fprintf(stderr,"O_DIRECT is unavailable (%s); using buffered I/O\n",strerror(errno));
         direct=0; fd=open(argv[1],O_RDONLY); }
+#elif defined(_WIN32)
+    int fd = direct ? compat_open_direct(argv[1]) : open(argv[1],COMPAT_O_RDONLY);
+    if(fd<0 && direct){ fprintf(stderr,"NO_BUFFERING is unavailable; using buffered I/O\n");
+        direct=0; fd=open(argv[1],COMPAT_O_RDONLY); }
 #else
     int fd=open(argv[1],O_RDONLY);                 /* macOS: F_NOCACHE ~ O_DIRECT */
 #ifdef __APPLE__
@@ -36,7 +40,11 @@ int main(int argc,char**argv){
 #endif
 #endif
     if(fd<0){perror("open");return 1;}
+#ifdef _WIN32
+    off_t sz=compat_fsize(fd);     /* CRT lseek(SEEK_END) ritorna -1 sui fd NO_BUFFERING */
+#else
     off_t sz=lseek(fd,0,SEEK_END);
+#endif
     if(sz<blk*2){fprintf(stderr,"file is too small\n");return 1;}
     /* offset random pre-generati (stessi per ogni configurazione: srand fisso).
      * 30 bit di rand combinati: su Windows RAND_MAX=32767 e un singolo rand()*4096

@@ -170,15 +170,38 @@ def apply_scheme(model, scheme):
 # Scoring — mirrors tools/eval_glm.py exactly:
 #   acc      = argmax over options of sum(logprob of continuation tokens)
 #   acc_norm = argmax over options of sum(logprob) / len(continuation string in CHARACTERS)
+#
+# THE PREFIX IS NOT OPTIONAL (issue #108, credit @bokiko). GLM-5.2 sees "[gMASK]<sop>" at the
+# start of every training sequence. Score it without that prefix and the model runs
+# out-of-distribution: measured here, perplexity on plain English prose goes 9.4 -> 29.2, and
+# on markdown/code 24.5 -> 131.0. It does not merely depress scores, it distorts SENSITIVITY:
+# an int4-vs-exact kernel A/B measured without the prefix reported a penalty that halved and
+# flipped sign on one corpus once the prefix was restored (#153). Any quantization delta
+# measured OOD is therefore suspect.
+#
+# The GLM tokenizer does NOT add it for you — add_special_tokens=True is a no-op there — so it
+# has to be prepended explicitly. Auto-detected from the vocab so it cannot be lost by
+# omission; models with no such prefix (e.g. OLMoE, which has no BOS at all) are unaffected.
 # --------------------------------------------------------------------------------------
-def load_docs(task, data_dir, limit, seed):
+def detect_prefix(tk):
+    """'[gMASK]<sop>' for GLM snapshots, '' otherwise. --prefix overrides."""
+    vocab = tk.get_vocab()
+    if "[gMASK]" in vocab and "<sop>" in vocab:
+        return "[gMASK]<sop>"
+    return ""
+
+
+def load_docs(task, data_dir, limit, seed, prefix=""):
     path = f"{data_dir}/{task}.jsonl"
     try:
         docs = [json.loads(l) for l in open(path) if l.strip()]
     except FileNotFoundError:
         raise SystemExit(f"missing {path} — run: python tools/fetch_benchmarks.py --out {data_dir} --tasks {task}")
     random.Random(seed).shuffle(docs)      # same seed/shuffle convention as eval_glm.py
-    return docs[:limit] if limit else docs
+    docs = docs[:limit] if limit else docs
+    if prefix:                             # condition every context in-distribution
+        docs = [dict(d, ctx=prefix + d["ctx"]) for d in docs]
+    return docs
 
 
 @torch.no_grad()
@@ -221,6 +244,9 @@ def main():
     ap.add_argument("--min-coverage", type=float, default=95.0,
                     help="fail if a scheme quantized less than this %% of params (catches the "
                          "3D-fused-expert trap, where a ndim==2 filter skips every expert)")
+    ap.add_argument("--prefix", default=None,
+                    help="context prefix (default: auto — '[gMASK]<sop>' for GLM, '' otherwise). "
+                         "Scoring GLM without it runs the model out-of-distribution: see #108.")
     a = ap.parse_args()
 
     tasks = a.tasks.split(",")
@@ -229,7 +255,11 @@ def main():
         parse_scheme(s)                              # fail fast on a typo
 
     tk = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
-    docs = {t: load_docs(t, a.data, a.limit, a.seed) for t in tasks}
+    prefix = detect_prefix(tk) if a.prefix is None else a.prefix
+    print(f"[prefix] {prefix!r}" + ("  (auto-detected: GLM snapshot)" if prefix and a.prefix is None
+                                    else "  (no prefix for this model)" if not prefix else "  (--prefix)"),
+          flush=True)
+    docs = {t: load_docs(t, a.data, a.limit, a.seed, prefix) for t in tasks}
 
     means, rows = {}, {}
     for scheme in schemes:
