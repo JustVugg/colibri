@@ -82,12 +82,35 @@ static int coli_cuda_load(void){
     if(g_cuda.loaded) return g_cuda.available;
     g_cuda.loaded = 1;
 
-    /* Search the model directory first (so a DLL shipped next to the model
-     * wins), then the engine directory, then the default DLL search path. */
-    g_cuda.dll = LoadLibraryA("coli_cuda.dll");
+    /* Resolve coli_cuda.dll to the engine's own directory, NOT the current
+     * working directory. LoadLibraryA("coli_cuda.dll") uses the default DLL
+     * search order, which includes writable locations on PATH — an attacker
+     * who can drop a same-named DLL earlier in the search order gets code
+     * execution inside glm.exe. Building the absolute path from
+     * GetModuleFileNameA sidesteps the search entirely. */
+    char dll_path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, dll_path, MAX_PATH);
+    if(n == 0 || n >= MAX_PATH){
+        fprintf(stderr, "[CUDA] cannot resolve engine directory; GPU tier disabled.\n");
+        return 0;
+    }
+    char *slash = strrchr(dll_path, '\\');
+    if(!slash) slash = strrchr(dll_path, '/');
+    if(!slash){
+        fprintf(stderr, "[CUDA] unexpected engine path %s; GPU tier disabled.\n", dll_path);
+        return 0;
+    }
+    static const char dll_name[] = "coli_cuda.dll";
+    size_t dir_len = (size_t)(slash - dll_path) + 1;
+    if(dir_len + sizeof(dll_name) > sizeof(dll_path)){
+        fprintf(stderr, "[CUDA] engine path too long; GPU tier disabled.\n");
+        return 0;
+    }
+    memcpy(dll_path + dir_len, dll_name, sizeof(dll_name));
+    g_cuda.dll = LoadLibraryExA(dll_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if(!g_cuda.dll){
-        fprintf(stderr, "[CUDA] coli_cuda.dll not found; GPU tier disabled "
-                        "(CPU path remains active).\n");
+        fprintf(stderr, "[CUDA] %s not found; GPU tier disabled "
+                        "(CPU path remains active).\n", dll_path);
         return 0;
     }
 

@@ -6,6 +6,11 @@ set -e
 cd "$(dirname "$0")"
 echo "🐦 colibrì — setup"
 
+# mktemp: use a random, mode-0600 path so the OpenMP probe below cannot be
+# hijacked via a pre-planted symlink at a predictable /tmp location.
+OMP_PROBE=$(mktemp)
+trap 'rm -f "$OMP_PROBE"' EXIT
+
 UNAME_S=$(uname -s)
 
 # 1) dipendenze
@@ -21,12 +26,12 @@ Darwin)
 MINGW*|MSYS*)
     command -v gcc  >/dev/null || { echo "gcc is missing (MinGW-w64). Install: pacman -S mingw-w64-x86_64-gcc make"; exit 1; }
     echo "  gcc: $(gcc -dumpversion) · MinGW-w64"
-    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "libgomp is missing (pacman -S mingw-w64-x86_64-gcc)"; exit 1; }
+    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o "$OMP_PROBE" 2>/dev/null && echo ok || { echo "libgomp is missing (pacman -S mingw-w64-x86_64-gcc)"; exit 1; }
     ;;
 *)
     command -v gcc  >/dev/null || { echo "gcc is missing (for example: sudo apt install build-essential)"; exit 1; }
     echo "  gcc: $(gcc -dumpversion) · $(nproc) core"
-    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "libgomp is missing"; exit 1; }
+    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o "$OMP_PROBE" 2>/dev/null && echo ok || { echo "libgomp is missing"; exit 1; }
     ;;
 esac
 
