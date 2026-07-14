@@ -462,7 +462,6 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #else
 #define IDOT_KERNEL "scalar"
 #endif
-static int g_lmhead_exact=0;   /* PROBE: LMHEAD_EXACT=1 -> pin lm_head to the exact int8 kernel */
 static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
@@ -2515,7 +2514,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
-    float *logit=falloc(c->vocab); matmul_qt_ex(logit,last,&m->lm_head,1,!g_lmhead_exact);
+    float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
     m->t_head += now_s()-th0;
     free(x); free(last); return logit;
 }
@@ -2530,7 +2529,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
-        matmul_qt_ex(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1, !g_lmhead_exact); }
+        matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
     free(x); free(row); return lo;
 }
 
@@ -2564,7 +2563,7 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
     double th0=now_s();
     float *logit=falloc((int64_t)S*c->vocab);
-    matmul_qt_ex(logit,norm,&m->lm_head,S,!g_lmhead_exact);
+    matmul_qt(logit,norm,&m->lm_head,S);
     m->t_head+=now_s()-th0;
     free(x); free(norm);
     return logit;
@@ -2613,12 +2612,12 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
         int dbg = getenv("MTP_DEBUG") && atoi(getenv("MTP_DEBUG"))>=2;
         int t_pre=-1;
-        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt_ex(logit, row, &m->lm_head, 1, !g_lmhead_exact);
+        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt(logit, row, &m->lm_head, 1);
                  t_pre=mtp_argmax(logit, c->vocab); }
         layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
         double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
-        matmul_qt_ex(logit, row, &m->lm_head, 1, !g_lmhead_exact);
+        matmul_qt(logit, row, &m->lm_head, 1);
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
@@ -2880,7 +2879,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     float *row=falloc(D);
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
-        matmul_qt_ex(lo, row, &m->lm_head, 1, !g_lmhead_exact);   /* exact-mode knob (#152) */
+        matmul_qt(lo, row, &m->lm_head, 1);
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
     }
@@ -2917,7 +2916,7 @@ static void run_score(Model *m, const char *path){
         double lp=0; int greedy=1;
         for(int pos=ctxlen-1; pos<T-1; pos++){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
-            matmul_qt_ex(lo,row,&m->lm_head,1,!g_lmhead_exact);
+            matmul_qt(lo,row,&m->lm_head,1);
             int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
@@ -4067,7 +4066,6 @@ int main(int argc, char **argv){
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
-    g_lmhead_exact = getenv("LMHEAD_EXACT")?atoi(getenv("LMHEAD_EXACT")):0;
     /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
      * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.
      * EN: matmul_qt documents the int4 IDOT threshold as "configurable via I4S", but the
