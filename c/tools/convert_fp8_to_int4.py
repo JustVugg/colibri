@@ -208,11 +208,21 @@ def main():
 
     # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
     # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
-    import fcntl
+    # fcntl is Unix-only; on Windows use msvcrt or skip locking.
     lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print("ERROR: another converter is already using this output directory. Exiting."); return
+    try:
+        import fcntl
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("ERROR: another converter is already using this output directory. Exiting."); return
+    except ImportError:
+        try:
+            import msvcrt
+            try: msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("ERROR: another converter is already using this output directory. Exiting."); return
+        except ImportError:
+            pass  # no locking available — single-user converter, acceptable
 
     # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
     # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
@@ -372,7 +382,8 @@ def main():
 
     from safetensors.numpy import save_file
     import time as _t
-    for att in range(999):
+    info = None
+    for att in range(10):
         try:
             info = HfApi().repo_info(a.repo, files_metadata=True)
             # dimensioni note dallo store: abilitano il download multi-stream a segmenti.
@@ -382,7 +393,13 @@ def main():
         except KeyboardInterrupt: raise
         except Exception as ex:
             w = min(60, 5*(att+1)); print(f"repo_info failed ({type(ex).__name__}); retrying in {w}s", flush=True); _t.sleep(w)
+    if info is None:
+        print("ERROR: could not reach the repository after 10 retries. Check your network and repo name.", flush=True)
+        return
     shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
+    if not shards:
+        print("ERROR: no .safetensors shards found in this repository.", flush=True)
+        return
     for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
         except Exception: pass
