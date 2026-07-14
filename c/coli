@@ -29,8 +29,31 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.path.join(HERE, "tools")
-GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
+
+# Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
+# support modules (resource_plan.py, doctor.py, openai_server.py) and
+# tools/ all live next to this script — unchanged from before.
+#
+# Installed layout ("make install"): this script is $(PREFIX)/bin/coli,
+# while the engine binaries and support files live in
+# $(PREFIX)/libexec/colibri, since they aren't meant to be run directly
+# by users. COLI_ENGINE overrides the engine path explicitly if neither
+# guess is right (e.g. a custom packaging layout).
+_EXE = ".exe" if sys.platform == "win32" else ""
+_LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_here_glm = os.path.join(HERE, "glm" + _EXE)
+
+if os.environ.get("COLI_ENGINE"):
+    GLM = os.environ["COLI_ENGINE"]
+    TOOLS = os.path.join(os.path.dirname(GLM), "tools")
+elif os.path.exists(_here_glm):
+    GLM = _here_glm
+    TOOLS = os.path.join(HERE, "tools")
+else:
+    GLM = os.path.join(_LIBEXEC, "glm" + _EXE)
+    TOOLS = os.path.join(_LIBEXEC, "tools")
+    sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
+
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
@@ -302,6 +325,9 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
+    if not os.path.exists(os.path.join(HERE, "Makefile")):
+        sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
+                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c glm.")
     sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
 
 def cmd_info(a):
