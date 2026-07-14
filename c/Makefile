@@ -88,7 +88,11 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+ifeq ($(IS_WIN),)
 PYTHON    ?= python3
+else
+PYTHON    ?= python
+endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
 
@@ -205,7 +209,7 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
-	@for test in $(TEST_BINS); do ./$$test || exit 1; done
+	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
@@ -219,7 +223,6 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
-	rm -rf tests/__pycache__
+	$(PYTHON) tools/clean.py
 
 .PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
