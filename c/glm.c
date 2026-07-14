@@ -3376,9 +3376,11 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
  * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
 static void stats_dump_q(Model *m, const char *path, int quiet){
     if(!path || !*path){ if(!quiet) fprintf(stderr,"stats_dump: empty path\n"); return; }
-    /* Resolve the directory portion via realpath so the actual file path we
-     * hand to open() is rooted in a canonical directory. The file itself may
-     * not exist yet (first invocation), so we can't realpath the whole path. */
+    /* Split the caller's path into dir + basename, canonicalise the dir via
+     * realpath, and rebuild the basename character-by-character through an
+     * ASCII allowlist. Every character reaching open() is either produced by
+     * realpath (dir) or has been individually admitted from a fixed set of
+     * safe filename characters (base) — no tainted character survives. */
     char work[PATH_MAX];
     if(snprintf(work,sizeof(work),"%s",path) >= (int)sizeof(work)){
         if(!quiet) fprintf(stderr,"stats_dump: path too long\n"); return;
@@ -3388,16 +3390,26 @@ static void stats_dump_q(Model *m, const char *path, int quiet){
     char *bsep = strrchr(work,'\\');
     if(bsep && (!sep || bsep > sep)) sep = bsep;
 #endif
-    char dir_resolved[PATH_MAX], resolved[PATH_MAX];
-    const char *base;
-    if(sep){ *sep = 0; base = sep + 1;
+    char dir_resolved[PATH_MAX];
+    const char *base_src;
+    if(sep){ *sep = 0; base_src = sep + 1;
         if(!realpath(work, dir_resolved)){ if(!quiet) perror(work); return; } }
-    else   { base = work;
+    else   { base_src = work;
         if(!realpath(".", dir_resolved)){ if(!quiet) perror("."); return; } }
-    if(!*base || strchr(base,'/') || strchr(base,'\n') || strchr(base,'\r')){
-        if(!quiet) fprintf(stderr,"stats_dump: invalid basename\n"); return;
+    char safe_base[256];
+    size_t bl = 0;
+    for(const char *p = base_src; *p; p++){
+        unsigned char c = (unsigned char)*p;
+        int ok = (c>='a'&&c<='z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') ||
+                 c=='.' || c=='-' || c=='_';
+        if(!ok){ if(!quiet) fprintf(stderr,"stats_dump: rejected basename char %#x\n",c); return; }
+        if(bl+1 >= sizeof(safe_base)){ if(!quiet) fprintf(stderr,"stats_dump: basename too long\n"); return; }
+        safe_base[bl++] = (char)c;
     }
-    if(snprintf(resolved,sizeof(resolved),"%s/%s",dir_resolved,base) >= (int)sizeof(resolved)){
+    safe_base[bl] = 0;
+    if(bl == 0){ if(!quiet) fprintf(stderr,"stats_dump: empty basename\n"); return; }
+    char resolved[PATH_MAX];
+    if(snprintf(resolved,sizeof(resolved),"%s/%s",dir_resolved,safe_base) >= (int)sizeof(resolved)){
         if(!quiet) fprintf(stderr,"stats_dump: resolved path too long\n"); return;
     }
     char tmp[PATH_MAX];
