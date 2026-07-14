@@ -21,11 +21,12 @@ static void call_path(int fmt, int use_i8mm, float *y, const int8_t *x, const fl
 
 static int bench_shape(int fmt, int S, int I, int O, const char *label){
     enum { REPS=21 };
+    double tn[REPS],tm[REPS]; volatile float sink=0; int ok=0;
     int rb=(I+1)/2; size_t wn=fmt==1?(size_t)O*I:(size_t)O*rb;
     uint8_t *w=malloc(wn); int8_t *x=malloc((size_t)S*I);
     float *yn=malloc((size_t)S*O*sizeof(float)),*ym=malloc((size_t)S*O*sizeof(float));
     float *sc=malloc((size_t)O*sizeof(float)),*sx=malloc((size_t)S*sizeof(float));
-    if(!w||!x||!yn||!ym||!sc||!sx){ fprintf(stderr,"bench_i8mm: OOM\n"); return 0; }
+    if(!w||!x||!yn||!ym||!sc||!sx){ fprintf(stderr,"bench_i8mm: OOM\n"); goto cleanup; }
     for(size_t i=0;i<wn;i++) w[i]=(uint8_t)xr();
     for(int i=0;i<S*I;i++) x[i]=(int8_t)((int)(xr()%255)-127);
     for(int i=0;i<O;i++) sc[i]=0.001f+(float)(i%17)*0.0001f;
@@ -34,9 +35,8 @@ static int bench_shape(int fmt, int S, int I, int O, const char *label){
     call_path(fmt,0,yn,x,sx,w,sc,S,I,O);
     call_path(fmt,1,ym,x,sx,w,sc,S,I,O);
     if(memcmp(yn,ym,(size_t)S*O*sizeof(float))!=0){
-        fprintf(stderr,"bench_i8mm: numeric mismatch: %s\n",label); return 0;
+        fprintf(stderr,"bench_i8mm: numeric mismatch: %s\n",label); goto cleanup;
     }
-    double tn[REPS],tm[REPS]; volatile float sink=0;
     for(int r=0;r<REPS;r++){
         int first=r&1;
         double t=now_s(); call_path(fmt,first,first?ym:yn,x,sx,w,sc,S,I,O); double dt0=now_s()-t;
@@ -49,7 +49,9 @@ static int bench_shape(int fmt, int S, int I, int O, const char *label){
     printf("%-4s %-18s S=%-2d %7.3f %8.3f %7.3fx  %s\n",
            fmt==1?"i8":"i4",label,S,tn[REPS/2]*1e3,tm[REPS/2]*1e3,
            tn[REPS/2]/tm[REPS/2],selected);
-    (void)sink; free(w);free(x);free(yn);free(ym);free(sc);free(sx); return 1;
+    (void)sink; ok=1;
+cleanup:
+    free(w);free(x);free(yn);free(ym);free(sc);free(sx); return ok;
 }
 
 int main(void){
