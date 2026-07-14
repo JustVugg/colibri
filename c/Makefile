@@ -105,17 +105,37 @@ INSTALL    ?= install
 #                   clean. See backend_loader.c and README "cuda-dll" below.
 CUDA      ?= 0
 CUDA_DLL  ?= 0
+ifneq ($(IS_WIN),)
+# the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
+# GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
+# NVCC defaults to plain `nvcc` from PATH: CUDA_PATH contains spaces, which the
+# unquoted recipe checks cannot survive — and the cuda-dll recipe already
+# requires an MSVC environment (vcvars64) on PATH, so requiring the CUDA bin
+# directory too is symmetric. The installer adds it by default.
+CUDA_HOME ?= $(subst \,/,$(CUDA_PATH))
+NVCC      ?= nvcc
+else
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
+endif
 CUDA_ARCH ?= native
+ifneq ($(IS_WIN),)
+# nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
+# -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
+# '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
+# the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
+# slash-form into a filesystem path).
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
+else
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+endif
 ifeq ($(IS_WIN),)
 PYTHON    ?= python3
 else
 PYTHON    ?= python
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -169,7 +189,7 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
-# __declspec(dllexport) so the 11 API symbols are exported.
+# __declspec(dllexport) so the 15 API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
@@ -218,6 +238,9 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h

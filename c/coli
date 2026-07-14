@@ -653,7 +653,13 @@ def main():
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
-    pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
+    pb.add_argument("--limit",type=int,default=40)
+    if sys.platform == "win32":
+        _cache_root = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
+    else:
+        _cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    _bench_cache = os.path.join(_cache_root, "colibri", "bench")
+    pb.add_argument("--data",default=_bench_cache)
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")

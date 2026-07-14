@@ -146,3 +146,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .brain-legend { gap: 8px; font-size: 10px; }
   .brain-tip { max-width: 220px; font-size: 10px; }
 }
+
+/* atlas hover extras */
+.brain-tip-spec { color: var(--primary); font-weight: 700; }
+.brain-tip-spec small, .brain-tip-aff { color: #8b9aa3; font-weight: 400; }
+.brain-tip-aff { font-size: 10px; }

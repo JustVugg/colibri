@@ -60,3 +60,6 @@ c/backend_metal_test
 c/tests/test_tier
 c/mio_env/
 c/bench/
+c/tests/test_decode_batch
+c/tests/test_i4_acc512
+c/tests/test_idot

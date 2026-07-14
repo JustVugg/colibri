@@ -17,6 +17,32 @@ $ ./coli chat
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
 
+
+## See it running
+
+<p align="center">
+  <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
+</p>
+<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model answering at 4+ tok/s end-to-end on 6× RTX 5090 —
+with live token metrics, the hardware panel, and the VRAM/RAM/disk expert tiers.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
+</p>
+<p align="center"><em>The <strong>Brain</strong> page: all 19,456 experts as a living cortex — colour is the storage tier,
+brightness is routing heat, and every expert routed in a turn flashes white. Hovering shows the expert's
+<a href="https://github.com/JustVugg/colibri/issues/175">measured topic affinity</a>.</em></p>
+
+## Contents
+
+- [The idea](#the-idea)
+- [See it running](#see-it-running)
+- [What's implemented](#whats-implemented)
+- [Honest numbers](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx)
+- [Download the model](#download-the-model)
+- [Web dashboard](#web-dashboard)
+- [Got a better machine?](#got-a-better-machine-try-it--heres-what-to-expect)
+
 ## The idea
 
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and only ~11 GB of those change from token to token (the routed experts). So:
@@ -354,6 +380,10 @@ PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
+CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -375,6 +405,25 @@ replay from 1.87 to 2.16 tok/s (+15.7%), reduced expert disk wait from 5.144s to
 3.948s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
 down automatically (54 to 40 in that run) so the larger pinned tier does not exceed
 the process budget. Start lower on hosts with less available RAM.
+
+`CUDA_EXPERT_GB=auto` fills each selected device only up to its measured free
+memory minus projected dense tensors and 2 GB of runtime headroom. `PIN_GB=all`
+then loads every remaining routed expert into RAM, eliminating decode-time disk
+misses when the host budget permits it. The regular `RAM_GB` guard still clamps
+the per-layer working cache and rejects unsafe projections; this mode is intended
+for dedicated high-memory inference hosts, not desktops running other workloads.
+On a dedicated 251 GiB host with six RTX 5090s, this mode selected a 176.7 GB
+VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). The
+mode also adapts the VRAM tier every 16 emitted tokens by swapping hot RAM
+experts into existing GPU slots. A real 64-token greedy GLM-5.2 generation
+measured **6.00 tok/s decode**, up from
+2.20 tok/s end-to-end with the earlier 150 GB tier; expert hit rate was 100%
+and disk wait was zero. Prompt prefill is reported separately. This is a
+host-specific capacity result, not a portable default.
+
+Text-mode timing reports prefill separately from decode. The decode rate starts
+after the prompt KV is built, so it is comparable to `REPLAY` throughput without
+hiding time-to-first-token.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
 
@@ -477,6 +526,23 @@ refresh the same VRAM tier budget. A 25% hysteresis and a four-swap limit preven
 thrashing. Persistent `.coli_usage` remains the long-term signal and is not decayed.
 
 **Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
+
+## Web dashboard
+
+One command serves the OpenAI-compatible API **and** the web console on the same port, then opens your browser when the engine is ready:
+
+```bash
+cd web && npm install && npm run build   # once
+./coli web --model <model-dir>
+```
+
+What you get:
+
+- **Chat** with live metrics: a flashing token counter while generating, then tok/s, time-to-first-token, prompt→completion counts and queue wait;
+- **Runtime panel**: your hardware (CPU, GPUs + VRAM, RAM, cores), the scheduler, and the live expert-tier bar — how many of the 19,456 experts sit in VRAM / RAM / disk right now;
+- **Brain**: the whole model as a 76×256 cortex, one cell per expert. Colour = tier, brightness = routing heat, and the experts routed in each turn flash white and decay — you watch the model think. Hover any cell for its tier, heat and [measured topic affinity](https://github.com/JustVugg/colibri/issues/175) (specialists for code, Chinese, math, law… live in layers 11–22).
+
+The dashboard talks to the engine over two tiny protocol lines (`TIERS`, `EMAP`/`HITS`) and plain JSON endpoints — nothing heavier than the engine itself.
 
 ## Got a better machine? Try it — here's what to expect
 
