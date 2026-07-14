@@ -1,0 +1,36 @@
+name: Python security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bandit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: pip install --disable-pip-version-check bandit==1.7.10
+
+      # B101 (assert) is expected in tests; B404/B603 (subprocess use) is safe here —
+      # every subprocess call in this repo passes an argv list, not a shell string.
+      - name: Run Bandit
+        run: |
+          bandit \
+            --recursive \
+            --severity-level low \
+            --confidence-level low \
+            --skip B101,B404,B603 \
+            c/
