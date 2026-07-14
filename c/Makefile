@@ -1,20 +1,36 @@
-# --- OS detection ---
-# On Windows the OS env var is 'Windows_NT' in EVERY shell (cmd, PowerShell,
-# MSYS2, Git-Bash), and GNU Make imports it. Detect Windows from it FIRST so
-# `make` works from a native PowerShell/CMD shell — there `uname` is not on
-# PATH, so the old uname-only check returned empty and fell through to the
-# Linux branch (no .exe, no -static). We only call `uname` when NOT on Windows.
-ifeq ($(OS),Windows_NT)
-IS_WIN   := 1
-UNAME_S  :=
-UNAME_M  :=
-else
-IS_WIN   :=
-UNAME_S  := $(shell uname -s)
-UNAME_M  := $(shell uname -m)
+# --- Target detection ---
+# Ask the compiler what it actually targets (rofl0r's note on #129): a gcc/clang
+# toolchain reports its target triple via `-dumpmachine`, e.g.
+#   x86_64-w64-mingw32   x86_64-pc-cygwin   x86_64-unknown-linux-gnu
+#   arm64-apple-darwin   powerpc64le-unknown-linux-gnu
+# The triple follows the toolchain, not the host shell that `uname` reports, so
+# it is correct under a native-Windows shell (no `uname` on PATH) AND when
+# cross-compiling (e.g. make CC=x86_64-w64-mingw32-gcc on Linux). CC is chosen
+# per-target below, so probe with the user's CC if they set one, else gcc
+# (present on Linux and mingw, and a clang shim on macOS).
+DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
+TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
+
+MINGW  := $(findstring mingw,$(TRIPLET))
+CYGWIN := $(findstring cygwin,$(TRIPLET))
+DARWIN := $(findstring darwin,$(TRIPLET))
+PPC64  := $(findstring powerpc64,$(TRIPLET))
+IS_WIN := $(MINGW)$(CYGWIN)
+
+# Fallbacks for the rare toolchain that does not answer -dumpmachine: keep the
+# #129 signal (OS=Windows_NT, set in every Windows shell) for Windows, then
+# `uname` for everything else, so no host regresses.
+ifeq ($(TRIPLET),)
+IS_WIN := $(if $(filter Windows_NT,$(OS)),1,)
+ifeq ($(IS_WIN),)
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+DARWIN  := $(findstring Darwin,$(UNAME_S))
+PPC64   := $(findstring ppc64,$(UNAME_M))
+endif
 endif
 
-ifeq ($(UNAME_S),Darwin)
+ifneq (,$(DARWIN))
 # --- macOS / Apple Silicon ---
 # Apple clang non include il runtime OpenMP: se c'e' libomp di Homebrew lo usa
 # (brew install libomp), altrimenti compila single-thread (i pragma omp sono ignorati).
@@ -47,8 +63,7 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 LDFLAGS = -lm -fopenmp -static
 EXE     = .exe
 else
-UNAME_M := $(shell uname -m)
-ifneq (,$(filter ppc64le ppc64,$(UNAME_M)))
+ifneq (,$(PPC64))
 # --- Linux PowerPC (POWER8/POWER9/POWER10) ---
 # PowerPC GCC uses -mcpu, not -march. ARCH=native works on gcc >= 4.7.
 # The AVX2/NEON kernels fall back to the portable scalar C path
@@ -102,7 +117,7 @@ endif
 
 # Linux CUDA direct-link path (unchanged).
 ifeq ($(CUDA),1)
-ifeq ($(UNAME_S),Darwin)
+ifneq (,$(DARWIN))
 $(error CUDA=1 is supported only on Linux)
 endif
 ifneq ($(IS_WIN),)
@@ -120,7 +135,7 @@ METAL     ?= 0
 METAL_OBJ  =
 METALXX    = clang++ -x objective-c++ -fobjc-arc -O3
 ifeq ($(METAL),1)
-ifneq ($(UNAME_S),Darwin)
+ifeq (,$(DARWIN))
 $(error METAL=1 is supported only on macOS)
 endif
 CFLAGS   += -DCOLI_METAL
