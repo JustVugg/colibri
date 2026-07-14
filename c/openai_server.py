@@ -979,6 +979,12 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
+        if os.environ.get("COLI_ALLOW_UNAUTH") != "1":
+            raise ValueError(
+                f"refusing to bind {host!r} without an API key: pass --api-key / "
+                "COLI_API_KEY, or set COLI_ALLOW_UNAUTH=1 to opt into an "
+                "unauthenticated public server."
+            )
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in

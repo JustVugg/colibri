@@ -220,6 +220,17 @@ def main():
     # EN: to compute segment boundaries and to know when a file is complete.
     SIZES = {}
 
+    def _safe_repo_path(fn):
+        """Reject filenames from the repo listing that would escape `dest` or
+        alter the target URL. HF filenames are normally plain shard names, but
+        we cannot rely on that when the --repo argument or a compromised mirror
+        could feed us anything."""
+        if not fn or fn.startswith(("/", "\\")) or ":" in fn:
+            raise ValueError(f"unsafe repo filename: {fn!r}")
+        parts = fn.replace("\\", "/").split("/")
+        if any(p in ("", "..", ".") for p in parts):
+            raise ValueError(f"unsafe repo filename: {fn!r}")
+
     def download_retry(repo, fn, dest, tries=999):
         """Downloader multi-stream con resume via Range. Apre N segmenti concorrenti
         (default 2, COLI_DL_STREAMS per cambiarli) e salva lo stato per-segmento in un
@@ -234,6 +245,7 @@ def main():
         EN: home line. Small files, COLI_DL_STREAMS=1 or a legacy .part -> single-stream
         EN: path (_download_single)."""
         import time as _t, threading, urllib.request, urllib.error
+        _safe_repo_path(fn)
         url = f"https://huggingface.co/{repo}/resolve/main/{fn}"
         out = os.path.join(dest, fn); part = out + ".part"; side = part + ".seg"
         os.makedirs(dest, exist_ok=True)

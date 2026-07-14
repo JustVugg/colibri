@@ -99,10 +99,22 @@ static void tok_load(Tok *T, const char *path){
     jval *added=json_get(root,"added_tokens");
     if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
-    /* id massimo per dimensionare id2str */
+    /* id massimo per dimensionare id2str. Reject negative or absurdly large ids
+     * from a malformed tokenizer.json before they become OOB writes into id2str. */
+    #define TOK_MAX_ID (1<<24)   /* 16M — no real tokenizer approaches this */
     int maxid=0;
-    for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>maxid)maxid=id; }
-    if(added) for(int i=0;i<added->len;i++){ int id=(int)json_get(added->kids[i],"id")->num; if(id>maxid)maxid=id; }
+    for(int i=0;i<vocab->len;i++){
+        double dn=vocab->kids[i]->num; int id=(int)dn;
+        if(dn<0||dn>=TOK_MAX_ID||id<0){ fprintf(stderr,"tokenizer.json: vocab id out of range: %g\n",dn); exit(1); }
+        if(id>maxid)maxid=id;
+    }
+    if(added) for(int i=0;i<added->len;i++){
+        jval *idv=json_get(added->kids[i],"id");
+        if(!idv||idv->t!=J_NUM){ fprintf(stderr,"tokenizer.json: added_tokens[%d].id is missing or non-numeric\n",i); exit(1); }
+        double dn=idv->num; int id=(int)dn;
+        if(dn<0||dn>=TOK_MAX_ID||id<0){ fprintf(stderr,"tokenizer.json: added-token id out of range: %g\n",dn); exit(1); }
+        if(id>maxid)maxid=id;
+    }
     T->n_ids=maxid+1;
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
@@ -112,6 +124,7 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->vocab, vc);
     for(int i=0;i<vocab->len;i++){
         const char *k=vocab->keys[i]; int id=(int)vocab->kids[i]->num;
+        if(id<0||id>=T->n_ids) continue;
         hm_put(&T->vocab, k, (int)strlen(k), id);
         T->id2str[id]=(char*)k;
     }
@@ -130,12 +143,16 @@ static void tok_load(Tok *T, const char *path){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
             jval *a=added->kids[i];
-            char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            jval *cv=json_get(a,"content");
+            if(!cv||cv->t!=J_STR){ fprintf(stderr,"tokenizer.json: added_tokens[%d].content is missing\n",i); exit(1); }
+            char *content=cv->str; int id=(int)json_get(a,"id")->num;
+            if(id<0||id>=T->n_ids) continue;              /* validated above; defense in depth */
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
             T->id2str[id]=content; T->id_added[id]=1;
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
+    #undef TOK_MAX_ID
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
     (void)arena;
 }

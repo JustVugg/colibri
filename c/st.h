@@ -14,8 +14,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+
+/* Safetensors headers are JSON; 128 MiB is an order of magnitude larger than
+ * any header we have ever seen and still small enough to reject bogus lengths
+ * from a malformed or malicious file before we try to allocate them. */
+#define ST_MAX_HEADER_BYTES (128ULL << 20)
 
 typedef struct {
     char   *name;
@@ -118,12 +124,22 @@ static void st_init(shards *S, const char *snap_dir) {
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) { perror("fstat"); exit(1); }
+        int64_t fsize = (int64_t)sb.st_size;
         uint64_t hlen;
         if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
+        if (hlen == 0 || hlen > ST_MAX_HEADER_BYTES ||
+            (int64_t)hlen > fsize - 8) {
+            fprintf(stderr, "%s: safetensors header length %llu is out of range\n",
+                    files[fi], (unsigned long long)hlen); exit(1);
+        }
         char *hdr = malloc(hlen + 1);
+        if (!hdr) { fprintf(stderr, "%s: header allocation failed\n", files[fi]); exit(1); }
         if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
+        int64_t data_bytes = fsize - data_start;
         char *arena = NULL;
         jval *root = json_parse(hdr, &arena);
         for (int i = 0; i < root->len; i++) {
@@ -133,8 +149,23 @@ static void st_init(shards *S, const char *snap_dir) {
             jval *dt = json_get(m, "dtype");
             jval *off = json_get(m, "data_offsets");
             jval *shp = json_get(m, "shape");
+            if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
+                !shp || shp->t != J_ARR) {
+                fprintf(stderr, "%s: tensor %s has malformed metadata\n", files[fi], name); exit(1);
+            }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
-            int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
+            if (a0 < 0 || b0 < a0 || b0 > data_bytes) {
+                fprintf(stderr, "%s: tensor %s has out-of-range data_offsets [%lld,%lld] (data=%lld)\n",
+                        files[fi], name, (long long)a0, (long long)b0, (long long)data_bytes); exit(1);
+            }
+            int64_t numel = 1;
+            for (int k = 0; k < shp->len; k++) {
+                int64_t dim = (int64_t)shp->kids[k]->num;
+                if (dim < 0 || (dim != 0 && numel > INT64_MAX / dim)) {
+                    fprintf(stderr, "%s: tensor %s has invalid shape\n", files[fi], name); exit(1);
+                }
+                numel *= dim;
+            }
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
@@ -220,6 +251,13 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
+    if (elem_off < 0 || n_elems < 0 ||
+        elem_off > INT64_MAX / esz || n_elems > INT64_MAX / esz ||
+        elem_off + n_elems > t->numel) {
+        fprintf(stderr, "%s: slice [%lld..%lld) out of tensor range %lld\n", name,
+                (long long)elem_off, (long long)(elem_off + n_elems), (long long)t->numel);
+        exit(1);
+    }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
     if (pread(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }

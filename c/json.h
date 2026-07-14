@@ -28,6 +28,11 @@ typedef struct {
     size_t      acap, aoff;
 } jparser;
 
+/* Guard against runaway recursion when parsing an attacker-controlled JSON blob
+ * (safetensors headers and tokenizer.json come from files on disk). 256 is well
+ * beyond any nesting we produce and small enough to fit any reasonable stack. */
+#define J_MAX_DEPTH 256
+
 static char *j_dup(jparser *p, const char *b, int n) {
     /* ogni stringa ha la sua allocazione: un'arena con realloc sposterebbe il
      * buffer invalidando i puntatori gia' emessi (use-after-free). */
@@ -44,7 +49,7 @@ static jval *j_new(jtype t) {
     v->t = t; return v;
 }
 
-static jval *j_parse_val(jparser *p);
+static jval *j_parse_val(jparser *p, int depth);
 
 static char *j_parse_str_raw(jparser *p) {
     /* assume *p->s == '"' */
@@ -62,10 +67,16 @@ static char *j_parse_str_raw(jparser *p) {
                 case 'r': c = '\r'; break; case 'b': c = '\b'; break;
                 case 'f': c = '\f'; break; case '/': c = '/'; break;
                 case '\\': c = '\\'; break; case '"': c = '"'; break;
-                case 'u': {  /* \uXXXX -> codepoint UTF-8 (con coppie surrogate) */
+                case 'u': {  /* \uXXXX -> codepoint UTF-8 (con coppie surrogate).
+                              * Short-circuit on the NUL terminator before we
+                              * index p->s[1..5]; a truncated escape near end of
+                              * file would otherwise walk past the arena. */
+                    if (!(p->s[0] && p->s[1] && p->s[2] && p->s[3])) { c = e; break; }
                     unsigned cp = (unsigned)strtoul((char[]){p->s[0],p->s[1],p->s[2],p->s[3],0}, NULL, 16);
                     p->s += 4;
-                    if (cp >= 0xD800 && cp <= 0xDBFF && p->s[0]=='\\' && p->s[1]=='u') {
+                    if (cp >= 0xD800 && cp <= 0xDBFF
+                            && p->s[0]=='\\' && p->s[1]=='u'
+                            && p->s[2] && p->s[3] && p->s[4] && p->s[5]) {
                         unsigned lo = (unsigned)strtoul((char[]){p->s[2],p->s[3],p->s[4],p->s[5],0}, NULL, 16);
                         if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp-0xD800)<<10) + (lo-0xDC00); p->s += 6; }
                     }
@@ -86,7 +97,11 @@ static char *j_parse_str_raw(jparser *p) {
     return j_dup(p, tmp, n);
 }
 
-static jval *j_parse_val(jparser *p) {
+static jval *j_parse_val(jparser *p, int depth) {
+    if (depth > J_MAX_DEPTH) {
+        fprintf(stderr, "json: nesting exceeds %d levels\n", J_MAX_DEPTH);
+        exit(1);
+    }
     j_ws(p);
     char c = *p->s;
     if (c == '"') { jval *v = j_new(J_STR); v->str = j_parse_str_raw(p); return v; }
@@ -99,7 +114,7 @@ static jval *j_parse_val(jparser *p) {
             j_ws(p);
             char *key = j_parse_str_raw(p);
             j_ws(p); if (*p->s == ':') p->s++;
-            jval *val = j_parse_val(p);
+            jval *val = j_parse_val(p, depth + 1);
             if (v->len == cap) { cap *= 2; v->keys = realloc(v->keys, cap*sizeof(char*)); v->kids = realloc(v->kids, cap*sizeof(jval*)); }
             v->keys[v->len] = key; v->kids[v->len] = val; v->len++;
             j_ws(p);
@@ -115,7 +130,7 @@ static jval *j_parse_val(jparser *p) {
         j_ws(p);
         if (*p->s == ']') { p->s++; return v; }
         for (;;) {
-            jval *val = j_parse_val(p);
+            jval *val = j_parse_val(p, depth + 1);
             if (v->len == cap) { cap *= 2; v->kids = realloc(v->kids, cap*sizeof(jval*)); }
             v->kids[v->len++] = val;
             j_ws(p);
@@ -135,7 +150,7 @@ static jval *j_parse_val(jparser *p) {
 /* API */
 static jval *json_parse(const char *text, char **arena_out) {
     jparser p = { text, NULL, 0, 0 };
-    jval *v = j_parse_val(&p);
+    jval *v = j_parse_val(&p, 0);
     if (arena_out) *arena_out = p.arena; else free(p.arena);
     return v;
 }
