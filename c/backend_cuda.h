@@ -60,7 +60,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTenso
  * memory, activations are converted to FP16 per tile, and Tensor Cores
  * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the
  * activation to INT4. */
-int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up,
+COLI_CUDA_DLLEXPORT int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up,
                                ColiCudaTensor *down, float *y,
                                const float *x, int S);
 
@@ -97,46 +97,46 @@ COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
 /* Replace a resident tensor's contents without reallocating its device slot. */
-int coli_cuda_tensor_update(ColiCudaTensor *tensor,
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                             const void *weights, const float *scales);
 
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
-float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
-void *coli_cuda_pipe_alloc(int device,size_t bytes);
-void coli_cuda_pipe_free(int device,void *p);
-int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
-int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
-int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
+COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
+COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);
-int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,
                         int stride,int offset,int R,int heads,float theta);
-int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,size_t n);
-int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n);
-int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
                             const int *rows_dev,int nrows,int D);
-int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
-int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_dev,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_dev,
                              const float *w_dev,int S,int D,float eps,
                              int xstride,int ystride);
-int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
                              int stride,int offset,int R,int heads,float theta);
-int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                           int spitch,int width,int height);
-int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
-int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_dev,
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_dev,
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
-int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,float *ctx,const float *q,
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,float *ctx,const float *q,
         const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
         float scale);
-int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
                              const float *src,size_t bytes);
-int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
-int coli_cuda_pipe_sync(int device);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 
 #ifdef __cplusplus
 }
