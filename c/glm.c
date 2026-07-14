@@ -3851,10 +3851,30 @@ int main(int argc, char **argv){
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx); }
-    const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
+    /* STATS=<file> -> istogramma uso expert a fine run. Normalise once at the
+     * boundary so every downstream open/fopen sees a canonical path. */
+    static char stats_buf[PATH_MAX];
+    const char *stats_env=getenv("STATS");
+    const char *stats=NULL;
+    if(stats_env){
+        if(!realpath(stats_env, stats_buf)){
+            /* realpath fails for non-existent files; if it's a plain basename
+             * without traversal, allow it — we'll create it below. */
+            if(strstr(stats_env,"..") || strchr(stats_env,'\n') || strchr(stats_env,'\r')){
+                fprintf(stderr,"STATS path rejected: %s\n", stats_env); return 1;
+            }
+            snprintf(stats_buf,sizeof(stats_buf),"%s",stats_env);
+        }
+        stats=stats_buf;
+    }
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
-    if(getenv("SCORE")){ run_score(&m, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SCORE")){
+        static char score_buf[PATH_MAX];
+        if(!realpath(getenv("SCORE"), score_buf)){ perror(getenv("SCORE")); return 1; }
+        run_score(&m, score_buf);
+        if(stats) stats_dump(&m,stats); return 0;
+    }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
     if(getenv("SERVE")){
