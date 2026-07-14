@@ -30,6 +30,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
 import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
+import { Brain } from "./Brain"
 import { persistPublicSettings, stored } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 
@@ -68,6 +69,7 @@ export default function App() {
   const [totalTokens, setTotalTokens] = useState({ prompt: 0, completion: 0 })
   const [connecting, setConnecting] = useState(false)
   const [connected, setConnected] = useState(false)
+  const [view, setView] = useState<"chat" | "brain">("chat")
   const [error, setError] = useState("")
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
@@ -305,6 +307,10 @@ export default function App() {
       <main className="chat-panel">
         <header className="topbar">
           <div><span className="eyebrow">ACTIVE MODEL</span><strong>{model}</strong></div>
+          <div className="view-tabs">
+            <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}><MessageSquareText className="size-3.5" /> Chat</button>
+            <button className={view === "brain" ? "active" : ""} onClick={() => setView("brain")}><BrainCircuit className="size-3.5" /> Brain</button>
+          </div>
           <div className="top-actions">
               {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {tokenCount} tokens</Badge> : null}
               {!loading && tokPerSec != null ? <Badge className="badge-speed"><Gauge className="size-3" /> {tokPerSec.toFixed(1)} tok/s</Badge> : null}
@@ -315,6 +321,8 @@ export default function App() {
               <Button variant="ghost" size="sm" onClick={() => { updateMessages([]); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({prompt:0,completion:0}) }} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> Clear</Button>
             </div>
         </header>
+
+        {view === "brain" ? <Brain baseUrl={baseUrl} apiKey={apiKey} connected={connected} /> : <>
 
         <div className="conversation">
           {!messages.length ? (
@@ -347,6 +355,7 @@ export default function App() {
             <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> Enter to send · Shift+Enter for newline</span>{loading ? <Button variant="destructive" size="icon" aria-label="Stop generation" onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label="Send message" disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
           </div>
         </div>
+        </>}
       </main>
     </div>
   )

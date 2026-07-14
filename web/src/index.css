@@ -122,3 +122,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .hw-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--foreground); }
 .hw-row svg { color: var(--primary); flex-shrink: 0; }
 .hw-row small { color: var(--muted-foreground); margin-left: 4px; }
+
+/* ---- Brain page ---- */
+.view-tabs { display: flex; gap: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3px; }
+.view-tabs button { display: flex; align-items: center; gap: 6px; padding: 5px 14px; font-size: 12px; font-weight: 600; color: var(--muted-foreground); background: none; border: none; border-radius: 7px; cursor: pointer; }
+.view-tabs button.active { background: var(--primary); color: #08110d; }
+.brain-page { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 18px 22px; overflow: auto; }
+.brain-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.brain-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 11px; color: #839197; align-items: center; }
+.brain-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
+.brain-pulse-hint { color: var(--primary); }
+.brain-canvas-wrap { flex: 1; overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 10px; }
+.brain-canvas-wrap canvas { image-rendering: pixelated; max-width: 100%; cursor: crosshair; }
+.brain-tip { position: fixed; z-index: 50; background: #0d1214; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 11px; color: var(--foreground); pointer-events: none; max-width: 280px; box-shadow: 0 8px 24px rgba(0,0,0,.5); display: grid; gap: 4px; }
+.brain-tip-title { display: flex; align-items: center; gap: 5px; font-weight: 700; color: var(--primary); }
+.brain-tip-role { color: #8b9aa3; font-style: italic; line-height: 1.4; border-top: 1px solid var(--border); padding-top: 5px; margin-top: 2px; }

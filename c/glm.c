@@ -176,6 +176,9 @@ typedef struct {
 
 static void usage_save(Model *m);
 static void tiers_emit(Model *m);
+static void ehit_mark(Model *m, int layer, int eid);
+static void emap_emit(Model *m);
+static void hits_emit(Model *m);
 static void hwinfo_emit(Model *m);        /* cache che impara: definita accanto a stats_dump */
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
@@ -1717,6 +1720,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             m->ereq+=keff[s];
             for(int kk=0;kk<keff[s];kk++){
                 m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
+                ehit_mark(m,layer,idxs[(int64_t)s*K+kk]);
                 if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
             }
             for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
@@ -1744,6 +1748,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         keff[s]=Ke; m->ereq+=Ke;
         for(int kk=0;kk<Ke;kk++){
             m->eusage[layer][idx[kk]]++;
+            ehit_mark(m,layer,idx[kk]);
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
             m->elast[layer][idx[kk]]=++m->eaccess_clock;
         }
@@ -3000,6 +3005,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
     hwinfo_emit(m);
     tiers_emit(m);
+    emap_emit(m);
+    hits_emit(m);
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
@@ -3089,6 +3096,7 @@ static void run_serve_mux(Model *m, const char *snap){
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
     hwinfo_emit(m);
     tiers_emit(m);
+    emap_emit(m);
     int eof=0;
     for(;;){
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
@@ -3286,6 +3294,18 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
 /* TIERS: fotografia della piramide expert per la dashboard web —
  * "TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>" sul canale di protocollo.
  * ram = pinnati non-VRAM + LRU corrente; disk = tutto il resto. */
+/* BRAIN MAP (dashboard): per-turn expert hit bitmap + full residency/heat map.
+ * g_ehit[layer][eid]=1 quando l'expert viene instradato in questo turno;
+ * hits_emit lo serializza e lo azzera. emap_emit fotografa tier+heat di TUTTI. */
+static uint8_t **g_ehit;
+static void ehit_mark(Model *m, int layer, int eid){
+    if(!g_ehit){ Cfg *c=&m->c;
+        g_ehit=calloc(c->n_layers+1,sizeof(uint8_t*));
+        for(int i=0;i<=c->n_layers;i++) g_ehit[i]=calloc(c->n_experts,1);
+    }
+    g_ehit[layer][eid]=1;
+}
+
 /* HWINFO: hardware snapshot for the web dashboard — emitted once at READY. */
 static void hwinfo_emit(Model *m){
     Cfg *c=&m->c;
@@ -3345,6 +3365,62 @@ static void tiers_emit(Model *m){
     double eb=(double)expert_bytes_probe(m,m->ebits);
     printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
     fflush(stdout);
+}
+
+/* EMAP: 1 byte/expert (2bit tier: 0=disk 1=RAM 2=VRAM | 6bit heat log2-bucket),
+ * righe = layer sparsi in ordine (+MTP se presente), colonne = n_experts. Hex. */
+static void emap_emit(Model *m){
+    Cfg *c=&m->c;
+    int rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
+    if(has_mtp) rows++;
+    int cols=c->n_experts;
+    char *hex=malloc((size_t)rows*cols*2+1); int w=0;
+    for(int i=0;i<=c->n_layers;i++){
+        int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
+        if(!is_row) continue;
+        for(int e=0;e<cols;e++){
+            int tier=0;
+            ESlot *P=m->pin[i];
+            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+#ifdef COLI_CUDA
+                tier = P[z].g.cuda?2:1;
+#else
+                tier = 1;
+#endif
+                break; }
+            if(!tier && m->ecache && m->ecache[i])
+                for(int z=0;z<m->ecn[i];z++) if(m->ecache[i][z].eid==e){ tier=1; break; }
+            uint32_t u = m->eusage[i]?m->eusage[i][e]:0;
+            int heat=0; while(u){ heat++; u>>=1; } if(heat>63) heat=63;
+            int b=(tier<<6)|heat;
+            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
+        }
+    }
+    hex[w]=0;
+    printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex);
+}
+
+/* HITS: bitmap 1bit/expert (stesso ordine di EMAP), poi azzera per il turno dopo. */
+static void hits_emit(Model *m){
+    Cfg *c=&m->c; if(!g_ehit) return;
+    int rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
+    if(has_mtp) rows++;
+    int cols=c->n_experts, nb=(rows*cols+7)/8;
+    uint8_t *bm=calloc(nb,1); int bit=0;
+    for(int i=0;i<=c->n_layers;i++){
+        int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
+        if(!is_row) continue;
+        for(int e=0;e<cols;e++,bit++)
+            if(g_ehit[i][e]){ bm[bit>>3]|=1<<(bit&7); g_ehit[i][e]=0; }
+    }
+    char *hex=malloc((size_t)nb*2+1); int w=0;
+    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
+    hex[w]=0;
+    printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
 }
 
 /* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN).

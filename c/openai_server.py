@@ -392,7 +392,10 @@ class Engine:
         self.dispatcher_error = None
         self.kv_slots = kv_slots
         self.tiers = None
-        self.hwinfo = None                      # latest "TIERS" snapshot from the engine
+        self.hwinfo = None
+        self.emap = None
+        self.hits = None
+        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -465,6 +468,11 @@ class Engine:
                                    "vram_total_gb": float(fields[5]),
                                    "cpu": parts[0].strip() if len(parts)>0 else "",
                                    "gpu": parts[1].strip() if len(parts)>1 else ""}
+                elif kind == "EMAP" and len(fields) == 4:
+                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
+                elif kind == "HITS" and len(fields) == 4:
+                    self.hits = fields[3]
+                    self.hits_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
@@ -678,6 +686,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 if tiers: payload["tiers"] = tiers
                 hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                 if hwinfo: payload["hwinfo"] = hwinfo
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/experts":
+                eng = self.server.engine
+                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
+                if eng and getattr(eng, "emap", None):
+                    payload.update(eng.emap)
+                    payload["hits"] = eng.hits or ""
+                    payload["seq"] = eng.hits_seq
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
