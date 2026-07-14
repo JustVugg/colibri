@@ -3710,6 +3710,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
     double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
     hwinfo_emit(m);
+    usage_save(m);                       /* la cache che impara non deve aspettare l'uscita */
     tiers_emit(m);
     emap_emit(m);
     hits_emit(m);
