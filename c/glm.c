@@ -27,6 +27,13 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/types.h>
+#include <sys/sysctl.h>                           /* hw.optional.arm.FEAT_I8MM */
+#elif defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>                            /* getauxval(AT_HWCAP2) */
+#include <elf.h>                                 /* AT_HWCAP2 */
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
 #endif
@@ -73,6 +80,21 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 #undef vector                                     /* igiene: si usano __vector/__bool espliciti */
 #undef pixel
 #undef bool
+#endif
+
+/* Build SMMLA in an isolated function while keeping the rest of the binary at
+ * baseline AArch64. GCC and Clang spell the per-function extension differently. */
+#if defined(__aarch64__) && defined(__ARM_NEON) && \
+    ((defined(__clang__) && __clang_major__ >= 10) || \
+     (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 10))
+#define COLI_HAVE_I8MM 1
+#if defined(__clang__)
+#define COLI_TARGET_I8MM __attribute__((target("i8mm")))
+#else
+#define COLI_TARGET_I8MM __attribute__((target("+i8mm")))
+#endif
+#else
+#define COLI_HAVE_I8MM 0
 #endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
@@ -487,6 +509,48 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "scalar"
 #endif
 static int g_idot=1;
+#if COLI_HAVE_I8MM
+static int g_i8mm=-1;  /* -1=runtime auto, 0=force NEON for A/B, 1=SMMLA available */
+static int cpu_has_i8mm(void){
+#if defined(__APPLE__)
+    int value=0; size_t size=sizeof(value);
+    return sysctlbyname("hw.optional.arm.FEAT_I8MM",&value,&size,NULL,0)==0 && value;
+#elif defined(__linux__)
+    /* Stable arm64 Linux UAPI bit; define it locally for older libc headers. */
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1UL << 13)
+#endif
+    return (getauxval(AT_HWCAP2)&HWCAP2_I8MM)!=0;
+#else
+    return 0;
+#endif
+}
+static int i8mm_enabled(void){
+    if(g_i8mm<0) g_i8mm=cpu_has_i8mm();
+    return g_i8mm;
+}
+typedef struct { int8_t *data; size_t cap; } I8mmScratch;
+static _Thread_local I8mmScratch g_i8mm_scratch;
+static void i8mm_pack_pair(int8_t *dst, const int8_t *x0, const int8_t *x1, int I){
+    for(int i=0;i+8<=I;i+=8){ memcpy(dst+2*i,x0+i,8); memcpy(dst+2*i+8,x1+i,8); }
+}
+static const int8_t *i8mm_pack_x(const int8_t *x, int S, int I, size_t *pair_stride){
+    size_t stride=(size_t)(I/8)*16, need=(size_t)((S+1)/2)*stride;
+    if(need>g_i8mm_scratch.cap){
+        int8_t *p=realloc(g_i8mm_scratch.data,need);
+        if(!p){ fprintf(stderr,"OOM i8mm scratch\n"); exit(1); }
+        g_i8mm_scratch.data=p; g_i8mm_scratch.cap=need;
+    }
+    for(int s=0;s<S;s+=2){
+        const int8_t *x0=x+(int64_t)s*I;
+        const int8_t *x1=s+1<S?x0+I:x0;
+        i8mm_pack_pair(g_i8mm_scratch.data+(size_t)(s/2)*stride,x0,x1,I);
+    }
+    *pair_stride=stride; return g_i8mm_scratch.data;
+}
+#else
+static int i8mm_enabled(void){ return 0; }
+#endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
                        * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
@@ -701,14 +765,170 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
     return sum;
 }
+
+#if COLI_HAVE_I8MM
+/* SMMLA treats its operands as [2,8] and [2,8], and returns the four row
+ * products as {w0*x0, w0*x1, w1*x0, w1*x1}. Pairing two output rows and two
+ * activation rows is what exposes all four dot products instead of wasting
+ * three quarters of the instruction. Scalar tails preserve arbitrary shapes. */
+COLI_TARGET_I8MM __attribute__((always_inline))
+static inline void dot_i8i8_2x2_i8mm(int32_t out[4], const int8_t *w0, const int8_t *w1,
+                                     const int8_t *xp, const int8_t *x0, const int8_t *x1, int I){
+    int32x4_t a0=vdupq_n_s32(0),a1=a0,a2=a0,a3=a0; int i=0;
+    for(;i+32<=I;i+=32){
+        int8x16_t wv=vcombine_s8(vld1_s8(w0+i),vld1_s8(w1+i));
+        a0=vmmlaq_s32(a0,wv,vld1q_s8(xp+2*i));
+        wv=vcombine_s8(vld1_s8(w0+i+8),vld1_s8(w1+i+8));
+        a1=vmmlaq_s32(a1,wv,vld1q_s8(xp+2*i+16));
+        wv=vcombine_s8(vld1_s8(w0+i+16),vld1_s8(w1+i+16));
+        a2=vmmlaq_s32(a2,wv,vld1q_s8(xp+2*i+32));
+        wv=vcombine_s8(vld1_s8(w0+i+24),vld1_s8(w1+i+24));
+        a3=vmmlaq_s32(a3,wv,vld1q_s8(xp+2*i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+8<=I;i+=8){
+        int8x16_t wv=vcombine_s8(vld1_s8(w0+i),vld1_s8(w1+i));
+        int8x16_t xv=vld1q_s8(xp+2*i);
+        acc=vmmlaq_s32(acc,wv,xv);
+    }
+    vst1q_s32(out,acc);
+    for(;i<I;i++){
+        out[0]+=(int32_t)w0[i]*x0[i]; out[1]+=(int32_t)w0[i]*x1[i];
+        out[2]+=(int32_t)w1[i]*x0[i]; out[3]+=(int32_t)w1[i]*x1[i];
+    }
+}
+
+COLI_TARGET_I8MM __attribute__((always_inline))
+static inline int8x16_t unpack_i4_pair_i8mm(const uint8_t *w0, const uint8_t *w1, int i,
+                                             uint8x8_t m4, int8x8_t b8){
+    uint32_t d0,d1; memcpy(&d0,w0+(i>>1),4); memcpy(&d1,w1+(i>>1),4);
+    uint8x8_t p0=vreinterpret_u8_u32(vdup_n_u32(d0));
+    uint8x8_t p1=vreinterpret_u8_u32(vdup_n_u32(d1));
+    uint8x8x2_t z0=vzip_u8(vand_u8(p0,m4),vshr_n_u8(p0,4));
+    uint8x8x2_t z1=vzip_u8(vand_u8(p1,m4),vshr_n_u8(p1,4));
+    return vcombine_s8(vsub_s8(vreinterpret_s8_u8(z0.val[0]),b8),
+                       vsub_s8(vreinterpret_s8_u8(z1.val[0]),b8));
+}
+
+COLI_TARGET_I8MM __attribute__((always_inline))
+static inline void dot_i4i8_2x2_i8mm(int32_t out[4], const uint8_t *w0, const uint8_t *w1,
+                                     const int8_t *xp, const int8_t *x0, const int8_t *x1, int I){
+    const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
+    int32x4_t a0=vdupq_n_s32(0),a1=a0,a2=a0,a3=a0; int i=0;
+    for(;i+32<=I;i+=32){
+        a0=vmmlaq_s32(a0,unpack_i4_pair_i8mm(w0,w1,i,m4,b8),vld1q_s8(xp+2*i));
+        a1=vmmlaq_s32(a1,unpack_i4_pair_i8mm(w0,w1,i+8,m4,b8),vld1q_s8(xp+2*i+16));
+        a2=vmmlaq_s32(a2,unpack_i4_pair_i8mm(w0,w1,i+16,m4,b8),vld1q_s8(xp+2*i+32));
+        a3=vmmlaq_s32(a3,unpack_i4_pair_i8mm(w0,w1,i+24,m4,b8),vld1q_s8(xp+2*i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+8<=I;i+=8){
+        int8x16_t wv=unpack_i4_pair_i8mm(w0,w1,i,m4,b8);
+        int8x16_t xv=vld1q_s8(xp+2*i);
+        acc=vmmlaq_s32(acc,wv,xv);
+    }
+    vst1q_s32(out,acc);
+    for(;i<I;i++){
+        uint8_t b0v=w0[i>>1], b1v=w1[i>>1];
+        int a0=(i&1)?(int)(b0v>>4)-8:(int)(b0v&0xF)-8;
+        int a1=(i&1)?(int)(b1v>>4)-8:(int)(b1v&0xF)-8;
+        out[0]+=a0*x0[i]; out[1]+=a0*x1[i]; out[2]+=a1*x0[i]; out[3]+=a1*x1[i];
+    }
+}
+
+/* Non-inlined entries let the baseline-ISA exactness test exercise each tile
+ * directly. Hot matmul loops call the always-inline helpers above instead. */
+COLI_TARGET_I8MM __attribute__((noinline))
+static void dot_i8i8_2x2_i8mm_entry(int32_t out[4], const int8_t *w0, const int8_t *w1,
+                                    const int8_t *x0, const int8_t *x1, int I){
+    size_t n=(size_t)(I/8)*16; int8_t *xp=malloc(n?n:1);
+    if(!xp){ fprintf(stderr,"OOM i8mm test entry\n"); exit(1); }
+    i8mm_pack_pair(xp,x0,x1,I); dot_i8i8_2x2_i8mm(out,w0,w1,xp,x0,x1,I); free(xp);
+}
+COLI_TARGET_I8MM __attribute__((noinline))
+static void dot_i4i8_2x2_i8mm_entry(int32_t out[4], const uint8_t *w0, const uint8_t *w1,
+                                    const int8_t *x0, const int8_t *x1, int I){
+    size_t n=(size_t)(I/8)*16; int8_t *xp=malloc(n?n:1);
+    if(!xp){ fprintf(stderr,"OOM i8mm test entry\n"); exit(1); }
+    i8mm_pack_pair(xp,x0,x1,I); dot_i4i8_2x2_i8mm(out,w0,w1,xp,x0,x1,I); free(xp);
+}
+
+COLI_TARGET_I8MM __attribute__((noinline))
+static void matmul_q_i8mm(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                          const float *scale, const int8_t *xp, size_t xp_stride,
+                          int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O-1;o+=2){
+        const int8_t *w0=q+(int64_t)o*I, *w1=w0+I; int s=0;
+        for(;s+1<S;s+=2){
+            const int8_t *x0=xq+(int64_t)s*I, *x1=x0+I;
+            int32_t d[4]; dot_i8i8_2x2_i8mm(d,w0,w1,xp+(size_t)(s/2)*xp_stride,x0,x1,I);
+            y[(int64_t)s*O+o]=(float)d[0]*scale[o]*sx[s];
+            y[(int64_t)(s+1)*O+o]=(float)d[1]*scale[o]*sx[s+1];
+            y[(int64_t)s*O+o+1]=(float)d[2]*scale[o+1]*sx[s];
+            y[(int64_t)(s+1)*O+o+1]=(float)d[3]*scale[o+1]*sx[s+1];
+        }
+        if(s<S){
+            int32_t d[4]; const int8_t *xs=xq+(int64_t)s*I;
+            dot_i8i8_2x2_i8mm(d,w0,w1,xp+(size_t)(s/2)*xp_stride,xs,xs,I);
+            y[(int64_t)s*O+o]=(float)d[0]*scale[o]*sx[s];
+            y[(int64_t)s*O+o+1]=(float)d[2]*scale[o+1]*sx[s];
+        }
+    }
+    if(O&1){ int o=O-1; const int8_t *w=q+(int64_t)o*I;
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*scale[o]*sx[s]; }
+}
+
+COLI_TARGET_I8MM __attribute__((noinline))
+static void matmul_i4_i8mm(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
+                           const float *scale, const int8_t *xp, size_t xp_stride,
+                           int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O-1;o+=2){
+        const uint8_t *w0=q4+(int64_t)o*rb, *w1=w0+rb; int s=0;
+        for(;s+1<S;s+=2){
+            const int8_t *x0=xq+(int64_t)s*I, *x1=x0+I;
+            int32_t d[4]; dot_i4i8_2x2_i8mm(d,w0,w1,xp+(size_t)(s/2)*xp_stride,x0,x1,I);
+            y[(int64_t)s*O+o]=(float)d[0]*scale[o]*sx[s];
+            y[(int64_t)(s+1)*O+o]=(float)d[1]*scale[o]*sx[s+1];
+            y[(int64_t)s*O+o+1]=(float)d[2]*scale[o+1]*sx[s];
+            y[(int64_t)(s+1)*O+o+1]=(float)d[3]*scale[o+1]*sx[s+1];
+        }
+        if(s<S){
+            int32_t d[4]; const int8_t *xs=xq+(int64_t)s*I;
+            dot_i4i8_2x2_i8mm(d,w0,w1,xp+(size_t)(s/2)*xp_stride,xs,xs,I);
+            y[(int64_t)s*O+o]=(float)d[0]*scale[o]*sx[s];
+            y[(int64_t)s*O+o+1]=(float)d[2]*scale[o+1]*sx[s];
+        }
+    }
+    if(O&1){ int o=O-1; const uint8_t *w=q4+(int64_t)o*rb;
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*scale[o]*sx[s]; }
+}
+#endif
+
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
+#if COLI_HAVE_I8MM
+    if(I>=8 && O>=2 && i8mm_enabled()){
+        size_t stride; const int8_t *xp=i8mm_pack_x(xq,S,I,&stride);
+        matmul_q_i8mm(y,xq,sx,q,scale,xp,stride,S,I,O); return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
+#if COLI_HAVE_I8MM
+    /* At S=1, int4 unpack dominates short (I=2048) down-projection rows on
+     * M-series. Keep those on SDOT; paired rows or GLM's I=6144 gate/up rows win. */
+    if(I>=8 && O>=2 && (S>=2 || I>=6144) && i8mm_enabled()){
+        size_t stride; const int8_t *xp=i8mm_pack_x(xq,S,I,&stride);
+        matmul_i4_i8mm(y,xq,sx,q4,scale,xp,stride,S,I,O); return;
+    }
+#endif
     int rb=(I+1)/2;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
@@ -4810,6 +5030,10 @@ int main(int argc, char **argv){
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+#if COLI_HAVE_I8MM
+    g_i8mm=cpu_has_i8mm();
+    if(getenv("I8MM") && atoi(getenv("I8MM"))==0) g_i8mm=0; /* A/B kill switch; cannot force unsupported silicon */
+#endif
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
@@ -4884,6 +5108,9 @@ int main(int argc, char **argv){
     }
 #endif
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
+#if COLI_HAVE_I8MM
+    if(i8mm_enabled()) printf("[i8mm] SMMLA 2x2 expert kernel active (I8MM=0 disables for A/B)\n");
+#endif
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0){

@@ -61,6 +61,7 @@ Format: `VAR` — default — effect.
 | `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. |
 | `ABSORB` | `-1` (auto: absorbed for S≤4) | MLA attention absorption mode. |
 | `IDOT` | `1` | Integer dot-product kernel. `IDOT=0` uses exact f32 kernels (for A/B numerical checks). |
+| `I8MM` | auto | On supported AArch64 CPUs, use the runtime-dispatched SMMLA expert kernel. `I8MM=0` forces the existing NEON/SDOT path for same-binary A/B measurements. |
 | `COLI_POLICY` | `quality` | Resource policy: `quality`, `balanced`, or `experimental-fast`. |
 
 ---
