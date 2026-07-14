@@ -51,8 +51,18 @@ static DeviceContext *find_ctx(int device) {
     return nullptr;
 }
 
+/* cudaSetDevice on every call doubles expert-matmul time on 2 GPUs when the
+ * serial expert loop alternates devices (measured on RTX 5090 + 4090: 14.3s
+ * -> 25.4s per 32 tokens). The current device is per-thread in the CUDA
+ * runtime, so a thread-local cache skips the redundant switches. */
+static thread_local int g_current_device = -1;
+
 static int select_ctx(DeviceContext *ctx) {
-    return ctx && cuda_ok(cudaSetDevice(ctx->device), "select device");
+    if (!ctx) return 0;
+    if (g_current_device == ctx->device) return 1;
+    if (!cuda_ok(cudaSetDevice(ctx->device), "select device")) return 0;
+    g_current_device = ctx->device;
+    return 1;
 }
 
 __host__ __device__ static size_t row_bytes(int fmt, int I) {

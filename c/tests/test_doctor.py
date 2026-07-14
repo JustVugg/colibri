@@ -104,7 +104,14 @@ class DoctorTest(unittest.TestCase):
         report = self.report(ram_gb=40)
         checks = self.checks_by_id(report)
 
-        self.assertEqual(checks["engine.binary"]["status"], "fail")
+        # On Windows chmod(0o644) does not remove executability (NTFS has no
+        # execute bit; os.access(X_OK) is always True for existing files), so
+        # the engine.binary check stays "pass" there. The excessive-RAM check
+        # (memory.ram) is platform-independent and must still fail. (#141)
+        if sys.platform == "win32":
+            self.assertEqual(checks["engine.binary"]["status"], "pass")
+        else:
+            self.assertEqual(checks["engine.binary"]["status"], "fail")
         self.assertEqual(checks["memory.ram"]["status"], "fail")
         self.assertEqual(report["status"], "error")
 
