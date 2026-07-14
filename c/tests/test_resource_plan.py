@@ -140,6 +140,55 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertFalse(plan["policy"]["quality_preserving"])
         self.assertFalse(plan["policy"]["preserve_router"])
 
+    # --- CUDA auto-detect env-var generation ---
+
+    def test_auto_detect_sets_cuda_one_and_expert_budget(self):
+        """cuda_enabled=True + GPUs present → COLI_CUDA=1, CUDA_EXPERT_GB set."""
+        # Use a model whose expert bytes exceed the 2 GB GPU reserve so
+        # the VRAM budget is a meaningful positive number.
+        big = Path(self.tmp.name) / "big"
+        big.mkdir()
+        (big / "config.json").write_text(json.dumps({
+            "num_hidden_layers": 2,
+            "n_routed_experts": 2,
+            "kv_lora_rank": 4,
+            "qk_rope_head_dim": 2,
+            "qk_nope_head_dim": 3,
+            "v_head_dim": 5,
+            "num_attention_heads": 2,
+        }))
+        # ~4 MB of expert data — enough to show as >0.000 GB
+        write_shard(big / "model.safetensors", [
+            ("model.layers.1.mlp.experts.0.gate_proj.weight", 2_000_000),
+            ("model.layers.1.mlp.experts.0.up_proj.weight",   1_000_000),
+            ("model.layers.1.mlp.experts.1.gate_proj.weight",   500_000),
+            ("model.layers.1.mlp.experts.1.up_proj.weight",     500_000),
+        ])
+        gpus = [{"index": 0, "name": "a", "total_bytes": 8 * GB, "free_bytes": 7 * GB}]
+        plan = build_plan(big, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus)
+        env = environment_for_plan(plan, cuda_enabled=True)
+        self.assertEqual(env["COLI_CUDA"], "1")
+        self.assertIn("CUDA_EXPERT_GB", env)
+        self.assertGreater(float(env["CUDA_EXPERT_GB"]), 0)
+
+    def test_auto_detect_zero_vram_budget_skips_gpu_tier(self):
+        """VRAM budget ≤ 0 → no GPU env vars set (no usable VRAM)."""
+        gpus = [{"index": 0, "name": "b", "total_bytes": 8 * GB, "free_bytes": 1 * GB}]
+        plan = build_plan(self.model, ram_gb=16, vram_gb=0,
+                          available_memory=32 * GB, available_disk=1, gpus=gpus)
+        env = environment_for_plan(plan, cuda_enabled=True)
+        self.assertNotIn("COLI_CUDA", env)
+        self.assertNotIn("CUDA_EXPERT_GB", env)
+
+    def test_auto_detect_no_gpus_skips_gpu_tier(self):
+        """Empty GPU list → no GPU env vars, even with cuda_enabled=True."""
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[])
+        env = environment_for_plan(plan, cuda_enabled=True)
+        self.assertNotIn("COLI_CUDA", env)
+        self.assertNotIn("CUDA_EXPERT_GB", env)
+
     def test_balanced_policy_enables_lossless_live_repin(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
                           gpus=[], policy="balanced")
