@@ -893,7 +893,12 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
-    int half = c->qk_rope/2; float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
+    int half = c->qk_rope/2;
+    /* Validate against the fixed buffer: the config checker allows qk_rope up
+     * to 1<<16 but this stack buffer holds 256 floats. Abort cleanly instead
+     * of smashing the stack. (GLM-5.2 qk_rope=64, well within bounds.) */
+    if(c->qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope_interleave buffer (256)\n",c->qk_rope); exit(1); }
+    float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
     for(int j=0;j<half;j++){
         float inv = powf(c->theta, -2.0f*j/c->qk_rope);
         float ang = pos*inv, cs=cosf(ang), sn=sinf(ang);
@@ -2705,13 +2710,14 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,0);
     float *lo=falloc(c->vocab);
+    float *row=falloc(D);
     for(int s=0;s<S;s++){
-        float row[8192]; rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
+        rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo, row, &m->lm_head, 1);
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
     }
-    free(x); free(lo);
+    free(x); free(lo); free(row);
 }
 
 /* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */
@@ -3021,7 +3027,9 @@ static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, in
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
     if(m->has_mtp) s->kv.kv_start[m->c.n_layers]=-1;
     kv_bind(m,&s->kv); kv_alloc(m,maxctx);
-    s->hist=malloc(maxctx*sizeof(int)); s->first=1;
+    s->hist=malloc(maxctx*sizeof(int));
+    if(!s->hist){ fprintf(stderr,"OOM serve_ctx_init hist\n"); exit(1); }
+    s->first=1;
     if(slot==0) snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv",snap);
     else snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv.%d",snap,slot);
     s->len=kv_disk_load(m,s->hist,maxctx); if(s->len>0) s->first=0;
@@ -3100,6 +3108,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
+    if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
     int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-2);
     free(raw); free(line);
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
@@ -3330,7 +3339,11 @@ static void run_serve(Model *m, const char *snap){
     free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
-static int *read_arr(jval*o,const char*k,int*n){ jval*a=json_get(o,k); int*r=malloc(a->len*sizeof(int));
+static int *read_arr(jval*o,const char*k,int*n){
+    jval*a=json_get(o,k);
+    if(!a){ *n=0; return NULL; }
+    int*r=malloc(a->len*sizeof(int));
+    if(!r){ fprintf(stderr,"OOM read_arr\n"); exit(1); }
     for(int i=0;i<a->len;i++) r[i]=(int)a->kids[i]->num; *n=a->len; return r; }
 
 /* byte residenti di un tensore [O,I] al numero di bit dato (specchio di qt_bytes) */
@@ -3845,7 +3858,8 @@ int main(int argc, char **argv){
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f);
     char *ar=NULL; jval *ref=json_parse(b,&ar);
-    int np,nfull; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
+    int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
+    if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
     int n_new=nfull-np;
     /* L'oracolo (ref_glm.json in repo) e' del modello TINY: contro il 744B da' 0/20
      * garantito su OGNI piattaforma (prompt-token tiny = spazzatura per il modello vero).
