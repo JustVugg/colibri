@@ -3667,7 +3667,8 @@ int main(int argc, char **argv){
      * re-exec + tuning path (distinct from the internal COLI_OMP_TUNED sentinel).
      *
      * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
-    if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")){
+    if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
+       !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
