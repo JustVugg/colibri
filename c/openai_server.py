@@ -672,9 +672,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
 
     def require_auth(self):
-        if self.server.api_key and self.headers.get("Authorization") != f"Bearer {self.server.api_key}":
-            raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
-                           "authentication_error")
+        if self.server.api_key:
+            import hmac
+            provided = self.headers.get("Authorization", "")
+            expected = f"Bearer {self.server.api_key}"
+            if not hmac.compare_digest(provided, expected):
+                raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
+                               "authentication_error")
 
     def read_json(self):
         try:

@@ -127,8 +127,9 @@ def discover_gpus():
     except (OSError, subprocess.SubprocessError):
         return []
     devices = []
-    for line in result.stdout.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
+    import csv
+    for fields in csv.reader(result.stdout.splitlines()):
+        fields = [f.strip() for f in fields]
         if len(fields) != 4:
             continue
         try:
