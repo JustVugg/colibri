@@ -22,6 +22,17 @@ Configuration through environment variables or flags (also valid after the subco
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
+# The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
+if sys.platform != "win32":
+    try:
+        import resource
+        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        _want = min(65536 if _hard == resource.RLIM_INFINITY else _hard, 65536)
+        if _soft < _want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (_want, _hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
 # Windows: forza output UTF-8 (console cp1252 tronca Unicode box-drawing/emoji)
 if sys.platform == "win32":
     for s in (sys.stdout, sys.stderr):
@@ -29,8 +40,31 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.path.join(HERE, "tools")
-GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
+
+# Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
+# support modules (resource_plan.py, doctor.py, openai_server.py) and
+# tools/ all live next to this script — unchanged from before.
+#
+# Installed layout ("make install"): this script is $(PREFIX)/bin/coli,
+# while the engine binaries and support files live in
+# $(PREFIX)/libexec/colibri, since they aren't meant to be run directly
+# by users. COLI_ENGINE overrides the engine path explicitly if neither
+# guess is right (e.g. a custom packaging layout).
+_EXE = ".exe" if sys.platform == "win32" else ""
+_LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_here_glm = os.path.join(HERE, "glm" + _EXE)
+
+if os.environ.get("COLI_ENGINE"):
+    GLM = os.environ["COLI_ENGINE"]
+    TOOLS = os.path.join(os.path.dirname(GLM), "tools")
+elif os.path.exists(_here_glm):
+    GLM = _here_glm
+    TOOLS = os.path.join(HERE, "tools")
+else:
+    GLM = os.path.join(_LIBEXEC, "glm" + _EXE)
+    TOOLS = os.path.join(_LIBEXEC, "tools")
+    sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
+
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
@@ -302,6 +336,9 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
+    if not os.path.exists(os.path.join(HERE, "Makefile")):
+        sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
+                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c glm.")
     sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
 
 def cmd_info(a):
@@ -513,6 +550,28 @@ def cmd_serve(a):
           a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
           a.max_queue,a.queue_timeout,a.kv_slots)
 
+def cmd_web(a):
+    """serve + open the dashboard in the browser once the API answers."""
+    need_model(a.model)
+    dist = os.path.join(os.path.dirname(os.path.abspath(HERE)), "web", "dist")
+    if not os.path.exists(os.path.join(dist, "index.html")):
+        print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
+        print("serving the API anyway (the dashboard will 404 until built).")
+    url = f"http://{a.host}:{a.port}/"
+    if not getattr(a, "no_browser", False):
+        import threading, urllib.request, webbrowser
+        def opener():
+            for _ in range(600):                    # the 744B engine takes minutes to load
+                time.sleep(2)
+                try:
+                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=2)
+                    webbrowser.open(url); return
+                except OSError:
+                    continue
+        threading.Thread(target=opener, daemon=True).start()
+    print(f"dashboard: {url}  (opens automatically when the engine is ready)")
+    cmd_serve(a)
+
 def cmd_bench(a):
     need_model(a.model)
     banner("bench")
@@ -583,6 +642,16 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
+    for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
+                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
+                   ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
+                   ("--cors-origin",dict(action="append",default=None)),
+                   ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
+                   ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
+                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1"))))):
+        pw.add_argument(arg,**kw)
+    pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
@@ -591,7 +660,7 @@ def main():
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
-             "convert":cmd_convert}.get(a.cmd)
+             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 
