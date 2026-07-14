@@ -137,3 +137,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .brain-tip { position: fixed; z-index: 50; background: #0d1214; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 11px; color: var(--foreground); pointer-events: none; max-width: 280px; box-shadow: 0 8px 24px rgba(0,0,0,.5); display: grid; gap: 4px; }
 .brain-tip-title { display: flex; align-items: center; gap: 5px; font-weight: 700; color: var(--primary); }
 .brain-tip-role { color: #8b9aa3; font-style: italic; line-height: 1.4; border-top: 1px solid var(--border); padding-top: 5px; margin-top: 2px; }
+
+/* Brain responsive */
+.brain-canvas-wrap { display: flex; align-items: flex-start; justify-content: center; min-height: 300px; }
+@media (max-width: 900px) {
+  .brain-page { padding: 10px; }
+  .brain-head { flex-direction: column; align-items: flex-start; }
+  .brain-legend { gap: 8px; font-size: 10px; }
+  .brain-tip { max-width: 220px; font-size: 10px; }
+}

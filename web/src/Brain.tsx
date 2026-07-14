@@ -23,11 +23,24 @@ function depthRole(row: number, rows: number, isMtp: boolean): string {
 
 export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey: string; connected: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const [wrapSize, setWrapSize] = useState({ w: 1200, h: 700 })
   const [data, setData] = useState<ExpertMap | null>(null)
   const [tip, setTip] = useState<{ x: number; y: number; row: number; col: number; tier: number; heat: number } | null>(null)
   const pulseRef = useRef<Float32Array | null>(null)   // per-expert pulse intensity 0..1
   const lastSeq = useRef(0)
   const rafRef = useRef(0)
+
+  // track container size for responsive cell sizing
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      setWrapSize({ w: el.clientWidth - 24, h: el.clientHeight - 24 })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
 
   // poll /experts
   useEffect(() => {
@@ -64,7 +77,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     const ctx = canvas.getContext("2d")
     if (!ctx) return
     const { rows, cols, map } = data
-    const cell = Math.max(2, Math.floor(Math.min(1400 / cols, 900 / rows)))
+    const cell = Math.max(2, Math.floor(Math.min(wrapSize.w / cols, wrapSize.h / rows)))
     const gap = cell >= 4 ? 1 : 0
     canvas.width = cols * (cell + gap)
     canvas.height = rows * (cell + gap)
@@ -95,14 +108,14 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     draw()
     const keepalive = window.setInterval(() => { if (!rafRef.current) draw(); rafRef.current = 0 }, 400)
     return () => { cancelAnimationFrame(rafRef.current); window.clearInterval(keepalive) }
-  }, [data])
+  }, [data, wrapSize])
 
   const onMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!data) return
     const rect = e.currentTarget.getBoundingClientRect()
     const scaleX = e.currentTarget.width / rect.width
     const scaleY = e.currentTarget.height / rect.height
-    const cell = Math.max(2, Math.floor(Math.min(1400 / data.cols, 900 / data.rows)))
+    const cell = Math.max(2, Math.floor(Math.min(wrapSize.w / data.cols, wrapSize.h / data.rows)))
     const gap = cell >= 4 ? 1 : 0
     const col = Math.floor(((e.clientX - rect.left) * scaleX) / (cell + gap))
     const row = Math.floor(((e.clientY - rect.top) * scaleY) / (cell + gap))
@@ -129,7 +142,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
           <span className="brain-pulse-hint">⚡ white flash = routed this turn</span>
         </div>
       </div>
-      <div className="brain-canvas-wrap">
+      <div className="brain-canvas-wrap" ref={wrapRef}>
         <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setTip(null)} />
         {!connected && <p className="runtime-unavailable">Connect to the engine to see the cortex.</p>}
       </div>
