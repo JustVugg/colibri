@@ -67,10 +67,9 @@ jobs:
         working-directory: c
     steps:
       - uses: actions/checkout@v4
-      - uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '12.4.0'
-          method: network
-          sub-packages: '["nvcc"]'
+      - name: Install nvcc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-4
       - name: Syntax check (no GPU needed)
         run: nvcc -c backend_cuda.cu -std=c++17 -O0
