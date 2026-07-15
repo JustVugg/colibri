@@ -202,6 +202,7 @@ typedef struct {
                                                   * thread di compute; il servizio disco
                                                   * overlappato vive in g_edisk_ns) */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
+    double t_rmsnorm,t_router,t_resadd,t_embed;        /* decode "other" breakdown (#292) */
     int64_t resident_bytes;
     /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
      * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
@@ -2796,6 +2797,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!rank_buf||!rank_w){ free(rank_buf); free(rank_w); rank_buf=NULL; rank_w=NULL; do_cache_route=0; }
     }
     /* ---- FASE A: routing di tutte le S posizioni ---- */
+    double trouter=now_s();
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
     /* router in UN matmul batch: stessa matematica, via le S chiamate S=1 */
@@ -2910,10 +2912,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->route_kl_sum+=kl; m->route_kl_n++;
             }
         } else {
+            /* top-K via taken-flag: O(K×E) instead of O(K²×E) — the old version
+             * re-scanned idx[0..kk) for every expert e to check "already taken";
+             * a flag array makes that O(1). With K=8,E=256 that's 8× fewer
+             * comparisons in the selection loop (#292 "other" breakdown). */
+            char taken[256]; memset(taken,0,(size_t)E);   /* E<=256 */
             for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                    if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-                idx[kk]=best; w[kk]=logit[best];
+                for(int e=0;e<E;e++){ if(!taken[e] && choice[e]>bv){bv=choice[e];best=e;} }
+                idx[kk]=best; w[kk]=logit[best]; taken[best]=1;
             }
             if(g_route_agree){
                 m->route_agree_hit+=(uint64_t)Ksel;
@@ -2962,6 +2968,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
+    m->t_router+=now_s()-trouter;
     /* ---- FASE B: union degli expert del batch ---- */
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
     unsigned char seen[E]; memset(seen,0,(size_t)E);
@@ -3813,17 +3820,25 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
         }
     }
 #endif
+    double tnorm=now_s();
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
+    m->t_rmsnorm+=now_s()-tnorm;
     attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
+    double tres=now_s();
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    m->t_resadd+=now_s()-tres;
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
         la_predict(m,li+1,x,1);  /* baseline: stale-state PILOT */
         la_predict(m,li+1,x,2);  /* two-step: shared-expert-corrected prediction */
     }
+    tnorm=now_s();
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
+    m->t_rmsnorm+=now_s()-tnorm;
     if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    tres=now_s();
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    m->t_resadd+=now_s()-tres;
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     layer_forward_rows(m,l,li,x,S,pos_base,NULL,NULL,nrm,tmp);
@@ -3952,7 +3967,9 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
+    double temb=now_s();
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    m->t_embed+=now_s()-temb;
     layers_forward(m,x,S,pos_base);
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
@@ -3967,7 +3984,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
 static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
+    double temb=now_s();
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    m->t_embed+=now_s()-temb;
     layers_forward(m,x,S,pos_base);
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=64) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
@@ -4482,12 +4501,17 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    double accounted=edisk_s()+m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    double other=elapsed-accounted;
+    double other_tracked=m->t_rmsnorm+m->t_router+m->t_resadd+m->t_embed;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(including kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
-        edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+        edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,other);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
+    if(other>0.001 || other_tracked>0.001)
+        printf("OTHER: rmsnorm %.3fs | router %.3fs | resadd %.3fs | embed %.3fs | untracked %.3fs\n",
+            m->t_rmsnorm,m->t_router,m->t_resadd,m->t_embed,other-other_tracked);
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
@@ -4502,6 +4526,7 @@ static void profile_print(Model *m, double elapsed){
 static void profile_reset(Model *m){
     m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_aproj=m->t_acore=m->t_aout=0;
+    m->t_rmsnorm=m->t_router=m->t_resadd=m->t_embed=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
 }
 
