@@ -611,18 +611,28 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 #elif defined(__ARM_NEON)
     /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
      * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* 4 accumulatori indipendenti: una sola catena vdotq e' latency-bound (misurato).
+     * EN: 4 independent accumulators; a single chained vdotq is latency-bound. */
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        a0=vdotq_s32(a0,vld1q_s8(w+i),   vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vld1q_s8(w+i+16),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vld1q_s8(w+i+32),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vld1q_s8(w+i+48),vld1q_s8(x+i+48));
+    }
+    for(;i+16<=I;i+=16) a0=vdotq_s32(a0,vld1q_s8(w+i),vld1q_s8(x+i));
+    sum=vaddvq_s32(vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3)));
+#else
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+16<=I;i+=16){
         int8x16_t wv=vld1q_s8(w+i), xv=vld1q_s8(x+i);
-#if defined(__ARM_FEATURE_DOTPROD)
-        acc=vdotq_s32(acc,wv,xv);
-#else
         int16x8_t p=vmull_s8(vget_low_s8(wv),vget_low_s8(xv));
         p=vmlal_s8(p,vget_high_s8(wv),vget_high_s8(xv));
         acc=vpadalq_s16(acc,p);
-#endif
     }
     sum=vaddvq_s32(acc);
+#endif
 #elif defined(__VSX__)
     /* POWER8: vec_msum (s8 x u8 -> s32) somma i prodotti byte DIRETTAMENTE in lane
      * s32, 16 byte/iter: il bound anti-saturazione a 16 bit di maddubs qui non serve.
@@ -702,6 +712,26 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     sum=hsum256_i32(acc);
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* 4 accumulatori indipendenti, come dot_i8i8. EN: 4 accumulators, see dot_i8i8. */
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        uint8x16_t by=vld1q_u8(w4+(i>>1)), cy=vld1q_u8(w4+(i>>1)+16);
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        uint8x16x2_t k=vzipq_u8(vandq_u8(cy,m4q), vshrq_n_u8(cy,4));
+        a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vsubq_s8(vreinterpretq_s8_u8(k.val[0]),b8q),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vsubq_s8(vreinterpretq_s8_u8(k.val[1]),b8q),vld1q_s8(x+i+48));
+    }
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4));
+        a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
+    }
+    sum=vaddvq_s32(vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3)));
+#else
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+32<=I;i+=32){
         uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
@@ -709,18 +739,15 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
         int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
         int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
-#if defined(__ARM_FEATURE_DOTPROD)
-        acc=vdotq_s32(acc,w0,x0); acc=vdotq_s32(acc,w1,x1);
-#else
         int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: nessun overflow */
         p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
         acc=vpadalq_s16(acc,p);
         p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
         p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
         acc=vpadalq_s16(acc,p);
-#endif
     }
     sum=vaddvq_s32(acc);
+#endif
 #elif defined(__VSX__)
     /* 16 byte = 32 nibble. vec_mergeh/vec_mergel su ppc64le (GCC) interallacciano come
      * unpacklo/unpackhi x86 (verificato empiricamente su POWER8): i nibble escono in
