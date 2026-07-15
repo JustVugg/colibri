@@ -203,6 +203,7 @@ typedef struct {
                                                   * overlappato vive in g_edisk_ns) */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     double t_rmsnorm,t_router,t_resadd,t_embed;        /* decode "other" breakdown (#292) */
+    double t_alloc,t_cache,t_pilot,t_dsa,t_moe_oh;     /* deeper "other" breakdown (#292) */
     int64_t resident_bytes;
     /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
      * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
@@ -2970,6 +2971,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     m->t_router+=now_s()-trouter;
     /* ---- FASE B: union degli expert del batch ---- */
+    double tmoe=now_s();
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
     unsigned char seen[E]; memset(seen,0,(size_t)E);
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
@@ -3056,9 +3058,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
+    m->t_moe_oh+=now_s()-tmoe;                              /* Phase B union + allocs */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+        double tcache=now_s();
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
@@ -3067,6 +3071,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
+        m->t_cache+=now_s()-tcache;
         int metal_done=0;
 #ifdef COLI_METAL
         /* GPU/disk OVERLAP: submit the RESIDENT experts (pin/LRU hits, + shared expert on
@@ -3827,11 +3832,13 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     double tres=now_s();
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     m->t_resadd+=now_s()-tres;
+    { double tp=now_s();
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
         la_predict(m,li+1,x,1);  /* baseline: stale-state PILOT */
         la_predict(m,li+1,x,2);  /* two-step: shared-expert-corrected prediction */
     }
+    m->t_pilot+=now_s()-tp; }
     tnorm=now_s();
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     m->t_rmsnorm+=now_s()-tnorm;
@@ -4501,7 +4508,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=edisk_s()+m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    double accounted=edisk_s()+m->t_emm+m->t_attn+m->t_head;
     double other=elapsed-accounted;
     double other_tracked=m->t_rmsnorm+m->t_router+m->t_resadd+m->t_embed;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
@@ -4509,9 +4516,14 @@ static void profile_print(Model *m, double elapsed){
         edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,other);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
-    if(other>0.001 || other_tracked>0.001)
-        printf("OTHER: rmsnorm %.3fs | router %.3fs | resadd %.3fs | embed %.3fs | untracked %.3fs\n",
-            m->t_rmsnorm,m->t_router,m->t_resadd,m->t_embed,other-other_tracked);
+    if(other>0.001 || other_tracked>0.001){
+        double other_tracked2=m->t_alloc+m->t_cache+m->t_pilot+m->t_dsa+m->t_moe_oh;
+        printf("OTHER: rmsnorm %.3fs | router %.3fs | resadd %.3fs | embed %.3fs | "
+               "alloc %.3fs | cache %.3fs | pilot %.3fs | dsa %.3fs | moe_oh %.3fs | untracked %.3fs\n",
+            m->t_rmsnorm,m->t_router,m->t_resadd,m->t_embed,
+            m->t_alloc,m->t_cache,m->t_pilot,m->t_dsa,m->t_moe_oh,
+            other-other_tracked-other_tracked2);
+    }
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
@@ -4527,6 +4539,7 @@ static void profile_reset(Model *m){
     m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_aproj=m->t_acore=m->t_aout=0;
     m->t_rmsnorm=m->t_router=m->t_resadd=m->t_embed=0;
+    m->t_alloc=m->t_cache=m->t_pilot=m->t_dsa=m->t_moe_oh=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
 }
 
