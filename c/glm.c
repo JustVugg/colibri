@@ -1789,8 +1789,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     double ta0=now_s();
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
-     * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims. */
-    if(g_metal_enabled && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+     * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims.
+     * kvs==NULL: the contiguous, currently-bound KV path. When the multiplexed server
+     * (run_serve_mux) forwards ragged rows, kvs[]/positions[] are per-sequence and the
+     * fused kernel must NOT run — it binds m->Lc/m->Rc and pos_base, which would attend at
+     * the wrong position and corrupt KV (#285/#286: serve+Metal → 1-token replies). */
+    if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
@@ -2925,8 +2929,12 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
 #ifdef COLI_METAL
     /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
      * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
-     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto. */
-    if(g_metal_enabled && S<=4 && li<c->n_layers && l->sparse
+     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
+     * !kvs: contiguous single-sequence decode only — ragged mux rows take the CPU path
+     * below, which honours per-row kvs[]/positions[] (#285/#286). Routed experts still
+     * run on the GPU via the batched-expert path; only the fused attention/layer CB is
+     * gated off here. */
+    if(g_metal_enabled && !kvs && !positions && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
