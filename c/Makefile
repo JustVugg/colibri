@@ -56,15 +56,23 @@ CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
-$(error CUDA=1 is supported only on Linux)
+$(error CUDA=1 is supported only on Linux and Windows)
 endif
 ifneq ($(IS_WIN),)
-# GPU: stub only in Phase 1 (G0). G1 builds coli_cuda.dll with MSVC+nvcc.
-$(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see PORT_WINDOWS_PLAN.md §8))
-endif
+# Windows (Phase G1): backend_cuda.cu is built as coli_cuda.dll by a separate
+# rule (nvcc + MSVC host compiler), then loaded at runtime via
+# LoadLibrary/GetProcAddress from compat_cuda.c. This side of the Makefile
+# only pulls in the CPU-side loader; the DLL itself is built with:
+#     make coli_cuda.dll CUDA=1
+# from an environment that has both nvcc and cl.exe on PATH (vcvars64.bat).
+CFLAGS   += -DCOLI_CUDA
+CUDA_OBJ  = compat_cuda.o
+else
+# Linux: compile-time link with the .cu directly (original path, unchanged).
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
+endif
 endif
 
 all: glm$(EXE)
@@ -79,10 +87,34 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
+# Windows-only: compile the LoadLibrary shim into an object linkable with the
+# MinGW-built glm.exe. compat_cuda.h/.c must be present alongside glm.c.
+compat_cuda.o: compat_cuda.c compat_cuda.h backend_cuda.h
+	$(CC) $(CFLAGS) -c compat_cuda.c -o $@
+
+# Windows-only DLL build. Uses nvcc (which auto-picks cl.exe as host compiler
+# when both are on PATH). Requires running from a shell where vcvars64.bat has
+# initialized the MSVC toolchain — see README §Windows for details. The .def
+# file drives symbol export; no source changes to backend_cuda.h needed.
+# CUDA_ARCH=native lets nvcc pick the sm_XX matching the current GPU; override
+# with e.g. CUDA_ARCH=sm_86 for portability across a set of known cards.
+coli_cuda.dll: backend_cuda.cu backend_cuda.h coli_cuda.def
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) --shared -o coli_cuda.dll backend_cuda.cu \
+		-Xlinker /DEF:coli_cuda.def -Xcompiler /MD
+
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
+
+# Windows-only: validate coli_cuda.dll via LoadLibrary + GetProcAddress from a
+# separate binary. Proves the DLL loading path is functional independently of
+# the full glm.exe. Requires coli_cuda.dll built (run `make coli_cuda.dll` first).
+cuda-dll-test: tests/test_dll_loadlib.c coli_cuda.dll
+	$(CC) $(CFLAGS) -c tests/test_dll_loadlib.c -o tests/test_dll_loadlib.o
+	$(CC) tests/test_dll_loadlib.o -o tests/test_dll_loadlib$(EXE) -lm
+	./tests/test_dll_loadlib$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)

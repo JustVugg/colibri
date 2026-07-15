@@ -1,0 +1,17 @@
+; Windows DLL export table for coli_cuda.dll.
+; Enumerates the 8 public C-linkage symbols from backend_cuda.h so they show up
+; in the DLL export table without touching the .cu source. Loaded at runtime
+; from glm.exe via LoadLibrary + GetProcAddress (see compat.h Windows shims).
+LIBRARY coli_cuda
+EXPORTS
+    coli_cuda_init
+    coli_cuda_shutdown
+    coli_cuda_device_count
+    coli_cuda_device_at
+    coli_cuda_mem_info
+    coli_cuda_stats
+    coli_cuda_tensor_upload
+    coli_cuda_matmul
+    coli_cuda_tensor_free
+    coli_cuda_tensor_bytes
+    coli_cuda_tensor_device

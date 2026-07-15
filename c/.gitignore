@@ -1,4 +1,10 @@
 *.exe
+*.o
 glm_tiny/
 olmoe_hf/
 olmoe_i4/
+
+# Windows CUDA DLL build artifacts (see Makefile target coli_cuda.dll)
+coli_cuda.dll
+coli_cuda.exp
+coli_cuda.lib

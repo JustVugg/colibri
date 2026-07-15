@@ -36,6 +36,7 @@
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
+#include "compat_cuda.h"   /* Windows: LoadLibrary shim (no-op on Linux/macOS) */
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -2533,6 +2534,12 @@ int main(int argc, char **argv){
         else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
         else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
         if(g_cuda_ndev<1){ fprintf(stderr,"COLI_GPUS non valido: usa una lista come 0,1,2\n"); return 2; }
+#ifdef _WIN32
+        /* Windows: coli_cuda.dll is loaded at runtime; symbols must be resolved
+         * before the first coli_cuda_* call so the redirect macros have a
+         * valid function pointer. Linux/macOS use compile-time linking. */
+        if(!compat_cuda_load()){ return 2; }
+#endif
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
     }
