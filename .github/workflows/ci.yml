@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  engine:
+    name: Engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: c
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (portable)
+        run: make portable
+      - name: C unit tests
+        run: make test-c
+      - name: Python tests
+        run: make test-python
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  cuda-syntax:
+    name: CUDA syntax
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: c
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.0'
+          method: network
+          sub-packages: '["nvcc"]'
+      - name: Syntax check (no GPU needed)
+        run: nvcc -c backend_cuda.cu -std=c++17 -O0
