@@ -7,12 +7,12 @@ on:
     branches: [main, dev]
 
 jobs:
-  engine:
+  engine-linux-windows:
     name: Engine (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
         working-directory: c
@@ -20,6 +20,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build (portable)
         run: make portable
+      - name: C unit tests
+        run: make test-c
+      - name: Python tests
+        run: make test-python
+
+  engine-macos:
+    name: Engine (macos-latest)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: c
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libomp
+        run: brew install libomp
+      - name: Build
+        run: make glm
       - name: C unit tests
         run: make test-c
       - name: Python tests
@@ -50,7 +67,7 @@ jobs:
         working-directory: c
     steps:
       - uses: actions/checkout@v4
-      - uses: Jimver/cuda-toolkit@v0.2.19
+      - uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.4.0'
           method: network
