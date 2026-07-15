@@ -62,16 +62,11 @@ jobs:
   cuda-syntax:
     name: CUDA syntax
     runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.0-devel-ubuntu22.04
     defaults:
       run:
         working-directory: c
     steps:
       - uses: actions/checkout@v4
-      - name: Install nvcc
-        run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-4
       - name: Syntax check (no GPU needed)
         run: nvcc -c backend_cuda.cu -std=c++17 -O0
