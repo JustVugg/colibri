@@ -2148,6 +2148,12 @@ static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for 
                            * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
 static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
+static int g_batch_read=0;/* BATCH_READ=1: coalesce all layer-block misses into sorted preads.
+                           * Instead of N×expert_load (each 1-3 preads), resolve all miss
+                           * descriptors, sort by (fd,offset), issue one big pread per shard
+                           * run into a staging buffer, then memcpy into per-slot slabs.
+                           * Reduces ~550 preads/forward to ~76 (one per sparse layer).
+                           * Mutually exclusive with PIPE (batch_read supersedes it). */
 typedef struct {
     _Atomic uint64_t cur;                         /* (gen<<8)|index; gen main-only, index 0..njobs (≤64) */
     _Atomic int njobs;                            /* current batch job count */
@@ -6147,6 +6153,7 @@ int main(int argc, char **argv){
 #endif
         ;
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
+    g_batch_read = getenv("BATCH_READ")?atoi(getenv("BATCH_READ")):0;  /* coalesced batch expert reads */
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
