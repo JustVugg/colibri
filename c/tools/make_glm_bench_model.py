@@ -22,7 +22,7 @@ import torch
 from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # importa glm_fp8_emit se lanciato da c/
-from glm_fp8_emit import save_fp8_safetensors
+from glm_fp8_emit import save_fp8_safetensors, unfuse_experts
 
 
 def build_config() -> GlmMoeDsaConfig:
@@ -85,16 +85,6 @@ def main() -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     params = sum(p.numel() for p in model.parameters())
-    if args.fp8:
-        n_fp8, n_tot = save_fp8_safetensors(model.state_dict(), output / "model.safetensors")
-        # save_pretrained scrive config.json; nel path FP8 lo bypassiamo, quindi lo scriviamo
-        # a mano (serve al converter e al motore C). EN: save_pretrained writes config.json;
-        # the FP8 path bypasses it, so write it manually (converter + C engine need it).
-        (output / "config.json").write_text(json.dumps(cfg.to_dict()))
-        print(f"saved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
-              f"-> {output / 'model.safetensors'}")
-    else:
-        model.save_pretrained(output, safe_serialization=True, max_shard_size="4GB")
 
     model.to(args.device)
     prompt = [3, 14, 159, 26, 53, 58, 200, 11, 77, 240, 5, 99]
@@ -102,6 +92,25 @@ def main() -> None:
     with torch.inference_mode():
         full = model.generate(ids, max_new_tokens=8, do_sample=False, use_cache=True)[0]
         logits = model(full.unsqueeze(0), use_cache=False).logits[0]
+
+    # Unfuse experts AFTER reference generation (model needs fused weights for
+    # forward/generate) but BEFORE saving — the real checkpoint and the converter
+    # + C engine all expect per-expert 2-D gate_proj/up_proj/down_proj tensors.
+    sd = model.state_dict()
+    unfuse_experts(sd)
+
+    if args.fp8:
+        n_fp8, n_tot = save_fp8_safetensors(sd, output / "model.safetensors")
+        # save_pretrained scrive config.json; nel path FP8 lo bypassiamo, quindi lo scriviamo
+        # a mano (serve al converter e al motore C). EN: save_pretrained writes config.json;
+        # the FP8 path bypasses it, so write it manually (converter + C engine need it).
+        (output / "config.json").write_text(json.dumps(cfg.to_dict()))
+        print(f"saved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
+              f"-> {output / 'model.safetensors'}")
+    else:
+        from safetensors.torch import save_file
+        save_file({k: v.contiguous() for k, v in sd.items()}, str(output / "model.safetensors"))
+        (output / "config.json").write_text(json.dumps(cfg.to_dict()))
 
     ref = {
         "prompt_ids": prompt,

@@ -22,7 +22,7 @@ from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # importa glm_fp8_emit se lanciato da c/
 from glm_fp8_emit import (fp8_block_quantize, fp8_block_dequantize, keep_f32,
-                          save_fp8_safetensors)
+                          save_fp8_safetensors, unfuse_experts)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--fp8", action="store_true",
@@ -84,7 +84,7 @@ with torch.no_grad():
 if args.fp8:
     with torch.no_grad():
         for n, p in model.named_parameters():
-            if keep_f32(n, p) or p.dim() < 2:
+            if keep_f32(n, p) or p.dim() != 2:
                 continue
             q, s = fp8_block_quantize(p)
             p.copy_(fp8_block_dequantize(q, s))
@@ -109,12 +109,19 @@ with torch.no_grad():
 tf_pred = lg.argmax(-1).tolist()
 print("tf_pred:", tf_pred)
 
+# Unfuse experts AFTER reference generation (model needs fused weights for
+# forward/generate) but BEFORE saving — the real checkpoint and the converter
+# + C engine all expect per-expert 2-D gate_proj/up_proj/down_proj tensors.
+sd = model.state_dict()
+unfuse_experts(sd)
+
 if args.fp8:
-    n_fp8, n_tot = save_fp8_safetensors(model.state_dict(), "glm_tiny/model.safetensors")
+    n_fp8, n_tot = save_fp8_safetensors(sd, "glm_tiny/model.safetensors")
     print(f"\nsaved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
           f"-> glm_tiny/model.safetensors")
 else:
-    model.save_pretrained("glm_tiny", safe_serialization=True)
+    from safetensors.torch import save_file
+    save_file({k: v.contiguous() for k, v in sd.items()}, "glm_tiny/model.safetensors")
 json.dump(cfg.to_dict(), open("glm_tiny/config.json", "w"))
 json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred}, open("ref_glm.json", "w"))
 print("saved: glm_tiny/ (weights + config) and ref_glm.json"

@@ -66,6 +66,48 @@ def fp8_block_dequantize(w_fp8, scale):
     return qf * scale.repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)[:O, :I]
 
 
+def unfuse_experts(sd):
+    """Split HF's fused 3-D `experts.gate_up_proj` [E, 2*M, I] into per-expert 2-D
+    `experts.{e}.gate_proj` [M, I] + `experts.{e}.up_proj` [M, I], and
+    `experts.down_proj` [E, I, M] -> `experts.{e}.down_proj` [M_out, I].
+
+    The real GLM-5.2-FP8 checkpoint stores experts UNFUSED as per-expert 2-D tensors
+    (gate_proj, up_proj, down_proj), each with its own _scale_inv. HF's
+    GlmMoeDsaForCausalLM fuses gate+up into a single 3-D gate_up_proj for efficiency.
+    The converter (classify + ndim!=2 guard) and the C engine both expect the unfused
+    layout, so we split before saving.
+
+    Idempotent: if experts are already unfused (no 3-D gate_up_proj), returns sd as-is.
+    EN: split HF's fused 3-D expert weights into the per-expert 2-D layout that the real
+    EN: checkpoint uses and the converter/engine expect. No-op if already unfused."""
+    keys_to_remove = []
+    new_entries = {}
+    for name, t in sd.items():
+        if not name.endswith(".mlp.experts.gate_up_proj"):
+            continue
+        # prefix = everything before ".mlp.experts.gate_up_proj"
+        prefix = name[:-len(".mlp.experts.gate_up_proj")]
+        E, twoM, I = t.shape          # [E, 2*intermediate, input]
+        M = twoM // 2
+        for e in range(E):
+            new_entries[f"{prefix}.mlp.experts.{e}.gate_proj.weight"] = t[e, :M, :].contiguous()
+            new_entries[f"{prefix}.mlp.experts.{e}.up_proj.weight"]   = t[e, M:, :].contiguous()
+        keys_to_remove.append(name)
+    # down_proj may be 3-D [E, I, M] in the fused form, or already per-expert
+    for name, t in sd.items():
+        if not name.endswith(".mlp.experts.down_proj") or t.dim() != 3:
+            continue
+        prefix = name[:-len(".mlp.experts.down_proj")]
+        E = t.shape[0]
+        for e in range(E):
+            new_entries[f"{prefix}.mlp.experts.{e}.down_proj.weight"] = t[e].contiguous()
+        keys_to_remove.append(name)
+    for k in keys_to_remove:
+        sd.pop(k, None)
+    sd.update(new_entries)
+    return sd
+
+
 def state_dict_to_fp8(sd):
     """Converte uno state_dict HuggingFace nel layout FP8 del checkpoint reale:
     per ogni tensore quantizzabile 2-D scrive `{name}` (F8_E4M3) + `{name}_scale_inv` (F32);
