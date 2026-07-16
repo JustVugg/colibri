@@ -29,6 +29,12 @@ Design notes:
 """
 import os, sys, re, json, time, argparse, subprocess, signal, traceback
 from datetime import datetime
+
+def fmt_val(v, suffix=""):
+    """Format a metric value for console output: '?' if None, else str(v)+suffix."""
+    if v is None: return "?"
+    if isinstance(v, float): return f"{v:.3f}{suffix}" if "e" not in f"{v:.3f}" else f"{v:.2e}{suffix}"
+    return f"{v}{suffix}"
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -136,7 +142,8 @@ def extract_metrics(stdout: str, stderr: str) -> dict:
         m = rx.search(combined)
         if m:
             try: metrics[name] = fn(m)
-            except (ValueError, IndexError): pass
+            except (ValueError, IndexError, TypeError) as e:
+                pass  # parse failed for this metric — raw log has the line for debugging
     # TOKENS dump is stderr-only and may appear once; grab it explicitly
     m = RX["tokens_dump"][0].search(text_err)
     if m:
@@ -165,8 +172,61 @@ def extract_metrics(stdout: str, stderr: str) -> dict:
             mm = rx.search(line)
             if mm:
                 try: p[pname] = fn(mm)
-                except: pass
+                except Exception: pass
         if p: metrics[label] = p
+    # ATTENTION sub-buckets (projection/RoPE, score-softmax-value, output projection)
+    for idx, line in enumerate(l for l in text_out.splitlines() if l.startswith("ATTENTION:")):
+        label = "prefill_attention_detail" if idx == 0 else "decode_attention_detail"
+        d = {}
+        for tag, rx in [("proj_rope", r"projection/RoPE ([\d.]+)s"),
+                        ("score_softmax", r"score-softmax-value ([\d.]+)s"),
+                        ("output_proj", r"output projection ([\d.]+)s")]:
+            mm = re.search(rx, line)
+            if mm:
+                try: d[tag] = float(mm.group(1))
+                except Exception: pass
+        if d: metrics[label] = d
+    # OTHER sub-buckets (rmsnorm, router, untracked, etc.)
+    for idx, line in enumerate(l for l in text_out.splitlines() if l.startswith("OTHER:")):
+        label = "prefill_other_detail" if idx == 0 else "decode_other_detail"
+        d = {}
+        for tag, rx in [("rmsnorm", r"rmsnorm ([\d.]+)s"), ("router", r"router ([\d.]+)s"),
+                        ("resadd", r"resadd ([\d.]+)s"), ("untracked", r"untracked ([\d.]+)s"),
+                        ("alloc", r"alloc ([\d.]+)s"), ("cache", r"cache ([\d.]+)s")]:
+            mm = re.search(rx, line)
+            if mm:
+                try: d[tag] = float(mm.group(1))
+                except Exception: pass
+        if d: metrics[label] = d
+    # stderr diagnostic lines: capture activation confirmations for optimization features
+    diag = {}
+    for tag, rx in [
+        ("cache_route", r"\[CACHE_ROUTE\] on (.+)"),
+        ("expert_budget_dropped", r"dropped (\d+) experts.*?saved"),
+        ("pin_placement", r"\[PIN\] placement: (.+)"),
+        ("usage_loaded", r"\[USAGE\] (.+)"),
+        ("dsa_active", r"\[DSA\] (.+)"),
+        ("cuda_mode", r"\[CUDA\] mode: (.+)"),
+        ("cuda_tier_summary", r"CUDA expert tier: (.+)"),
+        ("mtp_active", r"\[MTP\] (.+)"),
+        ("kv_slots", r"\[KV\] (.+)"),
+    ]:
+        mm = re.search(rx, text_err)
+        if mm:
+            try: diag[tag] = mm.group(1).strip()
+            except Exception: pass
+    if diag: metrics["diagnostics"] = diag
+    # route_agree and route_kl (if CACHE_ROUTE active)
+    mm = re.search(r"route_agree ([\d.]+)% \| route_kl ([\d.]+)", text_out)
+    if mm:
+        metrics["route_agree"] = float(mm.group(1))
+        metrics["route_kl"] = float(mm.group(2))
+    # swap rate (CACHE_ROUTE)
+    mm = re.search(r"swap ([\d.]+)% \((\d+)/(\d+)\)", text_out)
+    if mm:
+        metrics["route_swap_pct"] = float(mm.group(1))
+        metrics["route_swaps"] = int(mm.group(2))
+        metrics["route_slots"] = int(mm.group(3))
     return metrics
 
 
@@ -217,11 +277,22 @@ class EngineRunner:
         except Exception as e:
             stdout, stderr, rc = "", f"[EXCEPTION] {e}\n{traceback.format_exc()}", -2
         elapsed = time.time() - t0
-        # Write raw log (both streams, clearly delimited)
+        # Write raw log (both streams + env, clearly delimited for reproducibility)
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"=== CMD: {' '.join(cmd)}\n=== ELAPSED: {elapsed:.1f}s\n=== RC: {rc}\n\n")
-            f.write("--- STDOUT ---\n"); f.write(stdout or ""); f.write("\n")
-            f.write("--- STDERR ---\n"); f.write(stderr or ""); f.write("\n")
+            # Log all non-inherited env vars so runs are reproducible
+            inherited = set(os.environ.keys())
+            custom_env = {k:v for k,v in env.items() if k not in inherited or k in
+                          ("SNAP","PROMPT","NGEN","SCORE","TOKENS","TEMP","RAM_GB",
+                           "CACHE_ROUTE","ROUTE_J","ROUTE_M","EXPERT_BUDGET",
+                           "COLI_CUDA","COLI_GPU","CUDA_DENSE","COLI_CUDA_ATTN",
+                           "COLI_CUDA_PIPE","COLI_CUDA_PIPE_S_MIN","COLI_CUDA_MTP",
+                           "DIRECT","PIPE","PIPE_WORKERS","MTP","LOOKA","DISK_SPLIT",
+                           "ROUTE_AGREE","COLI_CUDA_PROFILE")}
+            f.write("--- ENV (custom) ---\n")
+            for k in sorted(custom_env): f.write(f"{k}={custom_env[k]}\n")
+            f.write(f"\n--- STDOUT ---\n"); f.write(stdout or ""); f.write("\n")
+            f.write(f"--- STDERR ---\n"); f.write(stderr or ""); f.write("\n")
         return stdout or "", stderr or "", rc, elapsed
 
 
@@ -314,7 +385,8 @@ class DiagnosticHarness:
             except Exception as e:
                 print(f"[warn] could not load tokenizer: {e}", file=sys.stderr)
         self.results = {"meta": {"snap": self.snap, "glm": self.glm,
-                                 "timestamp": ts, "args": vars(args)},
+                                 "timestamp": ts, "args": vars(args),
+                                 "env_stack": base_env},
                         "phases": {}}
 
     def phase_system(self):
@@ -431,6 +503,8 @@ class DiagnosticHarness:
             "generated_text": text[:500],
             "prefill_profile": metrics.get("prefill_profile", {}),
             "decode_profile": metrics.get("decode_profile", {}),
+            "decode_attention_detail": metrics.get("decode_attention_detail", {}),
+            "decode_other_detail": metrics.get("decode_other_detail", {}),
             "decode_tps": metrics.get("decode_tps"),
             "prefill_secs": metrics.get("prefill_secs"),
             "hit_rate": metrics.get("hit_rate"),
@@ -440,26 +514,44 @@ class DiagnosticHarness:
             "mtp_counts": metrics.get("mtp_acc_cnt"),
             "spec_tok_per_fw": metrics.get("spec_tok_per_fw"),
             "cuda_tier": metrics.get("cuda_tier"),
+            "route_agree": metrics.get("route_agree"),
+            "route_kl": metrics.get("route_kl"),
+            "route_swap_pct": metrics.get("route_swap_pct"),
+            "diagnostics": metrics.get("diagnostics", {}),
             "progress_curve": metrics.get("progress_curve", []),
         }
         # Print the PROFILE breakdown
         dp = result["decode_profile"]
         print(f"\n  DECODE TIMING BREAKDOWN (per-bucket, seconds):")
-        print(f"    expert-disk:    {dp.get('prof_expert_disk', '?'):>8}")
-        print(f"    expert-matmul:  {dp.get('prof_expert_mm', '?'):>8}")
-        print(f"    attention:      {dp.get('prof_attention', '?'):>8}")
-        print(f"    lm_head:        {dp.get('prof_lm_head', '?'):>8}")
-        print(f"    other:          {dp.get('prof_other', '?'):>8}")
+        print(f"    expert-disk:    {fmt_val(dp.get('prof_expert_disk'))}")
+        print(f"    expert-matmul:  {fmt_val(dp.get('prof_expert_mm'))}")
+        print(f"    attention:      {fmt_val(dp.get('prof_attention'))}")
+        print(f"    lm_head:        {fmt_val(dp.get('prof_lm_head'))}")
+        print(f"    other:          {fmt_val(dp.get('prof_other'))}")
+        ad = result.get("decode_attention_detail", {})
+        if ad:
+            print(f"    └ projection:   {fmt_val(ad.get('proj_rope'))}")
+            print(f"    └ softmax:      {fmt_val(ad.get('score_softmax'))}")
+            print(f"    └ output proj:  {fmt_val(ad.get('output_proj'))}")
         print(f"\n  PERFORMANCE:")
-        print(f"    prefill:   {result['prefill_secs']:.2f}s" if result['prefill_secs'] else "    prefill:   ?")
-        print(f"    decode:    {result['decode_tps']:.3f} tok/s" if result['decode_tps'] else "    decode:    ?")
-        print(f"    hit rate:  {result['hit_rate']:.1f}%" if result.get('hit_rate') is not None else "    hit rate:  ?")
-        print(f"    RSS:       {result['rss_gb']:.1f} GB" if result.get('rss_gb') else "    RSS:       ?")
-        print(f"    exp/tok:   {result['experts_per_tok']:.1f}" if result.get('experts_per_tok') else "    exp/tok:   ?")
-        print(f"    MTP:       {result['mtp_accept']:.0f}% accept" if result.get('mtp_accept') is not None else "    MTP:       ?")
+        print(f"    prefill:   {fmt_val(result['prefill_secs'], 's')}")
+        print(f"    decode:    {fmt_val(result['decode_tps'], ' tok/s')}")
+        print(f"    hit rate:  {fmt_val(result.get('hit_rate'), '%')}")
+        print(f"    RSS:       {fmt_val(result.get('rss_gb'), ' GB')}")
+        print(f"    exp/tok:   {fmt_val(result.get('experts_per_tok'))}")
+        print(f"    MTP:       {fmt_val(result.get('mtp_accept'), '% accept')}")
+        if result.get('route_agree') is not None:
+            print(f"    route_agree: {result['route_agree']:.1f}% (KL={result.get('route_kl','?')})")
+        if result.get('route_swap_pct') is not None:
+            print(f"    swap: {result['route_swap_pct']:.1f}%")
         if result.get('cuda_tier'):
             ct = result['cuda_tier']
             print(f"    CUDA tier: {ct['resident']} experts, {ct['vram_gb']:.1f} GB VRAM")
+        diag = result.get("diagnostics", {})
+        if diag:
+            print(f"\n  ENGINE DIAGNOSTICS (stderr):")
+            for k, v in sorted(diag.items()):
+                print(f"    {k}: {v[:80] if isinstance(v, str) else v}")
         # Show generated text preview
         if text:
             print(f"\n  GENERATED TEXT (first 200 chars):")
@@ -489,10 +581,13 @@ class DiagnosticHarness:
         py = sys.executable
         cmd = [py, eval_script, "--snap", self.snap, "--glm", self.glm,
                "--data", bench_dir, "--tasks", ",".join(tasks), "--limit", str(limit)]
+        # eval_glm.py inherits our env and passes it to glm.exe via dict(os.environ).
+        # Apply the same optimization stack so scoring runs at full speed.
         env = dict(os.environ)
-        if self.args.ram: env["RAM_GB"] = str(self.args.ram)
+        env.update(self.runner.default_env)
         print(f"  Running eval_glm.py (tasks={tasks}, n={limit})...")
-        print(f"  This takes ~{limit*3*4/0.05:.0f}s at 0.05 tok/s (worst case)...")
+        print(f"  Optimization stack: {', '.join(k+'='+v for k,v in sorted(self.runner.default_env.items()) if k not in ('TEMP',))}")
+        print(f"  ETA: ~{limit*3*4/1.0:.0f}s at ~1 tok/s (or ~{limit*3*4/0.3:.0f}s at 0.3 tok/s)...")
         t0 = time.time()
         log_path = self.out_dir / "quality_eval.log"
         try:
