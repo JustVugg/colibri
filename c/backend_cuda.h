@@ -110,6 +110,23 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch8(ColiCudaTensor *kv_b,
                                       int S,int H,int Q,int R,
                                       int V,int K,int T,float attention_scale);
 
+/* KV8 long-T: device-resident fp8 KV shadow. No T cap (tiled online softmax
+ * beyond the shared-memory limit); only q goes up and ctx/out comes down.
+ * The _sel variant attends the DSA-selected rows only (absolute indices). */
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev8(ColiCudaTensor *kv_b,float *ctx,const float *q,
+        const uint8_t *latent_dev,const float *lsc_dev,
+        const uint8_t *rope_dev,const float *rsc_dev,
+        int H,int Q,int R,int V,int K,int T,float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev8_sel(ColiCudaTensor *kv_b,float *ctx,const float *q,
+        const uint8_t *latent_dev,const float *lsc_dev,
+        const uint8_t *rope_dev,const float *rsc_dev,
+        const int *sel,int nsel,int H,int Q,int R,int V,int K,float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_kvdev8(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+        float *out,const float *q,
+        const uint8_t *latent_dev,const float *lsc_dev,
+        const uint8_t *rope_dev,const float *rsc_dev,
+        int S,int H,int Q,int R,int V,int K,int T,float attention_scale);
+
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
