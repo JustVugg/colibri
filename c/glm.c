@@ -1554,7 +1554,7 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
     for(int d=0,h0=0;d<g_cuda_ndev;d++){
         int hn=H/g_cuda_ndev+(d<H%g_cuda_ndev),rows=hn*(Q+V);
         const void *part=weights+(int64_t)h0*(Q+V)*rb;
-        const float *scale=l->kv_b.s+(int64_t)h0*(Q+V);
+        const float *scale=l->kv_b.s+(int64_t)h0*(Q+V)*(l->kv_b.gs>0?(l->kv_b.I+l->kv_b.gs-1)/l->kv_b.gs:1);
         if(!coli_cuda_tensor_upload(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d],l->kv_b.gs))return;
         l->shard_h0[d]=h0;l->shard_hn[d]=hn;l->n_kv_b_shard++;h0+=hn;
     }
