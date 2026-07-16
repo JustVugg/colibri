@@ -3,9 +3,33 @@ Architettura vera (MLA + DSA indexer + router sigmoid/noaux_tc + shared expert),
 dimensioni minuscole. Salva pesi+config in c/glm_tiny/ e un riferimento greedy in
 c/ref_glm.json. seq corta (<= index_topk) cosi' il DSA seleziona tutte le key e
 l'attenzione coincide con la MLA densa: il motore C puo' validare senza implementare
-l'indexer sparso."""
-import json, torch
+l'indexer sparso.
+
+--fp8: salva i pesi come FP8 e4m3 + scale a blocchi 128x128 (layout del checkpoint reale
+GLM-5.2-FP8) invece di bf16, cosi' convert_fp8_to_int4.py puo' esercitare il path FP8->int4
+su un modello minuscolo. PRIMA di calcolare ref_glm.json fa il round-trip dei pesi per FP8
+(quant->dequant, copy_ nel modello): cosi' il riferimento riflette ESATTAMENTE il modello
+FP8 che il converter legge, non il modello bf16 a precisione piena. Default: bf16 (oracolo
+originale invariato).
+EN: --fp8 writes FP8 e4m3 + 128x128 block scale_inv (real GLM-5.2-FP8 layout) instead of bf16,
+EN: so convert_fp8_to_int4.py can run its FP8->int4 path on a tiny model. ref_glm.json is
+EN: computed AFTER the FP8 round-trip, so the reference matches exactly what the converter
+EN: ingests. Default: bf16 (original oracle unchanged)."""
+import json, sys, argparse
+from pathlib import Path
+import torch
 from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # importa glm_fp8_emit se lanciato da c/
+from glm_fp8_emit import (fp8_block_quantize, fp8_block_dequantize, keep_f32,
+                          save_fp8_safetensors, unfuse_experts)
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--fp8", action="store_true",
+                help="salva in FP8 e4m3 + 128x128 block scale_inv (layout GLM-5.2-FP8) e "
+                     "calcola ref_glm.json sul modello dopo il round-trip FP8. "
+                     "EN: write FP8 e4m3 + block scale_inv, ref computed on FP8-rounded model")
+args = ap.parse_args()
 
 torch.manual_seed(1234)
 
@@ -53,6 +77,18 @@ with torch.no_grad():
             layer.mlp.gate.e_score_correction_bias.copy_(
                 torch.linspace(-0.1, 0.1, cfg.n_routed_experts))
 
+# --fp8: round-trip dei pesi quantizzabili per FP8 PRIMA di calcolare il riferimento,
+# cosi' ref_glm.json riflette esattamente il modello FP8 che il converter leggera'.
+# Norme/router/bias (keep_f32) restano a precisione piena. EN: --fp8: round-trip quantizable
+# weights through FP8 before computing the reference, so ref_glm.json matches the FP8 model.
+if args.fp8:
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if keep_f32(n, p) or p.dim() != 2:
+                continue
+            q, s = fp8_block_quantize(p)
+            p.copy_(fp8_block_dequantize(q, s))
+
 print("=== state_dict tensors (names used by the C loader) ===")
 for n, p in model.state_dict().items():
     print(f"  {n:60s} {tuple(p.shape)}")
@@ -73,7 +109,20 @@ with torch.no_grad():
 tf_pred = lg.argmax(-1).tolist()
 print("tf_pred:", tf_pred)
 
-model.save_pretrained("glm_tiny", safe_serialization=True)
+# Unfuse experts AFTER reference generation (model needs fused weights for
+# forward/generate) but BEFORE saving — the real checkpoint and the converter
+# + C engine all expect per-expert 2-D gate_proj/up_proj/down_proj tensors.
+sd = model.state_dict()
+unfuse_experts(sd)
+
+if args.fp8:
+    n_fp8, n_tot = save_fp8_safetensors(sd, "glm_tiny/model.safetensors")
+    print(f"\nsaved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
+          f"-> glm_tiny/model.safetensors")
+else:
+    from safetensors.torch import save_file
+    save_file({k: v.contiguous() for k, v in sd.items()}, "glm_tiny/model.safetensors")
 json.dump(cfg.to_dict(), open("glm_tiny/config.json", "w"))
 json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred}, open("ref_glm.json", "w"))
-print("\nsaved: glm_tiny/ (weights + config) and ref_glm.json")
+print("saved: glm_tiny/ (weights + config) and ref_glm.json"
+      + (" [fp8]" if args.fp8 else ""))

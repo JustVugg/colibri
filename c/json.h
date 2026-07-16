@@ -26,7 +26,13 @@ typedef struct {
     const char *s;
     char       *arena;     /* buffer per le stringhe smontate */
     size_t      acap, aoff;
+    int         depth;     /* annidamento corrente: bound contro lo stack-overflow
+                            * da JSON malevolo tipo [[[[...]]]] (discesa ricorsiva) */
 } jparser;
+
+/* tetto di annidamento: gli header safetensors / config sono piatti (profondita'
+ * ~3). 1024 e' larghissimo per input legittimi e ben sotto il limite di stack. */
+#define J_MAX_DEPTH 1024
 
 static char *j_dup(jparser *p, const char *b, int n) {
     /* ogni stringa ha la sua allocazione: un'arena con realloc sposterebbe il
@@ -91,10 +97,11 @@ static jval *j_parse_val(jparser *p) {
     char c = *p->s;
     if (c == '"') { jval *v = j_new(J_STR); v->str = j_parse_str_raw(p); return v; }
     if (c == '{') {
+        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_OBJ);
         int cap = 8; v->keys = malloc(cap * sizeof(char*)); v->kids = malloc(cap * sizeof(jval*));
         j_ws(p);
-        if (*p->s == '}') { p->s++; return v; }
+        if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
             j_ws(p);
             char *key = j_parse_str_raw(p);
@@ -107,13 +114,15 @@ static jval *j_parse_val(jparser *p) {
             if (*p->s == '}') { p->s++; break; }
             break;
         }
+        p->depth--;
         return v;
     }
     if (c == '[') {
+        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_ARR);
         int cap = 8; v->kids = malloc(cap * sizeof(jval*));
         j_ws(p);
-        if (*p->s == ']') { p->s++; return v; }
+        if (*p->s == ']') { p->s++; p->depth--; return v; }
         for (;;) {
             jval *val = j_parse_val(p);
             if (v->len == cap) { cap *= 2; v->kids = realloc(v->kids, cap*sizeof(jval*)); }
@@ -123,6 +132,7 @@ static jval *j_parse_val(jparser *p) {
             if (*p->s == ']') { p->s++; break; }
             break;
         }
+        p->depth--;
         return v;
     }
     if (c == 't') { p->s += 4; jval *v = j_new(J_BOOL); v->boolean = 1; return v; }
@@ -134,7 +144,7 @@ static jval *j_parse_val(jparser *p) {
 
 /* API */
 static jval *json_parse(const char *text, char **arena_out) {
-    jparser p = { text, NULL, 0, 0 };
+    jparser p = { text, NULL, 0, 0, 0 };
     jval *v = j_parse_val(&p);
     if (arena_out) *arena_out = p.arena; else free(p.arena);
     return v;

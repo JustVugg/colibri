@@ -10,8 +10,10 @@ from pathlib import Path
 
 
 SPEED_RE = re.compile(r"REPLAY decode:.*\| ([0-9.]+) tok/s")
+# accetta sia il formato storico "expert-disk 0.123s |" sia quello attuale
+# "expert-disk 0.123s service / 0.045s wait |" (glm.c profile_print)
 PROFILE_RE = re.compile(
-    r"PROFILE: expert-disk ([0-9.]+)s \| expert-matmul ([0-9.]+)s "
+    r"PROFILE: expert-disk ([0-9.]+)s(?: service / ([0-9.]+)s wait)? \| expert-matmul ([0-9.]+)s "
     r"\| attention ([0-9.]+)s .* lm_head ([0-9.]+)s \| other ([0-9.-]+)s"
 )
 PROFILE_KEYS = ("disk", "expert_matmul", "attention", "lm_head", "other")
@@ -23,7 +25,9 @@ def parse_output(stdout: str, stderr: str = "") -> tuple[float, list[float]]:
     profile = PROFILE_RE.search(stdout)
     if not speed or not profile:
         raise RuntimeError(f"benchmark output missing\nstdout:\n{stdout}\nstderr:\n{stderr}")
-    return float(speed.group(1)), [float(value) for value in profile.groups()]
+    service, wait, *rest = profile.groups()
+    disk = float(service) + (float(wait) if wait else 0.0)
+    return float(speed.group(1)), [disk] + [float(value) for value in rest]
 
 
 def execute(engine: str, env: dict[str, str]) -> tuple[float, list[float]]:

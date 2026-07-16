@@ -48,11 +48,24 @@ def load_docs(task, data_dir, limit, seed):
     random.Random(seed).shuffle(docs)
     return docs[:limit] if limit else docs
 
-def build_requests(tk, docs_by_task):
+def detect_prefix(snap):
+    """GLM sees [gMASK]<sop> at the start of every training sequence; scoring raw text
+    without it is out-of-distribution and silently depresses/distorts scores (#108).
+    Default the prefix ON for GLM snapshots; EVAL_PREFIX (even empty) overrides."""
+    if "EVAL_PREFIX" in os.environ: return os.environ["EVAL_PREFIX"]
+    try: mt = json.load(open(os.path.join(snap, "config.json"))).get("model_type", "")
+    except Exception: mt = ""
+    if "glm" in mt.lower():
+        print("[prefix] GLM snapshot: prepending [gMASK]<sop> to every context "
+              "(override with EVAL_PREFIX, disable with EVAL_PREFIX=)", file=sys.stderr)
+        return "[gMASK]<sop>"
+    return ""
+
+def build_requests(tk, docs_by_task, prefix=""):
     reqs, meta, perq = [], [], {}
     for t, docs in docs_by_task.items():
         for qi, d in enumerate(docs):
-            ctx, conts, gold = d["ctx"], d["choices"], int(d["gold"])
+            ctx, conts, gold = prefix + d["ctx"], d["choices"], int(d["gold"])
             ctx_ids = tk.encode(ctx).ids
             for oi, cont in enumerate(conts):
                 full = tk.encode(ctx + cont).ids
@@ -115,14 +128,17 @@ def main():
     docs_by_task = {t: load_docs(t, a.data, a.limit, a.seed) for t in tasks}
     for t, d in docs_by_task.items(): print(f"[{t}] {len(d)} questions", file=sys.stderr)
 
-    reqs, meta, perq = build_requests(tk, docs_by_task)
+    reqs, meta, perq = build_requests(tk, docs_by_task, detect_prefix(a.snap))
     print(f"total requests: {len(reqs)} (answer options)", file=sys.stderr)
     if a.dry:
         for r in reqs[:3]: print("  example request:", r[:80], "...", file=sys.stderr)
         print("DRY: request construction and tokenization passed. Engine was not run.", file=sys.stderr); return
 
-    req_path = tempfile.mktemp(suffix=".txt")
-    open(req_path, "w").write("\n".join(reqs) + "\n")
+    # mkstemp (non mktemp): crea il file atomicamente con permessi 0600, niente
+    # race TOCTOU/symlink su una tmp dir condivisa (CWE-377).
+    fd, req_path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(reqs) + "\n")
     env = dict(os.environ, SNAP=a.snap, SCORE=req_path)
     if a.ram: env["RAM_GB"] = str(a.ram)
     cmd = [a.glm, str(a.cap)] + a.bits.split()

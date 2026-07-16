@@ -14,8 +14,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+
+/* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
+ * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
+ * malloc gigante prima ancora di leggere: lo respingiamo. */
+#define ST_MAX_HEADER (512ll << 20)
 
 typedef struct {
     char   *name;
@@ -81,8 +87,8 @@ static int st_open_fd(shards *S, const char *path) {
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
-#elif defined(__APPLE__)
-    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE ~ O_DIRECT */
+#elif defined(__APPLE__) || defined(_WIN32)
+    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
 #else
     S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
 #endif
@@ -118,14 +124,27 @@ static void st_init(shards *S, const char *snap_dir) {
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
+        struct stat sst;
+        if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
+        int64_t fsz = (int64_t)sst.st_size;
         uint64_t hlen;
         if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
+        /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
+         * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
+         * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
+         * malloc gigante. */
+        if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
+            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
+                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
         char *hdr = malloc(hlen + 1);
+        if (!hdr) { perror("malloc safetensors header"); exit(1); }
         if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
         jval *root = json_parse(hdr, &arena);
+        if (!root || root->t != J_OBJ) {
+            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
             if (!strcmp(name, "__metadata__")) continue;
@@ -133,7 +152,21 @@ static void st_init(shards *S, const char *snap_dir) {
             jval *dt = json_get(m, "dtype");
             jval *off = json_get(m, "data_offsets");
             jval *shp = json_get(m, "shape");
+            /* un header crafted puo' omettere i campi o dare tipi sbagliati:
+             * senza questi guard si dereferenzia NULL (json_get) o si legge
+             * off->kids[0/1] oltre i limiti dell'array. */
+            if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
+                !shp || shp->t != J_ARR) {
+                fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
+                        files[fi], name); exit(1); }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
+            /* offset dichiarati dal file: non-negativi, ordinati e dentro al
+             * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
+             * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
+             * oppure off punta fuori dal file. */
+            if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
+                fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
+                        files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
             int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
@@ -184,6 +217,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     void *raw = malloc(t->nbytes);
+    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
     if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);

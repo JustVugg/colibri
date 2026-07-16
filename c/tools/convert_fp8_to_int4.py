@@ -51,6 +51,38 @@ def quant_int4(w, bits):                        # -> (qbytes U8 [O*ceil(I/2)], s
         out[:, :v1.shape[1]] |= (v1 << 4)
     return out.reshape(-1), s[:, 0].astype(np.float32)
 
+def quant_int4_grouped(w, bits, gs=128):
+    """Group-scaled int4: one scale per group of `gs` elements along the input dim.
+    Drastically reduces quantization error vs per-row scaling — matches the FP8
+    source's 128x128 block-scale granularity. Output layout:
+      qbytes: same packed nibble format as quant_int4
+      scales: f32 [O * ngroups] where ngroups = ceil(I/gs), laid out as
+              s[o * ngroups + g] = scale for row o, group g.
+    The engine detects this format (fmt=4) by checking the .qs array size."""
+    O, I = w.shape
+    qmax = (1 << (bits - 1)) - 1
+    ngroups = (I + gs - 1) // gs
+    # pad I to a multiple of gs for clean reshape, then trim
+    Ipad = ngroups * gs
+    wpad = np.zeros((O, Ipad), np.float32)
+    wpad[:, :I] = w
+    wr = wpad.reshape(O, ngroups, gs)                     # [O, ngroups, gs]
+    amax = np.abs(wr).max(axis=2, keepdims=True)          # [O, ngroups, 1]
+    s = np.maximum(amax / qmax, 1e-8)                     # [O, ngroups, 1]
+    q = np.clip(np.rint(wr / s), -8, qmax).astype(np.int32)  # [O, ngroups, gs]
+    q = q.reshape(O, Ipad)[:, :I]                         # trim padding -> [O, I]
+    # pack nibbles (identical to quant_int4)
+    rb = (I + 1) // 2
+    out = np.zeros((O, rb), np.uint8)
+    v0 = (q[:, 0::2] + 8).astype(np.uint8)
+    out[:, :v0.shape[1]] = v0
+    if I > 1:
+        v1 = (q[:, 1::2] + 8).astype(np.uint8)
+        out[:, :v1.shape[1]] |= (v1 << 4)
+    # scales: flatten [O, ngroups] -> [O * ngroups]
+    s_flat = s[:, :, 0].astype(np.float32).reshape(-1)
+    return out.reshape(-1), s_flat
+
 def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
     O, I = w.shape
     qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
@@ -64,6 +96,16 @@ def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], s
         out[:, :vk.shape[1]] |= ((vk + 2).astype(np.uint8) << (k * 2))
     return out.reshape(-1), s[:, 0].astype(np.float32)
 
+# ---------- NVFP4 (modelopt) : LUT e2m1 ----------
+# FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codici, magnitudini {0,.5,1,1.5,2,3,4,6}.
+# Bit 3 = segno. Ordine impacchettato (compressed_tensors/vLLM): nibble BASSO = elemento
+# pari, nibble ALTO = elemento dispari. LUT verificata 1:1 con ml_dtypes.float4_e2m1fn.
+# EN: FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codes, magnitudes {0,.5,1,1.5,2,3,4,6}.
+# EN: bit 3 = sign. Packed order (compressed_tensors/vLLM): LOW nibble = even element,
+# EN: HIGH nibble = odd element. LUT verified 1:1 against ml_dtypes.float4_e2m1fn.
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
 # ---------- classificazione dei tensori ----------
 def layer_idx(name):
     p = name.split(".")
@@ -73,7 +115,10 @@ def layer_idx(name):
     return -1
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
-    if name.endswith("_scale_inv"): return "consumed"   # gestito col suo peso
+    if name.endswith("_scale_inv"): return "consumed"   # FP8 base: gestito col suo peso
+    # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro U8 .weight.
+    # EN: NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
+    if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
     li = layer_idx(name)
     if keep_idx:
         # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
@@ -92,13 +137,75 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
     if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
     if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
-    if name.endswith(".weight"): return "q"              # attn/dense-mlp/shared (residente)
+    # Split resident weights by type for mixed-precision control:
+    #   "sh" = shared expert (fires on every token, highest sensitivity)
+    #   "o"  = o_proj attention (reconstructs output, biggest attn tensor)
+    #   "kvb" = kv_b_proj (reconstructs KV cache on every decode step)
+    #   "attn" = other attention projections (q_a, q_b, kv_a)
+    #   "dmlp" = dense MLP (first 3 layers)
+    if "shared_experts" in name: return "sh"
+    if name.endswith("o_proj.weight"): return "o"
+    if name.endswith("kv_b_proj.weight"): return "kvb"
+    if any(name.endswith(k) for k in ("q_a_proj.weight", "q_b_proj.weight",
+                                       "kv_a_proj_with_mqa.weight")): return "attn"
+    if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
+                                       "mlp.down_proj.weight")): return "dmlp"
+    if name.endswith(".weight"): return "q"              # fallback: other resident weights
     return "f32"
 
-# ---------- dequant di un tensore (fp8+scale a blocchi / bf16 / f32) ----------
-def dequant(f, name):
+# ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
+def dequant_nvfp4(f, name):
+    """NVFP4 di NVIDIA modelopt (quant_algo=NVFP4, quant_method=modelopt).
+      - `name`               U8   [O, I/2]  : due nibble e2m1 per byte lungo la dim di
+                                              contrazione (input); pari=nibble basso, dispari=alto.
+      - `name.weight_scale`  F8_E4M3 [O, I/16] : scala per-BLOCCO di 16 elementi (group_size=16),
+                                              lungo la dim di input. Decodifica f8e4m3 -> f32.
+      - `name.weight_scale_2` F32 []        : scala GLOBALE per-tensore, ~amax/(6*448) (piccola).
+    Dequant (convenzione modelopt = MOLTIPLICA, NON dividere):
+        W[o,i] = e2m1_lut[nibble] * f8_block_scale[o, i//16] * weight_scale_2
+    FOOTGUN: llm-compressor/compressed-tensors memorizza il RECIPROCO (global grande) e DIVIDE;
+    modelopt memorizza il valore piccolo e MOLTIPLICA. Questo checkpoint e' modelopt -> moltiplica.
+    EN: NVIDIA modelopt NVFP4. LOW nibble=even elem, HIGH=odd. weight_scale = per-16-block FP8
+    EN: (group_size 16) along the input dim; weight_scale_2 = per-tensor global FP32 (~amax/2688,
+    EN: small). Dequant MULTIPLIES both scales. FOOTGUN: llm-compressor stores the reciprocal
+    EN: (large global) and DIVIDES; modelopt stores the small value and MULTIPLIES."""
+    import torch
+    GS = 16                                                       # NVFP4: block scale ogni 16 elementi
+    packed = f.get_tensor(name)                                    # uint8 [O, I/2]
+    bscale = f.get_tensor(name + "_scale").to(torch.float32)        # [O, ceil(I/16)] da f8e4m3
+    gscale = f.get_tensor(name + "_scale_2").to(torch.float32)      # scalare per-tensore
+    O, Ih = packed.shape; I = Ih * 2
+    # Convenzione: modelopt memorizza il global PICCOLO e MOLTIPLICA. Se e' >=1 e'
+    # quasi certamente il reciproco di compressed-tensors (che DIVIDE) -> ci fermiamo
+    # invece di corrompere silenziosamente ogni tensore. EN: guard modelopt-vs-CT.
+    assert float(gscale) < 1.0, (
+        f"{name}: weight_scale_2={float(gscale):.4g} >= 1 sembra il reciproco "
+        "(compressed-tensors, che DIVIDE); questo path assume modelopt (MOLTIPLICA)")
+    # Il layout deve essere lo scale per-blocco piatto di modelopt: una colonna ogni
+    # 16 elementi di input (niente swizzle cutlass/TensorRT). Verifichiamo, non deduciamo:
+    # dedurre gs = I // ncol misallinea in silenzio su layout paddati/swizzati.
+    nb = (I + GS - 1) // GS
+    assert bscale.shape[1] == nb, (
+        f"{name}: weight_scale ha {bscale.shape[1]} colonne, attese {nb} = ceil({I}/{GS}); "
+        "layout scale inatteso (swizzled/paddato?), rifiuto per non corrompere")
+    lut = torch.tensor(_E2M1, dtype=torch.float32)
+    nib = torch.empty((O, I), dtype=torch.long)
+    nib[:, 0::2] = (packed & 0x0F).to(torch.long)                  # elemento pari = nibble basso
+    nib[:, 1::2] = ((packed >> 4) & 0x0F).to(torch.long)           # elemento dispari = nibble alto
+    w4 = lut[nib]                                                  # [O, I] valori e2m1
+    sc = bscale.repeat_interleave(GS, dim=1)[:, :I]               # blocco parziale di coda: slice a I
+    return (w4 * sc * gscale).numpy()
+
+# ---------- dequant di un tensore (nvfp4 / fp8+scale a blocchi / bf16 / f32) ----------
+def dequant(f, name, keys):
     import torch
     sl = f.get_slice(name); dt = sl.get_dtype()
+    # NVFP4 (modelopt): pesi expert U8 con sidecar `.weight_scale`. In questo checkpoint gli
+    # UNICI tensori U8 sono gli expert NVFP4, ma richiediamo comunque il sidecar (keys e'
+    # obbligatorio: senza, un qualunque U8 verrebbe decodificato come NVFP4).
+    # EN: NVFP4 expert weights are U8 with a `.weight_scale` sidecar; require the sidecar.
+    if dt in ("U8", "uint8") and (name + "_scale") in keys:
+        return dequant_nvfp4(f, name)
     if dt in ("F8_E4M3", "float8_e4m3fn"):
         w = f.get_tensor(name).to(torch.float32)
         sc = f.get_tensor(name + "_scale_inv").to(torch.float32)   # [ceil(O/128),ceil(I/128)]
@@ -107,21 +214,34 @@ def dequant(f, name):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False):
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
+        keys = set(f.keys())
         for name in f.keys():
             kind = classify(name, n_layers, keep_mtp, keep_idx)
             if kind in ("skip", "consumed"): continue
-            w = dequant(f, name)
+            w = dequant(f, name, keys)
             if kind == "f32":
                 out_dict[name] = w.astype(np.float32)
             else:
-                bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+                # Resolve bits for this tensor type: use bits_map override if provided,
+                # otherwise fall back to the classic ebits/xbits/io_bits scheme.
+                if bits_map and kind in bits_map:
+                    bits = bits_map[kind]
+                else:
+                    bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+                # Any unknown kind that fell through classify as "q"
+                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
+                    bits = ebits
                 if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
                     out_dict[name] = w.astype(np.float32); continue
-                q, s = (quant_int2(w, bits) if bits <= 2 else
-                        quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
+                if group_size > 0 and bits <= 4:
+                    q, s = quant_int4_grouped(w, bits, group_size)
+                else:
+                    q, s = (quant_int2(w, bits) if bits <= 2 else
+                            quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
 
@@ -135,9 +255,25 @@ def main():
     ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
     ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
+    # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
+    # Set these higher to protect sensitive tensors from quantization error.
+    ap.add_argument("--shared-bits", type=int, default=None,
+        help="bits for shared expert (fires on every token, highest sensitivity). Default=ebits")
+    ap.add_argument("--o-bits", type=int, default=None,
+        help="bits for o_proj attention (reconstructs output, biggest attn tensor). Default=ebits")
+    ap.add_argument("--kvb-bits", type=int, default=None,
+        help="bits for kv_b_proj (reconstructs KV cache on every decode). Default=ebits")
+    ap.add_argument("--attn-bits", type=int, default=None,
+        help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
+    ap.add_argument("--dmlp-bits", type=int, default=None,
+        help="bits for dense MLP (first 3 layers). Default=ebits")
+    ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
+        help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--selftest-nvfp4", action="store_true",
+        help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
     ap.add_argument("--mtp", action="store_true",
         help="download and convert ONLY the MTP head (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
     ap.add_argument("--indexer", action="store_true",
@@ -151,6 +287,77 @@ def main():
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
         a.ebits = 8 if (a.mtp or a.indexer) else 4
     if a.xbits is None: a.xbits = a.ebits
+
+    # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
+    # converter falls back to ebits for that type.
+    bits_map = {}
+    if a.shared_bits is not None: bits_map["sh"] = a.shared_bits
+    if a.o_bits is not None:      bits_map["o"] = a.o_bits
+    if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
+    if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
+    if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
+    if bits_map:
+        print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+
+    if a.selftest_nvfp4:
+        import torch
+        # 1) LUT e2m1: i 16 codici devono decodificare esattamente ai valori attesi.
+        lut = torch.tensor(_E2M1, dtype=torch.float32)
+        expect = [0.0,0.5,1.0,1.5,2.0,3.0,4.0,6.0,-0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0]
+        assert lut.tolist() == expect, "LUT e2m1 errata"
+        print("[nvfp4] LUT e2m1: 16/16 codici OK")
+        # 2) round-trip: costruisco un tensore ai SOLI valori rappresentabili (scala nota per
+        #    blocco+globale), impacchetto come modelopt, poi dequant deve tornare ESATTO.
+        import numpy as np, io
+        from safetensors.torch import save as st_save
+        from safetensors import safe_open
+        rng = np.random.default_rng(0); O, I, GS = 8, 64, 16
+        codes = rng.integers(0, 16, size=(O, I)).astype(np.uint8)   # nibble e2m1 casuali
+        w4 = np.array(_E2M1, np.float32)[codes]                      # [O,I]
+        # scale per-blocco (rappresentabili in f8e4m3) + globale piccola (stile modelopt)
+        blk = rng.choice([0.5,1.0,2.0,4.0,8.0], size=(O, I//GS)).astype(np.float32)
+        gscale = np.float32(3.9e-5)
+        W = w4 * np.repeat(blk, GS, axis=1) * gscale                 # riferimento esatto
+        # impacchetto: pari->nibble basso, dispari->alto
+        packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
+        import ml_dtypes  # solo per il test: encode f8e4m3 delle scale di blocco
+        tens = {name: torch.from_numpy(arr) for name, arr in {
+            "w.weight": packed,
+            "w.weight_scale": blk.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),  # placeholder
+        }.items()}
+        # torch non ha un costruttore da bytes f8: passo via file safetensors scritto a mano.
+        # piu' semplice: uso direttamente dequant_nvfp4 su un finto 'f' in-memory.
+        class _F:
+            def __init__(s, d): s.d = d
+            def get_tensor(s, n): return s.d[n]
+            def get_slice(s, n): return None
+        blk_f8 = blk.astype(ml_dtypes.float8_e4m3fn)                 # quantizza le scale a f8
+        f = _F({"w.weight": torch.from_numpy(packed),
+                "w.weight_scale": torch.from_numpy(blk_f8.view(np.uint8)).view(torch.float8_e4m3fn),
+                "w.weight_scale_2": torch.tensor(gscale)})
+        got = dequant_nvfp4(f, "w.weight")
+        # riferimento con scale gia' quantizzate a f8 (per confronto esatto)
+        Wq = w4 * np.repeat(blk_f8.astype(np.float32), GS, axis=1) * gscale
+        maxerr = float(np.abs(got - Wq).max())
+        print(f"[nvfp4] round-trip encode->dequant: max abs err = {maxerr:.3e} "
+              f"({'OK' if maxerr < 1e-9 else 'FAIL'})")
+        assert maxerr < 1e-9
+        # 3) requant colibri int4 su valori dequantati -> errore piccolo atteso
+        q, s = quant_int4(got.astype(np.float32), 4)
+        rb = (I + 1)//2; qb = q.reshape(O, rb)
+        lo = (qb & 0x0F).astype(np.int32) - 8; hi = ((qb >> 4) & 0x0F).astype(np.int32) - 8
+        deq = np.empty((O, I), np.float32); deq[:, 0::2] = lo; deq[:, 1::2] = hi[:, :I-I//2]
+        deq = deq * s[:, None]
+        rel = np.abs(deq - got).mean() / (np.abs(got).mean() + 1e-12)
+        # Informativo, NON un test di uguaglianza: requantizzare int4 per-riga dati che
+        # spaziano 16x per il block-scale costa ~0.17 di errore relativo di suo. La soglia
+        # larga becca solo una corruzione grossolana, non e' un bound di precisione.
+        # EN: informational — per-row int4 requant of 16x-block-range data inherently ~0.17.
+        print(f"[nvfp4] dequant->colibri int4->dequant: errore rel medio = {rel:.4f} "
+              f"(atteso ~0.17; {'OK' if rel < 0.30 else 'ANOMALO'})")
+        assert rel < 0.30, f"requant rel err {rel:.3f} troppo alto: dequant probabilmente corrotto"
+        print("[nvfp4] SELFTEST OK")
+        return
 
     if a.selftest:
         import torch
@@ -173,7 +380,7 @@ def main():
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
             save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
         # copia config + tokenizer
         for fn in ["config.json"]:
@@ -208,11 +415,21 @@ def main():
 
     # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
     # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
-    import fcntl
+    # fcntl is Unix-only; on Windows use msvcrt or skip locking.
     lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print("ERROR: another converter is already using this output directory. Exiting."); return
+    try:
+        import fcntl
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("ERROR: another converter is already using this output directory. Exiting."); return
+    except ImportError:
+        try:
+            import msvcrt
+            try: msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("ERROR: another converter is already using this output directory. Exiting."); return
+        except ImportError:
+            pass  # no locking available — single-user converter, acceptable
 
     # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
     # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
@@ -372,7 +589,8 @@ def main():
 
     from safetensors.numpy import save_file
     import time as _t
-    for att in range(999):
+    info = None
+    for att in range(10):
         try:
             info = HfApi().repo_info(a.repo, files_metadata=True)
             # dimensioni note dallo store: abilitano il download multi-stream a segmenti.
@@ -382,7 +600,13 @@ def main():
         except KeyboardInterrupt: raise
         except Exception as ex:
             w = min(60, 5*(att+1)); print(f"repo_info failed ({type(ex).__name__}); retrying in {w}s", flush=True); _t.sleep(w)
+    if info is None:
+        print("ERROR: could not reach the repository after 10 retries. Check your network and repo name.", flush=True)
+        return
     shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
+    if not shards:
+        print("ERROR: no .safetensors shards found in this repository.", flush=True)
+        return
     for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
         except Exception: pass
@@ -399,7 +623,7 @@ def main():
             if os.path.exists(outp): print(f"[MTP] {outp} already done"); continue
             print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map)
             save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
@@ -419,7 +643,7 @@ def main():
             if os.path.exists(outp): continue             # gia' fatto -> ripartibile
             print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
             if out: save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
@@ -433,7 +657,7 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):

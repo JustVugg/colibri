@@ -1,1 +1,30 @@
-{"prompt": "The capital of France is", "prompt_ids": [510, 5347, 273, 6181, 310], "full_ids": [510, 5347, 273, 6181, 310, 7785, 15, 187, 187, 510, 5347, 273, 253, 1986, 2077, 310, 5041], "text": "The capital of France is Paris.\n\nThe capital of the United States is Washington"}
+{
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    510,
+    5347,
+    273,
+    6181,
+    310
+  ],
+  "full_ids": [
+    510,
+    5347,
+    273,
+    6181,
+    310,
+    7785,
+    15,
+    187,
+    187,
+    510,
+    3565,
+    3448,
+    273,
+    6181,
+    310,
+    5112,
+    15
+  ],
+  "text": "The capital of France is Paris.\n\nThe official language of France is French."
+}

@@ -3,14 +3,26 @@
 This is not a useful language model. It preserves the real glm_moe_dsa data
 flow while remaining small enough to generate locally and run repeated CPU/CUDA
 A/B tests without downloading the 379 GB checkpoint.
+
+With --fp8 the weights are written as FP8 e4m3 + 128x128 block scale_inv, in the
+SAME layout as the real GLM-5.2-FP8 checkpoint, so convert_fp8_to_int4.py can
+exercise its FP8->int4 dequant path on a local fixture (its dims are 128-friendly,
+so this is also the right fixture for --group-size 128 testing):
+
+  python tools/make_glm_bench_model.py --fp8 --output glm_bench_fp8
+  python tools/convert_fp8_to_int4.py --indir glm_bench_fp8 --outdir glm_bench_i4 --ebits 4 --group-size 128
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
 from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # importa glm_fp8_emit se lanciato da c/
+from glm_fp8_emit import save_fp8_safetensors, unfuse_experts
 
 
 def build_config() -> GlmMoeDsaConfig:
@@ -51,6 +63,9 @@ def main() -> None:
     parser.add_argument("--output", default="glm_bench_medium")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--fp8", action="store_true",
+                        help="write weights as FP8 e4m3 + 128x128 block scale_inv (same layout as "
+                             "GLM-5.2-FP8) instead of bf16, so convert_fp8_to_int4.py can dequant+requant")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -70,7 +85,6 @@ def main() -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     params = sum(p.numel() for p in model.parameters())
-    model.save_pretrained(output, safe_serialization=True, max_shard_size="4GB")
 
     model.to(args.device)
     prompt = [3, 14, 159, 26, 53, 58, 200, 11, 77, 240, 5, 99]
@@ -78,6 +92,25 @@ def main() -> None:
     with torch.inference_mode():
         full = model.generate(ids, max_new_tokens=8, do_sample=False, use_cache=True)[0]
         logits = model(full.unsqueeze(0), use_cache=False).logits[0]
+
+    # Unfuse experts AFTER reference generation (model needs fused weights for
+    # forward/generate) but BEFORE saving — the real checkpoint and the converter
+    # + C engine all expect per-expert 2-D gate_proj/up_proj/down_proj tensors.
+    sd = model.state_dict()
+    unfuse_experts(sd)
+
+    if args.fp8:
+        n_fp8, n_tot = save_fp8_safetensors(sd, output / "model.safetensors")
+        # save_pretrained scrive config.json; nel path FP8 lo bypassiamo, quindi lo scriviamo
+        # a mano (serve al converter e al motore C). EN: save_pretrained writes config.json;
+        # the FP8 path bypasses it, so write it manually (converter + C engine need it).
+        (output / "config.json").write_text(json.dumps(cfg.to_dict()))
+        print(f"saved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
+              f"-> {output / 'model.safetensors'}")
+    else:
+        from safetensors.torch import save_file
+        save_file({k: v.contiguous() for k, v in sd.items()}, str(output / "model.safetensors"))
+        (output / "config.json").write_text(json.dumps(cfg.to_dict()))
 
     ref = {
         "prompt_ids": prompt,
@@ -89,6 +122,7 @@ def main() -> None:
         "seed": args.seed,
         "parameters": params,
         "parameters_billions": round(params / 1e9, 4),
+        "format": "fp8-e4m3-128" if args.fp8 else "bf16",
         "purpose": "backend benchmark fixture; random weights, not a language model",
     }
     (output / "bench_manifest.json").write_text(json.dumps(manifest, indent=2))

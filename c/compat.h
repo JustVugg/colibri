@@ -57,6 +57,7 @@ static inline int compat_open_direct(const char *path){
  *                                  _read/_lseeki64 which are racy AND
  *                                  corrupt 0x0A bytes in binary files).
  * posix_fadvise -> no-op (advisory only; macOS already no-ops DONTNEED).
+ * mlock         -> compat_mlock  (VirtualLock + crescita working set).
  * posix_memalign->_aligned_malloc(free must be compat_aligned_free).
  * rename        -> compat_rename (MoveFileEx MOVEFILE_REPLACE_EXISTING;
  *                                  CRT rename fails EEXIST if dest exists,
@@ -94,7 +95,18 @@ static inline int compat_open_direct(const char *path){
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
 
-/* --- posix_fadvise: no-op (advisory only; safe to ignore) --- */
+/* --- posix_fadvise: Windows has no direct equivalent. Semantics:
+ *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
+ *                   pages resident. Implemented as an overlapped background ReadFile
+ *                   into a throwaway scratch buffer (fire-and-forget readahead). Called
+ *                   from the dedicated PILOT I/O thread / next-block readahead in moe(),
+ *                   NEVER inline on the hot path (the existing comment at glm.c:2847
+ *                   measures inline fadvise submit at ~0.5ms x 169k calls = +92s/48tok).
+ *                   Each call owns its OVERLAPPED + scratch buffer -> thread-safe.
+ *      DONTNEED  -> no-op: Windows' standby-list trimming self-regulates under pressure,
+ *                   and on a low-RAM host keeping the pages is what we want for reuse.
+ *                   Matches macOS (compat.h:16-19) which no-ops DONTNEED for the same
+ *                   reason. The engine only ever uses DONTNEED as an advisory. */
 #ifndef POSIX_FADV_NORMAL
 #define POSIX_FADV_NORMAL      0
 #define POSIX_FADV_RANDOM      1
@@ -103,7 +115,29 @@ static inline int compat_open_direct(const char *path){
 #define POSIX_FADV_DONTNEED    4
 #define POSIX_FADV_NOREUSE     5
 #endif
-#define posix_fadvise(fd,off,len,advice) do{(void)(fd);(void)(off);(void)(len);(void)(advice);}while(0)
+static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
+    if(advice!=POSIX_FADV_WILLNEED || len<=0) return 0;
+    intptr_t osfh=_get_osfhandle(fd);
+    if(osfh==-1 || osfh==-2) return 0;
+    HANDLE h=(HANDLE)osfh;
+    /* Cap the readahead window: reading a whole 19MB expert per hint is fine on the
+     * PILOT thread, but a pathological huge len would spike transient memory. */
+    size_t rdlen = (len>(off_t)(64*1024*1024)) ? (size_t)(64*1024*1024) : (size_t)len;
+    char *buf=(char*)_aligned_malloc(rdlen, 4096);
+    if(!buf) return -1;
+    OVERLAPPED ov={0};
+    ov.Offset     = (DWORD)( (off_t)off        & 0xFFFFFFFFULL);
+    ov.OffsetHigh = (DWORD)(((off_t)off >> 32) & 0xFFFFFFFFULL);
+    /* Issue an overlapped read. With a non-OVERLAPPED-opened handle ReadFile still
+     * accepts lpOverlapped (it carries the 64-bit offset) and blocks until the read
+     * completes — but crucially it populates the standby page cache for this region,
+     * so the later synchronous pread on the same offsets faults from RAM not disk. */
+    DWORD got=0;
+    ReadFile(h, buf, (DWORD)rdlen, &got, &ov);
+    _aligned_free(buf);
+    return 0;
+}
+#define posix_fadvise compat_fadvise
 
 /* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
@@ -134,6 +168,25 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     return (ssize_t)total;
 }
 #define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)
+
+/* --- mlock -> VirtualLock con crescita del working set ---
+ * VirtualLock fallisce oltre il working set MINIMO del processo (default ~qualche
+ * centinaio di KB): prima si allarga il working set di len + margine, poi si blocca.
+ * Best effort come mlock su Linux: -1 su fallimento, il chiamante decide (pin_wire
+ * lo tratta come non-fatale). SeIncreaseWorkingSetPrivilege e' concesso agli utenti
+ * standard di default. */
+static inline int compat_mlock(const void *addr, size_t len){
+    HANDLE p = GetCurrentProcess();
+    SIZE_T mn = 0, mx = 0;
+    if(GetProcessWorkingSetSize(p, &mn, &mx)){
+        SIZE_T need = len + (SIZE_T)(1u<<20);
+        SetProcessWorkingSetSize(p, mn + need, mx + need);   /* best effort */
+    }
+    return VirtualLock((LPVOID)addr, len) ? 0 : -1;
+}
+static inline int compat_munlock(const void *addr, size_t len){
+    return VirtualUnlock((LPVOID)addr, len) ? 0 : -1;
+}
 
 /* --- posix_memalign -> _aligned_malloc ---
  * ATTN: memoria allocata con _aligned_malloc DEVE essere liberata con
@@ -214,6 +267,35 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
     return (ssize_t)pos;
 }
 #define getline(lineptr,n,stream) compat_getline(lineptr,n,stream)
+
+/* --- O_DIRECT -> FILE_FLAG_NO_BUFFERING ---
+ * Apre il fd "gemello" senza cache del file system, come il twin O_DIRECT di
+ * st.h su Linux e F_NOCACHE su macOS. Stesso contratto: offset, lunghezza e
+ * buffer del chiamante devono essere allineati a 4K (gli slab expert usano
+ * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
+ * e len); richieste non allineate falliscono con -1, mai dati corrotti.
+ * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+static inline int compat_open_direct(const char *path){
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+    if(h == INVALID_HANDLE_VALUE) return -1;
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
+    if(fd < 0){ CloseHandle(h); return -1; }
+    return fd;
+}
+
+/* --- dimensione file da fd: GetFileSizeEx ---
+ * La lseek(SEEK_END) del CRT ritorna -1 sui fd NO_BUFFERING (misurato su
+ * UCRT): la dimensione si chiede direttamente al kernel. Funziona su
+ * qualsiasi fd (buffered o direct). -1 su errore. */
+static inline off_t compat_fsize(int fd){
+    intptr_t osfh = _get_osfhandle(fd);
+    if(osfh == -1 || osfh == -2) return -1;
+    LARGE_INTEGER li;
+    if(!GetFileSizeEx((HANDLE)osfh, &li)) return -1;
+    return (off_t)li.QuadPart;
+}
 
 /* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){

@@ -29,12 +29,18 @@ distributing or on machines with an unsupported iGPU visible to the runtime
 - `COLI_CUDA=1` + `COLI_GPU=N` (or `COLI_GPUS=0,1,...`) — enable, select devices
 - `CUDA_EXPERT_GB=G` — VRAM budget for the expert tier (clamped to free VRAM
   minus projected dense set and 2 GB headroom per device)
-- `CUDA_EXTEND=0` (default) — **mirror mode**: promotes the hottest experts
-  already in the RAM pin to VRAM (compute acceleration; for matmul-bound machines)
-- `CUDA_EXTEND=1` — **extension mode**: the VRAM budget pins the *next* experts
-  in the frequency ranking beyond the RAM pin; host copies are freed after
-  upload, so this adds cache capacity at zero RAM cost (for disk-bound machines)
+- `CUDA_RELEASE_HOST=1` — GPU-tier experts drop their host backing after
+  upload (default on multi-GPU); combined with `PIN=auto`/`PIN_FILL`, VRAM
+  becomes additional pinned capacity at zero RAM cost. The engine
+  rematerializes an expert from disk (`expert_host_ensure`) whenever the CPU
+  path needs one whose host copy was released — validated under total GPU
+  failure below.
 - `CUDA_DENSE=1` — experimental resident-dense path (unchanged)
+- `COLI_CUDA_TC_W4A16=1` — opt-in W4A16 tensor-core path. **NVIDIA-only**:
+  the WMMA kernels are compile-gated (`COLI_GPU_HAS_WMMA` in the compat
+  header) because gfx GPUs report `compute_major >= 7` and a runtime check
+  alone would select empty kernel bodies under HIP. On AMD, all compute uses
+  the portable kernels; rocWMMA matrix-core support is a possible follow-up.
 
 ## Validation
 
@@ -65,24 +71,35 @@ the test binary, and the full engine link, plus the standard CPU `make check`.
 Kernel *execution* is not possible on hosted runners; that's what the unit
 tests above and the hardware matrix below are for.
 
-### Engine-level fault injection (VRAM-only repair path)
+### Engine-level fault injection (host-released repair path)
 
-`COLI_GPU_FAIL_AFTER=N` makes the backend report failure after N successful
-matmuls. Because the engine repairs a failed VRAM-only expert by reloading it
-from disk and recomputing on CPU (then skipping the slot in future lookups),
-setting `N=0` with `CUDA_EXTEND=1` must reproduce the pure-CPU greedy output
-**byte-for-byte** — every GPU call fails, every slot is repaired, and the
-run degrades to CPU-exact behavior instead of crashing or corrupting output.
+`COLI_GPU_FAIL_AFTER=N` makes every GPU *compute* entry point (matmul, fused
+expert MLP, grouped experts, shared MLP, the attention pipeline ops) report
+failure after N successful calls; uploads and queries are not gated. With
+`N=0` (every GPU call fails) and `CUDA_RELEASE_HOST=1`, the validated
+properties on GLM-5.2 (RX 9070 XT, greedy, `DRAFT=0`) are:
+
+- **No crash, no corruption**: every host-released expert is rematerialized
+  from disk (`expert_host_ensure`) before the CPU fallback touches it; the
+  run completes with coherent output.
+- **Deterministic**: two total-failure runs from the same `.coli_usage`
+  snapshot are byte-identical. (Across un-frozen runs, outputs vary because
+  the learning cache evolves pin membership between runs — by design.)
+- **Speculation disengages losslessly** under total GPU failure (0 MTP
+  proposals, plain decode) — a graceful degradation, but note the perf
+  cliff: a failing GPU also costs the MTP speedup.
+- **Not byte-identical to a pure-CPU run**: the GPU-enabled engine's CPU
+  fallbacks select different kernel shapes/paths (grouped experts, attention
+  pipeline fallbacks) than the CPU-only flow, and per #100 the kernels are
+  shape-dependent. This is a reproducible numerics identity limit of kernel
+  selection, not a correctness defect; both outputs are stable and coherent.
 
 ```sh
-# reference                        vs   full-failure repair run
-./coli run "<prompt>" --temp 0          COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=12 \
-                                        CUDA_EXTEND=1 COLI_GPU_FAIL_AFTER=0 \
-                                        ./coli run "<prompt>" --temp 0
+# repeatability: snapshot .coli_usage, then run twice and cmp
+cp <model>/.coli_usage /tmp/u; \
+COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=12 CUDA_RELEASE_HOST=1 \
+COLI_GPU_FAIL_AFTER=0 DRAFT=0 ./coli run "<prompt>" --temp 0   # x2, restoring /tmp/u between runs
 ```
-
-Mid-run failure (`N=2000`) must complete generation, printing per-tensor
-`disabled after an error` notices as slots degrade.
 
 ### Hardware test matrix (documented results)
 
@@ -98,6 +115,8 @@ Mid-run failure (`N=2000`) must complete generation, printing per-tensor
   the shape-dependence documented in #100), and MTP draft acceptance measures
   lower on GPU-heavy configs (~40% → ~31% on the PR #112 machine). A
   numerics-matched integer GPU kernel is the planned follow-up.
-- `CUDA_EXTEND=1` startup loads+uploads its experts serially (~15 s for
-  634 experts on the test machine); parallelizing is a known follow-up.
-- `coli plan` / `resource_plan.py` do not yet model the extension tier.
+- An earlier revision of this branch carried `CUDA_EXTEND=1` (VRAM tier
+  holding experts beyond the RAM pin). It was superseded by upstream's
+  `PIN=auto` + `PIN_FILL` + `CUDA_RELEASE_HOST`, which achieve the same
+  capacity extension with deeper engine integration; this branch's safety
+  and validation work now targets that mechanism.

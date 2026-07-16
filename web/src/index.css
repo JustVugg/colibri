@@ -86,3 +86,68 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 @media (max-width: 560px) { .sidebar { grid-template-columns: 1fr; }.brand-row, .sidebar-foot { grid-column: auto; }.empty-state h2 { font-size: 36px; }.message-list { width: calc(100% - 28px); }.composer-foot > span { display: none; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
+
+/* expert tier pyramid: where the 19k experts live right now */
+.tier-panel { display: grid; gap: 7px; }
+.tier-bar { display: flex; height: 10px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); background: var(--card); }
+.tier-bar span { display: block; min-width: 0; transition: width .6s ease; }
+.tier-vram { background: var(--primary); }
+.tier-ram { background: #5a9bd8; }
+.tier-disk { background: #3a4750; }
+.tier-legend { display: flex; gap: 12px; font-size: 10px; color: #839197; flex-wrap: wrap; }
+.tier-legend span { display: flex; align-items: center; gap: 5px; }
+.tier-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.tier-legend strong { font: 600 12px ui-monospace, SFMono-Regular, monospace; color: var(--foreground); }
+.tier-legend small { color: var(--muted-foreground); }
+
+/* ---- rich metrics badges & animations ---- */
+.badge-live { background: rgba(78,214,165,.15); border-color: rgba(78,214,165,.4); color: #4ed6a5; }
+.badge-speed { background: rgba(90,155,216,.12); border-color: rgba(90,155,216,.35); color: #5a9bd8; }
+.flash { animation: flash 0.6s ease infinite alternate; }
+@keyframes flash { from { opacity: 1; } to { opacity: 0.3; } }
+.top-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.top-actions .badge-live, .top-actions .badge-speed { font-variant-numeric: tabular-nums; }
+
+/* session stats row */
+.session-stats { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #7f8d92; padding: 2px 0; }
+.session-stats strong { font: 600 11px ui-monospace, SFMono-Regular, monospace; color: var(--foreground); }
+
+/* tier bar tweaks */
+.tier-bar { height: 12px; }
+.tier-bar span { transition: width 0.8s cubic-bezier(.4,0,.2,1); }
+.tier-legend strong { font-size: 13px; }
+
+/* hardware info panel */
+.hw-panel { display: grid; gap: 5px; padding: 8px 0; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+.hw-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--foreground); }
+.hw-row svg { color: var(--primary); flex-shrink: 0; }
+.hw-row small { color: var(--muted-foreground); margin-left: 4px; }
+
+/* ---- Brain page ---- */
+.view-tabs { display: flex; gap: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3px; }
+.view-tabs button { display: flex; align-items: center; gap: 6px; padding: 5px 14px; font-size: 12px; font-weight: 600; color: var(--muted-foreground); background: none; border: none; border-radius: 7px; cursor: pointer; }
+.view-tabs button.active { background: var(--primary); color: #08110d; }
+.brain-page { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 18px 22px; overflow: auto; }
+.brain-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.brain-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 11px; color: #839197; align-items: center; }
+.brain-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
+.brain-pulse-hint { color: var(--primary); }
+.brain-canvas-wrap { flex: 1; overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 10px; }
+.brain-canvas-wrap canvas { image-rendering: pixelated; max-width: 100%; cursor: crosshair; }
+.brain-tip { position: fixed; z-index: 50; background: #0d1214; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 11px; color: var(--foreground); pointer-events: none; max-width: 280px; box-shadow: 0 8px 24px rgba(0,0,0,.5); display: grid; gap: 4px; }
+.brain-tip-title { display: flex; align-items: center; gap: 5px; font-weight: 700; color: var(--primary); }
+.brain-tip-role { color: #8b9aa3; font-style: italic; line-height: 1.4; border-top: 1px solid var(--border); padding-top: 5px; margin-top: 2px; }
+
+/* Brain responsive */
+.brain-canvas-wrap { display: flex; align-items: flex-start; justify-content: center; min-height: 300px; }
+@media (max-width: 900px) {
+  .brain-page { padding: 10px; }
+  .brain-head { flex-direction: column; align-items: flex-start; }
+  .brain-legend { gap: 8px; font-size: 10px; }
+  .brain-tip { max-width: 220px; font-size: 10px; }
+}
+
+/* atlas hover extras */
+.brain-tip-spec { color: var(--primary); font-weight: 700; }
+.brain-tip-spec small, .brain-tip-aff { color: #8b9aa3; font-weight: 400; }
+.brain-tip-aff { font-size: 10px; }

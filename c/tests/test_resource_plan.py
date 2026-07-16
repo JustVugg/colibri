@@ -6,7 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from resource_plan import GB, analyze_model, build_plan, environment_for_plan, format_plan
+from resource_plan import (
+    GB,
+    analyze_model,
+    build_plan,
+    environment_for_plan,
+    format_plan,
+    memory_available,
+)
 
 
 def write_shard(path, tensors):
@@ -53,15 +60,26 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(info["expert_count"], 2)
         self.assertEqual(info["per_cap_bytes"], 60)
 
+    def test_memory_available_is_positive(self):
+        # Regression: on native Windows CPython, /proc/meminfo does not exist,
+        # so the Linux-only path returned 0 and the expert cache was sized to
+        # 0 slots/layer. The value must be a sane positive number of bytes.
+        self.assertGreater(memory_available(), 0)
+
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,
                  "free_bytes": 10 * GB}]
         plan = build_plan(self.model, ram_gb=16, context=32, vram_gb=20,
-                          available_memory=32 * GB, available_disk=100 * GB, gpus=gpus)
-        self.assertEqual(plan["version"], 1)
+                          available_memory=32 * GB, available_disk=100 * GB, gpus=gpus,
+                          physical_cpus=24)
+        self.assertEqual(plan["version"], 2)
+        self.assertEqual(plan["policy"]["name"], "quality")
+        self.assertEqual(plan["cpu"]["physical_cores"], 24)
+        self.assertTrue(plan["policy"]["preserve_quantization"])
+        self.assertFalse(plan["tiers"]["vram"]["requires_host_backing"])
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
-        self.assertIn("required RAM backing", plan["warnings"][0])
+        self.assertIn("clamped", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
 
     def test_filters_requested_devices(self):
@@ -78,7 +96,7 @@ class ResourcePlanTest(unittest.TestCase):
             "--gpu", "none", "--json",
         ], text=True, capture_output=True, check=True)
         plan = json.loads(run.stdout)
-        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["version"], 2)
         self.assertEqual(plan["model"]["expert_count"], 2)
 
     def test_applies_plan_without_overriding_explicit_settings(self):
@@ -93,8 +111,20 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "12")
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
+        self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
+        if sys.platform == "win32":
+            # MinGW libgomp: niente affinity su Windows, le chiavi non vanno emesse
+            self.assertNotIn("OMP_PROC_BIND", env)
+            self.assertNotIn("OMP_PLACES", env)
+        else:
+            self.assertEqual(env["OMP_PROC_BIND"], "spread")
+            self.assertEqual(env["OMP_PLACES"], "cores")
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
 
+        explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
+                                                        "OMP_PROC_BIND": "close"})
+        self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
+        self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
     def test_cpu_binary_does_not_apply_gpu_tier(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
                           gpus=[{"index": 0, "name": "a", "total_bytes": 8 * GB,
@@ -105,6 +135,32 @@ class ResourcePlanTest(unittest.TestCase):
         disabled = environment_for_plan(plan, {"COLI_CUDA": "0"}, cuda_enabled=True)
         self.assertNotIn("COLI_GPU", disabled)
         self.assertNotIn("CUDA_EXPERT_GB", disabled)
+
+    def test_rejects_unknown_policy_and_marks_experimental_policy(self):
+        with self.assertRaisesRegex(ValueError, "unknown policy"):
+            build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                       gpus=[], policy="fast-ish")
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[], policy="experimental-fast")
+        self.assertFalse(plan["policy"]["quality_preserving"])
+        self.assertFalse(plan["policy"]["preserve_router"])
+
+    def test_balanced_policy_enables_lossless_live_repin(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[], policy="balanced")
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_POLICY"], "balanced")
+        self.assertEqual(env["REPIN"], "64")
+        explicit = environment_for_plan(plan, {"REPIN": "0"})
+        self.assertEqual(explicit["REPIN"], "0")
+
+    def test_plan_explains_hot_warm_and_cold_placement(self):
+        plan = build_plan(self.model, ram_gb=4, vram_gb=0,
+                          available_memory=4 * GB, available_disk=1, gpus=[])
+        self.assertEqual([item["target"] for item in plan["decisions"]],
+                         ["VRAM", "RAM", "Disk"])
+        self.assertIn("quality-preserving yes", format_plan(plan))
+        self.assertIn("expected_bottleneck", plan)
 
 
 if __name__ == "__main__":
