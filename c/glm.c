@@ -49,6 +49,14 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#if defined(_WIN32)
+#include <winioctl.h>        /* PORTING: IOCTL_STORAGE_QUERY_PROPERTY / STORAGE_BUS_TYPE (disk bus probe) */
+#else
+#include <sys/statvfs.h>     /* PORTING: statvfs (free disk space, POSIX storage probe) */
+#endif
+#if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>           /* PORTING: __get_cpuid for the CPU brand string in hwinfo_emit */
+#endif
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -57,6 +65,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#if !defined(_WIN32)
+#include <dlfcn.h>           /* PORTING: dlopen(libnvidia-ml.so) dynamic NVML binding for thermal heartbeat */
+#endif
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
@@ -212,6 +223,9 @@ static void ehit_mark(Model *m, int layer, int eid);
 static void emap_emit(Model *m);
 static void hits_emit(Model *m);
 static void hwinfo_emit(Model *m);
+#ifdef COLI_CUDA
+static int nvml_gpu_name(char *buf,int len);   /* real GPU model for the dashboard */
+#endif
 static int g_repin;
 static uint64_t g_last_repin;
 #ifdef COLI_CUDA
@@ -3832,7 +3846,21 @@ static void kv_bind(Model *m, KVState *k){
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
+/* PORTING: GPU thermal gate. NVML heartbeat thread sets g_thermal_pause_ms; step()
+ * calls thermal_gate() once per forward to bleed heat when the GPU is hot. In a
+ * CPU-only build (no COLI_CUDA) this is a total no-op, so the base engine is unchanged. */
+#ifdef COLI_CUDA
+static volatile int g_thermal_pause_ms;   /* set by the NVML thread (0 = no pause) */
+static inline void thermal_gate(void){
+    int ms=g_thermal_pause_ms;
+    if(ms>0){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
+}
+#else
+static inline void thermal_gate(void){}
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base){
+    thermal_gate();
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
@@ -5711,6 +5739,236 @@ static const char *coli_user_prompt(void){
     return p;
 }
 
+/* ============================================================================
+ * PORTING: probe_storage_drive() - checks free space and the bus type of the disk
+ * hosting the checkpoint BEFORE allocating memory. MoE streaming reads ~120 GB of
+ * cold experts per generation: on SATA/USB (~550 MB/s) this is the dominant
+ * bottleneck; on NVMe (~7 GB/s) it disappears. Compiled into ALL builds
+ * (even CPU-only): it is storage logic, not GPU logic.
+ *   Returns 1 = proceed, 0 = fatal (insufficient space / user refusal).
+ *   FORCE_SLOW_DRIVE=1 -> skip the interactive prompt (headless / Web UI start).
+ * ==========================================================================*/
+#ifndef STORAGE_MIN_FREE_GB
+#define STORAGE_MIN_FREE_GB 400ULL
+#endif
+
+#if defined(_WIN32)
+/* -1 = unknown, 0 = fast (NVMe/SAS/RAID), 1 = slow (SATA/USB/other) */
+static int storage_bus_is_slow(const char *root, const char **bus_name){
+    *bus_name="unknown";
+    if(!root[0] || root[1]!=':') return -1;
+    char vol[8]; snprintf(vol,sizeof vol,"\\\\.\\%c:",root[0]);
+    HANDLE h=CreateFileA(vol,0,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
+    if(h==INVALID_HANDLE_VALUE) return -1;
+    STORAGE_PROPERTY_QUERY q; memset(&q,0,sizeof q);
+    q.PropertyId=StorageDeviceProperty; q.QueryType=PropertyStandardQuery;
+    STORAGE_DEVICE_DESCRIPTOR d; memset(&d,0,sizeof d);
+    DWORD br=0; int slow=-1;
+    if(DeviceIoControl(h,IOCTL_STORAGE_QUERY_PROPERTY,&q,sizeof q,&d,sizeof d,&br,NULL)){
+        switch(d.BusType){
+            case BusTypeNvme: *bus_name="NVMe"; slow=0; break;
+            case BusTypeSas:  *bus_name="SAS";  slow=0; break;
+            case BusTypeRAID: *bus_name="RAID"; slow=0; break;
+            case BusTypeSata: *bus_name="SATA"; slow=1; break;
+            case BusTypeUsb:  *bus_name="USB";  slow=1; break;
+            default:          *bus_name="other/slow"; slow=1; break;
+        }
+    }
+    CloseHandle(h);
+    return slow;
+}
+
+static int probe_storage_drive(const char *model_path){
+    char root[MAX_PATH];
+    if(!GetVolumePathNameA(model_path,root,sizeof root)){
+        fprintf(stderr,"[STORAGE] cannot resolve the volume of '%s' (err %lu): proceeding.\n",
+                model_path,(unsigned long)GetLastError());
+        return 1;
+    }
+    ULARGE_INTEGER freeAvail={0}, total={0}, totalFree={0};
+    if(GetDiskFreeSpaceExA(root,&freeAvail,&total,&totalFree)){
+        double free_gb=(double)freeAvail.QuadPart/1e9;
+        if(freeAvail.QuadPart < (ULONGLONG)STORAGE_MIN_FREE_GB*1000000000ULL){
+            fprintf(stderr,"[STORAGE] FATAL: only %.1f GB free on %s (minimum %llu GB).\n",
+                    free_gb,root,(unsigned long long)STORAGE_MIN_FREE_GB);
+            return 0;
+        }
+        fprintf(stderr,"[STORAGE] %s: %.1f GB free (OK).\n",root,free_gb);
+    }
+    const char *bus="unknown";
+    int slow=storage_bus_is_slow(root,&bus);
+    if(slow==0){ fprintf(stderr,"[STORAGE] bus %s: NVMe/fast, streaming at full speed.\n",bus); return 1; }
+    if(slow<0){ fprintf(stderr,"[STORAGE] bus type undeterminable (%s): proceeding.\n",bus); return 1; }
+    fprintf(stderr,
+        "[WARNING] Model is residing on a SATA/Slow drive (%s). Mixture-of-Experts "
+        "streaming will be severely bottlenecked. It is highly recommended to move "
+        "the checkpoint to an NVMe SSD.\n",bus);
+    if(getenv("FORCE_SLOW_DRIVE") && atoi(getenv("FORCE_SLOW_DRIVE"))){
+        fprintf(stderr,"[STORAGE] FORCE_SLOW_DRIVE=1: proceeding without confirmation.\n");
+        return 1;
+    }
+    fprintf(stderr,"Continue anyway? (y/n): "); fflush(stderr);
+    int ch=getchar();
+    if(ch=='y'||ch=='Y') return 1;
+    fprintf(stderr,"[STORAGE] startup aborted by user.\n");
+    return 0;
+}
+#else  /* POSIX: statvfs for space; bus detection is not portable -> proceed */
+static int probe_storage_drive(const char *model_path){
+    struct statvfs vfs;
+    if(statvfs(model_path,&vfs)==0){
+        unsigned long long freeb=(unsigned long long)vfs.f_bavail*(unsigned long long)vfs.f_frsize;
+        double free_gb=(double)freeb/1e9;
+        if(freeb < (unsigned long long)STORAGE_MIN_FREE_GB*1000000000ULL){
+            fprintf(stderr,"[STORAGE] FATAL: only %.1f GB free (minimum %llu GB).\n",
+                    free_gb,(unsigned long long)STORAGE_MIN_FREE_GB);
+            return 0;
+        }
+        fprintf(stderr,"[STORAGE] %.1f GB free (OK). Bus detection unavailable on this platform.\n",free_gb);
+    }
+    return 1;
+}
+#endif
+
+#ifdef COLI_CUDA
+/* ----------------------------------------------------------------------------
+ * PORTING: NVML thermal heartbeat - background thread that samples GPU temperature
+ * and applies a step-down (proportional pause via g_thermal_pause_ms, read by
+ * thermal_gate() every forward step) when it overheats. NVML is loaded DYNAMICALLY
+ * (nvml.dll / libnvidia-ml.so): if absent, safety does not start and the engine
+ * proceeds. All isolated under #ifdef COLI_CUDA.
+ *   SAFE_MODE=0 -> disable the monitor entirely.
+ * -------------------------------------------------------------------------- */
+enum { TH_NORMAL=0, TH_WARN=1, TH_THROTTLE=2, TH_CRITICAL=3 };
+#ifndef TH_WARN_C
+#define TH_WARN_C   83     /* deg C */
+#define TH_THROT_C  88
+#define TH_CRIT_C   93
+#define TH_CLEAR_C  80     /* hysteresis: return to NORMAL below this */
+#endif
+static volatile int g_thermal_state=TH_NORMAL;
+static volatile int g_thermal_run=0;
+static volatile unsigned g_thermal_temp=0;
+static pthread_t g_thermal_thr;
+
+/* dynamic NVML bindings (minimal signatures needed) */
+typedef int (*nvmlInit_t)(void);
+typedef int (*nvmlShutdown_t)(void);
+typedef int (*nvmlHandleByIndex_t)(unsigned,void**);
+typedef int (*nvmlTemp_t)(void*,int,unsigned*);
+typedef int (*nvmlName_t)(void*,char*,unsigned);
+static void *g_nvml_lib=NULL, *g_nvml_dev=NULL;
+static nvmlInit_t          p_nvmlInit=NULL;
+static nvmlShutdown_t      p_nvmlShutdown=NULL;
+static nvmlHandleByIndex_t p_nvmlHandle=NULL;
+static nvmlTemp_t          p_nvmlTemp=NULL;
+static nvmlName_t          p_nvmlName=NULL;
+
+static int nvml_load(void){
+#if defined(_WIN32)
+    g_nvml_lib=(void*)LoadLibraryA("nvml.dll");
+    if(!g_nvml_lib){
+        char p[MAX_PATH]; const char *pf=getenv("ProgramFiles");
+        snprintf(p,sizeof p,"%s\\NVIDIA Corporation\\NVSMI\\nvml.dll",pf?pf:"C:\\Program Files");
+        g_nvml_lib=(void*)LoadLibraryA(p);
+    }
+    if(!g_nvml_lib) return 0;
+    #define NVSYM(n) ((void*)GetProcAddress((HMODULE)g_nvml_lib,(n)))
+#else
+    g_nvml_lib=dlopen("libnvidia-ml.so.1",RTLD_NOW|RTLD_GLOBAL);
+    if(!g_nvml_lib) g_nvml_lib=dlopen("libnvidia-ml.so",RTLD_NOW|RTLD_GLOBAL);
+    if(!g_nvml_lib) return 0;
+    #define NVSYM(n) dlsym(g_nvml_lib,(n))
+#endif
+    p_nvmlInit=(nvmlInit_t)NVSYM("nvmlInit_v2");
+    if(!p_nvmlInit) p_nvmlInit=(nvmlInit_t)NVSYM("nvmlInit");
+    p_nvmlShutdown=(nvmlShutdown_t)NVSYM("nvmlShutdown");
+    p_nvmlHandle=(nvmlHandleByIndex_t)NVSYM("nvmlDeviceGetHandleByIndex_v2");
+    if(!p_nvmlHandle) p_nvmlHandle=(nvmlHandleByIndex_t)NVSYM("nvmlDeviceGetHandleByIndex");
+    p_nvmlTemp=(nvmlTemp_t)NVSYM("nvmlDeviceGetTemperature");
+    p_nvmlName=(nvmlName_t)NVSYM("nvmlDeviceGetName");
+    #undef NVSYM
+    return p_nvmlInit && p_nvmlHandle && p_nvmlTemp;
+}
+
+/* Fetch the GPU model string (e.g. "NVIDIA GeForce RTX 4070 Ti SUPER") via NVML.
+ * Reuses the handle opened by the thermal monitor; if that isn't running (e.g.
+ * SAFE_MODE=0) it opens NVML on demand. Returns 1 on success. */
+static int nvml_gpu_name(char *buf,int len){
+    if(!buf || len<=0) return 0;
+    buf[0]=0;
+    if(!g_nvml_lib && !nvml_load()) return 0;
+    if(!p_nvmlName) return 0;
+    void *dev=g_nvml_dev;
+    if(!dev){
+        if(p_nvmlInit) p_nvmlInit();   /* refcounted — safe if already initialised */
+        if(!p_nvmlHandle) return 0;
+        unsigned idx=(g_cuda_ndev>0)?(unsigned)g_cuda_devices[0]:0;
+        if(p_nvmlHandle(idx,&dev)!=0 || !dev) return 0;
+    }
+    return p_nvmlName(dev,buf,(unsigned)len)==0 && buf[0];
+}
+
+static void *thermal_worker(void *arg){
+    (void)arg;
+    while(g_thermal_run){
+        unsigned t=0;
+        if(p_nvmlTemp && g_nvml_dev && p_nvmlTemp(g_nvml_dev,0 /*NVML_TEMPERATURE_GPU*/,&t)==0){
+            g_thermal_temp=t;
+            int st=g_thermal_state, ns=st;
+            if(t>=TH_CRIT_C)      ns=TH_CRITICAL;
+            else if(t>=TH_THROT_C)ns=TH_THROTTLE;
+            else if(t>=TH_WARN_C) ns=TH_WARN;
+            else if(t<=TH_CLEAR_C)ns=TH_NORMAL;   /* hysteresis */
+            switch(ns){
+                case TH_CRITICAL: g_thermal_pause_ms=400; break;
+                case TH_THROTTLE: g_thermal_pause_ms=120; break;
+                default:          g_thermal_pause_ms=0;   break;
+            }
+            if(ns!=st){
+                static const char *nm[4]={"NORMAL","WARN","THROTTLE","CRITICAL"};
+                fprintf(stderr,"[THERMAL] GPU %u\xC2\xB0""C -> %s%s\n",t,nm[ns],
+                        ns>=TH_THROTTLE?" (step-down active)":"");
+                g_thermal_state=ns;
+            }
+        }
+        struct timespec ts={0,500L*1000L*1000L}; nanosleep(&ts,NULL);   /* poll ~500 ms */
+    }
+    return NULL;
+}
+
+static void thermal_monitor_stop(void){
+    if(!g_thermal_run) return;
+    g_thermal_run=0;
+    pthread_join(g_thermal_thr,NULL);
+    if(p_nvmlShutdown) p_nvmlShutdown();
+}
+
+static void thermal_monitor_start(void){
+    if(getenv("SAFE_MODE") && atoi(getenv("SAFE_MODE"))==0){
+        fprintf(stderr,"[THERMAL] SAFE_MODE=0: thermal monitor disabled.\n");
+        return;
+    }
+    if(!g_cuda_enabled) return;
+    if(!nvml_load()){ fprintf(stderr,"[THERMAL] NVML unavailable: thermal safety not active.\n"); return; }
+    if(p_nvmlInit()!=0){ fprintf(stderr,"[THERMAL] nvmlInit failed: thermal safety not active.\n"); return; }
+    if(p_nvmlHandle((unsigned)g_cuda_devices[0],&g_nvml_dev)!=0 || !g_nvml_dev){
+        fprintf(stderr,"[THERMAL] NVML handle for device %d not obtained.\n",g_cuda_devices[0]);
+        if(p_nvmlShutdown) p_nvmlShutdown();
+        return;
+    }
+    g_thermal_run=1;
+    if(pthread_create(&g_thermal_thr,NULL,thermal_worker,NULL)!=0){
+        g_thermal_run=0;
+        fprintf(stderr,"[THERMAL] pthread_create failed.\n");
+        if(p_nvmlShutdown) p_nvmlShutdown();
+        return;
+    }
+    fprintf(stderr,"[THERMAL] heartbeat active on device %d (warn %d\xC2\xB0""C / throttle %d\xC2\xB0""C / crit %d\xC2\xB0""C).\n",
+            g_cuda_devices[0],TH_WARN_C,TH_THROT_C,TH_CRIT_C);
+}
+#endif /* COLI_CUDA */
+
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
@@ -5757,6 +6015,9 @@ int main(int argc, char **argv){
     }
 #endif
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    /* PORTING: gate on checkpoint disk (free space + bus type) before allocating.
+     * FORCE_SLOW_DRIVE=1 skips the interactive prompt for headless starts (Web UI). */
+    if(!probe_storage_drive(snap)) return 3;
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
@@ -5897,6 +6158,9 @@ int main(int argc, char **argv){
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+        /* PORTING: NVML thermal heartbeat (SAFE_MODE=0 to disable). No-op if NVML absent. */
+        thermal_monitor_start();
+        atexit(thermal_monitor_stop);
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
@@ -6117,3 +6381,4 @@ int main(int argc, char **argv){
     if(stats) stats_dump(&m,stats);
     return 0;
 }
+

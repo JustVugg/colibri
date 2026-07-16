@@ -457,8 +457,17 @@ class Engine:
     def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        # PORTING: allow the quantization bit-width to be selected via env so the GUI can
+        # run the 4-bit config required on 16 GB GPUs. Absent -> engine defaults (8/8), i.e.
+        # upstream behavior is preserved.
+        engine_args = [str(executable), str(cap)]
+        _ebits = os.environ.get("COLI_EBITS")
+        _dbits = os.environ.get("COLI_DBITS")
+        if _ebits:
+            engine_args.append(_ebits)
+            engine_args.append(_dbits if _dbits else _ebits)
         self.process = subprocess.Popen(
-            [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
+            engine_args, env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
