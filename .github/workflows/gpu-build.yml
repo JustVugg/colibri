@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The default path: portable CPU build, dependency-free C and Python tests.
+  cpu-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make check (portable build + C/Python tests)
+        run: make -C c check
+
+  # Compile-only validation of the shared GPU backend under nvcc.
+  # Runners have no GPU, so kernels are built for a fixed arch and not executed;
+  # runtime correctness is covered by `make cuda-test` on GPU hardware
+  # (documented in GPU_BACKENDS.md).
+  cuda-compile:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: apt-get update && apt-get install -y --no-install-recommends make gcc g++
+      - name: compile backend + test binary + engine (nvcc)
+        run: |
+          make -C c gpu-compile CUDA_ARCH=sm_80
+          make -C c glm CUDA=1 CUDA_ARCH=sm_80
+
+  # Compile-only validation of the SAME backend source under hipcc (ROCm).
+  hip-compile:
+    runs-on: ubuntu-latest
+    container: rocm/dev-ubuntu-22.04:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: apt-get update && apt-get install -y --no-install-recommends make gcc g++
+      - name: compile backend + test binary + engine (hipcc)
+        run: |
+          make -C c gpu-compile HIP=1 HIP_ARCH=gfx1100
+          make -C c glm HIP=1 HIP_ARCH=gfx1100

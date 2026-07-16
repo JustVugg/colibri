@@ -127,6 +127,11 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
+# CI: compile the backend and its test binary WITHOUT executing them (for
+# runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
+gpu-compile: backend_cuda.o
+	$(GPUCC) $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
@@ -167,4 +172,4 @@ clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test hip-test portable test-c test-python test check clean
+.PHONY: all glm cuda-test hip-test gpu-compile portable test-c test-python test check clean

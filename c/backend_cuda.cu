@@ -26,6 +26,8 @@ static int g_nctx;
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     std::fprintf(stderr, "[CUDA] %s: %s\n", what, cudaGetErrorString(err));
+    (void)cudaGetLastError();   /* consume the sticky error: a failed call must
+                                   not poison the next launch's error check */
     return 0;
 }
 
@@ -191,10 +193,18 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* Test hook: COLI_GPU_FAIL_AFTER=N makes coli_cuda_matmul report failure after
+ * N successful calls (N=0: every call fails). Exercises the engine's VRAM-only
+ * repair and CPU-fallback paths without real hardware faults. Unset: no effect
+ * (the counter is not even incremented). */
+static long g_matmul_calls;
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int device) {
+    const char *fail_after = std::getenv("COLI_GPU_FAIL_AFTER");
+    if (fail_after && g_matmul_calls++ >= std::atol(fail_after)) return 0;
     if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
