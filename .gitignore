@@ -73,3 +73,7 @@ c/tests/test_uring
 model_weights/
 questions.txt
 verify_colibri.sh
+c/tests/test_kv_alloc
+c/tests/test_schema_gbnf
+c/tests/test_compat_direct
+c/tests/test_grammar
