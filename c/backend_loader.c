@@ -45,10 +45,10 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
-                                           const float *scales, int fmt, int I, int O, int device);
+                                           const float *scales, int fmt, int I, int O, int device, int gs);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
-                                    int fmt, int S, int I, int O, int device);
+                                    int fmt, int S, int I, int O, int device, int gs);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
@@ -291,16 +291,16 @@ int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,
 }
 
 int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
-                            const float *scales, int fmt, int I, int O, int device){
+                            const float *scales, int fmt, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
-    return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device);
+    return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device, gs);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      const void *weights, const float *scales,
-                     int fmt, int S, int I, int O, int device){
+                     int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
-    return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device);
+    return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){

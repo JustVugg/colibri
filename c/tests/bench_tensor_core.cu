@@ -30,9 +30,9 @@ int main(){
     for(int i=0;i<D;i++)ds[i]=0.006f+(i%7)*0.0002f;
     for(size_t i=0;i<x.size();i++)x[i]=std::sin((float)(i+1)*0.013f)*2.f;
     ColiCudaTensor *g=nullptr,*u=nullptr,*d=nullptr;
-    if(!coli_cuda_tensor_upload(&g,hidden.data(),hs.data(),2,D,I,device)||
-       !coli_cuda_tensor_upload(&u,hidden.data(),hs.data(),2,D,I,device)||
-       !coli_cuda_tensor_upload(&d,down.data(),ds.data(),2,I,D,device))return 2;
+    if(!coli_cuda_tensor_upload(&g,hidden.data(),hs.data(),2,D,I,device,0)||
+       !coli_cuda_tensor_upload(&u,hidden.data(),hs.data(),2,D,I,device,0)||
+       !coli_cuda_tensor_upload(&d,down.data(),ds.data(),2,I,D,device,0))return 2;
     for(int rows: {1,2,4,8}){
         double scalar=run(g,u,d,x.data(),a.data(),rows,3,0);
         double packed=run(g,u,d,x.data(),b.data(),rows,3,1);

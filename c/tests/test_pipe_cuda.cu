@@ -119,7 +119,7 @@ int main(void){
         for(int i=0;i<O;i++) sc[i]=0.01f+0.001f*(i%7);
         for(size_t i=0;i<(size_t)S*K;i++) x[i]=rndf();
         ColiCudaTensor *t=NULL;
-        ok&=coli_cuda_matmul(&t,ref,x,w4,sc,2,S,K,O,0);   /* host path = reference */
+        ok&=coli_cuda_matmul(&t,ref,x,w4,sc,2,S,K,O,0,0);   /* host path = reference */
         float *xd=(float*)coli_cuda_pipe_alloc(0,(size_t)S*K*4);
         float *yd=(float*)coli_cuda_pipe_alloc(0,(size_t)S*O*4);
         ok&=coli_cuda_pipe_upload(0,xd,x,(size_t)S*K*4);

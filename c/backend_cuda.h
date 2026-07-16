@@ -34,21 +34,23 @@ COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
-/* Upload without executing, so capacity failures happen during model startup. */
+/* Upload without executing, so capacity failures happen during model startup.
+ * gs is the group size for fmt=4 (grouped int4); 0 for all other formats. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
-                            int fmt, int I, int O, int device);
+                            int fmt, int I, int O, int device, int gs);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2.
- * The first successful call uploads W and its row scales; later calls reuse it.
+ * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4.
+ * gs is the group size for fmt=4 (0 for all other formats).
+ * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
-                     int fmt, int S, int I, int O, int device);
+                     int fmt, int S, int I, int O, int device, int gs);
 
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in
