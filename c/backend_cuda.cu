@@ -1,6 +1,7 @@
 #include "backend_cuda.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>                 /* KV8: fp8 e4m3 latent KV (hw cvt on sm_89+, our arches) */
 #include <mma.h>
 
 #include <cstdio>
@@ -25,6 +26,7 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
+    float *alsc,*arsc; size_t alsc_cap,arsc_cap;   /* KV8: scale per-riga di latent/rope */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
@@ -287,6 +289,12 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0]*d.ds[o];
 }
 
+/* KV8: decodifica un byte e4m3 (cvt hardware da sm_89; PTX/software prima). La scala
+ * per-riga viaggia in un array f32 separato e si applica una volta per score/peso. */
+__device__ static inline float fp8_e4m3(uint8_t b){
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3)));
+}
+
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
                                                 int fmt,int H,int Q,int R,int V,int K,int T,float scale){
@@ -332,6 +340,68 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     __syncthreads();
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)
         a+=scores[t]*latent[(size_t)t*K+k];cl[k]=a;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
+/* ---- KV8: gemelli fp8 dei due kernel di assorbimento. latent/rope arrivano come
+ * byte e4m3 + scala f32 per riga. Stessa matematica dei gemelli f32: la scala esce
+ * dal dot (score = Lsc·Σ q·v + Rsc·Σ qr·v) e per il contesto si fonde nel peso
+ * softmax, cosi' i loop interni restano una FMA per byte. */
+__global__ static void attention_absorb_kernel8(float *ctx,const float *q,const uint8_t *latent,
+        const float *lsc,const uint8_t *rope,const float *rsc,const void *weights,
+        const float *wscale,int fmt,int H,int Q,int R,int V,int K,int T,float scale){
+    int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);extern __shared__ float sm[];
+    float *qa=sm,*cl=qa+K,*scores=cl+K;
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*(fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+    __syncthreads();
+    for(int t=tid;t<T;t+=blockDim.x){float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
+        for(int d=0;d<R;d++)ar+=q[(size_t)h*(Q+R)+Q+d]*fp8_e4m3(rt[d]);
+        scores[t]=(a*lsc[t]+ar*rsc[t])*scale;}
+    __syncthreads();
+    if(!tid){float mx=scores[0];for(int t=1;t<T;t++)mx=fmaxf(mx,scores[t]);float z=0;
+        for(int t=0;t<T;t++){scores[t]=expf(scores[t]-mx);z+=scores[t];}for(int t=0;t<T;t++)scores[t]/=z;}
+    __syncthreads();
+    for(int t=tid;t<T;t+=blockDim.x)scores[t]*=lsc[t];       /* scala fusa nel peso softmax */
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<T;t++)a+=scores[t]*fp8_e4m3(latent[(size_t)t*K+k]);cl[k]=a;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
+__global__ static void attention_absorb_batch_kernel8(float *ctx,const float *q,
+        const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc,
+        const void *weights,const float *wscale,
+        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
+    if(s>=S||nt<1)return;
+    extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
+    const float *qs=q+((size_t)s*H+h)*(Q+R);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+    __syncthreads();
+    for(int t=tid;t<nt;t+=blockDim.x){float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K;
+        const uint8_t *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
+        for(int d=0;d<R;d++)ar+=qs[Q+d]*fp8_e4m3(rt[d]);
+        scores[t]=(a*lsc[t]+ar*rsc[t])*scale;}
+    __syncthreads();
+    float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];
+    for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv*lsc[t];  /* normalizza + scala fusa nel peso */
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)
+        a+=scores[t]*fp8_e4m3(latent[(size_t)t*K+k]);cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
@@ -403,6 +473,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
+        if(ctx->alsc)cudaFree(ctx->alsc);if(ctx->arsc)cudaFree(ctx->arsc);
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
@@ -415,6 +486,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
+        ctx->alsc=ctx->arsc=nullptr; ctx->alsc_cap=ctx->arsc_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
@@ -768,6 +840,80 @@ extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTenso
         float *out,const float *q,const float *latent,const float *rope,int S,int H,int Q,
         int R,int V,int K,int T,float scale){
     return attention_absorb_batch_run(w,proj,out,q,latent,rope,S,H,Q,R,V,K,T,scale);
+}
+
+/* ---- KV8: entry point fp8. Stessi contratti dei gemelli f32; latent/rope viaggiano
+ * come byte + scala per riga (1/4 del traffico PCIe — a T lunghi e' il collo). */
+extern "C" int coli_cuda_attention_absorb8(ColiCudaTensor *w,float *ctx,const float *q,
+        const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc,
+        int H,int Q,int R,int V,int K,int T,float scale){
+    if(!w||!ctx||!q||!latent||!lsc||!rope||!rsc||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
+       w->I!=K||w->O!=H*(Q+V))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)H*(Q+R)*sizeof(float),lb=(size_t)T*K,rb=(size_t)T*R;
+    size_t sb=(size_t)T*sizeof(float),cb=(size_t)H*V*sizeof(float);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
+       !reserve(&dc->ar,&dc->ar_cap,rb)||!reserve(&dc->ac,&dc->ac_cap,cb)||
+       !reserve(&dc->alsc,&dc->alsc_cap,sb)||!reserve(&dc->arsc,&dc->arsc_cap,sb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"attention q upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention fp8 latent upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->alsc,lsc,sb,cudaMemcpyHostToDevice,dc->stream),"attention latent scale upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention fp8 rope upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->arsc,rsc,sb,cudaMemcpyHostToDevice,dc->stream),"attention rope scale upload"))return 0;
+    size_t shared=(size_t)(2*K+T)*sizeof(float);
+    attention_absorb_kernel8<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,(const uint8_t*)dc->al,
+        dc->alsc,(const uint8_t*)dc->ar,dc->arsc,w->weights,w->scales,w->fmt,H,Q,R,V,K,T,scale);
+    if(!cuda_ok(cudaGetLastError(),"attention absorb8 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"attention context download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"attention synchronize"))return 0;
+    return 1;
+}
+
+static int attention_absorb_batch_run8(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
+        const float *q,const uint8_t *latent,const float *lsc,const uint8_t *rope,
+        const float *rsc,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(!w||!out||!q||!latent||!lsc||!rope||!rsc||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
+       T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
+    if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K,rb=(size_t)T*R;
+    size_t sb=(size_t)T*sizeof(float),cb=(size_t)S*H*V*sizeof(float);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
+       !reserve(&dc->ar,&dc->ar_cap,rb)||!reserve(&dc->ac,&dc->ac_cap,cb)||
+       !reserve(&dc->alsc,&dc->alsc_cap,sb)||!reserve(&dc->arsc,&dc->arsc_cap,sb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"attention batch q upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention batch fp8 latent upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->alsc,lsc,sb,cudaMemcpyHostToDevice,dc->stream),"attention batch latent scale upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch fp8 rope upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->arsc,rsc,sb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope scale upload"))return 0;
+    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    attention_absorb_batch_kernel8<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,
+        (const uint8_t*)dc->al,dc->alsc,(const uint8_t*)dc->ar,dc->arsc,
+        w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!cuda_ok(cudaGetLastError(),"attention batch8 launch"))return 0;
+    const float *src=dc->ac;size_t ob=cb;
+    if(proj){
+        ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
+        quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
+            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
+    }
+    if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
+                               proj?"attention projected output download":"attention batch context download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"attention batch synchronize"))return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_attention_absorb_batch8(ColiCudaTensor *w,float *ctx,const float *q,
+        const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc,
+        int S,int H,int Q,int R,int V,int K,int T,float scale){
+    return attention_absorb_batch_run8(w,nullptr,ctx,q,latent,lsc,rope,rsc,S,H,Q,R,V,K,T,scale);
+}
+
+extern "C" int coli_cuda_attention_project_batch8(ColiCudaTensor *w,ColiCudaTensor *proj,
+        float *out,const float *q,const uint8_t *latent,const float *lsc,const uint8_t *rope,
+        const float *rsc,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    return attention_absorb_batch_run8(w,proj,out,q,latent,lsc,rope,rsc,S,H,Q,R,V,K,T,scale);
 }
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {

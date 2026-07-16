@@ -49,6 +49,7 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -146,6 +147,8 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
+    uint8_t **Lc8, **Rc8;                        /* KV8: righe latenti fp8 e4m3 (Lc/Rc restano NULL) */
+    float **Lsc, **Rsc;                          /* KV8: scala amax/448 per riga (per token, per layer) */
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
@@ -168,6 +171,7 @@ typedef struct {
      * k_rot [qk_rope] (576 vs 32768 valori/token). k_nope e value si ricostruiscono al
      * volo con kv_b. E' cio' che rende gestibile il contesto su 15 GB (64 teste, no GQA). */
     float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
+    uint8_t **Lc8, **Rc8; float **Lsc, **Rsc;    /* alias KV8 (fp8 + scale) della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
@@ -2181,6 +2185,10 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;
+/* KV8=1: cache latente Lc/Rc in fp8 e4m3 + scala f32 per riga (~4x meno RAM del f32).
+ * Coperti CPU e CUDA (kernel absorb8); auto-off sotto COLI_METAL, e forza
+ * COLI_CUDA_PIPE=0 (l'ombra KV su device e il pipe-prefill leggono righe f32). */
+static int g_kv8=0;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
@@ -2405,16 +2413,26 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *qfull=Q+(int64_t)s*H*qh;
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
         const float *cs=comp+(int64_t)s*cw;
-        float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
-        float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
 #ifdef COLI_CUDA
         if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
             m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
 #endif
-        memcpy(Ldst, cs, c->kv_lora*sizeof(float));
-        rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
-        memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
-        rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
+        if(g_kv8){
+            /* KV8: norma+rope sul residuo di comp (scratch, mai riletto), poi
+             * quantizza riga+scala. E' IL produttore caldo: ogni token, ogni layer. */
+            float *Ls=comp+(int64_t)s*cw, *Rs=Ls+c->kv_lora;
+            rmsnorm(Ls, Ls, l->kv_a_ln, c->kv_lora, c->eps);      /* latente normato */
+            rope_interleave(Rs, pos, c);                          /* k_rot roped */
+            ks->Lsc[layer][pos]=coli_kv8_quant_row(Ls, coli_kv_row8(ks->Lc8[layer],pos,c->kv_lora), c->kv_lora);
+            ks->Rsc[layer][pos]=coli_kv8_quant_row(Rs, coli_kv_row8(ks->Rc8[layer],pos,c->qk_rope), c->qk_rope);
+        } else {
+            float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
+            float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
+            memcpy(Ldst, cs, c->kv_lora*sizeof(float));
+            rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);  /* latente normato */
+            memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
+            rope_interleave(Rdst, pos, c);                        /* k_rot roped, condiviso fra teste */
+        }
     }
     /* ---- DSA lightning indexer ----
      * Layer FULL: k_idx dei token nuovi in cache + selezione top-k per query (riusata
@@ -2525,10 +2543,16 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 qs+(int64_t)l->shard_h0[d]*S*qh+(int64_t)s*l->shard_hn[d]*qh,
                 Q+((int64_t)s*H+l->shard_h0[d])*qh,(size_t)l->shard_hn[d]*qh*sizeof(float));
             #pragma omp parallel for schedule(static) reduction(&:ok)
-            for(int d=0;d<n;d++)ok&=coli_cuda_attention_absorb_batch(l->kv_b_shard[d],
-                cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
-                coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
-                S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+            for(int d=0;d<n;d++)ok&=g_kv8
+                ?coli_cuda_attention_absorb_batch8(l->kv_b_shard[d],
+                    cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
+                    coli_kv_row8(m->Lc8[layer],st0,kvl),m->Lsc[layer]+st0,
+                    coli_kv_row8(m->Rc8[layer],st0,c->qk_rope),m->Rsc[layer]+st0,
+                    S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale)
+                :coli_cuda_attention_absorb_batch(l->kv_b_shard[d],
+                    cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
+                    coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
+                    S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
             if(ok)for(int d=0;d<n;d++)for(int s=0;s<S;s++)memcpy(
                 ctx+((int64_t)s*H+l->shard_h0[d])*vh,
                 cs+(int64_t)l->shard_h0[d]*S*vh+(int64_t)s*l->shard_hn[d]*vh,
@@ -2537,9 +2561,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         } else if(cuda_absorb&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             int st0=m->kv_start[layer],nt=pos_base+S-st0;
-            cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
-                coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
-                S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+            cuda_core=cuda_projected=g_kv8
+                ?coli_cuda_attention_project_batch8(l->kv_b.cuda,l->o.cuda,out,Q,
+                    coli_kv_row8(m->Lc8[layer],st0,kvl),m->Lsc[layer]+st0,
+                    coli_kv_row8(m->Rc8[layer],st0,c->qk_rope),m->Rsc[layer]+st0,
+                    S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale)
+                :coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
+                    coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
+                    S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
         } else if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
             cuda_core=1;
@@ -2554,10 +2583,15 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         m->kv_dev_R[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
                 if(!cuda_core)
-                    cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
-                        Q+(int64_t)s*H*qh,coli_kv_row(ks->Lc[layer],st0,kvl),
-                        coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
-                        vh,kvl,nt,c->attn_scale);
+                    cuda_core=g_kv8
+                        ?coli_cuda_attention_absorb8(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                            Q+(int64_t)s*H*qh,coli_kv_row8(ks->Lc8[layer],st0,kvl),
+                            ks->Lsc[layer]+st0,coli_kv_row8(ks->Rc8[layer],st0,c->qk_rope),
+                            ks->Rsc[layer]+st0,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale)
+                        :coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                            Q+(int64_t)s*H*qh,coli_kv_row(ks->Lc[layer],st0,kvl),
+                            coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
+                            vh,kvl,nt,c->attn_scale);
             }
         }
 #endif
@@ -2577,17 +2611,35 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-                const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
-                const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
-                float a=0; for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
-                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                float a=0;
+                if(g_kv8){
+                    /* LUT-dequant inline nel dot; la scala per-riga esce dalla
+                     * somma: score = Lsc·Σ q·lut[b] + Rsc·Σ qr·lut[b] */
+                    const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
+                    const uint8_t *kr=coli_kv_row8(ks->Rc8[layer],t,c->qk_rope);
+                    float al=0, ar=0;
+                    for(int i=0;i<kvl;i++) al+=qabs[i]*coli_fp8_lut[Lt[i]];
+                    for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
+                    a=al*ks->Lsc[layer][t]+ar*ks->Rsc[layer][t];
+                } else {
+                    const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
+                    const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
+                    for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
+                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                }
                 sc[jj]=a*c->attn_scale;
             }
             softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-                const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
-                float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
+                if(g_kv8){
+                    const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
+                    float a=sc[jj]*ks->Lsc[layer][t];       /* la scala si fonde nel peso */
+                    for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
+                } else {
+                    const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
+                    float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i];
+                } }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
         }
@@ -2601,7 +2653,17 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     m->t_aproj+=now_s()-ta0; double tk0=now_s();
     int stL=m->kv_start[layer];
     float *kvb_all=falloc((int64_t)Tk*kvb_dim);
-    matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    if(g_kv8){
+        /* staging f32 del latente dequantizzato: kv_b vuole righe float. Il buffer
+         * [Tk-stL,kvl] e' rumore rispetto a kvb_all [Tk,H*(nope+vh)] gia' allocato. */
+        float *Lf=falloc((int64_t)(Tk-stL)*c->kv_lora);
+        for(int t=stL;t<Tk;t++)
+            coli_kv8_dequant_row(coli_kv_row8(m->Lc8[layer],t,c->kv_lora), m->Lsc[layer][t],
+                                 Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora);
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
+        free(Lf);
+    } else
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     m->t_kvb += now_s()-tk0;
     /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
      * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
@@ -2620,9 +2682,15 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         int nt = ns ? ns : pos+1-st0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
-            const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
             float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
-            for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+            if(g_kv8){
+                const uint8_t *kr=coli_kv_row8(m->Rc8[layer],t,c->qk_rope);
+                float ar=0; for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
+                a+=ar*m->Rsc[layer][t];
+            } else {
+                const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
+                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+            }
             sc[jj]=a*c->attn_scale;
         }
         softmax(sc,nt);
@@ -3793,6 +3861,10 @@ static void kv_alloc(Model *m, int max_t){
         if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
 #endif
         free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
+    if(k->Lc8){ for(int i=0;i<c->n_layers+1;i++){ free(k->Lc8[i]); free(k->Rc8[i]);
+        free(k->Lsc[i]); free(k->Rsc[i]); }
+        free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
+        k->Lc8=k->Rc8=NULL; k->Lsc=k->Rsc=NULL; }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
     if(m->has_dsa){
         k->Ic=calloc(c->n_layers,sizeof(float*));
@@ -3801,6 +3873,19 @@ static void kv_alloc(Model *m, int max_t){
     k->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
+    if(g_kv8){
+        /* KV8: byte fp8 (non float) + una scala f32 per riga; Lc/Rc restano NULL.
+         * (576+8)/2304 B/token/layer contro i 2304 del f32: ~3.9x di RAM in meno. */
+        coli_fp8_lut_init();
+        k->Lc8=calloc(NR,sizeof(uint8_t*)); k->Rc8=calloc(NR,sizeof(uint8_t*));
+        k->Lsc=calloc(NR,sizeof(float*));   k->Rsc=calloc(NR,sizeof(float*));
+        for(int i=0;i<NR;i++){
+            k->Lc8[i]=malloc((size_t)max_t*c->kv_lora);
+            k->Rc8[i]=malloc((size_t)max_t*c->qk_rope);
+            k->Lsc[i]=falloc(max_t); k->Rsc[i]=falloc(max_t);
+            if(!k->Lc8[i]||!k->Rc8[i]){fprintf(stderr,"OOM kv8\n");exit(1);}
+        }
+    } else
     for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
         k->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
 #ifdef COLI_METAL
@@ -3817,12 +3902,14 @@ static void kv_alloc(Model *m, int max_t){
 #endif
     }
     m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic; m->max_t=k->max_t; m->kv_start=k->kv_start;
+    m->Lc8=k->Lc8; m->Rc8=k->Rc8; m->Lsc=k->Lsc; m->Rsc=k->Rsc;
 }
 
 static void kv_bind(Model *m, KVState *k){
     if(m->kv!=k && m->kv_dev_valid)                 /* ombra legata al KVState corrente */
         for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
+    m->Lc8=k->Lc8; m->Rc8=k->Rc8; m->Lsc=k->Lsc; m->Rsc=k->Rsc;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 
@@ -3870,7 +3957,10 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
             free(x); return NULL;
         }
         for(int l=0;l<c->n_layers;l++){
-            if(!rows[s].kv->Lc[l] || !rows[s].kv->Rc[l] ||
+            if((g_kv8 ? (!rows[s].kv->Lc8 || !rows[s].kv->Rc8 ||
+                         !rows[s].kv->Lc8[l] || !rows[s].kv->Rc8[l] ||
+                         !rows[s].kv->Lsc[l] || !rows[s].kv->Rsc[l])
+                      : (!rows[s].kv->Lc[l] || !rows[s].kv->Rc[l])) ||
                rows[s].kv->kv_start[l]<0 || rows[s].kv->kv_start[l]>rows[s].pos ||
                (m->has_dsa && c->idx_type[l] &&
                 (!rows[s].kv->Ic || !rows[s].kv->Ic[l]))){ free(x); return NULL; }
@@ -4629,33 +4719,43 @@ static void repin_pass_limit(Model *m,int limit){
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 static int g_kvsave=1;
-#define KV_MAGIC "COLIKV1\0"
+#define KV_MAGIC  "COLIKV1\0"                    /* v1: righe Lc/Rc f32 */
+#define KV_MAGIC2 "COLIKV2\0"                    /* v2 (KV8): righe fp8 e4m3 + scala f32 per riga */
 static void kv_hdr(Model *m, int32_t *h, int nrec){
     Cfg *c=&m->c; int nic=0;
     for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
-    h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
+    h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=g_kv8?1:0;
 }
 /* Bytes of one on-disk record: [tok i32][Lc+Rc per layer][Ic per DSA layer].
- * Layout matches what kv_disk_append writes and kv_disk_load reads. */
+ * Layout matches what kv_disk_append writes and kv_disk_load reads. Under KV8
+ * (v2 format) Lc/Rc are fp8 bytes + one f32 scale each: ~46 KB/token instead
+ * of ~182 (4x less write-amplification on ZFS). */
 static int64_t kv_rec_bytes(Model *m){
     Cfg *c=&m->c;
-    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
+    int64_t rec = 4 + (g_kv8 ? (int64_t)c->n_layers*(c->kv_lora+c->qk_rope+8)
+                             : (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4);
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
     return rec;
 }
 /* Open the persistent handle lazily; write the header if the file is new. After
  * this returns successfully, k->disk_fp is valid for the engine's lifetime and
- * positioned at end-of-header (nrec==0 case) or wherever the caller seeks. */
+ * positioned at end-of-header (nrec==0 case) or wherever the caller seeks.
+ * Formato del file != formato attivo (KV8 acceso o spento tra un run e l'altro):
+ * il file si riscrive da zero — e' il punto dove l'upgrade v1->v2 diventa reale. */
 static int kv_disk_open(Model *m){
     KVState *k=m->kv;
     if(k->disk_fp) return 1;
     k->disk_fp=fopen(k->disk_path,"r+b");
-    if(!k->disk_fp){                       /* not there yet -> create + header */
+    if(k->disk_fp){ char mg[8];
+        if(fread(mg,1,8,k->disk_fp)!=8 || memcmp(mg,g_kv8?KV_MAGIC2:KV_MAGIC,8)){
+            fclose(k->disk_fp); k->disk_fp=NULL; k->disk_nrec=0; }
+    }
+    if(!k->disk_fp){                       /* not there yet (or wrong format) -> create + header */
         k->disk_fp=fopen(k->disk_path,"wb");
         if(!k->disk_fp) return 0;
         int32_t h[8]; kv_hdr(m,h,0);
-        fwrite(KV_MAGIC,1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
+        fwrite(g_kv8?KV_MAGIC2:KV_MAGIC,1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
         fflush(k->disk_fp);
         fclose(k->disk_fp);
         k->disk_fp=fopen(k->disk_path,"r+b");   /* reopen r+b for append */
@@ -4692,8 +4792,15 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         uint8_t *b=k->disk_buf;            /* pack token + every layer into one record */
         *(int32_t*)b = hist[p]; b+=4;
         for(int i=0;i<c->n_layers;i++){
-            memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
-            memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
+            if(g_kv8){                     /* v2: fp8 + scala per riga, stesso staging */
+                memcpy(b, coli_kv_row8(m->Lc8[i],p,c->kv_lora), (size_t)c->kv_lora); b+=c->kv_lora;
+                memcpy(b, &m->Lsc[i][p], 4); b+=4;
+                memcpy(b, coli_kv_row8(m->Rc8[i],p,c->qk_rope), (size_t)c->qk_rope); b+=c->qk_rope;
+                memcpy(b, &m->Rsc[i][p], 4); b+=4;
+            } else {
+                memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
+                memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
+            }
         }
         if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
             memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
@@ -4711,30 +4818,58 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
     Cfg *c=&m->c;
     FILE *f=fopen(k->disk_path,"rb"); if(!f) return 0;
     char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
-    if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) || fread(h,4,8,f)!=8 ||
+    int dt=-1;                                        /* dtype del FILE: 0=f32 (v1), 1=fp8 (v2) */
+    if(fread(mg,1,8,f)==8){
+        if(!memcmp(mg,KV_MAGIC,8)) dt=0; else if(!memcmp(mg,KV_MAGIC2,8)) dt=1; }
+    if(dt<0 || fread(h,4,8,f)!=8 ||
        h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
         fprintf(stderr,"[KV] ignoring .coli_kv from a different model or version\n"); fclose(f); return 0; }
+    if(dt==1 && !g_kv8){
+        fprintf(stderr,"[KV] .coli_kv is fp8 (saved under KV8=1): starting over (set KV8=1 to resume it)\n");
+        fclose(f); return 0; }
     int nrec=h[6];
     if(nrec<1){ fclose(f); return 0; }
     if(nrec>=maxctx-8-g_draft){
         fprintf(stderr,"[KV] saved conversation (%d tokens) exceeds the context: starting over\n",nrec);
         fclose(f); return 0; }
     double t0=now_s();
+    /* v1 sotto KV8: righe f32 lette in staging e quantizzate al volo */
+    float *stage = (g_kv8&&dt==0) ? falloc(c->kv_lora>c->qk_rope?c->kv_lora:c->qk_rope) : NULL;
     for(int p=0;p<nrec;p++){
         int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; } hist[p]=tk;
         for(int i=0;i<c->n_layers;i++){
-            if(fread(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f)!=(size_t)c->kv_lora ||
-               fread(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+            if(dt==1){                                /* v2: fp8+scala, gia' nel formato in RAM */
+                if(fread(coli_kv_row8(m->Lc8[i],p,c->kv_lora), 1, c->kv_lora, f)!=(size_t)c->kv_lora ||
+                   fread(&m->Lsc[i][p], 4, 1, f)!=1 ||
+                   fread(coli_kv_row8(m->Rc8[i],p,c->qk_rope), 1, c->qk_rope, f)!=(size_t)c->qk_rope ||
+                   fread(&m->Rsc[i][p], 4, 1, f)!=1){ nrec=p; goto out; }
+            } else if(g_kv8){
+                if(fread(stage, 4, c->kv_lora, f)!=(size_t)c->kv_lora){ nrec=p; goto out; }
+                m->Lsc[i][p]=coli_kv8_quant_row(stage, coli_kv_row8(m->Lc8[i],p,c->kv_lora), c->kv_lora);
+                if(fread(stage, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+                m->Rsc[i][p]=coli_kv8_quant_row(stage, coli_kv_row8(m->Rc8[i],p,c->qk_rope), c->qk_rope);
+            } else {
+                if(fread(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f)!=(size_t)c->kv_lora ||
+                   fread(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+            }
         }
         if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
             if(fread(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f)!=(size_t)c->index_hd){ nrec=p; goto out; }
     }
 out:
-    fclose(f);
+    fclose(f); free(stage);
     if(nrec>0){
         if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* la finestra MTP riparte da sola */
         fprintf(stderr,"[KV] resumed conversation from disk: %d tokens in %.1fs (no re-prefill)\n",
             nrec, now_s()-t0);
+        if(g_kv8 && dt==0){
+            /* upgrade v1->v2: il file f32 non puo' ricevere append fp8. disk_nrec=0 e
+             * il file resta INTATTO (un crash prima del primo save non perde nulla):
+             * al primo append il controllo magic lo riscrive da zero in v2. */
+            k->disk_nrec=0;
+            fprintf(stderr,"[KV] f32 .coli_kv quantized in RAM; will be rewritten as fp8 (v2) at next save\n");
+            return nrec;
+        }
     }
     k->disk_nrec=nrec;
     return nrec;
@@ -4760,8 +4895,11 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
     free(k->disk_buf); k->disk_buf=NULL;
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
+    if(k->Lc8) for(int i=0;i<NR;i++){ free(k->Lc8[i]); free(k->Rc8[i]);
+        free(k->Lsc[i]); free(k->Rsc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
-    free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
+    free(k->Lc); free(k->Rc); free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
+    free(k->Ic); free(k->kv_start); free(s->hist);
 }
 
 typedef struct {
@@ -4943,7 +5081,7 @@ static void run_serve_mux(Model *m, const char *snap){
     }
     usage_save(m);
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
-    m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+    m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->Lc8=m->Rc8=NULL; m->Lsc=m->Rsc=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
 static void run_serve(Model *m, const char *snap){
@@ -5113,7 +5251,7 @@ static void run_serve(Model *m, const char *snap){
     #undef len
     #undef first
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]);
-    free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+    free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->Lc8=m->Rc8=NULL; m->Lsc=m->Rsc=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
 static int *read_arr(jval*o,const char*k,int*n){
@@ -5578,7 +5716,12 @@ static int kv_slot_count(void){
 }
 
 static double kv_pool_bytes(Model *m, int max_ctx){
-    Cfg *c=&m->c; double one=(double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0;
+    /* KV8: 1 byte/valore + 8 B di scale per token/layer, non 4 B/valore. E' questo
+     * conto che governa expert_avail e cap_for_ram: con KV8 il clamp PIN recupera
+     * ~35 GB/slot a 256k e KV_SLOTS=2 smette di demolire gli expert su disco. */
+    Cfg *c=&m->c;
+    double one=(double)(c->n_layers+1)*max_ctx*
+        (g_kv8 ? (double)(c->kv_lora+c->qk_rope)+8.0 : (c->kv_lora+c->qk_rope)*4.0);
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         one+=(double)max_ctx*c->index_hd*4.0;
     int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
@@ -5884,6 +6027,28 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+    /* KV8=1: KV-cache latente in fp8 e4m3. CPU e CUDA (kernel absorb8) sono coperti;
+     * lo shader Metal e il resident pipeline (COLI_CUDA_PIPE) leggono righe f32:
+     * finche' non esistono le varianti fp8, quei percorsi si spengono da soli. */
+    g_kv8 = getenv("KV8")?atoi(getenv("KV8")):0;
+    if(g_kv8){
+#ifdef COLI_METAL
+        if(g_kv8 && g_metal_enabled){
+            fprintf(stderr,"[KV8] COLI_METAL=1: fp8 KV unsupported on the Metal path; KV8 disabled\n");
+            g_kv8=0;
+        }
+#endif
+#ifdef COLI_CUDA
+        if(g_kv8 && g_cuda_pipe){
+            fprintf(stderr,"[KV8] COLI_CUDA_PIPE reads f32 KV rows; pipe disabled under KV8\n");
+            g_cuda_pipe=0;
+        }
+#endif
+        if(g_kv8){
+            coli_fp8_lut_init();
+            fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM)\n");
+        }
+    }
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);

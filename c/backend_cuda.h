@@ -92,6 +92,24 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,C
                                       const float *rope,int S,int H,int Q,int R,
                                       int V,int K,int T,float attention_scale);
 
+/* KV8 twins: latent/rope as fp8 e4m3 bytes + one f32 amax/448 scale per row
+ * (per token, Lc and Rc separately) — 1/4 the PCIe traffic of the f32 paths. */
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb8(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                               const uint8_t *latent,const float *lsc,
+                               const uint8_t *rope,const float *rsc,int H,int Q,
+                               int R,int V,int K,int T,float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch8(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                                     const uint8_t *latent,const float *lsc,
+                                     const uint8_t *rope,const float *rsc,int S,
+                                     int H,int Q,int R,int V,int K,int T,
+                                     float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch8(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+                                      float *out,const float *q,
+                                      const uint8_t *latent,const float *lsc,
+                                      const uint8_t *rope,const float *rsc,
+                                      int S,int H,int Q,int R,
+                                      int V,int K,int T,float attention_scale);
+
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);

@@ -67,4 +67,10 @@ c/bench/
 c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
+c/tests/test_kv_alloc
+c/tests/test_kv_alloc.exe
+c/tests/test_kv_fp8
+c/tests/test_kv_fp8.exe
+c/tests/test_kv_disk
+c/tests/test_kv_disk.exe
 c/tests/test_uring

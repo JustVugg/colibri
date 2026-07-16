@@ -1,4 +1,5 @@
 #include "../backend_cuda.h"
+#include "../kv_fp8.h"   /* host-side e4m3 quantizer: the KV8 kernels' input contract */
 
 #include <cmath>
 #include <cstdio>
@@ -106,6 +107,45 @@ int main(int argc, char **argv) {
     if(!coli_cuda_attention_absorb(at,actx,aq,al,ar,1,2,2,2,4,3,1.f)||
        !close_enough(actx,aref,2))return 1;
     coli_cuda_tensor_free(at);
+
+    /* KV8: same absorb case with e4m3-quantized latent/rope + per-row scales.
+       The reference is computed on the host from the DEQUANTIZED rows (exactly
+       what the kernel sees), so only accumulation order separates the two. */
+    {
+        coli_fp8_lut_init();
+        const float aw8[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        const float aq8[4]={1,2,.5f,-.5f};
+        float al8f[12],ar8f[6];
+        for(int i=0;i<12;i++)al8f[i]=std::sin((float)(i+1)*0.83f)*3.f;
+        for(int i=0;i<6;i++)ar8f[i]=std::cos((float)(i+1)*0.51f)*2.f;
+        uint8_t alq[12],arq[6];float alsc[3],arsc[3],ald[12],ard[6];
+        for(int t=0;t<3;t++){
+            alsc[t]=coli_kv8_quant_row(al8f+t*4,alq+t*4,4);
+            arsc[t]=coli_kv8_quant_row(ar8f+t*2,arq+t*2,2);
+            coli_kv8_dequant_row(alq+t*4,alsc[t],ald+t*4,4);
+            coli_kv8_dequant_row(arq+t*2,arsc[t],ard+t*2,2);
+        }
+        float sc8[3],ref8[2],got8[2];
+        for(int t=0;t<3;t++)sc8[t]=aq8[0]*ald[t*4]+aq8[1]*ald[t*4+1]+aq8[2]*ard[t*2]+aq8[3]*ard[t*2+1];
+        float m8=sc8[0],z8=0;for(int t=1;t<3;t++)m8=sc8[t]>m8?sc8[t]:m8;
+        for(int t=0;t<3;t++){sc8[t]=std::exp(sc8[t]-m8);z8+=sc8[t];}for(int t=0;t<3;t++)sc8[t]/=z8;
+        for(int v=0;v<2;v++){ref8[v]=0;for(int t=0;t<3;t++)ref8[v]+=sc8[t]*ald[t*4+2+v];}
+        ColiCudaTensor *at8=nullptr;if(!coli_cuda_tensor_upload(&at8,aw8,nullptr,0,4,4,d0))return 1;
+        if(!coli_cuda_attention_absorb8(at8,got8,aq8,alq,alsc,arq,arsc,1,2,2,2,4,3,1.f)||
+           !close_enough(got8,ref8,2)){std::fprintf(stderr,"attention_absorb8 mismatch\n");return 1;}
+        /* batch twin, S=2 (query s attends T-S+s+1 rows): reference per query */
+        float bq8[2*4]={1,2,.5f,-.5f, -1,.5f,1,2},bref[4],bgot[4];
+        for(int s=0;s<2;s++){
+            int ntk=3-2+s+1;float bs[3];
+            for(int t=0;t<ntk;t++)bs[t]=bq8[s*4]*ald[t*4]+bq8[s*4+1]*ald[t*4+1]+bq8[s*4+2]*ard[t*2]+bq8[s*4+3]*ard[t*2+1];
+            float bm=bs[0],bz=0;for(int t=1;t<ntk;t++)bm=bs[t]>bm?bs[t]:bm;
+            for(int t=0;t<ntk;t++){bs[t]=std::exp(bs[t]-bm);bz+=bs[t];}for(int t=0;t<ntk;t++)bs[t]/=bz;
+            for(int v=0;v<2;v++){bref[s*2+v]=0;for(int t=0;t<ntk;t++)bref[s*2+v]+=bs[t]*ald[t*4+2+v];}
+        }
+        if(!coli_cuda_attention_absorb_batch8(at8,bgot,bq8,alq,alsc,arq,arsc,2,1,2,2,2,4,3,1.f)||
+           !close_enough(bgot,bref,4)){std::fprintf(stderr,"attention_absorb_batch8 mismatch\n");return 1;}
+        coli_cuda_tensor_free(at8);
+    }
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */

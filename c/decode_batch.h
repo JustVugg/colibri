@@ -2,12 +2,19 @@
 #define COLIBRI_DECODE_BATCH_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <math.h>
 
 /* `base` belongs to one sequence's KV state.  Keeping this arithmetic in a
  * model-independent seam makes ragged decode row ownership directly testable. */
 static inline float *coli_kv_row(float *base, int position, int width)
+{
+    return base + (size_t)position * (size_t)width;
+}
+
+/* KV8 twin: same row arithmetic on the fp8 (e4m3) byte cache. */
+static inline uint8_t *coli_kv_row8(uint8_t *base, int position, int width)
 {
     return base + (size_t)position * (size_t)width;
 }
