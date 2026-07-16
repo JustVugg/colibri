@@ -285,9 +285,13 @@ class DiagnosticHarness:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.out_dir = Path(args.out or f"./diag_results/{ts}")
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        # Base env for all runs
+        # Base env for all runs — production optimization stack (1.08 tok/s on g64)
         base_env = {"TEMP": "0", "PIPE": "1", "PIPE_WORKERS": "8", "DIRECT": "1"}
+        if not args.no_optimize:
+            base_env.update({"CACHE_ROUTE": "1", "ROUTE_J": "2", "ROUTE_M": "12",
+                             "EXPERT_BUDGET": "4"})
         if args.ram: base_env["RAM_GB"] = str(args.ram)
+        else: base_env["RAM_GB"] = "28"   # default: use available RAM aggressively
         if args.cuda:
             base_env.update({
                 "COLI_CUDA": "1",
@@ -296,6 +300,7 @@ class DiagnosticHarness:
                 "COLI_CUDA_ATTN": "1",
                 "COLI_CUDA_PIPE": "2",
                 "COLI_CUDA_PIPE_S_MIN": "1",
+                "COLI_CUDA_MTP": "1",
             })
         self.runner = EngineRunner(self.glm, self.snap, self.out_dir, base_env, timeout=args.timeout)
         self.runner.default_cap = args.cap
@@ -683,8 +688,10 @@ def main():
     ap.add_argument("--out", default=None, help="output directory (default: ./diag_results/<timestamp>)")
     ap.add_argument("--ngen", type=int, default=64, help="generation length for smoke/throughput (default 64)")
     ap.add_argument("--quality-limit", type=int, default=40, help="questions per benchmark task (default 40)")
-    ap.add_argument("--ram", type=float, default=0, help="RAM_GB override (0=auto)")
-    ap.add_argument("--cuda", action="store_true", help="enable COLI_CUDA GPU tier")
+    ap.add_argument("--ram", type=float, default=0, help="RAM_GB override (0=default 28GB aggressive)")
+    ap.add_argument("--cuda", action="store_true", help="enable COLI_CUDA GPU tier + full optimization stack")
+    ap.add_argument("--no-optimize", action="store_true",
+                    help="disable CACHE_ROUTE/EXPERT_BUDGET (test raw unoptimized path)")
     ap.add_argument("--gpu", type=int, default=None, help="GPU device ordinal (with --cuda)")
     ap.add_argument("--cap", type=int, default=75, help="experts-per-layer cache cap (default 75)")
     ap.add_argument("--timeout", type=int, default=600, help="per-run timeout in seconds (default 600)")
