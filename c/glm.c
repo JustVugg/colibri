@@ -5980,12 +5980,13 @@ int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with no spin tuning libgomp parks the worker team
      * between regions and the re-wake latency dominates. We keep the team hot
-     * across those microsecond gaps with GOMP_SPINCOUNT — but under the PASSIVE
-     * wait policy, so idle workers actually park once the spin window lapses
-     * (between turns the engine blocks for seconds in getline(); `active` would
-     * spin all cores forever — see issue #341: "3000% CPU after the model
-     * finished the answer"). The spin window preserves the perf win (matmul
-     * time 66.9s -> 20.9s on the Zen5 build, no change to numerical output).
+     * across those microsecond gaps with GOMP_SPINCOUNT (libgomp) /
+     * KMP_BLOCKTIME (LLVM libomp) — but under the PASSIVE wait policy, so idle
+     * workers actually park once the spin window lapses (between turns the engine
+     * blocks for seconds in getline(); `active` would spin all cores forever —
+     * see issue #341: "3000% CPU after the model finished the answer"). The spin
+     * window preserves the perf win (matmul time 66.9s -> 20.9s on the Zen5
+     * build, no change to numerical output).
      *
      * libgomp reads the OMP_ / GOMP_ vars in a CONSTRUCTOR that runs before
      * main(), so setenv() here and continuing would be too late (verified:
@@ -6011,6 +6012,15 @@ int main(int argc, char **argv){
          * across the microsecond gaps between back-to-back matmul regions. */
         setenv("OMP_WAIT_POLICY","passive",0);
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin ~200k iters then park: hot through adjacent regions, idle at 0% */
+        /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
+         * read GOMP_*: KMP_BLOCKTIME is its analog — the ms a worker spins after a
+         * parallel region before parking. PASSIVE alone already parks libomp's
+         * team at idle (the core #341 fix), but the default blocktime varies across
+         * versions, so set 200 ms explicitly: hot across back-to-back per-expert
+         * matmuls (the GOMP_SPINCOUNT equivalent for the libomp path) and asleep
+         * during the multi-second getline() wait. libgomp ignores KMP_*;
+         * overwrite=0 keeps the user's own setting authoritative. */
+        setenv("KMP_BLOCKTIME","200",0);
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);

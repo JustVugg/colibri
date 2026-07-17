@@ -43,6 +43,7 @@ class EnvDefaultsTest(unittest.TestCase):
         self.assertEqual(e["PIPE"], "1")
         self.assertEqual(e["PILOT_REAL"], "1")
         self.assertEqual(e["OMP_WAIT_POLICY"], "passive")  # active would spin cores at idle (#341)
+        self.assertEqual(e["KMP_BLOCKTIME"], "200")  # libomp analog of GOMP_SPINCOUNT (#341, clang/libomp path)
         self.assertNotIn("OMP_PROC_BIND", e)  # MinGW libgomp: niente affinity
 
     def test_explicit_override_wins(self):
@@ -55,12 +56,13 @@ class EnvDefaultsTest(unittest.TestCase):
         e = self.env_for_with({"COLI_NO_OMP_TUNE": "1"}, "win32")
         self.assertNotIn("OMP_WAIT_POLICY", e)
         self.assertNotIn("OMP_NUM_THREADS", e)
+        self.assertNotIn("KMP_BLOCKTIME", e)
         self.assertEqual(e["DIRECT"], "1")   # i default I/O restano attivi
         self.assertEqual(e["PIPE"], "1")
 
     def test_non_windows_untouched(self):
         e = self.env_for_with({}, "linux")
-        for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY"):
+        for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY", "KMP_BLOCKTIME"):
             self.assertNotIn(k, e)
 
 
