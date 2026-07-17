@@ -79,6 +79,15 @@ Format: `VAR` — default — effect.
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
 
+> **Windows note.** On Windows, a bare `coli chat` / `coli run` / `coli serve`
+> (no `--gpu`/`--vram`/`--auto-tier`) **auto-enables the GPU** when it detects a
+> CUDA build (`coli_cuda.dll` next to the engine) and at least one GPU via
+> `nvidia-smi`. The expert-tier VRAM budget is then sized automatically from the
+> card's free VRAM (same computation as `--auto-tier`). If `nvidia-smi` is not on
+> `PATH` the run falls back to CPU with a warning — pass `--vram N` (or add
+> `nvidia-smi` to `PATH`) to enable CUDA in that case. `--gpu none` forces
+> CPU-only. (Linux/macOS behaviour is unchanged: pass a flag to enable CUDA.)
+
 ---
 
 ## Advanced / experimental / debug

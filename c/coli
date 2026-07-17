@@ -141,7 +141,18 @@ def need_model(model):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
 def cuda_binary():
-    if not os.path.exists(GLM) or sys.platform != "linux": return False
+    if not os.path.exists(GLM): return False
+    if sys.platform != "linux":
+        # Windows: the engine links cudart only inside a runtime-loaded
+        # coli_cuda.dll (built with `make cuda-dll`; backend_loader.c loads it
+        # from the engine's own dir). There is no libcudart symbol in glm.exe
+        # and no `ldd`, so the Linux ldd/grep check below is meaningless here.
+        # Presence of coli_cuda.dll next to glm.exe is the faithful proxy: the
+        # engine loads exactly that file (backend_loader.c:149-155), so if it is
+        # there the build is CUDA-capable. Resolved next to GLM (not CWD) for the
+        # same DLL-hijacking reason the loader uses an absolute path.
+        dll = os.path.join(os.path.dirname(GLM), "coli_cuda.dll")
+        return os.path.exists(dll)
     try:
         linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
         return any("libcudart" in line and "not found" not in line
@@ -219,6 +230,43 @@ def env_for(a):
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
+        # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
+        # run CPU-only, even on a CUDA build with a GPU present — cuda_binary()
+        # returned False on Windows (see above), and nothing set COLI_CUDA without
+        # an explicit flag. Now that detection works, auto-enable the GPU when one
+        # is detected so `coli chat` Just Works. Scoped to Windows: Linux already
+        # has working detection + the explicit-flag UX, and changing bare-chat
+        # semantics there is out of scope. Falls back to CPU with a warning if
+        # nvidia-smi is missing (discover_gpus can't size VRAM without it).
+        if (sys.platform == "win32" and a.gpu is None and not a.vram):
+            if cuda_binary():
+                from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
+                gpus = discover_gpus()
+                if gpus:
+                    e["COLI_CUDA"]="1"
+                    e.setdefault("COLI_GPUS", ",".join(str(g["index"]) for g in gpus))
+                    # Reuse the planner so the expert-tier VRAM budget is the real
+                    # free VRAM minus the 2 GB reserve — not a guess. Same machinery
+                    # as --auto-tier, just without requiring the user to pass it.
+                    ram,ctx,devices,vram_req = resource_request(a, e)
+                    try:
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        e.update(environment_for_plan(plan,e,cuda_enabled=True))
+                        vt=plan["tiers"]["vram"]
+                        names=",".join(g["name"].strip() for g in gpus)
+                        print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
+                              f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)
+                    except (OSError,ValueError,json.JSONDecodeError) as error:
+                        # Plan failed (e.g. model dir unreadable): don't block the
+                        # run, just leave the unsized COLI_CUDA=1 and let the engine
+                        # pick its own budget. Engine handles a missing budget.
+                        print(f"  {C.yel}[GPU] auto-enable: could not size VRAM ({error}); "
+                              f"using engine default{C.r}", file=sys.stderr)
+                else:
+                    print(f"  {C.yel}[GPU] coli_cuda.dll present but nvidia-smi not found on PATH "
+                          f"(cannot size VRAM); running CPU-only. Add nvidia-smi to PATH or pass "
+                          f"--vram N to enable CUDA.{C.r}", file=sys.stderr)
+            # else: CPU build (no coli_cuda.dll) — stay silent, CPU is correct.
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:
