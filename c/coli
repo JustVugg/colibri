@@ -172,8 +172,13 @@ def env_for(a):
             # prima di main, quindi su Windows vanno nell'ambiente del figlio.
             # niente OMP_PROC_BIND/OMP_PLACES: la libgomp di MinGW non supporta
             # l'affinity su Windows ("Affinity not supported on this configuration")
+            # PASSIVE (non active): sotto `active` libgomp tiene il team in spin
+            # userspace per SEMPRE tra le regioni, cosi' a turno finito il motore
+            # brucia ~100% per core mentre resta bloccato in getline() (issue #341).
+            # PASSIVE + GOMP_SPINCOUNT tiene il team caldo tra regioni matmul adiacenti
+            # (i microsecondi) ma lo parcheggia a 0% durante le attese lunghe.
             from resource_plan import physical_cpu_count
-            for k, v in (("OMP_WAIT_POLICY", "active"),
+            for k, v in (("OMP_WAIT_POLICY", "passive"),
                          ("GOMP_SPINCOUNT", "200000"),
                          ("OMP_DYNAMIC", "FALSE"),
                          ("OMP_NUM_THREADS", str(physical_cpu_count()))):

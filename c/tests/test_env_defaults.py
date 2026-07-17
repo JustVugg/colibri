@@ -42,7 +42,7 @@ class EnvDefaultsTest(unittest.TestCase):
         self.assertEqual(e["DIRECT"], "1")
         self.assertEqual(e["PIPE"], "1")
         self.assertEqual(e["PILOT_REAL"], "1")
-        self.assertEqual(e["OMP_WAIT_POLICY"], "active")
+        self.assertEqual(e["OMP_WAIT_POLICY"], "passive")  # active would spin cores at idle (#341)
         self.assertNotIn("OMP_PROC_BIND", e)  # MinGW libgomp: niente affinity
 
     def test_explicit_override_wins(self):

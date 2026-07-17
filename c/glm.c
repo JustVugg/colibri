@@ -5978,10 +5978,14 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
 
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
-     * tiny and back-to-back; with the default passive wait policy libgomp parks
-     * the worker team between regions and the re-wake latency dominates. Keeping
-     * the threads hot (active spin) collapses that overhead — measured matmul
-     * time 66.9s -> 20.9s on the Zen5 build, with no change to numerical output.
+     * tiny and back-to-back; with no spin tuning libgomp parks the worker team
+     * between regions and the re-wake latency dominates. We keep the team hot
+     * across those microsecond gaps with GOMP_SPINCOUNT — but under the PASSIVE
+     * wait policy, so idle workers actually park once the spin window lapses
+     * (between turns the engine blocks for seconds in getline(); `active` would
+     * spin all cores forever — see issue #341: "3000% CPU after the model
+     * finished the answer"). The spin window preserves the perf win (matmul
+     * time 66.9s -> 20.9s on the Zen5 build, no change to numerical output).
      *
      * libgomp reads the OMP_ / GOMP_ vars in a CONSTRUCTOR that runs before
      * main(), so setenv() here and continuing would be too late (verified:
@@ -5998,8 +6002,15 @@ int main(int argc, char **argv){
      * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
        !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
-        setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
-        setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
+        /* PASSIVE (not active): under `active` libgomp keeps the worker team
+         * spinning in userspace FOREVER between regions — so once a forward pass
+         * has spun the team up, the engine burns ~100% per core while it sits
+         * blocked in getline() waiting for the next prompt (issue #341: "3000%
+         * CPU after the model finished the answer"). PASSIVE parks idle workers
+         * on a futex; GOMP_SPINCOUNT below is what actually keeps them hot
+         * across the microsecond gaps between back-to-back matmul regions. */
+        setenv("OMP_WAIT_POLICY","passive",0);
+        setenv("GOMP_SPINCOUNT","200000",0);   /* spin ~200k iters then park: hot through adjacent regions, idle at 0% */
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
