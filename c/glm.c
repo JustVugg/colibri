@@ -4595,7 +4595,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=edisk_s()+m->t_emm+m->t_attn+m->t_head;
+    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
     double other=elapsed-accounted;
     double other_tracked=m->t_rmsnorm+m->t_router+m->t_resadd+m->t_embed;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
