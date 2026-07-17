@@ -193,6 +193,7 @@ typedef struct {
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
+    uint64_t hit_pin, hit_ecache;                /* split di hits: tier pin vs LRU ecache */
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
@@ -305,13 +306,14 @@ static void prof_lat(double s){ g_prof_lat[g_prof_nlat++ % PROF_LAT_CAP]=s; }
 /* snapshot for windowed reports (serve mode: one report per turn) */
 typedef struct {
     double edisk,ewait,emm,attn,head;
-    int64_t io; uint64_t hits,miss,ereq,n_fw,n_emit,nlat;
+    int64_t io; uint64_t hits,hit_pin,hit_ecache,miss,ereq,n_fw,n_emit,nlat;
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
     b->attn=m->t_attn; b->head=m->t_head;
     b->io=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
-    b->hits=m->hits; b->miss=m->miss; b->ereq=m->ereq;
+    b->hits=m->hits; b->hit_pin=m->hit_pin; b->hit_ecache=m->hit_ecache;
+    b->miss=m->miss; b->ereq=m->ereq;
     b->n_fw=m->n_fw; b->n_emit=m->n_emit; b->nlat=g_prof_nlat;
 }
 
@@ -3054,9 +3056,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
             ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; m->hit_ecache++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
@@ -4371,14 +4373,15 @@ static void emit_stream(int t, void *ud){
     EmitStream *e=(EmitStream*)ud; char dec[64];
     int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
     if(!e->quiet && ++e->count%16==0){ double tt=e->m->hits+e->m->miss;
+        double lru=tt?100.0*e->m->hit_ecache/tt:0.0;   /* quota LRU della hit rate: hit% - lru% = pin% */
         if(g_cache_route && e->m->route_slots){
             double swap=100.0*e->m->route_swaps/e->m->route_slots;
-            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-                rss_gb(), tt?100.0*e->m->hits/tt:0.0, swap, e->count/(now_s()-e->t0),
+            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%% (lru %.0f%%)  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
+                rss_gb(), tt?100.0*e->m->hits/tt:0.0, lru, swap, e->count/(now_s()-e->t0),
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         } else {
-            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-                rss_gb(), tt?100.0*e->m->hits/tt:0.0, e->count/(now_s()-e->t0),
+            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%% (lru %.0f%%)  %.2f tok/s  %.2f tok/fw]\n", e->count,
+                rss_gb(), tt?100.0*e->m->hits/tt:0.0, lru, e->count/(now_s()-e->t0),
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         }
     }
@@ -4531,6 +4534,7 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     }
     int64_t io=atomic_load_explicit(&g_prof_io,memory_order_relaxed)-b->io;
     uint64_t dh=m->hits-b->hits, dm=m->miss-b->miss, dq=m->ereq-b->ereq;
+    uint64_t dhp=m->hit_pin-b->hit_pin, dhe=m->hit_ecache-b->hit_ecache;
     double hitp=(dh+dm)?100.0*dh/(dh+dm):100.0;
     double eb=(double)expert_bytes_probe(m,m->ebits);
     int pinned=0,lru=0;
@@ -4538,10 +4542,10 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     double io_w=m->t_ewait-b->ewait;    /* stall the compute thread felt */
     double io_svc=edisk_s()-b->edisk;   /* read service on the loading threads (overlaps compute) */
     fprintf(f,"[PROF] expert I/O: %.3f GB fetched (%.1f MB/token, %.2f GB/s over the run%s) | "
-              "hit %.1f%% (%llu hit / %llu load) | %.1f loads/token | %.1fs read service / %.1fs felt wait\n",
+              "hit %.1f%% (%llu pin + %llu lru / %llu load) | %.1f loads/token | %.1fs read service / %.1fs felt wait\n",
         io/1e9, tokens>0?io/1e6/tokens:0.0, io/1e9/elapsed,
         g_mmap?"; COLI_MMAP=1: page cache may serve part":"",
-        hitp,(unsigned long long)dh,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
+        hitp,(unsigned long long)dhp,(unsigned long long)dhe,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
         io_svc,io_w);
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
         pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
@@ -4576,7 +4580,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
     float *logit=step(m,full,np-1,0); free(logit);
-    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
+    m->hits=m->hit_pin=m->hit_ecache=m->miss=m->ereq=m->gpu_expert_calls=0;
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
     double t0=now_s(); int steps=0;
@@ -4586,8 +4590,9 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
         if(g_prof){ prof_lat(now_s()-tf0); m->n_fw++; m->n_emit++; }
     }
     double dt=now_s()-t0, tot=m->hits+m->miss;
-    printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
-        steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%% (pin %.1f%% + lru %.1f%%)\n",
+        steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0,
+        tot?100.0*m->hit_pin/tot:0.0,tot?100.0*m->hit_ecache/tot:0.0);
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
@@ -4626,7 +4631,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     }
     prefill_t=now_s()-prefill_t;
     printf("PROFILO PREFILL (%.2fs):\n",prefill_t); profile_print(m,prefill_t);
-    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
+    m->hits=m->hit_pin=m->hit_ecache=m->miss=m->ereq=m->gpu_expert_calls=0;
     m->n_emit=m->n_fw=0;
     g_last_repin=0;
     profile_reset(m);
