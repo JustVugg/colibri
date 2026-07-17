@@ -90,6 +90,18 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
 }
 
+/* Scale for output `row`, input element `k`. fmt=4 (grouped int4) stores ng
+ * scales per row at scales[row*ng + k/gs]; every other quantized format has
+ * one scale per row at scales[row]. Mirrors quant_matmul's fmt==4 branch so the
+ * attention absorb kernels apply per-group scales instead of the per-row
+ * (fmt=2) semantic that crashed #298's g64 kv_b. */
+__device__ static float absorb_scale(const float *wscale, int fmt, int gs, int ng, int row, int k) {
+    if (!fmt) return 1.f;
+    if (fmt != 4) return wscale[row];
+    int g = k / gs; if (g >= ng) g = ng - 1;   /* tail of the last (partial) group */
+    return wscale[(size_t)row * ng + g];
+}
+
 __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]^=0x88;
 }
@@ -304,11 +316,12 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
 
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
-                                                int fmt,int H,int Q,int R,int V,int K,int T,float scale){
+                                                int fmt,int H,int Q,int R,int V,int K,int T,float scale,
+                                                int gs,int ng){
     int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);extern __shared__ float sm[];
     float *qa=sm,*cl=qa+K,*scores=cl+K;
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
-        a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*(fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+        a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*absorb_scale(wscale,fmt,gs,ng,rbase+d,k);qa[k]=a;}
     __syncthreads();
     for(int t=tid;t<T;t+=blockDim.x){float a=0;const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
         for(int k=0;k<K;k++)a+=qa[k]*lt[k];for(int d=0;d<R;d++)a+=q[(size_t)h*(Q+R)+Q+d]*rt[d];scores[t]=a*scale;}
@@ -319,19 +332,20 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<T;t++)a+=scores[t]*latent[(size_t)t*K+k];cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
-        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k)*absorb_scale(wscale,fmt,gs,ng,row,k);ctx[(size_t)h*V+v]=a;}
 }
 
 __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         const float *latent,const float *rope,const void *weights,const float *wscale,
-        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
+        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale,
+        int gs,int ng){
     int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
     if(s>=S||nt<1)return;
     extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
     const float *qs=q+((size_t)s*H+h)*(Q+R);
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
-          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+          absorb_scale(wscale,fmt,gs,ng,rbase+d,k);qa[k]=a;}
     __syncthreads();
     for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=latent+(size_t)t*K;
         const float *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
@@ -349,8 +363,8 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         a+=scores[t]*latent[(size_t)t*K+k];cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
-        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
-        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k)*absorb_scale(wscale,fmt,gs,ng,row,k);
+        ctx[((size_t)s*H+h)*V+v]=a;}
 }
 
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
@@ -745,7 +759,7 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention rope upload"))return 0;
     size_t shared=(size_t)(2*K+T)*sizeof(float);
     attention_absorb_kernel<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,dc->ar,w->weights,w->scales,
-        w->fmt,H,Q,R,V,K,T,scale);
+        w->fmt,H,Q,R,V,K,T,scale,w->gs,w->ng);
     if(!cuda_ok(cudaGetLastError(),"attention absorb launch")||
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"attention context download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"attention synchronize"))return 0;
@@ -768,7 +782,7 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope upload"))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
-        dc->ar,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        dc->ar,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale,w->gs,w->ng);
     if(!cuda_ok(cudaGetLastError(),"attention batch launch"))return 0;
     const float *src=dc->ac;size_t ob=cb;
     if(proj){
@@ -946,7 +960,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale,w->gs,w->ng);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch"))return 0;
     size_t ob=(size_t)S*proj->O*sizeof(float);
     if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
@@ -1005,7 +1019,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale,w->gs,w->ng);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch (dev out)"))return 0;
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(out_dev,dc->ac,proj->weights,
         proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->gs,proj->ng);
@@ -1023,7 +1037,7 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx_dev,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale,w->gs,w->ng);
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
@@ -1040,7 +1054,7 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,1),256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,1,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,1,H,Q,R,V,K,T,scale,w->gs,w->ng);
     if(!cuda_ok(cudaGetLastError(),"kvdev absorb launch")||
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev ctx download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev absorb sync"))return 0;
