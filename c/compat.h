@@ -142,7 +142,34 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
 /* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
  * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
- * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
+ * MB-centinaia di MB, il wrapper e' robusto per ogni taglia).
+ *
+ * RETRY ON TRANSIENT ERRORS (#307): gli shard handle NON sono aperti con
+ * FILE_FLAG_OVERLAPPED (st.h:85 li apre buffered), quindi il kernel serializza
+ * le ReadFile concorrenti allo stesso handle. Sotto il carico del motore su
+ * Windows (default: DIRECT=1, PIPE=1, PIPE_WORKERS=8, PILOT_REAL=1 -> 8 worker
+ * + pilot + main, tutti compat_pread sugli stessi shard handle; piu' un'altra
+ * ReadFile sincrona per ogni hint WILLNEED in compat_fadvise) errori transitori
+ * come ERROR_LOCK_VIOLATION / ERROR_SHARING_VIOLATION / ERROR_NOT_READY sono
+ * normali e recuperabili: conflitto momentaneo sul handle, AV che scansiona il
+ * VHDX, un detach/timeout del disco virtuale. Mapparli a EIO e ritornare -1 al
+ * primo tentativo (il comportamento precedente) uccideva il load con un singolo
+ * ReadFile flaky -> "[engine terminated: exit code 1]" + "pread qs: Input/output
+ * error (off X, 0/N bytes)" nel bel mezzo di una generazione, dopo che il motore
+ * aveva girato bene finche' il working set era caldo. Ora questi tre errori si
+ * ritentano fino a 3 volte con backoff 1/2/4 ms, poi si arrendono a EIO: un
+ * disco morente fallira' comunque (dopo i tentativi), ma un transient vero
+ * sopravvive. EOF, EBADF e gli altri errori reali restano immediati. */
+static inline int compat_pread_retryable(DWORD err){
+    /* Letture concorrenti su un handle non-overlapped, AV/VHDX, disco che si
+     * rimette in linea: transienti documentati, ognuno risolvibile ritentando. */
+    return err == ERROR_LOCK_VIOLATION   /* 33: un altro handle trattiene la regione */
+        || err == ERROR_SHARING_VIOLATION/* 32: conflitto di condivisione momentaneo */
+        || err == ERROR_NOT_READY;       /* 21: dispositivo non pronto (riprova) */
+}
+static inline void compat_sleep_ms(DWORD ms){
+    SleepEx(ms, FALSE);
+}
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
@@ -151,13 +178,20 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     while(total < n){
         size_t chunk = n - total;
         DWORD chunk32 = (chunk > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)chunk;
-        OVERLAPPED ov = {0};
-        ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
-        ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
-        DWORD rd = 0;
-        if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
-            DWORD err = GetLastError();
-            if(err == ERROR_HANDLE_EOF) break;  /* past EOF → return bytes read (0 if none, matching POSIX pread) */
+        DWORD rd = 0; DWORD err = 0; int attempt = 0; int ok = 0;
+        for(;;){                             /* retry loop: solo errori transienti */
+            OVERLAPPED ov = {0};
+            ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
+            ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
+            rd = 0;
+            ok = ReadFile(h, (char*)buf + total, chunk32, &rd, &ov);
+            if(ok) break;                    /* successo (EOF/partial gestiti sotto via rd) */
+            err = GetLastError();            /* significativo solo quando ok==0 */
+            if(!compat_pread_retryable(err) || ++attempt > 3) break;
+            compat_sleep_ms(attempt == 1 ? 1 : (attempt == 2 ? 2 : 4));
+        }
+        if(!ok){                             /* ReadFile fallito: err e' onesto */
+            if(err == ERROR_HANDLE_EOF) break;/* past EOF → bytes letti (0 = POSIX pread) */
             if(err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_FUNCTION) errno = EBADF;
             else errno = EIO;
             return -1;
