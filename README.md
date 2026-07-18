@@ -50,6 +50,43 @@ A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
 - the **dense part** (attention, shared experts, embeddings — ~17B params) stays **resident in RAM at int4** (~9.9 GB);
 - the **19,456 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
 
+### Local cluster mode
+
+The C engine can act as a coordinator while other Macs serve disk-backed
+experts. The coordinator still owns token generation, routing, and KV cache;
+each routed layer is sent as one batch-union RPC, so a token does not incur one
+network round trip per expert. Workers use the same quantized expert kernels as
+the single-box engine and keep one streamed expert slot per layer.
+
+Start the optional registration/discovery process on the coordinator:
+
+```bash
+cd c
+./coli cluster coordinator --host 0.0.0.0 --port 8765
+```
+
+On each worker, with the same converted model available locally:
+
+```bash
+./coli cluster worker --model /nvme/glm52_i4 --port 9100 \
+  --coordinator http://COORDINATOR:8765 --advertise-host WORKER_IP
+```
+
+Run inference on the coordinator. It discovers live expert workers before the
+large engine starts:
+
+```bash
+./coli serve --model /nvme/glm52_i4 \
+  --cluster-coordinator http://127.0.0.1:8765
+```
+
+For a static setup, skip discovery and provide `--cluster-workers
+HOST:PORT,...`. Cluster transport is disabled unless workers are configured,
+so existing single-machine runs retain their current execution path and output.
+The current seam is expert compute; dense-layer sharding is intentionally kept
+separate because it needs activation pipelining and tensor-parallel placement
+decisions rather than the same batch RPC.
+
 The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
 ## What's implemented

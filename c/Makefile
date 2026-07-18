@@ -330,7 +330,7 @@ install: glm$(EXE) olmoe$(EXE)
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
-	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py cluster.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 
 uninstall:
