@@ -258,6 +258,51 @@ extern "C" void coli_metal_attn_lat(double *ksched, double *gsched){
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
 static std::vector<Slab> g_slabs;
 static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel OpenMP threads
+
+// ---- E5 experiment: COLI_METAL_RESSET=1 -- one persistent MTLResidencySet attached to
+// g_queue (macOS 15+) replaces moe_submit's per-command-buffer useResource: loop over
+// resolved expert weight/scale slabs. Allocation is untouched (same newBufferWithBytesNoCopy
+// wrap as stock); only residency bookkeeping moves off the dispatch hot path -- see
+// SUMMARY.md for why skipping useResource: there is safe (read-only, indirectly-referenced
+// buffers only; residency sets don't do hazard tracking, but nothing here relied on it).
+// g_resset_obj is a bare `id` (holds id<MTLResidencySet>) so the global's declared type
+// carries no availability annotation -- the protocol name only appears inside
+// @available(macOS 15.0, *) guards below, keeping -Wunguarded-availability clean.
+static id g_resset_obj;
+static bool g_resset_enabled;   // COLI_METAL_RESSET=1, macOS 15+, and creation succeeded
+static bool g_resset_dirty;     // addAllocation: calls pending commit; g_slab_mtx-guarded
+
+// Add a just-wrapped buffer to the set. Deferred commit (batches an OMP loader burst into
+// one commit at the next moe_submit instead of one per slab): correct because every
+// register/unregister caller holds g_slab_mtx here, and resolve() (which every dispatch
+// calls before touching a slab) takes the same mutex -- a slab moe_submit's resolve() can
+// see was necessarily added, and marked dirty, before moe_submit's own resset_flush() ran.
+static void resset_add(id<MTLBuffer> b) {   // caller holds g_slab_mtx
+  if (!g_resset_enabled) return;
+  if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj addAllocation:b]; g_resset_dirty = true; }
+}
+// Remove + commit immediately, NOT deferred: the caller frees the underlying host memory
+// right after coli_metal_unregister returns, so the removal must be applied before that --
+// an uncommitted-but-still-resident allocation pointing at freed memory is a use-after-free
+// risk the GPU could act on.
+static void resset_remove(id<MTLBuffer> b) {   // caller holds g_slab_mtx
+  if (!g_resset_enabled) return;
+  if (@available(macOS 15.0, *)) {
+    id<MTLResidencySet> rs = (id<MTLResidencySet>)g_resset_obj;
+    [rs removeAllocation:b]; [rs commit];
+  }
+  g_resset_dirty = false;   // commit above also flushes any pending adds
+}
+// Flush pending adds before moe_submit relies on the set alone for residency -- the only
+// caller that skips per-buffer useResource: (see moe_submit below).
+static void resset_flush() {
+  if (!g_resset_enabled) return;
+  std::lock_guard<std::mutex> lk(g_slab_mtx);
+  if (!g_resset_dirty) return;
+  if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj commit]; }
+  g_resset_dirty = false;
+}
+
 // Persistent scratch buffers (grow-only) for the MoE pipeline.
 static id<MTLBuffer> g_gg, g_uu, g_hh, g_xg; static size_t g_gg_cap, g_uu_cap, g_hh_cap, g_xg_cap;
 static id<MTLBuffer> ensure(id<MTLBuffer> b, size_t *cap, size_t need) {
@@ -304,6 +349,25 @@ extern "C" int coli_metal_init(void) {
     if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
+    // E5 experiment: COLI_METAL_RESSET=1 -- see g_resset_obj comment above.
+    if (getenv("COLI_METAL_RESSET") && atoi(getenv("COLI_METAL_RESSET"))) {
+      if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        rd.initialCapacity = 4096;   // hint only (internal array presize), not a hard limit
+        NSError *rerr = nil;
+        id<MTLResidencySet> rs = [g_dev newResidencySetWithDescriptor:rd error:&rerr];
+        if (rs) {
+          [g_queue addResidencySet:rs];
+          g_resset_obj = rs; g_resset_enabled = true;
+          fprintf(stderr, "[METAL] residency-set: on (macOS 15+, moe_submit skips per-buffer useResource:)\n");
+        } else {
+          fprintf(stderr, "[METAL] residency-set create failed: %s -- stock per-CB residency path\n",
+                  rerr ? [[rerr localizedDescription] UTF8String] : "?");
+        }
+      } else {
+        fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but OS < macOS 15 -- stock per-CB residency path\n");
+      }
+    }
   }
   return 1;
 }
@@ -314,12 +378,16 @@ extern "C" void coli_metal_register(void *base, size_t len) {
                               options:g_res_opts deallocator:nil];
   if (!b) return;
   std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
-  for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; return; }
+  for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; resset_add(b); return; }
   g_slabs.push_back({base, len, b});
+  resset_add(b);
 }
 extern "C" void coli_metal_unregister(void *base) {
   std::lock_guard<std::mutex> lk(g_slab_mtx);
-  for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) { g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); return; }
+  for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) {
+    resset_remove(g_slabs[i].buf);   // must land before the caller frees base
+    g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); return;
+  }
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
@@ -357,7 +425,14 @@ extern "C" void coli_metal_spin_start(void) {
 }
 extern "C" void coli_metal_spin_stop(void) { g_spin_run.store(false); }
 
-extern "C" void coli_metal_shutdown(void) { coli_metal_spin_stop(); g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0; }
+extern "C" void coli_metal_shutdown(void) {
+  coli_metal_spin_stop();
+  if (g_resset_enabled) {
+    if (@available(macOS 15.0, *)) { [g_queue removeResidencySet:(id<MTLResidencySet>)g_resset_obj]; }
+  }
+  g_resset_obj=nil; g_resset_enabled=false; g_resset_dirty=false;
+  g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0;
+}
 extern "C" int  coli_metal_available(void) { return g_dev != nil; }
 extern "C" void coli_metal_stats(size_t *c, size_t *b) { if(c)*c=g_tensor_count; if(b)*b=g_tensor_bytes; }
 extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
