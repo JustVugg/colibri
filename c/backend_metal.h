@@ -98,6 +98,10 @@ int coli_metal_attn_decode(const float *x,
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
 void coli_metal_moe_times(double *setup, double *gpu, double *scatter);
 double coli_metal_moe_kernel_time(void);
+/* E5 (COLI_METAL_RESSET=1): returns 1 when the queue-attached residency set is active and
+ * writes the cumulative seconds moe_submit spent committing pending set adds -- a cost that
+ * sits OUTSIDE the setup/gpu/scatter breakdown above. Returns 0 (and writes 0) when off. */
+int coli_metal_resset_stats(double *flush_s);
 
 /*
  * Batched routed-expert SwiGLU for one MoE block, in ONE command buffer.

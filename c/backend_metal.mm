@@ -270,23 +270,36 @@ static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel Ope
 // @available(macOS 15.0, *) guards below, keeping -Wunguarded-availability clean.
 static id g_resset_obj;
 static bool g_resset_enabled;   // COLI_METAL_RESSET=1, macOS 15+, and creation succeeded
-static bool g_resset_dirty;     // addAllocation: calls pending commit; g_slab_mtx-guarded
+static bool g_resset_dirty;     // addAllocation: calls pending commit; g_resset_mtx-guarded
+// Set mutations + dirty flag get their OWN mutex, never held together with g_slab_mtx: no
+// live Metal call may run under the slab lock the parallel OMP loader threads contend on
+// (E4's audit round 2 found exactly that shape -- mutex over a live Metal call -- as the
+// leading suspect for its +12s expert-disk regression). g_slab_mtx keeps guarding g_slabs
+// bookkeeping only, exactly as on stock.
+static std::mutex g_resset_mtx;
+static double g_t_resset_flush;   // sec committing pending adds in moe_submit (gate on only)
 
-// Add a just-wrapped buffer to the set. Deferred commit (batches an OMP loader burst into
-// one commit at the next moe_submit instead of one per slab): correct because every
-// register/unregister caller holds g_slab_mtx here, and resolve() (which every dispatch
-// calls before touching a slab) takes the same mutex -- a slab moe_submit's resolve() can
-// see was necessarily added, and marked dirty, before moe_submit's own resset_flush() ran.
-static void resset_add(id<MTLBuffer> b) {   // caller holds g_slab_mtx
+// Add a just-wrapped buffer to the set; commit deferred (an OMP loader burst batches into
+// one commit at the next moe_submit instead of one per slab). Called by coli_metal_register
+// after it drops g_slab_mtx but before it returns -- and the engine cannot dispatch an
+// expert before the load that registers its slab returns, so any slab a given moe_submit
+// can resolve() was added (and marked dirty) under g_resset_mtx strictly before that
+// moe_submit's resset_flush() acquired the same mutex: the flush covers it. The slab-table
+// ordering itself (register-before-resolve) is unchanged and stays under g_slab_mtx.
+// Cost lands in the caller's existing expert-load accounting (t_ewait window in glm.c);
+// no separate counter for the add/remove side.
+static void resset_add(id<MTLBuffer> b) {
   if (!g_resset_enabled) return;
+  std::lock_guard<std::mutex> lk(g_resset_mtx);
   if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj addAllocation:b]; g_resset_dirty = true; }
 }
 // Remove + commit immediately, NOT deferred: the caller frees the underlying host memory
 // right after coli_metal_unregister returns, so the removal must be applied before that --
 // an uncommitted-but-still-resident allocation pointing at freed memory is a use-after-free
-// risk the GPU could act on.
-static void resset_remove(id<MTLBuffer> b) {   // caller holds g_slab_mtx
+// risk the GPU could act on. Also runs outside g_slab_mtx (see g_resset_mtx above).
+static void resset_remove(id<MTLBuffer> b) {
   if (!g_resset_enabled) return;
+  std::lock_guard<std::mutex> lk(g_resset_mtx);
   if (@available(macOS 15.0, *)) {
     id<MTLResidencySet> rs = (id<MTLResidencySet>)g_resset_obj;
     [rs removeAllocation:b]; [rs commit];
@@ -294,13 +307,22 @@ static void resset_remove(id<MTLBuffer> b) {   // caller holds g_slab_mtx
   g_resset_dirty = false;   // commit above also flushes any pending adds
 }
 // Flush pending adds before moe_submit relies on the set alone for residency -- the only
-// caller that skips per-buffer useResource: (see moe_submit below).
+// caller that skips per-buffer useResource: (see moe_submit below). Takes g_resset_mtx
+// only, never g_slab_mtx; the happens-before argument lives at resset_add above.
 static void resset_flush() {
   if (!g_resset_enabled) return;
-  std::lock_guard<std::mutex> lk(g_slab_mtx);
+  std::lock_guard<std::mutex> lk(g_resset_mtx);
   if (!g_resset_dirty) return;
   if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj commit]; }
   g_resset_dirty = false;
+}
+// Harness visibility for the flush cost, which sits OUTSIDE the moe_times setup/gpu
+// breakdown (timed around resset_flush in moe_submit, before ts_start). Returns whether
+// the set is active so glm.c prints the METAL-RESSET line only when the gate is on --
+// stock output stays byte-identical.
+extern "C" int coli_metal_resset_stats(double *flush_s) {
+  if (flush_s) *flush_s = g_t_resset_flush;
+  return g_resset_enabled ? 1 : 0;
 }
 
 // Persistent scratch buffers (grow-only) for the MoE pipeline.
@@ -377,17 +399,22 @@ extern "C" void coli_metal_register(void *base, size_t len) {
   id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
                               options:g_res_opts deallocator:nil];
   if (!b) return;
-  std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
-  for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; resset_add(b); return; }
-  g_slabs.push_back({base, len, b});
-  resset_add(b);
+  {
+    std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
+    bool found = false;
+    for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; found = true; break; }
+    if (!found) g_slabs.push_back({base, len, b});
+  }
+  resset_add(b);   // E5: outside g_slab_mtx (no Metal call under the slab lock); still before return
 }
 extern "C" void coli_metal_unregister(void *base) {
-  std::lock_guard<std::mutex> lk(g_slab_mtx);
-  for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) {
-    resset_remove(g_slabs[i].buf);   // must land before the caller frees base
-    g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); return;
+  id<MTLBuffer> b = nil;
+  {
+    std::lock_guard<std::mutex> lk(g_slab_mtx);
+    for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) {
+      b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }
   }
+  if (b) resset_remove(b);   // E5: outside g_slab_mtx; commits before the caller frees base
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
@@ -743,7 +770,9 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
   if (!g_dev || (fmt != 1 && fmt != 2)) return nil;
-  resset_flush();   // E5: commit any pending slab adds before we may skip useResource: below
+  if (g_resset_enabled) {   // E5: commit any pending slab adds before we may skip useResource:
+    double t0 = mnow(); resset_flush(); g_t_resset_flush += mnow() - t0;   // METAL-RESSET line
+  }
   double ts_start = mnow();
   std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
   std::vector<id<MTLBuffer>> use; use.reserve(nb*2);

@@ -17,12 +17,15 @@ reduction survives without the load-path tax (malloc pages never change ownershi
 
 ## What changed
 
-Everything is confined to `c/backend_metal.mm`. **No changes to `glm.c` or
-`backend_metal.h`** — `coli_metal_register`/`coli_metal_unregister`'s existing signatures and
-every call site in `glm.c` (expert_load, uring_load_add, qalloc, kv_alloc, map_of_fd) are
-untouched; the residency-set bookkeeping lives entirely inside those two functions' existing
-bodies. This is a smaller diff shape than E4, which needed new `backend_metal.h` declarations
-and new `glm.c` call sites because it changed the allocation function itself.
+All mechanism code is confined to `c/backend_metal.mm` —
+`coli_metal_register`/`coli_metal_unregister`'s existing signatures and every call site in
+`glm.c` (expert_load, uring_load_add, qalloc, kv_alloc, map_of_fd) are untouched; the
+residency-set bookkeeping lives entirely inside those two functions' existing bodies. The
+only `glm.c`/`backend_metal.h` touch is one instrumentation hook added in the validator
+round-1 fixes (`coli_metal_resset_stats` + the gate-on-only `METAL-RESSET:` stats line in
+`profile_print` — see "Validator round 1 fixes" below). Still a smaller diff shape than E4,
+which needed a new alloc/free API and four new `glm.c` call-site arms because it changed the
+allocation function itself.
 
 Env-gated `COLI_METAL_RESSET=1`, default OFF, runtime `@available(macOS 15.0, *)` guard with
 a one-line stderr fallback when requested on an older OS or when residency-set creation
@@ -40,12 +43,18 @@ the `COLI_METAL_RESSET` `getenv` branch in `coli_metal_init`, so `resset_add`/`r
   — one set, attached once, for the process lifetime. Failure (old OS or creation error)
   prints one stderr line and leaves `g_resset_enabled=false` — stock path.
 - **`coli_metal_register`**: after wrapping the buffer exactly as today
-  (`newBufferWithBytesNoCopy`), calls `resset_add(b)` under the *same* `g_slab_mtx` that
-  already serializes `g_slabs` mutation from parallel OMP loader threads. `resset_add` calls
-  `[rs addAllocation:b]` and sets a `g_resset_dirty` flag — **it does not commit**.
-- **`coli_metal_unregister`**: calls `resset_remove(b)` (also under `g_slab_mtx`) *before*
-  clearing the `g_slabs` entry. `resset_remove` calls `[rs removeAllocation:b]` **and commits
-  immediately** — no batching. See UNCERTAINTIES for why this asymmetry is deliberate.
+  (`newBufferWithBytesNoCopy`) and pushing the `g_slabs` entry under `g_slab_mtx` exactly as
+  today, calls `resset_add(b)` **after dropping `g_slab_mtx`** but before returning.
+  `resset_add` takes a dedicated `g_resset_mtx` (guarding only the set mutations and the
+  dirty flag), calls `[rs addAllocation:b]` and sets `g_resset_dirty` — **it does not
+  commit**. No Metal call ever runs under `g_slab_mtx` (validator round-1 fix; E4's audit
+  round 2 identified mutex-over-live-Metal-call as the leading suspect for its +12s
+  expert-disk regression).
+- **`coli_metal_unregister`**: erases the `g_slabs` entry under `g_slab_mtx` (stashing the
+  buffer), then calls `resset_remove(b)` **outside `g_slab_mtx`**, before returning.
+  `resset_remove` (under `g_resset_mtx`) calls `[rs removeAllocation:b]` **and commits
+  immediately** — no batching — because the caller frees the host memory right after the
+  function returns. See UNCERTAINTIES for why this asymmetry is deliberate.
 - **`moe_submit`** (the one function whose `use` list — resolved expert weight/scale slabs —
   scales with LRU cache size): calls `resset_flush()` at the top (commits any pending adds
   from `resset_add`, under `g_slab_mtx`), then, if `g_resset_enabled`, **skips** the
@@ -59,12 +68,13 @@ the `COLI_METAL_RESSET` `getenv` branch in `coli_metal_init`, so `resset_add`/`r
 
 ### Why only `moe_submit` skips `useResource:`
 
-Apple's own `MTLResidencySet` docs are explicit: *"Residency sets don't support hazard
-tracking, so you need to account for hazards with fences and events."* (confirmed against
-the actual SDK header comment and Apple's "Simplifying GPU resource management with residency
-sets" guide, both read directly for this design — see UNCERTAINTIES for the exact quotes and
-how they were obtained). Dropping `useResource:` therefore risks losing whatever
-hazard-tracking value those calls provided. Rather than apply the residency set uniformly and
+Apple's `MTLResidencySet` class reference (developer.apple.com, fetched during design on
+2026-07-18) is explicit: *"Residency sets don't support hazard tracking, so you need to
+account for hazards with fences and events."* The SDK header on this box
+(`MTLResidencySet.h`, read directly) is **silent** on hazard tracking — the statement comes
+from Apple's online documentation and adoption guide ("Simplifying GPU resource management
+with residency sets"), not the header (see UNCERTAINTIES for sourcing). Dropping
+`useResource:` therefore risks losing whatever hazard-tracking value those calls provided. Rather than apply the residency set uniformly and
 argue *in general* that hazard tracking isn't load-bearing, this diff draws the line at the
 one call site the mechanism history actually implicates:
 
@@ -102,15 +112,20 @@ next `moe_submit` call, which flushes once via `resset_flush()` before it relies
 for residency.
 
 This is correct — not just fast — because of an existing invariant the codebase already
-depends on for `resolve()` to work at all: a slab's `coli_metal_register` call (mutex-guarded)
-always completes and releases `g_slab_mtx` before any dispatch that references that slab's
+depends on for `resolve()` to work at all: a slab's `coli_metal_register` call always
+completes — including its trailing `resset_add`, which runs after `g_slab_mtx` is dropped
+but **before the function returns** — before any dispatch that references that slab's
 pointer can call `resolve()` for it (the caller in `glm.c` cannot pass a freshly-loaded
-expert's pointer to a dispatch before the load — which registers it — returns). Since
-`resset_flush()` also takes `g_slab_mtx`, and runs immediately before `moe_submit`'s own
-`resolve()` calls in program order, any slab a given `moe_submit` invocation will resolve was
-already `addAllocation:`-ed (and marked dirty) strictly before that invocation's
-`resset_flush()` runs — so the flush is guaranteed to cover it, regardless of what other
-threads are concurrently registering unrelated slabs.
+expert's pointer to a dispatch before the load — which registers it — returns). After the
+validator round-1 mutex split, the flush's synchronization runs through `g_resset_mtx`
+alone: `resset_add`'s set mutation + dirty write and `resset_flush`'s dirty read + commit
+are serialized by that one mutex, whose release/acquire pairs provide the memory ordering;
+`g_slab_mtx` still orders the slab-table bookkeeping (register-before-resolve) exactly as on
+stock. So any slab a given `moe_submit` invocation will resolve was `addAllocation:`-ed (and
+marked dirty) strictly before that invocation's `resset_flush()` acquired `g_resset_mtx` —
+the flush is guaranteed to cover it, regardless of what other threads are concurrently
+registering unrelated slabs. The two mutexes are never held simultaneously anywhere, so no
+deadlock ordering exists to maintain.
 
 `resset_remove`, by contrast, commits synchronously and immediately, with no batching,
 because the caller (`glm.c`, in every one of the four slab-realloc call sites, and in
@@ -127,16 +142,55 @@ lifecycle wording backs this reading: "`coli_metal_register` → add allocation 
 No existing counter's semantics changed. `coli_metal_moe_times`/`coli_metal_moe_counts`
 (`g_t_setup`, `g_t_gpu`, `g_t_kernel`, `g_t_scatter`, `g_moe_ok`/`g_moe_fb`/`g_moe_experts`)
 are computed exactly as before — `resset_flush()` runs *before* `ts_start = mnow()` in
-`moe_submit`, so its cost (whatever it is) is **outside** `g_t_setup` and therefore invisible
-to the existing setup/gpu/kernel breakdown. This is a deliberate choice: it keeps the
-orchestrator's A/B harness reading the same counters with the same meaning across stock/E4/E5,
-but it also means the harness's existing numbers will not show E5's flush cost if it turns
-out to be non-negligible — see UNCERTAINTIES. No new counters were added (no `glm.c`
-`profile_print` changes), unlike E4's `METAL-HEAP: alloc fallbacks` line, because there was no
-`glm.c` touch point to hang a print on without adding one — judged not worth the extra diff
-surface for an experiment branch; `[METAL] residency-set: on` / the two fallback stderr lines
-from `coli_metal_init` are the only new observability, sufficient to confirm which path a run
-took.
+`moe_submit`, so its cost is **outside** `g_t_setup`, keeping the orchestrator's A/B harness
+reading the same counters with the same meaning across stock/E4/E5. The flush cost is
+surfaced separately (validator round-1 fix — the original design left it invisible, a blind
+spot for the battery): a dedicated `g_t_resset_flush` accumulator timed around the flush in
+`moe_submit`, exported via `coli_metal_resset_stats()` (`backend_metal.h`) and printed by
+`profile_print` as its own `METAL-RESSET: flush N.NNs` line — a **separate line following
+the `METAL:` line, mirroring E4's `METAL-HEAP:` convention, so the existing `METAL:` line
+the harness parses keeps its exact format** — printed **only when the gate is on** (the
+function returns 0 when off), so stock output stays byte-identical. The register-side
+`resset_add`/`resset_remove` costs have no dedicated counter: they run inside the engine's
+existing expert-load wait accounting (the `t_ewait` window in `glm.c`), noted in a comment
+at `resset_add`, so a load-path regression from set bookkeeping would already show in the
+existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stderr lines from
+`coli_metal_init` confirm which path a run took.
+
+## Validator round 1 fixes
+
+1. **REQUIRED, Metal calls hoisted out of `g_slab_mtx`** (`backend_metal.mm`): the original
+   design ran `addAllocation:`/`removeAllocation:`/`commit` while holding `g_slab_mtx`, the
+   lock the parallel OMP loader threads contend on — structurally identical to the
+   mutex-over-live-Metal-call shape E4's audit round 2 identified as the leading suspect for
+   its replicated +12s expert-disk regression, and the SDK header notes commit on a resident
+   set tries to make resources resident "instantly" (real synchronous work; this set is
+   resident from startup since it is queue-attached for the process lifetime). Fixed by
+   introducing a dedicated `g_resset_mtx` guarding only the set mutations + dirty flag;
+   `g_slabs` push/erase stays under `g_slab_mtx` exactly as stock; the two mutexes are never
+   held together. The register→flush→resolve happens-before argument is preserved — see the
+   updated "Deferred-commit design" section and the comment at `resset_add`.
+2. **REQUIRED, false citations corrected** (this file + the `moe_submit` commit message,
+   rewritten pre-push): the original text attributed the hazard-tracking and thread-safety
+   statements to the SDK header (`MTLResidencySet.h`), which is in fact silent on both
+   topics. The statements come from Apple's **online** `MTLResidencySet` class reference and
+   the "Simplifying GPU resource management with residency sets" adoption guide (both
+   fetched 2026-07-18 during design). All attributions now name the actual source; where a
+   claim rests on design reasoning rather than documentation, it is labeled as such.
+3. **REQUIRED, flush cost made harness-visible**: `g_t_resset_flush` +
+   `coli_metal_resset_stats()` + the gate-on-only `METAL-RESSET:` line in `profile_print` —
+   see "Instrumentation parity" above.
+4. **NOTE — pre-existing fslab OOM-unwind bug becomes a longer-lived artifact under E5**
+   (no code change on this branch, per the fix round's scoping): `expert_load`'s fslab OOM
+   path (`c/glm.c` ~1868–1873 on this base) frees `s->slab` via `compat_aligned_free`
+   **without** `coli_metal_unregister` — on stock this leaves a stale `g_slabs` entry whose
+   GPU exposure ends with the last command buffer that declared it; under E5 the buffer is
+   additionally a **permanent residency-set member** referencing freed host memory until
+   some later realloc of the same slot unregisters by pointer, a strictly longer-lived
+   exposure than stock's transient per-CB one. When E5 graduates to the upstream PR, it must
+   carry the one-line unregister-before-free fix; E4's branch has the reference
+   implementation (`6753225`, "validator round-1 fixes (heap-create latch, unwind
+   unregister)").
 
 ## Per-seam differences vs E4
 
@@ -163,7 +217,9 @@ took.
    fix-plan's "Determinism side-finding").
 5. **`[METAL] residency-set: on` line present in stderr** at flag-on startup, and absent
    (or the OS<15/create-failed fallback line) otherwise — cheap sanity check that a run
-   actually exercised the intended path before trusting its numbers.
+   actually exercised the intended path before trusting its numbers. Also read the
+   **`METAL-RESSET: flush` line** (gate-on only): if that number is large, the deferred
+   set-commit cost is eating the stall win from the dispatch side.
 6. If the hypothesis holds (E5 stall ≈ E4, E5 load-path ≈ stock, identical output), E5 becomes
    the upstream PR candidate and must include the cap-default recalibration flagged in PR
    #386's CURRENT-STATE CALIBRATION markers, per the spec's validation plan.
@@ -173,7 +229,9 @@ took.
 `cd c && make glm METAL=1` and a separate explicit `-Wall -Wextra` compile of
 `backend_metal.mm` (the Makefile's `METALXX` line does not itself pass `-Wall -Wextra`, so
 "clean under `-Wall -Wextra`" was checked with those flags added explicitly), plus
-`cd c && make glm` (plain, non-Metal — unaffected, since this diff never touches `glm.c`), and
+`cd c && make glm` (plain, non-Metal — the one `glm.c` touch, the `METAL-RESSET` stats line,
+is inside the pre-existing `#ifdef COLI_METAL` arm of `profile_print`, so the plain build
+compiles none of it), and
 `make metal-test` (existing synthetic kernel-correctness unit test — no model, no
 `glm52_i4/`, random weights — run once with `COLI_METAL_RESSET` unset and once with
 `COLI_METAL_RESSET=1` to numerically exercise `coli_metal_register`/`moe_submit`'s changed
@@ -188,14 +246,16 @@ with the existing queue/command-buffer structure, or something unverifiable with
 model run — flagged per the task's hard requirement.**
 
 1. **The central design risk: skipping `useResource:` in `moe_submit` gives up Metal's
-   automatic hazard tracking for that buffer set.** Apple's `MTLResidencySet.h` header
-   (read directly from this box's SDK at
-   `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/.../Headers/MTLResidencySet.h`)
-   documents the protocol only in terms of residency; Apple's own "Simplifying GPU resource
-   management with residency sets" guide states plainly: *"You don't need to call
-   `useResource`/`useHeap`... for allocations in a residency set,"* and separately, the
-   `MTLResidencySet` class reference states *"Residency sets don't support hazard tracking,
-   so you need to account for hazards with fences and events."* I reasoned through every
+   automatic hazard tracking for that buffer set.** Sourcing (corrected in validator round
+   1): the SDK header on this box
+   (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/.../Headers/MTLResidencySet.h`,
+   read directly) documents the protocol only in terms of residency and says nothing about
+   hazard tracking either way; the two operative statements are from Apple's **online**
+   documentation (fetched 2026-07-18): the "Simplifying GPU resource management with
+   residency sets" adoption guide — *"You don't need to call `useResource`/`useHeap`... for
+   allocations in a residency set"* — and the `MTLResidencySet` class reference —
+   *"Residency sets don't support hazard tracking, so you need to account for hazards with
+   fences and events."* I reasoned through every
    code path that touches `moe_submit`'s `use` buffers (read-only, indirectly referenced,
    never concurrently written, freed only after the engine's own slot lifecycle guarantees
    no outstanding async reference) and concluded removing `useResource:` there specifically
@@ -205,30 +265,33 @@ model run — flagged per the task's hard requirement.**
    been) that existed before. **This is the #1 thing to watch for md5 divergence on**, and
    the reason the scope was deliberately narrowed to `moe_submit` alone rather than applied
    uniformly.
-2. **`resset_add`/`resset_remove`/`resset_flush` all run under `g_slab_mtx`, serializing
-   concurrent OMP loader threads' residency-set mutations against each other and against
-   dispatch's flush.** `MTLResidencySet`'s own header says *"all methods are non-threadsafe"*
-   (confirmed directly from the SDK header), so this serialization is required for
-   correctness, not optional — but it is structurally the same shape as the bug E4's
-   audit-round-2 found and fixed (mutex held across a live Metal call, serializing loader
-   threads during warmup fan-out, suspected root cause of E4's +12s regression). Apple's
-   guide frames `addAllocation:`/`commit` as lightweight bookkeeping relative to the actual
-   (deferred, async) page-in work ("Metal makes allocations resident when you call `commit()`
-   on the first command buffer using the set" — implying `commit()` itself doesn't
-   synchronously page anything in), which is why I judged holding the mutex across these
-   calls acceptable unlike E4's `newBufferWithLength:` (a real allocation call). **This is
-   unverified without profiling a loaded run** — if `commit()` or `addAllocation:` turns out
-   to be synchronously expensive on this hardware/OS build, this could reproduce E4's
-   expert-disk-load regression through a different code path, defeating E5's entire premise
-   (decoupling residency from the load path). Orchestrator: this is the single most important
-   number to check E5's load-path timing against stock, not just against E4.
+2. **Residency-set mutations are serialized under a dedicated `g_resset_mtx` (validator
+   round-1 fix — originally they ran under `g_slab_mtx`, the E4-regression shape; no Metal
+   call runs under the slab lock anymore).** The serialization itself is kept as required
+   for correctness: Apple's online `MTLResidencySet` class reference states the set's
+   *"methods aren't thread-safe"* (the SDK header contains no thread-safety statement either
+   way — citation corrected in round 1; the online doc is the source). What remains
+   **unverified without profiling a loaded run** is the *cost* of the calls themselves:
+   `resset_remove`'s synchronous `commit` runs inside `coli_metal_unregister` on the
+   loader path (its cost lands in the existing `t_ewait` accounting), and the SDK header
+   says commit on a resident set tries to make added/removed resources resident/non-resident
+   *"instantly"* — real synchronous work, since this set is resident from startup
+   (queue-attached for the process lifetime). If `commit()`/`addAllocation:` turn out
+   expensive on this hardware/OS build, the load path degrades through set bookkeeping
+   rather than mutex contention — a different, now-decoupled failure mode, but the same
+   symptom as E4's regression. Orchestrator: check E5's load-path timing against stock, not
+   just against E4, and read the new `METAL-RESSET: flush` line for the dispatch-side share.
 3. **`resset_flush()`'s cost sits outside `g_t_setup`/the `moe_times` breakdown** (it runs
-   before `ts_start = mnow()`), by design, to keep the harness's existing counters meaningful
-   — but this also means if `commit()` is expensive, it will show up as *general* wall-clock
-   slowdown / tok/s regression without a corresponding line in the existing instrumentation
-   pointing at it. No new counter was added for it (see "Instrumentation parity" above) to
-   avoid a `glm.c` touch; if E5 numbers look off without an obvious cause in the existing
-   breakdown, `resset_flush`/`commit()` cost is the first place to add a throwaway probe.
+   before `ts_start = mnow()`), by design, to keep the harness's existing counters
+   meaningful — and, since validator round 1, it is **no longer invisible**: the
+   `g_t_resset_flush` accumulator surfaces it as the gate-on-only `METAL-RESSET: flush`
+   line (see "Instrumentation parity"). Residual blind spots: (a) the accumulator is a
+   plain double written from `moe_submit` on the engine thread, matching the existing
+   `g_t_setup` convention — if `moe_submit` were ever called from multiple threads
+   concurrently, both counters would be equally wrong; (b) the register-side
+   `resset_add`/`resset_remove` costs have no dedicated counter and are only visible
+   blended into the existing `t_ewait`/disk-wait numbers (comment at `resset_add` says so)
+   — a fine-grained attribution would need a throwaway probe.
 4. **`initialCapacity = 4096` on the `MTLResidencySetDescriptor` is an unverified guess.**
    It's documented as a presize hint only (no correctness effect either way), chosen to be
    "clearly larger than the permanent-weight-tensor + KV-cache + plausible cap16 LRU-slab
@@ -273,3 +336,10 @@ model run — flagged per the task's hard requirement.**
    high-confidence. What is **not** independently verified is runtime behavior beyond what
    the docs state and what the synthetic unit test exercises — no substitute for the
    orchestrator's real cap-sweep battery.
+10. **Pre-existing fslab OOM-unwind bug has a strictly longer-lived exposure window under
+   E5** — see "Validator round 1 fixes" item 4. Not fixed on this branch (out of the
+   experiment's scope per the fix round), but the upstream PR built from E5 **must** carry
+   the one-line unregister-before-free fix (reference implementation on E4's branch,
+   commit `6753225`). The bug is only reachable through the fslab-OOM path (allocation
+   failure mid-load), so it cannot affect the orchestrator's controlled A/B runs at sane
+   RAM headroom — flagged for the PR, not for the battery.

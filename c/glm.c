@@ -4655,7 +4655,9 @@ static void profile_print(Model *m, double elapsed){
           if(aok){ double ks=0,gs=0; coli_metal_attn_lat(&ks,&gs);
           printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs | cpu-sched %.2fs gpu-sched %.2fs)\n",(unsigned long long)aok,aw,ak,ks,gs); } }
         printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
-               (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc); }
+               (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc);
+        { double rsf=0; if(coli_metal_resset_stats(&rsf))   /* E5: printed only when the gate is on */
+            printf("METAL-RESSET: flush %.2fs (residency-set commit in moe_submit, outside setup/gpu-wall)\n",rsf); } }
 #endif
 }
 
