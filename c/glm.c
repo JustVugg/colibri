@@ -219,10 +219,16 @@ typedef struct {
  * a small binary protocol.  Keeping this state outside Model makes cluster mode
  * orthogonal to model placement and preserves the single-box path byte-for-byte. */
 #if !defined(_WIN32)
-typedef struct { int fd; char host[128]; int port; } ClusterWorker;
+typedef struct { int fd; char host[128]; int port, first, last; } ClusterWorker;
 static ClusterWorker g_cluster_workers[16];
 static int g_cluster_n;
 static uint64_t g_cluster_calls, g_cluster_experts, g_cluster_rows;
+static ClusterWorker g_dense_workers[16];
+static int g_dense_n;
+static int g_dense_mlp_worker;
+static int g_dense_worker_first, g_dense_worker_last;
+static int cluster_dense_owner(int layer);
+static int dense_worker_run(const char *snap,int port,int first,int last,int cap,int ebits,int dbits);
 #endif
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
@@ -1427,9 +1433,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
     int io_bits = dbits>=8 ? 16 : dbits;
-    m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
-    m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
-    m->final_norm = ld(m,"model.norm.weight");
+    if(!g_dense_mlp_worker){
+        m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
+        m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
+        m->final_norm = ld(m,"model.norm.weight");
+    }
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
@@ -1443,6 +1451,16 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
+        if(g_dense_mlp_worker){
+            if(i<g_dense_worker_first||i>g_dense_worker_last||i>=c->first_dense) continue;
+            l->sparse=0;
+            #define PW(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
+            l->gate_proj=qt_load(m,PW("mlp.gate_proj.weight"),c->dense_inter,D,dbits);
+            l->up_proj=qt_load(m,PW("mlp.up_proj.weight"),c->dense_inter,D,dbits);
+            l->down_proj=qt_load(m,PW("mlp.down_proj.weight"),D,c->dense_inter,dbits);
+            #undef PW
+            continue;
+        }
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
@@ -1462,11 +1480,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             layer_cuda_shard_kvb(l,H,c->qk_nope,c->v_head);
 #endif
         l->sparse = (i >= c->first_dense);
-        if(!l->sparse){
+        if(!l->sparse && (i>=c->first_dense || cluster_dense_owner(i)<0)){
             l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
-        } else {
+        } else if(l->sparse) {
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
@@ -1496,7 +1514,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             "self_attn.kv_b_proj.weight","self_attn.o_proj.weight","mlp.gate.weight",
             "mlp.shared_experts.gate_proj.weight","mlp.shared_experts.down_proj.weight",
             "mlp.experts.0.gate_proj.weight","mlp.experts.255.down_proj.weight"};
-        char mn[256]; m->has_mtp=1;
+        char mn[256]; m->has_mtp=g_dense_mlp_worker?0:1;
         for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
             snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
             if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
@@ -1536,7 +1554,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     /* DSA lightning indexer: attivo SOLO se i pesi (conversione --indexer) ci sono per
      * TUTTI i layer full. Auto-rilevamento come per MTP: niente flag, niente passi extra. */
     {
-        m->has_dsa = (c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
+        m->has_dsa = (!g_dense_mlp_worker && c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
         char inm[300];
         for(int i=0;i<c->n_layers && m->has_dsa;i++){
             if(!c->idx_type[i]) continue;
@@ -1889,6 +1907,52 @@ static void cluster_init(void){
     free(copy);
     if(g_cluster_n<1){ fprintf(stderr,"[CLUSTER] no expert workers reachable\n"); exit(1); }
     fprintf(stderr,"[CLUSTER] coordinator connected to %d expert worker(s)\n",g_cluster_n);
+}
+static int cluster_dense_owner(int layer){
+    for(int i=0;i<g_dense_n;i++) if(layer>=g_dense_workers[i].first&&layer<=g_dense_workers[i].last) return i;
+    return -1;
+}
+/* DENSE_SHARDS=host:port:first:last,... is deliberately static in this first
+ * pipeline. A worker owns a contiguous range of dense MLP layers; attention
+ * and its KV state remain on the coordinator until the activation seam is
+ * proven. This removes the largest easy-to-isolate resident tensors without
+ * inventing distributed KV semantics prematurely. */
+static void cluster_dense_init(void){
+    const char *list=getenv("DENSE_SHARDS"); if(!list||!*list) return;
+    char *copy=strdup(list),*save=NULL;
+    for(char *tok=strtok_r(copy,",",&save);tok&&g_dense_n<16;tok=strtok_r(NULL,",",&save)){
+        char spec[256]; strncpy(spec,tok,sizeof(spec)-1); spec[sizeof(spec)-1]=0;
+        char *last=strrchr(spec,':'); if(!last) continue; int end=atoi(last+1); *last=0;
+        char *firstp=strrchr(spec,':'); if(!firstp) continue; int first=atoi(firstp+1); *firstp=0;
+        char *portp=strrchr(spec,':'); if(!portp) continue; int eport=atoi(portp+1); *portp=0;
+        char joined[256]; snprintf(joined,sizeof(joined),"%s:%d",spec,eport);
+        if(first<0||end<first||eport<1||eport>65535||cluster_connect_one(joined,&g_dense_workers[g_dense_n])) continue;
+        g_dense_workers[g_dense_n].first=first; g_dense_workers[g_dense_n].last=end; g_dense_n++;
+    }
+    free(copy);
+    if(!g_dense_n){ fprintf(stderr,"[DENSE] no dense shard workers reachable\n"); exit(1); }
+    fprintf(stderr,"[DENSE] activation pipeline connected to %d shard(s)\n",g_dense_n);
+}
+static void cluster_dense_close(void){
+    for(int i=0;i<g_dense_n;i++) if(g_dense_workers[i].fd>=0) close(g_dense_workers[i].fd);
+    g_dense_n=0;
+}
+static void cluster_dense_mlp(Model *m,int layer,const float *input,int S,float *output){
+    int wi=cluster_dense_owner(layer); if(wi<0){ fprintf(stderr,"[DENSE] no owner for layer %d\n",layer); exit(1); }
+    ClusterWorker *w=&g_dense_workers[wi]; uint32_t v; char magic[8]; int D=m->c.hidden,I=m->c.dense_inter;
+    if(cluster_io(w->fd,(void*)"COLIDN01",8,1)) goto fail;
+    v=1; if(cluster_u32(w->fd,&v,1)) goto fail; v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail; v=(uint32_t)I; if(cluster_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)S; if(cluster_u32(w->fd,&v,1)) goto fail;
+    if(cluster_io(w->fd,(void*)input,(size_t)S*D*sizeof(float),1)) goto fail;
+    if(cluster_io(w->fd,magic,8,0)||memcmp(magic,"COLIDN01",8)) goto fail;
+    if(cluster_u32(w->fd,&v,0)||v!=1) goto fail;
+    if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
+    if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)S) goto fail;
+    if(cluster_io(w->fd,output,(size_t)S*D*sizeof(float),0)) goto fail;
+    return;
+fail:
+    fprintf(stderr,"[DENSE] shard %s:%d failed for layer %d\n",w->host,w->port,layer); exit(1);
 }
 typedef struct { int eid,nr; int *rows; float *weights,*inputs; } ClusterItem;
 static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,int S,
@@ -3407,6 +3471,41 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
+#if !defined(_WIN32)
+static int dense_worker_run(const char *snap,int port,int first,int last,int cap,int ebits,int dbits){
+    g_dense_mlp_worker=1; g_dense_worker_first=first; g_dense_worker_last=last;
+    Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    int fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0){perror("dense worker socket");return 1;}
+    int yes=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+    struct sockaddr_in addr={0}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons((uint16_t)port);
+    if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))||listen(fd,4)){perror("dense worker bind/listen");return 1;}
+    fprintf(stderr,"[DENSE] worker listening on 0.0.0.0:%d · layers %d-%d · loaded %.2f MB in %.2fs\n",
+            port,first,last,m.resident_bytes/(1024.0*1024.0),now_s()-t0);
+    for(;;){
+        int cfd=accept(fd,NULL,NULL); if(cfd<0){if(errno==EINTR)continue;break;}
+        for(;;){
+            char magic[8]; uint32_t v,layer,D,I,S;
+            if(cluster_io(cfd,magic,8,0)) break;
+            if(memcmp(magic,"COLIDN01",8)||cluster_u32(cfd,&v,0)||v!=1||
+               cluster_u32(cfd,&layer,0)||cluster_u32(cfd,&D,0)||cluster_u32(cfd,&I,0)||cluster_u32(cfd,&S,0)||
+               layer>=(uint32_t)m.c.n_layers||layer<(uint32_t)first||layer>(uint32_t)last||layer>=(uint32_t)m.c.first_dense||
+               D!=(uint32_t)m.c.hidden||I!=(uint32_t)m.c.dense_inter||S<1||S>4096){
+                close(cfd); cfd=-1; break;
+            }
+            float *input=falloc((int64_t)S*D),*output=falloc((int64_t)S*D);
+            if(cluster_io(cfd,input,(size_t)S*D*sizeof(float),0)){free(input);free(output);break;}
+            dense_mlp(&m.L[layer],input,S,D,I,output);
+            v=1; if(cluster_io(cfd,(void*)"COLIDN01",8,1)||cluster_u32(cfd,&v,1)){free(input);free(output);break;}
+            v=0; if(cluster_u32(cfd,&v,1)){free(input);free(output);break;}
+            v=S; if(cluster_u32(cfd,&v,1)||cluster_io(cfd,output,(size_t)S*D*sizeof(float),1)){free(input);free(output);break;}
+            free(input);free(output);
+        }
+        if(cfd>=0)close(cfd);
+    }
+    close(fd); return 0;
+}
+#endif
+
 /* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
  * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
  * kind 0 = stesso layer saltando l'attention
@@ -3900,7 +3999,11 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
         la_predict(m,li+1,x,2);  /* two-step: shared-expert-corrected prediction */
     }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
-    if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    if(l->sparse) moe(m,l,li,nrm,S,tmp,1);
+#if !defined(_WIN32)
+    else if(cluster_dense_owner(li)>=0) cluster_dense_mlp(m,li,nrm,S,tmp);
+#endif
+    else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
@@ -6085,6 +6188,13 @@ int main(int argc, char **argv){
         if(port<1||port>65535){fprintf(stderr,"CLUSTER_WORKER_PORT must be 1..65535\n");return 2;}
         return cluster_worker_run(snap,port,ebits,dbits);
     }
+    if(getenv("DENSE_WORKER")){
+        int port=getenv("DENSE_WORKER_PORT")?atoi(getenv("DENSE_WORKER_PORT")):9200;
+        int first=getenv("DENSE_WORKER_FIRST")?atoi(getenv("DENSE_WORKER_FIRST")):-1;
+        int last=getenv("DENSE_WORKER_LAST")?atoi(getenv("DENSE_WORKER_LAST")):-1;
+        if(port<1||port>65535||first<0||last<first){fprintf(stderr,"invalid dense worker port/range\n");return 2;}
+        return dense_worker_run(snap,port,first,last,cap,ebits,dbits);
+    }
 #else
     if(getenv("EXPERT_WORKER")){ fprintf(stderr,"[CLUSTER] expert workers are not supported on Windows yet\n"); return 2; }
 #endif
@@ -6142,10 +6252,14 @@ int main(int argc, char **argv){
 #endif
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
+    #if !defined(_WIN32)
+    cluster_dense_init();
+    #endif
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
 #if !defined(_WIN32)
     cluster_init();
     atexit(cluster_close_all);
+    atexit(cluster_dense_close);
 #endif
     if(g_draft<0){
 #ifdef COLI_CUDA
