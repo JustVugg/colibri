@@ -1,0 +1,4 @@
+# build artifacts
+vk_int4_poc
+*.spv
+*.spv.comp
