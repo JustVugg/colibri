@@ -651,7 +651,7 @@ def cmd_serve(a):
 
 def cmd_cluster_coordinator(a):
     from cluster import serve
-    serve(a.host, a.port, a.stale_after)
+    serve(a.host, a.port, a.stale_after, a.data_port)
 
 def cmd_cluster_worker(a):
     need_worker_model(a.model)
@@ -844,7 +844,7 @@ def main():
     cluster_sub=pcluster.add_subparsers(dest="cluster_cmd")
     pcoord=cluster_sub.add_parser("coordinator", help="serve worker registration and discovery")
     pcoord.add_argument("--host",default="127.0.0.1"); pcoord.add_argument("--port",type=int,default=8765)
-    pcoord.add_argument("--stale-after",type=float,default=30.0)
+    pcoord.add_argument("--stale-after",type=float,default=30.0); pcoord.add_argument("--data-port",type=int,default=8766)
     pworker=cluster_sub.add_parser("worker", parents=[common], help="serve disk-backed expert compute")
     pworker.add_argument("--port",type=int,default=int(os.environ.get("CLUSTER_WORKER_PORT","9100")))
     pworker.add_argument("--coordinator",default=os.environ.get("CLUSTER_COORDINATOR"))

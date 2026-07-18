@@ -101,6 +101,46 @@ This is intentionally a narrow, testable activation pipeline. Full
 attention/KV layer ownership and tensor-parallel dense sharding are subsequent
 steps; they need explicit KV ownership and cross-node pipelining semantics.
 
+### Browser and mobile WebGPU workers
+
+The cluster coordinator also exposes a WebSocket worker path. Browser workers
+register their device type, precision, load, and expert ownership, while the
+coordinator's native TCP data port proxies the existing `COLIEX01` expert
+protocol to them. This keeps the C forward pass independent of browser APIs.
+
+Start the coordinator with its WebGPU data port (the default is `8766`):
+
+```bash
+./coli cluster coordinator --host 0.0.0.0 --port 8765 --data-port 8766
+```
+
+Build the web UI, open `/webgpu-worker.html` on an iPhone, iPad, Android device,
+or laptop, and connect it to:
+
+```text
+ws://COORDINATOR_IP:8765/v1/cluster/webgpu
+```
+
+Point the coordinator's inference process at the proxy:
+
+```bash
+./coli serve --model /nvme/glm52_i4 --cluster-workers COORDINATOR_IP:8766
+```
+
+The browser runtime currently uses f32 expert buffers and the model's gated
+SiLU FFN (`silu(W_gate x) * W_up x`, then `W_down`). Selected floating-point
+source experts can be exported with:
+
+```bash
+uv run python c/tools/export_webgpu_expert.py \
+  --source /path/to/source-checkpoint --output web/public \
+  --layer 0 --expert 0
+```
+
+The worker system is opt-in and intended for a trusted LAN in this first slice;
+TLS, authentication, and browser permission UX are still required before
+exposing it to the public internet.
+
 The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
 ## What's implemented
