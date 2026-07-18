@@ -743,6 +743,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
   if (!g_dev || (fmt != 1 && fmt != 2)) return nil;
+  resset_flush();   // E5: commit any pending slab adds before we may skip useResource: below
   double ts_start = mnow();
   std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
   std::vector<id<MTLBuffer>> use; use.reserve(nb*2);
@@ -764,7 +765,18 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
   memcpy([xg_buf contents], xg, (size_t)R*D*4);
 
   id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-  for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
+  // E5 (COLI_METAL_RESSET=1): the queue-attached MTLResidencySet already guarantees these
+  // buffers are resident, so skip the per-buffer declaration whose count scales with LRU
+  // cache size (mechanism history v5). Residency sets don't do hazard tracking (Apple docs),
+  // but none was load-bearing here: every buffer in `use` is MTLResourceUsageRead-only and
+  // referenced only indirectly (moe_gemv dereferences waddr[]/saddr[] baked into bag/bsg's
+  // contents), so there's no GPU-side write to serialize against; the one real hazard -- a
+  // slab unregistered+freed+reused while an async in-flight CB still reads it -- is a
+  // CPU-write race outside Metal's hazard tracking either way, held by the engine's own slot
+  // lifecycle, not by useResource:. See SUMMARY.md UNCERTAINTIES.
+  if (!g_resset_enabled) {
+    for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
+  }
   auto gemv=[&](id<MTLBuffer> wa,id<MTLBuffer> sa,id<MTLBuffer> xin,id<MTLBuffer> y,int O,int K,int Kin){
     int NT=R*O;
     [e setComputePipelineState:g_moe_gemv];
