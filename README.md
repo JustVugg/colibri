@@ -83,9 +83,23 @@ large engine starts:
 For a static setup, skip discovery and provide `--cluster-workers
 HOST:PORT,...`. Cluster transport is disabled unless workers are configured,
 so existing single-machine runs retain their current execution path and output.
-The current seam is expert compute; dense-layer sharding is intentionally kept
-separate because it needs activation pipelining and tensor-parallel placement
-decisions rather than the same batch RPC.
+
+The first dense-sharding seam offloads the model's contiguous dense MLP layers.
+The coordinator keeps attention and KV state local, while the worker owns only
+the gate/up/down tensors for its assigned range:
+
+```bash
+./coli cluster dense-worker --model /nvme/glm52_i4 \
+  --port 9200 --first 0 --last 2 \
+  --coordinator http://COORDINATOR:8765 --advertise-host WORKER_IP
+
+./coli serve --model /nvme/glm52_i4 \
+  --dense-shards WORKER_IP:9200:0:2
+```
+
+This is intentionally a narrow, testable activation pipeline. Full
+attention/KV layer ownership and tensor-parallel dense sharding are subsequent
+steps; they need explicit KV ownership and cross-node pipelining semantics.
 
 The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
