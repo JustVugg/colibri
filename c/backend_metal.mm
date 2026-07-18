@@ -399,13 +399,20 @@ extern "C" void coli_metal_register(void *base, size_t len) {
   id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
                               options:g_res_opts deallocator:nil];
   if (!b) return;
+  id<MTLBuffer> old = nil;   // E5: replaced wrapper on re-register of a live base (defensive)
   {
     std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
     bool found = false;
-    for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; found = true; break; }
+    for (auto &s : g_slabs) if (s.base == base) { old = s.buf; s.len = len; s.buf = b; found = true; break; }
     if (!found) g_slabs.push_back({base, len, b});
   }
-  resset_add(b);   // E5: outside g_slab_mtx (no Metal call under the slab lock); still before return
+  // E5, outside g_slab_mtx (no Metal call under the slab lock), before returning. Invariant
+  // defended: set membership mirrors g_slabs exactly -- a re-register of a live base must
+  // drop the replaced wrapper from the set (ARC releases our reference, but the set retains
+  // it and keeps its pages resident forever) before adding the new one. No in-tree caller
+  // re-registers a live base today; defensive.
+  if (old && old != b) resset_remove(old);
+  if (old != b) resset_add(b);
 }
 extern "C" void coli_metal_unregister(void *base) {
   id<MTLBuffer> b = nil;

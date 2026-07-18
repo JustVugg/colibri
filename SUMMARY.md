@@ -50,7 +50,10 @@ the `COLI_METAL_RESSET` `getenv` branch in `coli_metal_init`, so `resset_add`/`r
   dirty flag), calls `[rs addAllocation:b]` and sets `g_resset_dirty` — **it does not
   commit**. No Metal call ever runs under `g_slab_mtx` (validator round-1 fix; E4's audit
   round 2 identified mutex-over-live-Metal-call as the leading suspect for its +12s
-  expert-disk regression).
+  expert-disk regression). Re-registering a live base (no in-tree caller does today) drops
+  the replaced wrapper from the set via `resset_remove(old)` before adding the new one
+  (hazard-audit defensive fix — the set would otherwise retain the old buffer, and its
+  pages' residency, forever), keeping set membership an exact mirror of `g_slabs`.
 - **`coli_metal_unregister`**: erases the `g_slabs` entry under `g_slab_mtx` (stashing the
   buffer), then calls `resset_remove(b)` **outside `g_slab_mtx`**, before returning.
   `resset_remove` (under `g_resset_mtx`) calls `[rs removeAllocation:b]` **and commits
@@ -58,7 +61,8 @@ the `COLI_METAL_RESSET` `getenv` branch in `coli_metal_init`, so `resset_add`/`r
   function returns. See UNCERTAINTIES for why this asymmetry is deliberate.
 - **`moe_submit`** (the one function whose `use` list — resolved expert weight/scale slabs —
   scales with LRU cache size): calls `resset_flush()` at the top (commits any pending adds
-  from `resset_add`, under `g_slab_mtx`), then, if `g_resset_enabled`, **skips** the
+  from `resset_add`, under `g_resset_mtx` — it never touches the slab lock), then, if
+  `g_resset_enabled`, **skips** the
   `for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];` loop entirely — residency
   is already guaranteed by the queue-attached set. Every other `useResource:` call site in the
   file (`bind_gemv`'s weight/scale buffers, `coli_metal_attn_decode`/`coli_metal_layer_decode`'s
