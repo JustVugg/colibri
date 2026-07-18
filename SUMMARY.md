@@ -21,9 +21,10 @@ All mechanism code is confined to `c/backend_metal.mm` —
 `coli_metal_register`/`coli_metal_unregister`'s existing signatures and every call site in
 `glm.c` (expert_load, uring_load_add, qalloc, kv_alloc, map_of_fd) are untouched; the
 residency-set bookkeeping lives entirely inside those two functions' existing bodies. The
-only `glm.c`/`backend_metal.h` touch is one instrumentation hook added in the validator
-round-1 fixes (`coli_metal_resset_stats` + the gate-on-only `METAL-RESSET:` stats line in
-`profile_print` — see "Validator round 1 fixes" below). Still a smaller diff shape than E4,
+`glm.c`/`backend_metal.h` touches are two, both coordinator-sanctioned: the validator
+round-1 instrumentation hook (`coli_metal_resset_stats` + the gate-on-only `METAL-RESSET:`
+stats line in `profile_print`) and the ported fslab-OOM unwind fix (see "Validator round 1
+fixes" item 4). Still a smaller diff shape than E4,
 which needed a new alloc/free API and four new `glm.c` call-site arms because it changed the
 allocation function itself.
 
@@ -180,17 +181,19 @@ existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stder
 3. **REQUIRED, flush cost made harness-visible**: `g_t_resset_flush` +
    `coli_metal_resset_stats()` + the gate-on-only `METAL-RESSET:` line in `profile_print` —
    see "Instrumentation parity" above.
-4. **NOTE — pre-existing fslab OOM-unwind bug becomes a longer-lived artifact under E5**
-   (no code change on this branch, per the fix round's scoping): `expert_load`'s fslab OOM
-   path (`c/glm.c` ~1868–1873 on this base) frees `s->slab` via `compat_aligned_free`
-   **without** `coli_metal_unregister` — on stock this leaves a stale `g_slabs` entry whose
-   GPU exposure ends with the last command buffer that declared it; under E5 the buffer is
-   additionally a **permanent residency-set member** referencing freed host memory until
+4. **Pre-existing fslab OOM-unwind bug — now CARRIED ON THIS BRANCH** (follow-up commit,
+   coordinator-sanctioned second `glm.c` change): `expert_load`'s fslab OOM path
+   (`c/glm.c` ~1870 on this base) freed `s->slab` via `compat_aligned_free` **without**
+   `coli_metal_unregister` — on stock that leaves a stale `g_slabs` entry whose GPU
+   exposure ends with the last command buffer that declared it; under E5 the buffer would
+   additionally be a **permanent residency-set member** referencing freed host memory until
    some later realloc of the same slot unregisters by pointer, a strictly longer-lived
-   exposure than stock's transient per-CB one. When E5 graduates to the upstream PR, it must
-   carry the one-line unregister-before-free fix; E4's branch has the reference
-   implementation (`6753225`, "validator round-1 fixes (heap-create latch, unwind
-   unregister)").
+   exposure than stock's transient per-CB one. Fixed by porting E4's reference
+   implementation (`6753225`) to dev's non-heap code shape: `coli_metal_unregister(s->slab)`
+   before the free. The `uring_load_add` analog (E4's audit round-2 "cheap insurance") is
+   deliberately NOT carried: that arm is `#ifdef __linux__`-gated and `COLI_METAL` is
+   macOS-only, so it is dead code on every real build target, and unlike E4 this branch has
+   no allocation-path reason to touch the function at all.
 
 ## Per-seam differences vs E4
 
@@ -336,10 +339,13 @@ model run — flagged per the task's hard requirement.**
    high-confidence. What is **not** independently verified is runtime behavior beyond what
    the docs state and what the synthetic unit test exercises — no substitute for the
    orchestrator's real cap-sweep battery.
-10. **Pre-existing fslab OOM-unwind bug has a strictly longer-lived exposure window under
-   E5** — see "Validator round 1 fixes" item 4. Not fixed on this branch (out of the
-   experiment's scope per the fix round), but the upstream PR built from E5 **must** carry
-   the one-line unregister-before-free fix (reference implementation on E4's branch,
-   commit `6753225`). The bug is only reachable through the fslab-OOM path (allocation
-   failure mid-load), so it cannot affect the orchestrator's controlled A/B runs at sane
-   RAM headroom — flagged for the PR, not for the battery.
+10. **Pre-existing fslab OOM-unwind bug — carried on this branch** (follow-up commit; see
+   "Validator round 1 fixes" item 4 for the full mechanism). The one-line
+   unregister-before-free fix from E4's `6753225` is ported to dev's non-heap code shape,
+   so the upstream PR built from E5 inherits it automatically. Residual notes: (a) the fix
+   is only reachable through the fslab-OOM path (allocation failure mid-load), so it is
+   untestable without an OOM-injection harness and cannot affect the orchestrator's
+   controlled A/B runs at sane RAM headroom — carried as correctness insurance, verified by
+   inspection + clean builds only; (b) the `__linux__`-gated `uring_load_add` analog is
+   deliberately not carried (dead code on every real build target — rationale in the fixes
+   section).

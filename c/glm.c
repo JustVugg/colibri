@@ -1868,6 +1868,11 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
            posix_memalign((void**)&s->fslab,16384,fb)){
             fprintf(stderr,"OOM fslab\n"); if(fatal) exit(1);
+            /* unregister BEFORE freeing -- a stale g_slabs entry would let resolve() hand
+             * the GPU a pointer into freed memory (and under COLI_METAL_RESSET=1, leave the
+             * buffer a permanent residency-set member over it). Ported from e4/metal-heap
+             * validator fix 6753225; pre-existing gap on main/dev. */
+            if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
             compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;  /* clean, hidden slot (eid stays -1) */
             s->fslab=NULL; s->fslab_cap=0; return -1;
         }
