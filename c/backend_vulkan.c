@@ -239,6 +239,56 @@ static int dispatch2(VkShaderModule mod, VkBuffer gbuf, VkBuffer ubuf, int N){
     return 1;
 }
 
+/* Record-only variants: build pipeline + descriptor set, record the dispatch into
+ * an EXISTING command buffer, and stash the handles for later cleanup. This lets
+ * expert_group pack a whole layer's experts into ONE command buffer (one submit +
+ * one fence wait per layer instead of one per expert). */
+typedef struct { VkPipeline ppl; VkPipelineLayout pl; VkDescriptorSetLayout dsl; VkDescriptorPool dp; } RecCleanup;
+
+static void record4(VkCommandBuffer cb, VkShaderModule mod, VkBuffer b0,VkBuffer b1,VkBuffer b2,VkBuffer b3,
+                    uint32_t x,uint32_t y, size_t off_in, size_t off_out, RecCleanup* cl){
+    VkDescriptorSetLayoutBinding bnd[4]={
+        {0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0}};
+    vkCreateDescriptorSetLayout(g_dev,&(VkDescriptorSetLayoutCreateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=4,.pBindings=bnd},NULL,&cl->dsl);
+    vkCreatePipelineLayout(g_dev,&(VkPipelineLayoutCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&cl->dsl},NULL,&cl->pl);
+    VkPipelineShaderStageCreateInfo ssi={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=mod,.pName="main"};
+    vkCreateComputePipelines(g_dev,0,1,&(VkComputePipelineCreateInfo){.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage=ssi,.layout=cl->pl},NULL,&cl->ppl);
+    vkCreateDescriptorPool(g_dev,&(VkDescriptorPoolCreateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&(VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,4}},NULL,&cl->dp);
+    VkDescriptorSet ds; vkAllocateDescriptorSets(g_dev,&(VkDescriptorSetAllocateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=cl->dp,.descriptorSetCount=1,.pSetLayouts=&cl->dsl},&ds);
+    VkDescriptorBufferInfo bi[4]={{b0,0,VK_WHOLE_SIZE},{b1,0,VK_WHOLE_SIZE},{b2,off_in,VK_WHOLE_SIZE},{b3,off_out,VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wds[4];
+    for(int i=0;i<4;i++) wds[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=ds,.dstBinding=i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
+    vkUpdateDescriptorSets(g_dev,4,wds,0,NULL);
+    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,cl->ppl);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,cl->pl,0,1,&ds,0,0);
+    vkCmdDispatch(cb,(x+63)/64,(y>0?y:1),1);
+}
+static void record2(VkCommandBuffer cb, VkShaderModule mod, VkBuffer gbuf, VkBuffer ubuf, int N, RecCleanup* cl){
+    VkDescriptorSetLayoutBinding bnd[2]={
+        {0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0}};
+    vkCreateDescriptorSetLayout(g_dev,&(VkDescriptorSetLayoutCreateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=2,.pBindings=bnd},NULL,&cl->dsl);
+    vkCreatePipelineLayout(g_dev,&(VkPipelineLayoutCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&cl->dsl},NULL,&cl->pl);
+    VkPipelineShaderStageCreateInfo ssi={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=mod,.pName="main"};
+    vkCreateComputePipelines(g_dev,0,1,&(VkComputePipelineCreateInfo){.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage=ssi,.layout=cl->pl},NULL,&cl->ppl);
+    vkCreateDescriptorPool(g_dev,&(VkDescriptorPoolCreateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&(VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2}},NULL,&cl->dp);
+    VkDescriptorSet ds; vkAllocateDescriptorSets(g_dev,&(VkDescriptorSetAllocateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=cl->dp,.descriptorSetCount=1,.pSetLayouts=&cl->dsl},&ds);
+    VkDescriptorBufferInfo bi[2]={{gbuf,0,VK_WHOLE_SIZE},{ubuf,0,VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wds[2]={ {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[0]},
+                                  {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[1]} };
+    vkUpdateDescriptorSets(g_dev,2,wds,0,NULL);
+    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,cl->ppl);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,cl->pl,0,1,&ds,0,0);
+    vkCmdDispatch(cb,((uint32_t)N+63)/64,1,1);
+}
+static void cleanup_rec(RecCleanup* cl){
+    vkDestroyDescriptorPool(g_dev,cl->dp,NULL); vkDestroyPipeline(g_dev,cl->ppl,NULL);
+    vkDestroyPipelineLayout(g_dev,cl->pl,NULL); vkDestroyDescriptorSetLayout(g_dev,cl->dsl,NULL);
+}
+
 /* ==================== ABI ==================== */
 
 int coli_cuda_init(const int *devices, int count){
@@ -372,8 +422,69 @@ int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTenso
 }
 
 int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups, ColiCudaTensor *const *downs, const int *rows, int count, float *y, const float *x){
-    (void)gates;(void)ups;(void)downs;(void)rows;(void)count;(void)y;(void)x;
-    return 0;  /* glm.c fans out to per-expert expert_mlp, which we implement */
+    if(!gates||!ups||!downs||!rows||!x||!y||count<1) return 0;
+    ColiCudaTensor *first=gates[0];
+    if(!first) return 0;
+    int device=first->device, D=first->I, I=first->O, total=0, all_s4=1;
+    if(count>64) return 0;  /* matches CUDA GroupDesc[64] cap */
+    int offs[64];
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
+        all_s4&= (g->fmt==2&&u->fmt==2&&d->fmt==2);
+        offs[c]=total; total+=rows[c];
+    }
+    if(!all_s4) return 0;  /* only int4 (fmt=2) path implemented */
+    g_experts+=count; g_rows+=total;
+    size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float), yb=(size_t)total*D*sizeof(float);
+    VkBuffer xbuf,gbuf,ubuf,ybuf; VkDeviceMemory xm,gm,um,ym;
+    xbuf=make_buf(xb,&xm); gbuf=make_buf(ib,&gm); ubuf=make_buf(ib,&um); ybuf=make_buf(yb,&ym);
+    if(!xbuf||!gbuf||!ubuf||!ybuf) return 0;
+    void* p;
+    vkMapMemory(g_dev,xm,0,xb,0,&p); memcpy(p,x,xb); vkUnmapMemory(g_dev,xm);
+    /* x is in host-visible coherent memory -> already visible to GPU after memcpy. */
+    /* NOTE: weights are already device-resident (uploaded at tensor_upload). */
+    /* Record the whole layer into ONE command buffer. */
+    VkShaderModule m_mm=get_matmul_module(D,I,total);   /* fmt=2 matmul, row-len I */
+    VkShaderModule m_silu=get_silu_module((int)((size_t)total*(size_t)I));
+    if(!m_mm||!m_silu) return 0;
+    int nrec=count*3+1;  /* gate+up+down per expert, +1 silu */
+    RecCleanup *rc=malloc(sizeof(RecCleanup)*nrec);
+    VkCommandBuffer cb; vkAllocateCommandBuffers(g_dev,&(VkCommandBufferAllocateInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=g_pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1},&cb);
+    vkBeginCommandBuffer(cb,&(VkCommandBufferBeginInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
+    int ri=0;
+    for(int c=0;c<count;c++){
+        int r=rows[c], o=offs[c];
+        /* gate: x[o*D..] -> gate[o*I..] using gates[c] weights */
+        record4(cb,m_mm, gates[c]->wbuf, gates[c]->sbuf, xbuf, gbuf, (uint32_t)I, (uint32_t)r,
+                (size_t)o*(size_t)D*4, (size_t)o*(size_t)I*4, &rc[ri++]);
+        /* up:   x[o*D..] -> up[o*I..]   using ups[c] weights   */
+        record4(cb,m_mm, ups[c]->wbuf,   ups[c]->sbuf,   xbuf, ubuf, (uint32_t)I, (uint32_t)r,
+                (size_t)o*(size_t)D*4, (size_t)o*(size_t)I*4, &rc[ri++]);
+    }
+    /* silu(gate)*up -> gate (over full hidden, no offset) */
+    record2(cb,m_silu, gbuf, ubuf, (int)((size_t)total*(size_t)I), &rc[ri++]);
+    for(int c=0;c<count;c++){
+        int r=rows[c], o=offs[c];
+        /* down: gate[o*I..] -> y[o*D..] using downs[c] weights */
+        record4(cb,m_mm, downs[c]->wbuf, downs[c]->sbuf, gbuf, ybuf, (uint32_t)D, (uint32_t)r,
+                (size_t)o*(size_t)I*4, (size_t)o*(size_t)D*4, &rc[ri++]);
+    }
+    vkEndCommandBuffer(cb);
+    vkResetFences(g_dev,1,&g_fence);
+    vkQueueSubmit(g_queue,1,&(VkSubmitInfo){.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cb},g_fence);
+    vkWaitForFences(g_dev,1,&g_fence,VK_TRUE,~0ULL);
+    vkFreeCommandBuffers(g_dev,g_pool,1,&cb);
+    for(int i=0;i<nrec;i++) cleanup_rec(&rc[i]);
+    free(rc);
+    /* download y (one D2H) */
+    vkMapMemory(g_dev,ym,0,yb,0,&p); memcpy(y,p,yb); vkUnmapMemory(g_dev,ym);
+    vkDestroyBuffer(g_dev,xbuf,NULL); vkFreeMemory(g_dev,xm,NULL);
+    vkDestroyBuffer(g_dev,gbuf,NULL); vkFreeMemory(g_dev,gm,NULL);
+    vkDestroyBuffer(g_dev,ubuf,NULL); vkFreeMemory(g_dev,um,NULL);
+    vkDestroyBuffer(g_dev,ybuf,NULL); vkFreeMemory(g_dev,ym,NULL);
+    return 1;
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){
