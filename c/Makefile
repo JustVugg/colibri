@@ -58,8 +58,13 @@ CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indent
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+# For older X86_64 Macs (for example, Mac Pro 2019) we need to use -march
 ifneq ($(ARCH),)
+ifneq (,$(X86_64))
+CFLAGS += -march=$(ARCH)
+else
 CFLAGS += -mcpu=$(ARCH)
+endif
 endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
@@ -272,8 +277,9 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+# Intel Macs need -march for vector instructions
 ifneq (,$(DARWIN))
-PORTABLE_ARCH =
+PORTABLE_ARCH = $(if $(X86_64),x86-64-v3,)
 else ifneq (,$(AARCH64))
 PORTABLE_ARCH = armv8-a
 else ifneq (,$(PPC64))
