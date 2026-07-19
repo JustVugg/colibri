@@ -13,7 +13,14 @@
   }:
     flake-utils.lib.eachDefaultSystem (
       system: let
-        pkgs = import nixpkgs {inherit system;};
+        pkgs = import nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = pkg:
+            nixpkgs.lib.any (
+              license: (license.shortName or "") == "CUDA EULA"
+            ) (nixpkgs.lib.toList pkg.meta.license);
+        };
+        cudaToolkit = pkgs.cudaPackages_13_2.cudatoolkit;
 
         # Python with the packages needed by the offline converter tools
         pythonEnv = pkgs.python3.withPackages (
@@ -28,102 +35,95 @@
             ]
         );
 
-        colibri = pkgs.stdenv.mkDerivation {
-          pname = "colibri";
-          version = "1.0";
-          src = ./.;
+        colibri = {cudaSupport ? false}:
+          pkgs.stdenv.mkDerivation {
+            pname = "colibri";
+            version = "1.0";
+            src = ./.;
 
-          # python3 is needed by checkPhase: `make test-c` shells out to
-          # `python3 tools/run_tests.py` (see c/Makefile, PYTHON ?= python3).
-          nativeBuildInputs = with pkgs; [makeWrapper python3];
+            nativeBuildInputs = with pkgs; [makeWrapper python3];
 
-          buildInputs = with pkgs; [
-            gcc
-            gmp
-          ];
+            buildInputs = with pkgs;
+              [
+                gcc
+                gmp
+              ]
+              ++ pkgs.lib.optionals cudaSupport [cudaToolkit];
 
-          checkInputs = [pythonEnv];
+            checkInputs = [pythonEnv];
 
-          # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
-          ARCH =
-            if pkgs.stdenv.hostPlatform.isx86_64
-            then "x86-64-v3"
-            else "native";
+            # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
+            ARCH =
+              if pkgs.stdenv.hostPlatform.isx86_64
+              then "x86-64-v3"
+              else "native";
 
-          buildPhase = ''
-            runHook preBuild
-            make -C c glm ARCH="$ARCH"
-            runHook postBuild
-          '';
+            buildPhase = ''
+              runHook preBuild
+              make -C c glm ARCH="$ARCH" ${pkgs.lib.optionalString cudaSupport "CUDA=1 CUDA_HOME=${cudaToolkit}"}
+              runHook postBuild
+            '';
 
-          installPhase = ''
-            runHook preInstall
+            installPhase = ''
+              runHook preInstall
 
-            # Self-contained layout under $out/lib/colibri that mirrors the
-            # source tree `coli` runs in (see the path-resolution logic at the
-            # top of c/coli): the engine, the coli CLI script, the support
-            # modules it imports (openai_server.py, resource_plan.py,
-            # doctor.py), and tools/ all sit next to each other.
-            mkdir -p $out/lib/colibri/tools $out/bin
-            cp c/glm             $out/lib/colibri/glm
-            cp c/coli            $out/lib/colibri/coli
-            chmod +x $out/lib/colibri/coli
-            cp c/openai_server.py c/resource_plan.py c/doctor.py c/version.py \
-              $out/lib/colibri/
-            cp -r c/tools/*      $out/lib/colibri/tools/
+              # Keep the CLI's Python modules beside its bundled engine.
+              mkdir -p $out/lib/colibri/tools $out/bin
+              cp c/glm $out/lib/colibri/glm
+              cp c/coli $out/lib/colibri/coli
+              chmod +x $out/lib/colibri/coli
+              cp c/openai_server.py c/resource_plan.py c/doctor.py c/version.py \
+                $out/lib/colibri/
+              cp -r c/tools/* $out/lib/colibri/tools/
+              ln -s ../lib/colibri/glm $out/bin/glm
 
-            # $out/bin holds the user-facing entry points.
-            ln -s ../lib/colibri/glm $out/bin/glm
+              makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
+                --add-flags "$out/lib/colibri/coli" \
+                --set-default COLI_ENGINE "$out/lib/colibri/glm" \
+                --set PYTHONPATH "$out/lib/colibri:${pythonEnv}/${pkgs.python3.sitePackages}"
+              runHook postInstall
+            '';
 
-            # Wrap coli: point it at the bundled engine (COLI_ENGINE) so it is
-            # found by default, and at the module dir (PYTHONPATH) so
-            # `import openai_server` / `resource_plan` / `doctor` resolve.
-            makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
-              --add-flags "$out/lib/colibri/coli" \
-              --set-default COLI_ENGINE "$out/lib/colibri/glm" \
-              --set PYTHONPATH "$out/lib/colibri:${pythonEnv}/${pkgs.python3.sitePackages}"
-            runHook postInstall
-          '';
+            checkPhase = ''
+              runHook preCheck
+              cd c
+              make test-c
+              cd ..
+              runHook postCheck
+            '';
 
-          checkPhase = ''
-            runHook preCheck
-            cd c
-            make test-c
-            cd ..
-            runHook postCheck
-          '';
+            doCheck = true;
 
-          doCheck = true;
-
-          meta = with pkgs.lib; {
-            description = "Run GLM-5.2 (744B MoE) on a consumer machine with ~25 GB RAM";
-            homepage = "https://github.com/JustVugg/colibri";
-            license = licenses.asl20;
-            platforms = with platforms; linux ++ darwin;
-            mainProgram = "coli";
+            meta = with pkgs.lib; {
+              description = "Run GLM-5.2 (744B MoE) on a consumer machine with ~25 GB RAM";
+              homepage = "https://github.com/JustVugg/colibri";
+              license = licenses.asl20;
+              platforms = with platforms; linux ++ darwin;
+              mainProgram = "coli";
+            };
           };
-        };
       in {
         packages = {
-          default = colibri;
-          inherit colibri;
+          default = colibri {};
+          colibri = colibri {};
+          cuda = colibri {cudaSupport = true;};
         };
 
         apps = {
           default = {
             type = "app";
-            program = pkgs.lib.getExe colibri;
+            program = pkgs.lib.getExe (colibri {});
           };
           glm = {
             type = "app";
-            program = "${colibri}/share/colibri/glm";
+            program = "${colibri {}}/lib/colibri/glm";
           };
         };
 
         formatter = (import nixpkgs {inherit system;}).alejandra;
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [colibri];
+          inputsFrom = [colibri {}];
 
           packages = with pkgs; [
             pythonEnv
