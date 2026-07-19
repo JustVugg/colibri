@@ -470,8 +470,11 @@ static void numa_slab_bind(void *p, size_t n){
     unsigned long mask=(1UL<<g_numa_nodes)-1;
     uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
     size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
-    syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
-            (unsigned long)(g_numa_nodes+1),(unsigned)2/*MPOL_MF_MOVE*/);
+    long rc = syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
+            (unsigned long)(g_numa_nodes+1),(unsigned)0/*no MPOL_MF_MOVE — fresh mmap, no pages to migrate*/);
+    if(rc<0 && (int)-rc==1){ /* EPERM: no CAP_SYS_NICE — disable permanently */
+        g_numa_nodes=1;
+    }
 #else
     (void)p;(void)n;
 #endif
@@ -481,8 +484,17 @@ static void numa_init(void){
     if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
     for(int i=0;i<64;i++){ char pth[64]; snprintf(pth,sizeof(pth),"/sys/devices/system/node/node%d",i);
         struct stat st; if(stat(pth,&st)) break; g_numa_nodes=i+1; }
-    if(g_numa_nodes>=2) fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
-    else fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n");
+    if(g_numa_nodes<2){ fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n"); return; }
+    /* Probe mbind capability BEFORE any allocation: mbind requires CAP_SYS_NICE. */
+    { unsigned long mask=(1UL<<g_numa_nodes)-1; char buf[4096];
+      long rc=syscall(SYS_mbind,buf,sizeof(buf),3/*MPOL_INTERLEAVE*/,&mask,
+                      (unsigned long)(g_numa_nodes+1),0);
+      if(rc<0 && (int)-rc==1){ /* EPERM */
+          fprintf(stderr,"[NUMA] mbind not permitted (no CAP_SYS_NICE) — COLI_NUMA disabled\n");
+          g_numa_nodes=1; return;
+      }
+    }
+    fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
 #endif
 }
 
