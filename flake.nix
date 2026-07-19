@@ -35,7 +35,10 @@
             ]
         );
 
-        colibri = {cudaSupport ? false}:
+        colibri = pkgs.lib.makeOverridable ({
+          cudaSupport ? false,
+          cudaArch ? null,
+        }:
           pkgs.stdenv.mkDerivation {
             pname = "colibri";
             version = "1.0";
@@ -60,7 +63,7 @@
 
             buildPhase = ''
               runHook preBuild
-              make -C c glm ARCH="$ARCH" ${pkgs.lib.optionalString cudaSupport "CUDA=1 CUDA_HOME=${cudaToolkit}"}
+              make -C c glm ARCH="$ARCH" ${pkgs.lib.optionalString cudaSupport "CUDA=1 CUDA_HOME=${cudaToolkit}"} ${pkgs.lib.optionalString (cudaSupport && cudaArch != null) "CUDA_ARCH=${cudaArch}"}
               runHook postBuild
             '';
 
@@ -101,12 +104,15 @@
               platforms = with platforms; linux ++ darwin;
               mainProgram = "coli";
             };
-          };
+          });
       in {
         packages = {
           default = colibri {};
           colibri = colibri {};
-          cuda = colibri {cudaSupport = true;};
+          cuda = colibri {
+            cudaSupport = true;
+            cudaArch = "sm_86";
+          };
         };
 
         apps = {
