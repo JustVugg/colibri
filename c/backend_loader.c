@@ -75,6 +75,13 @@ typedef int (*fn_attention_project_ragged)(ColiCudaTensor *kv_b,ColiCudaTensor *
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
 typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
+typedef int (*fn_attention_absorb8)(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc, int H,int Q,int R,int V,int K,int T,float attention_scale);
+typedef int (*fn_attention_absorb_tq)(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent,const float *lrad,const uint8_t *rope,const float *rrad, int H,int Q,int R,int V,int K,int T,float attention_scale,int lrb,int rrb);
+typedef int (*fn_attention_absorb_batch8)(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc, int S,int H,int Q,int R,int V,int K,int T,float attention_scale);
+typedef int (*fn_attention_project_batch8)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const uint8_t *latent,const float *lsc, const uint8_t *rope,const float *rsc,int S,int H,int Q,int R,int V,int K,int T,float attention_scale);
+typedef int (*fn_attention_absorb_kvdev8)(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent_dev,const float *lsc_dev,const uint8_t *rope_dev,const float *rsc_dev, int H,int Q,int R,int V,int K,int T,float attention_scale);
+typedef int (*fn_attention_absorb_kvdev8_sel)(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent_dev,const float *lsc_dev,const uint8_t *rope_dev,const float *rsc_dev, const int *sel,int nsel,int H,int Q,int R,int V,int K,float attention_scale);
+typedef int (*fn_attention_project_batch_kvdev8)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const uint8_t *latent_dev,const float *lsc_dev, const uint8_t *rope_dev,const float *rsc_dev,int S,int H,int Q,int R,int V,int K,int T,float attention_scale);
 typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
@@ -94,6 +101,7 @@ typedef float * (*fn_pipe_scratch)(int device,int slot,size_t bytes);
 typedef int (*fn_pipe_silu_mul)(int device,float *gate_dev,const float *up_dev,size_t n);
 typedef int (*fn_pipe_sync)(int device);
 typedef int (*fn_pipe_upload)(int device,void *dst,const void *src,size_t bytes);
+typedef int (*fn_pipe_upload_async)(int device,void *dst,const void *src,size_t bytes);
 typedef int (*fn_shared_mlp_w4a16)(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int (*fn_tensor_update)(ColiCudaTensor *tensor, const void *weights, const float *scales);
 
@@ -130,6 +138,13 @@ static struct {
     fn_attention_project_ragged attention_project_ragged;
     fn_attention_project_batch_dev attention_project_batch_dev;
     fn_attention_project_batch_dev_out attention_project_batch_dev_out;
+    fn_attention_absorb8 attention_absorb8;
+    fn_attention_absorb_tq attention_absorb_tq;
+    fn_attention_absorb_batch8 attention_absorb_batch8;
+    fn_attention_project_batch8 attention_project_batch8;
+    fn_attention_absorb_kvdev8 attention_absorb_kvdev8;
+    fn_attention_absorb_kvdev8_sel attention_absorb_kvdev8_sel;
+    fn_attention_project_batch_kvdev8 attention_project_batch_kvdev8;
     fn_pipe_add pipe_add;
     fn_pipe_alloc pipe_alloc;
     fn_pipe_copy2d pipe_copy2d;
@@ -149,6 +164,7 @@ static struct {
     fn_pipe_silu_mul pipe_silu_mul;
     fn_pipe_sync pipe_sync;
     fn_pipe_upload pipe_upload;
+    fn_pipe_upload_async pipe_upload_async;   /* opzionale: dll vecchie non ce l'hanno */
     fn_shared_mlp_w4a16 shared_mlp_w4a16;
     fn_tensor_update tensor_update;
 } g_cuda;
@@ -244,6 +260,13 @@ static int coli_cuda_load(void){
     RESOLVE(attention_project_ragged, fn_attention_project_ragged)
     RESOLVE(attention_project_batch_dev, fn_attention_project_batch_dev)
     RESOLVE(attention_project_batch_dev_out, fn_attention_project_batch_dev_out)
+    RESOLVE(attention_absorb8, fn_attention_absorb8)
+    RESOLVE(attention_absorb_tq, fn_attention_absorb_tq)
+    RESOLVE(attention_absorb_batch8, fn_attention_absorb_batch8)
+    RESOLVE(attention_project_batch8, fn_attention_project_batch8)
+    RESOLVE(attention_absorb_kvdev8, fn_attention_absorb_kvdev8)
+    RESOLVE(attention_absorb_kvdev8_sel, fn_attention_absorb_kvdev8_sel)
+    RESOLVE(attention_project_batch_kvdev8, fn_attention_project_batch_kvdev8)
     RESOLVE(pipe_add, fn_pipe_add)
     RESOLVE(pipe_alloc, fn_pipe_alloc)
     RESOLVE(pipe_copy2d, fn_pipe_copy2d)
@@ -263,6 +286,11 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_silu_mul, fn_pipe_silu_mul)
     RESOLVE(pipe_sync, fn_pipe_sync)
     RESOLVE(pipe_upload, fn_pipe_upload)
+    /* opzionale (dll pre-2026-07): fallback al pipe_upload sincrono nel wrapper */
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
+    g_cuda.pipe_upload_async = (fn_pipe_upload_async)GetProcAddress(g_cuda.dll, "coli_cuda_pipe_upload_async");
+    _Pragma("GCC diagnostic pop")
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
     #undef RESOLVE
@@ -400,6 +428,40 @@ int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,float *ctx,const float
     return g_cuda.attention_absorb_batch(kv_b, ctx, q, latent, rope, S, H, Q, R, V, K, T, attention_scale);
 }
 
+int coli_cuda_attention_absorb8(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc, int H,int Q,int R,int V,int K,int T,float attention_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_absorb8(kv_b, ctx, q, latent, lsc, rope, rsc, H, Q, R, V, K, T, attention_scale);
+}
+int coli_cuda_attention_absorb_tq(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent,const float *lrad,const uint8_t *rope,const float *rrad, int H,int Q,int R,int V,int K,int T,float attention_scale,int lrb,int rrb){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_absorb_tq(kv_b, ctx, q, latent, lrad, rope, rrad, H, Q, R, V, K, T, attention_scale, lrb, rrb);
+}
+
+int coli_cuda_attention_absorb_batch8(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc, int S,int H,int Q,int R,int V,int K,int T,float attention_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_absorb_batch8(kv_b, ctx, q, latent, lsc, rope, rsc, S, H, Q, R, V, K, T, attention_scale);
+}
+
+int coli_cuda_attention_project_batch8(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const uint8_t *latent,const float *lsc, const uint8_t *rope,const float *rsc,int S,int H,int Q,int R,int V,int K,int T,float attention_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_project_batch8(kv_b, o_proj, out, q, latent, lsc, rope, rsc, S, H, Q, R, V, K, T, attention_scale);
+}
+
+int coli_cuda_attention_absorb_kvdev8(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent_dev,const float *lsc_dev,const uint8_t *rope_dev,const float *rsc_dev, int H,int Q,int R,int V,int K,int T,float attention_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_absorb_kvdev8(kv_b, ctx, q, latent_dev, lsc_dev, rope_dev, rsc_dev, H, Q, R, V, K, T, attention_scale);
+}
+
+int coli_cuda_attention_absorb_kvdev8_sel(ColiCudaTensor *kv_b,float *ctx,const float *q, const uint8_t *latent_dev,const float *lsc_dev,const uint8_t *rope_dev,const float *rsc_dev, const int *sel,int nsel,int H,int Q,int R,int V,int K,float attention_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_absorb_kvdev8_sel(kv_b, ctx, q, latent_dev, lsc_dev, rope_dev, rsc_dev, sel, nsel, H, Q, R, V, K, attention_scale);
+}
+
+int coli_cuda_attention_project_batch_kvdev8(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const uint8_t *latent_dev,const float *lsc_dev, const uint8_t *rope_dev,const float *rsc_dev,int S,int H,int Q,int R,int V,int K,int T,float attention_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.attention_project_batch_kvdev8(kv_b, o_proj, out, q, latent_dev, lsc_dev, rope_dev, rsc_dev, S, H, Q, R, V, K, T, attention_scale);
+}
+
 int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_dev, const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!g_cuda.available){ return 0; }
     return g_cuda.attention_absorb_batch_dev(kv_b_shard, ctx_dev, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
@@ -527,6 +589,12 @@ int coli_cuda_pipe_sync(int device){
 int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_upload(device, dst, src, bytes);
+}
+
+int coli_cuda_pipe_upload_async(int device,void *dst,const void *src,size_t bytes){
+    if(!g_cuda.available){ return 0; }
+    if(g_cuda.pipe_upload_async) return g_cuda.pipe_upload_async(device, dst, src, bytes);
+    return g_cuda.pipe_upload(device, dst, src, bytes);   /* dll vecchia: sincrono */
 }
 
 int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S){

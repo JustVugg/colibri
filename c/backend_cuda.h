@@ -113,10 +113,51 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,C
                                       const float *rope,int S,int H,int Q,int R,
                                       int V,int K,int T,float attention_scale);
 
+/* KV8 twins: latent/rope as fp8 e4m3 bytes + one f32 amax/448 scale per row
+ * (per token, Lc and Rc separately) — 1/4 the PCIe traffic of the f32 paths. */
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb8(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                               const uint8_t *latent,const float *lsc,
+                               const uint8_t *rope,const float *rsc,int H,int Q,
+                               int R,int V,int K,int T,float attention_scale);
+/* KV_TQ codec-1 (rotated int4) native single-sequence absorb: latent/rope are PACKED NIBBLES
+ * (lrb/rrb bytes/row) + per-row radius (lrad/rrad). HARDWARE-VALIDATION PENDING (see backend_cuda.cu). */
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_tq(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                               const uint8_t *latent,const float *lrad,
+                               const uint8_t *rope,const float *rrad,int H,int Q,
+                               int R,int V,int K,int T,float attention_scale,int lrb,int rrb);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch8(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                                     const uint8_t *latent,const float *lsc,
+                                     const uint8_t *rope,const float *rsc,int S,
+                                     int H,int Q,int R,int V,int K,int T,
+                                     float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch8(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+                                      float *out,const float *q,
+                                      const uint8_t *latent,const float *lsc,
+                                      const uint8_t *rope,const float *rsc,
+                                      int S,int H,int Q,int R,
+                                      int V,int K,int T,float attention_scale);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q,const void *const *keys,
         const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
+
+/* KV8 long-T: device-resident fp8 KV shadow. No T cap (tiled online softmax
+ * beyond the shared-memory limit); only q goes up and ctx/out comes down.
+ * The _sel variant attends the DSA-selected rows only (absolute indices). */
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev8(ColiCudaTensor *kv_b,float *ctx,const float *q,
+        const uint8_t *latent_dev,const float *lsc_dev,
+        const uint8_t *rope_dev,const float *rsc_dev,
+        int H,int Q,int R,int V,int K,int T,float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev8_sel(ColiCudaTensor *kv_b,float *ctx,const float *q,
+        const uint8_t *latent_dev,const float *lsc_dev,
+        const uint8_t *rope_dev,const float *rsc_dev,
+        const int *sel,int nsel,int H,int Q,int R,int V,int K,float attention_scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_kvdev8(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+        float *out,const float *q,
+        const uint8_t *latent_dev,const float *lsc_dev,
+        const uint8_t *rope_dev,const float *rsc_dev,
+        int S,int H,int Q,int R,int V,int K,int T,float attention_scale);
 
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
@@ -131,6 +172,9 @@ COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t byt
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
+/* Come pipe_upload ma ordinato sullo stream dei kernel del device (staging
+ * pinned, cudaMemcpyAsync): niente race col NULL stream, niente blocco host. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload_async(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);

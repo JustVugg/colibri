@@ -61,6 +61,8 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
+#include "kv_tq.h"                                /* KV_TQ=3|4: cache latente PolarQuant (rot+polare) */
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -169,6 +171,8 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
+    uint8_t **Lc8, **Rc8;                        /* KV8: righe latenti fp8 e4m3 (Lc/Rc restano NULL) */
+    float **Lsc, **Rsc;                          /* KV8: scala amax/448 per riga (per token, per layer) */
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
@@ -191,11 +195,14 @@ typedef struct {
      * k_rot [qk_rope] (576 vs 32768 valori/token). k_nope e value si ricostruiscono al
      * volo con kv_b. E' cio' che rende gestibile il contesto su 15 GB (64 teste, no GQA). */
     float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
+    uint8_t **Lc8, **Rc8; float **Lsc, **Rsc;    /* alias KV8 (fp8 + scale) della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
+    uint8_t **kv_dev_L8, **kv_dev_R8;            /* KV8: ombra fp8 (149 MB/layer a 256k, sta in VRAM) */
+    float **kv_dev_Ls, **kv_dev_Rs;              /* KV8: scale per-riga dell'ombra */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -717,6 +724,11 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
                           * non vengono stampate. Solo misura: nessun effetto sull'output. */
 
 #include "sample.h"
+/* KV-cache quantization tier flags — defined here (before kv_persist.h) so the .coli_kv
+ * disk format can see them; the full rationale comments live at their original site below. */
+static int g_kv8=0;                             /* KV8=1: fp8 e4m3 latent KV + per-row scale */
+static int g_tq=0, g_tq_bits=4, g_tq_codec=1;   /* KV_TQ: codec 1=rotated int4 (default), 0=PolarQuant */
+static int g_kv_shadow=0;                       /* fp8 device shadow (KV_SHADOW auto/force) */
 #include "kv_persist.h"
 #include "telemetry.h"
 
@@ -1091,7 +1103,10 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_CUDA
-    if(g_cuda_enabled&&g_cuda_dense){
+    /* fmt=4 (int4 a gruppi) non ha un percorso device: row_bytes()=0 nel backend
+     * rifiuta l'upload. Marcarlo eligible sprecava budget proiettato e spegneva in
+     * silenzio l'intera attention GPU KV8 sugli snapshot grouped-int4. */
+    if(g_cuda_enabled&&g_cuda_dense&&t.fmt!=4){
         t.cuda_eligible=1;
         int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
@@ -1149,6 +1164,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
+    m->kv_dev_L8=calloc(NR,sizeof(uint8_t*)); m->kv_dev_R8=calloc(NR,sizeof(uint8_t*));
+    m->kv_dev_Ls=calloc(NR,sizeof(float*)); m->kv_dev_Rs=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
@@ -2183,6 +2200,26 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;
+/* KV8=1: cache latente Lc/Rc in fp8 e4m3 + scala f32 per riga (~4x meno RAM del f32).
+ * Coperti CPU e CUDA (kernel absorb8); auto-off sotto COLI_METAL, e forza
+ * COLI_CUDA_PIPE=0 (l'ombra KV su device e il pipe-prefill leggono righe f32). */
+/* g_kv8 defined before the kv_persist.h include (above). */
+/* KV_TQ=3|4: tier TurboQuant/PolarQuant (rotazione Hadamard randomizzata +
+ * trasformata polare ricorsiva; raggio = norma L2 nella scala per-riga, solo gli
+ * angoli nei byte). CPU-only in fase 1 — niente kernel CUDA/Metal ne' ombra device:
+ * come KV8 sotto METAL, si spegne dove i percorsi leggono righe f32. Mutuamente
+ * esclusivo con KV8. Riusa Lc8/Rc8 (byte impacchettati, righe di coli_tq_row_bytes)
+ * + Lsc/Rsc (raggio f32 per riga). g_tq_bits = angoli livello-1 (3 o 4). */
+/* g_tq, g_tq_bits, g_tq_codec defined before the kv_persist.h include (above). */
+/* Ombra fp8 residente su device (~max_t*(kvl+R+8) byte per layer di VRAM).
+ * AUTO: sempre ACCESA sotto KV8+CUDA (57204d0) — il prefill a chunk la usa per
+ * non ricaricare l'intera storia fp8 per layer per chunk (~170 GB di PCIe
+ * misurati su un prompt da 124k), e anche il decode ragged multi-slot la usa
+ * per la riga del bound corrente (gate ks==m->kv). Nota: l'ombra e' UNA per
+ * processo — ogni kv_bind cross-slot azzera i watermark e il primo decode dello
+ * slot ricarica tutta la sua storia; ombre per-slot sono il follow-up noto.
+ * KV_SHADOW=0/1 forza. */
+/* g_kv_shadow defined before the kv_persist.h include (above). */
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 static int g_cuda_router=0; /* COLI_CUDA_ROUTER=1 (#431 PR-A): router on the layer home device at decode */
@@ -2253,10 +2290,70 @@ static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
     }
     int v=m->kv_dev_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,m->kv_dev_L[layer]+(size_t)v*kvl,
+        if(!coli_cuda_pipe_upload_async(dev,m->kv_dev_L[layer]+(size_t)v*kvl,
             coli_kv_row(m->kv->Lc[layer],v,kvl),(size_t)(upto-v)*kvl*4)||
-           !coli_cuda_pipe_upload(dev,m->kv_dev_R[layer]+(size_t)v*R,
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_R[layer]+(size_t)v*R,
             coli_kv_row(m->kv->Rc[layer],v,R),(size_t)(upto-v)*R*4)) return 0;
+        m->kv_dev_valid[layer]=upto;
+    }
+    return 1;
+}
+
+/* Gemello KV8 dell'ombra: byte fp8 + scale per-riga residenti sul device di kv_b.
+ * A 256k tokens l'ombra INTERA e' ~149 MB/layer (contro i 604 del f32 che non ci
+ * starebbero mai): il decode carica solo le righe nuove e l'attention legge VRAM.
+ * Alloc lazy e fail-soft: senza VRAM si torna al percorso host/CPU. */
+static int kv_dev_sync8(Model *m, Layer *l, int layer, int upto){
+    Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
+    if(!g_kv_shadow || upto>m->max_t) return 0;
+    if(!m->kv_dev_L8[layer]){
+        /* Guardia al punto d'allocazione (vale per OGNI modalita', anche PROMPT
+         * dove max_t segue il prompt e non CTX e la proiezione di pin_load non
+         * puo' saperlo): l'ombra si prende solo se al device restano >=1.5 GB
+         * DOPO — altrimenti meglio l'upload per-chiamata che affamare densa e
+         * scratch (OOM->CPU visto in prod 2026-07-16). */
+        /* Il rifiuto del floor NON si ricalcola a ogni chiamata: cudaMemGetInfo
+         * per layer per token e' un probe sincronizzante, e sotto pressione VRAM
+         * il fallback per-chiamata ricarica l'intera storia a ogni token (O(T^2)
+         * di PCIe cumulato). Backoff: dopo un rifiuto si riprova ogni ~1024
+         * chiamate (≈ ogni dozzina di token a 79 layer). */
+        static int shadow_backoff=0;
+        if(shadow_backoff>0){ shadow_backoff--; return 0; }
+        size_t free_b=0,total_b=0;
+        double need=(double)m->max_t*(kvl+R+8);
+        if(!coli_cuda_mem_info(dev,&free_b,&total_b) ||
+           (double)free_b < need+1.5e9){ shadow_backoff=1024; return 0; }
+        m->kv_dev_L8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl);
+        m->kv_dev_R8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R);
+        m->kv_dev_Ls[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*4);
+        m->kv_dev_Rs[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*4);
+        m->kv_dev_valid[layer]=0;
+        if(!m->kv_dev_L8[layer]||!m->kv_dev_R8[layer]||
+           !m->kv_dev_Ls[layer]||!m->kv_dev_Rs[layer]){
+            /* alloc PARZIALE: senza pulizia la prossima chiamata vedrebbe L8 valido
+             * e caricherebbe su buffer di scala NULL. Libera e azzera tutto. */
+            if(m->kv_dev_L8[layer]) coli_cuda_pipe_free(dev,m->kv_dev_L8[layer]);
+            if(m->kv_dev_R8[layer]) coli_cuda_pipe_free(dev,m->kv_dev_R8[layer]);
+            if(m->kv_dev_Ls[layer]) coli_cuda_pipe_free(dev,m->kv_dev_Ls[layer]);
+            if(m->kv_dev_Rs[layer]) coli_cuda_pipe_free(dev,m->kv_dev_Rs[layer]);
+            m->kv_dev_L8[layer]=NULL; m->kv_dev_R8[layer]=NULL;
+            m->kv_dev_Ls[layer]=NULL; m->kv_dev_Rs[layer]=NULL;
+            return 0;
+        }
+    }
+    int v=m->kv_dev_valid[layer];
+    if(v<upto){
+        /* ASYNC sullo stream dei kernel: ordinati per costruzione coi consumer
+         * (stessa stream; ogni chiamata attention termina con una stream-sync),
+         * e il decode smette di pagare 4 memcpy bloccanti per layer per token. */
+        if(!coli_cuda_pipe_upload_async(dev,m->kv_dev_L8[layer]+(size_t)v*kvl,
+            coli_kv_row8(m->kv->Lc8[layer],v,kvl),(size_t)(upto-v)*kvl)||
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_R8[layer]+(size_t)v*R,
+            coli_kv_row8(m->kv->Rc8[layer],v,R),(size_t)(upto-v)*R)||
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_Ls[layer]+v,
+            m->kv->Lsc[layer]+v,(size_t)(upto-v)*4)||
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_Rs[layer]+v,
+            m->kv->Rsc[layer]+v,(size_t)(upto-v)*4)) return 0;
         m->kv_dev_valid[layer]=upto;
     }
     return 1;
@@ -2399,14 +2496,21 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     rope_interleave(kd, pos, c); }
             }
             #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
-            int ok = coli_metal_attn_decode(x,
-                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
-                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
-                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
-                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
-                WP_(l->o), l->o.s, l->o.fmt,
+            #define QPROJ_ WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln, \
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt, \
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln, \
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt, \
+                WP_(l->o), l->o.s, l->o.fmt
+            int ok = g_tq ? coli_metal_attn_decode_tq(x, QPROJ_,
+                m->Lc8[layer], m->Lsc[layer], m->Rc8[layer], m->Rsc[layer], g_tq_bits, g_tq_codec,
+                S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out)
+              : g_kv8 ? coli_metal_attn_decode8(x, QPROJ_,
+                m->Lc8[layer], m->Lsc[layer], m->Rc8[layer], m->Rsc[layer],
+                S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out)
+              : coli_metal_attn_decode(x, QPROJ_,
                 m->Lc[layer], m->Rc[layer], S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
             #undef WP_
+            #undef QPROJ_
             if(ok){ m->t_attn += now_s()-ta0; return; }
         }
     }
@@ -2446,22 +2550,56 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         matmul_qt_ex(Q, QR, &l->q_b, S, 0);
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
     }
-    if(!pipe_done) for(int s=0;s<S;s++){
+#ifdef COLI_CUDA
+    /* Accorcia l'ombra PRIMA del loop (min pos riscritto), cosi' il loop caldo
+     * resta senza stato condiviso e puo' girare in parallelo. */
+    if(!pipe_done&&m->kv_dev_valid&&layer<=c->n_layers){
+        int minpos=-1;
+        for(int s=0;s<S;s++){
+            KVState *ks=kvs?kvs[s]:m->kv;
+            if(ks!=m->kv) continue;
+            int pos=positions?positions[s]:pos_base+s;
+            if(minpos<0||pos<minpos) minpos=pos;
+        }
+        if(minpos>=0&&m->kv_dev_valid[layer]>minpos) m->kv_dev_valid[layer]=minpos;
+    }
+#endif
+    /* Produttore KV: righe indipendenti (ogni s scrive solo la SUA riga pos).
+     * Era seriale — sotto KV8 sono ~576 encode libm per riga per layer, minuti
+     * su un prompt lungo mentre il pool OMP dormiva. */
+    if(!pipe_done){
+    #pragma omp parallel for schedule(static) if(S>8)
+    for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
         int pos=positions?positions[s]:pos_base+s;
         float *qfull=Q+(int64_t)s*H*qh;
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
         const float *cs=comp+(int64_t)s*cw;
-        float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
-        float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
-#ifdef COLI_CUDA
-        if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
-            m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
-#endif
-        memcpy(Ldst, cs, c->kv_lora*sizeof(float));
-        rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
-        memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
-        rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
+        if(g_tq){
+            /* KV_TQ: stessa norma+rope del produttore, poi PolarQuant. Il raggio
+             * (norma L2) va nella scala per-riga (Lsc/Rsc); solo gli angoli nei byte. */
+            float *Ls=comp+(int64_t)s*cw, *Rs=Ls+c->kv_lora;
+            rmsnorm(Ls, Ls, l->kv_a_ln, c->kv_lora, c->eps);
+            rope_interleave(Rs, pos, c);
+            ks->Lsc[layer][pos]=coli_kvq_quant_row(Ls, coli_kv_row8(ks->Lc8[layer],pos,coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec)), c->kv_lora, g_tq_bits, g_tq_codec);
+            ks->Rsc[layer][pos]=coli_kvq_quant_row(Rs, coli_kv_row8(ks->Rc8[layer],pos,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)), c->qk_rope, g_tq_bits, g_tq_codec);
+        } else if(g_kv8){
+            /* KV8: norma+rope sul residuo di comp (scratch, mai riletto), poi
+             * quantizza riga+scala. E' IL produttore caldo: ogni token, ogni layer. */
+            float *Ls=comp+(int64_t)s*cw, *Rs=Ls+c->kv_lora;
+            rmsnorm(Ls, Ls, l->kv_a_ln, c->kv_lora, c->eps);      /* latente normato */
+            rope_interleave(Rs, pos, c);                          /* k_rot roped */
+            ks->Lsc[layer][pos]=coli_kv8_quant_row(Ls, coli_kv_row8(ks->Lc8[layer],pos,c->kv_lora), c->kv_lora);
+            ks->Rsc[layer][pos]=coli_kv8_quant_row(Rs, coli_kv_row8(ks->Rc8[layer],pos,c->qk_rope), c->qk_rope);
+        } else {
+            float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
+            float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
+            memcpy(Ldst, cs, c->kv_lora*sizeof(float));
+            rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);  /* latente normato */
+            memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
+            rope_interleave(Rdst, pos, c);                        /* k_rot roped, condiviso fra teste */
+        }
+    }
     }
     /* ---- DSA lightning indexer ----
      * Layer FULL: k_idx dei token nuovi in cache + selezione top-k per query (riusata
@@ -2546,7 +2684,17 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     int cuda_absorb=0;
 #ifdef COLI_CUDA
     cuda_absorb=layer<c->n_layers&&!kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&
-                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512;
+                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512&&!g_tq;   /* TQ codec-1 uses its own native path (below); codec-0 stays CPU */
+    /* Non-silent: TQ on CUDA doesn't take the fp8 shadow path. codec-1 has a native single-seq
+     * kernel (below); codec-0 (PolarQuant) and long/DSA contexts fall to the CPU consumer (now the
+     * efficient orthogonality path). Say so ONCE so a CUDA operator isn't puzzled by CPU-bound attn. */
+    if(g_tq && g_cuda_enabled && getenv("COLI_CUDA_ATTN") && atoi(getenv("COLI_CUDA_ATTN"))){
+        static int tq_cuda_noted=0;
+        if(!tq_cuda_noted){ tq_cuda_noted=1;
+            fprintf(stderr,"[KV_TQ] CUDA: codec-%d %s; other cases use the CPU consumer "
+                "(rotated-int4 orthogonality path, not the old per-row dequant).\n",
+                g_tq_codec, g_tq_codec==1?"has a native single-sequence attention kernel (T<=4096, dense)":"is CPU-only (no CUDA kernel)"); }
+    }
 #endif
     int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4) || cuda_absorb;
     if(absorb && c->kv_lora<=512){
@@ -2569,7 +2717,16 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
-        if(kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+        /* Ragged batched attention (multi-slot serve) is f32-only BY DESIGN: the fp8
+         * device shadow mirrors ONLY the primary sequence (m->kv) — per-slot KVStates
+         * are never shadowed, so a ragged gather can neither read the shadow nor
+         * cheaply re-upload (there is no fp8 ragged kernel yet). Under KV8 the f32
+         * rows this branch reads (kvs[s]->Lc/Rc) are not even allocated; quantized
+         * ragged rows take the CPU ragged path instead, which decodes fp8 natively.
+         * A KV8-aware ragged gather (per-slot shadow or per-call fp8 upload) is
+         * future work. Safe to de-chain from the batch branch below: ragged needs
+         * kvs, cuda_absorb needs !kvs — mutually exclusive by construction. */
+        if(kvs&&!g_kv8&&!g_tq&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             const float **rl=malloc((size_t)S*sizeof(*rl)),**rr=malloc((size_t)S*sizeof(*rr));
@@ -2587,35 +2744,71 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     out,Q,rk,rl,rr,rn,S,H,c->qk_nope,c->qk_rope,vh,kvl,mt,c->attn_scale);
             }
             free(rk);free(rl);free(rr);free(rn);
-        } else if(cuda_absorb&&l->n_kv_b_shard>1){
+        }
+        /* KV8: se la selezione DSA e' attiva per QUALCHE riga, i rami batch (che
+         * attendono DENSO su tutte le chiavi) vanno saltati: il ramo S<=4 sotto ha
+         * il kernel gather e rispetta la selezione, come il percorso CPU. Il flusso
+         * f32 resta INVARIATO (il denso-su-selezione e' il comportamento storico). */
+        int sel_any=0;
+        if(g_kv8&&(S<=4||g_spec_live)&&dnsel) for(int s2=0;s2<S;s2++) if(dnsel[s2]>0){sel_any=1;break;}
+        if(cuda_absorb&&!sel_any&&l->n_kv_b_shard>1){
             int n=l->n_kv_b_shard,st0=m->kv_start[layer],nt=pos_base+S-st0,ok=1;
             float *qs=falloc((int64_t)S*H*qh),*cs=falloc((int64_t)S*H*vh);
             for(int d=0;d<n;d++)for(int s=0;s<S;s++)memcpy(
                 qs+(int64_t)l->shard_h0[d]*S*qh+(int64_t)s*l->shard_hn[d]*qh,
                 Q+((int64_t)s*H+l->shard_h0[d])*qh,(size_t)l->shard_hn[d]*qh*sizeof(float));
             #pragma omp parallel for schedule(static) reduction(&:ok)
-            for(int d=0;d<n;d++)ok&=coli_cuda_attention_absorb_batch(l->kv_b_shard[d],
-                cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
-                coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
-                S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+            for(int d=0;d<n;d++)ok&=g_kv8
+                ?coli_cuda_attention_absorb_batch8(l->kv_b_shard[d],
+                    cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
+                    coli_kv_row8(m->Lc8[layer],st0,kvl),m->Lsc[layer]+st0,
+                    coli_kv_row8(m->Rc8[layer],st0,c->qk_rope),m->Rsc[layer]+st0,
+                    S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale)
+                :coli_cuda_attention_absorb_batch(l->kv_b_shard[d],
+                    cs+(int64_t)l->shard_h0[d]*S*vh,qs+(int64_t)l->shard_h0[d]*S*qh,
+                    coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
+                    S,l->shard_hn[d],c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
             if(ok)for(int d=0;d<n;d++)for(int s=0;s<S;s++)memcpy(
                 ctx+((int64_t)s*H+l->shard_h0[d])*vh,
                 cs+(int64_t)l->shard_h0[d]*S*vh+(int64_t)s*l->shard_hn[d]*vh,
                 (size_t)l->shard_hn[d]*vh*sizeof(float));
             free(qs);free(cs);cuda_core=ok;
-        } else if(cuda_absorb&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+        } else if(cuda_absorb&&!sel_any&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             int st0=m->kv_start[layer],nt=pos_base+S-st0;
+            if(g_kv8){
+                /* prima l'ombra residente (sale solo q, nessun tetto di T); poi
+                 * l'upload per-chiamata; il f32 host resta com'era. */
+                cuda_core=cuda_projected=
+                    (!kvs&&kv_dev_sync8(m,l,layer,pos_base+S)&&
+                     coli_cuda_attention_project_batch_kvdev8(l->kv_b.cuda,l->o.cuda,out,Q,
+                        m->kv_dev_L8[layer]+(size_t)st0*kvl,m->kv_dev_Ls[layer]+st0,
+                        m->kv_dev_R8[layer]+(size_t)st0*c->qk_rope,m->kv_dev_Rs[layer]+st0,
+                        S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale))
+                    ||coli_cuda_attention_project_batch8(l->kv_b.cuda,l->o.cuda,out,Q,
+                        coli_kv_row8(m->Lc8[layer],st0,kvl),m->Lsc[layer]+st0,
+                        coli_kv_row8(m->Rc8[layer],st0,c->qk_rope),m->Rsc[layer]+st0,
+                        S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+            } else
             cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
-                coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
-                S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
-        } else if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
-           l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
+                    coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
+                    S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+        } else if((S<=4||(g_spec_live&&S<=64))&&g_cuda_enabled&&(!g_tq||g_tq_codec==1)&&getenv("COLI_CUDA_ATTN")&&
+           atoi(getenv("COLI_CUDA_ATTN"))&&l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){   /* codec-0 TQ stays CPU-only (no CUDA kernel); f32 would read NULL Lc */
             cuda_core=1;
             for(int s=0;s<S&&cuda_core;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;int pos=positions?positions[s]:pos_base+s;
                 int st0=ks->kv_start[layer],nt=pos+1-st0;
-                if(dnsel&&dnsel[s]>0){
+                int ns=(dnsel&&dnsel[s]>0)?dnsel[s]:0;
+                /* DSA selection active. Two gather routes now exist and they must not
+                 * collide: (a) the fp8 device shadow has its own gather kernel over
+                 * absolute indices (below), used when KV8 owns this layer's shadow;
+                 * (b) everything else falls to dev's COLI_DSA_GATHER staging path,
+                 * which reads f32 Lc/Rc rows. Under KV8-without-shadow or any KV_TQ
+                 * tier those f32 rows are not allocated and there is no TQ gather
+                 * kernel, so the CPU consumer takes it. */
+                if(ns&&!(g_kv8&&ks==m->kv&&layer<c->n_layers)){
+                    if(g_kv8||g_tq){cuda_core=0;break;}
                     /* Sparse decode used to force the CPU path here: the CUDA
                      * absorb kernel only scans contiguous rows and cannot take
                      * the DSA gather list. COLI_DSA_GATHER=1: gather the
@@ -2632,7 +2825,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     static int dsag=-1;
                     if(dsag<0) dsag=getenv("COLI_DSA_GATHER")?atoi(getenv("COLI_DSA_GATHER")):0;
                     if(!dsag){cuda_core=0;break;}
-                    int ns=dnsel[s]; const int *tl=dsel+(int64_t)s*dtopk;
+                    const int *tl=dsel+(int64_t)s*dtopk;
                     float *gl=falloc((int64_t)ns*kvl), *gr=falloc((int64_t)ns*c->qk_rope);
                     for(int jj=0;jj<ns;jj++){
                         memcpy(gl+(int64_t)jj*kvl, coli_kv_row(ks->Lc[layer],tl[jj],kvl), (size_t)kvl*sizeof(float));
@@ -2650,11 +2843,40 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         Q+(int64_t)s*H*qh,m->kv_dev_L[layer]+(size_t)st0*kvl,
                         m->kv_dev_R[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
-                if(!cuda_core)
-                    cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
-                        Q+(int64_t)s*H*qh,coli_kv_row(ks->Lc[layer],st0,kvl),
-                        coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
-                        vh,kvl,nt,c->attn_scale);
+                if(!cuda_core&&g_kv8&&ks==m->kv&&layer<c->n_layers&&kv_dev_sync8(m,l,layer,pos+1)){
+                    if(ns)                          /* righe DSA: gather dall'ombra (indici assoluti) */
+                        cuda_core=coli_cuda_attention_absorb_kvdev8_sel(l->kv_b.cuda,
+                            ctx+(int64_t)s*H*vh,Q+(int64_t)s*H*qh,
+                            m->kv_dev_L8[layer],m->kv_dev_Ls[layer],
+                            m->kv_dev_R8[layer],m->kv_dev_Rs[layer],
+                            dsel+(int64_t)s*dtopk,ns,H,c->qk_nope,c->qk_rope,vh,kvl,c->attn_scale);
+                    else                            /* denso: streaming oltre 4096, nessun tetto di T */
+                        cuda_core=coli_cuda_attention_absorb_kvdev8(l->kv_b.cuda,
+                            ctx+(int64_t)s*H*vh,Q+(int64_t)s*H*qh,
+                            m->kv_dev_L8[layer]+(size_t)st0*kvl,m->kv_dev_Ls[layer]+st0,
+                            m->kv_dev_R8[layer]+(size_t)st0*c->qk_rope,m->kv_dev_Rs[layer]+st0,
+                            H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+                }
+                if(ns&&!cuda_core){cuda_core=0;break;}   /* gather fallito: la selezione va su CPU */
+                if(!cuda_core&&g_tq){
+                    /* codec-1 native: per-call upload of the packed nibble cache + radii. codec-0
+                     * never reaches here (gate). nt>4096 -> absorb_tq returns 0 -> whole layer CPU. */
+                    int lrb=coli_kvq_row_bytes(kvl,g_tq_bits,g_tq_codec), rrb=coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec);
+                    cuda_core=coli_cuda_attention_absorb_tq(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                        Q+(int64_t)s*H*qh,coli_kv_row8(ks->Lc8[layer],st0,lrb),ks->Lsc[layer]+st0,
+                        coli_kv_row8(ks->Rc8[layer],st0,rrb),ks->Rsc[layer]+st0,
+                        H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale,lrb,rrb);
+                    if(!cuda_core)break;   /* T>4096 (or fault): fall the whole layer to CPU */
+                } else if(!cuda_core)
+                    cuda_core=g_kv8
+                        ?coli_cuda_attention_absorb8(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                            Q+(int64_t)s*H*qh,coli_kv_row8(ks->Lc8[layer],st0,kvl),
+                            ks->Lsc[layer]+st0,coli_kv_row8(ks->Rc8[layer],st0,c->qk_rope),
+                            ks->Rsc[layer]+st0,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale)
+                        :coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                            Q+(int64_t)s*H*qh,coli_kv_row(ks->Lc[layer],st0,kvl),
+                            coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
+                            vh,kvl,nt,c->attn_scale);
             }
         }
 #endif
@@ -2674,7 +2896,43 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
+            /* codec-1 rotated-int4: rotate the query ONCE per head (q.x_hat == rotate(q).c, the
+             * same orthogonality identity the Metal/CUDA native kernels use) and dot the packed
+             * nibbles directly — instead of f32-dequantizing every shared latent row per head
+             * (2H-redundant). std = radius/sqrt(n) rides Lsc/Rsc. codec-0 keeps the dequant path. */
+            int tq1 = (g_tq && g_tq_codec==1);
+            float qtl[512], qtr[512];
+            float invsnL = tq1 ? 1.f/sqrtf((float)kvl) : 0.f, invsnR = tq1 ? 1.f/sqrtf((float)c->qk_rope) : 0.f;
+            int lrb1=0, rrb1=0;
+            if(tq1){ coli_tq_rotate(qabs,qtl,kvl,COLI_TQ_SEED); coli_tq_rotate(qr,qtr,c->qk_rope,COLI_TQ_SEED);
+                     lrb1=coli_q4_row_bytes(kvl); rrb1=coli_q4_row_bytes(c->qk_rope); }
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
+                float a=0;
+                if(tq1){
+                    const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,lrb1);
+                    const uint8_t *Rt=coli_kv_row8(ks->Rc8[layer],t,rrb1);
+                    float al=0, ar=0;
+                    for(int i=0;i<kvl;i++){ int cc=(Lt[i>>1]>>((i&1)*4))&0xF; al+=qtl[i]*coli_q4_lev[cc]; }
+                    for(int d=0;d<c->qk_rope;d++){ int cc=(Rt[d>>1]>>((d&1)*4))&0xF; ar+=qtr[d]*coli_q4_lev[cc]; }
+                    a = al*ks->Lsc[layer][t]*invsnL + ar*ks->Rsc[layer][t]*invsnR;
+                } else if(g_tq){
+                    /* PolarQuant (codec 0): ricostruisci la riga latente + rope a f32, poi il
+                     * dot diretto (il raggio e' gia' nel dequant, niente scala esterna). */
+                    float Lf[512], Rf[512];
+                    coli_kvq_dequant_row(coli_kv_row8(ks->Lc8[layer],t,coli_kvq_row_bytes(kvl,g_tq_bits,g_tq_codec)), ks->Lsc[layer][t], Lf, kvl, g_tq_bits, g_tq_codec);
+                    coli_kvq_dequant_row(coli_kv_row8(ks->Rc8[layer],t,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)), ks->Rsc[layer][t], Rf, c->qk_rope, g_tq_bits, g_tq_codec);
+                    for(int i=0;i<kvl;i++) a+=qabs[i]*Lf[i];
+                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*Rf[d];
+                } else if(g_kv8){
+                    /* LUT-dequant inline nel dot; la scala per-riga esce dalla
+                     * somma: score = Lsc·Σ q·lut[b] + Rsc·Σ qr·lut[b] */
+                    const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
+                    const uint8_t *kr=coli_kv_row8(ks->Rc8[layer],t,c->qk_rope);
+                    float al=0, ar=0;
+                    for(int i=0;i<kvl;i++) al+=qabs[i]*coli_fp8_lut[Lt[i]];
+                    for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
+                    a=al*ks->Lsc[layer][t]+ar*ks->Rsc[layer][t];
+                } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
                 /* MLA-absorb score: dot(qabs, Lt) + dot(qr, kr). #442: the qabs·Lt
@@ -2683,7 +2941,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                  * AVX2 (8-lane fmadd + hsum256, same shape as matmul_q in quant.h)
                  * and NEON, with a scalar tail for the remainder. Reassociation
                  * is accepted here — softmax downstream softens the rounding flip. */
-                float a=0; int i=0;
+                int i=0;
 #if defined(__AVX2__)
                 __m256 acc=_mm256_setzero_ps();
                 for(;i+8<=kvl;i+=8)
@@ -2698,11 +2956,28 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 #endif
                 for(;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                }
                 sc[jj]=a*c->attn_scale;
             }
             softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
+                if(tq1){
+                    /* accumulate acc = sum_t w_t*std_t*lev[L[t]] in the rotated basis; unrotate
+                     * ONCE after the loop (context = unrotate(sum_t w_t c_t)). */
+                    const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,lrb1);
+                    float a=sc[jj]*ks->Lsc[layer][t]*invsnL;
+                    for(int i=0;i<kvl;i++){ int cc=(Lt[i>>1]>>((i&1)*4))&0xF; clat[i]+=a*coli_q4_lev[cc]; }
+                } else if(g_tq){
+                    float Lf[512];
+                    coli_kvq_dequant_row(coli_kv_row8(ks->Lc8[layer],t,coli_kvq_row_bytes(kvl,g_tq_bits,g_tq_codec)), ks->Lsc[layer][t], Lf, kvl, g_tq_bits, g_tq_codec);
+                    float a=sc[jj];                          /* raggio gia' nel dequant */
+                    for(int i=0;i<kvl;i++) clat[i]+=a*Lf[i];
+                } else if(g_kv8){
+                    const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
+                    float a=sc[jj]*ks->Lsc[layer][t];       /* la scala si fonde nel peso */
+                    for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
+                } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 /* MLA-absorb value mix: clat += sc[jj] * Lt (AXPY over kvl).
                  * #442: SIMD-ified — each lane writes back independently so there
@@ -2722,7 +2997,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 }
 #endif
                 for(;i<kvl;i++) clat[i]+=a*Lt[i];
-            }
+                } }
+            if(tq1) coli_tq_unrotate(clat,kvl,COLI_TQ_SEED);   /* rotated basis -> latent */
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
         }
@@ -2736,7 +3012,26 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     m->t_aproj+=now_s()-ta0; double tk0=now_s();
     int stL=m->kv_start[layer];
     float *kvb_all=falloc((int64_t)Tk*kvb_dim);
-    matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    if(g_tq){
+        /* PolarQuant: ricostruisci il latente a f32 (kv_b vuole righe float). */
+        float *Lf=falloc((int64_t)(Tk-stL)*c->kv_lora);
+        int lbb=coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec);
+        for(int t=stL;t<Tk;t++)
+            coli_kvq_dequant_row(coli_kv_row8(m->Lc8[layer],t,lbb), m->Lsc[layer][t],
+                                Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora, g_tq_bits, g_tq_codec);
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
+        free(Lf);
+    } else if(g_kv8){
+        /* staging f32 del latente dequantizzato: kv_b vuole righe float. Il buffer
+         * [Tk-stL,kvl] e' rumore rispetto a kvb_all [Tk,H*(nope+vh)] gia' allocato. */
+        float *Lf=falloc((int64_t)(Tk-stL)*c->kv_lora);
+        for(int t=stL;t<Tk;t++)
+            coli_kv8_dequant_row(coli_kv_row8(m->Lc8[layer],t,c->kv_lora), m->Lsc[layer][t],
+                                 Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora);
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
+        free(Lf);
+    } else
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     m->t_kvb += now_s()-tk0;
     /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
      * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
@@ -2756,9 +3051,19 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         int nt = ns ? ns : pos+1-st0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
-            const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
             float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
-            for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+            if(g_tq){
+                float Rf[512];
+                coli_kvq_dequant_row(coli_kv_row8(m->Rc8[layer],t,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)), m->Rsc[layer][t], Rf, c->qk_rope, g_tq_bits, g_tq_codec);
+                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*Rf[d];
+            } else if(g_kv8){
+                const uint8_t *kr=coli_kv_row8(m->Rc8[layer],t,c->qk_rope);
+                float ar=0; for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
+                a+=ar*m->Rsc[layer][t];
+            } else {
+                const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
+                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+            }
             sc[jj]=a*c->attn_scale;
         }
         softmax(sc,nt);
@@ -4225,6 +4530,9 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
      * single Lc/Rc + pos_base contract — see the matching guard in attention_rows. */
+    /* Full-layer fusion (attention + shared expert + router) in one GPU submit, for f32, KV8
+     * and KV_TQ alike — the attention uses the validated encode_attention and the whole-layer
+     * residual output is checked by metal-test run_layer for every codec. */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
@@ -4250,7 +4558,11 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                 WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt,
                 l->router, l->router_bias,
                 c->n_experts, c->topk, Ksel, tp, c->norm_topk, c->routed_scale,
-                m->Lc[li], m->Rc[li], S, pos_base, m->kv_start[li],
+                m->Lc[li], m->Rc[li], g_tq?2:g_kv8?1:0, g_tq_bits, g_tq_codec,
+                /* byte caches are NULL under f32 (only allocated for KV8/KV_TQ) — don't index a NULL array */
+                (g_kv8||g_tq)?m->Lc8[li]:NULL, (g_kv8||g_tq)?m->Lsc[li]:NULL,
+                (g_kv8||g_tq)?m->Rc8[li]:NULL, (g_kv8||g_tq)?m->Rsc[li]:NULL,
+                S, pos_base, m->kv_start[li],
                 c->eps, c->theta, c->attn_scale,
                 linrm, lnrm, lsh, lidx, lw, lkeff);
             #undef WP_
@@ -4387,8 +4699,13 @@ static void kv_alloc(Model *m, int max_t){
     KVState *k=m->kv;
 #ifdef COLI_CUDA
     if(m->kv_dev_L) for(int i=0;i<c->n_layers+1;i++){    /* dimensioni cambiate: ombra da rifare */
-        if(m->kv_dev_L[i]){ coli_cuda_pipe_free(m->L[i<c->n_layers?i:0].kv_b.cuda_device,m->kv_dev_L[i]); m->kv_dev_L[i]=NULL; }
-        if(m->kv_dev_R[i]){ coli_cuda_pipe_free(m->L[i<c->n_layers?i:0].kv_b.cuda_device,m->kv_dev_R[i]); m->kv_dev_R[i]=NULL; }
+        int sdev=m->L[i<c->n_layers?i:0].kv_b.cuda_device;
+        if(m->kv_dev_L[i]){ coli_cuda_pipe_free(sdev,m->kv_dev_L[i]); m->kv_dev_L[i]=NULL; }
+        if(m->kv_dev_R[i]){ coli_cuda_pipe_free(sdev,m->kv_dev_R[i]); m->kv_dev_R[i]=NULL; }
+        if(m->kv_dev_L8[i]){ coli_cuda_pipe_free(sdev,m->kv_dev_L8[i]); m->kv_dev_L8[i]=NULL; }
+        if(m->kv_dev_R8[i]){ coli_cuda_pipe_free(sdev,m->kv_dev_R8[i]); m->kv_dev_R8[i]=NULL; }
+        if(m->kv_dev_Ls[i]){ coli_cuda_pipe_free(sdev,m->kv_dev_Ls[i]); m->kv_dev_Ls[i]=NULL; }
+        if(m->kv_dev_Rs[i]){ coli_cuda_pipe_free(sdev,m->kv_dev_Rs[i]); m->kv_dev_Rs[i]=NULL; }
         m->kv_dev_valid[i]=0;
     }
 #endif
@@ -4397,6 +4714,15 @@ static void kv_alloc(Model *m, int max_t){
         if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
 #endif
         free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
+    if(k->Lc8){ for(int i=0;i<c->n_layers+1;i++){
+#ifdef COLI_METAL
+        if((g_kv8||g_tq) && g_metal_enabled){ coli_metal_unregister(k->Lc8[i]); coli_metal_unregister(k->Rc8[i]);
+            coli_metal_unregister(k->Lsc[i]); coli_metal_unregister(k->Rsc[i]); }
+#endif
+        free(k->Lc8[i]); free(k->Rc8[i]);
+        free(k->Lsc[i]); free(k->Rsc[i]); }
+        free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
+        k->Lc8=k->Rc8=NULL; k->Lsc=k->Rsc=NULL; }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
     if(m->has_dsa){
         k->Ic=calloc(c->n_layers,sizeof(float*));
@@ -4405,6 +4731,39 @@ static void kv_alloc(Model *m, int max_t){
     k->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
+    if(g_kv8 || g_tq){
+        /* KV8: byte fp8 + una scala f32 per riga. KV_TQ: byte polari impacchettati +
+         * raggio f32 per riga. In entrambi i casi Lc/Rc restano NULL e le righe hanno
+         * larghezza in BYTE lb/rb — KV8: kv_lora/qk_rope (1 byte/valore); TQ:
+         * coli_tq_row_bytes (< kv_lora, solo gli angoli). Lsc/Rsc reggono scala|raggio. */
+        int lb = g_tq ? coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec) : c->kv_lora;
+        int rb = g_tq ? coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec) : c->qk_rope;
+        if(g_kv8) coli_fp8_lut_init();
+        k->Lc8=calloc(NR,sizeof(uint8_t*)); k->Rc8=calloc(NR,sizeof(uint8_t*));
+        k->Lsc=calloc(NR,sizeof(float*));   k->Rsc=calloc(NR,sizeof(float*));
+        for(int i=0;i<NR;i++){
+#ifdef COLI_METAL
+            /* KV8/KV_TQ on Metal: page-align + register the byte caches and scale/radius
+             * sidecars for zero-copy GPU attention (the fused decode quantizes/decodes on-device). */
+            if((g_kv8||g_tq) && g_metal_enabled){
+                size_t lbb=(((size_t)max_t*lb)+16383)&~(size_t)16383;
+                size_t rbb=(((size_t)max_t*rb)+16383)&~(size_t)16383;
+                size_t sbb=(((size_t)max_t*4)+16383)&~(size_t)16383;
+                void *lp,*rp,*lsp,*rsp;
+                if(posix_memalign(&lp,16384,lbb)||posix_memalign(&rp,16384,rbb)||
+                   posix_memalign(&lsp,16384,sbb)||posix_memalign(&rsp,16384,sbb)){fprintf(stderr,"OOM kv8 metal\n");exit(1);}
+                k->Lc8[i]=(uint8_t*)lp; k->Rc8[i]=(uint8_t*)rp; k->Lsc[i]=(float*)lsp; k->Rsc[i]=(float*)rsp;
+                coli_metal_register(k->Lc8[i],lbb); coli_metal_register(k->Rc8[i],rbb);
+                coli_metal_register(k->Lsc[i],sbb); coli_metal_register(k->Rsc[i],sbb);
+                continue;
+            }
+#endif
+            k->Lc8[i]=malloc((size_t)max_t*lb);
+            k->Rc8[i]=malloc((size_t)max_t*rb);
+            k->Lsc[i]=falloc(max_t); k->Rsc[i]=falloc(max_t);
+            if(!k->Lc8[i]||!k->Rc8[i]){fprintf(stderr,"OOM kv8\n");exit(1);}
+        }
+    } else
     for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
         k->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
 #ifdef COLI_METAL
@@ -4421,12 +4780,14 @@ static void kv_alloc(Model *m, int max_t){
 #endif
     }
     m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic; m->max_t=k->max_t; m->kv_start=k->kv_start;
+    m->Lc8=k->Lc8; m->Rc8=k->Rc8; m->Lsc=k->Lsc; m->Rsc=k->Rsc;
 }
 
 static void kv_bind(Model *m, KVState *k){
     if(m->kv!=k && m->kv_dev_valid)                 /* ombra legata al KVState corrente */
         for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
+    m->Lc8=k->Lc8; m->Rc8=k->Rc8; m->Lsc=k->Lsc; m->Rsc=k->Rsc;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 
@@ -4497,7 +4858,10 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
             free(x); return NULL;
         }
         for(int l=0;l<c->n_layers;l++){
-            if(!rows[s].kv->Lc[l] || !rows[s].kv->Rc[l] ||
+            if(((g_kv8||g_tq) ? (!rows[s].kv->Lc8 || !rows[s].kv->Rc8 ||
+                         !rows[s].kv->Lc8[l] || !rows[s].kv->Rc8[l] ||
+                         !rows[s].kv->Lsc[l] || !rows[s].kv->Rsc[l])
+                      : (!rows[s].kv->Lc[l] || !rows[s].kv->Rc[l])) ||
                rows[s].kv->kv_start[l]<0 || rows[s].kv->kv_start[l]>rows[s].pos ||
                (m->has_dsa && c->idx_type[l] &&
                 (!rows[s].kv->Ic || !rows[s].kv->Ic[l]))){ free(x); return NULL; }
@@ -5470,8 +5834,11 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
     free(k->disk_buf); k->disk_buf=NULL;
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
+    if(k->Lc8) for(int i=0;i<NR;i++){ free(k->Lc8[i]); free(k->Rc8[i]);
+        free(k->Lsc[i]); free(k->Rsc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
-    free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
+    free(k->Lc); free(k->Rc); free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
+    free(k->Ic); free(k->kv_start); free(s->hist);
 }
 
 typedef struct {
@@ -5853,7 +6220,7 @@ static void run_serve_mux(Model *m, const char *snap){
     usage_save(m);
     for(int i=0;i<nctx;i++){ serve_ctx_free(m,&ctx[i]); grammar_teardown(&grd[i]); }
     free(ctx); free(req); free(grd);
-    m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+    m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->Lc8=m->Rc8=NULL; m->Lsc=m->Rsc=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
 static void run_serve(Model *m, const char *snap){
@@ -6028,7 +6395,7 @@ static void run_serve(Model *m, const char *snap){
     #undef len
     #undef first
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]);
-    free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+    free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->Lc8=m->Rc8=NULL; m->Lsc=m->Rsc=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
 static int *read_arr(jval*o,const char*k,int*n){
@@ -6307,10 +6674,24 @@ static void pin_load(Model *m, const char *statspath, double gb){
     double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
     int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0, prefix_est=0;
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
+    /* KV8: l'ombra fp8 si alloca LAZY sul device di kv_b DOPO questo conto — va
+     * proiettata come la densa, o l'auto-budget la mangia e al primo prefill i
+     * tensori densi vanno in OOM->CPU (visto in prod 2026-07-16: ~150 MB/layer
+     * a 256k sfondavano la riserva fissa da 2 GB/device). */
+    double shadow_proj[COLI_CUDA_MAX_DEVICES]={0};
+    if(g_kv_shadow&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))){
+        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
+        double per_layer=(double)est_ctx*(m->c.kv_lora+m->c.qk_rope+8);
+        for(int i=0;i<m->c.n_layers;i++) if(m->L[i].kv_b.cuda_eligible)
+            for(int d=0;d<g_cuda_ndev;d++)
+                if(g_cuda_devices[d]==m->L[i].kv_b.cuda_device){ shadow_proj[d]+=per_layer; break; }
+    }
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-g_cuda_reserve_gb*1e9;
+            /* dev's configurable reserve (was a hardcoded 2 GB) minus the KV8 device
+             * shadow's projected footprint, so CUDA_EXPERT_GB=auto still budgets for it. */
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-shadow_proj[i]-g_cuda_reserve_gb*1e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
         }
     }
@@ -6457,12 +6838,20 @@ static int kv_slot_count(void){
 }
 
 static double kv_pool_bytes(Model *m, int max_ctx){
-    Cfg *c=&m->c; double one=(double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0;
+    /* KV8: 1 byte/valore + 8 B di scale per token/layer, non 4 B/valore. E' questo
+     * conto che governa expert_avail e cap_for_ram: con KV8 il clamp PIN recupera
+     * ~35 GB/slot a 256k e KV_SLOTS=2 smette di demolire gli expert su disco. */
+    Cfg *c=&m->c;
+    double one=(double)(c->n_layers+1)*max_ctx*
+        (g_tq ? (double)(coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec)+coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec))+8.0
+         : g_kv8 ? (double)(c->kv_lora+c->qk_rope)+8.0
+         : (c->kv_lora+c->qk_rope)*4.0);
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         one+=(double)max_ctx*c->index_hd*4.0;
     int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
     return one*slots;
 }
+
 
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
@@ -6635,7 +7024,13 @@ int main(int argc, char **argv){
      *
      * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
-       !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
+       !getenv("COLI_CUDA") &&
+#ifdef COLI_METAL
+       (getenv("COLI_METAL") && !atoi(getenv("COLI_METAL")))   /* Metal is default-on: tune CPU only when COLI_METAL=0 */
+#else
+       !getenv("COLI_METAL")
+#endif
+      ){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
         /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
@@ -6882,12 +7277,22 @@ int main(int argc, char **argv){
     }
 #endif
 #ifdef COLI_METAL
-    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+    /* Metal is opt-OUT: on a Metal build we use the GPU by DEFAULT when a device is present.
+     * Apple unified memory is zero-copy (no separate VRAM budget to overflow), so auto-on is
+     * safe. COLI_METAL=0 forces the CPU path; unset = auto. (CUDA stays opt-in above — a discrete
+     * VRAM pool can OOM, so it must be requested explicitly with COLI_CUDA=1.) */
+    int metal_req = getenv("COLI_METAL") ? atoi(getenv("COLI_METAL")) : 1;
+    if(metal_req){
         g_metal_enabled = coli_metal_init();
-        if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
-        fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
-        if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
-        if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
+        if(!g_metal_enabled){
+            if(getenv("COLI_METAL")){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
+            /* auto (unset) and no Metal device: silent CPU fallback */
+        } else {
+            fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)%s\n",
+                getenv("COLI_METAL") ? "" : " [auto — set COLI_METAL=0 for CPU]");
+            if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
+            if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
+        }
     }
 #else
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
@@ -6895,6 +7300,57 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+    /* KV8=1: KV-cache latente in fp8 e4m3. CPU e CUDA (kernel absorb8) sono coperti;
+     * lo shader Metal e il resident pipeline (COLI_CUDA_PIPE) leggono righe f32:
+     * finche' non esistono le varianti fp8, quei percorsi si spengono da soli. */
+    g_kv8 = getenv("KV8")?atoi(getenv("KV8")):0;
+    if(g_kv8){
+#ifdef COLI_METAL
+        if(g_kv8 && g_metal_enabled)
+            fprintf(stderr,"[KV8] fp8 KV on the Metal fused-decode attention (GPU quantize+decode); CPU fp8 on the other paths\n");
+#endif
+#ifdef COLI_CUDA
+        if(g_kv8 && g_cuda_pipe){
+            fprintf(stderr,"[KV8] COLI_CUDA_PIPE reads f32 KV rows; pipe disabled under KV8\n");
+            g_cuda_pipe=0;
+        }
+#endif
+        if(g_kv8){
+            coli_fp8_lut_init();
+            /* AUTO: e' il MUX multi-slot (SERVE_BATCH) ad avere il decode ragged
+             * (step_decode_batch -> sempre CPU); run_serve semplice decodifica
+             * contiguo anche con piu' slot e l'ombra li' PAGA. Non basta contare
+             * gli slot: conta CHI decodifica. */
+            int mux = getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"));
+            g_kv_shadow = getenv("KV_SHADOW") ? atoi(getenv("KV_SHADOW"))
+                                              : !(mux && kv_slot_count()>1);
+            fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM); "
+                "device shadow %s\n", g_kv_shadow?"ON":
+                "off (multi-slot mux decode is ragged/CPU: the shadow would cost VRAM for nothing)");
+        }
+    }
+    /* KV_TQ=3|4: PolarQuant KV tier (mutuamente esclusivo con KV8). CPU-only in
+     * fase 1; sul percorso Metal (righe f32) si spegne da solo, come KV8. */
+    { int tqv = getenv("KV_TQ")?atoi(getenv("KV_TQ")):0;
+      if(tqv){
+        if(g_kv8){ fprintf(stderr,"[KV_TQ] KV8 and KV_TQ are mutually exclusive; KV_TQ wins (KV8 off)\n"); g_kv8=0; }
+        if(tqv<2) tqv=2; if(tqv>6) tqv=6;            /* documented 3|4; clamp to the header's grid range */
+        g_tq=1; g_tq_bits=tqv;
+        /* rotated int4 is a fixed 4-bit codec (best 4-bit for MLA); other bit widths and
+         * KV_TQ_POLAR=1 use PolarQuant (variable bits, paper-faithful). */
+        g_tq_codec = (getenv("KV_TQ_POLAR") || g_tq_bits!=4) ? 0 : 1;
+#ifdef COLI_METAL
+        if(g_metal_enabled)
+            fprintf(stderr,"[KV_TQ] PolarQuant KV on the Metal fused-decode attention (GPU encode+decode); CPU on the other paths\n");
+#endif
+#ifdef COLI_CUDA
+        if(g_tq && g_cuda_pipe){ fprintf(stderr,"[KV_TQ] COLI_CUDA_PIPE reads f32 KV rows; pipe disabled under KV_TQ\n"); g_cuda_pipe=0; }
+#endif
+        if(g_tq)
+            fprintf(stderr,"[KV_TQ] latent KV in %s (randomized-Hadamard rotation; radius = per-row scale)\n",
+                g_tq_codec ? "rotated int4 + Lloyd codebook (4-bit)" : "PolarQuant recursive-polar");
+      }
+    }
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);

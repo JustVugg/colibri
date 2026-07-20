@@ -78,7 +78,9 @@ int coli_metal_layer_decode(float *x,
     const void *shd_w, const float *shd_s, int shd_fmt,
     const float *router_w, const float *router_bias,
     int E, int K, int Ksel, float topp, int normk, float rscale,
-    float *Lc, float *Rc, int S, int pos_base, int st0,
+    float *Lc, float *Rc, int qmode, int bits, int codec,
+    const unsigned char *Lc8, const float *Lsc, const unsigned char *Rc8, const float *Rsc,
+    int S, int pos_base, int st0,
     float eps, float theta, float ascale,
     float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out);
 
@@ -110,6 +112,33 @@ int coli_metal_attn_decode(const float *x,
     const void *kvb_w, const float *kvb_s, int kvb_fmt,
     const void *o_w, const float *o_s, int o_fmt,
     float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
+
+/* KV8 twin: latent KV cache is fp8 e4m3 bytes (Lc8/Rc8) + per-row f32 scale (Lsc/Rsc);
+ * the GPU quantizes the new rows and decodes on read. All four arrays must be registered. */
+int coli_metal_attn_decode8(const float *x,
+    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt,
+    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *o_w, const float *o_s, int o_fmt,
+    const unsigned char *Lc8, const float *Lsc, const unsigned char *Rc8, const float *Rsc,
+    int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
+
+/* Test hook: GPU fp8 per-row quantize (a_fp8enc) for one row of n values -> dst bytes + scale. */
+int coli_metal_fp8_quant_row(const float *src, unsigned char *dst, float *scale, int n);
+/* Test hook: GPU TQ round-trip (a_tq_enc + a_tq_deq) for one row -> reconstructed out. codec 0=polar,1=int4. */
+int coli_metal_tq_roundtrip(const float *src, float *out, int n, int bits, int codec);
+
+/* KV_TQ (PolarQuant) twin: latent KV is packed polar bytes (Lc8/Rc8) + per-row radius (Lsc/Rsc);
+ * `bits` is the KV_TQ level (3|4). The GPU encodes new rows and reconstructs on read. */
+int coli_metal_attn_decode_tq(const float *x,
+    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt,
+    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *o_w, const float *o_s, int o_fmt,
+    const unsigned char *Lc8, const float *Lsc, const unsigned char *Rc8, const float *Rsc, int bits, int codec,
+    int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);

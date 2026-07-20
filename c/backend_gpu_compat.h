@@ -34,6 +34,13 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #else
 #error "rocWMMA headers not found. Install rocwmma-dev (or rocm-hip-runtime-dev) to build with HIP."
 #endif
+/* KV8 decodes e4m3 bytes. CUDA has the hardware cvt intrinsic (cuda_fp8.h, sm_89+
+ * on our arches); HIP has no 1:1 equivalent here, so backend_cuda.cu falls back to
+ * the portable bit-math decode — same values, just not the hw instruction.
+ * Deliberately NOT routed through the __half mapping above: rocwmma::float16_t is
+ * a WMMA fragment type, and the fallback is plain float arithmetic, so the two
+ * never meet. */
+#define COLI_GPU_HAS_FP8         0
 #define cudaError_t              hipError_t
 #define cudaSuccess              hipSuccess
 #define cudaGetErrorString       hipGetErrorString
@@ -75,8 +82,10 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaMemsetAsync          hipMemsetAsync
 #else
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>                 /* KV8: fp8 e4m3 latent KV (hw cvt on sm_89+, our arches) */
 #include <mma.h>
 #define COLI_GPU_HAS_WMMA        1
+#define COLI_GPU_HAS_FP8         1
 #endif
 
 #endif /* COLIBRI_BACKEND_GPU_COMPAT_H */

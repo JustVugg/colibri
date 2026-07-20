@@ -171,6 +171,213 @@ kernel void a_ctx(device const uchar* kvb [[buffer(0)]], device const float* sc 
   float a=0; for(int i=0;i<A_KVL;i++) a+=cl[i]*a_deqrow(kvb,row,i,sc); ctx[(long)sh*A_VH+j]=a;
 }
 
+// ===== KV8: fp8 e4m3 latent KV cache (bytes + per-row f32 scale) =====
+// exact twin of coli_fp8_enc (kv_fp8.h): float -> e4m3, round-to-nearest-even, sat +-448.
+inline uchar fp8_enc(float f){
+  uint u=as_type<uint>(f); uchar s=(uchar)((u>>24)&0x80u); float a=fabs(f);
+  if(!(a<=448.0f)) return (a!=a)?(uchar)0:(uchar)(s|0x7e);        // NaN->0, inf/overflow->+-448
+  if(a<0x1p-6f){ int k=(int)rint(a*0x1p9f); return (uchar)(s|(uchar)k); }   // denormal grid, step 2^-9
+  int e; frexp(a,e); int E=e+6; int k=(int)rint(ldexp(a,3-(e-1)));         // mantissa RNE in [8,16]
+  if(k==16){ k=8; E++; } if(E>15||(E==15&&k>14)) return (uchar)(s|0x7e);
+  return (uchar)(s|(uchar)(E<<3)|(uchar)(k-8));
+}
+// per-row fp8 quantize: one threadgroup per row. src[nrows,n] contiguous scratch -> dst rows at (pb+row).
+// matches coli_kv8_quant_row: amax/448 scale; zero/subnormal/NaN row -> bytes 0, scale 1.
+kernel void a_fp8enc(device const float* src [[buffer(0)]], device uchar* dst [[buffer(1)]],
+                     device float* scl [[buffer(2)]], constant int& n [[buffer(3)]], constant int& pb [[buffer(4)]],
+                     uint row [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]){
+  device const float* xr=src+(long)row*n; threadgroup float red[256];
+  float m=0; for(int i=lid;i<n;i+=tgsz) m=max(m,fabs(xr[i])); red[lid]=m; threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=tgsz/2;k>0;k>>=1){ if(lid<k) red[lid]=max(red[lid],red[lid+k]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+  float amax=red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+  device uchar* dr=dst+(long)(pb+(int)row)*n;
+  if(!(amax>1e-35f) || amax>3.4e38f){ for(int i=lid;i<n;i+=tgsz) dr[i]=0; if(lid==0) scl[pb+(int)row]=1.0f; return; }
+  float inv=448.0f/amax; for(int i=lid;i<n;i+=tgsz) dr[i]=fp8_enc(xr[i]*inv);
+  if(lid==0) scl[pb+(int)row]=amax/448.0f;
+}
+// score with fp8 L/R rows + per-row scale: a = Lsc*sum(qabs*lut[L]) + Rsc*sum(qr*lut[R]).
+kernel void a_score8(device const float* qabs [[buffer(0)]], device const uchar* Lc [[buffer(1)]],
+                     device const float* Lsc [[buffer(2)]], device const uchar* Rc [[buffer(3)]],
+                     device const float* Rsc [[buffer(4)]], device const float* q [[buffer(5)]],
+                     device const float* lut [[buffer(6)]], device float* sc [[buffer(7)]],
+                     constant int& T [[buffer(8)]], constant float& ascale [[buffer(9)]],
+                     constant int& PB [[buffer(10)]], uint gid [[thread_position_in_grid]]){
+  int s=gid/(A_H*T), r=gid%(A_H*T), h=r/T, t=r%T; long o=(long)(s*A_H+h)*T+t;
+  if(t > PB+s){ sc[o]=-1e30f; return; }
+  device const float* qa=qabs+(long)(s*A_H+h)*A_KVL; device const uchar* Lt=Lc+(long)t*A_KVL;
+  device const float* qr=q+(long)s*A_QHH+(long)h*A_QH+A_NOPE; device const uchar* Rt=Rc+(long)t*A_ROPE;
+  float al=0,ar=0; for(int i=0;i<A_KVL;i++) al+=qa[i]*lut[Lt[i]]; for(int d=0;d<A_ROPE;d++) ar+=qr[d]*lut[Rt[d]];
+  sc[o]=(al*Lsc[t]+ar*Rsc[t])*ascale;
+}
+// context accumulation in latent space with fp8 L rows + scale: clat[i] = sum_t sc[t]*Lsc[t]*lut[L[t][i]].
+kernel void a_clat8(device const float* sc [[buffer(0)]], device const uchar* Lc [[buffer(1)]],
+                    device const float* Lsc [[buffer(2)]], device const float* lut [[buffer(3)]],
+                    device float* clat [[buffer(4)]], constant int& T [[buffer(5)]], uint gid [[thread_position_in_grid]]){
+  int sh=gid/A_KVL, i=gid%A_KVL; device const float* s=sc+(long)sh*T; float a=0;
+  for(int t=0;t<T;t++) a+=s[t]*Lsc[t]*lut[Lc[(long)t*A_KVL+i]]; clat[(long)sh*A_KVL+i]=a;
+}
+
+// ===== KV_TQ: PolarQuant latent KV (randomized Hadamard rotation + recursive polar) =====
+// Faithful device twin of kv_tq.h: one thread per row (serial), n<=512, bits in {2..6}. The
+// radius (row L2 norm) rides the per-row scale slot; only angles are packed. Decode reconstructs
+// each row to f32 (a_tq_deq); the existing f32 a_score/a_clat then run on the staged rows.
+constant uint TQ_SEED = 0x9E3779B9u;
+constant float TQ_PI = 3.14159265358979323846f;
+// rotated-int4 Lloyd-Max 16-level codebook for N(0,1) (twin of coli_q4_lev).
+constant float TQ_Q4LEV[16] = { -2.733f,-2.069f,-1.618f,-1.256f,-0.942f,-0.657f,-0.388f,-0.128f,
+                                 0.128f, 0.388f, 0.657f, 0.942f, 1.256f, 1.618f, 2.069f, 2.733f };
+inline int tq_q4enc(float v){ int best=0; float bd=1e30f;
+  for(int k=0;k<16;k++){ float d=fabs(v-TQ_Q4LEV[k]); if(d<bd){bd=d;best=k;} } return best; }
+inline uint  tq_hash(uint x){ x+=0x9E3779B9u; x=(x^(x>>16))*0x85EBCA6Bu; x=(x^(x>>13))*0xC2B2AE35u; return x^(x>>16); }
+inline float tq_sign(int i){ return (tq_hash(TQ_SEED ^ (uint)i)&1u)?-1.0f:1.0f; }
+inline void  tq_fwht(thread float* a, int n){
+  for(int len=1; len<n; len<<=1) for(int i=0;i<n;i+=len<<1) for(int j=i;j<i+len;j++){ float u=a[j],v=a[j+len]; a[j]=u+v; a[j+len]=u-v; }
+  float inv=1.0f/sqrt((float)n); for(int i=0;i<n;i++) a[i]*=inv;
+}
+inline int   tq_b1(int bits){ return bits; }
+inline int   tq_b2(int bits){ return bits>1?bits-1:1; }
+inline uint  tq_enc1(float ang,int b){ float u=(ang+TQ_PI)*(0.5f/TQ_PI); int m=(1<<b)-1; int q=(int)floor(u*(float)(1<<b)); return (uint)clamp(q,0,m); }
+inline float tq_dec1(uint q,int b){ return -TQ_PI + ((float)q+0.5f)*(2.0f*TQ_PI)/(float)(1<<b); }
+inline float tq_hw(int level){ float s=(float)(1u<<(level-1)); float w=1.5f/sqrt(s); float cap=0.25f*TQ_PI; return w<cap?w:cap; }
+inline uint  tq_enc2(float ang,int b,int level){ float w=tq_hw(level); float lo=0.25f*TQ_PI-w; float u=(ang-lo)/(2.0f*w); int m=(1<<b)-1; int q=(int)floor(u*(float)(1<<b)); return (uint)clamp(q,0,m); }
+inline float tq_dec2(uint q,int b,int level){ float w=tq_hw(level); float lo=0.25f*TQ_PI-w; return lo+((float)q+0.5f)*(2.0f*w)/(float)(1<<b); }
+inline void  tq_wbits(device uchar* buf,thread int* pos,uint val,int w){ for(int k=0;k<w;k++){ int bit=(*pos)+k; if((val>>k)&1u) buf[bit>>3]|=(uchar)(1u<<(bit&7)); } *pos+=w; }
+inline uint  tq_rbits(device const uchar* buf,thread int* pos,int w){ uint v=0; for(int k=0;k<w;k++){ int bit=(*pos)+k; if((buf[bit>>3]>>(bit&7))&1u) v|=(1u<<k); } *pos+=w; return v; }
+// producer: quantize the S new rows (contiguous f32 scratch) into the byte cache at pos_base + radius.
+kernel void a_tq_enc(device const float* src [[buffer(0)]], device uchar* dst [[buffer(1)]],
+                     device float* rad [[buffer(2)]], constant int& n [[buffer(3)]], constant int& bits [[buffer(4)]],
+                     constant int& pb [[buffer(5)]], constant int& rowbytes [[buffer(6)]], constant int& codec [[buffer(7)]],
+                     uint row [[thread_position_in_grid]]){
+  device const float* xr=src+(long)row*n; device uchar* dr=dst+(long)(pb+(int)row)*rowbytes;
+  for(int i=0;i<rowbytes;i++) dr[i]=0;
+  float ss=0; for(int i=0;i<n;i++) ss+=xr[i]*xr[i]; float norm=sqrt(ss);
+  if(!(norm>1e-35f) || norm>3.4e38f){ rad[pb+(int)row]=0.0f; return; }
+  thread float r[512]; for(int i=0;i<n;i++) r[i]=xr[i]*tq_sign(i); tq_fwht(r,n);   // rotate
+  if(codec==1){                                     // rotated int4 + Lloyd codebook
+    float invstd=sqrt((float)n)/norm;
+    for(int i=0;i<n;i++){ int c=tq_q4enc(r[i]*invstd); dr[i>>1]|=(uchar)(c<<((i&1)*4)); }
+    rad[pb+(int)row]=norm; return;
+  }
+  int b1=tq_b1(bits), b2=tq_b2(bits), pos=0;
+  for(int level=1, rlen=n; rlen>1; level++){ int hlf=rlen/2, b=(level==1)?b1:b2;   // 'half' is an MSL type
+    for(int j=0;j<hlf;j++){ float a=r[2*j], c=r[2*j+1]; float ang=atan2(c,a);
+      uint code=(level==1)?tq_enc1(ang,b):tq_enc2(ang,b,level); tq_wbits(dr,&pos,code,b); r[j]=sqrt(a*a+c*c); }
+    rlen=hlf; }
+  rad[pb+(int)row]=norm;
+}
+// consumer: reconstruct T rows from byte cache + radius into a contiguous f32 stage [T,n].
+kernel void a_tq_deq(device const uchar* src [[buffer(0)]], device const float* rad [[buffer(1)]],
+                     device float* dst [[buffer(2)]], constant int& n [[buffer(3)]], constant int& bits [[buffer(4)]],
+                     constant int& rowbytes [[buffer(5)]], constant int& codec [[buffer(6)]], uint row [[thread_position_in_grid]]){
+  device const uchar* sr=src+(long)row*rowbytes; device float* dr=dst+(long)row*n;
+  float radius=rad[row];
+  if(!(radius>0.0f) || radius>3.4e38f){ for(int i=0;i<n;i++) dr[i]=0.0f; return; }
+  if(codec==1){                                     // rotated int4 + Lloyd codebook
+    float st=radius/sqrt((float)n); thread float y[512];
+    for(int i=0;i<n;i++){ int c=(sr[i>>1]>>((i&1)*4))&0xF; y[i]=TQ_Q4LEV[c]*st; }
+    tq_fwht(y,n); for(int i=0;i<n;i++) dr[i]=y[i]*tq_sign(i); return;   // unrotate
+  }
+  int b1=tq_b1(bits), b2=tq_b2(bits), pos=0; thread float ang[512];
+  for(int level=1, len=n/2, off=0; len>=1; level++){ int b=(level==1)?b1:b2;
+    for(int j=0;j<len;j++){ uint code=tq_rbits(sr,&pos,b); ang[off+j]=(level==1)?tq_dec1(code,b):tq_dec2(code,b,level); }
+    off+=len; if(len==1) break; len>>=1; }
+  thread float cur[512], nxt[512]; cur[0]=radius;
+  for(int clen=1; clen<n; clen*=2){ int offb=n-2*clen;
+    for(int j=0;j<clen;j++){ float aa=ang[offb+j]; nxt[2*j]=cur[j]*cos(aa); nxt[2*j+1]=cur[j]*sin(aa); }
+    for(int j=0;j<2*clen;j++) cur[j]=nxt[j]; }
+  tq_fwht(cur,n); for(int i=0;i<n;i++) dr[i]=cur[i]*tq_sign(i);   // unrotate
+}
+
+// ===== KV_TQ codec-1 NATIVE fused attention (no f32 restage) =====================
+// The rotated-int4 codec reconstructs x_hat = unrotate(c), c_i = TQ_Q4LEV[code_i]*std,
+// std = radius/sqrt(n). Because the randomized-Hadamard rotate/unrotate are ADJOINT
+// orthonormal maps, score and context need NO per-row dequant:
+//   score:   q . x_hat            == rotate(q) . c
+//   context: sum_t w_t . x_hat_t  == unrotate(sum_t w_t . c_t)
+// So we rotate the query ONCE per head (a_tq_qrot), dot it against the packed nibbles
+// through TQ_Q4LEV (a_score_tq), accumulate weighted codebook values (a_clat_tq), and
+// unrotate the accumulator ONCE (a_tq_unrot) — the KV8 a_score8/a_clat8 shape, at 4 bits.
+// This replaces the 2*T serial per-row FWHTs of a_tq_deq with 2 FWHTs per head per token.
+// (Proven by test_kv_tq.c's score/context orthogonality identity; codec-0 keeps a_tq_deq.)
+
+// threadgroup-parallel FWHT of one power-of-two row already resident in shared memory.
+inline void tq_fwht_tg(threadgroup float* sh, int n, uint lid, uint tgsz){
+  for(int len=1; len<n; len<<=1){
+    for(int k=(int)lid; k<(n>>1); k+=(int)tgsz){ int off=k%len, blk=k/len, j=blk*(len<<1)+off;
+      float u=sh[j], v=sh[j+len]; sh[j]=u+v; sh[j+len]=u-v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float inv=1.0f/sqrt((float)n); for(int i=(int)lid;i<n;i+=(int)tgsz) sh[i]*=inv;   // normalized FWHT
+}
+// rotate one query row per threadgroup: qt = fwht(sign .* q). Source row `row` starts at
+// src + row*srcstride + srcbase (n contiguous); dst row is dst + row*n (compact).
+kernel void a_tq_qrot(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                      constant int& n [[buffer(2)]], constant int& srcstride [[buffer(3)]], constant int& srcbase [[buffer(4)]],
+                      uint row [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]){
+  threadgroup float sh[512];
+  device const float* q=src+(long)row*srcstride+srcbase;
+  for(int i=(int)lid;i<n;i+=(int)tgsz) sh[i]=q[i]*tq_sign(i);            // sign flip (D)
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  tq_fwht_tg(sh,n,lid,tgsz);                                            // H
+  for(int i=(int)lid;i<n;i+=(int)tgsz) dst[(long)row*n+i]=sh[i];
+}
+// score with packed-nibble L/R rows + per-row radius: a = stdL*sum(qtl*lev[L]) + stdR*sum(qtr*lev[R]).
+// qtl/qtr are the pre-rotated queries; lrb/rrb are the packed row-byte strides (codec-1: n/2).
+kernel void a_score_tq(device const float* qtl [[buffer(0)]], device const uchar* Lc [[buffer(1)]],
+                       device const float* Lrad [[buffer(2)]], device const uchar* Rc [[buffer(3)]],
+                       device const float* Rrad [[buffer(4)]], device const float* qtr [[buffer(5)]],
+                       device float* sc [[buffer(6)]], constant int& T [[buffer(7)]], constant float& ascale [[buffer(8)]],
+                       constant int& PB [[buffer(9)]], constant int& lrb [[buffer(10)]], constant int& rrb [[buffer(11)]],
+                       uint gid [[thread_position_in_grid]]){
+  int s=gid/(A_H*T), r=gid%(A_H*T), h=r/T, t=r%T; long o=(long)(s*A_H+h)*T+t;
+  if(t > PB+s){ sc[o]=-1e30f; return; }
+  device const float* ql=qtl+(long)(s*A_H+h)*A_KVL; device const uchar* Lt=Lc+(long)t*lrb;
+  device const float* qr=qtr+(long)(s*A_H+h)*A_ROPE; device const uchar* Rt=Rc+(long)t*rrb;
+  float al=0,ar=0;
+  for(int i=0;i<A_KVL;i++){ int c=(Lt[i>>1]>>((i&1)*4))&0xF; al+=ql[i]*TQ_Q4LEV[c]; }
+  for(int d=0;d<A_ROPE;d++){ int c=(Rt[d>>1]>>((d&1)*4))&0xF; ar+=qr[d]*TQ_Q4LEV[c]; }
+  float stdL=Lrad[t]*(1.0f/sqrt((float)A_KVL)), stdR=Rrad[t]*(1.0f/sqrt((float)A_ROPE));
+  sc[o]=(al*stdL+ar*stdR)*ascale;
+}
+// context accumulation (pre-unrotate): acc[i] = sum_t sc[t]*stdL[t]*lev[L[t][i]]. a_tq_unrot
+// then turns acc into clat = unrotate(acc), reusing the aclat_ buffer in place.
+kernel void a_clat_tq(device const float* sc [[buffer(0)]], device const uchar* Lc [[buffer(1)]],
+                      device const float* Lrad [[buffer(2)]], device float* acc [[buffer(3)]],
+                      constant int& T [[buffer(4)]], constant int& lrb [[buffer(5)]], uint gid [[thread_position_in_grid]]){
+  int sh=gid/A_KVL, i=gid%A_KVL; device const float* s=sc+(long)sh*T; float a=0; float invsn=1.0f/sqrt((float)A_KVL);
+  for(int t=0;t<T;t++){ int c=(Lc[(long)t*lrb+(i>>1)]>>((i&1)*4))&0xF; a+=s[t]*(Lrad[t]*invsn)*TQ_Q4LEV[c]; }
+  acc[(long)sh*A_KVL+i]=a;
+}
+// unrotate the accumulator in place: clat = D (H acc). One threadgroup per (s,head) row.
+kernel void a_tq_unrot(device float* clat [[buffer(0)]], constant int& n [[buffer(1)]],
+                       uint row [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]){
+  threadgroup float sh[512];
+  device float* c=clat+(long)row*n;
+  for(int i=(int)lid;i<n;i+=(int)tgsz) sh[i]=c[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  tq_fwht_tg(sh,n,lid,tgsz);                                            // H
+  for(int i=(int)lid;i<n;i+=(int)tgsz) c[i]=sh[i]*tq_sign(i);           // D
+}
+// codec-1 producer, threadgroup-per-row (replaces the serial a_tq_enc at decode): parallel
+// norm reduction + FWHT, each thread packs one byte (two nibbles). Twin of coli_q4_quant_row.
+kernel void a_tq_enc1(device const float* src [[buffer(0)]], device uchar* dst [[buffer(1)]],
+                      device float* rad [[buffer(2)]], constant int& n [[buffer(3)]], constant int& pb [[buffer(4)]], constant int& rowbytes [[buffer(5)]],
+                      uint row [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]){
+  threadgroup float sh[512]; threadgroup float red[256];
+  device const float* xr=src+(long)row*n;
+  float ss=0; for(int i=(int)lid;i<n;i+=(int)tgsz){ float v=xr[i]; ss+=v*v; }
+  red[lid]=ss; threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=tgsz/2;k>0;k>>=1){ if(lid<k) red[lid]+=red[lid+k]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+  float norm=sqrt(red[0]); device uchar* dr=dst+(long)(pb+(int)row)*rowbytes;
+  if(!(norm>1e-35f) || norm>3.4e38f){ for(int i=(int)lid;i<rowbytes;i+=(int)tgsz) dr[i]=0; if(lid==0) rad[pb+(int)row]=0.0f; return; }
+  for(int i=(int)lid;i<n;i+=(int)tgsz) sh[i]=xr[i]*tq_sign(i);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  tq_fwht_tg(sh,n,lid,tgsz);
+  float invstd=sqrt((float)n)/norm;
+  for(int b=(int)lid;b<(n>>1);b+=(int)tgsz){ int c0=tq_q4enc(sh[2*b]*invstd), c1=tq_q4enc(sh[2*b+1]*invstd); dr[b]=(uchar)(c0|(c1<<4)); }
+  if(lid==0) rad[pb+(int)row]=norm;
+}
+
 // ===== full-layer tail kernels =====
 // y[i] += a[i]  (residual add), grid = n
 kernel void a_add(device float* y [[buffer(0)]], device const float* a [[buffer(1)]],
@@ -297,6 +504,13 @@ static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gat
                                   // standalone coli_metal_rtop8 runner, so no caller can
                                   // reach r_top8_par's 32-lane reduction on an unsafe
                                   // device even by explicitly requesting par=1.
+static id<MTLComputePipelineState> g_a_fp8enc, g_a_score8, g_a_clat8;   // KV8 fp8 attention
+static id<MTLComputePipelineState> g_a_tq_enc, g_a_tq_deq;              // KV_TQ codec-0 (PolarQuant): serial enc + staging deq
+static id<MTLComputePipelineState> g_a_tq_enc1, g_a_tq_qrot, g_a_score_tq, g_a_clat_tq, g_a_tq_unrot; // KV_TQ codec-1 native fused
+static id<MTLBuffer> g_fp8lut;                                          // 256-entry e4m3 decode LUT (twin of coli_fp8_lut)
+// PolarQuant packed-row byte count (host twin of coli_tq_row_bytes): (n/2)*b1 + (n/2-1)*b2 bits.
+static inline int tq_row_bytes_h(int n,int bits,int codec){ if(codec) return n/2;   /* rotated int4 */
+  int b2=bits>1?bits-1:1; long t=(long)(n/2)*bits+(long)(n/2-1)*b2; return (int)((t+7)/8); }
 static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
@@ -445,42 +659,52 @@ extern "C" int coli_metal_init(void) {
     if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
     NSError *err = nil;
-    id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:SHADER]
-                                             options:nil error:&err];
-    if (!lib) { fprintf(stderr, "[metal] shader compile failed: %s\n",
+    // TWO libraries from the same source. The KV quantizers (a_fp8enc RNE e4m3; the TQ
+    // codec encoders) must round bit-for-bit like their CPU twins, so they compile with
+    // fast-math OFF (no rint/frexp reassociation). EVERYTHING else — the f32/MoE kernels and
+    // all quantized CONSUMERS — compiles fast-math ON, exactly as the merge-base did: a
+    // whole-library MTLMathModeSafe flip silently changed f32 numerics (mm_gemv alone drifts
+    // ~4e-6, compounding to flip greedy argmax at the first decode token vs merge-base).
+    MTLCompileOptions *fastOpts = [MTLCompileOptions new];   // fast-math ON (== merge-base options:nil)
+    MTLCompileOptions *safeOpts = [MTLCompileOptions new];
+    if (@available(macOS 15.0, *)) safeOpts.mathMode = MTLMathModeSafe;   // exact rint/frexp for the encoders
+    else safeOpts.fastMathEnabled = NO;
+    NSString *src = [NSString stringWithUTF8String:SHADER];
+    id<MTLLibrary> libFast = [g_dev newLibraryWithSource:src options:fastOpts error:&err];
+    if (!libFast) { fprintf(stderr, "[metal] shader compile failed (fast): %s\n",
                         err ? [[err localizedDescription] UTF8String] : "?"); g_dev = nil; return 0; }
-    g_gemv     = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_gemv"]   error:&err];
-    g_moe_gemv = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_gemv"] error:&err];
-    g_moe_silu = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_silu"] error:&err];
-    auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
-    g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
-    g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
-    g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
+    id<MTLLibrary> libSafe = [g_dev newLibraryWithSource:src options:safeOpts error:&err];
+    if (!libSafe) { fprintf(stderr, "[metal] shader compile failed (safe): %s\n",
+                        err ? [[err localizedDescription] UTF8String] : "?"); g_dev = nil; return 0; }
+    auto P=[&](id<MTLLibrary> lib,const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
+    g_gemv=P(libFast,"mm_gemv"); g_moe_gemv=P(libFast,"moe_gemv"); g_moe_silu=P(libFast,"moe_silu");
+    g_a_rms=P(libFast,"a_rmsnorm"); g_a_rope=P(libFast,"a_rope"); g_a_copy=P(libFast,"a_copy");
+    g_a_qabs=P(libFast,"a_qabs"); g_a_score=P(libFast,"a_score"); g_a_smax=P(libFast,"a_smax"); g_a_clat=P(libFast,"a_clat"); g_a_ctx=P(libFast,"a_ctx");
+    g_a_add=P(libFast,"a_add"); g_r_router=P(libFast,"r_router"); g_r_top8=P(libFast,"r_top8"); g_r_top8p=P(libFast,"r_top8_par");
+    g_a_score8=P(libFast,"a_score8"); g_a_clat8=P(libFast,"a_clat8");
+    g_a_tq_deq=P(libFast,"a_tq_deq"); g_a_tq_qrot=P(libFast,"a_tq_qrot");
+    g_a_score_tq=P(libFast,"a_score_tq"); g_a_clat_tq=P(libFast,"a_clat_tq"); g_a_tq_unrot=P(libFast,"a_tq_unrot");
+    g_a_fp8enc=P(libSafe,"a_fp8enc");
+    g_a_tq_enc=P(libSafe,"a_tq_enc"); g_a_tq_enc1=P(libSafe,"a_tq_enc1");
     if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
-    // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
-    // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
-    // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
-    // is a hard safety fact (g_rtop8_width_ok), not just a policy default: it gates BOTH
-    // the engine dispatch site and the standalone coli_metal_rtop8 runner (degrade-to-safe,
-    // same pattern as the pool/ring fallbacks elsewhere) — no caller can opt back into an
-    // unsafe reduction on such a device, even by explicitly requesting par=1.
+    if(!g_a_fp8enc||!g_a_score8||!g_a_clat8){ fprintf(stderr,"[metal] fp8 attn pipelines failed\n"); g_dev=nil; return 0; }
+    if(!g_a_tq_enc||!g_a_tq_deq||!g_a_tq_enc1||!g_a_tq_qrot||!g_a_score_tq||!g_a_clat_tq||!g_a_tq_unrot){ fprintf(stderr,"[metal] tq attn pipelines failed\n"); g_dev=nil; return 0; }
     if ([g_r_top8p threadExecutionWidth] != 32) {
       g_rtop8_width_ok = 0;
       if (g_rtop8_par)
-        fprintf(stderr, "[metal] COLI_RTOP8 parallel top-8 disabled: threadExecutionWidth=%lu "
-                        "!= 32 (r_top8_par's reduction assumes 32-lane simdgroups) — serial "
-                        "r_top8 in use\n", (unsigned long)[g_r_top8p threadExecutionWidth]);
+        fprintf(stderr, "[metal] COLI_RTOP8 parallel top-8 disabled: threadExecutionWidth=%lu != 32 "
+                        "(r_top8_par's reduction assumes 32-lane simdgroups) - serial r_top8 in use\n",
+                        (unsigned long)[g_r_top8p threadExecutionWidth]);
       g_rtop8_par = 0;
     }
     if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
-    // E5 experiment: COLI_METAL_RESSET=1 -- see g_resset_obj comment above.
     if (getenv("COLI_METAL_RESSET") && atoi(getenv("COLI_METAL_RESSET"))) {
 #if COLI_HAS_RESSET
       if (@available(macOS 15.0, *)) {
         MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
-        rd.initialCapacity = 4096;   // hint only (internal array presize), not a hard limit
+        rd.initialCapacity = 4096;
         NSError *rerr = nil;
         id<MTLResidencySet> rs = [g_dev newResidencySetWithDescriptor:rd error:&rerr];
         if (rs) {
@@ -488,17 +712,23 @@ extern "C" int coli_metal_init(void) {
           g_resset_obj = rs; g_resset_enabled = true;
           fprintf(stderr, "[METAL] residency-set: on (macOS 15+, moe_submit skips per-buffer useResource:)\n");
         } else {
-          fprintf(stderr, "[METAL] residency-set create failed: %s -- stock per-CB residency path\n",
+          fprintf(stderr, "[METAL] residency-set create failed: %s - stock per-CB residency path\n",
                   rerr ? [[rerr localizedDescription] UTF8String] : "?");
         }
       } else {
-        fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but OS < macOS 15 -- stock per-CB residency path\n");
+        fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but OS < macOS 15 - stock per-CB residency path\n");
       }
 #else
       fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but this binary was built against a "
                       "macOS SDK < 15 (MTLResidencySet unavailable) -- stock per-CB residency path\n");
 #endif
     }
+    // e4m3 decode LUT, byte-identical to coli_fp8_lut_init (kv_fp8.h): lut[b] = value of code b.
+    g_fp8lut = [g_dev newBufferWithLength:256*4 options:MTLResourceStorageModeShared];
+    { float *L=(float*)[g_fp8lut contents];
+      for(int b=0;b<256;b++){ int E=(b>>3)&0xF, M=b&7;
+        float v = E ? ldexpf(1.f+(float)M/8.f, E-7) : ldexpf((float)M,-9);
+        if(E==15&&M==7) v=0.f; L[b]=(b&0x80)?-v:v; } }
   }
   return 1;
 }
@@ -623,10 +853,17 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
 enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=4 };
 static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
 static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_;   // full-layer tail
+static id<MTLBuffer> aLf_,aRf_;                                               // KV8/TQ producer f32 scratch (S rows)
+static id<MTLBuffer> aLstg_,aRstg_; static size_t aLstg_cap,aRstg_cap;        // KV_TQ codec-0 consumer f32 stage (T rows)
+static id<MTLBuffer> aqtl_,aqtr_;                                             // KV_TQ codec-1 rotated query (latent/rope)
+static int g_tq_force_stage=0;                                                // test/bench hook: force codec-1 down the staging path
+extern "C" void coli_metal_tq_force_stage(int on){ g_tq_force_stage=on?1:0; } // native-vs-staging A/B in one process
 static void attn_scratch_init(){
   if(ax_) return;
   auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:g_res_opts]; };
   ax_=L(AH*4); aqr_=L(AQLORA*4); aqf_=L(AHQH*4); acomp_=L((AKVL+AROPE)*4);
+  aLf_=L(AKVL*4); aRf_=L(AROPE*4);
+  aqtl_=L((size_t)AHEADS*AKVL*4); aqtr_=L((size_t)AHEADS*AROPE*4);
   aqabs_=L((size_t)AHEADS*AKVL*4); aclat_=L((size_t)AHEADS*AKVL*4); actx_=L(AHVH*4); aout_=L(AH*4);
   aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
   axr_=L(AH*4); anrm_=L(AH*4); ash1_=L(2048*4); ash2_=L(2048*4); ashout_=L(AH*4);
@@ -665,7 +902,12 @@ typedef struct {
 static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
                              id<MTLBuffer> Lb, size_t loff, id<MTLBuffer> Rb, size_t roff,
                              id<MTLBuffer> kvbW, size_t kvbwoff, id<MTLBuffer> kvbS, size_t kvbsoff,
-                             int S, int pos_base, float eps, float theta, float ascale) {
+                             int S, int pos_base, float eps, float theta, float ascale,
+                             int qmode, int bits, int codec, id<MTLBuffer> L8, size_t l8off, id<MTLBuffer> R8, size_t r8off,
+                             id<MTLBuffer> Ls, size_t lsoff, id<MTLBuffer> Rs, size_t rsoff,
+                             id<MTLBuffer> Lstg, id<MTLBuffer> Rstg) {
+    /* qmode: 0=f32 cache (Lb/Rb), 1=KV8 fp8 (L8/R8 bytes + Ls/Rs scale), 2=KV_TQ PolarQuant
+     * (L8/R8 packed bytes + Ls/Rs radius; decoded to the f32 stage Lstg/Rstg then f32 score/clat). */
     int T=pos_base+S;
     memcpy([aqaln_ contents],W->qa_ln,AQLORA*4); memcpy([akvaln_ contents],W->kva_ln,AKVL*4);
     size_t Loff=loff+(size_t)pos_base*AKVL*4, Roff=roff+(size_t)pos_base*AROPE*4;
@@ -682,18 +924,96 @@ static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
       [e dispatchThreads:MTLSizeMake((size_t)S*n,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; };
     bind_gemv(e,W->qa_w,W->qa_s,W->qa_fmt,AH,AQLORA,ax_,aqr_,S);
     bind_gemv(e,W->kva_w,W->kva_s,W->kva_fmt,AH,AKVL+AROPE,ax_,acomp_,S); BAR();
-    rms(aqr_,0,aqaln_,AQLORA,S); cpy(0,Lb,Loff,AKVL); cpy(AKVL,Rb,Roff,AROPE); BAR();
-    bind_gemv(e,W->qb_w,W->qb_s,W->qb_fmt,AQLORA,AHQH,aqr_,aqf_,S); rms(Lb,Loff,akvaln_,AKVL,S); rope(Rb,Roff,0,AROPE,0,1); BAR();
+    // producer: normed latent L + roped k_rot. f32 -> straight into the cache; KV8 -> a f32
+    // scratch (aLf_/aRf_), then fp8-quantized (per-row amax/448 scale) into the byte cache at pos_base.
+    bool quant = (qmode!=0);
+    bool tq_native = (qmode==2 && codec==1 && !g_tq_force_stage);   // rotated-int4: native fused score/clat, no restage
+    id<MTLBuffer> Lp = quant?aLf_:Lb; size_t Lpo = quant?0:Loff;
+    id<MTLBuffer> Rp = quant?aRf_:Rb; size_t Rpo = quant?0:Roff;
+    rms(aqr_,0,aqaln_,AQLORA,S); cpy(0,Lp,Lpo,AKVL); cpy(AKVL,Rp,Rpo,AROPE); BAR();
+    bind_gemv(e,W->qb_w,W->qb_s,W->qb_fmt,AQLORA,AHQH,aqr_,aqf_,S); rms(Lp,Lpo,akvaln_,AKVL,S); rope(Rp,Rpo,0,AROPE,0,1); BAR();
+    if(qmode==1){
+      auto enc=[&](id<MTLBuffer> src, id<MTLBuffer> dstB, size_t dstoff, id<MTLBuffer> sclB, size_t scloff, int n){
+        [e setComputePipelineState:g_a_fp8enc];
+        [e setBuffer:src offset:0 atIndex:0]; [e setBuffer:dstB offset:dstoff atIndex:1]; [e setBuffer:sclB offset:scloff atIndex:2];
+        [e setBytes:&n length:4 atIndex:3]; [e setBytes:&pos_base length:4 atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
+      enc(aLf_,L8,l8off,Ls,lsoff,AKVL); enc(aRf_,R8,r8off,Rs,rsoff,AROPE); BAR();
+    } else if(tq_native){
+      // codec-1 producer: one threadgroup per new row (parallel norm+FWHT+pack) — not the
+      // single-thread serial a_tq_enc, which was a per-token latency floor at decode.
+      auto tqenc1=[&](id<MTLBuffer> src, id<MTLBuffer> dstB, size_t dstoff, id<MTLBuffer> radB, size_t radoff, int n){
+        int rbw=tq_row_bytes_h(n,bits,codec); [e setComputePipelineState:g_a_tq_enc1];
+        [e setBuffer:src offset:0 atIndex:0]; [e setBuffer:dstB offset:dstoff atIndex:1]; [e setBuffer:radB offset:radoff atIndex:2];
+        [e setBytes:&n length:4 atIndex:3]; [e setBytes:&pos_base length:4 atIndex:4]; [e setBytes:&rbw length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
+      tqenc1(aLf_,L8,l8off,Ls,lsoff,AKVL); tqenc1(aRf_,R8,r8off,Rs,rsoff,AROPE); BAR();
+    } else if(qmode==2){
+      auto tqenc=[&](id<MTLBuffer> src, id<MTLBuffer> dstB, size_t dstoff, id<MTLBuffer> radB, size_t radoff, int n){
+        int rbw=tq_row_bytes_h(n,bits,codec); [e setComputePipelineState:g_a_tq_enc];
+        [e setBuffer:src offset:0 atIndex:0]; [e setBuffer:dstB offset:dstoff atIndex:1]; [e setBuffer:radB offset:radoff atIndex:2];
+        [e setBytes:&n length:4 atIndex:3]; [e setBytes:&bits length:4 atIndex:4]; [e setBytes:&pos_base length:4 atIndex:5]; [e setBytes:&rbw length:4 atIndex:6]; [e setBytes:&codec length:4 atIndex:7];
+        [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; };
+      tqenc(aLf_,L8,l8off,Ls,lsoff,AKVL); tqenc(aRf_,R8,r8off,Rs,rsoff,AROPE); BAR();
+    }
     rope(aqf_,0,ANOPE,AHQH,AQH,AHEADS); BAR();
     [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:Rb offset:roff atIndex:2]; [e setBuffer:aqf_ offset:0 atIndex:3]; [e setBuffer:ascore_ offset:0 atIndex:4];
-    [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&pos_base length:4 atIndex:7];
+    // KV_TQ codec-0 (PolarQuant): reconstruct ALL T rows to the f32 stage, then f32 score/clat.
+    // codec-1 (rotated int4): NO restage — rotate the query once, then dot packed nibbles natively.
+    if(qmode==2 && !tq_native){
+      auto tqdeq=[&](id<MTLBuffer> srcB, size_t srcoff, id<MTLBuffer> radB, size_t radoff, id<MTLBuffer> stg, int n){
+        int rbw=tq_row_bytes_h(n,bits,codec); [e setComputePipelineState:g_a_tq_deq];
+        [e setBuffer:srcB offset:srcoff atIndex:0]; [e setBuffer:radB offset:radoff atIndex:1]; [e setBuffer:stg offset:0 atIndex:2];
+        [e setBytes:&n length:4 atIndex:3]; [e setBytes:&bits length:4 atIndex:4]; [e setBytes:&rbw length:4 atIndex:5]; [e setBytes:&codec length:4 atIndex:6];
+        [e dispatchThreads:MTLSizeMake(T,1,1) threadsPerThreadgroup:MTLSizeMake(T<64?T:64,1,1)]; };
+      tqdeq(L8,l8off,Ls,lsoff,Lstg,AKVL); tqdeq(R8,r8off,Rs,rsoff,Rstg,AROPE); BAR();
+    } else if(tq_native){
+      // q~ = rotate(q): latent from aqabs_ (contiguous, stride AKVL), rope from aqf_ (stride AQH, base ANOPE).
+      auto qrot=[&](id<MTLBuffer> srcB, id<MTLBuffer> dstB, int n, int stride, int base){
+        [e setComputePipelineState:g_a_tq_qrot];
+        [e setBuffer:srcB offset:0 atIndex:0]; [e setBuffer:dstB offset:0 atIndex:1];
+        [e setBytes:&n length:4 atIndex:2]; [e setBytes:&stride length:4 atIndex:3]; [e setBytes:&base length:4 atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake((size_t)S*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
+      qrot(aqabs_,aqtl_,AKVL,AKVL,0); qrot(aqf_,aqtr_,AROPE,AQH,ANOPE); BAR();
+    }
+    id<MTLBuffer> CL=(qmode==2)?Lstg:Lb; size_t CLo=(qmode==2)?0:loff;
+    id<MTLBuffer> CR=(qmode==2)?Rstg:Rb; size_t CRo=(qmode==2)?0:roff;
+    int lrb=tq_row_bytes_h(AKVL,bits,codec), rrb=tq_row_bytes_h(AROPE,bits,codec);
+    if(tq_native){
+      [e setComputePipelineState:g_a_score_tq]; [e setBuffer:aqtl_ offset:0 atIndex:0];
+      [e setBuffer:L8 offset:l8off atIndex:1]; [e setBuffer:Ls offset:lsoff atIndex:2];
+      [e setBuffer:R8 offset:r8off atIndex:3]; [e setBuffer:Rs offset:rsoff atIndex:4];
+      [e setBuffer:aqtr_ offset:0 atIndex:5]; [e setBuffer:ascore_ offset:0 atIndex:6];
+      [e setBytes:&T length:4 atIndex:7]; [e setBytes:&ascale length:4 atIndex:8]; [e setBytes:&pos_base length:4 atIndex:9];
+      [e setBytes:&lrb length:4 atIndex:10]; [e setBytes:&rrb length:4 atIndex:11];
+    } else if(qmode==1){
+      [e setComputePipelineState:g_a_score8]; [e setBuffer:aqabs_ offset:0 atIndex:0];
+      [e setBuffer:L8 offset:l8off atIndex:1]; [e setBuffer:Ls offset:lsoff atIndex:2];
+      [e setBuffer:R8 offset:r8off atIndex:3]; [e setBuffer:Rs offset:rsoff atIndex:4];
+      [e setBuffer:aqf_ offset:0 atIndex:5]; [e setBuffer:g_fp8lut offset:0 atIndex:6]; [e setBuffer:ascore_ offset:0 atIndex:7];
+      [e setBytes:&T length:4 atIndex:8]; [e setBytes:&ascale length:4 atIndex:9]; [e setBytes:&pos_base length:4 atIndex:10];
+    } else {
+      [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:0 atIndex:0]; [e setBuffer:CL offset:CLo atIndex:1]; [e setBuffer:CR offset:CRo atIndex:2]; [e setBuffer:aqf_ offset:0 atIndex:3]; [e setBuffer:ascore_ offset:0 atIndex:4];
+      [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&pos_base length:4 atIndex:7];
+    }
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*T,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_smax]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBytes:&T length:4 atIndex:1];
     [e dispatchThreadgroups:MTLSizeMake((size_t)S*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    [e setComputePipelineState:g_a_clat]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBytes:&T length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    if(tq_native){
+      // acc = sum_t w_t*std_t*lev[L[t]] into aclat_, then unrotate aclat_ in place -> clat.
+      [e setComputePipelineState:g_a_clat_tq]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:L8 offset:l8off atIndex:1]; [e setBuffer:Ls offset:lsoff atIndex:2]; [e setBuffer:aclat_ offset:0 atIndex:3]; [e setBytes:&T length:4 atIndex:4]; [e setBytes:&lrb length:4 atIndex:5];
+      [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+      int nkvl=AKVL; [e setComputePipelineState:g_a_tq_unrot]; [e setBuffer:aclat_ offset:0 atIndex:0]; [e setBytes:&nkvl length:4 atIndex:1];
+      [e dispatchThreadgroups:MTLSizeMake((size_t)S*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    } else {
+      if(qmode==1){
+        [e setComputePipelineState:g_a_clat8]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:L8 offset:l8off atIndex:1]; [e setBuffer:Ls offset:lsoff atIndex:2]; [e setBuffer:g_fp8lut offset:0 atIndex:3]; [e setBuffer:aclat_ offset:0 atIndex:4]; [e setBytes:&T length:4 atIndex:5];
+      } else {
+        [e setComputePipelineState:g_a_clat]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:CL offset:CLo atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBytes:&T length:4 atIndex:3];
+      }
+      [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    }
     [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     bind_gemv(e,W->o_w,W->o_s,W->o_fmt,AHVH,AH,actx_,aout_,S);
@@ -733,13 +1053,152 @@ extern "C" int coli_metal_attn_decode(const float* x,
     id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
     [e useResource:Lb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rb usage:MTLResourceUsageRead|MTLResourceUsageWrite];
     [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
-    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale)) return 0;
+    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale,
+                         0,0,0,nil,0,nil,0,nil,0,nil,0,nil,nil)) return 0;
     double tc=mnow();
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
     g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
     g_attn_sched += [cb GPUStartTime]-[cb kernelStartTime]; g_attn_ksched += [cb kernelStartTime]-tc;
     memcpy(out,[aout_ contents],(size_t)S*AH*4);
+  }
+  return 1;
+}
+
+// KV8 twin of coli_metal_attn_decode: latent KV cache is fp8 bytes (Lc8/Rc8) + per-row
+// f32 scale (Lsc/Rsc). The producer fp8-quantizes the new rows on the GPU; the consumer
+// decodes via the e4m3 LUT + scale. All four cache arrays must be registered (page-aligned).
+extern "C" int coli_metal_attn_decode8(const float* x,
+    const void* qa_w,const float* qa_s,int qa_fmt,const float* qa_ln,
+    const void* qb_w,const float* qb_s,int qb_fmt,
+    const void* kva_w,const float* kva_s,int kva_fmt,const float* kva_ln,
+    const void* kvb_w,const float* kvb_s,int kvb_fmt,
+    const void* o_w,const float* o_s,int o_fmt,
+    const unsigned char* Lc8,const float* Lsc,const unsigned char* Rc8,const float* Rsc,
+    int S,int pos_base,int st0,float eps,float theta,float ascale,float* out){
+  if(!g_dev) return 0;
+  if(st0!=0 || S<1 || S>AMAXS) return 0;     // partial-KV / S>4 -> CPU
+  int T=pos_base+S;
+  @autoreleasepool {
+    attn_scratch_init();
+    AttnW W={qa_w,qa_s,qa_fmt,qa_ln,qb_w,qb_s,qb_fmt,kva_w,kva_s,kva_fmt,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt};
+    uint64_t la=0,ra=0,lsa=0,rsa=0,kwa=0,ksa=0;
+    id<MTLBuffer> L8=resolve(Lc8,&la), R8=resolve(Rc8,&ra), Ls=resolve(Lsc,&lsa), Rs=resolve(Rsc,&rsa);
+    id<MTLBuffer> kvbW=resolve(kvb_w,&kwa), kvbS=resolve(kvb_s,&ksa);
+    if(!L8||!R8||!Ls||!Rs||!kvbW||!kvbS) return 0;
+    uint64_t d; const void* ws[]={qa_w,qa_s,qb_w,qb_s,kva_w,kva_s,o_w,o_s};
+    for(auto p:ws) if(!resolve(p,&d)) return 0;
+    size_t l8off=la-(uint64_t)[L8 gpuAddress], r8off=ra-(uint64_t)[R8 gpuAddress];
+    size_t lsoff=lsa-(uint64_t)[Ls gpuAddress], rsoff=rsa-(uint64_t)[Rs gpuAddress];
+    size_t kvbwoff=kwa-(uint64_t)[kvbW gpuAddress], kvbsoff=ksa-(uint64_t)[kvbS gpuAddress];
+    ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
+    memcpy([ax_ contents],x,(size_t)S*AH*4);
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e useResource:L8 usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:R8 usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    [e useResource:Ls usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rs usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
+    if(!encode_attention(e,&W,nil,0,nil,0,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale,
+                         1,0,0,L8,l8off,R8,r8off,Ls,lsoff,Rs,rsoff,nil,nil)) return 0;
+    double tc=mnow();
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn8 cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
+    g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
+    g_attn_sched += [cb GPUStartTime]-[cb kernelStartTime]; g_attn_ksched += [cb kernelStartTime]-tc;
+    memcpy(out,[aout_ contents],(size_t)S*AH*4);
+  }
+  return 1;
+}
+
+// KV_TQ (PolarQuant) twin of the fused decode: latent KV is packed polar bytes (Lc8/Rc8) +
+// per-row radius (Lsc/Rsc). The GPU rotate+polar-encodes the new rows, reconstructs all T rows
+// to an f32 stage, then runs the f32 score/clat. All four cache arrays must be registered.
+extern "C" int coli_metal_attn_decode_tq(const float* x,
+    const void* qa_w,const float* qa_s,int qa_fmt,const float* qa_ln,
+    const void* qb_w,const float* qb_s,int qb_fmt,
+    const void* kva_w,const float* kva_s,int kva_fmt,const float* kva_ln,
+    const void* kvb_w,const float* kvb_s,int kvb_fmt,
+    const void* o_w,const float* o_s,int o_fmt,
+    const unsigned char* Lc8,const float* Lsc,const unsigned char* Rc8,const float* Rsc,int bits,int codec,
+    int S,int pos_base,int st0,float eps,float theta,float ascale,float* out){
+  if(!g_dev) return 0;
+  if(st0!=0 || S<1 || S>AMAXS) return 0;
+  int T=pos_base+S;
+  @autoreleasepool {
+    attn_scratch_init();
+    AttnW W={qa_w,qa_s,qa_fmt,qa_ln,qb_w,qb_s,qb_fmt,kva_w,kva_s,kva_fmt,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt};
+    uint64_t la=0,ra=0,lsa=0,rsa=0,kwa=0,ksa=0;
+    id<MTLBuffer> L8=resolve(Lc8,&la), R8=resolve(Rc8,&ra), Ls=resolve(Lsc,&lsa), Rs=resolve(Rsc,&rsa);
+    id<MTLBuffer> kvbW=resolve(kvb_w,&kwa), kvbS=resolve(kvb_s,&ksa);
+    if(!L8||!R8||!Ls||!Rs||!kvbW||!kvbS) return 0;
+    uint64_t d; const void* ws[]={qa_w,qa_s,qb_w,qb_s,kva_w,kva_s,o_w,o_s};
+    for(auto p:ws) if(!resolve(p,&d)) return 0;
+    size_t l8off=la-(uint64_t)[L8 gpuAddress], r8off=ra-(uint64_t)[R8 gpuAddress];
+    size_t lsoff=lsa-(uint64_t)[Ls gpuAddress], rsoff=rsa-(uint64_t)[Rs gpuAddress];
+    size_t kvbwoff=kwa-(uint64_t)[kvbW gpuAddress], kvbsoff=ksa-(uint64_t)[kvbS gpuAddress];
+    ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
+    aLstg_=ensure(aLstg_,&aLstg_cap,(size_t)T*AKVL*4);
+    aRstg_=ensure(aRstg_,&aRstg_cap,(size_t)T*AROPE*4);
+    memcpy([ax_ contents],x,(size_t)S*AH*4);
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e useResource:L8 usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:R8 usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    [e useResource:Ls usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rs usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
+    if(!encode_attention(e,&W,nil,0,nil,0,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale,
+                         2,bits,codec,L8,l8off,R8,r8off,Ls,lsoff,Rs,rsoff,aLstg_,aRstg_)) return 0;
+    double tc=mnow();
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn_tq cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
+    g_attn_ok++; g_attn_wall += mnow()-tc; g_attn_kernel += [cb GPUEndTime]-[cb GPUStartTime];
+    g_attn_sched += [cb GPUStartTime]-[cb kernelStartTime]; g_attn_ksched += [cb kernelStartTime]-tc;
+    memcpy(out,[aout_ contents],(size_t)S*AH*4);
+  }
+  return 1;
+}
+
+// Test hook: run the GPU fp8 per-row quantizer (a_fp8enc) on one host row and return
+// bytes + scale, so metal-test can check byte-for-byte parity with coli_kv8_quant_row
+// in isolation from the fused chain (whose pre-quant latent diverges ~1e-5 CPU vs GPU).
+extern "C" int coli_metal_fp8_quant_row(const float* src, unsigned char* dst, float* scale, int n){
+  if(!g_dev || n<1) return 0;
+  @autoreleasepool {
+    id<MTLBuffer> sb=[g_dev newBufferWithBytes:src length:(size_t)n*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> db=[g_dev newBufferWithLength:(size_t)n options:MTLResourceStorageModeShared];
+    id<MTLBuffer> cb2=[g_dev newBufferWithLength:4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    int pb=0; [e setComputePipelineState:g_a_fp8enc];
+    [e setBuffer:sb offset:0 atIndex:0]; [e setBuffer:db offset:0 atIndex:1]; [e setBuffer:cb2 offset:0 atIndex:2];
+    [e setBytes:&n length:4 atIndex:3]; [e setBytes:&pb length:4 atIndex:4];
+    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError) return 0;
+    memcpy(dst,[db contents],(size_t)n); *scale=*(float*)[cb2 contents];
+  }
+  return 1;
+}
+
+// Test hook: GPU PolarQuant round-trip (a_tq_enc then a_tq_deq) for one row, so metal-test
+// can check the MSL FWHT/polar math against kv_tq.h's coli_tq_quant_row/dequant_row.
+extern "C" int coli_metal_tq_roundtrip(const float* src, float* out, int n, int bits, int codec){
+  if(!g_dev || n<2) return 0;
+  @autoreleasepool {
+    int rbw=tq_row_bytes_h(n,bits,codec), pb=0;
+    id<MTLBuffer> sb=[g_dev newBufferWithBytes:src length:(size_t)n*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> db=[g_dev newBufferWithLength:(size_t)rbw options:MTLResourceStorageModeShared];
+    id<MTLBuffer> rb=[g_dev newBufferWithLength:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ob=[g_dev newBufferWithLength:(size_t)n*4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:g_a_tq_enc];
+    [e setBuffer:sb offset:0 atIndex:0]; [e setBuffer:db offset:0 atIndex:1]; [e setBuffer:rb offset:0 atIndex:2];
+    [e setBytes:&n length:4 atIndex:3]; [e setBytes:&bits length:4 atIndex:4]; [e setBytes:&pb length:4 atIndex:5]; [e setBytes:&rbw length:4 atIndex:6]; [e setBytes:&codec length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [e setComputePipelineState:g_a_tq_deq];
+    [e setBuffer:db offset:0 atIndex:0]; [e setBuffer:rb offset:0 atIndex:1]; [e setBuffer:ob offset:0 atIndex:2];
+    [e setBytes:&n length:4 atIndex:3]; [e setBytes:&bits length:4 atIndex:4]; [e setBytes:&rbw length:4 atIndex:5]; [e setBytes:&codec length:4 atIndex:6];
+    [e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError) return 0;
+    memcpy(out,[ob contents],(size_t)n*4);
   }
   return 1;
 }
@@ -762,7 +1221,9 @@ extern "C" int coli_metal_layer_decode(float *x,
     const void* shd_w,const float* shd_s,int shd_fmt,
     const float *router_w, const float *router_bias,
     int E, int K, int Ksel, float topp, int normk, float rscale,
-    float *Lc, float *Rc, int S, int pos_base, int st0,
+    float *Lc, float *Rc, int qmode, int bits, int codec,
+    const unsigned char* Lc8, const float* Lsc, const unsigned char* Rc8, const float* Rsc,
+    int S, int pos_base, int st0,
     float eps, float theta, float ascale,
     float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out) {
   if(!g_dev) return 0;
@@ -771,8 +1232,23 @@ extern "C" int coli_metal_layer_decode(float *x,
   @autoreleasepool {
     attn_scratch_init();
     AttnW W={qa_w,qa_s,qa_fmt,qa_ln,qb_w,qb_s,qb_fmt,kva_w,kva_s,kva_fmt,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt};
-    id<MTLBuffer> Lb,Rb,kvbW,kvbS; size_t loff,roff,kvbwoff,kvbsoff;
-    if(!resolve_attn(&W,Lc,Rc,&Lb,&loff,&Rb,&roff,&kvbW,&kvbwoff,&kvbS,&kvbsoff)) return 0;
+    // qmode 0: f32 cache (Lb/Rb via resolve_attn). qmode 1/2: byte cache + scale/radius (KV8/KV_TQ).
+    id<MTLBuffer> Lb=nil,Rb=nil,kvbW,kvbS; size_t loff=0,roff=0,kvbwoff,kvbsoff;
+    id<MTLBuffer> L8=nil,R8=nil,Ls=nil,Rs=nil; size_t l8off=0,r8off=0,lsoff=0,rsoff=0;
+    if(qmode==0){
+      if(!resolve_attn(&W,Lc,Rc,&Lb,&loff,&Rb,&roff,&kvbW,&kvbwoff,&kvbS,&kvbsoff)) return 0;
+    } else {
+      uint64_t la=0,ra=0,lsa=0,rsa=0,kwa=0,ksa=0;
+      L8=resolve(Lc8,&la); R8=resolve(Rc8,&ra); Ls=resolve(Lsc,&lsa); Rs=resolve(Rsc,&rsa);
+      kvbW=resolve(W.kvb_w,&kwa); kvbS=resolve(W.kvb_s,&ksa);
+      if(!L8||!R8||!Ls||!Rs||!kvbW||!kvbS) return 0;
+      uint64_t dd; const void* ws[]={W.qa_w,W.qa_s,W.qb_w,W.qb_s,W.kva_w,W.kva_s,W.o_w,W.o_s};
+      for(auto p:ws) if(!resolve(p,&dd)) return 0;
+      l8off=la-(uint64_t)[L8 gpuAddress]; r8off=ra-(uint64_t)[R8 gpuAddress];
+      lsoff=lsa-(uint64_t)[Ls gpuAddress]; rsoff=rsa-(uint64_t)[Rs gpuAddress];
+      kvbwoff=kwa-(uint64_t)[kvbW gpuAddress]; kvbsoff=ksa-(uint64_t)[kvbS gpuAddress];
+      if(qmode==2){ aLstg_=ensure(aLstg_,&aLstg_cap,(size_t)T*AKVL*4); aRstg_=ensure(aRstg_,&aRstg_cap,(size_t)T*AROPE*4); }
+    }
     uint64_t ina=0,pna=0,rwa=0,rba=0,d;
     id<MTLBuffer> inB=resolve(in_ln,&ina), pnB=resolve(post_ln,&pna);
     id<MTLBuffer> rwB=resolve(router_w,&rwa), rbB=resolve(router_bias,&rba);
@@ -785,7 +1261,9 @@ extern "C" int coli_metal_layer_decode(float *x,
     memcpy([axr_ contents],x,(size_t)S*AH*4);
 
     id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-    [e useResource:Lb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rb usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    if(qmode==0){ [e useResource:Lb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; }
+    else { [e useResource:L8 usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:R8 usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+           [e useResource:Ls usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rs usage:MTLResourceUsageRead|MTLResourceUsageWrite]; }
     [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
     [e useResource:inB usage:MTLResourceUsageRead]; [e useResource:pnB usage:MTLResourceUsageRead];
     [e useResource:rwB usage:MTLResourceUsageRead]; [e useResource:rbB usage:MTLResourceUsageRead];
@@ -799,8 +1277,9 @@ extern "C" int coli_metal_layer_decode(float *x,
       [e dispatchThreads:MTLSizeMake((size_t)S*n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; };
     // 1) in_ln: ax_ = rmsnorm(x)
     copyrow(axr_,ax_,AH); BAR(); rmsw(ax_,inB,inoff,AH,S); BAR();
-    // 2) attention (ax_ -> aout_)
-    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale)) return 0;
+    // 2) attention (ax_ -> aout_) — f32 / KV8 fp8 / KV_TQ per qmode
+    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale,
+                         qmode,bits,codec,L8,l8off,R8,r8off,Ls,lsoff,Rs,rsoff,aLstg_,aRstg_)) return 0;
     BAR();
     // 3) residual: axr_ += aout_ ; then nrm = post_ln(x_new)
     [e setComputePipelineState:g_a_add]; [e setBuffer:axr_ offset:0 atIndex:0]; [e setBuffer:aout_ offset:0 atIndex:1];

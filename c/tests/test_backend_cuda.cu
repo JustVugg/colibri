@@ -1,4 +1,6 @@
 #include "../backend_cuda.h"
+#include "../kv_fp8.h"   /* host-side e4m3 quantizer: the KV8 kernels' input contract */
+#include "../kv_tq.h"    /* host-side rotated-int4 codec: the KV_TQ codec-1 kernel's input contract */
 
 #include <cmath>
 #include <cstdio>
@@ -338,6 +340,140 @@ int main(int argc, char **argv) {
     if(!coli_cuda_attention_absorb(at,actx,aq,al,ar,1,2,2,2,4,3,1.f)||
        !close_enough(actx,aref,2))return 1;
     coli_cuda_tensor_free(at);
+
+    /* KV8: same absorb case with e4m3-quantized latent/rope + per-row scales.
+       The reference is computed on the host from the DEQUANTIZED rows (exactly
+       what the kernel sees), so only accumulation order separates the two. */
+    {
+        coli_fp8_lut_init();
+        const float aw8[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        const float aq8[4]={1,2,.5f,-.5f};
+        float al8f[12],ar8f[6];
+        for(int i=0;i<12;i++)al8f[i]=std::sin((float)(i+1)*0.83f)*3.f;
+        for(int i=0;i<6;i++)ar8f[i]=std::cos((float)(i+1)*0.51f)*2.f;
+        uint8_t alq[12],arq[6];float alsc[3],arsc[3],ald[12],ard[6];
+        for(int t=0;t<3;t++){
+            alsc[t]=coli_kv8_quant_row(al8f+t*4,alq+t*4,4);
+            arsc[t]=coli_kv8_quant_row(ar8f+t*2,arq+t*2,2);
+            coli_kv8_dequant_row(alq+t*4,alsc[t],ald+t*4,4);
+            coli_kv8_dequant_row(arq+t*2,arsc[t],ard+t*2,2);
+        }
+        float sc8[3],ref8[2],got8[2];
+        for(int t=0;t<3;t++)sc8[t]=aq8[0]*ald[t*4]+aq8[1]*ald[t*4+1]+aq8[2]*ard[t*2]+aq8[3]*ard[t*2+1];
+        float m8=sc8[0],z8=0;for(int t=1;t<3;t++)m8=sc8[t]>m8?sc8[t]:m8;
+        for(int t=0;t<3;t++){sc8[t]=std::exp(sc8[t]-m8);z8+=sc8[t];}for(int t=0;t<3;t++)sc8[t]/=z8;
+        for(int v=0;v<2;v++){ref8[v]=0;for(int t=0;t<3;t++)ref8[v]+=sc8[t]*ald[t*4+2+v];}
+        ColiCudaTensor *at8=nullptr;if(!coli_cuda_tensor_upload(&at8,aw8,nullptr,0,4,4,d0))return 1;
+        if(!coli_cuda_attention_absorb8(at8,got8,aq8,alq,alsc,arq,arsc,1,2,2,2,4,3,1.f)||
+           !close_enough(got8,ref8,2)){std::fprintf(stderr,"attention_absorb8 mismatch\n");return 1;}
+        /* batch twin, S=2 (query s attends T-S+s+1 rows): reference per query */
+        float bq8[2*4]={1,2,.5f,-.5f, -1,.5f,1,2},bref[4],bgot[4];
+        for(int s=0;s<2;s++){
+            int ntk=3-2+s+1;float bs[3];
+            for(int t=0;t<ntk;t++)bs[t]=bq8[s*4]*ald[t*4]+bq8[s*4+1]*ald[t*4+1]+bq8[s*4+2]*ard[t*2]+bq8[s*4+3]*ard[t*2+1];
+            float bm=bs[0],bz=0;for(int t=1;t<ntk;t++)bm=bs[t]>bm?bs[t]:bm;
+            for(int t=0;t<ntk;t++){bs[t]=std::exp(bs[t]-bm);bz+=bs[t];}for(int t=0;t<ntk;t++)bs[t]/=bz;
+            for(int v=0;v<2;v++){bref[s*2+v]=0;for(int t=0;t<ntk;t++)bref[s*2+v]+=bs[t]*ald[t*4+2+v];}
+        }
+        if(!coli_cuda_attention_absorb_batch8(at8,bgot,bq8,alq,alsc,arq,arsc,2,1,2,2,2,4,3,1.f)||
+           !close_enough(bgot,bref,4)){std::fprintf(stderr,"attention_absorb_batch8 mismatch\n");return 1;}
+
+        /* KV_TQ codec-1 (rotated int4): same absorb case, latent/rope quantized with the int4
+         * codec. attention_absorb_kernel_tq uses the Hadamard orthogonality identity (rotate the
+         * query, dot packed nibbles, unrotate the context) — so kernel vs a host reference on the
+         * DEQUANTIZED rows differs only by rotate/accumulate order. Guards tq_fwht_dev/tq_sign_dev
+         * matching the CPU codec (kv_tq.h). K=4,R=2 are powers of two as codec-1 requires. */
+        {
+            const float aqt[4]={1,2,.5f,-.5f};
+            float altf[12],artf[6];
+            for(int i=0;i<12;i++)altf[i]=std::sin((float)(i+1)*0.83f)*3.f;
+            for(int i=0;i<6;i++)artf[i]=std::cos((float)(i+1)*0.51f)*2.f;
+            int lrb=coli_q4_row_bytes(4), rrb=coli_q4_row_bytes(2);   /* 2 and 1 bytes/row */
+            uint8_t altq[2*3],artq[1*3]; float altr[3],artr[3],altd[12],artd[6];
+            for(int t=0;t<3;t++){
+                altr[t]=coli_q4_quant_row(altf+t*4,altq+t*lrb,4);
+                artr[t]=coli_q4_quant_row(artf+t*2,artq+t*rrb,2);
+                coli_q4_dequant_row(altq+t*lrb,altr[t],altd+t*4,4);
+                coli_q4_dequant_row(artq+t*rrb,artr[t],artd+t*2,2);
+            }
+            float sct[3],reft[2],gott[2];
+            for(int t=0;t<3;t++)sct[t]=aqt[0]*altd[t*4]+aqt[1]*altd[t*4+1]+aqt[2]*artd[t*2]+aqt[3]*artd[t*2+1];
+            float mt=sct[0],zt=0;for(int t=1;t<3;t++)mt=sct[t]>mt?sct[t]:mt;
+            for(int t=0;t<3;t++){sct[t]=std::exp(sct[t]-mt);zt+=sct[t];}for(int t=0;t<3;t++)sct[t]/=zt;
+            for(int v=0;v<2;v++){reft[v]=0;for(int t=0;t<3;t++)reft[v]+=sct[t]*altd[t*4+2+v];}
+            if(!coli_cuda_attention_absorb_tq(at8,gott,aqt,altq,altr,artq,artr,1,2,2,2,4,3,1.f,lrb,rrb)||
+               !relative_rms(gott,reft,2,3e-3f)){std::fprintf(stderr,"attention_absorb_tq mismatch\n");return 1;}
+        }
+
+        /* Long-T: T=6000 exceeds the shared-memory score cap, so the host path,
+           the device-shadow path (upload only q) and the DSA gather all run the
+           tiled online-softmax / selection kernels. Reference in double on the
+           dequantized rows. */
+        {
+            const int LT=6000;
+            float *Lf=(float*)malloc((size_t)LT*4*4), *Rf=(float*)malloc((size_t)LT*2*4);
+            uint8_t *Lq=(uint8_t*)malloc((size_t)LT*4), *Rq=(uint8_t*)malloc((size_t)LT*2);
+            float *Ls=(float*)malloc(LT*4), *Rs=(float*)malloc(LT*4);
+            float *Ld=(float*)malloc((size_t)LT*4*4), *Rd=(float*)malloc((size_t)LT*2*4);
+            for(int t=0;t<LT;t++){
+                for(int k=0;k<4;k++)Lf[t*4+k]=std::sin(0.013f*t+0.7f*k)*2.f;
+                for(int d=0;d<2;d++)Rf[t*2+d]=std::cos(0.011f*t+0.3f*d);
+                Ls[t]=coli_kv8_quant_row(Lf+t*4,Lq+t*4,4);
+                Rs[t]=coli_kv8_quant_row(Rf+t*2,Rq+t*2,2);
+                coli_kv8_dequant_row(Lq+t*4,Ls[t],Ld+t*4,4);
+                coli_kv8_dequant_row(Rq+t*2,Rs[t],Rd+t*2,2);
+            }
+            const float lq8[4]={.8f,-.6f,.4f,.9f};
+            double *dsc=(double*)malloc(LT*8);
+            auto dense_ref=[&](const int *sel,int ns,float *ref){
+                int n=sel?ns:LT; double mx=-1e300;
+                for(int j=0;j<n;j++){int t=sel?sel[j]:j;
+                    dsc[j]=(double)lq8[0]*Ld[t*4]+ (double)lq8[1]*Ld[t*4+1]+
+                           (double)lq8[2]*Rd[t*2]+ (double)lq8[3]*Rd[t*2+1];
+                    if(dsc[j]>mx)mx=dsc[j];}
+                double z=0; for(int j=0;j<n;j++){dsc[j]=std::exp(dsc[j]-mx);z+=dsc[j];}
+                double c0=0,c1=0;
+                for(int j=0;j<n;j++){int t=sel?sel[j]:j;
+                    c0+=dsc[j]/z*Ld[t*4+2]; c1+=dsc[j]/z*Ld[t*4+3];}
+                ref[0]=(float)c0; ref[1]=(float)c1;
+            };
+            float ref2[2],got2[2];
+            dense_ref(nullptr,0,ref2);
+            /* (a) host-upload path beyond the old 4096 cap -> streaming kernel */
+            if(!coli_cuda_attention_absorb8(at8,got2,lq8,Lq,Ls,Rq,Rs,1,2,2,2,4,LT,1.f)||
+               !relative_rms(got2,ref2,2,1e-3f)){std::fprintf(stderr,"absorb8 streaming (T=%d) mismatch\n",LT);return 1;}
+            /* (b) device-resident shadow */
+            uint8_t *dL=(uint8_t*)coli_cuda_pipe_alloc(d0,(size_t)LT*4);
+            uint8_t *dR=(uint8_t*)coli_cuda_pipe_alloc(d0,(size_t)LT*2);
+            float *dLs=(float*)coli_cuda_pipe_alloc(d0,(size_t)LT*4);
+            float *dRs=(float*)coli_cuda_pipe_alloc(d0,(size_t)LT*4);
+            if(!dL||!dR||!dLs||!dRs)return 1;
+            if(!coli_cuda_pipe_upload(d0,dL,Lq,(size_t)LT*4)||!coli_cuda_pipe_upload(d0,dR,Rq,(size_t)LT*2)||
+               !coli_cuda_pipe_upload(d0,dLs,Ls,(size_t)LT*4)||!coli_cuda_pipe_upload(d0,dRs,Rs,(size_t)LT*4))return 1;
+            if(!coli_cuda_attention_absorb_kvdev8(at8,got2,lq8,dL,dLs,dR,dRs,1,2,2,2,4,LT,1.f)||
+               !relative_rms(got2,ref2,2,1e-3f)){std::fprintf(stderr,"kvdev8 streaming mismatch\n");return 1;}
+            /* (c) DSA gather: every 3rd row */
+            int nsel=LT/3; int *sel=(int*)malloc(nsel*4);
+            for(int j=0;j<nsel;j++)sel[j]=j*3;
+            dense_ref(sel,nsel,ref2);
+            if(!coli_cuda_attention_absorb_kvdev8_sel(at8,got2,lq8,dL,dLs,dR,dRs,sel,nsel,1,2,2,2,4,1.f)||
+               !relative_rms(got2,ref2,2,1e-3f)){std::fprintf(stderr,"kvdev8_sel mismatch\n");return 1;}
+            /* (c2) small-NS single-block branch (the split path takes NS>=1024) */
+            int nsel2=500;
+            dense_ref(sel,nsel2,ref2);
+            if(!coli_cuda_attention_absorb_kvdev8_sel(at8,got2,lq8,dL,dLs,dR,dRs,sel,nsel2,1,2,2,2,4,1.f)||
+               !relative_rms(got2,ref2,2,1e-3f)){std::fprintf(stderr,"kvdev8_sel small-NS mismatch\n");return 1;}
+            /* (d) parity: streaming vs capped kernel on the SAME data at T=3000 */
+            float cap2[2];
+            if(!coli_cuda_attention_absorb8(at8,cap2,lq8,Lq,Ls,Rq,Rs,1,2,2,2,4,3000,1.f))return 1;
+            if(!coli_cuda_attention_absorb_kvdev8(at8,got2,lq8,dL,dLs,dR,dRs,1,2,2,2,4,3000,1.f)||
+               !relative_rms(got2,cap2,2,1e-4f)){std::fprintf(stderr,"capped-vs-shadow parity mismatch\n");return 1;}
+            coli_cuda_pipe_free(d0,dL);coli_cuda_pipe_free(d0,dR);
+            coli_cuda_pipe_free(d0,dLs);coli_cuda_pipe_free(d0,dRs);
+            free(Lf);free(Rf);free(Lq);free(Rq);free(Ls);free(Rs);free(Ld);free(Rd);free(dsc);free(sel);
+        }
+        coli_cuda_tensor_free(at8);
+    }
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */

@@ -1137,6 +1137,7 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        self._warned_unknown_line = False      # rate-limit the "unrecognized engine line" notice
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -1249,7 +1250,15 @@ class Engine:
                     if events is not None:
                         events.put(("error", _engine_error(fields[2:], message)))
                 else:
-                    raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
+                    # Unrecognized (or field-count-shifted) telemetry line: DATA/DONE/ERROR are the
+                    # only load-bearing frames; everything else (PROF/HITS/TIERS/EMAP/HWINFO/…) is
+                    # best-effort stats. A newer or older engine can emit a stat line this server
+                    # version doesn't parse — skip it rather than tearing down the whole dispatcher
+                    # (which failed EVERY in-flight request and made single-slot serve look broken).
+                    if not self._warned_unknown_line:
+                        self._warned_unknown_line = True
+                        sys.stderr.write(f"[server] ignoring unrecognized engine line: {' '.join(fields[:2])}…\n")
+                    continue
         except Exception as error:
             if not self.closed:
                 self.dispatcher_error = error

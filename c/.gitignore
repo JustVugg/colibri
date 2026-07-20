@@ -8,3 +8,14 @@ tests/test_st_pread
 tools/libiq3.so
 tools/libiq3.dylib
 tools/iq3.dll
+
+# compiled test/bench binaries (Mach-O/ELF, no extension); sources kept via negation
+tests/test_*
+tests/bench_*
+backend_metal_test
+backend_cuda_test
+!tests/*.c
+!tests/*.cu
+!tests/*.mm
+!tests/*.h
+!tests/*.py
