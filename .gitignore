@@ -16,6 +16,10 @@ c/olmoe
 c/olmoe.exe
 c/iobench
 c/iobench.exe
+c/coli-go
+c/coli-go.exe
+c/go/coli
+c/go/coli.exe
 c/tok_test
 c/backend_cuda.o
 c/backend_cuda_test

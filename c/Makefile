@@ -345,4 +345,11 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+
+# Optional dependency-free Go port of the `coli` launcher (issue #310). Not part
+# of `all`/`check`: the Python `coli` remains the default. Requires the Go
+# toolchain; builds ./coli-go, which finds the engine and Python support files
+# in this directory exactly like ./coli does.
+coli-go:
+	cd go && go build -o ../coli-go$(EXE) ./...
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench coli-go
