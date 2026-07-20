@@ -17,6 +17,12 @@ PROFILE_RE = re.compile(
     r"\| attention ([0-9.]+)s .* lm_head ([0-9.]+)s \| other ([0-9.-]+)s"
 )
 PROFILE_KEYS = ("disk", "expert_matmul", "attention", "lm_head", "other")
+P0_RE = re.compile(
+    r"P0-EXEC: routed CPU ([0-9.]+)s / ([0-9.]+) GB/s \(([0-9]+) row\) \| routed GPU critical ([0-9.]+)s \| "
+    r"router ([0-9.]+)s \| residual P2P ([0-9.]+)s / ([0-9]+) hop \| orchestration ([0-9.]+)s"
+)
+P0_KEYS = ("routed_cpu", "routed_cpu_gb_s", "routed_cpu_rows", "routed_gpu_critical",
+           "router", "p2p", "p2p_hops", "orchestration")
 
 
 def parse_output(stdout: str, stderr: str = "") -> tuple[float, list[float]]:
@@ -30,11 +36,20 @@ def parse_output(stdout: str, stderr: str = "") -> tuple[float, list[float]]:
     return float(speed.group(1)), [disk] + [float(value) for value in rest]
 
 
-def execute(engine: str, env: dict[str, str]) -> tuple[float, list[float]]:
+def parse_p0(stdout: str) -> list[float]:
+    """Extract the optional PROF=1 execution-layer breakdown."""
+    row = P0_RE.search(stdout)
+    if not row:
+        raise RuntimeError("benchmark output missing P0-EXEC profile")
+    return [float(value) for value in row.groups()]
+
+
+def execute(engine: str, env: dict[str, str]) -> tuple[float, list[float], list[float]]:
     run = subprocess.run(
         [engine, "4", "4", "4"], env=env, text=True, capture_output=True, check=True
     )
-    return parse_output(run.stdout, run.stderr)
+    speed, profile = parse_output(run.stdout, run.stderr)
+    return speed, profile, parse_p0(run.stdout)
 
 
 def main() -> None:
@@ -63,6 +78,8 @@ def main() -> None:
         OMP_NUM_THREADS=str(args.threads),
         OMP_PROC_BIND="spread",
         OMP_PLACES="cores",
+        DRAFT="0",
+        PROF="1",
     )
 
     execute(args.engine, base | {"STATS": str(stats)})
@@ -86,13 +103,15 @@ def main() -> None:
         execute(args.engine, base | extra)  # warm-up
     speeds = {name: [] for name in modes}
     profiles = {name: [] for name in modes}
+    p0_profiles = {name: [] for name in modes}
     names = list(modes)
     for run_index in range(args.runs):
         order = names[run_index % len(names):] + names[:run_index % len(names)]
         for name in order:
-            speed, profile = execute(args.engine, base | modes[name])
+            speed, profile, p0 = execute(args.engine, base | modes[name])
             speeds[name].append(speed)
             profiles[name].append(profile)
+            p0_profiles[name].append(p0)
 
     result = {}
     for name in names:
@@ -102,6 +121,10 @@ def main() -> None:
             "median_profile_s": {
                 key: statistics.median(row[index] for row in profiles[name])
                 for index, key in enumerate(PROFILE_KEYS)
+            },
+            "median_p0": {
+                key: statistics.median(row[index] for row in p0_profiles[name])
+                for index, key in enumerate(P0_KEYS)
             },
         }
     print(json.dumps(result, indent=2))

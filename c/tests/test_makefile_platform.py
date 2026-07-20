@@ -35,7 +35,7 @@ class MakefilePlatformTests(unittest.TestCase):
         env["PATH"] = ""
 
         result = subprocess.run(
-            [MAKE, "--no-print-directory", "-B", "-n", "glm"],
+            [MAKE, "--no-print-directory", "-B", "-n", "colibri"],
             cwd=C_DIR,
             env=env,
             text=True,
@@ -43,7 +43,7 @@ class MakefilePlatformTests(unittest.TestCase):
             check=True,
         )
 
-        self.assertIn("-o glm.exe", result.stdout)
+        self.assertIn("-o colibri.exe", result.stdout)
         self.assertIn("-fopenmp", result.stdout)
         self.assertIn("-static", result.stdout)
 

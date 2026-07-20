@@ -17,6 +17,45 @@ EN: computed AFTER the FP8 round-trip, so the reference matches exactly what the
 EN: ingests. Default: bf16 (original oracle unchanged)."""
 import json, sys, argparse
 from pathlib import Path
+
+# --- Version gate (must run BEFORE the heavy `from transformers import ...`,
+# which triggers transformers' lazy-loading and can in turn reset the in-memory
+# __version__ attribute; importlib.metadata reads the installed package version
+# directly and is immune to that). ---
+#
+# GLM-5.2's MLA attention uses interleaved (DeepSeek-style) RoPE, which is what
+# the C engine implements. transformers < 5.11.0 applied split-half (Llama-style)
+# RoPE in GlmMoeDsa* instead; an oracle built on those versions drifts and the
+# engine then scores 25/32 instead of the documented 32/32 (issue #281). Weights
+# come out identical across versions — only the forward pass differs — so there
+# is no safe "partial" run: a too-old transformers silently produces an invalid
+# ref_glm.json. Hard-fail rather than warn. EN: same.
+import transformers
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
+
+_MIN_TRANSFORMERS = (5, 11)
+def _tf_version_tuple():
+    try:
+        v = _pkg_version("transformers")          # authoritative: installed dist metadata
+    except PackageNotFoundError:
+        v = getattr(transformers, "__version__", "0")   # fallback (editable/src installs)
+    out = []
+    for part in v.split(".")[:2]:                 # major.minor only
+        out.append(int("".join(c for c in part if c.isdigit()) or "0"))
+    while len(out) < 2:
+        out.append(0)
+    return tuple(out[:2])
+
+_tf_ver = _tf_version_tuple()
+if _tf_ver < _MIN_TRANSFORMERS:
+    sys.exit(
+        f"\nERROR: make_glm_oracle.py requires transformers >= "
+        f"{'.'.join(map(str, _MIN_TRANSFORMERS))}.0 (found {_tf_ver[0]}.{_tf_ver[1]}). "
+        f"GLM-5.2 MLA uses interleaved RoPE; older versions apply split-half RoPE "
+        f"and silently produce an oracle the engine scores 25/32 against (issue #281). "
+        f"Upgrade: pip install -U 'transformers>=5.11'\n"
+    )
+
 import torch
 from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
 
@@ -115,6 +154,7 @@ print("tf_pred:", tf_pred)
 sd = model.state_dict()
 unfuse_experts(sd)
 
+Path("glm_tiny").mkdir(parents=True, exist_ok=True)   # safetensors/json won't create the dir themselves
 if args.fp8:
     n_fp8, n_tot = save_fp8_safetensors(sd, "glm_tiny/model.safetensors")
     print(f"\nsaved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "

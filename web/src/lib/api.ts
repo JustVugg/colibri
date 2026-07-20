@@ -49,6 +49,23 @@ export interface HealthResponse {
   hwinfo?: HwinfoHealth
 }
 
+export interface ProfileTurn {
+  wall_s: number
+  prompt_tokens: number
+  completion_tokens: number
+  expert_disk_s: number
+  expert_wait_s: number
+  expert_matmul_s: number
+  attention_s: number
+  lm_head_s: number
+  forwards: number
+}
+
+export interface ProfileResponse {
+  seq: number
+  turns: ProfileTurn[]
+}
+
 export interface TokenUsage {
   prompt_tokens: number
   completion_tokens: number
@@ -98,6 +115,12 @@ export async function getHealth(baseUrl: string, apiKey = "", signal?: AbortSign
   const response = await fetch(serverEndpoint(baseUrl, "health"), { headers: headers(apiKey), signal })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as HealthResponse
+}
+
+export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ProfileResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "profile"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ProfileResponse
 }
 
 export function extractSSE(buffer: string) {

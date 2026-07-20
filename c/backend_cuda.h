@@ -14,6 +14,7 @@
 #define COLI_CUDA_DLLEXPORT
 #endif
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -92,6 +93,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,C
                                       const float *rope,int S,int H,int Q,int R,
                                       int V,int K,int T,float attention_scale);
 
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+        float *out,const float *q,const void *const *keys,
+        const float *const *latent,const float *const *rope,
+        const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
+
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
@@ -143,4 +149,3 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 #endif
 
 #endif
-

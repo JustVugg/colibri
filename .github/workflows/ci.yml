@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+jobs:
+  engine:
+    name: Engine (Linux, CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build colibri
+        run: cd c && make colibri
+      - name: C test suite
+        run: cd c && make test-c
+
+  engine-cuda-syntax:
+    name: CUDA syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA toolkit (compiler only)
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          # v0.2.19's version table stops at 12.6.2 — 12.6.3 fails the install
+          # step with "Version not available" before nvcc is ever reached.
+          cuda: '12.6.2'
+          method: network
+          sub-packages: '["nvcc"]'
+      - name: Compile backend_cuda.cu (syntax only, no GPU)
+        run: |
+          cd c
+          # NOT `nvcc ... | head -40`: a pipeline exits with the status of its
+          # LAST command, so head's 0 masked every nvcc error and the job could
+          # only ever be green. A check that cannot fail is worse than no check —
+          # it buys false confidence in the one file nothing else compiles.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "CUDA syntax check passed"
+
+  windows-cuda-build:
+    # The Windows CUDA path has no coverage anywhere: `engine-cuda-syntax` above
+    # compiles with nvcc's *GCC* host on Linux, and check.yml's windows job is
+    # MinGW/UCRT64 CPU-only by design (#140). But nvcc on Windows requires MSVC
+    # as its host compiler — it does not accept MinGW — so `make cuda-dll` runs a
+    # toolchain nothing else in CI touches. That gap is not theoretical: every
+    # bug in #158 was a *build* failure on this path (MSVC rejects the GCC-style
+    # -Xcompiler=-Wall,-Wextra with "D8021 invalid numeric argument '/Wextra'",
+    # unresolvable CUDA_HOME/NVCC defaults, POSIX setenv in the kernel test), and
+    # #314 was CUDA_HOME with spaces — the layout the CUDA installer ships by
+    # default. Both classes are compile-time and need no GPU to catch.
+    #
+    # Build-only ON PURPOSE: GitHub's hosted runners have no NVIDIA device, so
+    # this job proves the Windows+MSVC CUDA build stays buildable, NOT that the
+    # kernels or the DLL loader behave on real silicon. That still needs hardware
+    # (see #157). Claiming otherwise would be the false confidence the
+    # engine-cuda-syntax comment above already warns about.
+    name: CUDA build (Windows, MSVC host)
+    # windows-2022, NOT windows-latest: the latest image now ships Visual Studio
+    # 18 (MSVC 14.5x), and CUDA's crt/host_config.h hard-errors on any host newer
+    # than VS 2022 ("Only the versions between 2017 and 2022 (inclusive) are
+    # supported"). That is a real constraint for every CUDA user on Windows, not
+    # a CI quirk — pinning tracks what the toolkit actually supports. Revisit when
+    # a CUDA release accepts VS 18; -allow-unsupported-compiler would only mask it.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: MSVC environment (puts cl.exe on PATH for nvcc -ccbin)
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install CUDA toolkit (compiler only)
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          # Same pin as engine-cuda-syntax: v0.2.19's version table stops at
+          # 12.6.2. This installs to the default "C:\Program Files\NVIDIA GPU
+          # Computing Toolkit\..." path, so CUDA_HOME is space-bearing here —
+          # which is exactly the #314 regression this job would have caught.
+          cuda: '12.6.2'
+          method: network
+          # cudart as well as nvcc: unlike the Linux job (which only needs to
+          # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
+          # runtime headers/import lib ship as a separate installer component —
+          # with '["nvcc"]' alone this fails at `#include <cuda_runtime.h>`.
+          sub-packages: '["nvcc", "cudart"]'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          # inherit: cl.exe (msvc-dev-cmd) and nvcc (cuda-toolkit) are added to
+          # the *Windows* PATH by the steps above; without inheriting it the
+          # recipe's `command -v` guards fail inside the MSYS2 shell.
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+      - name: make cuda-dll (nvcc + MSVC host)
+        shell: msys2 {0}
+        run: |
+          cd c
+          # CUDA_ARCH is pinned: the default is `native`, which asks the driver
+          # what card is present — there is none here, so it must be explicit.
+          # sm_80 matches engine-cuda-syntax and is supported by the 12.6 pin.
+          make cuda-dll CUDA_ARCH=sm_80
+          test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
+          echo "coli_cuda.dll built (MSVC host)"
+      - name: make colibri CUDA_DLL=1 (host links backend_loader, not cudart)
+        shell: msys2 {0}
+        run: |
+          cd c
+          make colibri CUDA_DLL=1
+          test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "colibri.exe built against the DLL loader"
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npx vitest run
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python test suite
+        run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'

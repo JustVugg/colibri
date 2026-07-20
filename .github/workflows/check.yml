@@ -1,0 +1,49 @@
+# CI: run the repo's own dependency-free gate (`make check` = clean + portable
+# CPU build + C unit suites + Python stdlib tests) on the three claimed
+# platforms. No model downloads, no CUDA, no external deps — by design (#140).
+name: check
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make check
+        run: make -C c check
+
+  windows:
+    # The job that would have caught #68/#137 pre-merge: native MinGW-w64
+    # (MSYS2/UCRT64), the exact toolchain the README's Windows port targets.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: make check
+        run: make -C c check
+
+  macos:
+    # clang; libomp for the threaded path (Makefile falls back to
+    # single-threaded automatically if it's ever missing).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libomp
+        run: brew install libomp
+      - name: make check
+        run: make -C c check

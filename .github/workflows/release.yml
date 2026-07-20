@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            ext: ""
+            make_args: "ARCH=x86-64-v3"
+          - os: macos-latest
+            name: macos-arm64
+            ext: ""
+            make_args: ""
+          - os: windows-latest
+            name: windows-x86_64
+            ext: ".exe"
+            make_args: ""
+            # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
+            # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
+            shell: "msys2 {0}"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell || 'bash' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          # inherit: the Package step calls the runner's 7z.exe, which lives on
+          # the Windows PATH; the default minimal path would not see it.
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+
+      - if: matrix.os == 'macos-latest'
+        run: brew install libomp
+
+      - name: Build engine
+        run: |
+          cd c
+          make glm ${{ matrix.make_args }}
+          ls -lh glm${{ matrix.ext }}
+
+      - name: Package
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p dist
+          cp c/glm${{ matrix.ext }} dist/colibri-${TAG}-${{ matrix.name }}${{ matrix.ext }}
+          cp c/coli dist/
+          cp c/version.py dist/
+          cp c/openai_server.py dist/
+          cp c/resource_plan.py dist/
+          cp c/doctor.py dist/
+          cp LICENSE dist/
+          cd dist
+          if [ "${{ matrix.ext }}" = ".exe" ]; then
+            7z a colibri-${TAG}-${{ matrix.name }}.zip *
+          else
+            tar czf colibri-${TAG}-${{ matrix.name }}.tar.gz *
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: colibri-${{ matrix.name }}
+          path: dist/colibri-*.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          # Extract the latest version section from CHANGELOG
+          NOTES=$(awk "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${TAG}"
+          fi
+          gh release create "$TAG" artifacts/* \
+            --title "colibrì ${TAG}" \
+            --notes "$NOTES"

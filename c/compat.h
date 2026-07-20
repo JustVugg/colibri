@@ -80,6 +80,7 @@ static inline int compat_open_direct(const char *path){
 #endif
 #include <windows.h>
 #include <io.h>
+#include <direct.h>   /* _mkdir (for the mkdtemp shim below) */
 #include <process.h>
 #include <malloc.h>
 #include <fcntl.h>
@@ -143,6 +144,12 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
  * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
  * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
+/* Ultimo GetLastError() di una ReadFile fallita, per thread: il chiamante
+ * (pread_full in glm.c) lo stampa accanto a strerror. Senza questo, OGNI
+ * fallimento Windows collassa in "EIO -> Input/output error" e la diagnosi
+ * dal campo diventa un tirare a indovinare (#307: tre giri di ipotesi tra
+ * tre persone perche' il codice vero non compariva da nessuna parte). */
+static __thread DWORD compat_pread_lasterr __attribute__((unused));
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
@@ -158,6 +165,7 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
         if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
             DWORD err = GetLastError();
             if(err == ERROR_HANDLE_EOF) break;  /* past EOF → return bytes read (0 if none, matching POSIX pread) */
+            compat_pread_lasterr = err;         /* preserva il codice VERO per il report (#307) */
             if(err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_FUNCTION) errno = EBADF;
             else errno = EIO;
             return -1;
@@ -237,7 +245,9 @@ static inline int compat_rename(const char *old, const char *new){
 /* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
  * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */
 #include <psapi.h>
-#pragma comment(lib, "psapi.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")   /* MSVC: link psapi; MinGW/GCC uses -lpsapi */
+#endif
 struct rusage { long ru_maxrss; };
 #define RUSAGE_SELF 0
 static inline int getrusage(int who, struct rusage *r){
@@ -304,7 +314,51 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- getenv_utf8: read an env var as UTF-8, not through the ANSI codepage ---
+ * Plain getenv()/_environ are populated by the CRT from the ANSI-codepage view
+ * of the process environment block, not UTF-8. A parent that hands the child a
+ * Unicode value via CreateProcessW's wide env block (e.g. Python's subprocess
+ * module, which coli uses to pass the chat prompt) round-trips correctly only
+ * through GetEnvironmentVariableW; going through narrow getenv() re-encodes it
+ * via CP_ACP first, so any non-ASCII prompt text (Cyrillic, CJK, ...) comes out
+ * corrupted before the byte-level tokenizer ever sees it. Read the wide value
+ * directly and convert straight to UTF-8, bypassing the ANSI codepage entirely.
+ * Returned buffer is intentionally leaked: called a handful of times at
+ * startup, lives for the process. */
+static inline const char *compat_getenv_utf8(const char *name){
+    wchar_t wname[64];
+    if(MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64) <= 0) return getenv(name);
+    DWORD need = GetEnvironmentVariableW(wname, NULL, 0);
+    if(!need) return NULL;
+    wchar_t *wval = (wchar_t*)malloc(need * sizeof(wchar_t));
+    if(!wval) return NULL;
+    GetEnvironmentVariableW(wname, wval, need);
+    int blen = WideCharToMultiByte(CP_UTF8, 0, wval, -1, NULL, 0, NULL, NULL);
+    char *val = blen>0 ? (char*)malloc((size_t)blen) : NULL;
+    if(val) WideCharToMultiByte(CP_UTF8, 0, wval, -1, val, blen, NULL, NULL);
+    free(wval);
+    return val;
+}
+#define getenv_utf8(name) compat_getenv_utf8(name)
+
+/* --- mkdtemp -> _mktemp + _mkdir (POSIX mkdtemp assente su Windows) ---
+ * Test binaries (test_stops.c) create a scratch dir in the CWD via a
+ * "name_XXXXXX" template; POSIX mkdtemp fills the X's and mkdirs 0700. The
+ * Windows CRT has _mktemp (in-place, same XXXXXX contract) so we compose it.
+ * Returns the template pointer on success, NULL on failure — matching POSIX. */
+static inline char *compat_mkdtemp(char *tmpl){
+    if(!tmpl) return NULL;
+    if(!_mktemp(tmpl)) return NULL;       /* fills the trailing X's in place */
+    if(_mkdir(tmpl) != 0) return NULL;    /* EEXIST is impossible post-_mktemp */
+    return tmpl;
+}
+#define mkdtemp(tmpl) compat_mkdtemp(tmpl)
+
 #endif /* _WIN32 */
+
+#ifndef getenv_utf8
+#define getenv_utf8(name) getenv(name)
+#endif
 
 /* --- compat_aligned_free su piattaforme diverse da Windows ---
  * Su Linux/macOS, posix_memalign usa free() normale. */

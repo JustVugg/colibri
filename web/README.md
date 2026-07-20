@@ -17,9 +17,14 @@ npm test
 npm run build
 ```
 
+Besides Chat and Brain, the **Profiling** tab charts where the engine spent
+each turn's wall time (I/O wait, expert matmul, attention, LM head) from the
+server's `/profile` endpoint — a rolling window of per-turn `PROF` snapshots
+emitted by the engine.
+
 The test suite stays browser-light: API requests use a mocked `fetch`, while
 runtime capability and storage behavior are covered through pure helpers. It
-checks that `/health` is resolved next to (not below) the OpenAI `/v1` prefix,
+checks that `/health` and `/profile` are resolved next to (not below) the OpenAI `/v1` prefix,
 supports both boolean and numeric `scheduler.active` responses, and sends the
 colibrì-specific `cache_slot` field only when KV-slot support was advertised.
 

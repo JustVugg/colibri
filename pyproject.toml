@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colibri-engine"
+dynamic = ["version"]
+description = "Tiny engine, immense model — run GLM-5.2 (744B MoE) locally"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    {name = "JustVugg"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+convert = [
+    "numpy",
+    "huggingface_hub",
+]
+oracle = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "safetensors",
+]
+bench = [
+    "tokenizers",
+    "datasets",
+]
+
+[project.scripts]
+coli = "colibri.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/JustVugg/colibri"
+Issues = "https://github.com/JustVugg/colibri/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "colibri._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["colibri*"]

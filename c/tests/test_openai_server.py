@@ -380,6 +380,25 @@ class DispatcherTest(unittest.TestCase):
         engine.close()
         self.assertEqual(chunks, ["é"])
 
+    def test_records_profile_snapshots_from_prof_lines(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.profile_seq, 1)
+        self.assertEqual(list(engine.profile), [{
+            "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
+            "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
+            "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+        }])
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
@@ -442,6 +461,20 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+
+    def test_profile_reports_recent_turns_without_auth(self):
+        with urlopen(self.base + "/profile", timeout=2) as response:
+            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+        turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
+                "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
+                "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
+        self.engine.profile = [turn]
+        self.engine.profile_seq = 1
+        try:
+            with urlopen(self.base + "/profile", timeout=2) as response:
+                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+        finally:
+            del self.engine.profile, self.engine.profile_seq
 
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={

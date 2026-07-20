@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
+PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -270,6 +271,14 @@ def parse_tool_calls(reply, tools=None):
                 salvaged.append(name)
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if tools and not calls and re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
+        # Diagnosi per la #401: il client ha dichiarato i tools e il modello ha PROVATO la
+        # sintassi, ma il parse rigoroso non ha agganciato nulla (tipico output int4 storpiato).
+        # EN: #401 field diagnosis: tools were declared and the model attempted the syntax,
+        # EN: but the strict parse matched nothing (typically quantization-mangled output).
+        sys.stderr.write("[api] tools declared and tool-call markers present, but no call "
+                         "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
+        sys.stderr.flush()
     text = _BOX_RE.sub("", reply)
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
@@ -405,7 +414,10 @@ def generation_options(body, limit):
         maximum = body.get("max_tokens")
         maximum_param = "max_tokens"
     if maximum is None:
-        maximum = min(256, limit)
+        # Client omitted max_tokens: honor the operator's configured budget (--max-tokens /
+        # --ngen), not an arbitrary 256 — `coli serve --ngen 32768` must mean 32768 (#382).
+        # Generation still ends at EOS, so this is a cap, not a target.
+        maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
     temperature = 0.7 if temperature is None else temperature
@@ -473,6 +485,8 @@ class Engine:
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
+        self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
+        self.profile_seq = 0
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -550,6 +564,20 @@ class Engine:
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
+                elif kind == "PROF" and len(fields) >= 10:
+                    # per-turn phase timings: where the engine spent this turn's wall time
+                    self.profile.append({
+                        "wall_s": float(fields[1]),
+                        "prompt_tokens": int(fields[2]),
+                        "completion_tokens": int(fields[3]),
+                        "expert_disk_s": float(fields[4]),
+                        "expert_wait_s": float(fields[5]),
+                        "expert_matmul_s": float(fields[6]),
+                        "attention_s": float(fields[7]),
+                        "lm_head_s": float(fields[8]),
+                        "forwards": int(fields[9]),
+                    })
+                    self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
@@ -780,6 +808,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/profile":
+                eng = self.server.engine
+                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
+                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):

@@ -20,7 +20,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
+import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
@@ -40,6 +40,8 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from version import __version__ as _version
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, openai_server.py) and
@@ -52,16 +54,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # guess is right (e.g. a custom packaging layout).
 _EXE = ".exe" if sys.platform == "win32" else ""
 _LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_here_colibri = os.path.join(HERE, "colibri" + _EXE)
 _here_glm = os.path.join(HERE, "glm" + _EXE)
 
 if os.environ.get("COLI_ENGINE"):
     GLM = os.environ["COLI_ENGINE"]
     TOOLS = os.path.join(os.path.dirname(GLM), "tools")
+elif os.path.exists(_here_colibri):
+    GLM = _here_colibri
+    TOOLS = os.path.join(HERE, "tools")
 elif os.path.exists(_here_glm):
     GLM = _here_glm
     TOOLS = os.path.join(HERE, "tools")
 else:
-    GLM = os.path.join(_LIBEXEC, "glm" + _EXE)
+    GLM = os.path.join(_LIBEXEC, "colibri" + _EXE)
     TOOLS = os.path.join(_LIBEXEC, "tools")
     sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
 
@@ -115,7 +121,7 @@ def sprite_lines():
 def banner(sub=""):
     sp=sprite_lines()
     txt=[
-        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
+        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
         f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
@@ -141,12 +147,24 @@ def need_model(model):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
 def cuda_binary():
-    if not os.path.exists(GLM) or sys.platform != "linux": return False
-    try:
-        linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
-        return any("libcudart" in line and "not found" not in line
-                   for line in linked.stdout.splitlines())
-    except (OSError,subprocess.SubprocessError): return False
+    if not os.path.exists(GLM): return False
+    if sys.platform == "linux":
+        try:
+            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            return any("libcudart" in line and "not found" not in line
+                       for line in linked.stdout.splitlines())
+        except (OSError,subprocess.SubprocessError): return False
+    if sys.platform == "win32":
+        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
+        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
+        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
+        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        try:
+            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+        except OSError: return False
+        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+    return False
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
@@ -227,13 +245,13 @@ def env_for(a):
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
                 if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
                 e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
             if not cuda_binary():
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
             e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
@@ -407,8 +425,8 @@ def cmd_build(a):
     banner("build")
     if not os.path.exists(os.path.join(HERE, "Makefile")):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
-                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c glm.")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
+                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
+    sys.exit(subprocess.call(["make","-C",HERE,"colibri"]))
 
 def cmd_info(a):
     banner("info")
@@ -480,13 +498,141 @@ def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink)
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
+    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
+    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
+    # <think> open so the engine emits its reasoning block; the default stays nothink.
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
     sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
 
+def server_probe(base, api_key=None, timeout=1.5):
+    """Is a coli serve alive at `base`? Returns its model_id, or None.
+    Probes /health then /v1/models — both cheap, neither touches the engine."""
+    import urllib.request, urllib.error
+    def get(path):
+        req=urllib.request.Request(base.rstrip("/")+path)
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8","replace"))
+    try:
+        if get("/health").get("status")!="ok": return None
+        data=get("/v1/models").get("data") or []
+        return data[0]["id"] if data else None
+    except Exception:
+        return None
+
+def chat_attached(a, base, model_id):
+    """The chat REPL over HTTP against a running `coli serve`.
+
+    Why this exists (the cold-chat cost, measured): spawning a private engine
+    pays 34-136 s of resident load on EVERY start, and begins with an empty
+    expert cache — hit rate 4% cold vs 55% warm, a ~10x on early decode. A
+    resident server pays load once and keeps the LRU warm across sessions;
+    its KV slots reuse the conversation prefix, so a continued chat skips
+    re-prefill too. The engine byte-protocol stays untouched — this is plain
+    OpenAI SSE over localhost, stdlib only."""
+    import urllib.request
+    print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
+    msgs=[]
+    w=term_w()-4
+    while True:
+        if TTY:
+            print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
+            try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            except EOFError: print(); break
+            print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+        else:
+            try: msg=input()
+            except EOFError: break
+        msg=msg.strip()
+        if msg in (":q",":quit","exit"): break
+        if not msg: continue
+        if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        msgs.append({"role":"user","content":msg})
+        body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
+                         "max_tokens":a.ngen}).encode()
+        req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
+                                   headers={"Content-Type":"application/json"})
+        if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
+        print(f"\n  {C.teal}◆ colibrì{C.r}")
+        sp=Spinner("thinking…"); sp.start()
+        md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False
+        try:
+            with urllib.request.urlopen(req) as r:
+                for raw in r:
+                    line=raw.decode("utf-8","replace").strip()
+                    if not line.startswith("data: "): continue
+                    data=line[6:]
+                    if data=="[DONE]": break
+                    try: ev=json.loads(data)
+                    except ValueError: continue
+                    for ch in ev.get("choices",[]):
+                        d=ch.get("delta",{})
+                        txt=d.get("content")
+                        if not txt: continue          # ping/ruolo/reasoning: non è testo
+                        if first: sp.stop(); first=False
+                        md.feed(txt); reply.append(txt)
+        except KeyboardInterrupt:
+            interrupted=True                          # il server annulla la richiesta alla disconnessione
+        except OSError as e:
+            sp.stop()
+            print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
+        sp.stop(); md.close()
+        if reply: msgs.append({"role":"assistant","content":"".join(reply)})
+        else: msgs.pop()                              # turno vuoto: non sporcare la history
+        el=time.time()-t0
+        note=" · ⏹ interrupted" if interrupted else ""
+        print(f"\r  {C.dgray}└─ ~{len(''.join(reply))//4} tok · {el:.0f}s{note}{C.r}\n")
+    print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
+
+def kv_resume_notice(model_dir):
+    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load): a chat
+    started today continues a conversation from days ago, with `first=0` so the
+    turn is appended WITHOUT the [gMASK]<sop> prefix. The engine does announce it
+    on stderr — but nothing here ever shows that: the drain thread's
+    p.stderr.read() blocks until EOF, so on a healthy start errlog is still empty
+    when the status lines are printed. The warning only appeared once the engine
+    DIED, which is exactly when it no longer mattered.
+
+    Measured cost of the silence: a chat inherited 670 tokens of an old Italian
+    session ("il mio numero preferito e 7, ricordalo!"). Every later reply came
+    back in Italian, and "explain fibonacci in short" was answered about the
+    number 7 — the model was being coherent with a context nobody could see, and
+    it read as a quantization bug for a day.
+
+    So say it here, in Python, from the file itself: no pipe, no thread, no
+    Windows deadlock risk (see the stderr comment below)."""
+    p=os.path.join(model_dir, ".coli_kv")
+    try:
+        with open(p,"rb") as f:
+            if f.read(8)!=b"COLIKV1\0": return
+            h=struct.unpack("<8i", f.read(32))
+        n=h[6]
+        if n<1: return
+        age=time.time()-os.path.getmtime(p)
+        when=f"{age/86400:.0f}d ago" if age>86400 else f"{age/3600:.0f}h ago" if age>3600 else "just now"
+        print(f"  {C.yel}↺ resuming a saved conversation: {n} tokens, last written {when}{C.r}")
+        print(f"  {C.dgray}  it steers tone, language and topic. :reset clears it · "
+              f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
+    except (OSError, struct.error): pass
+
 def cmd_chat(a):
+    # ATTACH: a running `coli serve` beats a private engine every time — the load
+    # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
+    # wins; otherwise probe localhost quietly and use it if it's there. --no-attach
+    # forces the old behaviour. The probe costs ~1 ms when nothing is listening.
+    if not getattr(a,"no_attach",False):
+        base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
+        mid=server_probe(base, getattr(a,"api_key",None))
+        if mid:
+            banner(f"chat · {mid} · attached")
+            chat_attached(a, base, mid); return
+        if getattr(a,"attach",None):
+            sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
+    kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
@@ -619,12 +765,65 @@ def cmd_chat(a):
         except Exception: pass
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
+def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
+
 def cmd_serve(a):
     need_model(a.model)
+    # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
+    # EN: pidfile so `coli stop` can shut everything down without manual pkill.
+    try:
+        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+    except OSError: pass
     from openai_server import serve
-    serve(a.model, a.host, a.port, a.model_id, a.api_key,
-          a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
-          a.max_queue,a.queue_timeout,a.kv_slots)
+    try:
+        serve(a.model, a.host, a.port, a.model_id, a.api_key,
+              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+              a.max_queue,a.queue_timeout,a.kv_slots)
+    finally:
+        try: os.unlink(serve_pidfile(a.port))
+        except OSError: pass
+
+def cmd_stop(a):
+    """Shut down a running `coli serve` AND its engine — one command, no pkill.
+    The engine re-execs itself for OMP tuning, so its process is named `exe`,
+    not `glm`: every `pkill -x glm` in history silently killed nothing (that is
+    how two 17+5 GB ghost engines OOM'd this box on 2026-07-16). This finds the
+    real processes: the pidfile first, then /proc by cmdline/environ — only
+    processes that are demonstrably ours (SERVE=1 + our SNAP, or `coli serve`
+    in the command line)."""
+    banner("stop")
+    targets=[]  # (pid, descrizione)
+    pf=serve_pidfile(a.port)
+    try:
+        pid=int(open(pf).read().split()[0])
+        os.kill(pid,0); targets.append((pid,f"coli serve (pidfile, port {a.port})"))
+    except (OSError,ValueError,IndexError): pass
+    for pd in os.listdir("/proc"):
+        if not pd.isdigit(): continue
+        pid=int(pd)
+        try:
+            cmd=open(f"/proc/{pd}/cmdline","rb").read().replace(b"\0",b" ").decode("utf-8","replace")
+            if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
+                if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
+            comm=open(f"/proc/{pd}/comm").read().strip()
+            if comm in ("colibri","glm","exe","olmoe"):
+                env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
+                if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
+        except (OSError,PermissionError): continue
+    if not targets:
+        print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
+    for pid,desc in targets: print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
+    if a.dry_run: return
+    for pid,_ in targets:
+        try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    time.sleep(2.0)
+    for pid,_ in targets:
+        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
+        except OSError: pass       # gia' morto: bene
+    try: os.unlink(pf)
+    except OSError: pass
+    print(f"  {C.grn}✓ stopped{C.r} — RAM released")
 
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
@@ -712,6 +911,7 @@ def main():
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
+    ap.add_argument("--version", action="version", version=f"colibrì {_version}")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
@@ -719,7 +919,14 @@ def main():
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
-    sub.add_parser("chat", parents=[common])
+    pc=sub.add_parser("chat", parents=[common])
+    pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,
+                    help="chat against a running `coli serve` instead of spawning an engine "
+                         "(keeps the model loaded and the expert cache warm across chat sessions). "
+                         "Bare --attach probes localhost:8000.")
+    pc.add_argument("--no-attach", action="store_true",
+                    help="never auto-attach, always spawn a private engine")
+    pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
@@ -728,6 +935,8 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
+    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
@@ -751,7 +960,7 @@ def main():
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
+             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)

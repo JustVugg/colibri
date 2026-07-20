@@ -10,6 +10,7 @@ from resource_plan import (
     GB,
     analyze_model,
     build_plan,
+    cpu_socket_count,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -66,15 +67,19 @@ class ResourcePlanTest(unittest.TestCase):
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
 
+    def test_cpu_socket_count_is_positive(self):
+        self.assertGreaterEqual(cpu_socket_count(), 1)
+
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,
                  "free_bytes": 10 * GB}]
         plan = build_plan(self.model, ram_gb=16, context=32, vram_gb=20,
                           available_memory=32 * GB, available_disk=100 * GB, gpus=gpus,
-                          physical_cpus=24)
+                          physical_cpus=24, cpu_sockets=2)
         self.assertEqual(plan["version"], 2)
         self.assertEqual(plan["policy"]["name"], "quality")
         self.assertEqual(plan["cpu"]["physical_cores"], 24)
+        self.assertEqual(plan["cpu"]["sockets"], 2)
         self.assertTrue(plan["policy"]["preserve_quantization"])
         self.assertFalse(plan["tiers"]["vram"]["requires_host_backing"])
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
@@ -105,7 +110,7 @@ class ResourcePlanTest(unittest.TestCase):
             {"index": 1, "name": "b", "total_bytes": 12 * GB, "free_bytes": 10 * GB},
         ]
         plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
-                          available_disk=1, gpus=gpus)
+                          available_disk=1, gpus=gpus, cpu_sockets=2)
         env = environment_for_plan(plan, {"RAM_GB": "12", "PIN": "stats.txt",
                                                "COLI_GPUS": "1"})
         self.assertEqual(env["RAM_GB"], "12")
@@ -125,6 +130,91 @@ class ResourcePlanTest(unittest.TestCase):
                                                         "OMP_PROC_BIND": "close"})
         self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
         self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
+
+        if sys.platform.startswith("linux"):
+            self.assertEqual(env["COLI_NUMA"], "1")
+            explicit_numa = environment_for_plan(plan, {"COLI_NUMA": "0"})
+            self.assertEqual(explicit_numa["COLI_NUMA"], "0")
+
+    def test_single_socket_plan_does_not_enable_numa(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[], physical_cpus=8, cpu_sockets=1)
+        self.assertNotIn("COLI_NUMA", environment_for_plan(plan))
+
+    def test_auto_tune_mtp_off_when_compute_bound(self):
+        # Tiny model with 64 GB RAM and no GPU: all experts fit in RAM with no
+        # warm tier, so the plan classifies as compute-bound.
+        plan = build_plan(self.model, ram_gb=64, available_memory=64 * GB,
+                          available_disk=100 * GB, gpus=[], physical_cpus=24,
+                          cpu_sockets=2)
+        # With such a small model fully in RAM and no GPU, bottleneck is compute
+        self.assertEqual(plan["bottleneck_class"], "compute")
+        self.assertIn("DRAFT", plan["tune"])
+        self.assertEqual(plan["tune"]["DRAFT"]["value"], "0")
+        env = environment_for_plan(plan)
+        self.assertEqual(env["DRAFT"], "0")
+        explicit = environment_for_plan(plan, {"DRAFT": "3"})
+        self.assertEqual(explicit["DRAFT"], "3")
+
+    def test_auto_tune_mtp_off_when_disk_low_hit(self):
+        # Use a model large enough that 8 GB RAM can't hold all experts.
+        big = tempfile.TemporaryDirectory()
+        bigmodel = Path(big.name)
+        (bigmodel / "config.json").write_text(json.dumps({
+            "num_hidden_layers": 2, "n_routed_experts": 4,
+            "kv_lora_rank": 4, "qk_rope_head_dim": 2,
+            "qk_nope_head_dim": 3, "v_head_dim": 5, "num_attention_heads": 2,
+        }))
+        expert_size = 3 * GB  # each expert 3 GB → 12 GB total, won't fit in 8 GB budget
+        write_shard(bigmodel / "out-00000.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_a_proj.weight", 200),
+        ])
+        for i in range(4):
+            write_shard(bigmodel / f"out-{i+1:05d}.safetensors", [
+                (f"model.layers.1.mlp.experts.{i}.gate_proj.weight", expert_size),
+            ])
+        plan = build_plan(bigmodel, ram_gb=0, available_memory=4 * GB,
+                          available_disk=100 * GB, gpus=[], physical_cpus=8,
+                          cpu_sockets=1)
+        big.cleanup()
+        self.assertEqual(plan["bottleneck_class"], "disk")
+        self.assertLess(plan["projected_hit_rate"], 0.90)
+        self.assertEqual(plan["tune"]["DRAFT"]["value"], "0")
+
+    def test_auto_tune_pipe_multi_gpu(self):
+        gpus = [
+            {"index": 0, "name": "a", "total_bytes": 32 * GB, "free_bytes": 30 * GB},
+            {"index": 1, "name": "b", "total_bytes": 32 * GB, "free_bytes": 30 * GB},
+        ]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus, cpu_sockets=2)
+        self.assertEqual(plan["tune"]["COLI_CUDA_PIPE"]["value"], "2")
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_CUDA_PIPE"], "2")
+
+    def test_auto_tune_pipe_single_gpu(self):
+        gpus = [{"index": 0, "name": "a", "total_bytes": 12 * GB, "free_bytes": 10 * GB}]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus, cpu_sockets=1)
+        self.assertEqual(plan["tune"]["COLI_CUDA_PIPE"]["value"], "1")
+
+    def test_auto_tune_numa_hint_for_cpu_only(self):
+        plan = build_plan(self.model, ram_gb=64, available_memory=64 * GB,
+                          available_disk=1, gpus=[], physical_cpus=64, cpu_sockets=2)
+        self.assertIn("_numa_hint", plan["tune"])
+        self.assertIn("numactl", plan["tune"]["_numa_hint"])
+        self.assertIn("auto-tune", format_plan(plan))
+
+    def test_format_plan_shows_tune_and_hit_rate(self):
+        plan = build_plan(self.model, ram_gb=64, available_memory=64 * GB,
+                          available_disk=100 * GB, gpus=[], physical_cpus=24,
+                          cpu_sockets=1)
+        text = format_plan(plan)
+        self.assertIn("hit", text)
+        self.assertIn("auto-tune", text)
+        self.assertIn("DRAFT", text)
+
     def test_cpu_binary_does_not_apply_gpu_tier(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
                           gpus=[{"index": 0, "name": "a", "total_bytes": 8 * GB,

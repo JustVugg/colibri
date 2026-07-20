@@ -7,7 +7,7 @@
  * (sign-trick kernels must treat |−128| as 128 unsigned, not saturate to 127),
  * and random data at qrow_i8's contract (|x| <= 127, w full int8 range). */
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static uint32_t rng_state=0x12345678u;
