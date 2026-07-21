@@ -26,6 +26,9 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
+| `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). || `serve` | Start the OpenAI-compatible HTTP server. |
+| `stop` | Stop a server on the selected port. |
+| `ramdisk` | Open the Linux NUMA-aware RAM-disk TUI or run a scriptable lifecycle action. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
@@ -73,6 +76,59 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--io-bits` | `8` | Resident (attention/dense/embed) bit width. |
 | `--xbits` | `0` | Extra/override bit width. |
 | `--no-mtp` | off | Skip the MTP speculative-draft head. |
+
+**`ramdisk`** (Linux only)
+
+Run `coli ramdisk` in a terminal for the curses interface, or select one of the
+equivalent scriptable actions:
+
+```sh
+coli ramdisk plan --model /models/glm --json
+coli ramdisk prepare --model /models/glm --yes
+coli ramdisk start --base-port 8000
+coli ramdisk status --json
+coli ramdisk benchmark --json
+coli ramdisk stop
+coli ramdisk destroy --yes
+```
+
+`benchmark` requires managed engines to be stopped so SSD, tmpfs/slab, direct
+RAM-map, and per-node aggregate runs all use the same deterministic controls.
+The best safe I/O knobs are saved per topology and reused by `start`; managed
+engines still use every physical core on their target topology.
+Partial plans also show the profile coverage of shard-closure staging beside a
+same-budget hot-expert `PIN` estimate, making shard-granularity waste explicit.
+System scorecards report mount-specific tmpfs allocation; tmpfs does not expose
+per-mount THP counters, so huge-page coverage is labeled as host-global.
+Saved benchmark reports include the source revision and dirty-tree state, exact
+command, hardware and storage details, warm-up count, measured-run count, and
+median throughput required for reproducible comparisons.
+Linux physical-read accounting carries an explicit validity bit: unavailable
+`/proc/self/io` data is shown as `n/a` and cannot satisfy the full-mode
+zero-SSD-read acceptance check.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--mode` | `full` | `full` copies every shard; `partial` requires a compatible usage profile and stages complete shard closures. |
+| `--topology` | `interleaved` | One interleaved engine, or `per-node` replicas bound with `numactl`. |
+| `--capacity-gb` | full model size | Staging budget; required and strictly enforced in partial mode. |
+| `--profile` | `<model>/.coli_usage` | Explicit compatible text/JSON expert-usage profile for partial mode. |
+| `--mount-root` | `/mnt/colibri-ram` | Managed tmpfs mount root. V1 accepts only non-symlink paths below `/mnt`; existing paths must be empty and not writable by the invoking user. |
+| `--allow-swappable` | off | Explicitly permit tmpfs without `noswap` on older kernels; Colibri never runs `swapoff`. |
+| `--thp` | `auto` | tmpfs THP policy: `auto` prefers `within_size`, or select `within_size`/`advise` explicitly. Unsupported `within_size` mounts retry with `advise`. |
+| `--prefault` | `1` for managed full mode, otherwise `0` | Prefault direct mappings at engine startup. |
+| `--parallel` | `2` | Bounded shard-copy worker count. |
+| `plan/status/benchmark --json` | off | Emit a versioned machine-readable report. |
+| `prepare/destroy --yes` | off | Confirm reviewed mount or cleanup work in non-interactive scripts. |
+| `start --base-port` | `8000` | Interleaved port, or base plus NUMA node id for replicas. |
+
+Planning and status are unprivileged. Preparation and destruction request sudo
+only for their exact `mount`/`umount` commands; model files and durable
+`.coli_usage`/`.coli_kv*` state remain on SSD and are never modified by staging.
+Set `XDG_STATE_HOME` to an absolute SSD-backed path: tmpfs/ramfs state locations
+and locations beneath the weight mount are rejected. `X-mount.mkdir=0755` may
+leave an empty root-owned directory below `/mnt` after unmount; the mounted tmpfs
+itself is still private (`mode=0700`) and that empty directory is safe to reuse.
 
 **`bench`**: `[tasks...]` (positional), `--limit 40`, `--data <bench dir>`.
 **`plan` / `doctor`**: `--json`.

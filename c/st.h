@@ -16,8 +16,24 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include "json.h"
 #include "compat.h"
+
+/* Keep the filesystem probes dependency-free.  linux/magic.h is not available
+ * in every libc/sysroot used by the portable build, so define the two values we
+ * need when the platform headers did not provide them. */
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
+#ifndef NINEP_SUPER_MAGIC
+#define NINEP_SUPER_MAGIC 0x01021997
+#endif
+#ifndef WSLFS_MAGIC
+#define WSLFS_MAGIC 0x53464846
+#endif
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -39,6 +55,8 @@ typedef struct {
     int        fds[512];
     int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
     char      *paths[512];
+    long       fs_magic[512]; /* fstatfs result for the opened descriptor (Linux) */
+    unsigned char is_tmpfs[512]; /* descriptor backing, not pathname spelling/symlink */
     int        nfd;
 #define ST_MAX_MIR 4       /* extra read replicas beyond the primary (multi-SSD) */
     int        mfds[ST_MAX_MIR][512];  /* MIRROR: fds of replica copy r+1 (multi-SSD), -1 = absent */
@@ -102,15 +120,29 @@ static inline float f16_to_f32(uint16_t h) {
 
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
+    if (S->nfd >= ST_MAX_SHARDS) {
+        fprintf(stderr, "too many open shards (>%d)\n", ST_MAX_SHARDS); exit(1);
+    }
     int fd = open(path, COMPAT_O_RDONLY);
     if (fd < 0) { perror(path); exit(1); }
-    S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
+    int si=S->nfd;
+    S->paths[si] = strdup(path); S->fds[si] = fd;
+#ifdef __linux__
+    struct statfs sfs;
+    if(fstatfs(fd,&sfs)==0){
+        S->fs_magic[si]=(long)sfs.f_type;
+        S->is_tmpfs[si]=((unsigned long)sfs.f_type==(unsigned long)TMPFS_MAGIC);
+    }
+#endif
 #ifdef O_DIRECT
-    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
+    /* O_DIRECT has no value for tmpfs and may fail with EINVAL on older kernels.
+     * More importantly, the RAM-map path must not manufacture a second descriptor
+     * whose semantics suggest physical storage for an in-memory shard. */
+    S->dfds[si] = S->is_tmpfs[si] ? -1 : open(path, COMPAT_O_RDONLY | O_DIRECT); /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
-    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
+    S->dfds[si] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
 #else
-    S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
+    S->dfds[si] = -1;                                /* niente equivalente: solo buffered */
 #endif
     S->nfd++;
     return fd;
@@ -124,6 +156,17 @@ static int st_fidx(shards *S, int fd) {
 }
 static int st_direct_fd(shards *S, int fd) {
     int i = st_fidx(S, fd); return i < 0 ? -1 : S->dfds[i];
+}
+
+static int st_fd_slot(const shards *S, int fd) {
+    for(int i=0;i<S->nfd;i++) if(S->fds[i]==fd) return i;
+    return -1;
+}
+static int st_fd_is_tmpfs(const shards *S, int fd) {
+    int i=st_fd_slot(S,fd); return i>=0 && S->is_tmpfs[i];
+}
+static long st_fd_fs_magic(const shards *S, int fd) {
+    int i=st_fd_slot(S,fd); return i>=0 ? S->fs_magic[i] : 0;
 }
 
 /* ---- MIRROR (multi-SSD): read-only copies of the model on other drives ----

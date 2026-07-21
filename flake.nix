@@ -66,12 +66,12 @@
             # source tree `coli` runs in (see the path-resolution logic at the
             # top of c/coli): the engine, the coli CLI script, the support
             # modules it imports (openai_server.py, resource_plan.py,
-            # doctor.py), and tools/ all sit next to each other.
+            # doctor.py, ramdisk.py), and tools/ all sit next to each other.
             mkdir -p $out/lib/colibri/tools $out/bin
             cp c/colibri         $out/lib/colibri/colibri
             cp c/coli            $out/lib/colibri/coli
             chmod +x $out/lib/colibri/coli
-            cp c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/version.py \
+            cp c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/version.py c/ramdisk.py \
               $out/lib/colibri/
             cp -r c/tools/*      $out/lib/colibri/tools/
 
@@ -80,7 +80,7 @@
 
             # Wrap coli: point it at the bundled engine (COLI_ENGINE) so it is
             # found by default, and at the module dir (PYTHONPATH) so
-            # `import openai_server` / `resource_plan` / `doctor` resolve.
+            # `import openai_server` / `resource_plan` / `doctor` / `ramdisk` resolve.
             makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
               --add-flags "$out/lib/colibri/coli" \
               --set-default COLI_ENGINE "$out/lib/colibri/colibri" \
@@ -91,7 +91,7 @@
           checkPhase = ''
             runHook preCheck
             cd c
-            make test-c
+            make test
             cd ..
             runHook postCheck
           '';

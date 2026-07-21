@@ -3,6 +3,7 @@ import io
 import json
 import math
 import socket
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -412,6 +413,80 @@ class FakeProcess:
         self.terminate()
 
 
+class StartupProcess:
+    def __init__(self, output=b"", ignore_terminate=False):
+        self.stdout = BlockingStream(output)
+        self.stdin = io.BytesIO()
+        self.returncode = None
+        self.ignore_terminate = ignore_terminate
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls = []
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_calls += 1
+        if not self.ignore_terminate:
+            self.returncode = 0
+            self.stdout.close()
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("glm", timeout)
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        self.returncode = -9
+        self.stdout.close()
+
+
+class EngineStartupTest(unittest.TestCase):
+    def test_readiness_parse_failure_reaps_stubborn_child_before_reraising(self):
+        process = StartupProcess(READY + b"BROKEN\n", ignore_terminate=True)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(RuntimeError, "invalid engine status: BROKEN"):
+                Engine("glm", "model")
+
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 1)
+        self.assertEqual(process.wait_calls, [5, 5])
+        self.assertEqual(process.returncode, -9)
+
+    def test_readiness_timeout_terminates_child_without_changing_constructor_api(self):
+        process = StartupProcess()
+        errors = []
+
+        def construct():
+            try:
+                Engine(
+                    "glm",
+                    "model",
+                    env={"COLI_ENGINE_READY_TIMEOUT": "0.01"},
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            thread = threading.Thread(target=construct, daemon=True)
+            thread.start()
+            thread.join(timeout=0.5)
+            finished_within_bound = not thread.is_alive()
+            if thread.is_alive():
+                process.terminate()
+                thread.join(timeout=1)
+
+        self.assertTrue(finished_within_bound, "Engine readiness wait was unbounded")
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "did not become ready within")
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 0)
+        self.assertEqual(process.wait_calls, [5])
+
+
 class DispatcherTest(unittest.TestCase):
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
@@ -543,6 +618,49 @@ class DispatcherTest(unittest.TestCase):
             "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
         }])
+
+    def test_records_extended_persistent_benchmark_telemetry(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertEqual(profile["forward_p50_ms"], 12.5)
+        self.assertEqual(profile["forward_p99_ms"], 44.0)
+        self.assertEqual(profile["physical_ssd_bytes"], 4096)
+        self.assertIs(profile["physical_ssd_valid"], True)
+        self.assertEqual(profile["rammap_experts"], 8)
+        self.assertEqual(profile["rammap_bytes"], 65536)
+        self.assertEqual(profile["ttft_ms"], 123.0)
+        self.assertEqual(profile["prefault_seconds"], 1.25)
+
+    def test_extended_profile_distinguishes_unavailable_physical_io(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 0 8 65536 123.000 1.250 0\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertIsNone(profile["physical_ssd_bytes"])
+        self.assertIs(profile["physical_ssd_valid"], False)
 
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None

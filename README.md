@@ -384,13 +384,20 @@ COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk pl
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mirror preflight
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
+./coli ramdisk --model /nvme/glm52_i4     # Linux NUMA/tmpfs staging and managed engines
 ./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
 ./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
 ```
 
-On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
-The engine at runtime is pure C — python is only used by the one-time converter
-and the optional API gateway.
+On Windows the portable commands work with syntax such as
+`python coli chat --model D:\glm52_i4`.
+The engine runtime remains pure C. Python is used by the standard-library CLI,
+one-time converter, optional API gateway, and RAM-disk control plane.
+
+`coli ramdisk` can stage the full model or profile-selected shard closures into
+THP-enabled tmpfs, launch one interleaved engine or NUMA-bound node replicas, and
+benchmark persistent SSD/slab/direct-map paths. It keeps KV and usage state on an
+absolute SSD-backed XDG state path and never changes global swap or HugeTLB state.
 
 #### The same commands run any of the models
 
@@ -440,6 +447,7 @@ Two things that differ per model, both documented in the per-model page:
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| CLI flags and RAM-disk lifecycle commands | [docs/SETTINGS.md](docs/SETTINGS.md) |
 
 ## What's next
 

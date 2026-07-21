@@ -41,6 +41,7 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
+ENGINE_READY_TIMEOUT = 7200.0
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -1193,18 +1194,69 @@ def cap_for_arch(arch, cap):
 
 
 class Engine:
+    @staticmethod
+    def _terminate_process(process):
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    @classmethod
+    def _wait_until_ready(cls, process, timeout):
+        outcome = queue.Queue(maxsize=1)
+
+        def read_ready():
+            try:
+                read_engine_turn(process.stdout, READY, lambda _: None)
+            except BaseException as error:
+                outcome.put(error)
+            else:
+                outcome.put(None)
+
+        reader = threading.Thread(target=read_ready, name="colibri-ready", daemon=True)
+        reader.start()
+        try:
+            try:
+                error = outcome.get(timeout=timeout)
+            except queue.Empty:
+                raise RuntimeError(
+                    "colibri engine did not become ready within %.3g seconds" % timeout
+                )
+            if error is not None:
+                raise error
+        except BaseException:
+            cls._terminate_process(process)
+            reader.join(timeout=5)
+            raise
+        reader.join()
+
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
     # coli_resolve_cap, #379), non-glm arches get the legacy 8, via
     # cap_for_arch above. Same convention as the --cap flags in coli and
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
-    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
+    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1,
+                 command_prefix=None, stderr=None):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        try:
+            ready_timeout = float(child_env.get("COLI_ENGINE_READY_TIMEOUT",
+                                                ENGINE_READY_TIMEOUT))
+        except (TypeError, ValueError):
+            raise ValueError("COLI_ENGINE_READY_TIMEOUT must be numeric")
+        if not math.isfinite(ready_timeout) or not 0 < ready_timeout <= 86400:
+            raise ValueError("COLI_ENGINE_READY_TIMEOUT must be between 0 and 86400 seconds")
+        command = list(command_prefix or ()) + [
+            str(executable), str(cap_for_arch(model_arch(model), cap))
+        ]
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(model_arch(model), cap))], env=child_env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+            command, env=child_env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=stderr, bufsize=0,
         )
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
@@ -1220,7 +1272,7 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
+        self._wait_until_ready(self.process, ready_timeout)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -1308,7 +1360,7 @@ class Engine:
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
+                    profile = {
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
@@ -1318,7 +1370,27 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
-                    })
+                    }
+                    if len(fields) >= 17:
+                        physical_bytes = int(fields[12])
+                        if len(fields) >= 18:
+                            physical_valid = bool(int(fields[17]))
+                        else:
+                            # Legacy producers used zero both for a measured
+                            # zero and for unsupported accounting. A positive
+                            # legacy count is known-valid; zero is unknown.
+                            physical_valid = True if physical_bytes > 0 else None
+                        profile.update({
+                            "forward_p50_ms": None if float(fields[10]) < 0 else float(fields[10]),
+                            "forward_p99_ms": None if float(fields[11]) < 0 else float(fields[11]),
+                            "physical_ssd_bytes": physical_bytes if physical_valid else None,
+                            "physical_ssd_valid": physical_valid,
+                            "rammap_experts": int(fields[13]),
+                            "rammap_bytes": int(fields[14]),
+                            "ttft_ms": float(fields[15]),
+                            "prefault_seconds": float(fields[16]),
+                        })
+                    self.profile.append(profile)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
@@ -1432,13 +1504,7 @@ class Engine:
                 return
             self.closed = True
         self._fail_pending(RuntimeError("colibri engine is shutting down"))
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+        self._terminate_process(self.process)
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 

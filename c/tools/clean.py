@@ -19,9 +19,23 @@ FILES = [
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
 ]
-# Test binaries match this pattern. Only remove executables (.exe on Windows,
-# no extension on Unix) — never .c or .py source files.
-TEST_GLOBS = ["tests/test_*.exe"]
+# Test binaries are extensionless on Unix and `.exe` on Windows.  Keep the
+# basenames explicit so clean can never mistake a source/fixture for an output.
+TEST_BASENAMES = [
+    "test_json", "test_st", "test_st_pread", "test_st_mirror", "test_tier", "test_grammar",
+    "test_schema_gbnf", "test_decode_batch", "test_idot",
+    "test_i4_grouped", "test_stops", "test_topp", "test_kv_alloc",
+    "test_i4_acc512", "test_compat_direct", "test_dsa_select",
+    "test_int3", "test_int3_load", "test_logit_nan", "test_pipe_block",
+    "test_sample_nan", "test_tok_o200k", "test_efficiency_report",
+    "test_uring", "test_rammap",
+]
+ON_DEMAND_BASENAMES = ["bench_topp", "bench_dsa_select"]
+TEST_GLOBS = [
+    "tests/%s%s" % (name, suffix)
+    for name in TEST_BASENAMES + ON_DEMAND_BASENAMES
+    for suffix in ("", ".exe")
+]
 # Directories to remove.
 DIRS = ["tests/__pycache__"]
 

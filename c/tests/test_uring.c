@@ -11,6 +11,40 @@
 
 static int fail(const char *s){ fprintf(stderr,"FAIL: %s\n",s); return 1; }
 
+static int uring_resource_unavailable(int err){
+    return err==ENOMEM || err==EPERM || err==ENOSYS || err==EACCES;
+}
+
+static void free_tensor_metadata(Model *m){
+    if(!m || !m->S.t) return;
+    for(int i=0;i<m->S.n;i++) free(m->S.t[i].name);
+    free(m->S.t); m->S.t=NULL; m->S.n=m->S.cap=0;
+}
+
+/* Metadata finalization is independent of the kernel ring.  Exercise it even
+ * when io_uring_setup is blocked by the test sandbox: grouped-int4 scales must
+ * produce fmt=4/gs=16, exactly like the buffered expert loader. */
+static int test_grouped_finalize_metadata(void){
+    Model m={0}; ESlot slot={0}; UringBatch batch={0};
+    m.c.hidden=64; m.c.moe_inter=64;
+    st_tensor weights[3]={{0}}, scales[3]={{0}};
+    int64_t wbytes=64*32, sbytes=64*4*4;
+    if(posix_memalign((void**)&slot.slab,4096,(size_t)wbytes*3+4096)) slot.slab=NULL;
+    slot.fslab=calloc((size_t)sbytes*3/4,sizeof(float));
+    if(!slot.slab||!slot.fslab) return fail("grouped finalize allocation");
+    UringLoad *load=&batch.load[0]; load->m=&m; load->s=&slot;
+    load->eid=9; load->done=1;
+    for(int k=0;k<3;k++){
+        weights[k].nbytes=wbytes; scales[k].nbytes=sbytes;
+        load->tw[k]=&weights[k]; load->tq[k]=&scales[k]; load->pos[k]=(int64_t)k*wbytes;
+    }
+    int rc=uring_finalize_load(&batch,0,1);
+    int bad=rc || slot.eid!=9 || slot.g.fmt!=4 || slot.u.fmt!=4 || slot.d.fmt!=4
+        || slot.g.gs!=16 || slot.u.gs!=16 || slot.d.gs!=16;
+    compat_aligned_free(slot.slab); free(slot.fslab);
+    return bad?fail("grouped-int4 io_uring finalization"):0;
+}
+
 static int test_expert_layout(int fd){
     Model m={0}; ESlot slot={0}; UringBatch batch={0};
     m.c.hidden=4; m.c.moe_inter=3; m.ebits=8;
@@ -31,7 +65,15 @@ static int test_expert_layout(int fd){
         size_t n=strlen(name); memcpy(name+n,".qs",4);
         m.S.t[3+k]=(st_tensor){strdup(name),fd,so,sbytes[k],2,sbytes[k]/4}; so+=sbytes[k];
     }
-    if(uring_batch_init(&batch)){ free(m.S.t); return fail("expert ring init"); }
+    if(uring_batch_init(&batch)){
+        int err=errno;
+        free_tensor_metadata(&m);
+        if(uring_resource_unavailable(err)){
+            printf("test_uring: expert batch skipped (%s)\n",strerror(err));
+            return 0;
+        }
+        return fail("expert ring init");
+    }
     uring_batch_reset(&batch);
     int li=uring_load_add(&batch,&m,1,7,&slot,1);
     if(li!=0 || uring_submit_batch(&batch) || uring_finalize_load(&batch,li,1)){
@@ -50,7 +92,19 @@ static int test_expert_layout(int fd){
     m.ecache[1]=calloc(2,sizeof(ESlot));
     if(!m.pin||!m.npin||!m.ecache||!m.ecn||!m.ecache[1])
         return fail("pilot fixture allocation");
-    if(uring_batch_init(&g_ub_pilot)) return fail("pilot ring init");
+    if(uring_batch_init(&g_ub_pilot)){
+        int err=errno;
+        /* slot.slab/slot.fslab already freed at the end of the expert-batch
+         * section above; only the pilot fixture allocations need cleanup here. */
+        free(m.ecache[1]);
+        free(m.pin); free(m.npin); free(m.ecache); free(m.ecn);
+        free_tensor_metadata(&m);
+        if(uring_resource_unavailable(err)){
+            printf("test_uring: pilot batch skipped (%s)\n",strerror(err));
+            return 0;
+        }
+        return fail("pilot ring init");
+    }
     memset(g_pilot_inflight,0,sizeof(g_pilot_inflight));
     atomic_store(&g_cur_moe_layer,-1); atomic_store(&g_pilot_loads,0); atomic_store(&g_pilot_drops,0);
     pilot_r=0; pilot_w=1; pilot_q[0].l=1; pilot_q[0].e=7;
@@ -61,12 +115,12 @@ static int test_expert_layout(int fd){
     compat_aligned_free(m.ecache[1][0].slab); free(m.ecache[1][0].fslab);
     free(m.ecache[1]);
     free(m.pin); free(m.npin); free(m.ecache); free(m.ecn);
-    for(int i=0;i<m.S.n;i++) free(m.S.t[i].name);
-    free(m.S.t);
+    free_tensor_metadata(&m);
     return bad?fail("pilot uring publication"):0;
 }
 
 int main(void){
+    if(test_grouped_finalize_metadata()) return 1;
     char path[]="/tmp/coli-uring-XXXXXX";
     int fd=mkstemp(path); if(fd<0) return fail("mkstemp");
     unlink(path);
@@ -79,7 +133,7 @@ int main(void){
     }
     ColiUring ring;
     if(coli_uring_init(&ring,8)){
-        if(errno==EPERM || errno==ENOSYS || errno==EACCES){
+        if(uring_resource_unavailable(errno)){
             printf("test_uring: skipped (%s)\n",strerror(errno)); close(fd); return 0;
         }
         close(fd); return fail("io_uring_setup");

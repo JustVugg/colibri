@@ -24,7 +24,7 @@ Format: `VAR` — default — effect.
 | `TOPK` | `0` (off) | Top-k filter on the sampling distribution (`0` = no limit). |
 | `TOPP` | `0` (off) | Top-p filter (`0` = use `NUCLEUS`). |
 | `SEED` | unset → seeded from clock + PID | RNG seed for sampling. **Unset = different every run.** Set a fixed value for reproducible sampling. |
-| `KVSAVE` | `1` (on) | Persist the KV cache to `<model>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
+| `KVSAVE` | `1` (on) | Persist the KV cache to `<COLI_STATE_DIR>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
 | `KV_SLOTS` | `1` | Number of independent KV conversation slots (1–16), used in serve mode. |
 | `THINK` | `0` (off) | Emit a `<think>` reasoning block. `THINK=1` turns on visible reasoning. |
 | `MTP` | on | Multi-Token Prediction (speculative draft head). `MTP=0` disables it. |
@@ -49,8 +49,12 @@ Format: `VAR` — default — effect.
 | `CAP_RAISE` | `1` (on); `0` on Metal + macOS + fast model volume (#379) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. When the platform-aware Metal cache default engages (F_NOCACHE probe measured the model volume fast), the *default* flips to `0` — auto-raise re-creates the Metal residency churn the minimal cache avoids. An explicit `CAP_RAISE` always wins. |
 | `COLI_SSD_FAST_GBS` | `4.0` | Threshold (GB/s, measured F_NOCACHE, cached in `<model>/.coli_ssd` — see [The `.coli_ssd` probe cache](#the-coli_ssd-probe-cache) below) at or above which the model volume counts as "fast" for the platform-aware Metal cache defaults (#379). |
 | `PREFETCH` | `0` | Prefetch depth for streamed experts. |
-| `COLI_MMAP` | `0` | `mmap` the weights instead of read()-ing into slabs. |
-| `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
+| `COLI_WEIGHTS_DIR` | `SNAP` | Complete safetensors namespace used for weight loading. `coli ramdisk` points this at a tmpfs namespace containing staged shards and validated symlinks to unstaged canonical shards; configuration and tokenizer identity remain rooted at `SNAP`. |
+| `COLI_STATE_DIR` | `SNAP` | Durable directory for `.coli_usage` and `.coli_kv*`. Managed RAM-disk engines derive stable per-model/per-node directories from an absolute SSD-backed `XDG_STATE_HOME`; tmpfs/ramfs and paths beneath the volatile weight mount are rejected, so volatile weight mounts never hold runtime state. |
+| `COLI_RAMMAP` | `0` | Linux-only direct mapping of complete experts whose six weight/scale tensors are tmpfs-backed. Mapped experts bypass slabs and LRU I/O; unstaged experts keep the existing SSD path. Incompatible with `COLI_MMAP=1`. |
+| `COLI_RAM_PREFAULT` | `0` | Prefault direct RAM mappings at startup. Managed full-model mode defaults this to `1` for benchmarking; `0` leaves pages demand-faulted. |
+| `COLI_MMAP` | `0` | Legacy page-cache-backed `mmap` path. Do not combine it with `COLI_RAMMAP=1`; the engine rejects that configuration. |
+| `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from `COLI_STATE_DIR/.coli_usage` (updated after every turn) with `SNAP/stats.txt` as the fallback for a virgin state directory; neither present → no pin this run. RAM-mapped experts are already resident and are excluded from pin/LRU allocation. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
 | `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
@@ -71,7 +75,7 @@ Format: `VAR` — default — effect.
 | `ABSORB` | `-1` (auto: absorbed for S≤4) | MLA attention absorption mode. |
 | `IDOT` | `1` | Integer dot-product kernel. `IDOT=0` uses exact f32 kernels (for A/B numerical checks). |
 | `COLI_POLICY` | `quality` | Resource policy: `quality`, `balanced`, or `experimental-fast`. |
-| `PROF` | `0` (off) | Performance profile: a startup header (machine + effective config), then per run — or per turn in serve mode, on stderr — forward-latency percentiles (p50/p90/p99/max), expert-I/O totals and cache-tier fill, phase shares of wall time, and a verdict naming the knob most likely to help on this machine. Output is additive; `PROF` unset changes nothing. |
+| `PROF` | `0` (off) | Performance profile: a startup header (machine + effective config), then per run — or per turn in serve mode, on stderr — forward-latency percentiles (p50/p90/p99/max), SSD-backed expert bytes requested, Linux block-layer `read_bytes`, cache-tier fill, phase shares of wall time, and a verdict naming the knob most likely to help on this machine. Output is additive; `PROF` unset changes nothing. |
 | `COLI_NO_FUSED_PAIR` | `0` (off) | `=1` disables the fused-pair matmul kernel. |
 | `DISK_SPLIT` | `0` (off) | `=1` splits the reported disk-load time across the draft/absorb/forward phases in stats. |
 | `I4S` | unset | Engage the int4 `IDOT` kernel only for batch `S>=<n>` (testing). |
@@ -244,7 +248,9 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 | `COLI_API_KEY` | unset | Required bearer token for the server. |
 | `COLI_ALLOWED_HOSTS` | unset | Comma-separated hostnames or IP addresses accepted by the DNS-rebinding guard in addition to loopback and the bind address. Equivalent to repeating `--allowed-host`. |
 | `COLI_MAX_QUEUE` | `8` | Max queued requests. |
+| `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. || `COLI_MAX_QUEUE` | `8` | Max queued requests. |
 | `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. |
+| `COLI_ENGINE_READY_TIMEOUT` | `7200` | Seconds the Python server waits for the C engine/model to become ready. Invalid values and timeouts terminate and reap the child process. |
 | `COLI_KV_SLOTS` | `1` | Independent KV conversation slots (→ engine `KV_SLOTS`). |
 | `COLI_POLICY` | `quality` | Resource policy (shared with the engine): `quality` \| `balanced` \| `experimental-fast`. |
 | `COLI_COLOR` | auto (TTY) | `COLI_COLOR=1` forces colored `coli` output when not a TTY. |

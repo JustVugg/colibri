@@ -9,6 +9,8 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
   coli info                 model, RAM, disk, and configuration status
   coli plan                 Disk / RAM / VRAM resource plan
   coli mirror               Plan, stage, or verify a learned partial mirror
+  coli ramdisk              NUMA-aware RAM-disk manager and interactive TUI
+  coli ramdisk plan --json  scriptable RAM-disk capacity and staging plan
   coli doctor               installation and execution-plan diagnostics
   coli bench [task...]      quality benchmarks (MMLU/HellaSwag/...)
   coli convert              convert GLM-5.2-FP8 to int4, one shard at a time
@@ -59,7 +61,8 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
-# support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
+# support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py,
+# ramdisk.py) and
 # tools/ all live next to this script — unchanged from before.
 #
 # Installed layout ("make install"): this script is $(PREFIX)/bin/coli,
@@ -757,7 +760,7 @@ def chat_attached(a, base, model_id):
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
-    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load): a chat
+    """SERVE mode silently resumes .coli_kv from durable state (glm.c kv_disk_load): a chat
     started today continues a conversation from days ago, with `first=0` so the
     turn is appended WITHOUT the [gMASK]<sop> prefix. The engine does announce it
     on stderr — but nothing here ever shows that: the drain thread's
@@ -773,7 +776,8 @@ def kv_resume_notice(model_dir):
 
     So say it here, in Python, from the file itself: no pipe, no thread, no
     Windows deadlock risk (see the stderr comment below)."""
-    p=os.path.join(model_dir, ".coli_kv")
+    state_dir=os.environ.get("COLI_STATE_DIR") or model_dir
+    p=os.path.join(state_dir, ".coli_kv")
     try:
         with open(p,"rb") as f:
             if f.read(8)!=b"COLIKV1\0": return
@@ -1117,7 +1121,6 @@ def cmd_convert(a):
     print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
 
-
 def cmd_mirror(a):
     if not a.mirror:
         sys.exit("mirror path required: pass --mirror or set COLI_MODEL_MIRROR")
@@ -1138,7 +1141,18 @@ def cmd_mirror(a):
     return subprocess.call(command)
 
 
-def main():
+def cmd_ramdisk(a):
+    import ramdisk
+    if getattr(a,"ramdisk_action",None) is not None:
+        return ramdisk.dispatch(a,cli_path=os.path.abspath(__file__),engine_path=GLM)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("coli ramdisk: the interactive TUI requires a terminal; "
+              "use `coli ramdisk plan --json` or another scriptable action",
+              file=sys.stderr)
+        return 2
+    return ramdisk.launch_tui(a,cli_path=os.path.abspath(__file__),engine_path=GLM)
+
+def main(argv=None):
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
@@ -1174,6 +1188,9 @@ def main():
     pm.add_argument("--usage")
     pm.add_argument("--budget-gib", type=float, default=0)
     pm.add_argument("--reserve-gib", type=float, default=10)
+    import ramdisk
+    prd=sub.add_parser("ramdisk",parents=[common],help="manage NUMA-aware tmpfs weight staging")
+    ramdisk.configure_parser(prd, common_parent=common)
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pd.add_argument("--deep",action="store_true",
@@ -1236,11 +1253,11 @@ def main():
     pc.add_argument("--group-size",type=int,default=64,
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
-    a=ap.parse_args()
+    a=ap.parse_args(argv)
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"web":cmd_web,"ramdisk":cmd_ramdisk}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 

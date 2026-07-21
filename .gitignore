@@ -68,6 +68,9 @@ c/bench/
 c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
+c/tests/test_i4_grouped
+c/tests/test_stops
+c/tests/test_kv_alloc
 c/tests/test_uring
 olmoe_merged/
 olmoe_i4/
@@ -75,3 +78,15 @@ c/olmoe_merged/
 c/olmoe_i4/
 .idea
 c/tiny_inkling/
+c/tests/test_rammap
+c/tests/test_rammap.exe
+c/tests/test_st_pread
+c/tests/test_st_pread.exe
+c/tests/test_topp
+c/tests/test_topp.exe
+c/tests/test_dsa_select
+c/tests/test_dsa_select.exe
+c/tests/bench_topp
+c/tests/bench_topp.exe
+c/tests/bench_dsa_select
+c/tests/bench_dsa_select.exe

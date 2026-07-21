@@ -4,6 +4,11 @@
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
 
+/* PR #377: forward decl — rammap_slot() is defined in colibri.c below the point
+ * this header is #included, but emap_emit/tiers_emit consult it for the tmpfs
+ * direct tier. telemetry.h is included after Model/ESlot are defined. */
+static ESlot *rammap_slot(Model *m, int layer, int eid);
+
 static int64_t tbytes(int O,int I,int bits){
     if(bits>=16) return (int64_t)O*I*4;
     if(bits>=5)  return (int64_t)O*I + (int64_t)O*4;
@@ -120,10 +125,12 @@ static void tiers_emit(Model *m){
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
 #endif
-    int ram=pinned-vram+lru; if(ram<0) ram=0;
+    int anon_ram=pinned-vram+lru; if(anon_ram<0) anon_ram=0;
+    int ram=anon_ram+m->rammap_experts;
     int disk=total-vram-ram; if(disk<0) disk=0;
     double eb=(double)expert_bytes_probe(m,m->ebits);
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
+    double ram_gb=anon_ram*eb/1e9+m->rammap_bytes/1e9;
+    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_gb);
     fflush(stdout);
 }
 
@@ -139,9 +146,9 @@ static void emap_emit(Model *m){
         int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
-            int tier=0;
+            int tier=rammap_slot(m,i,e)?1:0;
             ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+            for(int z=0;!tier && z<m->npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
 #else
