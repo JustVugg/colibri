@@ -20,6 +20,21 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
+# =============================================================================
+# FROZEN (issue #310 — Python -> Go launcher port). Do NOT add features here.
+#
+# This launcher is being replaced by the dependency-free Go port in c/go/. It is
+# frozen: new commands, flags, output changes, and behavior changes go to the Go
+# CLI (c/go/), NOT to this file. Keep the two in parity — the Go envFor golden
+# test (c/go/env_test.go) uses this file as its oracle.
+#
+# Allowed here: security/correctness bug fixes ONLY, and they must land in the Go
+# CLI in the same change. Everything else belongs in c/go/.
+#
+# This file (and the launcher-only surface) will be deleted once the Go port
+# reaches full parity and ships as the default. The gateway (openai_server.py)
+# and the offline tools are NOT frozen by this notice.
+# =============================================================================
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
