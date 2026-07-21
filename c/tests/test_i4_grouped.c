@@ -18,7 +18,7 @@
  * index, a wrong group boundary or a swapped nibble cannot hide under it —
  * those are O(1) relative errors, not O(1e-6). */
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static uint32_t rng_state=0xC0FFEEu;
@@ -93,6 +93,72 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
     return 0;
 }
 
+/* matmul_i4_grouped_pair (fused gate+up, #298) reads x once instead of twice.
+ * Checked two ways, because "identical" is only true where it can be:
+ *
+ *  - Correctness, always: both outputs must match the double reference within
+ *    the same magnitude-relative epsilon as the unfused kernel.
+ *  - Bit-exactness, only when I % gs == 0: then every group is covered by the
+ *    AVX2 body, whose accumulation order is identical to the unfused kernel, so
+ *    the results agree to the last bit. This is the shape the real g64
+ *    checkpoints have (I = 2048 / 6144, gs = 64), i.e. the production path.
+ *
+ * With a PARTIAL last group the group tail falls to scalar code, and the
+ * compiler is free to contract/reassociate the fused body differently from the
+ * single-matrix one. The results then differ by ~1e-7 -- rounding, not logic
+ * (which of gate/up "differs" is arbitrary, the tell that it is FP luck).
+ * Demanding bit-exactness there would report a compiler artifact as a bug. */
+#ifdef COLI_HAVE_GROUPED_PAIR
+static int check_pair(const char *name, int S, int I, int O, int gs){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs;
+    uint8_t *qg=malloc((size_t)O*rb), *qu=malloc((size_t)O*rb);
+    float *sg=malloc((size_t)O*ng*sizeof(float)), *su=malloc((size_t)O*ng*sizeof(float));
+    float *x=malloc((size_t)S*I*sizeof(float));
+    float *yg=malloc((size_t)S*O*sizeof(float)), *yu=malloc((size_t)S*O*sizeof(float));
+    float *rg=malloc((size_t)S*O*sizeof(float)), *ru=malloc((size_t)S*O*sizeof(float));
+    double *dg=malloc((size_t)S*O*sizeof(double)), *du=malloc((size_t)S*O*sizeof(double));
+    double *mg=malloc((size_t)S*O*sizeof(double)), *mu=malloc((size_t)S*O*sizeof(double));
+    if(!qg||!qu||!sg||!su||!x||!yg||!yu||!rg||!ru||!dg||!du||!mg||!mu){ fprintf(stderr,"%s: OOM\n",name); return 1; }
+
+    for(size_t i=0;i<(size_t)O*rb;i++){ qg[i]=(uint8_t)(xr()&0xFF); qu[i]=(uint8_t)(xr()&0xFF); }
+    for(int i=0;i<O*ng;i++){ sg[i]=frand(); su[i]=frand(); }
+    for(int i=0;i<S*I;i++) x[i]=frand();
+
+    matmul_i4_grouped_pair(yg,yu,x,qg,sg,qu,su,S,I,O,gs);
+    matmul_i4_grouped(rg,x,qg,sg,S,I,O,gs);
+    matmul_i4_grouped(ru,x,qu,su,S,I,O,gs);
+    ref_grouped(dg,mg,x,qg,sg,S,I,O,gs);
+    ref_grouped(du,mu,x,qu,su,S,I,O,gs);
+
+    int bad=0, exact=1; double worst=0;
+    for(int i=0;i<S*O;i++){
+        double eg = mg[i]>1e-30 ? fabs((double)yg[i]-dg[i])/mg[i] : fabs((double)yg[i]-dg[i]);
+        double eu = mu[i]>1e-30 ? fabs((double)yu[i]-du[i])/mu[i] : fabs((double)yu[i]-du[i]);
+        if(eg>worst) worst=eg;
+        if(eu>worst) worst=eu;
+        if(eg>1e-6||eu>1e-6){
+            if(bad<3) fprintf(stderr,"%s: [%d] gate %.9g/%.9g up %.9g/%.9g (rel %.3g/%.3g)\n",
+                              name,i,(double)yg[i],dg[i],(double)yu[i],du[i],eg,eu);
+            bad++;
+        }
+        if(yg[i]!=rg[i]||yu[i]!=ru[i]) exact=0;
+    }
+    /* Aligned shapes run entirely through the AVX2 body: same order as unfused,
+     * so bit-exactness is a real invariant there and worth asserting. */
+    if(I%gs==0 && !exact){
+        fprintf(stderr,"%s: FAIL fused != unfused bitwise on an ALIGNED shape "
+                       "(no scalar tail runs here; the orders must match)\n",name);
+        bad++;
+    }
+    free(qg);free(qu);free(sg);free(su);free(x);free(yg);free(yu);free(rg);free(ru);
+    free(dg);free(du);free(mg);free(mu);
+    if(bad){ fprintf(stderr,"%s: FAIL (%d mismatched)\n",name,bad); return 1; }
+    printf("  %-42s ok (S=%d I=%d O=%d gs=%d, worst rel %.2g%s)\n",name,S,I,O,gs,worst,
+           I%gs==0?", bit-exact vs unfused":"");
+    return 0;
+}
+#endif
+
 int main(void){
     int fail=0;
     printf("test_i4_grouped: matmul_i4_grouped vs plain-C dequant reference\n");
@@ -119,6 +185,15 @@ int main(void){
 
     /* batch: S>1 exercises the per-s inner loop against a shared scale row */
     fail|=check("gs=64, batch S=8",                   8, 320, 6, 64, 0);
+
+#ifdef COLI_HAVE_GROUPED_PAIR
+    printf("test_i4_grouped: matmul_i4_grouped_pair (fused gate+up) vs two separate calls\n");
+    fail|=check_pair("pair: gs=64, I multiple of gs",  2, 512, 8, 64);
+    fail|=check_pair("pair: gs=64, partial last group",2, 200, 4, 64);
+    fail|=check_pair("pair: gs=64, odd I (I=201)",     2, 201, 4, 64);
+    fail|=check_pair("pair: gs=64, decode S=1",        1, 320, 6, 64);
+    fail|=check_pair("pair: gs=128, I=512",            2, 512, 4, 128);
+#endif
 
     if(fail){ printf("test_i4_grouped: FAIL\n"); return 1; }
     printf("test_i4_grouped: ok\n");

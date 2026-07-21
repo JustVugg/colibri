@@ -32,11 +32,11 @@ esac
 
 # 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
 echo "  building (ARCH=${ARCH:-native})…"
-make -s glm ARCH="${ARCH:-native}"
+make -s colibri ARCH="${ARCH:-native}"
 
 # 3) self-test sull'oracolo tiny, se presente
 if [ -d glm_tiny ] && [ -f ref_glm.json ]; then
-    r=$(SNAP=./glm_tiny TF=1 ./glm 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
+    r=$(SNAP=./glm_tiny TF=1 ./colibri 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
     echo "  engine self-test: ${r:-?}  (expected 32/32)"
 fi
 

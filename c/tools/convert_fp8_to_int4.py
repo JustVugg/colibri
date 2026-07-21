@@ -286,6 +286,17 @@ def main():
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
         a.ebits = 8 if (a.mtp or a.indexer) else 4
+    if a.mtp and a.ebits < 8 and a.group_size <= 0:
+        # Non solo lossy: eh_proj ha ~20-30x di asimmetria di scala fra le due meta' di
+        # colonna, quindi l'int4 per-riga (UNA scala per riga) arrotonda a ZERO l'intera
+        # meta' embedding -> il draft non vede il token -> acceptance ~0% (issue #8).
+        # EN: not merely lossy: eh_proj has ~20-30x column-scale asymmetry, so per-row
+        # EN: int4 rounds its ENTIRE embedding half to exact zeros -> the draft cannot
+        # EN: see the input token -> ~0% acceptance (issue #8). A container converted
+        # EN: this way is repairable in place with tools/repair_mtp_int8.py.
+        print(f"WARNING: --mtp with --ebits {a.ebits} and per-row scales ZEROES eh_proj's "
+              "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
+              "or add --group-size 128 for group-scaled int4.")
     if a.xbits is None: a.xbits = a.ebits
 
     # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
@@ -298,6 +309,16 @@ def main():
     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
     if bits_map:
         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+
+    # Il PIANO risolto, PRIMA di toccare qualunque cosa (#383): --mtp/--indexer cambiano il
+    # default di ebits a 8 (testa int4 = acceptance ~0%, issue #8) e il ramo grouped e'
+    # gated su bits<=4 — combinazioni sorprendenti devono mostrarsi al secondo 1 di un job
+    # da ore, non nel size-check dopo. EN: print the RESOLVED plan before doing anything.
+    mode = "MTP head only" if a.mtp else "DSA indexer only" if a.indexer else "main model"
+    grp = f"grouped gs={a.group_size} (fmt=4)" if (a.group_size and a.ebits <= 4) else \
+          (f"PER-ROW (grouped branch needs bits<=4; ebits={a.ebits} disables it)" if a.group_size else "per-row")
+    print(f"[PLAN] mode: {mode} | source: {'local ' + a.indir if a.indir else 'download ' + a.repo} | "
+          f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {a.xbits}-bit | {grp}")
 
     if a.selftest_nvfp4:
         import torch
@@ -379,14 +400,99 @@ def main():
     if a.indir:    # conversione locale (test)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
+        # #383: se l'indice c'e', i passaggi --mtp/--indexer convertono SOLO gli shard
+        # che contengono i tensori richiesti (3 invece di scandire tutti i 141 — ogni
+        # scansione a vuoto apre comunque uno shard da 5 GB). Senza indice: scansione
+        # completa come prima.
+        # EN: #383: when the index is present, the --mtp/--indexer passes convert ONLY
+        # the shards that hold the requested tensors (3 instead of scanning all 141 —
+        # every empty scan still opens a 5 GB shard). Without the index: full scan as
+        # before.
+        if a.mtp or a.indexer:
+            idxp = os.path.join(a.indir, "model.safetensors.index.json")
+            if os.path.exists(idxp):
+                wmap = json.load(open(idxp))["weight_map"]
+                if a.mtp:
+                    want = {v for k, v in wmap.items() if k.startswith(f"model.layers.{a.n_layers}.")}
+                else:
+                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) < a.n_layers}
+                keep = [sp for sp in shards if os.path.basename(sp) in want]
+                print(f"[PLAN] index: {len(keep)}/{len(shards)} local shard(s) hold the requested tensors")
+                shards = keep
+        # BUG #355: questo ramo ignorava --mtp/--indexer. Con --mtp scriveva
+        # out-NNNNN (gli STESSI nomi di una conversione normale) in ebits=8 e
+        # keep_mtp=False -> il "secondo passaggio MTP" nella stessa outdir
+        # SOVRASCRIVEVA il container gia' finito con una riconversione int8
+        # completa, in silenzio (137/141 shard distrutti prima di accorgersene).
+        # Ora il ramo locale rispecchia il download path: prefisso corretto,
+        # flag passate, shard vuoti saltati.
+        prefix = "out-mtp-" if a.mtp else "out-idx-" if a.indexer else "out-"
+        # RIPRESA (#383): i nomi out-NNNNN contano gli shard EMESSI, non l'indice di
+        # input (gli shard senza tensori rilevanti non producono file), quindi "il
+        # file esiste" non basta per saltare il lavoro gia' fatto. Un manifest
+        # sidecar ricorda input -> output (o "vuoto") e con quali parametri: la
+        # ripresa salta solo cio' che combacia, e parametri diversi sulla stessa
+        # outdir vengono rifiutati invece di mescolare container (il modo #355).
+        # EN: RESUME (#383): out-NNNNN names count EMITTED shards, not the input
+        # EN: index (shards with no relevant tensors emit no file), so "the file
+        # EN: exists" is not enough to skip completed work. A sidecar manifest
+        # EN: records input -> output (or "empty") plus the conversion parameters:
+        # EN: resume skips only what matches, and different parameters on the same
+        # EN: outdir are refused instead of mixing containers (the #355 failure mode).
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map}
+        prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
+        prog = {}
+        if os.path.exists(prog_path):
+            try: prog = json.loads(open(prog_path).read())
+            except (OSError, ValueError): prog = {}
+            if prog and prog.get("params") != params:
+                print(f"ERROR: {prog_path} records a conversion with {prog.get('params')};\n"
+                      f"       this run uses {params}. Refusing to mix conversions in the same "
+                      f"outdir — use a fresh --outdir (or delete the manifest and the "
+                      f"{prefix}*.safetensors shards to redo).")
+                return
+        done = prog.setdefault("shards", {}); prog["params"] = params
+        n = 0; fresh = 0; skipped = 0
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
-            save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
-        # copia config + tokenizer
-        for fn in ["config.json"]:
-            src = os.path.join(a.indir, fn)
-            if os.path.exists(src): shutil.copy(src, a.outdir)
-        print(f"converted {len(shards)} shards -> {a.outdir}")
+            key = os.path.basename(sp)
+            prev = done.get(key)                          # None = mai visto; "" = visto, vuoto; nome = emesso
+            if prev is not None and (prev == "" or os.path.exists(os.path.join(a.outdir, prev))):
+                if prev: n += 1
+                skipped += 1
+                continue
+            out = {}
+            convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                          keep_mtp=a.mtp, keep_idx=a.indexer,
+                          group_size=a.group_size, bits_map=bits_map)
+            if not out:                                   # shard senza MTP/idx: niente file (come il download path)
+                done[key] = ""
+            else:
+                name = f"{prefix}{n:05d}.safetensors"
+                save_file(out, os.path.join(a.outdir, name))
+                done[key] = name; n += 1; fresh += 1
+            tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
+            with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
+            os.replace(tmp_prog, prog_path)
+        if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
+        # metadati per la conversione principale: gli stessi quattro file del download
+        # path — senza tokenizer.json chat/serve non partono. I passaggi mtp/idx vanno
+        # nella stessa outdir di un container gia' completo di metadati.
+        # EN: metadata for the main pass: the same four files as the download path —
+        # EN: chat/serve won't start without tokenizer.json. The mtp/idx passes target
+        # EN: an outdir whose container already has its metadata.
+        if not a.mtp and not a.indexer:
+            copied, missing = [], []
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
+                src = os.path.join(a.indir, fn)
+                if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
+                else: missing.append(fn)
+            print(f"[META] copied from {a.indir}: {', '.join(copied) if copied else 'nothing'}")
+            if missing:
+                print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
+                      + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
+        tag = "MTP" if a.mtp else "indexer" if a.indexer else "main"
+        print(f"converted {fresh} {tag} shard(s), {n} in container -> {a.outdir} ({prefix}NNNNN)")
         return
 
     # reale: scarica shard per shard, converte, cancella

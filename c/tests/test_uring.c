@@ -6,7 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static int fail(const char *s){ fprintf(stderr,"FAIL: %s\n",s); return 1; }

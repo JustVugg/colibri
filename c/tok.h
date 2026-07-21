@@ -42,6 +42,11 @@ typedef struct {
     hmap vocab;          /* stringa byte-level -> id */
     hmap merges;         /* "left\0right" -> rank */
     char **id2str; int *id_added; int n_ids;   /* id -> stringa; id_added=1 se added-token (output letterale) */
+    int *id_special;                            /* 1 = added-token con "special":true nel tokenizer:
+                                                 * token di CONTROLLO (<|user|>, <|assistant|>, <sop>, ...),
+                                                 * mai contenuto legittimo di una risposta. Distinto da
+                                                 * id_added, che copre anche <think>/<tool_call> ("special"
+                                                 * false), i quali sono testo vero e vanno renderizzati. */
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
@@ -106,6 +111,7 @@ static void tok_load(Tok *T, const char *path){
     T->n_ids=maxid+1;
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
+    T->id_special=calloc(T->n_ids,sizeof(int));
 
     /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
@@ -133,6 +139,8 @@ static void tok_load(Tok *T, const char *path){
             char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
             T->id2str[id]=content; T->id_added[id]=1;
+            jval *sf=json_get(a,"special");                 /* "special": true/false */
+            if(sf && sf->t==J_BOOL && sf->boolean) T->id_special[id]=1;
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }

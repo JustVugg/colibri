@@ -203,6 +203,70 @@ def physical_cpu_count():
     return os.cpu_count() or 1
 
 
+def cpu_socket_count():
+    """Return the number of physical CPU sockets visible to this process."""
+    if not sys.platform.startswith("linux"):
+        return 1
+    try:
+        result = subprocess.run(["lscpu", "-p=socket"], text=True,
+                                capture_output=True, check=True, timeout=5)
+        sockets = {int(line) for line in result.stdout.splitlines()
+                   if line and not line.startswith("#")}
+        if sockets:
+            return len(sockets)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return 1
+
+
+def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_metal):
+    """Derive tuning knobs from the bottleneck classification."""
+    tune = {}
+    has_gpu = bool(gpus)
+    n_gpu = len(gpus)
+
+    # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
+    if bottleneck_class == "compute":
+        tune["DRAFT"] = {"value": "0",
+                         "reason": "compute-bound: MTP batch overhead exceeds yield"}
+    elif bottleneck_class == "disk" and projected_hit < 0.90:
+        tune["DRAFT"] = {"value": "0",
+                         "reason": "low hit rate: MTP widens expert union, adds disk reads"}
+    # otherwise leave DRAFT unset (engine default: auto)
+
+    # PIPE: resident pipeline mode depends on GPU count
+    if has_gpu and n_gpu == 1:
+        tune["COLI_CUDA_PIPE"] = {"value": "1",
+                                  "reason": "single GPU: S=1 pipeline gate"}
+    elif has_gpu and n_gpu > 1:
+        tune["COLI_CUDA_PIPE"] = {"value": "2",
+                                  "reason": "multi-GPU: residual stays on-device across layers"}
+    elif not has_gpu and bottleneck_class == "disk":
+        tune["PIPE"] = {"value": "1",
+                        "reason": "overlap disk reads with resident expert compute"}
+
+    # NUMA: selective interleave for GPU hosts, blanket hint for CPU-only
+    if cpu_sockets > 1 and has_gpu:
+        tune["COLI_NUMA"] = {"value": "1",
+                             "reason": "multi-socket + GPU: interleave expert slabs, protect DMA buffers"}
+    elif cpu_sockets > 1 and not has_gpu:
+        tune["COLI_NUMA"] = {"value": "1",
+                             "reason": "multi-socket CPU-only: interleave expert slabs across nodes"}
+        tune["_numa_hint"] = "numactl --interleave=all may perform better on CPU-only hosts"
+
+    # OMP: kill hot-thread spin when GPU/Metal owns the power budget
+    if plan_has_metal:
+        tune["COLI_NO_OMP_TUNE"] = {"value": "1",
+                                    "reason": "Metal: OMP spin-wait steals GPU power budget"}
+
+    # PIN: fully resident if RAM allows and no GPU tier competes
+    if projected_hit >= 0.99 and not has_gpu:
+        tune["PIN_GB"] = {"value": "all",
+                          "reason": "enough RAM for full expert residency"}
+
+    return tune
+
+
 POLICIES = {
     "quality": {"preserve_quantization": True, "preserve_router": True},
     "balanced": {"preserve_quantization": True, "preserve_router": True},
@@ -212,11 +276,12 @@ POLICIES = {
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
-               policy="quality", physical_cpus=None):
+               policy="quality", physical_cpus=None, cpu_sockets=None):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
     info = analyze_model(model)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
+    cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
@@ -273,12 +338,28 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if cold_bytes:
         warnings.append("cold expert misses may reach disk; normal decode speed depends on hit rate")
 
+    total_expert = info["expert_bytes"]
+    resident_expert = hot_bytes + warm_bytes
+    projected_hit = resident_expert / total_expert if total_expert else 1.0
+
     if cold_bytes:
         bottleneck = "disk expert misses"
-    elif warm_bytes:
-        bottleneck = "CPU expert compute and RAM bandwidth"
+        bottleneck_class = "disk"
+    elif warm_bytes and gpus:
+        bottleneck = "CPU expert tail and GPU compute"
+        bottleneck_class = "mixed"
+    elif projected_hit >= 0.99:
+        if gpus:
+            bottleneck = "GPU compute and interconnect"
+        else:
+            bottleneck = "CPU expert compute (fully resident)"
+        bottleneck_class = "compute"
     else:
-        bottleneck = "GPU compute and interconnect"
+        bottleneck = "CPU expert compute and RAM bandwidth"
+        bottleneck_class = "memory"
+
+    tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
+                      plan_has_metal=False)
 
     return {
         "version": 2,
@@ -286,6 +367,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
         "cpu": {"physical_cores": max(1, int(physical_cpus)),
+                "sockets": max(1, int(cpu_sockets)),
                 "thread_policy": "physical-cores"},
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
@@ -299,6 +381,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                      "expert_capacity": vram_experts, "requires_host_backing": False},
         },
         "expected_bottleneck": bottleneck,
+        "bottleneck_class": bottleneck_class,
+        "projected_hit_rate": round(projected_hit, 4),
+        "tune": tune,
         "decisions": [
             {"target": "VRAM", "reason": "profile-ranked hot experts"},
             {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
@@ -318,6 +403,11 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         # ("Affinity not supported on this configuration"): non impostarle li'.
         result.setdefault("OMP_PROC_BIND", "spread")
         result.setdefault("OMP_PLACES", "cores")
+    tune = plan.get("tune", {})
+    for key, entry in tune.items():
+        if key.startswith("_"):
+            continue
+        result.setdefault(key, entry["value"])
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
@@ -364,5 +454,18 @@ def format_plan(plan):
     else:
         lines.append("VRAM   no NVIDIA device detected · CPU path")
     lines.append(f"limit  {plan['expected_bottleneck']}")
+    hit = plan.get("projected_hit_rate", 0)
+    lines.append(f"hit    {hit:.0%} projected expert residency")
+    tune = plan.get("tune", {})
+    if tune:
+        lines.append("")
+        lines.append("auto-tune:")
+        for key, entry in tune.items():
+            if key.startswith("_"):
+                continue
+            lines.append(f"  {key}={entry['value']:12s} {entry['reason']}")
+        hint = tune.get("_numa_hint")
+        if hint:
+            lines.append(f"  hint: {hint}")
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

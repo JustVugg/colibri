@@ -3,7 +3,10 @@
 
 Downloads or converts a local OLMoE checkpoint (e.g., allenai/OLMoE-1B-7B-0125-Instruct).
 Dense weights stay as-is (engine reads BF16/F16 → F32 on load).
-Expert weights get row-wise int8 quantization with float32 scales.
+Expert weights get row-wise symmetric quantization to --ebits bits (default 4)
+with float32 scales. Storage stays one value per int8 byte regardless of bits,
+matching the engine's expert layout (olmoe.c quantize_rows) — for 4 bits the
+values are simply confined to [-8, 7] with scales computed against qmax=7.
 
 Usage:
   python tools/convert_olmoe.py --repo allenai/OLMoE-1B-7B-0125-Instruct --out ./olmoe_i4
@@ -29,12 +32,21 @@ except ImportError as exc:
 EXPERT_KEY_RE = r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
 
 
-def quantize_row(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Row-wise int8 quantization. Returns (int8_weights, float32_scales)."""
+def quantize_row(w: torch.Tensor, bits: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-wise symmetric quantization to `bits` (2..8).
+
+    Returns (int8_weights, float32_scales). Storage is one value per int8 byte
+    for every bit width — the engine dequantizes as q*scale and never assumes
+    the full int8 range — mirroring olmoe.c quantize_rows():
+        qmax  = 2**(bits-1) - 1        (8 -> 127, 4 -> 7, 2 -> 1)
+        scale = amax(|w|, row) / qmax
+        q     = clamp(round(w / scale), -qmax-1, qmax)
+    """
+    qmax = (1 << (bits - 1)) - 1
     w_f32 = w.float()
     row_max = w_f32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-    scales = row_max / 127.0
-    q = (w_f32 / scales).round().clamp(-128, 127).to(torch.int8)
+    scales = row_max / qmax
+    q = (w_f32 / scales).round().clamp(-qmax - 1, qmax).to(torch.int8)
     return q, scales.squeeze(1)
 
 
@@ -50,8 +62,11 @@ def main():
     src.add_argument("--model", help="Local HF checkpoint directory")
     ap.add_argument("--out", required=True, help="Output directory for int4 model")
     ap.add_argument("--ebits", type=int, default=4,
-                    help="Expert quant bits (4 or 8, default 4)")
+                    help="Expert quant bits (2..8, default 4)")
     args = ap.parse_args()
+
+    if not 2 <= args.ebits <= 8:   # storage is int8_t; engine rejects the same range (olmoe.c)
+        sys.exit(f"--ebits must be 2..8 (got {args.ebits})")
 
     if args.repo:
         from huggingface_hub import snapshot_download
@@ -96,7 +111,7 @@ def main():
         for name, tensor in tensors.items():
             if is_expert_weight(name):
                 expert_count += 1
-                q, scales = quantize_row(tensor)
+                q, scales = quantize_row(tensor, args.ebits)
                 total_expert_f32 += tensor.numel() * tensor.element_size()
                 total_expert_q += q.numel() * 1 + scales.numel() * 4
                 out_tensors[name] = q
@@ -109,7 +124,7 @@ def main():
         ratio = total_expert_q / max(total_expert_f32, 1) * 100
         print(f"ok")
 
-    print(f"\nDone. {expert_count} expert tensors quantized.")
+    print(f"\nDone. {expert_count} expert tensors quantized to int{args.ebits}.")
     print(f"Expert storage: {total_expert_f32/1e9:.1f} GB -> {total_expert_q/1e9:.1f} GB ({ratio:.0f}%)")
     print(f"Model ready at: {out}")
     print(f"\nRun: SNAP={out} ./olmoe.exe 32 4 16")

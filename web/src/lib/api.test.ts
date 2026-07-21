@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { extractSSE, getHealth, serverEndpoint, streamChat } from "./api"
+import { extractSSE, getHealth, getProfile, serverEndpoint, streamChat } from "./api"
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -35,6 +35,19 @@ describe("runtime API", () => {
     expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/health", expect.objectContaining({
       headers: expect.objectContaining({ Authorization: "Bearer secret" }),
     }))
+  })
+
+  it("requests the profiling history next to the OpenAI v1 prefix", async () => {
+    const turn = {
+      wall_s: 2.5, prompt_tokens: 7, completion_tokens: 12,
+      expert_disk_s: 0.4, expert_wait_s: 0.1, expert_matmul_s: 0.9,
+      attention_s: 0.6, lm_head_s: 0.2, forwards: 15,
+    }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ seq: 1, turns: [turn] })))
+    vi.stubGlobal("fetch", fetchMock)
+
+    await expect(getProfile("http://localhost:8000/v1/")).resolves.toEqual({ seq: 1, turns: [turn] })
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/profile", expect.anything())
   })
 })
 
