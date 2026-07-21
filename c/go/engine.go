@@ -142,9 +142,9 @@ func envFor(a *Args) map[string]string {
 	e := currentEnvMap()
 	e["SNAP"] = a.Model
 	if isWindows {
-		// Measured Windows defaults (docs/tuning-9950x3d-5090.md): presence-based,
-		// all setdefault. COLI_NO_OMP_TUNE (any non-empty value) disables ONLY the
-		// OMP block; the I/O defaults keep their own kill-switches (DIRECT=0 etc.).
+		// Measured Windows defaults: presence-based, all setdefault. COLI_NO_OMP_TUNE
+		// (any non-empty value) disables ONLY the OMP block; the I/O defaults keep
+		// their own kill-switches (DIRECT=0 etc.).
 		if e["COLI_NO_OMP_TUNE"] == "" {
 			setdefault(e, "OMP_WAIT_POLICY", "active")
 			setdefault(e, "GOMP_SPINCOUNT", "200000")
