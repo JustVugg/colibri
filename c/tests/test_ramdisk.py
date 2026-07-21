@@ -357,7 +357,9 @@ class MountAndCopyTest(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 32, "", "mount: invalid argument")
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with mock.patch.object(ramdisk, "_run", side_effect=run), mock.patch.object(
+        with mock.patch.object(
+            ramdisk, "_trusted_system_binary", return_value="/bin/mount"
+        ), mock.patch.object(ramdisk, "_run", side_effect=run), mock.patch.object(
             ramdisk, "_privileged", side_effect=lambda command, hardware: command
         ):
             ramdisk._mount_tmpfs(plan, plan["mounts"][0])
@@ -381,7 +383,9 @@ class MountAndCopyTest(unittest.TestCase):
                 )
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with mock.patch.object(ramdisk, "_run", side_effect=run), mock.patch.object(
+        with mock.patch.object(
+            ramdisk, "_trusted_system_binary", return_value="/bin/mount"
+        ), mock.patch.object(ramdisk, "_run", side_effect=run), mock.patch.object(
             ramdisk, "_privileged", side_effect=lambda command, hardware: command
         ):
             ramdisk._mount_tmpfs(plan, plan["mounts"][0])
@@ -401,7 +405,11 @@ class MountAndCopyTest(unittest.TestCase):
         with ModelFixture() as fixture:
             plan = ramdisk.build_plan(plan_args(fixture.root), hardware=hardware_fixture())
         result = subprocess.CompletedProcess([], 1, "", "permission denied")
-        with mock.patch.object(ramdisk, "_run", return_value=result) as run, mock.patch.object(
+        with mock.patch.object(
+            ramdisk, "_trusted_system_binary", return_value="/bin/mount"
+        ), mock.patch.object(
+            ramdisk, "_run", return_value=result
+        ) as run, mock.patch.object(
             ramdisk, "_privileged", side_effect=lambda command, hardware: command
         ):
             with self.assertRaises(ramdisk.RamdiskError):
@@ -409,8 +417,12 @@ class MountAndCopyTest(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
 
     def test_prepare_immediately_rolls_back_identityless_successful_mount(self):
-        with ModelFixture() as fixture:
-            plan = ramdisk.build_plan(plan_args(fixture.root), hardware=hardware_fixture())
+        with ModelFixture() as fixture, mock.patch.object(
+            ramdisk, "_filesystem_for_path", return_value="ext4"
+        ):
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
         with mock.patch.object(ramdisk, "_load_manifest", return_value=None), mock.patch.object(
             ramdisk, "build_plan", return_value=plan
         ), mock.patch.object(ramdisk, "_save_manifest"), mock.patch.object(
@@ -425,8 +437,12 @@ class MountAndCopyTest(unittest.TestCase):
         unmount.assert_called_once_with(plan["mounts"][0]["path"], plan["hardware"])
 
     def test_prepare_cleanup_runs_even_when_error_manifest_cannot_be_saved(self):
-        with ModelFixture() as fixture:
-            plan = ramdisk.build_plan(plan_args(fixture.root), hardware=hardware_fixture())
+        with ModelFixture() as fixture, mock.patch.object(
+            ramdisk, "_filesystem_for_path", return_value="ext4"
+        ):
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
         actual = {
             "mount_id": 9,
             "device": "0:42",
