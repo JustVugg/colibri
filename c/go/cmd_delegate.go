@@ -43,7 +43,7 @@ func runChildForwardingSignals(cmd *exec.Cmd) int {
 			// first stop signal — the same clean shutdown the in-process Python
 			// `coli serve` performs on Ctrl-C — and hard-kill on a second.
 			if first {
-				_ = cmd.Process.Signal(syscall.SIGTERM)
+				_ = terminateChild(cmd)
 				first = false
 			} else {
 				_ = cmd.Process.Kill()

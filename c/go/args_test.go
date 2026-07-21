@@ -87,3 +87,29 @@ func TestParseArgsErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestParseArgsErrorStrings pins the exact error messages. These are the Go
+// CLI's own contract (intentionally not a byte-clone of Python argparse); this
+// test is what makes any future drift visible.
+func TestParseArgsErrorStrings(t *testing.T) {
+	cases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"policy", []string{"chat", "--policy", "bogus"},
+			`argument --policy: invalid choice: "bogus" (choose from quality, balanced, experimental-fast)`},
+		{"unknown_command", []string{"frobnicate"},
+			"unknown command: frobnicate"},
+		{"unexpected_positional", []string{"info", "extra"},
+			"unrecognized arguments: extra"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseArgs(tc.argv)
+			if err == nil || err.Error() != tc.want {
+				t.Errorf("parseArgs(%v) error = %v, want %q", tc.argv, err, tc.want)
+			}
+		})
+	}
+}

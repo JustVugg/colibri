@@ -40,22 +40,29 @@ engine (`glm`) and the Python support files the same way the Python `coli` does;
 
 ## Parity
 
-The port mirrors the Python `coli` byte-for-byte where it matters:
+The port mirrors the Python `coli` where it matters, and the Go tests
+(`go test ./...`, gated by `make test-go`) pin it:
 
-- identical help text, `info` rows, and error strings (`tests/test_cli_output.py`);
-- identical child environment from `env_for`, including the measured Windows
-  I/O/OMP defaults (`tests/test_env_defaults.py`) and `--auto-tier`;
+- identical help text and `info` rows;
+- identical child environment from `env_for` — `env_test.go` spawns the real
+  Python `env_for` as an oracle and diffs the child-env map byte-for-byte,
+  including the measured Windows I/O/OMP defaults;
 - identical `plan` / `doctor` output (they call the same `resource_plan.py` /
-  `doctor.py`);
+  `doctor.py`); `drivers_test.go` guards against those modules' APIs drifting;
 - the same engine byte protocol: `\x01\x01READY\x01\x01\n` /
   `\x01\x01END\x01\x01\n` sentinels, `STAT` lines, `\x02RESET`/`\x02MORE` control
   writes, and two-stage Ctrl-C handling in `chat`.
 
+Error messages are the Go CLI's own contract (pinned by `args_test.go`), not a
+byte-clone of Python argparse — e.g. `--policy`'s invalid-choice text is
+Go-native. The Go binary is the launcher going forward, so it owns these.
+
 ## Known differences
 
-- On Windows, `OMP_NUM_THREADS` defaults to the logical CPU count
-  (`runtime.NumCPU()`) rather than the physical-core count the Python
-  `physical_cpu_count()` computes. It is a `setdefault` the user can override, and
-  Windows is not the primary target of this port.
+- On Windows, coli relays Ctrl-C by delivering `CTRL_BREAK_EVENT` to the child's
+  process group (POSIX `SIGINT`/`SIGTERM` cannot be sent to another process on
+  Windows). Whether the child shuts down *gracefully* depends on its own
+  console-control handler — the engine (`glm.c`) and the Python gateway
+  (`openai_server.py`); absent that, Ctrl-Break's default action still stops it.
 - The `chat` input box is drawn once per prompt rather than redrawn with cursor
   math as the Python TTY version does; behaviour is otherwise identical.

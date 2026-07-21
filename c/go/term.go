@@ -41,17 +41,22 @@ func init() {
 	}
 }
 
-// termWidth approximates term_w() = min(columns, 100). It reads $COLUMNS to stay
-// dependency-free, falling back to 80. Unlike the Python term_w()
-// (shutil.get_terminal_size, which ioctls the tty), $COLUMNS is often not
-// exported to child processes, so this usually returns the 80 fallback — a known
-// difference: the chat box may render narrower than the real terminal.
+// termWidth mirrors term_w() = min(columns, 100). It follows the same precedence
+// as Python's shutil.get_terminal_size: honour $COLUMNS when set and valid, else
+// query the controlling terminal (terminalCols, per-OS: TIOCGWINSZ on Unix,
+// GetConsoleScreenBufferInfo on Windows), else fall back to 80.
 func termWidth() int {
-	cols := 80
+	cols := 0
 	if v := os.Getenv("COLUMNS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cols = n
 		}
+	}
+	if cols == 0 {
+		cols = terminalCols()
+	}
+	if cols <= 0 {
+		cols = 80
 	}
 	if cols > 100 {
 		cols = 100

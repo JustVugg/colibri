@@ -104,9 +104,12 @@ func main() {
 		"bench":   cmdBench,
 		"convert": cmdConvert,
 	}
-	if h := handlers[a.Cmd]; h != nil {
-		os.Exit(h(a))
+	h := handlers[a.Cmd]
+	if h == nil {
+		// Unreachable: parseArgs only yields commands present in this map. Fail
+		// loudly rather than silently succeeding if the two ever drift.
+		fmt.Fprintln(os.Stderr, "coli: unhandled command: "+a.Cmd)
+		os.Exit(2)
 	}
-	banner("")
-	fmt.Println(usageDoc)
+	os.Exit(h(a))
 }

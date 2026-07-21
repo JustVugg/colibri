@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -210,12 +211,6 @@ func envFor(a *Args) map[string]string {
 	return e
 }
 
-// physicalCPUCount is a dependency-free approximation. The Python
-// physical_cpu_count() counts physical cores (via lscpu / Win32 APIs); here we
-// use the logical count, which only affects the Windows OMP_NUM_THREADS default
-// (a setdefault the user can override).
-func physicalCPUCount() int { return runtime.NumCPU() }
-
 // engineProc wraps the engine subprocess and a single persistent stdout reader
 // goroutine feeding a byte channel, so streamTurn can consume the byte protocol
 // and be interrupted by SIGINT even during a minutes-long cold prefill.
@@ -290,7 +285,7 @@ func streamTurn(ep *engineProc, sentinel []byte, sigCh <-chan os.Signal, onBytes
 					return nil, errInterruptQuit
 				}
 				interrupted = true
-				_ = ep.cmd.Process.Signal(syscall.SIGINT)
+				_ = interruptChild(ep.cmd)
 				fmt.Printf("\n  %s⏹ stopping… (Ctrl-C again to quit)%s\n", C.yel, C.r)
 				continue
 			case b, ok = <-ep.bytes:
@@ -302,7 +297,7 @@ func streamTurn(ep *engineProc, sentinel []byte, sigCh <-chan os.Signal, onBytes
 			return nil, errEngineDead
 		}
 		pend = append(pend, b)
-		if bytesHasSuffix(pend, sentinel) {
+		if bytes.HasSuffix(pend, sentinel) {
 			rest := pend[:len(pend)-len(sentinel)]
 			if len(rest) > 0 {
 				onBytes(rest)
@@ -316,13 +311,6 @@ func streamTurn(ep *engineProc, sentinel []byte, sigCh <-chan os.Signal, onBytes
 			pend = append(pend[:0], pend[len(pend)-len(sentinel):]...)
 		}
 	}
-}
-
-func bytesHasSuffix(b, suffix []byte) bool {
-	if len(b) < len(suffix) {
-		return false
-	}
-	return string(b[len(b)-len(suffix):]) == string(suffix)
 }
 
 // engineDiag explains why the engine died (mirrors engine_diag in c/coli): a

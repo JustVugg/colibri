@@ -99,15 +99,27 @@ func cmdChat(a *Args) int {
 	if err != nil {
 		fatal("cannot create a temp log: " + err.Error())
 	}
+	// LIFO: Close runs before Remove — Windows cannot delete a still-open file.
 	defer os.Remove(errlog.Name())
+	defer errlog.Close()
 
 	e := envFor(a)
 	e["SERVE"] = "1"
 	cmd := exec.Command(GLM, strconv.Itoa(a.Cap))
 	cmd.Env = envToSlice(e)
-	stdin, _ := cmd.StdinPipe()
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
+	prepareEngineProc(cmd) // Windows: own process group so Ctrl-Break can target it
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		fatal("cannot open the engine stdin: " + err.Error())
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		fatal("cannot open the engine stdout: " + err.Error())
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		fatal("cannot open the engine stderr: " + err.Error())
+	}
 	if err := cmd.Start(); err != nil {
 		fatal("cannot start the engine: " + err.Error())
 	}
