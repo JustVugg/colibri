@@ -797,6 +797,7 @@ static pthread_mutex_t g_pilot_mx=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pilot_cv=PTHREAD_COND_INITIALIZER;
 static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' entrato (per forward) */
 static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can load a layer concurrently */
+static int g_pilot_nw=1;                 /* PILOT_WORKERS: blocking-path pilot threads (SPMC ring). 1 = today's behaviour (byte-identical). Only the non-URING PILOT_REAL path fans out; URING already batches to QD>1. */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
@@ -3743,7 +3744,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
  * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
  * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
  * (un hint perso non e' un errore). */
-static struct { int l,e; } pilot_q[4096];
+static struct { _Atomic int l,e; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. */
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
@@ -3751,46 +3752,61 @@ static Model *pilot_m=NULL;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
 static void pilot_realload(Model *m, int layer, int eid){
     pthread_mutex_lock(&g_pilot_mx);
-    if(layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
-        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-        pthread_mutex_unlock(&g_pilot_mx); return;      /* il main possiede gia' questo layer */
+    if(layer<0 || layer>=256 || layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
+        pthread_mutex_unlock(&g_pilot_mx); return;
     }
     ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
     for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-    for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
-    if(nn<m->ecap){ slot=nn; isnew=1; }
-    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
+    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];   /* dedup contro residenti E prenotazioni in volo -(eid+2) */
+    for(int z=0;z<nn;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    /* SPMC (PILOT_WORKERS>1): scegli lo slot sotto lock e MARCALO prenotato prima di
+     * rilasciarlo, cosi' gli altri worker non lo scelgono come vittima ne' ricaricano
+     * lo stesso eid. Stesso schema del ramo URING (prenotazione visibile -(eid+2),
+     * ecn bumpato subito, scan-vittima che salta le prenotazioni). */
+    int slot,isnew=0;
+    if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
+    else {
+        slot=-1;
+        for(int z=0;z<nn;z++){
+            if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
+            if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
+            if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
+        }
+        if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti gli slot sono in volo */
         /* LFRU eviction guard (#441, fix #490): a speculation must not drop a WARM
          * demand-loaded expert. We PROTECT the victim only when it is genuinely warm
          * (>=2 demand accesses) AND clearly hotter than the speculation by tier_pick_lfru's
-         * 25%+4-freq hysteresis. The original #441 formula tested the speculation's score
-         * against victim+margin, which — because a speculation is by definition historically
-         * colder than a just-used demand expert — dropped ~all speculations once the cache
-         * was full, collapsing the LRU hit share (#490). Cache placement only -> output
-         * byte-identical (a dropped speculation is demand-loaded later, same value). */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
-            int vid=Sl[lru].eid; uint32_t vh=m->eheat[layer][vid];
+         * 25%+4-freq hysteresis; otherwise the speculation may evict the LRU victim as
+         * before. Skips free slots (eid==-1) and other workers' reservations (eid<-1,
+         * excluded by the scan above). Cache placement only -> output byte-identical. */
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
+            int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
                 uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
                 uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
                 if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                            pthread_mutex_unlock(&g_pilot_mx); return; } } } }
+                                            pthread_mutex_unlock(&g_pilot_mx); return; } } }
+    }
     ESlot *dst=&Sl[slot];
-    dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
+    dst->eid=-(eid+2);                                  /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono (isnew) */
+    (void)isnew;
+    dst->used=(uint64_t)-1;                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
+                                                         * (chiude la finestra eid-reale/used-vecchio: uno snapshot di eclock si sarebbe potuto
+                                                         * far superare da altri load durante il pread). used fresco ristampato al successo. */
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server; demand=0: speculative, never classified */
+    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, concorrente fra worker (come i PIPE demand); fatal=0: una speculazione fallita NON uccide il server; demand=0: speculative, never classified. Al successo expert_load setta dst->eid=eid. */
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
-        if(isnew) m->ecn[layer]=slot+1;                 /* pubblica lo slot SOLO ora che eid e' valido */
+        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load fallito: slot resta nascosto (eid=-1), mai pubblicato */
+        dst->eid=-1;                                    /* load fallito: libera la prenotazione (slot resta in ecn ma nascosto, riusabile) */
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
     pthread_cond_broadcast(&g_pilot_cv);
@@ -3806,7 +3822,7 @@ static void pilot_uring_batch(Model *m){
     unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
     unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
     while(r!=w && nd<URING_LOAD_MAX){
-        int layer=pilot_q[r&4095].l,eid=pilot_q[r&4095].e; r++;
+        int layer=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed),eid=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed); r++;
         if(layer<0 || layer>=256){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue; }
         pthread_mutex_lock(&g_pilot_mx);
         if(layer<=atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
@@ -3883,22 +3899,63 @@ static void pilot_uring_batch(Model *m){
     }
 }
 #endif
-static void *pilot_worker(void *arg){
-    (void)arg;
+/* SPMC ring claim: each of N pilot workers grabs a UNIQUE ring index via CAS, never
+ * advancing past pilot_w. Returns 1 and *out=index, or 0 if the ring is empty. The
+ * producer stays single (main thread, only pilot_w) — this only splits the consumer. */
+static int pilot_ring_claim(int *out_l, int *out_e){
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
-        if(r==w){ usleep(200); continue; }
-        if(g_pilot_real){
-#ifdef __linux__
-            if(g_uring){ pilot_uring_batch(pilot_m); continue; }
-#endif
-            pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        if(r==w) return 0;                              /* empty */
+        /* Read the payload BEFORE committing the claim. While pilot_r==r the slot at
+         * index r cannot be overwritten (the producer's w-r<4096 guard keeps pilot_w
+         * below r+4096). If the CAS succeeds, pilot_r was r the whole time -> the read
+         * is valid. If it fails, another worker advanced pilot_r; we discard and retry
+         * (a torn read there is thrown away, never used). */
+        int l=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed), e=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed);
+        if(__atomic_compare_exchange_n(&pilot_r,&r,r+1,/*weak=*/1,
+                                       __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+            *out_l=l; *out_e=e; return 1;                /* claimed exactly one item, payload valid */
         }
-        else             expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
-        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+        /* lost the CAS race to another worker -> retry */
+    }
+}
+static void *pilot_worker(void *arg){
+    (void)arg;
+    for(;;){
+#ifdef __linux__
+        if(g_pilot_real && g_uring){                    /* URING drains a whole batch itself -> single worker (nw==1) */
+            unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
+            unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+            if(r==w){ usleep(200); continue; }
+            pilot_uring_batch(pilot_m);
+            continue;
+        }
+#endif
+        int l,e;                                        /* blocking / hint path: SPMC, one item per worker */
+        if(!pilot_ring_claim(&l,&e)){ usleep(200); continue; }
+        if(g_pilot_real) pilot_realload(pilot_m, l, e); /* QD=N: N concurrent preads instead of 1 */
+        else             expert_prefetch(pilot_m, l, e);
     }
     return NULL;
+}
+/* Spawn the pilot worker(s) ONCE, from the MAIN thread (first pilot_prefetch/couple_prefetch).
+ * Only the blocking PILOT_REAL path fans out to g_pilot_nw threads; the URING path already
+ * batches to QD>1 and hint-only is cheap fadvise, so both keep a single worker. */
+static void pilot_spawn(Model *m){
+    if(pilot_m) return;                                 /* pilot_m is the once-guard; only the main thread calls this */
+    pilot_m=m;
+    int uring_active=0;
+#ifdef __linux__
+    uring_active=g_uring;
+#endif
+    /* INVARIANTE: con URING attivo nw DEVE restare 1 — pilot_uring_batch e' un
+     * consumatore SINGOLO (avanza pilot_r con uno store semplice, non la CAS di
+     * pilot_ring_claim); due drainer URING concorrenti corromperebbero pilot_r.
+     * Il ramo blocking (pilot_ring_claim, CAS) e' invece SPMC-safe a N. */
+    int nw=(g_pilot_real && !uring_active)?g_pilot_nw:1;
+    if(nw<1) nw=1; if(nw>16) nw=16;
+    for(int i=0;i<nw;i++){ pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
 }
 /* parse .coli_pairs (see tools/route_pairs.py): "COLIPAIRS 1 <n>" then
  * "<L> <dL> <e> f:c f:c ..." lines. Needs c->n_experts/n_layers -> called post-init. */
@@ -3939,7 +3996,7 @@ static void couple_load(Model *m, const char *path){
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
     Cfg *c=&m->c; int E=c->n_experts;
     if(E>512) return;
-    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    pilot_spawn(m);
     for(int dL=1; dL<=g_couple_d; dL++){
         int lt=layer+dL;
         if(lt>=c->n_layers || !m->L[lt].sparse) continue;
@@ -3964,7 +4021,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
-                    pilot_q[w&4095].l=lt; pilot_q[w&4095].e=best;
+                    atomic_store_explicit(&pilot_q[w&4095].l,lt,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                     g_cp_enq++;
                 }
@@ -3975,7 +4032,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
     int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
-    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    pilot_spawn(m);
     float *nrm=falloc(D), *ch=falloc(E);
     /* Two-step workspace (allocated once, reused across positions) */
     float *snrm=NULL, *sg=NULL, *su=NULL, *sout=NULL, *hc=NULL;
@@ -4026,7 +4083,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
-                    pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
+                    atomic_store_explicit(&pilot_q[w&4095].l,lnext,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                 }
             }
@@ -6689,13 +6746,18 @@ int main(int argc, char **argv){
     if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
     g_pilot_two = getenv("PILOT_TWO")?atoi(getenv("PILOT_TWO")):0; /* 1 = two-step: shared-expert-corrected router prediction (+2.3% recall, 3 extra matmuls) */
     if(g_pilot_two) g_pilot=1;                            /* PILOT_TWO implies PILOT active */
-    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
     /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
      * Under PILOT_REAL the speculative loads are REAL and create LRU eviction
      * pressure, so at ~28% mispredict a large K thrashes the cache — default to 6
      * (best-measured this session) unless the user set PILOT_K explicitly. */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
+    /* PILOT_WORKERS: blocking-path pilot threads (SPMC ring). Default 1 = today's
+     * behaviour, byte-identical. >1 raises NVMe queue depth on the non-URING
+     * PILOT_REAL path (the URING path already batches). Clamp [1,16]. */
+    g_pilot_nw = getenv("PILOT_WORKERS")?atoi(getenv("PILOT_WORKERS")):1;
+    if(g_pilot_nw<1) g_pilot_nw=1; if(g_pilot_nw>16) g_pilot_nw=16;
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
     g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
 #ifdef _WIN32
