@@ -11,6 +11,7 @@ import shutil
 # Files (relative to c/) to remove if present.
 FILES = [
     "olmoe", "olmoe.exe",
+    "colibri", "colibri.exe",
     "glm", "glm.exe",
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o",

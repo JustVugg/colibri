@@ -1,6 +1,6 @@
 """End-to-end RAM-disk zero-SSD-read contract test.
 
-Launches the REAL glm engine on a tmpfs-backed int4 model and asserts the live
+Launches the real Colibri engine on a tmpfs-backed int4 model and asserts the live
 PROF output reports ~0 physical SSD reads and that COLI_RAMMAP actually bound
 experts. This is the live-process proof the dependency-free unit suite fakes:
 FakeEngine hardcodes physical_ssd_bytes=0 (test_ramdisk.py), so a green suite
@@ -12,7 +12,7 @@ The acceptance contract being proven (docs/SETTINGS.md, "full mode"):
   * the decode window does zero block-device reads -> /proc/self/io read_bytes
     stays ~0, reported as `[PROF] physical SSD reads: 0.000 GB`.
 
-Gating: needs a real glm-runnable int4 model on tmpfs plus the built glm binary.
+Gating: needs a real GLM-compatible int4 model on tmpfs plus the built colibri binary.
 The unit suite cannot produce that (the repo's fixture generators need a recent
 transformers with the GLM modeling code), so the live test runs only when
 COLI_RAMMAP_E2E_MODEL points at such a directory; otherwise it skips. A skip is
@@ -22,7 +22,7 @@ and sets the variable (see the ramdisk-e2e job in .github/workflows/ci.yml).
     COLI_RAMMAP_E2E_MODEL=/dev/shm/glm_i4 python3 -m pytest tests/test_rammap_e2e.py -v
 
 The parse logic itself is covered by ProfParseTest below, which runs everywhere
-and pins the exact glm.c PROF emission strings.
+and pins the exact colibri.c PROF emission strings.
 """
 
 import os
@@ -32,9 +32,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-GLM = ROOT / "glm"
+ENGINE = ROOT / "colibri"
 
-# `[PROF] RAM map: <experts> experts / <gb> GB direct | ...` (glm.c prof_report,
+# `[PROF] RAM map: <experts> experts / <gb> GB direct | ...` (colibri.c prof_report,
 # printed only when COLI_RAMMAP bound at least one expert -> tmpfs-backed).
 RAM_MAP_RE = re.compile(r"\[PROF\] RAM map: (\d+) experts / ([0-9.]+) GB direct")
 # `[PROF] physical SSD reads: <gb> GB (...)` -- the live /proc/self/io read_bytes
@@ -73,11 +73,11 @@ def parse_prof(output):
     "set COLI_RAMMAP_E2E_MODEL to a tmpfs-backed int4 model dir",
 )
 class RammapE2ETest(unittest.TestCase):
-    """Live glm on tmpfs: asserts the zero-physical-SSD-read contract holds."""
+    """Live Colibri on tmpfs: asserts the zero-physical-SSD-read contract holds."""
 
     def setUp(self):
         self.model = Path(os.environ["COLI_RAMMAP_E2E_MODEL"])
-        self.assertTrue(GLM.exists(), "glm binary not built -- run `make glm`")
+        self.assertTrue(ENGINE.exists(), "colibri binary not built -- run `make colibri`")
         self.assertTrue(self.model.is_dir(), "model dir missing: %s" % self.model)
         self.assertTrue(REF.exists(), "missing %s -- run from a repo checkout" % REF)
 
@@ -100,11 +100,11 @@ class RammapE2ETest(unittest.TestCase):
         )
         env.pop("COLI_STATE_DIR", None)  # default to SNAP; an explicit tmpfs path is rejected
         proc = subprocess.run(
-            [str(GLM)], env=env, capture_output=True, text=True, timeout=180
+            [str(ENGINE)], env=env, capture_output=True, text=True, timeout=180
         )
         output = proc.stdout + proc.stderr
         self.assertEqual(
-            proc.returncode, 0, "glm exited %d:\n%s" % (proc.returncode, output[-2000:])
+            proc.returncode, 0, "colibri exited %d:\n%s" % (proc.returncode, output[-2000:])
         )
         self.assertNotIn(
             UNAVAILABLE,
@@ -131,7 +131,7 @@ class RammapE2ETest(unittest.TestCase):
 
 
 class ProfParseTest(unittest.TestCase):
-    """Pins parse_prof against the exact glm.c PROF strings -- runs everywhere."""
+    """Pins parse_prof against the exact colibri.c PROF strings -- runs everywhere."""
 
     def test_parses_bound_tmpfs_output(self):
         sample = (

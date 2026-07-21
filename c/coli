@@ -9,9 +9,9 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
   coli info                 model, RAM, disk, and configuration status
   coli plan                 Disk / RAM / VRAM resource plan
   coli mirror               Plan, stage, or verify a learned partial mirror
+  coli doctor               installation and execution-plan diagnostics
   coli ramdisk              NUMA-aware RAM-disk manager and interactive TUI
   coli ramdisk plan --json  scriptable RAM-disk capacity and staging plan
-  coli doctor               installation and execution-plan diagnostics
   coli bench [task...]      quality benchmarks (MMLU/HellaSwag/...)
   coli convert              convert GLM-5.2-FP8 to int4, one shard at a time
   coli build                build the engine

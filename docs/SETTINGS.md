@@ -1,6 +1,6 @@
 # CLI & Settings Reference
 
-Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The underlying `glm` engine is driven by environment variables — see [ENVIRONMENT.md](ENVIRONMENT.md).
+Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The underlying Colibri engine is driven by environment variables — see [ENVIRONMENT.md](ENVIRONMENT.md).
 
 **Updated for the contribution based on `upstream/dev @ 21e7a35`** (argparse definitions in `c/coli` and `c/openai_server.py`). See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate.
 
@@ -12,7 +12,7 @@ Command-line settings for the two user-facing programs: the **`coli`** CLI and t
 coli <subcommand> [flags]
 ```
 
-Flags may also be given **after** the subcommand. Most flags map onto an engine environment variable before `glm` is launched (see the mapping table at the bottom).
+Flags may also be given **after** the subcommand. Most flags map onto an engine environment variable before Colibri is launched (see the mapping table at the bottom).
 
 ### Subcommands
 
@@ -26,7 +26,6 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
-| `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). || `serve` | Start the OpenAI-compatible HTTP server. |
 | `stop` | Stop a server on the selected port. |
 | `ramdisk` | Open the Linux NUMA-aware RAM-disk TUI or run a scriptable lifecycle action. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
@@ -151,7 +150,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--model` | `$COLI_MODEL` (required if unset) | Model snapshot directory. |
-| `--engine` | `./glm` | Path to the engine binary. |
+| `--engine` | `./colibri` | Path to the engine binary. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
@@ -164,7 +163,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | KV conversation slots. |
 
-Tool calling (`tools` in the request) is supported; the opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed int4 tool calls. Server-relevant env vars: `COLI_METAL`, `PIPE`, `DIRECT`, `COLI_NO_OMP_TUNE`, `RAM_GB`, `CTX`, `KVSAVE` (all from [ENVIRONMENT.md](ENVIRONMENT.md)) apply because the server launches the same `glm` engine.
+Tool calling (`tools` in the request) is supported; the opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed int4 tool calls. Server-relevant env vars: `COLI_METAL`, `PIPE`, `DIRECT`, `COLI_NO_OMP_TUNE`, `RAM_GB`, `CTX`, `KVSAVE` (all from [ENVIRONMENT.md](ENVIRONMENT.md)) apply because the server launches the same Colibri engine.
 
 ---
 
@@ -174,4 +173,4 @@ A flag and its mapped environment variable are two routes to the same engine kno
 
 - For knobs with a flag (`--temp`, `--ctx`, `--ram`, `--topk`, `--topp`, `--repin`, `--cap`, `--ngen`, `--policy`), prefer the flag — it's the supported surface.
 - For knobs with **no** flag (`COLI_METAL`, `PIPE`, `DIRECT`, `COLI_NO_OMP_TUNE`, `MLOCK`, `CAP_RAISE`, `KVSAVE`, `SEED`, `NUCLEUS`, …), export the environment variable.
-- The CLI copies your whole environment through to `glm`, so any variable you export is honored unless a flag explicitly overrides it.
+- The CLI copies your whole environment through to Colibri, so any variable you export is honored unless a flag explicitly overrides it.

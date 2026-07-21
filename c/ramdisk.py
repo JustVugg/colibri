@@ -3157,10 +3157,17 @@ def _resolve_engine_path(cli_path, engine_path=None):
     if engine_path:
         candidates.append(engine_path)
     here = os.path.dirname(os.path.abspath(cli_path))
+    suffix = ".exe" if os.name == "nt" else ""
     candidates.extend(
         [
-            os.path.join(here, "glm"),
-            os.path.join(os.path.dirname(here), "libexec", "colibri", "glm"),
+            os.path.join(here, "colibri" + suffix),
+            os.path.join(
+                os.path.dirname(here), "libexec", "colibri", "colibri" + suffix
+            ),
+            os.path.join(here, "glm" + suffix),
+            os.path.join(
+                os.path.dirname(here), "libexec", "colibri", "glm" + suffix
+            ),
         ]
     )
     for candidate in candidates:

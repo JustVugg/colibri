@@ -54,6 +54,11 @@ int main(void){
 #ifndef __linux__
     puts("test_rammap: skipped (Linux only)"); return 0;
 #else
+    QT grouped={.fmt=4,.O=2,.I=129,.gs=64};
+    QT int3={.fmt=5,.O=2,.I=65};
+    if(qt_scale_bytes(&grouped)!=24 || qt_scale_bytes(&int3)!=16 ||
+       qt_bytes(&int3)-qt_scale_bytes(&int3)!=96)
+        return fail("grouped/int3 scale and weight byte geometry");
     ProfPhysicalWire unavailable=prof_physical_wire(-1);
     ProfPhysicalWire measured_zero=prof_physical_wire(0);
     ProfPhysicalWire measured_bytes=prof_physical_wire(4096);
@@ -189,6 +194,10 @@ int main(void){
     m.ecache[0]=calloc(1,sizeof(ESlot)); m.ecache[0][0].eid=0; m.ecache[0][0].used=123; m.ecn[0]=1;
     atomic_store_explicit(&g_prof_io,777,memory_order_relaxed); m.rammap_calls=0;
     ESlot *direct=rammap_slot(&m,0,0);
+    if(!expert_slot_is_pinned(&m,0,&m.pin[0][0]) ||
+       expert_slot_is_pinned(&m,0,direct) ||
+       expert_slot_is_pinned(&m,0,&m.ecache[0][0]))
+        return fail("pin tier classification uses slot identity");
     if(expert_resident_slot(&m,0,0,1)!=direct || m.rammap_calls!=1 ||
        m.ecache[0][0].used!=123 || atomic_load_explicit(&g_prof_io,memory_order_relaxed)!=777)
         return fail("direct-map precedence / LRU and I/O exclusion / telemetry");

@@ -52,12 +52,9 @@ class RealTmpfsLifecycleTest(unittest.TestCase):
             ):
                 plan = ramdisk.build_plan(args)
                 # This test validates the prepare/status/destroy lifecycle, not the
-                # host's free RAM. The planner's global_margin floor
-                # (max(total_RAM/10, 16 GB)) blocks staging whenever free RAM is under
-                # ~16 GB -- always true on a 7 GB CI runner, and on any loaded box.
-                # That is environmental, not a lifecycle defect, so skip on it; still
-                # fail on any OTHER blocker (Linux/tmpfs/numactl/budget prerequisites),
-                # which would be a real problem.
+                # production 16 GiB OS reserve. Fail on every non-memory prerequisite,
+                # then bypass only that reserve in the reviewed plan returned to
+                # prepare; production planning and admission remain untouched.
                 blockers = plan["blockers"]
                 memory_blockers = [
                     b for b in blockers if "memory" in b.lower() or "reserve" in b.lower()
@@ -67,12 +64,19 @@ class RealTmpfsLifecycleTest(unittest.TestCase):
                     [],
                     "non-memory plan blockers: %s" % blockers,
                 )
-                if memory_blockers:
-                    self.skipTest(
-                        "host lacks free RAM for the planner reserve (%s); "
-                        "lifecycle test needs >=16 GB free" % memory_blockers
-                    )
-                prepared = ramdisk.prepare(args, display_plan=False)
+                plan["blockers"] = []
+                plan["reserve"]["os_margin_bytes"] = 0
+                plan["reserve"]["total_os_margin_bytes"] = 0
+                plan["reserve"]["required_global_bytes"] = (
+                    plan["staging"]["staged_bytes"]
+                    + plan["reserve"]["runtime_bytes"]
+                    + plan["reserve"]["page_table_bytes"]
+                )
+                plan["reserve"]["total_required_bytes"] = plan["reserve"][
+                    "required_global_bytes"
+                ]
+                with mock.patch.object(ramdisk, "build_plan", return_value=plan):
+                    prepared = ramdisk.prepare(args, display_plan=False)
                 self.assertEqual(prepared["state"], "ready")
                 report = ramdisk.status()
                 self.assertTrue(report["source_fingerprint_verified"])

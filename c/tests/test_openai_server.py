@@ -16,7 +16,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
-                           generation_options, parse_tool_calls, read_engine_turn,
+                           default_engine, generation_options, parse_tool_calls, read_engine_turn,
                            render_chat, render_chat_kimi, serve,
                            split_thinking_reply, stop_policy)
 
@@ -234,6 +234,11 @@ class StopFilterTest(unittest.TestCase):
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_default_engine_uses_current_binary_name(self):
+        with patch("openai_server.Path.exists", autospec=True,
+                   side_effect=lambda candidate: candidate.name == "colibri.exe"):
+            self.assertEqual(default_engine().name, "colibri.exe")
+
     def test_reads_payload_and_extended_status(self):
         stream = io.BytesIO(b"hello" + END + b"STAT 2 3.5 44 1.2 7 1\n")
         chunks = []

@@ -108,6 +108,7 @@ jobs:
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp c/autotune.py dist/
+          cp c/ramdisk.py dist/
           cp LICENSE dist/
           # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
           # probe that layout as well as the source checkout's one-level-up form.

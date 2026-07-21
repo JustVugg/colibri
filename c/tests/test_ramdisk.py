@@ -1065,6 +1065,22 @@ class ManagedLaunchTest(unittest.TestCase):
 
 
 class BenchmarkTest(unittest.TestCase):
+    def test_engine_resolution_prefers_current_binary_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = root / "coli"
+            cli.write_text("", encoding="utf-8")
+            suffix = ".exe" if os.name == "nt" else ""
+            current = root / ("colibri" + suffix)
+            legacy = root / ("glm" + suffix)
+            for engine in (current, legacy):
+                engine.write_text("", encoding="utf-8")
+                engine.chmod(0o755)
+
+            resolved = ramdisk._resolve_engine_path(str(cli))
+
+        self.assertEqual(resolved, str(current.resolve()))
+
     def test_system_score_uses_concurrent_aggregate_rss_and_mount_shmem(self):
         filesystem = mock.Mock(f_blocks=10, f_bfree=6, f_frsize=4096)
         manifest = {

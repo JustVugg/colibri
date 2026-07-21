@@ -2,11 +2,11 @@
 
 Reference for the environment variables read by the colibrì engine.
 
-**Generated from `dev @ d5327e2`** by scanning every `getenv()` site in `c/glm.c` and the other C sources (`c/olmoe.c`, `c/backend_cuda.cu`, `c/backend_metal.mm`). Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
+**Generated from `dev @ d5327e2`** by scanning every `getenv()` site in `c/colibri.c` and the other C sources (`c/olmoe.c`, `c/backend_cuda.cu`, `c/backend_metal.mm`). Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
 
 ## Which program reads these?
 
-The C engine binary (`c/glm`, built from `c/glm.c`) reads **all** of these. You rarely export them by hand — the `coli` CLI and `openai_server.py` translate most of their flags into these variables before launching `glm` (e.g. `--temp` → `TEMP`, `--ctx` → `CTX`). See [SETTINGS.md](SETTINGS.md) for the flag → variable mapping. Export a variable directly only to reach a knob the CLI doesn't surface, or to override what the CLI would set.
+The C engine binary (`c/colibri`, built from `c/colibri.c`) reads **all** of these. You rarely export them by hand — the `coli` CLI and `openai_server.py` translate most of their flags into these variables before launching Colibri (e.g. `--temp` → `TEMP`, `--ctx` → `CTX`). See [SETTINGS.md](SETTINGS.md) for the flag → variable mapping. Export a variable directly only to reach a knob the CLI doesn't surface, or to override what the CLI would set.
 
 Format: `VAR` — default — effect.
 
@@ -236,7 +236,7 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 
 ## Server / CLI (`openai_server.py`, `coli`)
 
-These are read by the Python programs (not the `glm` engine), so they don't appear in `glm.c`. They cover the OpenAI-compatible server, tool calling, and the debug view.
+These are read by the Python programs (not the C engine), so they don't appear in `colibri.c`. They cover the OpenAI-compatible server, tool calling, and the debug view.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -248,7 +248,6 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 | `COLI_API_KEY` | unset | Required bearer token for the server. |
 | `COLI_ALLOWED_HOSTS` | unset | Comma-separated hostnames or IP addresses accepted by the DNS-rebinding guard in addition to loopback and the bind address. Equivalent to repeating `--allowed-host`. |
 | `COLI_MAX_QUEUE` | `8` | Max queued requests. |
-| `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. || `COLI_MAX_QUEUE` | `8` | Max queued requests. |
 | `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. |
 | `COLI_ENGINE_READY_TIMEOUT` | `7200` | Seconds the Python server waits for the C engine/model to become ready. Invalid values and timeouts terminate and reap the child process. |
 | `COLI_KV_SLOTS` | `1` | Independent KV conversation slots (→ engine `KV_SLOTS`). |
@@ -262,7 +261,7 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 
 `coli` / `openai_server.py` set these internally to select a run mode or pass through a flag:
 
-- `SNAP` — model snapshot directory (required by `glm`; set from `--model`).
+- `SNAP` — model snapshot directory (required by Colibri; set from `--model`).
 - `SERVE`, `SERVE_BATCH` — select serve / batched-serve mode.
 - `PROMPT` — one-shot text mode (the engine also honors `COLI_PROMPT`, preferred cross-platform; `PROMPT` is ignored on Windows if it contains cmd.exe `$`-metacharacters).
 - `COLI_OMP_TUNED` — internal sentinel guarding the OMP re-exec (see `COLI_NO_OMP_TUNE`); not user-facing.

@@ -43,9 +43,8 @@
             gmp
           ];
 
-          # python3 is needed by checkPhase: `make test-c` shells out to
-          # `python3 tools/run_tests.py` (see c/Makefile, PYTHON ?= python3).
-          nativeCheckInputs = with pkgs; [python3];
+          # `make test` runs both the C harness and Python converter tests.
+          nativeCheckInputs = [pythonEnv];
 
           # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
           ARCH =
@@ -77,6 +76,7 @@
 
             # $out/bin holds the user-facing entry points.
             ln -s ../lib/colibri/colibri $out/bin/colibri
+            ln -s colibri $out/bin/glm
 
             # Wrap coli: point it at the bundled engine (COLI_ENGINE) so it is
             # found by default, and at the module dir (PYTHONPATH) so

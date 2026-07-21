@@ -361,7 +361,8 @@ typedef struct {
     int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
 #endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
-    ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */    ESlot *rammap;                                /* PR #377: immutable [layer][expert] tmpfs views */
+    ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
+    ESlot *rammap;                               /* PR #377: immutable [layer][expert] tmpfs views */
     int rammap_experts; int64_t rammap_bytes; uint64_t rammap_calls;
     double rammap_prefault_s;
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -799,7 +800,8 @@ static void prof_base(Model *m, ProfBase *b){
         b->dc_direct_n[i]=atomic_load_explicit(&g_dc_direct_n[i],memory_order_relaxed);
     }
     dc_wall_read(b->dc_wall_ns,&b->dc_wall_all_ns);
-}static int64_t prof_physical_read_delta(const ProfBase *b){
+}
+static int64_t prof_physical_read_delta(const ProfBase *b){
     uint64_t now;
     if(!b->physical_read_valid || !prof_physical_read_bytes(&now) ||
        now<b->physical_read_bytes) return -1;
@@ -2055,7 +2057,8 @@ static void *map_of_fd(int fd){
 #endif
     pthread_mutex_unlock(&g_map_mtx);
     return base;
-}static ESlot *rammap_slot(Model *m, int layer, int eid){
+}
+static ESlot *rammap_slot(Model *m, int layer, int eid){
     if(!m->rammap || layer<0 || layer>m->c.n_layers || eid<0 || eid>=m->c.n_experts) return NULL;
     ESlot *s=&m->rammap[(int64_t)layer*m->c.n_experts+eid];
     return s->backing==ESLOT_BACKING_RAMMAP && s->eid==eid ? s : NULL;
@@ -2119,7 +2122,7 @@ static int64_t rammap_bind_one(Model *m, int layer, int eid, ESlot *s){
 
 static void rammap_touch_qt(const QT *q){
     const char *w=q->fmt==1?(const char*)q->q8:(const char*)q->q4;
-    int64_t scale_b=(q->fmt==4)?(int64_t)q->O*((q->I+q->gs-1)/q->gs)*4:(int64_t)q->O*4;
+    int64_t scale_b=qt_scale_bytes(q);
     int64_t weight_b=qt_bytes(q)-scale_b;
     volatile unsigned char acc=0;
     for(int64_t i=0;i<weight_b;i+=4096) acc^=(unsigned char)w[i];
@@ -3920,6 +3923,12 @@ static ESlot *expert_resident_slot(Model *m, int layer, int eid, int touch){
 static int expert_is_resident(Model *m, int layer, int eid){
     return expert_resident_slot(m,layer,eid,0)!=NULL;
 }
+static int expert_slot_is_pinned(const Model *m, int layer, const ESlot *slot){
+    if(!slot || !m->pin || !m->npin || layer<0 || layer>m->c.n_layers) return 0;
+    const ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(slot==&P[z]) return 1;
+    return 0;
+}
 
 /* I loop di selezione top-K partono da best=-1 e lo usano come indice appena il
  * giro finisce. Se OGNI punteggio candidato e' non finito nessun confronto riesce
@@ -4360,7 +4369,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                  * (counted in m->rammap_calls inside expert_resident_slot), pin/ecache
                  * stay distinguishable for the PROF tier breakdown. */
                 if(use[j]->backing!=ESLOT_BACKING_RAMMAP){
-                    if(use[j]>=m->pin[layer] && use[j]<m->pin[layer]+m->npin[layer]) m->hit_pin++;
+                    if(expert_slot_is_pinned(m,layer,use[j])) m->hit_pin++;
                     else m->hit_ecache++;
                 }
             } else { qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
