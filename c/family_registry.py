@@ -393,6 +393,38 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _minimax_geometry(config, context, _model_dir):
+    """MiniMax-M3: plain GQA -- no latent compression, so the cache holds the
+    full K and V rows rather than a compressed pair.
+
+    Mirrors colibri.c's ARCH_M3 allocation. load_cfg aliases the MLA cache
+    fields onto the GQA widths (kv_lora = qk_rope = num_key_value_heads *
+    head_dim, colibri.c:1411-1412), so kv_alloc's per-layer Lc/Rc pair is one
+    full K row and one full V row per token. It keeps num_hidden_layers + 1
+    rows: the extra one is the MTP layer's KV.
+
+        state = (layers + 1) * context * 2 * kv_heads * head_dim * 4
+
+    Workspace mirrors attention_gqa()'s scratch set with S == context at
+    prefill: q and ctx are heads-wide, k and v are kv_heads-wide, plus the
+    per-row score buffer (heads * window, window <= context).
+
+        ws = context * ((2 * heads + 2 * kv_heads) * head_dim + heads) * 4
+
+    Experts: configured_experts = num_local_experts (M3's spelling of
+    n_routed_experts).
+    """
+    layers = _required_int(config, "num_hidden_layers", "minimax_m3")
+    experts = _required_int(config, "num_local_experts", "minimax_m3")
+    heads = _required_int(config, "num_attention_heads", "minimax_m3")
+    kv_heads = _required_int(config, "num_key_value_heads", "minimax_m3")
+    head_dim = _required_int(config, "head_dim", "minimax_m3")
+
+    state = (layers + 1) * context * 2 * kv_heads * head_dim * 4
+    workspace = context * ((2 * heads + 2 * kv_heads) * head_dim + heads) * 4
+    return PlannerGeometry(state, 0, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -588,6 +620,43 @@ FAMILIES = (
         capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
+    ),
+    FamilyDescriptor(
+        id="minimax_m3",
+        # The converter flattens text_config to the root and stamps
+        # "minimax_m3"; a raw MiniMax checkpoint is the VL wrapper
+        # ("minimax_m3_vl") with the text model nested. Both resolve here, and
+        # config_section="text_config" reads either shape.
+        model_types=("minimax_m3", "minimax_m3_vl"),
+        display_name="MiniMax-M3",
+        display_scale="426B",
+        # Shares GLM's binary ON PURPOSE: colibri.c reads config.json and
+        # switches itself to ARCH_M3 (GQA + MSA). The descriptor keeps them
+        # distinct where it matters -- internal_arch, template, planner -- so
+        # this is routing, not the #879 fallthrough. engine_aliases mirrors
+        # GLM's because it is literally the same artifact on disk.
+        engine_artifact="colibri",
+        engine_aliases=("glm",),
+        engine_group="colibri-core",
+        internal_arch="minimax_m3",
+        build_target="colibri",
+        process_names=("colibri",),
+        default_model_id="minimax-m3-colibri",
+        cli_adapter="minimax_m3",
+        gateway_adapter="minimax_m3",
+        planner_id="minimax_m3_gqa",
+        planner_geometry=_minimax_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        config_section="text_config",
+        # implicit_cap 0 is GLM's platform-auto sentinel, which this binary
+        # resolves itself -- the legacy 8 belongs to the sister engines.
+        # One KV slot: batched serve is not validated for M3 in this PR.
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 0, "CTX"),
+        capabilities=FamilyCapabilities(False, False, False, True),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        tune_prompt_template="]~!b[]~b]user\n{prompt}[e~[\n]~b]ai\n</mm:think>",
     ),
 )
 

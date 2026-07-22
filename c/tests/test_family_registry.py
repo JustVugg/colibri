@@ -38,15 +38,6 @@ def qwen_geometry(config, context, _model_dir):
     return PlannerGeometry(kv, fixed, 0, config["num_experts"])
 
 
-def minimax_geometry(config, context, _model_dir):
-    state = ((config["num_hidden_layers"] + 1) * context *
-             config["num_key_value_heads"] * config["head_dim"] * 2 * 4)
-    sparse = config["sparse_attention_config"]
-    state += sum(bool(value) for value in sparse["sparse_attention_freq"]) * \
-        context * sparse["sparse_index_dim"] * 4
-    return PlannerGeometry(state, 0, 0, config["num_local_experts"])
-
-
 TEST_INVENTORY = lambda _name, _size, _config: ()
 QWEN36_FIXTURE = FamilyDescriptor(
     id="qwen36",
@@ -70,29 +61,6 @@ QWEN36_FIXTURE = FamilyDescriptor(
     limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
     capabilities=FamilyCapabilities(False, False, False, True),
 )
-MINIMAX_M3_FIXTURE = FamilyDescriptor(
-    id="minimax_m3",
-    model_types=("minimax_m3",),
-    display_name="MiniMax M3",
-    display_scale="",
-    engine_artifact="colibri",
-    engine_aliases=(),
-    engine_group="colibri-core",
-    internal_arch="minimax_m3",
-    build_target="colibri",
-    process_names=("colibri",),
-    default_model_id="minimax-m3-colibri",
-    cli_adapter="minimax_m3",
-    gateway_adapter="minimax_m3",
-    planner_id="minimax_m3_gqa",
-    planner_geometry=minimax_geometry,
-    planner_unsupported_reason="",
-    expert_inventory=TEST_INVENTORY,
-    config_section="root",
-    limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "CTX"),
-    capabilities=FamilyCapabilities(True, False, False, True),
-)
-
 
 class FamilyRegistryTest(unittest.TestCase):
     def test_production_descriptors_are_complete_unique_and_serializable(self):
@@ -151,7 +119,7 @@ class FamilyRegistryTest(unittest.TestCase):
         for model_type in ("qwen2", "qwen3_moe", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
 
-    def test_minimax_fixture_can_share_colibri_without_becoming_glm(self):
+    def test_minimax_shares_colibri_without_becoming_glm(self):
         config = {
             "model_type": "minimax_m3",
             "num_hidden_layers": 2,
@@ -160,14 +128,15 @@ class FamilyRegistryTest(unittest.TestCase):
             "head_dim": 8,
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
-            "sparse_attention_config": {
-                "use_sparse_attention": True,
-                "sparse_index_dim": 8,
-                "sparse_attention_freq": [0, 1],
-            },
+            "moe_layer_freq": [0, 1],
         }
-        by_id, by_type = _build_registry(FAMILIES + (MINIMAX_M3_FIXTURE,))
+        # minimax_m3 is a registered family now, so the fixture this test
+        # landed with would collide on its id. Assert against the production
+        # descriptor instead -- the stronger test: it pins the shipped
+        # geometry, not a copy.
+        by_id, by_type = _build_registry(FAMILIES)
         family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["minimax_m3"])
         self.assertEqual(family.engine_artifact, by_id["glm"].engine_artifact)
         self.assertEqual(family.engine_group, by_id["glm"].engine_group)
         self.assertNotEqual(family.internal_arch, by_id["glm"].internal_arch)
@@ -175,7 +144,9 @@ class FamilyRegistryTest(unittest.TestCase):
                                    "model_dir": "."})()
         geometry = planner_geometry(resolved, 32)
         self.assertEqual(geometry.configured_experts, 4)
-        self.assertEqual(geometry.context_state_bytes, 13_312)
+        # 3 rows (2 layers + the MTP row) x 32 tokens x (K + V) x 2 kv heads
+        # x 8 head_dim x 4 bytes. No latent compression: GQA caches full rows.
+        self.assertEqual(geometry.context_state_bytes, 12_288)
 
     def test_olmoe_fixture_models_conventional_fp32_kv_cache(self):
         # OLMoE keeps a full K and V cache per layer, sized at num_attention_heads
@@ -843,6 +814,11 @@ class FamilyRegistryTest(unittest.TestCase):
             "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
+            # MiniMax-M3 opens the ai turn with </mm:think>, the same nothink
+            # marker its history turns carry -- the bare "]~b]ai\\n" state is
+            # the thinking one, so replaying without it would tune a different
+            # workload than the default `coli run` / `coli serve` path.
+            "minimax_m3": "]~!b[]~b]user\nhello {world}[e~[\n]~b]ai\n</mm:think>",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},

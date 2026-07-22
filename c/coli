@@ -1220,11 +1220,19 @@ def cmd_run(a):
             [engine, str(cap_for_launch(a.cap,e,16)), "8"],
             input=prompt+"\n", text=True, env=e, check=False)
         sys.exit(result.returncode)
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
-    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
-    # <think> open so the engine emits its reasoning block; the default stays nothink.
-    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
+    # Official GLM-5.2 template: no \n after the role markers; <think></think> means a
+    # direct answer (nothink). THINK=1 leaves <think> open so the engine emits its
+    # reasoning block -- same convention as serve mode (glm.c); the default stays nothink.
+    think=os.environ.get("THINK","0")=="1"
+    if arch=="minimax_m3":
+        # MiniMax-M3 chat_template.jinja: ]~!b[ once, ]~b]<role>\n<content>[e~[\n blocks,
+        # ai turn opens bare (adaptive thinking); </mm:think> prefix = nothink, like history.
+        tk="" if think else "</mm:think>"
+        p=f"]~!b[]~b]user\n{prompt}[e~[\n]~b]ai\n{tk}"
+    else:
+        tk="<think>" if think else "<think></think>"
+        p=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
+    e=env_for(a); e["PROMPT"]=p
     sys.exit(subprocess.call([GLM, str(cap_for_launch(a.cap,e,0))], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):

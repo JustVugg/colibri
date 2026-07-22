@@ -252,6 +252,8 @@ def m3_name(name):
         return None
     if ".self_attn.index_" in name: return None
     if name.startswith("language_model."): name = name[len("language_model."):]
+    name = name.replace(".block_sparse_moe.e_score_correction_bias",
+                        ".mlp.gate.e_score_correction_bias")   # the C loader's GLM name
     name = name.replace(".block_sparse_moe.", ".mlp.")
     name = name.replace(".w1.weight", ".gate_proj.weight")
     name = name.replace(".w3.weight", ".up_proj.weight")

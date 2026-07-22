@@ -1274,6 +1274,36 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     return "".join(prompt)
 
 
+def render_chat_m3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                   tool_choice=None):
+    """Text-only subset of the MiniMax-M3 chat template (chat_template.jinja):
+    ]~!b[ once, then ]~b]<role>\n<content>[e~[\n blocks. A client "system" message
+    maps to the `developer` role (the official template reserves `system` for the
+    auto-injected model-identity block, which we do not fabricate here). History
+    assistant turns carry the </mm:think> prefix; the open ai turn does too unless
+    thinking is enabled. Tool calls: not yet rendered for this family."""
+    if tools:
+        raise APIError(400, "tools are not yet supported for the MiniMax-M3 template.", "tools")
+    prompt = ["]~!b["]
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            prompt.append(f"]~b]developer\n{text}[e~[\n")
+        elif role == "user":
+            prompt.append(f"]~b]user\n{text}[e~[\n")
+        elif role == "assistant":
+            prompt.append(f"]~b]ai\n</mm:think>{text.strip()}[e~[\n")
+        else:
+            raise APIError(400, f"Unsupported message role for MiniMax-M3: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    prompt.append("]~b]ai\n" + ("" if enable_thinking else "</mm:think>"))
+    return "".join(prompt)
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
@@ -1378,7 +1408,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     renderer = (render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
-                render_chat_olmoe if ARCH == "olmoe" else render_chat)
+                render_chat_olmoe if ARCH == "olmoe" else
+                render_chat_m3 if ARCH == "minimax_m3" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
