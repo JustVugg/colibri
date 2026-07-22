@@ -7852,9 +7852,13 @@ static void forward_all(Model *m, const int *ids, int S, int *pred, const int *r
     layers_forward(m,x,S,0);
     float *lo=falloc(c->vocab);
     float *row=falloc(D);
+    int dump_lo = getenv("TF_LOGITS")!=NULL;      /* oracle bisection: full logit rows */
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
         matmul_qt(lo, row, &m->lm_head, 1);
+        if(dump_lo){ fprintf(stderr,"TFLOGITS %d:",s);
+            for(int i=0;i<c->vocab;i++) fprintf(stderr," %.6f",lo[i]);
+            fprintf(stderr,"\n"); }
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
         if(dbg && pred[s]!=ref[s]) dump_top5_logits(s, lo, c->vocab, ref[s], pred[s]);
@@ -11496,6 +11500,22 @@ int main(int argc, char **argv){
         if(ok<nfull) fprintf(stderr,
             "[ORACLE] %d/%d mismatches — run: TF=1 DEBUG_LOGITS=1 for top-5 logit dump\n",
             nfull-ok,nfull);
+        if(getenv("TF_DECODE")){
+            /* same oracle, INCREMENTAL path: prefill np rows, then S=1 steps over the
+             * continuation — validates the decode/KV-append code against the same
+             * tf_pred rows the batch check used (positions np-1 .. nfull-2). */
+            kv_alloc(&m,nfull+2);
+            int okd=0, tot=0;
+            float *lg=step(&m,full,np,0);
+            for(int i=np-1;i<nfull-1;i++){
+                if(i>=np) { lg=step(&m,full+i,1,i); }
+                int best=0; for(int t=1;t<m.c.vocab;t++) if(lg[best]<lg[t]) best=t;
+                tot++; if(best==tf[i]) okd++;
+                else fprintf(stderr,"[ORACLE] decode mismatch pos=%d expected=%d got=%d\n",i,tf[i],best);
+                free(lg); lg=NULL;
+            }
+            printf("DECODE (incremental) C vs oracle: %d/%d positions\n",okd,tot);
+        }
         profile_print(&m,tdt);
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();
