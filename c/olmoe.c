@@ -82,6 +82,7 @@ typedef struct {
     uint8_t *is_pinned;     /* [n_layers * n_experts], 1 if expert is globally pinned */
     uint8_t *is_queued;     /* [n_layers * n_experts], 1 if expert is currently in the prefetch queue */
     float pilot_conf_limit; /* CONF_LIMIT env: cumulative gate probability threshold (e.g. 0.92) */
+    uint32_t *last_access;  /* [n_layers * n_experts], clock time when expert was last accessed */
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -90,6 +91,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
+
+static uint64_t lfru_score(uint32_t heat, uint32_t last, uint64_t clock) {
+    uint64_t age = (clock > last) ? (clock - last) : 0;
+    uint64_t recent = (age < 255) ? (255 - age) : 0;
+    return ((uint64_t)heat << 8) | recent;
+}
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
@@ -287,6 +295,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->pilot_smooth = sv;
     m->is_pinned = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
     m->is_queued = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
+    m->last_access = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
     float cl = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
     if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
     m->pilot_conf_limit = cl;
@@ -368,6 +377,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
         m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
@@ -406,6 +416,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -685,6 +696,19 @@ static void pilot_realload(Model *m, int layer, int eid) {
             pthread_mutex_unlock(&g_pilot_mx);
             return; /* all pinned/in-flight, skip */
         }
+        
+        /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
+        if (g_pilot_evict_guard && m->freq && m->last_access && lc->slots[lru].eid >= 0) {
+            int vid = lc->slots[lru].eid;
+            uint64_t vs = lfru_score(m->freq[layer * c->n_experts + vid], m->last_access[layer * c->n_experts + vid], m->clock);
+            uint64_t cs = lfru_score(m->freq[layer * c->n_experts + eid], m->last_access[layer * c->n_experts + eid], m->clock);
+            if (cs <= vs + (vs >> 2) + (4u << 8)) {
+                m->is_queued[layer * c->n_experts + eid] = 0;
+                pthread_mutex_unlock(&g_pilot_mx);
+                return; /* drop speculation */
+            }
+        }
+        
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;
@@ -696,6 +720,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -874,6 +899,7 @@ int main(int argc, char **argv) {
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
@@ -888,8 +914,8 @@ int main(int argc, char **argv) {
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, hot_n, smooth, conf);
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f ==\n",
+           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
