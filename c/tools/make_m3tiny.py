@@ -2,7 +2,10 @@
 engine-vs-oracle validation — the M3 counterpart of glm_tiny. Layer 0 dense + layer 1
 MoE, GQA 4/2 heads with head_dim 8 (deliberately != hidden/heads to exercise the
 explicit head_dim path), partial rotary 4 of 8, all 4 experts present, nonzero router
-bias (exercises the choice-vs-weight distinction). Convert with:
+bias (exercises the choice-vs-weight distinction). The MoE/sparse layer also carries an
+MSA Lightning Indexer (index_dim 8, 2 index heads = NK, block_size 4, top-2 blocks +
+1 local) so the 24-token oracle sequence spans 6 blocks and exercises block selection.
+Convert with:
   python3 tools/convert_fp8_to_int4.py --indir m3tiny --outdir m3tiny_i8 --ebits 8 --io-bits 8
 then validate with tools/oracle_m3.py + the engine's REF/TF gate."""
 import json, sys, os
@@ -15,6 +18,7 @@ torch.manual_seed(42)
 
 D, L, H, NK, HD = 16, 2, 4, 2, 8
 ROT, E, TOPK, MI, DI, SI, V = 4, 4, 2, 8, 12, 8, 32
+IDX_DIM, IDX_H, BLK, TOPK_BLK, LOCAL_BLK = 8, NK, 4, 2, 1   # MSA Lightning Indexer
 
 t = {}
 def w(n, o, i): t[n] = (torch.randn(o, i) * 0.3).to(torch.bfloat16)
@@ -34,6 +38,11 @@ for i in range(L):
     w(Lp+"self_attn.o_proj.weight", D, H*HD)
     vv(Lp+"self_attn.q_norm.weight", HD)
     vv(Lp+"self_attn.k_norm.weight", HD)
+    if i >= 1:                                    # sparse layers carry the MSA Lightning Indexer
+        w(Lp+"self_attn.index_q_proj.weight", IDX_H*IDX_DIM, D)
+        w(Lp+"self_attn.index_k_proj.weight", IDX_DIM, D)   # single index-k head
+        vv(Lp+"self_attn.index_q_norm.weight", IDX_DIM)
+        vv(Lp+"self_attn.index_k_norm.weight", IDX_DIM)
     if i == 0:                                    # dense layer
         w(Lp+"mlp.gate_proj.weight", DI, D)
         w(Lp+"mlp.up_proj.weight", DI, D)
@@ -64,7 +73,13 @@ cfg = {"model_type": "minimax_m3_vl",
            "rms_norm_eps": 1e-6, "rope_theta": 5000000, "vocab_size": V,
            "use_qk_norm": True, "qk_norm_type": "per_head", "use_gemma_norm": True,
            "hidden_act": "swigluoai", "swiglu_alpha": 1.702, "swiglu_limit": 7.0,
-           "eos_token_id": V-1},
+           "eos_token_id": V-1,
+           "sparse_attention_config": {
+               "use_sparse_attention": True, "sparse_index_dim": IDX_DIM,
+               "sparse_num_index_heads": IDX_H, "sparse_block_size": BLK,
+               "sparse_topk_blocks": TOPK_BLK, "sparse_local_block": LOCAL_BLK,
+               "sparse_init_block": 0, "sparse_score_type": "max",
+               "sparse_attention_freq": [0, 1]}},   # layer 0 dense/full, layer 1 sparse
        "vision_config": {"hidden_size": 8}}
 json.dump(cfg, open(os.path.join(OUT, "config.json"), "w"), indent=1)
 print(f"{OUT}: {len(t)} tensors, D={D} L={L} H={H}/{NK} hd={HD} rot={ROT} E={E} top{TOPK} V={V}")

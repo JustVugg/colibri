@@ -202,8 +202,12 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
     li = layer_idx(name)
     if keep_idx:
-        # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
-        if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
+        # modalita' --indexer: SOLO i pesi dell'indexer di scoring dei layer principali.
+        # GLM DSA usa "indexer"; MiniMax-M3 MSA usa "self_attn.index_" (Lightning Indexer).
+        # EN: --indexer mode: ONLY the scoring-indexer weights. GLM DSA = "indexer",
+        # MiniMax-M3 MSA = "self_attn.index_".
+        is_idx = ("indexer" in name) or (".index_" in name)
+        if li < 0 or li >= n_layers or not is_idx: return "skip"
         if name.endswith("norm.weight"): return "f32"
         return "q"                                       # int8 consigliato (--ebits 8): pesi di scoring
     if keep_mtp:
@@ -244,13 +248,12 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
 #   .block_sparse_moe.                -> .mlp.          (router gate.weight + bias line up)
 #   .experts.E.{w1,w3,w2}.weight      -> .experts.E.{gate_proj,up_proj,down_proj}.weight
 #   vision_tower / multi_modal_projector / patch_merge_mlp -> dropped (text-only port)
-#   .self_attn.index_*                -> dropped (MSA index branch; separate pass later,
-#                                       like the GLM DSA indexer)
+#   .self_attn.index_{q,k}_{proj,norm}  -> KEPT (MSA Lightning Indexer: q/k_proj int8,
+#                                          q/k_norm f32; used for block-sparse selection)
 # Returns the container name, or None to skip the tensor entirely.
 def m3_name(name):
     if name.startswith(("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")):
         return None
-    if ".self_attn.index_" in name: return None
     if name.startswith("language_model."): name = name[len("language_model."):]
     name = name.replace(".block_sparse_moe.e_score_correction_bias",
                         ".mlp.gate.e_score_correction_bias")   # the C loader's GLM name

@@ -175,8 +175,9 @@ typedef struct {
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
     int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
-    int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
-    int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
+    int index_topk, index_nh, index_hd;          /* DSA lightning indexer (GLM); M3 MSA reuses index_nh/index_hd + Ic */
+    int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa); M3: sparse-attn layer */
+    int msa, msa_blk, msa_topk_blk, msa_local_blk;  /* M3 MSA: on, block size, top-k blocks, local blocks */
     float eps, theta, attn_scale, routed_scale;
     int arch;                                    /* ARCH_GLM | ARCH_M3 */
     int n_kv_heads, head_dim, rotary;            /* M3: GQA KV heads, head dim, partial-rope dims */
@@ -381,6 +382,8 @@ typedef struct {
     QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
     /* GQA (ARCH_M3): plain projections + per-head QK-norm weights [head_dim] */
     QT q_p, k_p, v_p; float *q_hn, *k_hn;
+    /* MSA Lightning Indexer (ARCH_M3 sparse layers): block-selection branch */
+    QT idx_q, idx_k; float *idx_qn, *idx_kn;
 #ifdef COLI_CUDA
     ColiCudaTensor *kv_b_shard[COLI_CUDA_MAX_DEVICES];
     int shard_h0[COLI_CUDA_MAX_DEVICES],shard_hn[COLI_CUDA_MAX_DEVICES],n_kv_b_shard;
@@ -1699,6 +1702,19 @@ static void load_cfg(Cfg *c, const char *snap){
         { jval *fr=json_get(r,"moe_layer_freq"); c->first_dense=0;
           if(fr && fr->t==J_ARR){ int i=0; while(i<fr->len && (int)fr->kids[i]->num==0) i++;
                                   c->first_dense=i; } }
+        /* MSA (Lightning Indexer): block-sparse attention on the non-dense layers. Reuses
+         * the DSA cache slots (index_hd/index_nh/idx_type/Ic). Sparse layers == MoE layers
+         * (sparse_attention_freq mirrors moe_layer_freq), so idx_type = (li >= first_dense). */
+        { jval *sac=json_get(r,"sparse_attention_config");
+          if(sac && gi(sac,"sparse_index_dim")>0){   /* use_sparse_attention is a JSON bool (gi reads num) */
+              c->msa=1;
+              c->index_hd=gi(sac,"sparse_index_dim");
+              c->index_nh=gi(sac,"sparse_num_index_heads");
+              c->msa_blk=gi(sac,"sparse_block_size");
+              c->msa_topk_blk=gi(sac,"sparse_topk_blocks");
+              c->msa_local_blk=gi(sac,"sparse_local_block");
+              for(int i=0;i<c->n_layers && i<128;i++) c->idx_type[i]=(i>=c->first_dense);
+          } }
         c->norm_topk=1;                          /* M3 always renormalizes the top-k weights */
         c->n_group=1;                            /* no grouped routing (key absent -> 0) */
         /* GQA rows ride the MLA cache aliases: Lc rows = K (n_kv*hd), Rc rows = V. */
@@ -1744,6 +1760,7 @@ static void load_cfg(Cfg *c, const char *snap){
         fclose(gf);
       } }
     /* DSA lightning indexer: parametri + tipo per-layer (lista esplicita o formula freq/offset) */
+    if(c->arch!=ARCH_M3){                            /* GLM DSA indexer; M3 MSA set its own above */
     c->index_topk=gi(r,"index_topk"); c->index_nh=gi(r,"index_n_heads"); c->index_hd=gi(r,"index_head_dim");
     { jval *it=json_get(r,"indexer_types");
       int freq=gi(r,"index_topk_freq"); if(freq<1) freq=1;
@@ -1753,6 +1770,7 @@ static void load_cfg(Cfg *c, const char *snap){
               c->idx_type[i] = !strcmp(it->kids[i]->str,"full");
           else { int v=i-off+1; if(v<0) v=0; c->idx_type[i] = (v%freq)==0; }
       } }
+    }
     if(c->arch==ARCH_M3){
         c->qk_head=c->head_dim;
         c->attn_scale = 1.f / sqrtf((float)c->head_dim);
@@ -2405,6 +2423,12 @@ static void model_init_range(Model *m, const char *snap, int cap,
         l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->head_dim, dbits);
         l->q_hn  = ld(m,P("self_attn.q_norm.weight"));
         l->k_hn  = ld(m,P("self_attn.k_norm.weight"));
+        if(c->msa && i>=c->first_dense){             /* MSA Lightning Indexer (sparse layers) */
+            l->idx_q  = qt_load(m,P("self_attn.index_q_proj.weight"), c->index_nh*c->index_hd, D, dbits);
+            l->idx_k  = qt_load(m,P("self_attn.index_k_proj.weight"), c->index_hd, D, dbits);
+            l->idx_qn = ld(m,P("self_attn.index_q_norm.weight"));
+            l->idx_kn = ld(m,P("self_attn.index_k_norm.weight"));
+        }
         } else {
         l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
@@ -4216,6 +4240,15 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
     matmul_qt(q,x,&l->q_p,S);
     matmul_qt(k,x,&l->k_p,S);
     matmul_qt(v,x,&l->v_p,S);
+    /* MSA Lightning Indexer (sparse layers): a small IDX_H-head scoring branch that picks
+     * the top-k key BLOCKS per query, so the main attention only reads those blocks. idx_q/
+     * idx_k are roped like the main attention (same partial-ROT split-half NEOX); idx_k is
+     * mirrored into the persistent Ic cache. IDX_H == NK (one selection per KV group). */
+    int IDX_H=c->index_nh, IDX_D=c->index_hd, BLK=c->msa_blk, TOPK=c->msa_topk_blk, LOCAL=c->msa_local_blk;
+    int is_sparse = (c->msa && layer<c->n_layers && c->idx_type[layer] && m->kv && m->kv->Ic);
+    float *iq=NULL, *ik=NULL; int *sel=NULL;
+    if(is_sparse){ iq=falloc((int64_t)S*IDX_H*IDX_D); ik=falloc((int64_t)S*IDX_D);
+        matmul_qt(iq,x,&l->idx_q,S); matmul_qt(ik,x,&l->idx_k,S); }
     m->t_aproj+=now_s()-tp0;
     for(int s=0;s<S;s++){                        /* norm+rope, then mirror into the cache */
         KVState *ks=kvs?kvs[s]:m->kv;
@@ -4227,6 +4260,44 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
             rms_head_g(kh,l->k_hn,hd,c->eps); rope_half_neox(kh,rot,pos,c->theta); }
         memcpy(ks->Lc[layer]+(int64_t)pos*KVd, ksr, (size_t)KVd*sizeof(float));
         memcpy(ks->Rc[layer]+(int64_t)pos*KVd, vsr, (size_t)KVd*sizeof(float));
+        if(is_sparse){                           /* index heads: Gemma-norm + rope, mirror idx_k */
+            float *iqs=iq+(int64_t)s*IDX_H*IDX_D, *iks=ik+(int64_t)s*IDX_D;
+            for(int h=0;h<IDX_H;h++){ float *ih=iqs+(int64_t)h*IDX_D;
+                rms_head_g(ih,l->idx_qn,IDX_D,c->eps); rope_half_neox(ih,rot,pos,c->theta); }
+            rms_head_g(iks,l->idx_kn,IDX_D,c->eps); rope_half_neox(iks,rot,pos,c->theta);
+            memcpy(ks->Ic[layer]+(int64_t)pos*IDX_D, iks, (size_t)IDX_D*sizeof(float));
+        }
+    }
+    if(is_sparse){                               /* block selection: top-k blocks per (s, index head) */
+        sel=malloc((size_t)S*IDX_H*TOPK*sizeof(int));
+        for(int s=0;s<S;s++){
+            KVState *ks=kvs?kvs[s]:m->kv;
+            int pos=positions?positions[s]:pos_base+s, st0=ks->kv_start[layer];
+            const float *Ic0=ks->Ic[layer]; int nblk=pos/BLK+1;
+            double *bscore=malloc((size_t)nblk*sizeof(double)); float *iqs=iq+(int64_t)s*IDX_H*IDX_D;
+            for(int hi=0;hi<IDX_H;hi++){
+                const float *ih=iqs+(int64_t)hi*IDX_D;
+                for(int b=0;b<nblk;b++) bscore[b]=-1e300;
+                for(int t=st0;t<=pos;t++){        /* max-pool index score into blocks (f64 like the ref) */
+                    const float *kt=Ic0+(int64_t)t*IDX_D;
+                    double d=0; for(int i=0;i<IDX_D;i++) d+=(double)ih[i]*kt[i];
+                    int b=t/BLK; if(d>bscore[b]) bscore[b]=d;
+                }
+                int qb=pos/BLK;                  /* local blocks always selected */
+                for(int lb=0;lb<LOCAL;lb++){ int bb=qb-lb; if(bb>=0) bscore[bb]=1e300; }
+                int topk = TOPK<nblk?TOPK:nblk;
+                int *sg=&sel[((int64_t)s*IDX_H+hi)*TOPK];
+                for(int j=0;j<TOPK;j++) sg[j]=-1;
+                for(int j=0;j<topk;j++){         /* greedy top-k, ties -> lowest block index */
+                    int best=-1; double bv=-1e300;
+                    for(int b=0;b<nblk;b++){ int taken=0;
+                        for(int p=0;p<j;p++) if(sg[p]==b){taken=1;break;}
+                        if(!taken && bscore[b]>bv){ bv=bscore[b]; best=b; } }
+                    sg[j]=best;
+                }
+            }
+            free(bscore);
+        }
     }
     double tc0=now_s();
     int vk_core=0, vk_projected=0; (void)vk_core; (void)vk_projected;
@@ -4237,7 +4308,7 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
      * invalidated like the CUDA/MLA shadow on rewrite/rebind/resize). Single-sequence
      * decode only (no ragged mux); falls back to the CPU core on any failure. The
      * fused variant keeps ctx on-device and runs the o-projection in the same submit. */
-    if(g_vk_attn && !kvs && !positions && S<=4 && layer<c->n_layers &&
+    if(g_vk_attn && !is_sparse && !kvs && !positions && S<=4 && layer<c->n_layers &&
        m->vk_kv_valid && m->kv->Lc[layer] && m->kv->Rc[layer]){
         int st0=m->kv_start[layer], T=pos_base+S;
         if(T<=m->max_t && coli_vk_kv_ensure(layer,m->max_t,KVd,KVd)){
@@ -4271,6 +4342,28 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
             const float *qh=qs+(int64_t)h*hd;
             int g=h/G;                           /* repeat_kv: query head h reads KV head h/G */
             float *ah=att+(int64_t)h*win;
+            float *ch=cs+(int64_t)h*hd;
+            if(is_sparse){                        /* MSA: attend only the selected key blocks of group g */
+                int *sg=&sel[((int64_t)s*IDX_H+g)*TOPK];
+                float mx=-1e30f; int nk=0;
+                for(int j=0;j<TOPK;j++){ int b=sg[j]; if(b<0) continue;
+                    int t0=b*BLK, t1=t0+BLK; if(t0<st0)t0=st0; if(t1>T)t1=T;
+                    for(int t=t0;t<t1;t++){
+                        const float *kr=K0+(int64_t)t*KVd+(int64_t)g*hd;
+                        float d=0; for(int i=0;i<hd;i++) d+=qh[i]*kr[i];
+                        d*=c->attn_scale; ah[nk++]=d; if(d>mx) mx=d; } }
+                float ssum=0; for(int t=0;t<nk;t++){ ah[t]=expf(ah[t]-mx); ssum+=ah[t]; }
+                float inv=1.f/ssum;
+                for(int i=0;i<hd;i++) ch[i]=0.f;
+                int ki=0;
+                for(int j=0;j<TOPK;j++){ int b=sg[j]; if(b<0) continue;
+                    int t0=b*BLK, t1=t0+BLK; if(t0<st0)t0=st0; if(t1>T)t1=T;
+                    for(int t=t0;t<t1;t++){
+                        const float *vr=V0+(int64_t)t*KVd+(int64_t)g*hd;
+                        float a=ah[ki++]*inv;
+                        for(int i=0;i<hd;i++) ch[i]+=a*vr[i]; } }
+                continue;
+            }
             float mx=-1e30f;
             for(int t=st0;t<T;t++){
                 const float *kr=K0+(int64_t)t*KVd+(int64_t)g*hd;
@@ -4280,7 +4373,6 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
             float ssum=0;
             for(int t=0;t<win;t++){ ah[t]=expf(ah[t]-mx); ssum+=ah[t]; }
             float inv=1.f/ssum;
-            float *ch=cs+(int64_t)h*hd;
             for(int i=0;i<hd;i++) ch[i]=0.f;
             for(int t=st0;t<T;t++){
                 const float *vr=V0+(int64_t)t*KVd+(int64_t)g*hd;
@@ -4294,7 +4386,7 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
     double to0=now_s();
     if(!vk_projected) matmul_qt(out,ctx,&l->o,S);   /* VK fused path already filled out */
     m->t_aout+=now_s()-to0;
-    free(q); free(k); free(v); free(ctx);
+    free(q); free(k); free(v); free(ctx); free(iq); free(ik); free(sel);
     m->t_attn += now_s()-ta0;
 }
 
@@ -7266,7 +7358,7 @@ static void kv_alloc(Model *m, int max_t){
         free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
         k->Lc8=k->Rc8=NULL; k->Lsc=k->Rsc=NULL; }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
-    if(m->has_dsa){
+    if(m->has_dsa || c->msa){                        /* index-key cache: GLM DSA or M3 MSA */
         k->Ic=calloc(c->n_layers,sizeof(float*));
         for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) k->Ic[i]=falloc((int64_t)max_t*c->index_hd);
     }

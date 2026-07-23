@@ -12,7 +12,7 @@ Conventions (transformers modeling_minimax_m3_vl, pinned 2026-07-22):
   (gate=min(g,lim), up=clamp(±lim), (up+1)*gate*sigmoid(alpha*gate));
   router sigmoid -> +bias for CHOICE only, raw-sigmoid weights renormalized,
   routed_out * routed_scaling + shared_out; pre-norm residual layers."""
-import json, sys, glob
+import json, sys, glob, os
 import numpy as np
 from safetensors import safe_open
 
@@ -29,6 +29,11 @@ E, TOPK, V = cfg["num_local_experts"], cfg["num_experts_per_tok"], cfg["vocab_si
 EPS, TH = cfg["rms_norm_eps"], cfg["rope_theta"]
 A, LIM, RS = cfg["swiglu_alpha"], cfg["swiglu_limit"], cfg["routed_scaling_factor"]
 FD = sum(1 for x in (cfg.get("moe_layer_freq") or []) if x == 0) if cfg.get("moe_layer_freq") else 0
+SP = cfg.get("sparse_attention_config") or {}                    # MSA Lightning Indexer
+SPARSE = bool(SP.get("use_sparse_attention"))
+IDX_DIM, IDX_H = SP.get("sparse_index_dim"), SP.get("sparse_num_index_heads")
+BLK, TOPK_BLK = SP.get("sparse_block_size"), SP.get("sparse_topk_blocks")
+LOCAL_BLK = SP.get("sparse_local_block", 1)
 
 def deq(name):
     """Dequant a container tensor exactly as the engine reads it (int8 per-row, f32)."""
@@ -78,13 +83,44 @@ for li in range(L):
         for h in range(H):  q[s, h] = rope(rms(q[s, h], qn), s)
         for h in range(NK): k[s, h] = rope(rms(k[s, h], kn), s)
     G = H // NK
+    # --- MSA Lightning Indexer: per-query block selection on sparse layers (li >= FD) ---
+    # A small IDX_H-head dot-product branch scores every causal key, max-pools the scores
+    # into BLK-sized blocks, forces the LOCAL_BLK current/preceding blocks in, and keeps the
+    # top-TOPK_BLK blocks per index head. Index head hi == KV group g (IDX_H == NK). Uses the
+    # SAME partial-ROT split-half rope as the main attention (index_head_dim > ROT).
+    sel = None
+    if SPARSE and li >= FD:
+        iq = nrm @ deq(P + "self_attn.index_q_proj.weight").T     # [S, IDX_H*IDX_DIM]
+        ik = nrm @ deq(P + "self_attn.index_k_proj.weight").T     # [S, IDX_DIM] (single k head)
+        iqn = T[P + "self_attn.index_q_norm.weight"].astype(np.float32)
+        ikn = T[P + "self_attn.index_k_norm.weight"].astype(np.float32)
+        iq = iq.reshape(S, IDX_H, IDX_DIM)
+        for s in range(S):
+            for h in range(IDX_H): iq[s, h] = rope(rms(iq[s, h], iqn), s)
+            ik[s] = rope(rms(ik[s], ikn), s)
+        sel = [[None] * IDX_H for _ in range(S)]
+        for s in range(S):
+            for hi in range(IDX_H):
+                scores = iq[s, hi].astype(np.float64) @ ik[:s+1].astype(np.float64).T   # [s+1] causal
+                nblk = s // BLK + 1
+                bscore = np.full(nblk, -np.inf)
+                for t in range(s + 1):
+                    b = t // BLK
+                    if scores[t] > bscore[b]: bscore[b] = scores[t]
+                qb = s // BLK                                    # local boost -> always selected
+                for l in range(LOCAL_BLK):
+                    if qb - l >= 0: bscore[qb - l] = np.inf
+                topk = min(TOPK_BLK, nblk)
+                order = np.argsort(-bscore, kind="stable")       # ties -> lower block index first
+                sel[s][hi] = set(int(b) for b in order[:topk])
     ctx = np.zeros((S, H, HD), np.float32)
     for s in range(S):
         for h in range(H):
             g = h // G
-            sc = (q[s, h] @ k[:s+1, g].T) / np.sqrt(HD)
+            kk = np.array([t for t in range(s+1) if sel is None or (t // BLK) in sel[s][g]])
+            sc = (q[s, h] @ k[kk, g].T) / np.sqrt(HD)
             sc = sc - sc.max(); e = np.exp(sc); a = e / e.sum()
-            ctx[s, h] = a @ v[:s+1, g]
+            ctx[s, h] = a @ v[kk, g]
     x = x + ctx.reshape(S, H * HD) @ deq(P + "self_attn.o_proj.weight").T
     nrm = rms(x, T[P + "post_attention_layernorm.weight"].astype(np.float32))
     if li < FD:                                    # dense
