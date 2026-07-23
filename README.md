@@ -89,8 +89,30 @@ the right experts get. It works because routing has measurable structure (see
 the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
 structure is cacheable.
 
-The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
-at runtime, no GPU required.
+The engine is a single C file (`c/colibri.c`) plus small headers. No BLAS, no
+Python at runtime, no GPU required.
+
+### Browser WebGPU expert workers
+
+The optional bridge lets a browser with WebGPU execute exported expert FFNs.
+Start the bridge and serve `web/public` from the same origin:
+
+```bash
+./coli webgpu --host 0.0.0.0 --control-port 8765 --data-port 8766
+```
+
+Open `web/public/webgpu-worker.html`, choose the bridge WebSocket URL, and load
+a manifest exported from a source checkpoint:
+
+```bash
+uv run python c/tools/export_webgpu_expert.py \
+  --source /models/glm52_fp8 --output web/public \
+  --layer 0-2 --expert 0-7
+```
+
+Point the native coordinator at the bridge with `--webgpu-workers BRIDGE_IP:8766`.
+This first format is little-endian f32 for cross-browser validation; quantized
+WebGPU buffers can be added without changing the activation protocol.
 
 ## How it works
 

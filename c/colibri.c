@@ -30,6 +30,10 @@
 #include <unistd.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
@@ -75,6 +79,11 @@ static const float *g_pre_sh;
 /* routing precalcolata dalla GPU (Metal layer CB o device router CUDA, #431):
  * moe() la usa e salta la FASE A. NULL = router su CPU. */
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
+#if !defined(_WIN32)
+typedef struct { int fd; char host[128]; int port; } WebGPUWorker;
+static WebGPUWorker g_webgpu_worker;
+static int g_webgpu_enabled;
+#endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
@@ -1670,6 +1679,8 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
     return rc;
 }
 
+#include "webgpu.h"
+
 #ifdef __linux__
 /* io_uring expert batches.  One owner prepares all reads for a block, submits
  * them in one syscall, and reaps CQEs on demand.  The kernel, rather than a set
@@ -3027,6 +3038,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
+#if !defined(_WIN32)
+        if(g_webgpu_enabled){
+            webgpu_moe_batch(m,layer,x,S,out,idxs,ws,keff,K,uniq,base,nb);
+            continue;
+        }
+#endif
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
             ESlot *P=m->pin[layer];
@@ -6533,6 +6550,12 @@ int main(int argc, char **argv){
 #endif
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
+#if !defined(_WIN32)
+    if(getenv("WEBGPU_WORKERS") && *getenv("WEBGPU_WORKERS")){
+        webgpu_init();
+        atexit(webgpu_close);
+    }
+#endif
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
         /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8

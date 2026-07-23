@@ -211,6 +211,7 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    if getattr(a, "webgpu_workers", None): e["WEBGPU_WORKERS"] = a.webgpu_workers
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -836,6 +837,11 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
+def cmd_webgpu_coordinator(a):
+    return subprocess.call([sys.executable, os.path.join(HERE, "webgpu.py"),
+                            "--host", a.host, "--control-port", str(a.control_port),
+                            "--data-port", str(a.data_port)])
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -963,6 +969,8 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
+    common.add_argument("--webgpu-workers", default=os.environ.get("WEBGPU_WORKERS"),
+                        help="WebGPU proxy endpoint, host:port")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
     ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
@@ -988,6 +996,10 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pcluster=sub.add_parser("webgpu", help="serve the browser WebGPU coordinator bridge")
+    pcluster.add_argument("--host",default="127.0.0.1")
+    pcluster.add_argument("--control-port",type=int,default=8765)
+    pcluster.add_argument("--data-port",type=int,default=8766)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
@@ -1015,6 +1027,7 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+    if a.cmd=="webgpu": handler=cmd_webgpu_coordinator
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 

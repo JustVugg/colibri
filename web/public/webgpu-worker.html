@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>colibri WebGPU expert worker</title>
+<style>body{font:15px system-ui,sans-serif;max-width:720px;margin:3rem auto;padding:0 1rem}label{display:block;margin:.8rem 0 .25rem}input{width:100%;padding:.55rem;box-sizing:border-box}button{margin-top:1rem;padding:.6rem 1rem}pre{background:#111;color:#9f9;padding:1rem;min-height:4rem}</style>
+<h1>colibri WebGPU expert worker</h1>
+<p>This browser tab contributes expert FFN compute to a trusted local coordinator.</p>
+<label>Coordinator WebSocket URL</label><input id="url" value="ws://127.0.0.1:8765/v1/webgpu">
+<label>Worker ID</label><input id="worker" value="browser-worker-1">
+<label>Manifest URL</label><input id="manifest" value="/webgpu-manifest.json">
+<label>Expert ownership (<code>layer:expert</code>, or <code>*</code>)</label><input id="experts" value="*">
+<button id="start">Start worker</button><pre id="status">idle</pre>
+<script type="module">
+import {WebGPUExpertWorker} from "/webgpu-worker.js";
+const status=document.querySelector("#status");
+document.querySelector("#start").onclick=async()=>{try{
+ status.textContent="loading manifest and requesting WebGPU…";
+ const manifest=await fetch(document.querySelector("#manifest").value).then(r=>r.json());
+ const experts=document.querySelector("#experts").value.split(",").map(x=>x.trim()).filter(Boolean);
+ await new WebGPUExpertWorker({manifest,experts,workerId:document.querySelector("#worker").value})
+   .connect(document.querySelector("#url").value);
+ status.textContent=`connected · ${manifest.hidden} hidden · ${manifest.intermediate} intermediate · WebGPU active`;
+}catch(error){status.textContent=error.stack||String(error)}};
+</script>
