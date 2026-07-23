@@ -35,6 +35,10 @@ void coli_vk_set_activation(int act, float alpha, float limit);
  * (K in the L buffer, V in the R buffer, both NK*hd wide). Returns 0 -> CPU fallback. */
 int coli_vk_gqa_attn(float *ctx, const float *q, int layer, int S, int H, int NK, int hd,
                      int st0, int T, float scale);
+/* Fused GQA core + o-projection: ctx stays on-device, only [S,Dout] returns. */
+int coli_vk_gqa_attn_project(float *out, const float *q, ColiVkTensor **ot, const void *ow,
+                             const float *osc, int ofmt, int ogrp, int layer, int S, int H,
+                             int NK, int hd, int st0, int T, float scale, int Dout);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].

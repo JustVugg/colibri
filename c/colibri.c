@@ -4229,13 +4229,14 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
         memcpy(ks->Rc[layer]+(int64_t)pos*KVd, vsr, (size_t)KVd*sizeof(float));
     }
     double tc0=now_s();
-    int vk_core=0; (void)vk_core;
+    int vk_core=0, vk_projected=0; (void)vk_core; (void)vk_projected;
 #ifdef COLI_VULKAN
     /* Vulkan GQA core (COLI_VK_ATTN=1): scores/softmax/weighted-V for all S x H in
      * ONE submit per layer, reading the persistent on-device K/V mirror (K in the L
      * buffer, V in the R buffer; rows appended incrementally, vk_kv_valid watermark,
      * invalidated like the CUDA/MLA shadow on rewrite/rebind/resize). Single-sequence
-     * decode only (no ragged mux); falls back to the CPU core on any failure. */
+     * decode only (no ragged mux); falls back to the CPU core on any failure. The
+     * fused variant keeps ctx on-device and runs the o-projection in the same submit. */
     if(g_vk_attn && !kvs && !positions && S<=4 && layer<c->n_layers &&
        m->vk_kv_valid && m->kv->Lc[layer] && m->kv->Rc[layer]){
         int st0=m->kv_start[layer], T=pos_base+S;
@@ -4246,7 +4247,13 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
                                         m->kv->Rc[layer]+(int64_t)t*KVd);
             if(ok){
                 m->vk_kv_valid[layer]=T;
-                if(coli_vk_gqa_attn(ctx,q,layer,S,H,NK,hd,st0,T,c->attn_scale)) vk_core=1;
+                if(VK_FMT_OK(&l->o)&&
+                   coli_vk_gqa_attn_project(out,q,&l->o.vk,
+                        l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
+                        l->o.s,l->o.fmt,l->o.gs,layer,S,H,NK,hd,st0,T,c->attn_scale,c->hidden))
+                    vk_core=vk_projected=1;
+                else if(coli_vk_gqa_attn(ctx,q,layer,S,H,NK,hd,st0,T,c->attn_scale))
+                    vk_core=1;
             }
         }
     }
@@ -4285,7 +4292,7 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
     }
     m->t_acore+=now_s()-tc0;
     double to0=now_s();
-    matmul_qt(out,ctx,&l->o,S);
+    if(!vk_projected) matmul_qt(out,ctx,&l->o,S);   /* VK fused path already filled out */
     m->t_aout+=now_s()-to0;
     free(q); free(k); free(v); free(ctx);
     m->t_attn += now_s()-ta0;

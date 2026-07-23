@@ -1342,6 +1342,69 @@ int coli_vk_gqa_attn(float *ctx, const float *q, int layer, int S, int H, int NK
     return 1;
 }
 
+/* Fused GQA core + o-projection in ONE submit: the core writes ctx into a device
+ * scratch (att_ctx, never read back), a barrier, then the o-projection matmul reads
+ * it and only the final output [S,Dout] returns to the host. Offloads the o-proj
+ * (the single largest attention cost after the projections) with no extra submit
+ * over the core alone. Returns 0 -> caller runs the CPU o-proj (or CPU core). */
+int coli_vk_gqa_attn_project(float *out, const float *q, ColiVkTensor **ot, const void *ow,
+                             const float *osc, int ofmt, int ogrp, int layer, int S, int H,
+                             int NK, int hd, int st0, int T, float scale, int Dout) {
+    if (!G.ready || !G.pipe_gqa || !G.pipe || S < 1 || H < 1 || NK < 1 || layer < 0 || layer >= VK_KV_LAYERS) return 0;
+    if (hd > 256 || H % NK != 0 || st0 < 0 || T - S - st0 < 0 || Dout < 1) return 0;
+    int KVd = NK * hd;
+    VkKvLayer *kv = &G.kv[layer];
+    if (!kv->bl || kv->rows < T || kv->K != KVd || kv->R != KVd) return 0;
+    if (!upload_tensor(ot, ow, osc, ofmt, H * hd, Dout, ogrp)) return 0;   /* o: [Dout, H*hd] */
+    ColiVkTensor *to = *ot;
+    int cap = T - st0;
+    size_t qb = (size_t)S * H * hd * 4, cb = (size_t)S * H * hd * 4;
+    size_t sb = (size_t)S * H * cap * 4, ob = (size_t)S * Dout * 4;
+    if (!scratch_reserve(&G.x, qb) || !scratch_reserve(&G.att_ctx, cb) ||
+        !scratch_reserve(&G.att_sc, sb) || !scratch_reserve_mt(&G.y, ob, G.memtype_cached)) return 0;
+    memcpy(G.x.ptr, q, qb);
+
+    VkDescriptorBufferInfo bi[5] = {   /* core: Q, K, V, scores, ctx(->att_ctx device) */
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
+        {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_gqa, 5, bi);
+    VkDescriptorBufferInfo oi[4] = {   /* o-proj: att_ctx, o_w, o_s, out */
+        {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}, {.buffer = to->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = to->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset, 4, oi);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gqa);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gqa, 0, 1, &G.dset_gqa, 0, NULL);
+    struct PCGqa pc = {S, H, NK, hd, st0, T, cap, scale};
+    vkCmdPushConstants(G.cmd, G.plyt_gqa, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)S, 1);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
+    struct PC opc = {ofmt, S, H * hd, Dout, to->rowWords, to->gs};
+    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(opc), &opc);
+    vkCmdDispatch(G.cmd, (uint32_t)((Dout + 7) / 8), (uint32_t)S, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double vp0 = G.eg_prof ? vk_now() : 0;
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
+    memcpy(out, G.y.ptr, ob);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
 /* Two resident matmuls sharing the SAME input x in ONE submit (q_a + kv_a in the
  * attention prologue): one x staging, two dispatches, one fence — replaces two
  * full submit+wait roundtrips. Outputs y1 [S,O1] and y2 [S,O2] read back from
