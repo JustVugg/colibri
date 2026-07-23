@@ -186,7 +186,21 @@ static void stats_dump_q(Model *m, const char *path, int quiet){ (void)m; rt_sav
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
 static char g_usage_path[2100]="";
-static int64_t usage_load(Model *m, const char *path){ (void)m; return rt_load(path); }
-static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
+static int colibri_persist_enabled(void){
+    const char *v=getenv("COLI_PERSIST");
+    if(!v || !*v) return 1;
+    if(!strcmp(v,"0") || !strcmp(v,"false") || !strcmp(v,"False") ||
+       !strcmp(v,"off") || !strcmp(v,"OFF")) return 0;
+    return 1;
+}
+static int64_t usage_load(Model *m, const char *path){
+    (void)m;
+    if(!colibri_persist_enabled()) return 0;
+    return rt_load(path);
+}
+static void usage_save(Model *m){
+    if(!colibri_persist_enabled()) return;
+    if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1);
+}
 
 #endif /* TELEMETRY_H */

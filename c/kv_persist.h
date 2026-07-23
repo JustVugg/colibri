@@ -6,6 +6,12 @@
 #define KV_PERSIST_H
 
 static int g_kvsave=1;
+static int colibri_kv_persist_enabled(void){
+    const char *v=getenv("COLI_PERSIST");
+    if(!v || !*v) return 1;
+    if(!strcmp(v,"0") || !strcmp(v,"false") || !strcmp(v,"False") || !strcmp(v,"off") || !strcmp(v,"OFF")) return 0;
+    return 1;
+}
 #define KV_MAGIC "COLIKV1\0"
 
 static void kv_hdr(Model *m, int32_t *h, int nrec){
@@ -40,7 +46,7 @@ static int kv_disk_open(Model *m){
 }
 
 static void kv_disk_truncate(Model *m, int nrec){
-    if(!g_kvsave) return;
+    if(!g_kvsave || !colibri_kv_persist_enabled()) return;
     KVState *k=m->kv;
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
     FILE *f=fopen(k->disk_path,"r+b");
@@ -54,7 +60,7 @@ static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
 
 static void kv_disk_append(Model *m, const int *hist, int len){
     KVState *k=m->kv;
-    if(!g_kvsave || len<=k->disk_nrec) return;
+    if(!g_kvsave || !colibri_kv_persist_enabled() || len<=k->disk_nrec) return;
     Cfg *c=&m->c;
     if(!kv_disk_open(m)) return;
     FILE *f=k->disk_fp;
@@ -84,7 +90,7 @@ static void kv_disk_append(Model *m, const int *hist, int len){
 }
 
 static int kv_disk_load(Model *m, int *hist, int maxctx){
-    if(!g_kvsave) return 0;
+    if(!g_kvsave || !colibri_kv_persist_enabled()) return 0;
     KVState *k=m->kv;
     Cfg *c=&m->c;
     FILE *f=fopen(k->disk_path,"rb"); if(!f) return 0;

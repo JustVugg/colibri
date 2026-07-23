@@ -26,7 +26,8 @@ _loader.exec_module(coli)
 
 def args(**over):
     base = dict(model="X", policy="quality", ram=0, ngen=0, topp=0, topk=0,
-                temp=None, repin=0, ctx=0, auto_tier=False, gpu=None, vram=0)
+                temp=None, repin=0, ctx=0, auto_tier=False, gpu=None, vram=0,
+                no_kv_save=False, no_autopin=False, no_persist=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -69,6 +70,25 @@ class EnvDefaultsTest(unittest.TestCase):
         e = self.env_for_with({}, "linux")
         for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY"):
             self.assertNotIn(k, e)
+
+    def test_no_kv_save_disables_kv_persistence(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(sys, "platform", "linux"):
+            e = coli.env_for(args(no_kv_save=True))
+        self.assertEqual(e["KVSAVE"], "0")
+
+    def test_no_autopin_disables_auto_pin(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(sys, "platform", "linux"):
+            e = coli.env_for(args(no_autopin=True))
+        self.assertEqual(e["AUTOPIN"], "0")
+
+    def test_no_persist_disables_disk_state_writes(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(sys, "platform", "linux"):
+            e = coli.env_for(args(no_persist=True))
+        self.assertEqual(e["KVSAVE"], "0")
+        self.assertEqual(e["COLI_PERSIST"], "0")
 
 
 class CudaAutoEnableTest(unittest.TestCase):
