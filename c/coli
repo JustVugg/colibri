@@ -149,6 +149,14 @@ def need_model(model):
     if not os.path.exists(GLM):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
+def need_worker_model(model):
+    if not os.path.isdir(model):
+        sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
+    if not os.path.exists(os.path.join(model,"config.json")):
+        sys.exit(f"{C.yel}config.json is missing from:{C.r} {model}")
+    if not os.path.exists(GLM):
+        sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
+
 def cuda_binary():
     if not os.path.exists(GLM): return False
     if sys.platform == "linux":
@@ -211,6 +219,8 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    if getattr(a, "cluster_workers", None): e["CLUSTER_WORKERS"] = a.cluster_workers
+    if getattr(a, "cluster_coordinator", None): e["CLUSTER_COORDINATOR"] = a.cluster_coordinator
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -828,13 +838,52 @@ def cmd_serve(a):
         with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
     from openai_server import serve
+    e=env_for(a)
+    if a.cluster_coordinator and not a.cluster_workers:
+        from cluster import discover_workers
+        try:
+            workers=discover_workers(a.cluster_coordinator)
+        except OSError as error:
+            sys.exit(f"{C.yel}cannot discover cluster workers:{C.r} {error}")
+        if not workers:
+            sys.exit(f"{C.yel}cluster coordinator has no live expert workers{C.r}")
+        e["CLUSTER_WORKERS"] = ",".join(workers)
+        print(f"  {C.dim}[CLUSTER] discovered {len(workers)} expert worker(s){C.r}", file=sys.stderr)
     try:
         serve(a.model, a.host, a.port, a.model_id, a.api_key,
-              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+              a.cap,a.ngen,GLM,e,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots)
     finally:
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
+
+def cmd_cluster_coordinator(a):
+    from cluster import serve
+    serve(a.host, a.port, a.stale_after)
+
+def cmd_cluster_worker(a):
+    need_worker_model(a.model)
+    coordinator=a.coordinator or os.environ.get("CLUSTER_COORDINATOR")
+    host=a.advertise_host or os.environ.get("CLUSTER_ADVERTISE_HOST", "127.0.0.1")
+    node_id=a.node_id or f"{host}:{a.port}"
+    stop_heartbeat=threading.Event()
+    if coordinator:
+        from cluster import heartbeat, register
+        register(coordinator, {"node_id":node_id, "host":host, "port":a.port,
+                               "role":"expert", "layers":a.layers})
+        def keep_registered():
+            while not stop_heartbeat.wait(10):
+                try: heartbeat(coordinator, node_id)
+                except OSError: pass
+        threading.Thread(target=keep_registered, name="colibri-cluster-heartbeat", daemon=True).start()
+    e=env_for(a)
+    e.update({"EXPERT_WORKER":"1", "CLUSTER_WORKER_PORT":str(a.port),
+              "COLI_MMAP":os.environ.get("COLI_MMAP", "1")})
+    print(f"  {C.dim}[CLUSTER] expert worker · {host}:{a.port} · layers {a.layers}{C.r}")
+    try:
+        return subprocess.call([GLM,str(a.cap),str(a.ebits),str(a.dbits)],env=e)
+    finally:
+        stop_heartbeat.set()
 
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
@@ -963,6 +1012,10 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
+    common.add_argument("--cluster-workers", default=os.environ.get("CLUSTER_WORKERS"),
+                        help="comma-separated expert workers, host:port,...")
+    common.add_argument("--cluster-coordinator", default=os.environ.get("CLUSTER_COORDINATOR"),
+                        help="control-plane URL used to discover expert workers")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
     ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
@@ -988,6 +1041,17 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pcluster=sub.add_parser("cluster", help="run the local-cluster control plane or an expert worker")
+    cluster_sub=pcluster.add_subparsers(dest="cluster_cmd")
+    pcoord=cluster_sub.add_parser("coordinator", help="serve worker registration and discovery")
+    pcoord.add_argument("--host",default="127.0.0.1"); pcoord.add_argument("--port",type=int,default=8765)
+    pcoord.add_argument("--stale-after",type=float,default=30.0)
+    pworker=cluster_sub.add_parser("worker", parents=[common], help="serve disk-backed expert compute")
+    pworker.add_argument("--port",type=int,default=int(os.environ.get("CLUSTER_WORKER_PORT","9100")))
+    pworker.add_argument("--coordinator",default=os.environ.get("CLUSTER_COORDINATOR"))
+    pworker.add_argument("--node-id",default=None); pworker.add_argument("--advertise-host",default=None)
+    pworker.add_argument("--layers",default="all",help="topology label, e.g. 0-37")
+    pworker.add_argument("--ebits",type=int,default=8); pworker.add_argument("--dbits",type=int,default=8)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
@@ -1015,6 +1079,9 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+    if a.cmd=="cluster":
+        if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
+        elif a.cluster_cmd=="worker": handler=cmd_cluster_worker
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 
