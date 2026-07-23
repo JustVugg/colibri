@@ -30,6 +30,10 @@
 #include <unistd.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
@@ -75,6 +79,19 @@ static const float *g_pre_sh;
 /* routing precalcolata dalla GPU (Metal layer CB o device router CUDA, #431):
  * moe() la usa e salta la FASE A. NULL = router su CPU. */
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+typedef struct { int fd; char host[128]; int port, first, last; } DenseShard;
+static DenseShard g_dense_shards[16];
+static int g_dense_n;
+static int g_dense_worker;
+static int g_dense_worker_first, g_dense_worker_last;
+static int dense_owner(int layer);
+static int dense_worker_run(const char *snap, int port, int first, int last,
+                            int cap, int ebits, int dbits);
+#else
+static int g_dense_worker;
+static int g_dense_worker_first, g_dense_worker_last;
+#endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
@@ -1088,6 +1105,70 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 }
 #endif
 
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+/* Dense-shard protocol. Headers use network-order u32 values; activations and
+ * outputs stay raw little-endian f32, matching the host engine's ABI. */
+#define COLI_DENSE_MAGIC "COLIDN01"
+static int dense_io(int fd, void *buf, size_t n, int write_mode){
+    char *p=(char*)buf;
+    while(n){
+        ssize_t r=write_mode?send(fd,p,n,0):recv(fd,p,n,MSG_WAITALL);
+        if(r<=0){ if(r<0&&errno==EINTR) continue; return -1; }
+        p+=r; n-=(size_t)r;
+    }
+    return 0;
+}
+static int dense_u32(int fd, uint32_t *v, int write_mode){
+    uint32_t x=write_mode?htonl(*v):0;
+    if(dense_io(fd,write_mode?(void*)&x:(void*)v,sizeof(x),write_mode)) return -1;
+    if(!write_mode) *v=ntohl(*v);
+    return 0;
+}
+static int dense_connect_one(const char *spec, DenseShard *out){
+    char copy[256]; strncpy(copy,spec,sizeof(copy)-1); copy[sizeof(copy)-1]=0;
+    char *colon=strrchr(copy,':'); if(!colon||colon==copy||!colon[1]) return -1;
+    *colon=0; int port=atoi(colon+1); if(port<1||port>65535) return -1;
+    char portbuf[16]; snprintf(portbuf,sizeof(portbuf),"%d",port);
+    struct addrinfo hint={0},*ai=NULL; hint.ai_socktype=SOCK_STREAM;
+    if(getaddrinfo(copy,portbuf,&hint,&ai)!=0) return -1;
+    int fd=-1;
+    for(struct addrinfo *p=ai;p;p=p->ai_next){
+        fd=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
+        if(fd<0) continue;
+        if(connect(fd,p->ai_addr,p->ai_addrlen)==0) break;
+        close(fd); fd=-1;
+    }
+    freeaddrinfo(ai); if(fd<0) return -1;
+    out->fd=fd; strncpy(out->host,copy,sizeof(out->host)-1); out->host[sizeof(out->host)-1]=0;
+    out->port=port; return 0;
+}
+static int dense_owner(int layer){
+    for(int i=0;i<g_dense_n;i++)
+        if(layer>=g_dense_shards[i].first&&layer<=g_dense_shards[i].last) return i;
+    return -1;
+}
+static void dense_init(void){
+    const char *list=getenv("DENSE_SHARDS"); if(!list||!*list) return;
+    char *copy=strdup(list),*save=NULL;
+    for(char *tok=strtok_r(copy,",",&save);tok&&g_dense_n<16;tok=strtok_r(NULL,",",&save)){
+        char spec[256]; strncpy(spec,tok,sizeof(spec)-1); spec[sizeof(spec)-1]=0;
+        char *last=strrchr(spec,':'); if(!last) continue; int end=atoi(last+1); *last=0;
+        char *firstp=strrchr(spec,':'); if(!firstp) continue; int first=atoi(firstp+1); *firstp=0;
+        if(first<0||end<first) continue;
+        if(dense_connect_one(spec,&g_dense_shards[g_dense_n])) continue;
+        g_dense_shards[g_dense_n].first=first; g_dense_shards[g_dense_n].last=end;
+        g_dense_n++;
+    }
+    free(copy);
+    if(!g_dense_n){ fprintf(stderr,"[DENSE] no dense shard workers reachable\n"); exit(1); }
+    fprintf(stderr,"[DENSE] activation pipeline connected to %d shard(s)\n",g_dense_n);
+}
+static void dense_close(void){
+    for(int i=0;i<g_dense_n;i++) if(g_dense_shards[i].fd>=0) close(g_dense_shards[i].fd);
+    g_dense_n=0;
+}
+#endif
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
@@ -1097,9 +1178,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
     int io_bits = dbits>=8 ? 16 : dbits;
-    m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
-    m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
-    m->final_norm = ld(m,"model.norm.weight");
+    if(!g_dense_worker){
+        m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
+        m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
+        m->final_norm = ld(m,"model.norm.weight");
+    }
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
@@ -1114,6 +1197,16 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
+        if(g_dense_worker){
+            if(i<g_dense_worker_first||i>g_dense_worker_last||i>=c->first_dense) continue;
+            l->sparse=0;
+            #define PW(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
+            l->gate_proj=qt_load(m,PW("mlp.gate_proj.weight"),c->dense_inter,D,dbits);
+            l->up_proj=qt_load(m,PW("mlp.up_proj.weight"),c->dense_inter,D,dbits);
+            l->down_proj=qt_load(m,PW("mlp.down_proj.weight"),D,c->dense_inter,dbits);
+            #undef PW
+            continue;
+        }
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
@@ -1133,7 +1226,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             layer_cuda_shard_kvb(l,H,c->qk_nope,c->v_head);
 #endif
         l->sparse = (i >= c->first_dense);
-        if(!l->sparse){
+        if(!l->sparse
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+           && dense_owner(i)<0
+#endif
+          ){
             l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
@@ -1169,7 +1266,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             "self_attn.kv_b_proj.weight","self_attn.o_proj.weight","mlp.gate.weight",
             "mlp.shared_experts.gate_proj.weight","mlp.shared_experts.down_proj.weight",
             "mlp.experts.0.gate_proj.weight"};
-        char mn[256]; m->has_mtp=1;
+        char mn[256]; m->has_mtp=g_dense_worker?0:1;
         for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
             snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
             if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
@@ -1216,7 +1313,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     /* DSA lightning indexer: attivo SOLO se i pesi (conversione --indexer) ci sono per
      * TUTTI i layer full. Auto-rilevamento come per MTP: niente flag, niente passi extra. */
     {
-        m->has_dsa = (c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
+        m->has_dsa = (!g_dense_worker && c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
         char inm[300];
         for(int i=0;i<c->n_layers && m->has_dsa;i++){
             if(!c->idx_type[i]) continue;
@@ -3542,6 +3639,65 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+static void dense_mlp_remote(Model *m,int layer,const float *input,int S,float *output){
+    int wi=dense_owner(layer);
+    if(wi<0){ fprintf(stderr,"[DENSE] no owner for layer %d\n",layer); exit(1); }
+    DenseShard *w=&g_dense_shards[wi]; uint32_t v;
+    int D=m->c.hidden,I=m->c.dense_inter;
+    if(dense_io(w->fd,(void*)COLI_DENSE_MAGIC,8,1)) goto fail;
+    v=1; if(dense_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)layer; if(dense_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)D; if(dense_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)I; if(dense_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)S; if(dense_u32(w->fd,&v,1)) goto fail;
+    if(dense_io(w->fd,(void*)input,(size_t)S*D*sizeof(float),1)) goto fail;
+    char magic[8];
+    if(dense_io(w->fd,magic,8,0)||memcmp(magic,COLI_DENSE_MAGIC,8)) goto fail;
+    if(dense_u32(w->fd,&v,0)||v!=1) goto fail;
+    if(dense_u32(w->fd,&v,0)||v!=0) goto fail;
+    if(dense_u32(w->fd,&v,0)||v!=(uint32_t)S) goto fail;
+    if(dense_io(w->fd,output,(size_t)S*D*sizeof(float),0)) goto fail;
+    return;
+fail:
+    fprintf(stderr,"[DENSE] shard %s:%d failed for layer %d\n",w->host,w->port,layer);
+    exit(1);
+}
+
+static int dense_worker_run(const char *snap,int port,int first,int last,int cap,int ebits,int dbits){
+    g_dense_worker=1; g_dense_worker_first=first; g_dense_worker_last=last;
+    Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    int fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0){perror("dense worker socket");return 1;}
+    int yes=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+    struct sockaddr_in addr={0}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons((uint16_t)port);
+    if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))||listen(fd,4)){perror("dense worker bind/listen");return 1;}
+    fprintf(stderr,"[DENSE] worker listening on 0.0.0.0:%d · layers %d-%d · loaded %.2f MB in %.2fs\n",
+            port,first,last,m.resident_bytes/(1024.0*1024.0),now_s()-t0);
+    for(;;){
+        int cfd=accept(fd,NULL,NULL); if(cfd<0){if(errno==EINTR)continue;break;}
+        for(;;){
+            char magic[8]; uint32_t v,layer,D,I,S;
+            if(dense_io(cfd,magic,8,0)) break;
+            if(memcmp(magic,COLI_DENSE_MAGIC,8)||dense_u32(cfd,&v,0)||v!=1||
+               dense_u32(cfd,&layer,0)||dense_u32(cfd,&D,0)||dense_u32(cfd,&I,0)||dense_u32(cfd,&S,0)||
+               layer>=(uint32_t)m.c.n_layers||layer<(uint32_t)first||layer>(uint32_t)last||layer>=(uint32_t)m.c.first_dense||
+               D!=(uint32_t)m.c.hidden||I!=(uint32_t)m.c.dense_inter||S<1||S>4096){
+                close(cfd); cfd=-1; break;
+            }
+            float *input=falloc((int64_t)S*D),*output=falloc((int64_t)S*D);
+            if(dense_io(cfd,input,(size_t)S*D*sizeof(float),0)){free(input);free(output);break;}
+            dense_mlp(&m.L[layer],input,S,D,I,output);
+            v=1; if(dense_io(cfd,(void*)COLI_DENSE_MAGIC,8,1)||dense_u32(cfd,&v,1)){free(input);free(output);break;}
+            v=0; if(dense_u32(cfd,&v,1)){free(input);free(output);break;}
+            v=S; if(dense_u32(cfd,&v,1)||dense_io(cfd,output,(size_t)S*D*sizeof(float),1)){free(input);free(output);break;}
+            free(input);free(output);
+        }
+        if(cfd>=0)close(cfd);
+    }
+    close(fd); return 0;
+}
+#endif
+
 /* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
  * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
  * kind 0 = stesso layer saltando l'attention
@@ -4127,7 +4283,11 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
         la_predict(m,li+1,x,2);  /* two-step: shared-expert-corrected prediction */
     }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
-    if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    if(l->sparse) moe(m,l,li,nrm,S,tmp,1);
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    else if(dense_owner(li)>=0) dense_mlp_remote(m,li,nrm,S,tmp);
+#endif
+    else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
@@ -6531,8 +6691,29 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if(getenv("DENSE_WORKER")){
+        int port=getenv("DENSE_WORKER_PORT")?atoi(getenv("DENSE_WORKER_PORT")):9200;
+        int first=getenv("DENSE_WORKER_FIRST")?atoi(getenv("DENSE_WORKER_FIRST")):-1;
+        int last=getenv("DENSE_WORKER_LAST")?atoi(getenv("DENSE_WORKER_LAST")):-1;
+        if(port<1||port>65535||first<0||last<first){
+            fprintf(stderr,"invalid dense worker port/range\n"); return 2;
+        }
+        return dense_worker_run(snap,port,first,last,cap,ebits,dbits);
+    }
+#else
+    if(getenv("DENSE_WORKER")){
+        fprintf(stderr,"[DENSE] dense workers are not supported on Windows yet\n"); return 2;
+    }
+#endif
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if(getenv("DENSE_SHARDS") && *getenv("DENSE_SHARDS")){
+        dense_init();
+        atexit(dense_close);
+    }
+#endif
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
         /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8
