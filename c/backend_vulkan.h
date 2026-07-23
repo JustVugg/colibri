@@ -31,6 +31,10 @@ void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
 void coli_vk_alloc_priority(float p);
 /* Fused gate+up activation (model-global): 0 = silu(gate)*up (GLM), 1 = swigluoai (M3). */
 void coli_vk_set_activation(int act, float alpha, float limit);
+/* Decode GQA attention core (MiniMax-M3): K/V rows mirrored via coli_vk_kv_row
+ * (K in the L buffer, V in the R buffer, both NK*hd wide). Returns 0 -> CPU fallback. */
+int coli_vk_gqa_attn(float *ctx, const float *q, int layer, int S, int H, int NK, int hd,
+                     int st0, int T, float scale);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].

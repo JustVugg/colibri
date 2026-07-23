@@ -61,6 +61,8 @@ static struct {
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
+    VkShaderModule shader_gqa; VkDescriptorSetLayout dsl_gqa; VkPipelineLayout plyt_gqa;
+    VkPipeline pipe_gqa; VkDescriptorPool dpool_gqa; VkDescriptorSet dset_gqa;
     VkCommandPool cpool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -120,6 +122,7 @@ void coli_vk_set_activation(int act, float alpha, float limit) {
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
+struct PCGqa { int S, H, NK, hd, st0, T, cap; float scale; };   /* M3 GQA attention core */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -439,6 +442,12 @@ int coli_vk_init(const char *spv_path) {
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
+    /* Optional GQA attention core (MiniMax-M3): Q, K-cache, V-cache, scores, ctx. */
+    char gqa_path[512]; derive_dir_file(spv_path, "attention_gqa.spv", gqa_path, sizeof(gqa_path));
+    G.shader_gqa = load_spv(G.dev, gqa_path);
+    if (G.shader_gqa && !build_pipeline(G.dev, 5, sizeof(struct PCGqa), G.shader_gqa, &G.dsl_gqa, &G.plyt_gqa, &G.pipe_gqa, &G.dpool_gqa, &G.dset_gqa))
+        return 0;
+
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
     VKCHECK(vkCreateCommandPool(G.dev, &cpci, NULL, &G.cpool), "cmdPool");
@@ -452,8 +461,9 @@ int coli_vk_init(const char *spv_path) {
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
-            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "");
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s\n", p.deviceName, G.qfam, G.memtype,
+            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
+            G.shader_gqa ? ", GQA attention" : "");
     return 1;
 }
 
@@ -1285,6 +1295,53 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     return 1;
 }
 
+/* Decode GQA attention core for S causal query rows (MiniMax-M3), one submit:
+ * ctx[s,h,:] = softmax((q[s,h] . K_t[g]) * scale) weighted V_t[g], g = h/(H/NK).
+ * K and V rows [st0, T) must already be mirrored via coli_vk_kv_row (K in the L
+ * buffer, V in the R buffer, both NK*hd wide). Queries and cache rows arrive
+ * already normed+roped. Returns 0 -> caller falls back to the CPU core. */
+int coli_vk_gqa_attn(float *ctx, const float *q, int layer, int S, int H, int NK, int hd,
+                     int st0, int T, float scale) {
+    if (!G.ready || !G.pipe_gqa || S < 1 || H < 1 || NK < 1 || layer < 0 || layer >= VK_KV_LAYERS) return 0;
+    if (hd > 256 || H % NK != 0 || st0 < 0 || T - S - st0 < 0) return 0;   /* qsh[256] limit */
+    int KVd = NK * hd;
+    VkKvLayer *kv = &G.kv[layer];
+    if (!kv->bl || kv->rows < T || kv->K != KVd || kv->R != KVd) return 0;
+    int cap = T - st0;
+    size_t qb = (size_t)S * H * hd * 4, cb = (size_t)S * H * hd * 4;
+    size_t sb = (size_t)S * H * cap * 4;
+    if (!scratch_reserve(&G.x, qb) || !scratch_reserve_mt(&G.y, cb, G.memtype_cached) ||
+        !scratch_reserve(&G.att_sc, sb)) return 0;    /* y (ctx) is read back -> cached */
+    memcpy(G.x.ptr, q, qb);
+
+    VkDescriptorBufferInfo bi[5] = {
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
+        {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_gqa, 5, bi);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gqa);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gqa, 0, 1, &G.dset_gqa, 0, NULL);
+    struct PCGqa pc = {S, H, NK, hd, st0, T, cap, scale};
+    vkCmdPushConstants(G.cmd, G.plyt_gqa, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)S, 1);     /* one workgroup per (head, row) */
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double vp0 = G.eg_prof ? vk_now() : 0;
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
+    memcpy(ctx, G.y.ptr, cb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
 /* Two resident matmuls sharing the SAME input x in ONE submit (q_a + kv_a in the
  * attention prologue): one x staging, two dispatches, one fence — replaces two
  * full submit+wait roundtrips. Outputs y1 [S,O1] and y2 [S,O2] read back from
@@ -1584,6 +1641,13 @@ void coli_vk_shutdown(void) {
         vkDestroyPipelineLayout(G.dev, G.plyt_att, NULL);
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_att, NULL);
         vkDestroyShaderModule(G.dev, G.shader_att, NULL);
+    }
+    if (G.shader_gqa) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_gqa, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_gqa, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_gqa, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_gqa, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_gqa, NULL);
     }
     for (VkWArena *a = g_warena; a;) {   /* weight arenas: unmapped/freed with the device */
         VkWArena *nx = a->next;

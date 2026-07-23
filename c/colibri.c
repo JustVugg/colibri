@@ -4229,6 +4229,29 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
         memcpy(ks->Rc[layer]+(int64_t)pos*KVd, vsr, (size_t)KVd*sizeof(float));
     }
     double tc0=now_s();
+    int vk_core=0; (void)vk_core;
+#ifdef COLI_VULKAN
+    /* Vulkan GQA core (COLI_VK_ATTN=1): scores/softmax/weighted-V for all S x H in
+     * ONE submit per layer, reading the persistent on-device K/V mirror (K in the L
+     * buffer, V in the R buffer; rows appended incrementally, vk_kv_valid watermark,
+     * invalidated like the CUDA/MLA shadow on rewrite/rebind/resize). Single-sequence
+     * decode only (no ragged mux); falls back to the CPU core on any failure. */
+    if(g_vk_attn && !kvs && !positions && S<=4 && layer<c->n_layers &&
+       m->vk_kv_valid && m->kv->Lc[layer] && m->kv->Rc[layer]){
+        int st0=m->kv_start[layer], T=pos_base+S;
+        if(T<=m->max_t && coli_vk_kv_ensure(layer,m->max_t,KVd,KVd)){
+            int ok=1;
+            for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
+                ok=coli_vk_kv_row(layer,t,m->kv->Lc[layer]+(int64_t)t*KVd,
+                                        m->kv->Rc[layer]+(int64_t)t*KVd);
+            if(ok){
+                m->vk_kv_valid[layer]=T;
+                if(coli_vk_gqa_attn(ctx,q,layer,S,H,NK,hd,st0,T,c->attn_scale)) vk_core=1;
+            }
+        }
+    }
+#endif
+    if(!vk_core)
     for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
         int pos=positions?positions[s]:pos_base+s;
