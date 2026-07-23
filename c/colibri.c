@@ -2409,6 +2409,14 @@ static void model_init_range(Model *m, const char *snap, int cap,
     m->eheat=calloc(NR,sizeof(uint32_t*));
     m->elast=calloc(NR,sizeof(uint32_t*));
     m->elast_dc=calloc(NR,sizeof(uint32_t*)); m->elast_pre=calloc(NR,sizeof(uint32_t*));
+    /* MSA auto-detect: the config announces sparse attention, but a container converted
+     * before the indexer was kept has no index weights — fall back to full attention
+     * (exact <=2048 ctx) rather than failing the load. Add them with a `--indexer` pass. */
+    if(c->msa){ char inm[300];
+        snprintf(inm,sizeof(inm),"model.layers.%d.self_attn.index_q_proj.weight",c->first_dense);
+        if(!st_has(&m->S,inm)){ c->msa=0; for(int i=0;i<c->n_layers;i++) c->idx_type[i]=0;
+            fprintf(stderr,"[MSA] indexer weights absent — full causal attention "
+                           "(add them with: convert --arch m3 --indexer for block-sparse long context)\n"); } }
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=layer_begin;i<layer_end;i++){
