@@ -109,6 +109,9 @@ jobs:
           cp c/doctor.py dist/
           cp c/autotune.py dist/
           cp c/ramdisk.py dist/
+          cp c/ramdisk_ui.py dist/
+          cp c/ramdisk_textual.py dist/
+          cp c/requirements-tui.txt dist/
           cp LICENSE dist/
           # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
           # probe that layout as well as the source checkout's one-level-up form.
@@ -155,7 +158,7 @@ jobs:
               sys.exit("FAIL: coli would not resolve these next to itself: " + ", ".join(missing))
           print("OK: every engine is where coli's engine_for() looks for it")
           PYCHK
-          out=$(python3 coli info 2>&1 || true)
+          out=$(python3 coli info --model . 2>&1)
           echo "$out"
           case "$out" in
             *"engine is not built"*) echo "FAIL: coli cannot find the packaged engine"; exit 1 ;;
@@ -170,6 +173,18 @@ jobs:
           test -f web/dist/index.html   || { echo "FAIL: dashboard missing from archive"; exit 1; }
           test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
           python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
+          echo "$out" | grep -Fq "ready ✓" || { echo "FAIL: coli cannot find the packaged engine"; exit 1; }
+          python3 coli ramdisk --help > ramdisk-help.txt
+          grep -Fq "interleaved = one shared model copy" ramdisk-help.txt || {
+            echo "FAIL: packaged RAM-disk UI modules did not load"; exit 1;
+          }
+          python3 -m py_compile ramdisk.py ramdisk_ui.py ramdisk_textual.py
+          test -f requirements-tui.txt || {
+            echo "FAIL: packaged Textual dependency contract is missing"; exit 1;
+          }
+          python3 -m pip install --disable-pip-version-check -r requirements-tui.txt
+          PYTHONPATH=. python3 -c "import ramdisk_textual; assert ramdisk_textual.RamdiskTextualApp"
+          echo "OK: packaged engine and guided Textual UI load from one archive"
 
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
       # (the engine was versioned, so it did not match); now that the engine is plainly named,

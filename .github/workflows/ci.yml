@@ -257,6 +257,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install supported TUI dependency
+        run: python3 -m pip install -r c/requirements-tui.txt
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 

@@ -1101,48 +1101,364 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
  * every bind here lands before the pread that first-touches the pages, so
  * there is nothing to migrate. */
 #ifdef __linux__
-static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA is a no-op */
+/* Linux CPU/node lists use the same grammar: N or N-M terms separated by
+ * commas.  Keep the mask dynamically sized so node 65 is represented by bit
+ * 65, not mistaken for "the 66th contiguous node".  The runtime callers cap
+ * untrusted environment input to the kernel's possible/online domain; the
+ * generous absolute cap only bounds a corrupt sysfs file. */
+#define COLI_IDMASK_MAX_ID 1048575UL
+typedef struct {
+    unsigned long *words;
+    size_t nwords, count;
+    unsigned long maxnode;       /* kernel ABI: highest selected ID + 1 */
+} ColiIdMask;
+
+static void coli_idmask_free(ColiIdMask *m){
+    if(!m) return;
+    free(m->words);
+    *m=(ColiIdMask){0};
+}
+
+static int coli_idmask_parse_uint(const char **cursor,unsigned long max_id,
+                                  unsigned long *value){
+    const char *p=*cursor;
+    if(!p || *p<'0' || *p>'9'){ errno=EINVAL; return -1; }
+    unsigned long v=0;
+    do {
+        unsigned long digit=(unsigned long)(*p-'0');
+        if(v>max_id/10 || (v==max_id/10 && digit>max_id%10)){
+            errno=ERANGE; return -1;
+        }
+        v=v*10+digit; p++;
+    } while(*p>='0' && *p<='9');
+    *cursor=p; *value=v; return 0;
+}
+
+static int coli_idmask_parse_pass(const char *spec,unsigned long max_id,
+                                  unsigned long *words,size_t nwords,
+                                  size_t *count,unsigned long *maxnode){
+    const unsigned long word_bits=(unsigned long)(sizeof(unsigned long)*CHAR_BIT);
+    const char *p=spec;
+    size_t selected=0;
+    unsigned long high=0;
+    if(!p || !*p){ errno=EINVAL; return -1; }
+    for(;;){
+        unsigned long first,last;
+        if(coli_idmask_parse_uint(&p,max_id,&first)) return -1;
+        last=first;
+        if(*p=='-'){
+            p++;
+            if(coli_idmask_parse_uint(&p,max_id,&last)) return -1;
+            if(last<first){ errno=EINVAL; return -1; }
+        }
+        for(unsigned long id=first;;id++){
+            if(words){
+                size_t wi=(size_t)(id/word_bits);
+                unsigned long bit=1UL<<(id%word_bits);
+                if(wi>=nwords){ errno=ERANGE; return -1; }
+                if(words[wi]&bit){ errno=EINVAL; return -1; }
+                words[wi]|=bit;
+            }
+            if(selected==(size_t)-1){ errno=EOVERFLOW; return -1; }
+            selected++;
+            if(id+1>high) high=id+1;
+            if(id==last) break;
+        }
+        if(!*p) break;
+        if(*p!=','){ errno=EINVAL; return -1; }
+        p++;
+        if(!*p){ errno=EINVAL; return -1; }
+    }
+    if(count) *count=selected;
+    if(maxnode) *maxnode=high;
+    return 0;
+}
+
+/* `out` must be empty.  On every failure it remains empty, which lets managed
+ * configuration fail closed without accidentally retaining a previous mask. */
+static int coli_idmask_parse(const char *spec,unsigned long max_id,ColiIdMask *out){
+    const unsigned long word_bits=(unsigned long)(sizeof(unsigned long)*CHAR_BIT);
+    unsigned long maxnode=0;
+    if(!out){ errno=EINVAL; return -1; }
+    *out=(ColiIdMask){0};
+    if(max_id==ULONG_MAX) max_id=ULONG_MAX-1; /* maxnode must represent id+1 */
+    if(coli_idmask_parse_pass(spec,max_id,NULL,0,NULL,&maxnode)) return -1;
+    if(!maxnode){ errno=EINVAL; return -1; }
+    size_t nwords=(size_t)((maxnode-1)/word_bits)+1;
+    if(nwords>(size_t)-1/sizeof(unsigned long)){ errno=EOVERFLOW; return -1; }
+    unsigned long *words=(unsigned long*)calloc(nwords,sizeof(unsigned long));
+    if(!words) return -1;
+    size_t count=0;
+    if(coli_idmask_parse_pass(spec,max_id,words,nwords,&count,&maxnode)){
+        int saved=errno; free(words); errno=saved; return -1;
+    }
+    out->words=words; out->nwords=nwords; out->count=count; out->maxnode=maxnode;
+    return 0;
+}
+
+static int coli_idmask_has(const ColiIdMask *m,unsigned long id){
+    const unsigned long word_bits=(unsigned long)(sizeof(unsigned long)*CHAR_BIT);
+    size_t wi=(size_t)(id/word_bits);
+    return m && wi<m->nwords && !!(m->words[wi]&(1UL<<(id%word_bits)));
+}
+
+static int coli_idmask_is_subset(const ColiIdMask *selected,const ColiIdMask *domain){
+    if(!selected || !domain) return 0;
+    for(size_t i=0;i<selected->nwords;i++){
+        unsigned long allowed=i<domain->nwords?domain->words[i]:0;
+        if(selected->words[i]&~allowed) return 0;
+    }
+    return 1;
+}
+
+static int coli_idmask_read_file(const char *path,unsigned long max_id,ColiIdMask *out){
+    char buf[4096];
+    FILE *fp=fopen(path,"r");
+    if(!fp) return -1;
+    if(!fgets(buf,sizeof(buf),fp)){
+        int saved=ferror(fp)?errno:EINVAL; fclose(fp); errno=saved; return -1;
+    }
+    size_t n=strlen(buf);
+    if(n==sizeof(buf)-1 && buf[n-1]!='\n' && !feof(fp)){
+        fclose(fp); errno=EOVERFLOW; return -1;
+    }
+    if(fclose(fp)) return -1;
+    while(n && (buf[n-1]=='\n'||buf[n-1]=='\r')) buf[--n]=0;
+    return coli_idmask_parse(buf,max_id,out);
+}
+
+static int coli_idmask_read_status_field(const char *field,unsigned long max_id,
+                                         ColiIdMask *out){
+    char line[4096];
+    size_t field_len=strlen(field);
+    FILE *fp=fopen("/proc/self/status","r");
+    if(!fp) return -1;
+    while(fgets(line,sizeof(line),fp)){
+        size_t n=strlen(line);
+        if(n==sizeof(line)-1 && line[n-1]!='\n' && !feof(fp)){
+            fclose(fp); errno=EOVERFLOW; return -1;
+        }
+        if(strncmp(line,field,field_len) || line[field_len]!=':') continue;
+        char *spec=line+field_len+1;
+        while(*spec==' '||*spec=='\t') spec++;
+        while(n && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]=0;
+        if(fclose(fp)) return -1;
+        return coli_idmask_parse(spec,max_id,out);
+    }
+    {
+        int saved=ferror(fp)?(errno?errno:EIO):ENOENT;
+        fclose(fp); errno=saved; return -1;
+    }
+}
+
+/* `/sys/.../online` is authoritative and already uses range-list syntax.  The
+ * bounded directory scan is only the old-kernel fallback; unlike the former
+ * loop it does not stop at the first sparse node ID. */
+static int coli_numa_online_mask(ColiIdMask *out){
+    if(!coli_idmask_read_file("/sys/devices/system/node/online",
+                              COLI_IDMASK_MAX_ID,out)) return 0;
+    char spec[256]={0};
+    size_t used=0;
+    int found=0;
+    for(int i=0;i<64;i++){
+        char path[64];
+        struct stat st;
+        snprintf(path,sizeof(path),"/sys/devices/system/node/node%d",i);
+        if(stat(path,&st)) continue;
+        int wrote=snprintf(spec+used,sizeof(spec)-used,"%s%d",found?",":"",i);
+        if(wrote<0 || (size_t)wrote>=sizeof(spec)-used){ errno=EOVERFLOW; return -1; }
+        used+=(size_t)wrote; found=1;
+    }
+    if(!found){ errno=ENOENT; return -1; }
+    return coli_idmask_parse(spec,63,out);
+}
+
+/* Apply and then read back a managed CPU mask.  sched_setaffinity may silently
+ * intersect a request with offline CPUs or a cgroup cpuset, so success alone is
+ * not an exact-placement guarantee; byte-for-byte readback is required. */
+static int coli_cpu_affinity_apply(const char *spec){
+#if defined(SYS_sched_setaffinity) && defined(SYS_sched_getaffinity)
+    const unsigned long word_bits=(unsigned long)(sizeof(unsigned long)*CHAR_BIT);
+    ColiIdMask possible={0},requested={0};
+    unsigned long max_id=0;
+    size_t kernel_words=0;
+    int have_possible=!coli_idmask_read_file("/sys/devices/system/cpu/possible",
+                                             COLI_IDMASK_MAX_ID,&possible);
+    if(have_possible){
+        if(!possible.maxnode){ errno=EINVAL; goto fail; }
+        max_id=possible.maxnode-1;
+        kernel_words=possible.nwords;
+    } else {
+        long ncpu=sysconf(_SC_NPROCESSORS_CONF);
+        if(ncpu<1){ errno=ENODEV; goto fail; }
+        max_id=(unsigned long)ncpu-1;
+        kernel_words=(size_t)(((unsigned long)ncpu-1)/word_bits)+1;
+    }
+    if(coli_idmask_parse(spec,max_id,&requested)) goto fail;
+    if(have_possible && !coli_idmask_is_subset(&requested,&possible)){
+        errno=EINVAL; goto fail;
+    }
+    if(kernel_words>(size_t)-1/sizeof(unsigned long)){ errno=EOVERFLOW; goto fail; }
+    size_t bytes=kernel_words*sizeof(unsigned long);
+    unsigned long *wanted=(unsigned long*)calloc(kernel_words,sizeof(unsigned long));
+    unsigned long *actual=(unsigned long*)calloc(kernel_words,sizeof(unsigned long));
+    if(!wanted || !actual){
+        int saved=errno; free(wanted); free(actual); errno=saved; goto fail;
+    }
+    memcpy(wanted,requested.words,requested.nwords*sizeof(unsigned long));
+    if(syscall(SYS_sched_setaffinity,0,bytes,wanted)<0){
+        int saved=errno;
+        free(wanted); free(actual); errno=saved; goto fail;
+    }
+    if(syscall(SYS_sched_getaffinity,0,bytes,actual)<0){
+        int saved=errno;
+        free(wanted); free(actual); errno=saved; goto fail;
+    }
+    if(memcmp(wanted,actual,bytes)){
+        int saved=EPERM; /* an offline CPU or cpuset silently narrowed the request */
+        free(wanted); free(actual); errno=saved; goto fail;
+    }
+    free(wanted); free(actual);
+    coli_idmask_free(&requested);
+    coli_idmask_free(&possible);
+    return 0;
+fail:
+    {
+        int saved=errno?errno:EINVAL;
+        coli_idmask_free(&requested);
+        coli_idmask_free(&possible);
+        errno=saved;
+        return -1;
+    }
+#else
+    (void)spec;
+    errno=ENOTSUP;
+    return -1;
+#endif
+}
+
+#define COLI_MPOL_BIND 2
+#define COLI_MPOL_INTERLEAVE 3
+#define COLI_MPOL_F_STATIC_NODES (1<<15)
+static int coli_numa_policy_mode(size_t selected_count,int explicit_nodes){
+    int mode=selected_count==1 && explicit_nodes
+             ?COLI_MPOL_BIND:COLI_MPOL_INTERLEAVE;
+    return mode|(explicit_nodes?COLI_MPOL_F_STATIC_NODES:0);
+}
+static ColiIdMask g_numa_mask={0};
+static int g_numa_nodes=0;      /* selected-node count; IDs live in g_numa_mask */
+static int g_numa_mbind_mode=COLI_MPOL_INTERLEAVE;
 static int g_numa_skip_bind=0;  /* raised around the GPU-prefix pin load: those slabs are
                                  * upload staging, freed right after — binding them buys
                                  * nothing and costs ~2 transient VMAs each (#419) */
 #endif
-static void numa_slab_bind(void *p, size_t n){
+static int numa_slab_bind(void *p, size_t n){
 #ifdef __linux__
-    if(g_numa_nodes<2 || g_numa_skip_bind || !p || !n) return;
-    unsigned long mask=(1UL<<g_numa_nodes)-1;
+    if(g_numa_nodes<1 || !g_numa_mask.words || g_numa_skip_bind || !p || !n) return 0;
     uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
     size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
-    syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
-            (unsigned long)(g_numa_nodes+1),0);
+    return syscall(SYS_mbind,a,len,g_numa_mbind_mode,g_numa_mask.words,
+                   g_numa_mask.maxnode,0)<0?-1:0;
 #else
     (void)p;(void)n;
+    return 0;
 #endif
 }
-static void numa_init(void){
+static int numa_init(void){
 #ifdef __linux__
-    if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
-    for(int i=0;i<64;i++){ char pth[64]; snprintf(pth,sizeof(pth),"/sys/devices/system/node/node%d",i);
-        struct stat st; if(stat(pth,&st)) break; g_numa_nodes=i+1; }
-    if(g_numa_nodes<2){ fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n"); return; }
+    const char *enabled=getenv("COLI_NUMA");
+    const char *selected_spec=getenv("COLI_NUMA_NODES");
+    if(!enabled||!atoi(enabled)) return 0;
+    ColiIdMask online={0},allowed={0},selected={0};
+    coli_idmask_free(&g_numa_mask);
+    g_numa_nodes=0;
+    g_numa_mbind_mode=COLI_MPOL_INTERLEAVE;
+    if(coli_numa_online_mask(&online)){
+        fprintf(stderr,"[NUMA] cannot discover online nodes: %s\n",strerror(errno));
+        return selected_spec?-1:0;
+    }
+    if(selected_spec){
+        int selected_rc=coli_idmask_parse(selected_spec,online.maxnode-1,&selected);
+        if(!selected_rc && !coli_idmask_is_subset(&selected,&online)){
+            errno=EINVAL; selected_rc=-1;
+        }
+        if(selected_rc){
+            int saved=errno?errno:EINVAL;
+            fprintf(stderr,"[NUMA] invalid COLI_NUMA_NODES=%s: selected nodes must be "
+                    "a subset of the online range list\n",selected_spec);
+            coli_idmask_free(&selected); coli_idmask_free(&online);
+            errno=saved; return -1;
+        }
+        if(coli_idmask_read_status_field("Mems_allowed_list",
+                                         COLI_IDMASK_MAX_ID,&allowed)){
+            int saved=errno?errno:EIO;
+            fprintf(stderr,"[NUMA] cannot validate COLI_NUMA_NODES against "
+                    "Mems_allowed_list: %s\n",strerror(saved));
+            coli_idmask_free(&allowed); coli_idmask_free(&selected);
+            coli_idmask_free(&online); errno=saved; return -1;
+        }
+        if(!coli_idmask_is_subset(&selected,&allowed)){
+            fprintf(stderr,"[NUMA] COLI_NUMA_NODES=%s exceeds this process's "
+                    "Mems_allowed_list\n",selected_spec);
+            coli_idmask_free(&allowed); coli_idmask_free(&selected);
+            coli_idmask_free(&online); errno=EPERM; return -1;
+        }
+        coli_idmask_free(&allowed);
+        coli_idmask_free(&online);
+    } else {
+        selected=online;
+        online=(ColiIdMask){0};
+    }
+    if(selected.count>(size_t)INT_MAX){
+        coli_idmask_free(&selected); errno=EOVERFLOW; return -1;
+    }
+    /* Keep explicit physical node IDs stable if the task later crosses a
+     * cpuset boundary.  Legacy autodetection keeps the historical remapping
+     * behavior.  MPOL_F_STATIC_NODES is the Linux UAPI bit from mempolicy.h. */
+    g_numa_mbind_mode=coli_numa_policy_mode(selected.count,selected_spec!=NULL);
+    g_numa_mask=selected;
+    g_numa_nodes=(int)selected.count;
+    if(g_numa_nodes<2 && !selected_spec){
+        fprintf(stderr,"[NUMA] single selected node: COLI_NUMA ignored\n");
+        coli_idmask_free(&g_numa_mask);
+        return 0;
+    }
     /* Probe mbind once so a constrained container degrades with a message
      * instead of silently losing the interleave. The probe page must be
-     * page-aligned (mbind rejects unaligned addresses with EINVAL) and only
-     * errno==EPERM disables — any other failure keeps NUMA on. */
+     * page-aligned (mbind rejects unaligned addresses with EINVAL). Legacy
+     * autodetection retains its EPERM degradation; an explicit managed mask
+     * fails closed on every probe error. */
     { void *pg=NULL;
-      if(!posix_memalign(&pg,4096,4096)){
-          unsigned long mask=(1UL<<g_numa_nodes)-1; errno=0;
-          long rc=syscall(SYS_mbind,pg,4096,3/*MPOL_INTERLEAVE*/,&mask,
-                          (unsigned long)(g_numa_nodes+1),0);
-          int eperm = rc<0 && errno==EPERM;
+      int alloc_rc=posix_memalign(&pg,4096,4096);
+      if(!alloc_rc){
+          errno=0;
+          long rc=syscall(SYS_mbind,pg,4096,g_numa_mbind_mode,
+                          g_numa_mask.words,g_numa_mask.maxnode,0);
+          int probe_errno=rc<0?errno:0;
           free(pg);
-          if(eperm){
-              fprintf(stderr,"[NUMA] mbind not permitted (EPERM) — COLI_NUMA disabled\n");
-              g_numa_nodes=1; return;
+          if(probe_errno && selected_spec){
+              fprintf(stderr,"[NUMA] COLI_NUMA_NODES=%s cannot be applied: %s\n",
+                      selected_spec,strerror(probe_errno));
+              coli_idmask_free(&g_numa_mask); g_numa_nodes=0;
+              errno=probe_errno; return -1;
           }
+          if(probe_errno==EPERM){
+              fprintf(stderr,"[NUMA] mbind not permitted (EPERM) — COLI_NUMA disabled\n");
+              coli_idmask_free(&g_numa_mask); g_numa_nodes=0; return 0;
+          }
+      } else if(selected_spec){
+          fprintf(stderr,"[NUMA] cannot allocate mbind probe page: %s\n",strerror(alloc_rc));
+          coli_idmask_free(&g_numa_mask); g_numa_nodes=0; errno=alloc_rc; return -1;
       }
     }
-    fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
+    if((g_numa_mbind_mode&0x7fff)==COLI_MPOL_BIND)
+        fprintf(stderr,"[NUMA] expert slabs bound to %d explicitly selected node "
+                       "(maxnode=%lu)\n",g_numa_nodes,g_numa_mask.maxnode);
+    else
+        fprintf(stderr,"[NUMA] expert slabs interleaved across %d selected nodes "
+                       "(maxnode=%lu)\n",g_numa_nodes,g_numa_mask.maxnode);
 #endif
+    return 0;
 }
 
 static void *qalloc(size_t n){
@@ -1152,7 +1468,12 @@ static void *qalloc(size_t n){
         coli_metal_register(p,r); return p; }
 #endif
     void *p=malloc(n);
-    if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
+    if(n>=(size_t)1<<20 && numa_slab_bind(p,n)){
+        int saved=errno?errno:EIO;
+        fprintf(stderr,"[NUMA] cannot apply reviewed policy to %.1f MiB slab: %s\n",
+                n/(double)(1<<20),strerror(saved));
+        free(p); errno=saved; exit(2);
+    }      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
     return p;
 }
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
@@ -2444,7 +2765,13 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
-        numa_slab_bind(s->slab,(size_t)s->slab_cap);
+        if(numa_slab_bind(s->slab,(size_t)s->slab_cap)){
+            int saved=errno?errno:EIO;
+            fprintf(stderr,"[NUMA] cannot apply reviewed policy to expert slab: %s\n",
+                    strerror(saved));
+            compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
+            errno=saved; if(fatal) exit(2); return -1;
+        }
 #endif
     }
     if(!s->fslab || ftot > s->fslab_cap){
@@ -2481,7 +2808,13 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             }
         }
         s->fslab_cap=ftot;
-        numa_slab_bind(s->fslab,(size_t)ftot*sizeof(float));
+        if(numa_slab_bind(s->fslab,(size_t)ftot*sizeof(float))){
+            int saved=errno?errno:EIO;
+            fprintf(stderr,"[NUMA] cannot apply reviewed policy to expert scales: %s\n",
+                    strerror(saved));
+            free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
+            errno=saved; if(fatal) exit(2); return -1;
+        }
 #endif
     }
     /* DISK-CLASS: classify before the reads; computed unconditionally at dc_on sites so
@@ -2668,6 +3001,11 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         if(posix_memalign((void**)&s->slab,4096,(size_t)wtot+8192)){
             s->slab=NULL; s->slab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert slab"),li; }
         s->slab_cap=wtot+8192;
+        if(numa_slab_bind(s->slab,(size_t)s->slab_cap)){
+            int saved=errno?errno:EIO;
+            compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
+            return uring_load_error(l,saved,"io_uring expert slab NUMA policy"),li;
+        }
 #endif
     }
     if(!s->fslab || ftot>s->fslab_cap){
@@ -2681,6 +3019,11 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         free(s->fslab); s->fslab=malloc((size_t)ftot*sizeof(float));
         if(!s->fslab){ s->fslab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert scales"),li; }
         s->fslab_cap=ftot;
+        if(numa_slab_bind(s->fslab,(size_t)s->fslab_cap*sizeof(float))){
+            int saved=errno?errno:EIO;
+            free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
+            return uring_load_error(l,saved,"io_uring expert scales NUMA policy"),li;
+        }
 #endif
     }
     int ord[3]={0,1,2};
@@ -8192,7 +8535,7 @@ static int pin_rec_cmp(const void *a,const void *b){
  * its alloc branch never fires); aslab marks arena ownership for the
  * release/ensure paths. Arena-OOM just leaves the slots on the individual path. */
 static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
-    if(g_numa_nodes<2 || g_mmap || from>=to) return;
+    if(g_numa_nodes<1 || g_mmap || from>=to) return;
     Cfg *c=&m->c; int NR=c->n_layers+1;
     int *cnt=calloc((size_t)NR,sizeof(int)); int *first=malloc((size_t)NR*sizeof(int));
     if(!cnt||!first){ free(cnt); free(first); return; }
@@ -8215,8 +8558,13 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
         uint8_t *aw=NULL; float *af=NULL;
         if(posix_memalign((void**)&aw,4096,(size_t)cnt[l]*ws)) continue;
         if(posix_memalign((void**)&af,4096,(size_t)cnt[l]*fs)){ free(aw); continue; }
-        numa_slab_bind(aw,(size_t)cnt[l]*ws);
-        numa_slab_bind(af,(size_t)cnt[l]*fs);
+        if(numa_slab_bind(aw,(size_t)cnt[l]*ws) ||
+           numa_slab_bind(af,(size_t)cnt[l]*fs)){
+            int saved=errno?errno:EIO;
+            fprintf(stderr,"[NUMA] cannot apply reviewed policy to layer-%d pin arena: %s\n",
+                    l,strerror(saved));
+            free(aw); free(af); errno=saved; exit(2);
+        }
         int i=0;
         for(int a=from;a<to;a++){
             if(r[a].l!=l) continue;
@@ -9103,6 +9451,20 @@ static int state_dir_prepare(const char *path){
 }
 
 int main(int argc, char **argv){
+#ifdef __linux__
+    /* The managed placement contract is independent of OMP tuning/re-exec.
+     * Apply and read it back on every entry, including COLI_NO_OMP_TUNE=1,
+     * COLI_OMP_TUNED=1, and explicit CPU-only COLI_CUDA=0 launches. */
+    const char *managed_cpu_affinity=getenv("COLI_CPU_AFFINITY");
+    if(managed_cpu_affinity){
+        if(coli_cpu_affinity_apply(managed_cpu_affinity)){
+            fprintf(stderr,"[CPU] invalid or unavailable COLI_CPU_AFFINITY=%s: %s\n",
+                    managed_cpu_affinity,strerror(errno));
+            return 2;
+        }
+        fprintf(stderr,"[CPU] managed affinity: %s\n",managed_cpu_affinity);
+    }
+#endif
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
      * the worker team between regions and the re-wake latency dominates. Keeping
@@ -9121,7 +9483,9 @@ int main(int argc, char **argv){
      * and COLI_NO_OMP_TUNE=1 is a documented kill-switch that disables the whole
      * re-exec + tuning path (distinct from the internal COLI_OMP_TUNED sentinel).
      *
-     * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
+     * This must remain the first tuning block in main(): argv is passed verbatim
+     * to execv(). Managed CPU-contract validation above is intentionally outside
+     * the optional tuning path. */
     /* COLI_OMP_TUNED e COLI_NO_OMP_TUNE sono KILL-SWITCH: presence-based e' voluto
      * (c/coli lo documenta: "impostarla a qualsiasi valore, anche 0, disattiva").
      * COLI_CUDA e COLI_METAL invece sono STATO, e uno 0 significa "niente GPU":
@@ -9148,13 +9512,16 @@ int main(int argc, char **argv){
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
-        fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
         /* #471: execv PRESERVES the CPU affinity mask. If the user exported
          * OMP_PROC_BIND/OMP_PLACES, libgomp's constructor already bound THIS thread to
          * place 0 (one core's SMT siblings) before main() ran; the re-exec'd image would
          * inherit that 1-core mask, enumerate OMP_PLACES=cores inside it, and jail the
-         * whole team on one core (measured ~20x slowdown). Reset to all online CPUs so
-         * the fresh libgomp binds from the full set — the user's OMP_* env still wins. */
+         * whole team on one core (measured ~20x slowdown). A managed server launch
+         * supplies COLI_CPU_AFFINITY and gets that exact mask (including sparse CPU
+         * IDs); apply+readback fails closed if a cpuset/offline CPU narrows it.
+         * Unmanaged launches retain the legacy reset to all online CPUs so the fresh
+         * libgomp binds from the full set — the user's OMP_* env still wins. */
+        if(!managed_cpu_affinity){
         /* CPU_SETSIZE is only exposed when _GNU_SOURCE was defined before the first
          * system header. The standalone engine build defines it at the top of this
          * file so the reset is active where it matters; test TUs that #include this
@@ -9168,6 +9535,8 @@ int main(int argc, char **argv){
           if(sched_setaffinity(0, sizeof(all), &all) != 0)
               perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
 #endif
+        }
+        fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
@@ -9216,7 +9585,7 @@ int main(int argc, char **argv){
         return 2;
     }
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
-    numa_init();                                       /* COLI_NUMA=1: expert-slab interleave (#82) */
+    if(numa_init()) return 2;                          /* exact managed NUMA masks fail closed */
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     /* EXPERT_BUDGET e' sotto quarantena: la finestra operativa e' misurata VUOTA.

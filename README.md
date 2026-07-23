@@ -328,8 +328,11 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 ./setup.sh                                # checks gcc/OpenMP, builds, self-tests
 ```
 
-Want `coli` on your PATH? From a checkout, `pip install -e .` registers it (the
-engine still lives in `c/` — an editable install from the clone, not a wheel).
+Want `coli` on your PATH? From a checkout, `pip install -e .` registers it; the
+editable install continues to use the engine in `c/`. A wheel bundles the
+launcher, server control plane, and guided RAM-disk UI, but not a
+platform-specific native engine binary. Build the engine from source or point
+`COLI_ENGINE` at a compatible release binary before starting inference.
 
 ### 2. Get the model
 
@@ -394,10 +397,14 @@ On Windows the portable commands work with syntax such as
 The engine runtime remains pure C. Python is used by the standard-library CLI,
 one-time converter, optional API gateway, and RAM-disk control plane.
 
-`coli ramdisk` can stage the full model or profile-selected shard closures into
-THP-enabled tmpfs, launch one interleaved engine or NUMA-bound node replicas, and
-benchmark persistent SSD/slab/direct-map paths. It keeps KV and usage state on an
-absolute SSD-backed XDG state path and never changes global swap or HugeTLB state.
+`coli ramdisk` opens a guided server console that makes the copy count, selected
+NUMA memory nodes, whole-core CPU mask, and endpoints explicit before staging.
+It can stage the full model or profile-selected shard closures into THP-enabled
+tmpfs, launch one shared engine or explicitly requested node replicas, and
+benchmark persistent SSD/slab/direct-map paths. It keeps KV and usage state on
+an absolute SSD-backed XDG state path and never changes global swap, HugeTLB, or
+host-wide weighted-interleave settings. Linux placement is NUMA-node based;
+individual DIMMs/channels are inventory, not allocation targets.
 
 #### The same commands run any of the models
 

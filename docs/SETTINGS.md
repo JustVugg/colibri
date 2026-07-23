@@ -78,11 +78,45 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 
 **`ramdisk`** (Linux only)
 
-Run `coli ramdisk` in a terminal for the curses interface, or select one of the
-equivalent scriptable actions:
+Run `coli ramdisk` in a terminal for the guided Textual server console, or select
+one of the equivalent scriptable actions. Source and flat-archive users can
+install the supported interface with
+`python3 -m pip install -r c/requirements-tui.txt` from a source checkout, or
+`python3 -m pip install -r requirements-tui.txt` from an unpacked release
+archive. `COLI_RAMDISK_UI=auto` is the default and falls back to the
+one-release curses interface only when Textual is unavailable;
+`COLI_RAMDISK_UI=textual` or `curses` selects one explicitly.
+
+The console walks through Inspect → Placement → Capacity → Runtime → Review →
+Operate. A live backplane rail always shows the resulting copy count, memory
+nodes, engine count, and ports. The normal `interleaved` plan is shown as **one
+shared model copy and one engine** whose RAM pages span the selected NUMA nodes.
+Replica placement cannot be enabled by an accidental TUI toggle; request
+`--topology per-node` explicitly to review its full-copy and endpoint multiplier.
+Memory-node and whole-core CPU range lists are validated against the invoking
+process's effective cgroup/cpuset masks. Once prepared, the persisted placement
+is shown as the active deployment and its weight settings stay locked until it
+is destroyed. Mount policies use Linux static-node IDs, and Start/Benchmark
+refuse to run if the effective CPU or memory-node masks changed after Prepare.
+Capacity admission is also cgroup-aware: on cgroup v2 it uses the tightest
+`memory.max - memory.current` headroom across the current cgroup and every
+limiting ancestor; cgroup v1 memory limits receive the equivalent check.
+`memory.high` is reported as a reclaim/throttling warning rather than a hard
+limit. Host/NUMA availability and cgroup headroom are both enforced, using the
+smaller value.
+
+Linux memory policy addresses NUMA nodes, not individual DIMMs or channels.
+DIMM/channel data is therefore informational: populate symmetric firmware-
+recommended DIMM/channel pairs, then use `--memory-nodes` to select the NUMA
+domains they expose. Colibri never rewrites the host-global weighted-interleave
+weights.
+Prepare, Start, and Benchmark remain navigable while they run and can be
+cancelled with `c`; Colibri waits for a rollback/cleanup checkpoint before
+returning control. `q` requests the same safe cancellation and exits only after
+cleanup succeeds; cleanup failures remain visible in the TUI.
 
 ```sh
-coli ramdisk plan --model /models/glm --json
+coli ramdisk plan --model /models/glm --memory-nodes 0,2 --cpu-list 0-31,64-95 --json
 coli ramdisk prepare --model /models/glm --yes
 coli ramdisk start --base-port 8000
 coli ramdisk status --json
@@ -94,7 +128,9 @@ coli ramdisk destroy --yes
 `benchmark` requires managed engines to be stopped so SSD, tmpfs/slab, direct
 RAM-map, and per-node aggregate runs all use the same deterministic controls.
 The best safe I/O knobs are saved per topology and reused by `start`; managed
-engines still use every physical core on their target topology.
+engines use exactly the reviewed whole-core CPU masks. The engine preserves
+those masks through its OpenMP self-reexec instead of widening back to every
+online CPU.
 Partial plans also show the profile coverage of shard-closure staging beside a
 same-budget hot-expert `PIN` estimate, making shard-granularity waste explicit.
 System scorecards report mount-specific tmpfs allocation; tmpfs does not expose
@@ -109,7 +145,9 @@ zero-SSD-read acceptance check.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--mode` | `full` | `full` copies every shard; `partial` requires a compatible usage profile and stages complete shard closures. |
-| `--topology` | `interleaved` | One interleaved engine, or `per-node` replicas bound with `numactl`. |
+| `--topology` | `interleaved` | One shared copy/engine, or `per-node`: one complete staged copy and independent engine per NUMA node (replication, not sharding). |
+| `--memory-nodes` | effective CPU-bearing NUMA nodes | Linux NUMA range list such as `0-3,8`. Shared mode requests equal interleave over a multi-node mask and a strict bind for one selected node, then verifies initial page placement; per-node mode creates replicas only on these nodes. |
+| `--cpu-list` | effective CPUs on selected nodes | Linux CPU range list for managed engines. Selections must contain whole effective physical-core sibling groups. Shared plans flag CPUs outside the memory-node mask as intentional remote access; replica plans reject them. |
 | `--capacity-gb` | full model size | Staging budget; required and strictly enforced in partial mode. |
 | `--profile` | `<model>/.coli_usage` | Explicit compatible text/JSON expert-usage profile for partial mode. |
 | `--mount-root` | `/mnt/colibri-ram` | Managed tmpfs mount root. V1 accepts only non-symlink paths below `/mnt`; existing paths must be empty and not writable by the invoking user. |
@@ -119,11 +157,21 @@ zero-SSD-read acceptance check.
 | `--parallel` | `2` | Bounded shard-copy worker count. |
 | `plan/status/benchmark --json` | off | Emit a versioned machine-readable report. |
 | `prepare/destroy --yes` | off | Confirm reviewed mount or cleanup work in non-interactive scripts. |
-| `start --base-port` | `8000` | Interleaved port, or base plus NUMA node id for replicas. |
+| `start --base-port` | prepared value (`8000` initially) | Interleaved port, or base plus NUMA node id for replicas; omitted restarts preserve the previous value. |
 
-Planning and status are unprivileged. Preparation and destruction request sudo
-only for their exact `mount`/`umount` commands; model files and durable
+Planning and status are unprivileged. In the TUI, preparation and destruction
+validate sudo once in the foreground; their background workers then use
+non-interactive sudo only for the exact `mount`/`umount` commands, so a password
+prompt can never collide with the interface. Colibri verifies that the ticket
+is reusable before mounting and refreshes it without prompting while a long
+copy is active, preserving rollback authority. `SIGHUP`/`SIGTERM` request
+cooperative rollback for Prepare/Start/Benchmark; Stop/Destroy finish their
+verified cleanup transaction before returning the signal exit code. Model files and durable
 `.coli_usage`/`.coli_kv*` state remain on SSD and are never modified by staging.
+Linux interleave can fall back to other allowed nodes under severe pressure;
+Colibri reduces that risk with an admission reserve and rejects staging when its
+post-copy page sample materially escapes the reviewed mask. A cgroup/cpuset remains the
+hard host-level boundary when strict isolation is required.
 Set `XDG_STATE_HOME` to an absolute SSD-backed path: tmpfs/ramfs state locations
 and locations beneath the weight mount are rejected. `X-mount.mkdir=0755` may
 leave an empty root-owned directory below `/mnt` after unmount; the mounted tmpfs

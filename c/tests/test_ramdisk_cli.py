@@ -71,6 +71,10 @@ class RamdiskCliTest(unittest.TestCase):
                 self.assertEqual(Path(captured["kwargs"]["cli_path"]), CLI)
                 self.assertTrue(captured["kwargs"]["engine_path"])
 
+    def test_start_without_port_preserves_the_prepared_deployment_value(self):
+        captured = self.parsed_dispatch("ramdisk", "start")
+        self.assertIsNone(captured["args"].base_port)
+
     def test_shared_model_option_works_before_and_after_action(self):
         before = self.parsed_dispatch(
             "ramdisk", "--model", "/tmp/model-before", "plan", "--json"
@@ -91,6 +95,10 @@ class RamdiskCliTest(unittest.TestCase):
             "partial",
             "--topology",
             "per-node",
+            "--memory-nodes",
+            "0,2",
+            "--cpu-list",
+            "0-15,32-47",
             "--capacity-gb",
             "12.5",
             "--profile",
@@ -107,6 +115,8 @@ class RamdiskCliTest(unittest.TestCase):
         args = captured["args"]
         self.assertEqual(args.mode, "partial")
         self.assertEqual(args.topology, "per-node")
+        self.assertEqual(args.memory_nodes, "0,2")
+        self.assertEqual(args.cpu_list, "0-15,32-47")
         self.assertEqual(args.capacity_gb, 12.5)
         self.assertEqual(args.profile, "/tmp/profile")
         self.assertEqual(args.mount_root, "/tmp/ram-root")
@@ -135,6 +145,9 @@ class RamdiskCliTest(unittest.TestCase):
             "destroy",
         ):
             self.assertIn(action, result.stdout)
+        help_text = " ".join(result.stdout.split())
+        self.assertIn("one shared model copy and one engine", help_text)
+        self.assertIn("complete copy and independent engine per NUMA node", help_text)
 
     def test_kv_resume_notice_uses_durable_state_directory(self):
         with tempfile.TemporaryDirectory() as directory:

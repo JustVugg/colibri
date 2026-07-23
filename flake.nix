@@ -28,6 +28,7 @@
               numpy
               tokenizers
               datasets
+              textual
             ]
         );
 
@@ -65,12 +66,12 @@
             # source tree `coli` runs in (see the path-resolution logic at the
             # top of c/coli): the engine, the coli CLI script, the support
             # modules it imports (openai_server.py, resource_plan.py,
-            # doctor.py, ramdisk.py), and tools/ all sit next to each other.
+            # doctor.py, ramdisk.py, ramdisk_ui.py, ramdisk_textual.py), and tools/ all sit next to each other.
             mkdir -p $out/lib/colibri/tools $out/bin
             cp c/colibri         $out/lib/colibri/colibri
             cp c/coli            $out/lib/colibri/coli
             chmod +x $out/lib/colibri/coli
-            cp c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/version.py c/ramdisk.py \
+            cp c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/version.py c/ramdisk.py c/ramdisk_ui.py c/ramdisk_textual.py c/requirements-tui.txt \
               $out/lib/colibri/
             cp -r c/tools/*      $out/lib/colibri/tools/
 

@@ -29,7 +29,7 @@ TEST_BASENAMES = [
     "test_i4_acc512", "test_compat_direct", "test_dsa_select",
     "test_int3", "test_int3_load", "test_logit_nan", "test_pipe_block",
     "test_sample_nan", "test_tok_o200k", "test_efficiency_report",
-    "test_uring", "test_rammap",
+    "test_uring", "test_rammap", "test_resource_masks", "test_e8_kernel",
 ]
 ON_DEMAND_BASENAMES = ["bench_topp", "bench_dsa_select"]
 TEST_GLOBS = [

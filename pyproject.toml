@@ -9,6 +9,9 @@ description = "Tiny engine, immense model — run GLM-5.2 (744B MoE) locally"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
+dependencies = [
+    "textual>=8.2.8,<9",
+]
 authors = [
     {name = "JustVugg"},
 ]
@@ -50,4 +53,17 @@ version = {attr = "colibri._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["colibri*"]
+include = ["colibri*", "c", "c.tools"]
+namespaces = false
+
+[tool.setuptools.package-data]
+c = [
+    "coli",
+    "requirements-tui.txt",
+]
+"c.tools" = [
+    "*.json",
+    "*.md",
+    "*.sh",
+    "*.txt",
+]
