@@ -29,6 +29,8 @@ void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
  * mem_budget reports device-local usage/budget in GB (VK_EXT_memory_budget);
  * returns 0 if unavailable. */
 void coli_vk_alloc_priority(float p);
+/* Fused gate+up activation (model-global): 0 = silu(gate)*up (GLM), 1 = swigluoai (M3). */
+void coli_vk_set_activation(int act, float alpha, float limit);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].

@@ -104,7 +104,19 @@ static struct {
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
 } G;
 
-struct PC { int fmt, S, I, O, rowWords, gs; };
+struct PC { int fmt, S, I, O, rowWords, gs; int act; float alpha, limit; };
+
+/* Fused gate+up activation, model-global (all experts + the shared/dense MLP share it):
+ * 0 = silu(gate)*up (GLM), 1 = swigluoai (MiniMax-M3). Set once via coli_vk_set_activation;
+ * applied in every gate_up dispatch's push constants. File-static so both device contexts
+ * (G and the dev2 G2) read the same value. */
+static int   vk_act;
+static float vk_alpha = 1.702f, vk_limit = 7.0f;
+void coli_vk_set_activation(int act, float alpha, float limit) {
+    vk_act = act;
+    if (alpha > 0) vk_alpha = alpha;
+    if (limit > 0) vk_limit = limit;
+}
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
@@ -685,6 +697,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};   // PC.I = input D, PC.O = moe_inter I
+    pc.act = vk_act; pc.alpha = vk_alpha; pc.limit = vk_limit;   // gate activation (M3: swigluoai)
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)S, 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -777,6 +790,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     for (int c = 0; c < count; c++) {
         struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+        pc.act = vk_act; pc.alpha = vk_alpha; pc.limit = vk_limit;   // gate activation (M3: swigluoai)
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
@@ -1119,6 +1133,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe_gu);
     for (int c = 0; c < count; c++) {
         struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+        pc.act = vk_act; pc.alpha = vk_alpha; pc.limit = vk_limit;   // gate activation (M3: swigluoai)
         vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
         vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);

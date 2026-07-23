@@ -25,6 +25,9 @@ layout(push_constant) uniform P {
     int S, I, O;    // I = input dim (hidden), O = moe_inter
     int rowWords;   // uint32 words per weight row (of the I-dim rows)
     int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
+    int act;        // gate activation: 0 = silu(gate)*up (GLM), 1 = swigluoai (MiniMax-M3)
+    float alpha;    // swigluoai: sigmoid(alpha*gate), alpha = 1.702
+    float limit;    // swigluoai: gate=min(g,limit), up=clamp(u,+/-limit), limit = 7.0
 } p;
 
 shared float xsh[6144];
@@ -99,6 +102,16 @@ void main() {
         }
         float gt = subgroupAdd(g), ut = subgroupAdd(u);
         if (p.fmt != 5 && p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
-        if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up
+        if (lane == 0) {
+            float h;
+            if (p.act == 1) {          // swigluoai (MiniMax-M3): (up+1)*gate*sigmoid(alpha*gate)
+                float gc = min(gt, p.limit);              // gate clamped above
+                float uc = clamp(ut, -p.limit, p.limit);  // up clamped both sides
+                h = (uc + 1.0) * gc / (1.0 + exp(-p.alpha * gc));
+            } else {                   // silu(gate)*up (GLM)
+                h = (gt / (1.0 + exp(-gt))) * ut;
+            }
+            hid[s * p.O + o] = h;
+        }
     }
 }

@@ -9432,11 +9432,10 @@ static void vk_dense_preload(Model *m){
 static void vk_registry_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
     if(!g_vulkan || g_vk_budget<=0) return;
-    if(c->arch!=ARCH_GLM){                       /* expert-group shaders hardcode silu */
-        fprintf(stderr,"[VK] expert tier disabled for this architecture (shader activation "
-                       "is silu; swigluoai shader variant pending) — experts run on the CPU\n");
-        return;
-    }
+    /* The fused gate+up shader selects its activation via a push constant — silu for GLM,
+     * swigluoai for MiniMax-M3 — so the expert tier runs on any of our arches. Set the
+     * model's choice once here, before the tier fills (all gate_up dispatches read it). */
+    coli_vk_set_activation(g_act_swigluoai, c->swiglu_alpha, c->swiglu_limit);
     int64_t nz=0;
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
     if(!nz){ fprintf(stderr,"[VK] expert tier: no usage history yet — tier empty this run "
