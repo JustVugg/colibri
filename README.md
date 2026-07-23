@@ -89,8 +89,32 @@ the right experts get. It works because routing has measurable structure (see
 the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
 structure is cacheable.
 
-The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
-at runtime, no GPU required.
+The engine is a single C file (`c/colibri.c`) plus small headers. No BLAS, no
+Python at runtime, no GPU required.
+
+### Dense MLP activation sharding
+
+The first local-cluster seam can move contiguous dense MLP layers to another
+machine. Attention, KV state, routing, and token generation remain on the
+coordinator; the worker owns only the selected gate/up/down tensors and
+returns the activation result over a small TCP protocol.
+
+Start a worker with the same converted model:
+
+```bash
+./coli cluster dense-worker --model /nvme/glm52_i4 \
+  --port 9200 --first 0 --last 2
+```
+
+Point the coordinator at that range:
+
+```bash
+./coli serve --model /nvme/glm52_i4 \
+  --dense-shards WORKER_IP:9200:0:2
+```
+
+This is intentionally a narrow activation pipeline. Full attention/KV
+ownership and tensor-parallel sharding are separate follow-up designs.
 
 ## How it works
 

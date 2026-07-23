@@ -215,6 +215,7 @@ def env_for(a):
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
+    if getattr(a, "dense_shards", None): e["DENSE_SHARDS"]=a.dense_shards
     if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
                                                         # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
     if a.repin: e["REPIN"]=str(a.repin)
@@ -836,6 +837,16 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
+def cmd_cluster_dense_worker(a):
+    need_model(a.model)
+    if a.first < 0 or a.last < a.first:
+        sys.exit(f"{C.yel}dense worker range must satisfy 0 <= --first <= --last{C.r}")
+    e=env_for(a)
+    e.update({"DENSE_WORKER":"1", "DENSE_WORKER_PORT":str(a.port),
+              "DENSE_WORKER_FIRST":str(a.first), "DENSE_WORKER_LAST":str(a.last)})
+    print(f"  {C.dim}[DENSE] worker · layers {a.first}-{a.last} · MLP activation pipeline{C.r}")
+    return subprocess.call([GLM,str(a.cap),str(a.ebits),str(a.dbits)],env=e)
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -963,6 +974,8 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
+    common.add_argument("--dense-shards", default=os.environ.get("DENSE_SHARDS"),
+                        help="static dense MLP shards: host:port:first:last,...")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
     ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
@@ -988,6 +1001,14 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pcluster=sub.add_parser("cluster", help="run local dense-shard workers")
+    cluster_sub=pcluster.add_subparsers(dest="cluster_cmd")
+    pdense=cluster_sub.add_parser("dense-worker", parents=[common], help="serve sharded dense MLP layers")
+    pdense.add_argument("--port",type=int,default=9200)
+    pdense.add_argument("--first",type=int,required=True)
+    pdense.add_argument("--last",type=int,required=True)
+    pdense.add_argument("--ebits",type=int,default=8)
+    pdense.add_argument("--dbits",type=int,default=8)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
@@ -1015,6 +1036,8 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+    if a.cmd=="cluster" and a.cluster_cmd=="dense-worker":
+        handler=cmd_cluster_dense_worker
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 
