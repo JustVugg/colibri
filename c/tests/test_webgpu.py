@@ -1,4 +1,5 @@
 import socket
+import struct
 import sys
 import threading
 import unittest
@@ -13,12 +14,21 @@ from webgpu import (WebGPURegistry, _ProxyHandler, _ProxyServer, _recv_exact,
 
 class WebGPURuntimeTests(unittest.TestCase):
     def test_batch_and_response_preserve_raw_activation_bytes(self):
-        batch = {"layer": 4, "hidden": 2,
+        batch = {"layer": 4, "hidden": 2, "intermediate": 3,
                  "items": [{"expert_id": 7, "rows": 1, "activations": b"abcdefgh"}]}
         decoded = parse_batch(pack_batch(batch))
+        self.assertEqual(decoded["intermediate"], 3)
         self.assertEqual(decoded["items"][0]["activations"], b"abcdefgh")
         version, status, count, _ = parse_response(pack_response(decoded, [b"12345678"]))
         self.assertEqual((version, status, count), (1, 0, 1))
+
+    def test_native_and_webgpu_workers_share_the_same_request_layout(self):
+        batch = {"layer": 4, "hidden": 2, "intermediate": 3,
+                 "items": [{"expert_id": 7, "rows": 1, "activations": b"abcdefgh"}]}
+        native_wire = (b"COLIEX01" + struct.pack("!5I", 1, 4, 2, 3, 1)
+                       + struct.pack("!2I", 7, 1) + b"abcdefgh")
+        self.assertEqual(pack_batch(batch), native_wire)
+        self.assertEqual(parse_batch(native_wire), batch | {"version": 1})
 
     def test_dispatches_batch_to_a_browser_connection(self):
         coordinator, browser = socket.socketpair()
@@ -33,7 +43,7 @@ class WebGPURuntimeTests(unittest.TestCase):
 
         worker = threading.Thread(target=browser_worker)
         worker.start()
-        batch = {"layer": 4, "hidden": 2,
+        batch = {"layer": 4, "hidden": 2, "intermediate": 3,
                  "items": [{"expert_id": 7, "rows": 1, "activations": b"abcdefgh"}]}
         try:
             version, status, count, _ = parse_response(registry.dispatch(pack_batch(batch)))
@@ -62,7 +72,7 @@ class WebGPURuntimeTests(unittest.TestCase):
         worker = threading.Thread(target=browser_worker)
         worker.start()
         native = socket.create_connection(proxy.server_address)
-        batch = {"layer": 4, "hidden": 2,
+        batch = {"layer": 4, "hidden": 2, "intermediate": 3,
                  "items": [{"expert_id": 7, "rows": 1, "activations": b"abcdefgh"}]}
         try:
             native.sendall(pack_batch(batch))

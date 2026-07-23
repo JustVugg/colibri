@@ -57,12 +57,13 @@ def _ws_frame(opcode, payload):
 
 
 def parse_batch(payload):
-    if len(payload) < 24 or payload[:8] != MAGIC:
+    if len(payload) < 28 or payload[:8] != MAGIC:
         raise ValueError("invalid expert batch magic")
-    version, layer, hidden, count = struct.unpack_from("!4I", payload, 8)
-    if version != VERSION or count > 64 or not 1 <= hidden <= 65536:
+    version, layer, hidden, intermediate, count = struct.unpack_from("!5I", payload, 8)
+    if (version != VERSION or count > 64 or not 1 <= hidden <= 65536
+            or not 1 <= intermediate <= 1 << 20):
         raise ValueError("invalid expert batch header")
-    offset, items = 24, []
+    offset, items = 28, []
     for _ in range(count):
         if offset + 8 > len(payload):
             raise ValueError("truncated expert item")
@@ -78,11 +79,13 @@ def parse_batch(payload):
         offset += size
     if offset != len(payload):
         raise ValueError("trailing expert bytes")
-    return {"version": version, "layer": layer, "hidden": hidden, "items": items}
+    return {"version": version, "layer": layer, "hidden": hidden,
+            "intermediate": intermediate, "items": items}
 
 
 def pack_batch(batch):
-    parts = [MAGIC, struct.pack("!4I", VERSION, batch["layer"], batch["hidden"], len(batch["items"]))]
+    parts = [MAGIC, struct.pack("!5I", VERSION, batch["layer"], batch["hidden"],
+                                batch["intermediate"], len(batch["items"]))]
     for item in batch["items"]:
         expected = item["rows"] * batch["hidden"] * 4
         if len(item["activations"]) != expected:
@@ -243,11 +246,12 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
     def handle(self):
         try:
             while True:
-                header = _recv_exact(self.request, 24)
+                header = _recv_exact(self.request, 28)
                 if header[:8] != MAGIC:
                     raise ValueError("invalid expert batch magic")
-                version, layer, hidden, count = struct.unpack("!4I", header[8:])
-                if version != VERSION or count > 64 or not 1 <= hidden <= 65536:
+                version, layer, hidden, intermediate, count = struct.unpack("!5I", header[8:])
+                if (version != VERSION or count > 64 or not 1 <= hidden <= 65536
+                        or not 1 <= intermediate <= 1 << 20):
                     raise ValueError("invalid expert batch header")
                 batch_parts = [header]
                 for _ in range(count):

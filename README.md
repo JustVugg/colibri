@@ -111,8 +111,11 @@ uv run python c/tools/export_webgpu_expert.py \
 ```
 
 Point the native coordinator at the bridge with `--webgpu-workers BRIDGE_IP:8766`.
-This first format is little-endian f32 for cross-browser validation; quantized
-WebGPU buffers can be added without changing the activation protocol.
+The bridge uses the same `COLIEX01` request/response framing as native expert
+workers, including the layer, hidden, intermediate, expert IDs, and raw
+little-endian f32 activations. This first format is intentionally f32 for
+cross-worker validation; quantized WebGPU buffers can be added without
+changing the activation protocol.
 
 ## How it works
 

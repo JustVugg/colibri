@@ -17,6 +17,7 @@ static void test_shared_wire_header(void)
     value = 1; assert(webgpu_u32(sockets[0], &value, 1) == 0);
     value = 4; assert(webgpu_u32(sockets[0], &value, 1) == 0);
     value = 2; assert(webgpu_u32(sockets[0], &value, 1) == 0);
+    value = 3; assert(webgpu_u32(sockets[0], &value, 1) == 0);
     value = 1; assert(webgpu_u32(sockets[0], &value, 1) == 0);
     value = 7; assert(webgpu_u32(sockets[0], &value, 1) == 0);
     value = 1; assert(webgpu_u32(sockets[0], &value, 1) == 0);
@@ -28,6 +29,7 @@ static void test_shared_wire_header(void)
     value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 1);
     value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 4);
     value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 2);
+    value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 3);
     value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 1);
     value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 7);
     value = 0; assert(webgpu_u32(sockets[1], &value, 0) == 0 && value == 1);

@@ -74,6 +74,7 @@ static void webgpu_moe_batch(Model *m,int layer,float *x,int S,float *out,
     v=1; if(webgpu_u32(w->fd,&v,1)) goto fail;
     v=(uint32_t)layer; if(webgpu_u32(w->fd,&v,1)) goto fail;
     v=(uint32_t)D; if(webgpu_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)m->c.moe_inter; if(webgpu_u32(w->fd,&v,1)) goto fail;
     v=(uint32_t)n; if(webgpu_u32(w->fd,&v,1)) goto fail;
     for(int j=0;j<n;j++){
         v=(uint32_t)items[j].eid; if(webgpu_u32(w->fd,&v,1)) goto fail;

@@ -41,7 +41,7 @@ export class WebGPUExpertWorker {
   await readback.mapAsync(GPUMapMode.READ);const result=readback.getMappedRange().slice(0);readback.unmap();[input,hiddenBuffer,output,readback,uniform].forEach(buffer=>buffer.destroy());return result;
  }
  async _onMessage(data){try{const bytes=new Uint8Array(data),view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);if(textMagic(bytes.subarray(0,8))!==MAGIC||getU32(view,8)!==VERSION)throw new Error("bad request");
-  const layer=getU32(view,12),hidden=getU32(view,16),count=getU32(view,20);if(hidden!==this.manifest.hidden||count>64)throw new Error("unsupported request shape");let offset=24,outputs=[];
+  const layer=getU32(view,12),hidden=getU32(view,16),intermediate=getU32(view,20),count=getU32(view,24);if(hidden!==this.manifest.hidden||intermediate!==this.manifest.intermediate||count>64)throw new Error("unsupported request shape");let offset=28,outputs=[];
   for(let i=0;i<count;i++){const expertId=getU32(view,offset),rows=getU32(view,offset+4);offset+=8;const size=rows*hidden*4;if(rows<1||rows>65536||offset+size>bytes.byteLength)throw new Error("invalid activation shape");const input=bytes.slice(offset,offset+size);offset+=size;outputs.push({expertId,rows,bytes:await this._forward(layer,expertId,rows,hidden,input)})}
   const head=new Uint8Array(20),response=new DataView(head.buffer);for(let i=0;i<8;i++)head[i]=MAGIC.charCodeAt(i);putU32(response,8,VERSION);putU32(response,12,0);putU32(response,16,outputs.length);const parts=[head];
   for(const output of outputs){const item=new Uint8Array(8),view2=new DataView(item.buffer);putU32(view2,0,output.expertId);putU32(view2,4,output.rows);parts.push(item,new Uint8Array(output.bytes))}this.socket.send(concat(parts));
