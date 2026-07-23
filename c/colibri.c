@@ -2361,7 +2361,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
      * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s]. */
-    if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+    if(g_metal_enabled && !kvs && g_absorb!=0 && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
@@ -4287,11 +4287,12 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
+    double tl0=now_s();
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
-            fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+            fprintf(stderr,"[prefill] layer %d/%d · %d token · +%.2fs\n", i+1, c->n_layers, S, now_s()-tl0);
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
         if(pipe2 && l->sparse && i<c->n_layers &&
