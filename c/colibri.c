@@ -5209,6 +5209,14 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         g_mmap?"; COLI_MMAP=1: page cache may serve part":"",
         hitp,(unsigned long long)dhp,(unsigned long long)dhe,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
         io_svc,io_w);
+    /* Headline streaming rates. Aggregate = bytes/wall (the rate the disk delivered averaged
+     * over the phase). Read-service seconds SUM across parallel loader threads, so
+     * io_svc/wall is the average read concurrency and bytes/io_svc is the per-loader-thread
+     * rate (aggregate = per-thread x concurrency). experts/s = cold-expert faults per
+     * wall-second. The per-class cold/warm GB/s-thread and GB/s-wall split follows in DISK-CLASS. */
+    if(elapsed>1e-9)
+        fprintf(f,"[PROF] disk stream: %.1f experts/s | %.2f GB/s aggregate over the phase (%.1fx avg read concurrency, %.2f GB/s per loader thread)\n",
+            dm/elapsed, io/1e9/elapsed, io_svc/elapsed, io_svc>1e-9?io/1e9/io_svc:0.0);
     /* DISK-CLASS: per-load cold/warm classification vs. which fd ACTUALLY served it.
      * Three per-class rates, labeled to keep the units unambiguous (ambiguous units
      * mislead -- measured lesson): GB/s-thread = bytes / thread-seconds (per-read
@@ -6613,6 +6621,17 @@ static void pin_load(Model *m, const char *statspath, double gb){
     }
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
+    /* Initial-load disk throughput (opt-in, same convention as the rest of PROF; g_prof isn't
+     * parsed until after pin_load, so read PROF directly here). Aggregate rate = bytes / pin wall,
+     * the true rate the OMP loaders pulled off disk during startup. For a CUDA run the wall also
+     * covers the interleaved VRAM upload, flagged below. */
+    if(getenv("PROF")&&atoi(getenv("PROF"))){
+        double pin_wall=now_s()-t0, pin_gb=(double)npin*(double)eb/1e9;
+        fprintf(stderr,"[PROF] pin load: %.1f GB read in %.0fs = %.2f GB/s aggregate | %d experts @ %.0f experts/s (%.1f MB/expert)%s\n",
+            pin_gb, pin_wall, pin_wall>1e-9?pin_gb/pin_wall:0.0,
+            npin, pin_wall>1e-9?npin/pin_wall:0.0, (double)eb/1e6,
+            m->gpu_expert_count?" [wall incl. VRAM upload]":"");
+    }
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l); free(slot_of); free(next);
 }
