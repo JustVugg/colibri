@@ -189,10 +189,13 @@ _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
 
 # ---------- classificazione dei tensori ----------
 def layer_idx(name):
+    # find "layers.<N>" anywhere: handles both "model.layers.N..." (mapped) and the raw
+    # "language_model.model.layers.N..." (MiniMax-M3 VL prefix) forms.
     p = name.split(".")
-    if len(p) > 2 and p[0] == "model" and p[1] == "layers":
-        try: return int(p[2])
-        except ValueError: return -1
+    for i in range(len(p) - 1):
+        if p[i] == "layers":
+            try: return int(p[i + 1])
+            except ValueError: return -1
     return -1
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
@@ -622,9 +625,11 @@ def main():
         print(f"[ARCH] auto-detected: {a.arch}" + (f" (model_type {mt})" if mt else ""))
     if a.n_layers is None:
         a.n_layers = 60 if a.arch == "m3" else 78
-    if a.arch == "m3" and (a.mtp or a.indexer):
-        raise SystemExit("--arch m3: the checkpoint ships no MTP tensors, and the MSA index "
-                         "branch pass is not implemented yet (dropped in the main pass, like DSA)")
+    if a.arch == "m3" and a.mtp:
+        raise SystemExit("--arch m3: the checkpoint ships no MTP tensors")
+    # --arch m3 --indexer: supplemental pass for the MSA Lightning Indexer weights
+    # (self_attn.index_{q,k}_{proj,norm}) -> out-idx-*.safetensors, kept next to a main
+    # container that predates the indexer being kept in the main pass.
 
     # Il PIANO risolto, PRIMA di toccare qualunque cosa (#383): --mtp/--indexer cambiano il
     # default di ebits a 8 (testa int4 = acceptance ~0%, issue #8) e il ramo grouped e'
@@ -730,8 +735,9 @@ def main():
                 wmap = json.load(open(idxp))["weight_map"]
                 if a.mtp:
                     want = {v for k, v in wmap.items() if k.startswith(f"model.layers.{a.n_layers}.")}
-                else:
-                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) < a.n_layers}
+                else:   # GLM DSA "indexer" or MiniMax-M3 MSA "self_attn.index_"
+                    want = {v for k, v in wmap.items()
+                            if ("indexer" in k or ".index_" in k) and 0 <= layer_idx(k) < a.n_layers}
                 keep = [sp for sp in shards if os.path.basename(sp) in want]
                 print(f"[PLAN] index: {len(keep)}/{len(shards)} local shard(s) hold the requested tensors")
                 shards = keep
