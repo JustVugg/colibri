@@ -13,3 +13,14 @@ tools/librans_c.dylib
 tools/rans_c.dll
 tests/fuzz_rans
 tests/*.dSYM/
+
+# compiled test/bench binaries (Mach-O/ELF, no extension); sources kept via negation
+tests/test_*
+tests/bench_*
+backend_metal_test
+backend_cuda_test
+!tests/*.c
+!tests/*.cu
+!tests/*.mm
+!tests/*.h
+!tests/*.py
