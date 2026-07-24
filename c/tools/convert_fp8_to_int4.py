@@ -232,6 +232,11 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     #   "attn" = other attention projections (q_a, q_b, kv_a)
     #   "dmlp" = dense MLP (first 3 layers)
     if "shared_experts" in name: return "sh"
+    # "idx" = MSA/DSA scoring-indexer projections (MiniMax-M3 self_attn.index_*).
+    # Selection is DISCRETE (top-k blocks): quantization noise flips choices rather
+    # than blurring them, so these tiny tensors (~215 MB) default to int8 instead
+    # of following ebits (the validated real-model MSA config used int8).
+    if ".index_" in name and name.endswith("proj.weight"): return "idx"
     if name.endswith("o_proj.weight"): return "o"
     if name.endswith("kv_b_proj.weight"): return "kvb"
     if any(name.endswith(k) for k in ("q_a_proj.weight", "q_b_proj.weight",
@@ -512,6 +517,9 @@ def main():
         help="bits for kv_b_proj (reconstructs KV cache on every decode). Default=ebits")
     ap.add_argument("--attn-bits", type=int, default=None,
         help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
+    ap.add_argument("--idx-bits", type=int, default=8,
+        help="bits for the MSA/DSA scoring-indexer projections (block selection is "
+             "discrete — noise flips choices; tiny tensors, keep int8). Default=8")
     ap.add_argument("--dmlp-bits", type=int, default=None,
         help="bits for dense MLP (first 3 layers). Default=ebits")
     ap.add_argument("--group-size", type=int, default=64,
@@ -599,6 +607,7 @@ def main():
     if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
     if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
+    bits_map["idx"] = a.idx_bits             # always set: default 8 (see --idx-bits)
     if bits_map:
         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
 
