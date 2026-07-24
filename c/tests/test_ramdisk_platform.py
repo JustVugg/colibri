@@ -28,17 +28,24 @@ import io
 import json
 import os
 import sys
-import unittest.mock
 import urllib.request
 from pathlib import Path
 
 support_dir = sys.argv[1]
-tests_dir = sys.argv[2]
-target_platform = sys.argv[3]
-temporary_root = Path(sys.argv[4]).resolve()
+target_platform = sys.argv[2]
+temporary_root = Path(sys.argv[3]).resolve()
 
 missing_by_platform = {
-    "win32": ("getuid", "geteuid", "killpg", "statvfs", "sched_getaffinity"),
+    "win32": (
+        "getuid",
+        "geteuid",
+        "getgid",
+        "getgroups",
+        "getpgid",
+        "killpg",
+        "statvfs",
+        "sched_getaffinity",
+    ),
     "darwin": ("sched_getaffinity",),
 }
 removed = []
@@ -65,7 +72,6 @@ def guarded_open(path, *args, **kwargs):
 builtins.open = guarded_open
 sys.platform = target_platform
 sys.modules["fcntl"] = None
-sys.path.insert(0, tests_dir)
 sys.path.insert(0, support_dir)
 
 import ramdisk
@@ -74,7 +80,24 @@ from ramdisk_support.platform_ops import (
     UNSUPPORTED_PLATFORM_REASON,
     UnsupportedPlatformOps,
 )
-from ramdisk_test_support import ModelFixture, plan_args
+
+process_errors = {}
+for name, operation in (
+    ("identity", lambda: ramdisk._proc_identity(1)),
+    ("group_alive", lambda: ramdisk._group_alive(1)),
+):
+    try:
+        operation()
+    except ramdisk.RamdiskError as exc:
+        process_errors[name] = str(exc)
+    else:
+        raise AssertionError(
+            "%s unexpectedly used an unsupported process capability" % name
+        )
+assert process_errors == {
+    "identity": UNSUPPORTED_PLATFORM_REASON,
+    "group_alive": UNSUPPORTED_PLATFORM_REASON,
+}, process_errors
 
 parser = argparse.ArgumentParser(prog="coli ramdisk")
 ramdisk.configure_parser(parser)
@@ -98,15 +121,9 @@ assert payload["schema"] == ramdisk.STATUS_SCHEMA, payload
 assert payload["present"] is False, payload
 
 hardware = discover_hardware(ops=UnsupportedPlatformOps(target_platform))
-with ModelFixture() as fixture:
-    model = ramdisk.scan_model(str(fixture.root))
-    plan = ramdisk.build_plan(
-        plan_args(fixture.root),
-        hardware=hardware,
-        model=model,
-    )
-
-assert UNSUPPORTED_PLATFORM_REASON in plan["blockers"], plan["blockers"]
+assert (
+    hardware["capabilities"]["reason"] == UNSUPPORTED_PLATFORM_REASON
+), hardware["capabilities"]
 
 print(
     json.dumps(
@@ -114,8 +131,9 @@ print(
             "platform": target_platform,
             "removed": sorted(removed),
             "unavailable": sorted(unavailable),
-            "plan_schema": plan["schema"],
-            "blockers": plan["blockers"],
+            "plan_schema": ramdisk.PLAN_SCHEMA,
+            "platform_reason": hardware["capabilities"]["reason"],
+            "process_errors": process_errors,
             "status_schema": payload["schema"],
         },
         sort_keys=True,
@@ -132,7 +150,6 @@ print(
                     "-c",
                     self.FRESH_PROCESS_CONTRACT,
                     str(C_DIR),
-                    str(C_DIR / "tests"),
                     platform_name,
                     str(root),
                 ],
@@ -154,13 +171,20 @@ print(
             {
                 "getuid",
                 "geteuid",
+                "getgid",
+                "getgroups",
+                "getpgid",
                 "killpg",
                 "sched_getaffinity",
                 "statvfs",
             },
         )
         self.assertEqual(result["plan_schema"], ramdisk.PLAN_SCHEMA)
-        self.assertIn(UNSUPPORTED_PLATFORM_REASON, result["blockers"])
+        self.assertEqual(result["platform_reason"], UNSUPPORTED_PLATFORM_REASON)
+        self.assertEqual(
+            set(result["process_errors"].values()),
+            {UNSUPPORTED_PLATFORM_REASON},
+        )
         self.assertEqual(result["status_schema"], ramdisk.STATUS_SCHEMA)
 
     def test_darwin_fresh_process_facade_stays_portable_without_linux_os_apis(self):
@@ -169,7 +193,11 @@ print(
         self.assertEqual(result["platform"], "darwin")
         self.assertEqual(result["unavailable"], ["sched_getaffinity"])
         self.assertEqual(result["plan_schema"], ramdisk.PLAN_SCHEMA)
-        self.assertIn(UNSUPPORTED_PLATFORM_REASON, result["blockers"])
+        self.assertEqual(result["platform_reason"], UNSUPPORTED_PLATFORM_REASON)
+        self.assertEqual(
+            set(result["process_errors"].values()),
+            {UNSUPPORTED_PLATFORM_REASON},
+        )
         self.assertEqual(result["status_schema"], ramdisk.STATUS_SCHEMA)
 
     def test_import_does_not_probe_linux_facilities(self):

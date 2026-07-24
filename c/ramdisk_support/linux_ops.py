@@ -418,6 +418,99 @@ def _privileged(command, hardware, *, trusted_system_binary=None):
     return [sudo] + options + ["--"] + command
 
 
+def _process_identity(pid):
+    """Read one process identity from procfs without trusting its command."""
+    _require_linux()
+    getpgid = getattr(os, "getpgid", None)
+    if getpgid is None:
+        raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+    pid = int(pid)
+    try:
+        raw_stat = _read_text("/proc/%d/stat" % pid)
+        close = raw_stat.rfind(")")
+        fields = raw_stat[close + 2 :].split()
+        starttime = int(fields[19])
+        with open("/proc/%d/cmdline" % pid, "rb") as stream:
+            cmdline = stream.read().split(b"\0")
+        with open("/proc/%d/environ" % pid, "rb") as stream:
+            environ = stream.read().split(b"\0")
+        env = {}
+        for item in environ:
+            if b"=" in item:
+                key, value = item.split(b"=", 1)
+                env[key.decode("utf-8", "replace")] = value.decode(
+                    "utf-8",
+                    "replace",
+                )
+        return {
+            "pid": pid,
+            "uid": os.stat("/proc/%d" % pid).st_uid,
+            "starttime": starttime,
+            "cmdline": [
+                value.decode("utf-8", "replace")
+                for value in cmdline
+                if value
+            ],
+            "nonce": env.get("COLI_MANAGED_NONCE"),
+            "pgid": getpgid(pid),
+        }
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _process_group_member_pids(pgid):
+    """Return procfs PIDs whose stat record reports the requested PGID."""
+    _require_linux()
+    pgid = int(pgid)
+    members = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        raw = _read_text("/proc/%d/stat" % pid)
+        close = raw.rfind(")")
+        try:
+            fields = raw[close + 2 :].split()
+            member_pgid = int(fields[2])
+        except (ValueError, IndexError):
+            continue
+        if member_pgid == pgid:
+            members.append(pid)
+    return members
+
+
+def _process_group_alive(pgid):
+    _require_linux()
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+    try:
+        killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _signal_process_group(pgid, signum):
+    _require_linux()
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+    killpg(int(pgid), signum)
+
+
+def _process_status(pid, *, read_text=None):
+    _require_linux()
+    read_text = _read_text if read_text is None else read_text
+    return read_text("/proc/%d/status" % int(pid))
+
+
 class LinuxPlatformOps:
     """Narrow Linux discovery operations with no import-time probes."""
 
@@ -444,6 +537,11 @@ class LinuxPlatformOps:
     read_cgroup_contract = staticmethod(_read_cgroup_contract)
     node_meminfo = staticmethod(_node_meminfo)
     physical_cores = staticmethod(_physical_cores)
+    process_identity = staticmethod(_process_identity)
+    process_group_member_pids = staticmethod(_process_group_member_pids)
+    process_group_alive = staticmethod(_process_group_alive)
+    signal_process_group = staticmethod(_signal_process_group)
+    process_status = staticmethod(_process_status)
 
     @staticmethod
     def path_exists(path):

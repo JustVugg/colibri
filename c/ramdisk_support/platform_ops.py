@@ -6,6 +6,8 @@ import os
 import platform
 import sys
 
+from .common import RamdiskError
+
 
 UNSUPPORTED_PLATFORM_REASON = "coli ramdisk is supported only on Linux"
 
@@ -33,6 +35,11 @@ def _capabilities(platform_name, supported, reason=None):
     }
 
 
+def _unsupported_process_operation(*args, **kwargs):
+    del args, kwargs
+    raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+
+
 class UnsupportedPlatformOps:
     """Portable facts for a host without a RAM-disk lifecycle backend."""
 
@@ -53,6 +60,12 @@ class UnsupportedPlatformOps:
 
     def kernel_release(self):
         return platform.release()
+
+    process_identity = staticmethod(_unsupported_process_operation)
+    process_group_member_pids = staticmethod(_unsupported_process_operation)
+    process_group_alive = staticmethod(_unsupported_process_operation)
+    signal_process_group = staticmethod(_unsupported_process_operation)
+    process_status = staticmethod(_unsupported_process_operation)
 
 
 def get_platform_ops(platform_name=None):

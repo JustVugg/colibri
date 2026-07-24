@@ -75,6 +75,7 @@ from ramdisk_support.linux_ops import (
     _noninteractive_privilege as _linux_noninteractive_privilege,
     _physical_cores,
     _privileged as _linux_privileged,
+    _process_status as _linux_process_status,
     _read_cgroup_contract,
     _read_cgroup_value,
     _read_text,
@@ -122,6 +123,28 @@ from ramdisk_support.planning import (
     _requested_ids,
     _runtime_reserve,
     _select_partial,
+)
+from ramdisk_support.processes import (
+    _admit_concurrent_runtimes as _processes_admit_concurrent_runtimes,
+    _admit_runtime as _processes_admit_runtime,
+    _assert_effective_masks_unchanged as _processes_assert_effective_masks_unchanged,
+    _forget_managed_child,
+    _group_alive,
+    _managed_children,
+    _managed_children_lock,
+    _managed_process_metrics as _processes_managed_process_metrics,
+    _poll_managed_child,
+    _proc_identity,
+    _process_group_members as _processes_process_group_members,
+    _process_matches as _processes_process_matches,
+    _process_tree_alive as _processes_process_tree_alive,
+    _resolve_engine_path,
+    _runtime_admission_requirement,
+    _terminate_direct_child,
+    _terminate_group as _processes_terminate_group,
+    _terminate_verified_group as _processes_terminate_verified_group,
+    _track_managed_child,
+    _wait_managed_ready as _processes_wait_managed_ready,
 )
 from ramdisk_support.platform_ops import current_euid, get_platform_ops
 from ramdisk_support.state import (
@@ -1192,101 +1215,28 @@ def prepare(
         raise
 
 
-def _proc_identity(pid):
-    try:
-        raw_stat = _read_text("/proc/%d/stat" % pid)
-        close = raw_stat.rfind(")")
-        fields = raw_stat[close + 2 :].split()
-        starttime = int(fields[19])
-        cmdline = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")
-        environ = open("/proc/%d/environ" % pid, "rb").read().split(b"\0")
-        env = {}
-        for item in environ:
-            if b"=" in item:
-                key, value = item.split(b"=", 1)
-                env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
-        return {
-            "pid": pid,
-            "uid": os.stat("/proc/%d" % pid).st_uid,
-            "starttime": starttime,
-            "cmdline": [value.decode("utf-8", "replace") for value in cmdline if value],
-            "nonce": env.get("COLI_MANAGED_NONCE"),
-            "pgid": os.getpgid(pid),
-        }
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 def _process_group_members(pgid):
-    """Return readable identities in a process group, plus unreadable member PIDs."""
-    members, unreadable = [], []
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return members, unreadable
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
-        raw = _read_text("/proc/%d/stat" % pid)
-        close = raw.rfind(")")
-        try:
-            fields = raw[close + 2 :].split()
-            member_pgid = int(fields[2])
-        except (ValueError, IndexError):
-            continue
-        if member_pgid != pgid:
-            continue
-        identity = _proc_identity(pid)
-        if identity:
-            members.append(identity)
-        else:
-            unreadable.append(pid)
-    return members, unreadable
+    return _processes_process_group_members(
+        pgid,
+        proc_identity=_proc_identity,
+    )
 
 
 def _process_matches(record):
-    pid = int(record["pid"])
-    expected_pgid = int(record.get("pgid", pid))
-    actual = _proc_identity(pid)
-    if not actual:
-        # The Python serve wrapper can die before its engine child.  A managed
-        # session keeps the original PGID, so validate every surviving member's
-        # inherited UID+nonce before treating the group as signalable.
-        members, unreadable = _process_group_members(expected_pgid)
-        if not members and not unreadable:
-            return False, "not-running", None
-        if unreadable:
-            return False, "unverified-process-group", {"pgid": expected_pgid, "members": unreadable}
-        if any(
-            member["uid"] != record.get("uid")
-            or member["nonce"] != record.get("nonce")
-            for member in members
-        ):
-            return False, "foreign-process-group", {"pgid": expected_pgid, "members": members}
-        return True, "running-group", {"pid": pid, "pgid": expected_pgid, "members": members}
-    if actual["uid"] != record.get("uid"):
-        return False, "foreign-uid", actual
-    if actual["starttime"] != record.get("starttime"):
-        return False, "reused-pid", actual
-    if actual["nonce"] != record.get("nonce"):
-        return False, "foreign-nonce", actual
-    if actual["pgid"] != expected_pgid:
-        return False, "foreign-process-group", actual
-    return True, "running", actual
+    return _processes_process_matches(
+        record,
+        proc_identity=_proc_identity,
+        process_group_members=_process_group_members,
+    )
 
 
 def _process_tree_alive(record, actual):
-    expected_pgid = int(record.get("pgid", record["pid"]))
-    if actual and actual.get("pgid") == expected_pgid:
-        try:
-            os.killpg(expected_pgid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-    return bool(_proc_identity(int(record["pid"])))
+    return _processes_process_tree_alive(
+        record,
+        actual,
+        group_alive=_group_alive,
+        proc_identity=_proc_identity,
+    )
 
 
 def _assert_canonical_usage_target(canonical_path, plan=None):
@@ -1329,279 +1279,59 @@ def _assert_ready_mounts(manifest):
         _validate_namespace(plan, record)
 
 
-def _runtime_admission_requirement(plan, mount, benchmark=False):
-    """Return the runtime, page-table, and protected host floor for one engine."""
-    reserve = plan["reserve"]
-    runtime_bytes = int(
-        reserve.get("benchmark_runtime_bytes" if benchmark else "managed_runtime_bytes")
-        or reserve["runtime_bytes"]
-    )
-    page_tables = int(reserve["page_table_bytes"])
-    if mount.get("node") is None:
-        margin = int(reserve["os_margin_bytes"])
-    else:
-        node = next(
-            item for item in plan["hardware"]["nodes"] if item["id"] == mount["node"]
-        )
-        margin = int(node.get("reserve_bytes", max(node["memory_total_bytes"] // 10, 8 * GIB)))
-    return runtime_bytes + page_tables + margin
-
-
 def _admit_runtime(plan, mount, benchmark=False):
-    """Recheck the reviewed post-staging floor immediately before launch."""
-    required = _runtime_admission_requirement(plan, mount, benchmark=benchmark)
-    available = _available_for_mount(mount, plan=plan)
-    if available < required:
-        label = "global memory" if mount.get("node") is None else "NUMA node %d" % mount["node"]
-        raise RamdiskError(
-            "%s has %d bytes available; launch would breach the %d-byte runtime/OS floor"
-            % (label, available, required)
-        )
-    return {"available_bytes": available, "required_bytes": required}
+    return _processes_admit_runtime(
+        plan,
+        mount,
+        benchmark=benchmark,
+        available_for_mount=_available_for_mount,
+    )
 
 
 def _admit_concurrent_runtimes(plan, mounts, benchmark=False):
-    """Admit a replica set against one shared cgroup-headroom snapshot."""
-    mounts = list(mounts)
-    if not mounts:
-        raise RamdiskError("concurrent runtime admission requires at least one mount")
-    admissions = []
-    for mount in mounts:
-        required = _runtime_admission_requirement(
-            plan, mount, benchmark=benchmark
-        )
-        host_available = _host_available_for_mount(mount, plan=plan)
-        if host_available < required:
-            label = (
-                "global memory"
-                if mount.get("node") is None
-                else "NUMA node %d" % mount["node"]
-            )
-            raise RamdiskError(
-                "%s has %d bytes available; launch would breach the "
-                "%d-byte runtime/OS floor"
-                % (label, host_available, required)
-            )
-        admissions.append(
-            {
-                "mount": mount,
-                "host_available_bytes": host_available,
-                "required_bytes": required,
-            }
-        )
-    cgroup_available = _cgroup_available_memory()
-    aggregate_required = sum(item["required_bytes"] for item in admissions)
-    if (
-        cgroup_available is not None
-        and cgroup_available < aggregate_required
-    ):
-        raise RamdiskError(
-            "cgroup memory has %d bytes available; concurrent launch would "
-            "breach the %d-byte aggregate runtime/OS floor"
-            % (cgroup_available, aggregate_required)
-        )
-    return {
-        "mounts": admissions,
-        "cgroup_available_bytes": cgroup_available,
-        "required_bytes": aggregate_required,
-    }
+    return _processes_admit_concurrent_runtimes(
+        plan,
+        mounts,
+        benchmark=benchmark,
+        host_available_for_mount=_host_available_for_mount,
+        cgroup_available_memory=_cgroup_available_memory,
+    )
 
 
 def _assert_effective_masks_unchanged(plan):
-    """Refuse a managed launch after its cgroup/cpuset placement contract drifts."""
-    hardware = plan.get("hardware", {})
-    placement = plan.get("placement")
-    if (
-        not placement
-        or hardware.get("effective_mask_source") != "kernel-task-status"
-    ):
-        return
-    current = discover_hardware()
-    expected_nodes = list(placement.get("effective_nodes", []))
-    expected_cpus = list(placement.get("effective_cpus", []))
-    if (
-        list(current.get("effective_nodes", [])) != expected_nodes
-        or list(current.get("effective_cpus", [])) != expected_cpus
-    ):
-        raise RamdiskError(
-            "effective CPU/NUMA mask changed since preparation; destroy and review a fresh plan"
-        )
-
-
-def _group_alive(pgid):
-    try:
-        os.killpg(int(pgid), 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-_managed_children_lock = threading.Lock()
-_managed_children = {}
-
-
-def _track_managed_child(process):
-    """Retain local Popen handles so a long-lived TUI can reap engine zombies."""
-    with _managed_children_lock:
-        _managed_children[int(process.pid)] = process
-
-
-def _poll_managed_child(pid):
-    with _managed_children_lock:
-        process = _managed_children.get(int(pid))
-    if process is None:
-        return None
-    try:
-        returncode = process.poll()
-    except (ChildProcessError, OSError):
-        returncode = getattr(process, "returncode", None)
-    if returncode is not None:
-        with _managed_children_lock:
-            if _managed_children.get(int(pid)) is process:
-                _managed_children.pop(int(pid), None)
-    return returncode
-
-
-def _forget_managed_child(pid):
-    with _managed_children_lock:
-        _managed_children.pop(int(pid), None)
-
-
-def _terminate_direct_child(process, term_seconds=10.0, kill_seconds=3.0):
-    """Terminate an unrecorded direct child by PID, never an unverified PGID."""
-    if process.poll() is not None:
-        return None
-    try:
-        process.terminate()
-    except ProcessLookupError:
-        return None
-    try:
-        process.wait(timeout=term_seconds)
-        return None
-    except ChildProcessError:
-        return None
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        process.kill()
-    except ProcessLookupError:
-        return None
-    try:
-        process.wait(timeout=kill_seconds)
-        return None
-    except ChildProcessError:
-        return None
-    except subprocess.TimeoutExpired:
-        return "direct child PID %s survived SIGKILL" % process.pid
+    return _processes_assert_effective_masks_unchanged(
+        plan,
+        discover_hardware=discover_hardware,
+    )
 
 
 def _terminate_group(pgid, term_seconds=10.0, kill_seconds=3.0):
-    """Terminate one already-verified or directly-created process group."""
-    try:
-        os.killpg(int(pgid), signal.SIGTERM)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + term_seconds
-    while time.monotonic() < deadline and _group_alive(pgid):
-        time.sleep(0.1)
-    if not _group_alive(pgid):
-        return None
-    try:
-        os.killpg(int(pgid), signal.SIGKILL)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + kill_seconds
-    while time.monotonic() < deadline and _group_alive(pgid):
-        time.sleep(0.05)
-    return "process group %s survived SIGKILL" % pgid if _group_alive(pgid) else None
+    return _processes_terminate_group(
+        pgid,
+        term_seconds=term_seconds,
+        kill_seconds=kill_seconds,
+        group_alive=_group_alive,
+    )
 
 
 def _terminate_verified_group(record, term_seconds=10.0, kill_seconds=3.0):
-    """Signal only while the persisted process identity still owns its PGID."""
-    expected_pgid = int(record.get("pgid", record["pid"]))
-
-    def revalidate(stage):
-        # When Start ran inside the still-live TUI process, poll its retained
-        # Popen handle first so an exited group leader cannot remain a zombie
-        # that falsely appears to have survived SIGTERM/SIGKILL.
-        _poll_managed_child(record["pid"])
-        matches, reason, actual = _process_matches(record)
-        if matches and actual and int(actual.get("pgid", -1)) == expected_pgid:
-            return True, None
-        if reason == "not-running":
-            return False, None
-        return (
-            False,
-            "PID/PGID %s identity changed %s (%s); refusing another signal"
-            % (expected_pgid, stage, reason),
-        )
-
-    alive, failure = revalidate("before SIGTERM")
-    if failure or not alive:
-        return failure
-    try:
-        os.killpg(expected_pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + term_seconds
-    while time.monotonic() < deadline:
-        alive, failure = revalidate("after SIGTERM")
-        if failure or not alive:
-            return failure
-        time.sleep(0.1)
-
-    alive, failure = revalidate("before SIGKILL")
-    if failure or not alive:
-        return failure
-    try:
-        os.killpg(expected_pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + kill_seconds
-    while time.monotonic() < deadline:
-        alive, failure = revalidate("after SIGKILL")
-        if failure or not alive:
-            return failure
-        time.sleep(0.05)
-    alive, failure = revalidate("after SIGKILL")
-    if failure or not alive:
-        return failure
-    return "process group %s survived SIGKILL" % expected_pgid
+    return _processes_terminate_verified_group(
+        record,
+        term_seconds=term_seconds,
+        kill_seconds=kill_seconds,
+        poll_managed_child=_poll_managed_child,
+        process_matches=_process_matches,
+    )
 
 
 def _wait_managed_ready(record, timeout, api_key=None, cancel_event=None):
-    deadline = time.monotonic() + timeout
-    headers = {"Authorization": "Bearer " + api_key} if api_key else {}
-    last_error = "listener not ready"
-    while time.monotonic() < deadline:
-        _raise_if_cancelled(cancel_event)
-        matches, reason, _ = _process_matches(record)
-        if not matches:
-            raise RamdiskError(
-                "managed engine PID %s exited before readiness (%s); see %s"
-                % (record["pid"], reason, record["log"])
-            )
-        try:
-            request = urllib.request.Request(
-                "http://127.0.0.1:%d/health" % record["port"], headers=headers
-            )
-            with urllib.request.urlopen(request, timeout=2) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            if payload.get("status") == "ok":
-                record["ready_at"] = _utc_now()
-                return
-            last_error = "health response was not ready"
-        except (OSError, ValueError, urllib.error.URLError) as exc:
-            last_error = str(exc)
-        if cancel_event is None:
-            time.sleep(0.5)
-        elif cancel_event.wait(0.5):
-            _raise_if_cancelled(cancel_event)
-    raise RamdiskError(
-        "managed engine on port %s did not become ready within %.0fs (%s); see %s"
-        % (record["port"], timeout, last_error, record["log"])
+    return _processes_wait_managed_ready(
+        record,
+        timeout,
+        api_key=api_key,
+        cancel_event=cancel_event,
+        process_matches=_process_matches,
+        urlopen=urllib.request.urlopen,
     )
 
 
@@ -2367,30 +2097,6 @@ def _parse_profiler(text, elapsed):
         "ttft_ms": ttft_ms,
         "rss_bytes": rss_bytes,
     }
-
-
-def _resolve_engine_path(cli_path, engine_path=None):
-    candidates = []
-    if engine_path:
-        candidates.append(engine_path)
-    here = os.path.dirname(os.path.abspath(cli_path))
-    suffix = ".exe" if os.name == "nt" else ""
-    candidates.extend(
-        [
-            os.path.join(here, "colibri" + suffix),
-            os.path.join(
-                os.path.dirname(here), "libexec", "colibri", "colibri" + suffix
-            ),
-            os.path.join(here, "glm" + suffix),
-            os.path.join(
-                os.path.dirname(here), "libexec", "colibri", "glm" + suffix
-            ),
-        ]
-    )
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return os.path.realpath(candidate)
-    raise RamdiskError("cannot locate the executable Colibri engine for persistent benchmarking")
 
 
 def _node_core_count(plan, node=None):
@@ -3532,63 +3238,15 @@ def _human_benchmark(result):
 
 
 def _managed_process_metrics(record):
-    rss_bytes = None
-    rss_processes = 0
-    matches, _, _ = _process_matches(record)
-    if matches:
-        members, unreadable = _process_group_members(
-            int(record.get("pgid", record["pid"]))
-        )
-        verified = [
-            member
-            for member in members
-            if member.get("uid") == record.get("uid")
-            and member.get("nonce") == record.get("nonce")
-        ]
-        if not unreadable and len(verified) == len(members) and verified:
-            rss_bytes = 0
-            for member in verified:
-                for line in _read_text(
-                    "/proc/%s/status" % member["pid"]
-                ).splitlines():
-                    if line.startswith("VmRSS:"):
-                        try:
-                            rss_bytes += int(line.split()[1]) * 1024
-                            rss_processes += 1
-                        except (ValueError, IndexError):
-                            pass
-                        break
-    tail = ""
-    log_path = record.get("log")
-    if log_path:
-        try:
-            with open(log_path, "rb") as stream:
-                stream.seek(0, os.SEEK_END)
-                stream.seek(max(0, stream.tell() - 65536))
-                tail = stream.read().decode("utf-8", "replace")
-        except OSError:
-            pass
-    ram_experts = ram_bytes = ssd_bytes = None
-    matches = re.findall(r"RAM map:\s*(\d+) experts / ([0-9.]+) GB", tail)
-    if matches:
-        ram_experts, ram_bytes = int(matches[-1][0]), float(matches[-1][1]) * 1e9
-    else:
-        matches = re.findall(
-            r"\[RAMMAP\]\s*(\d+) direct tmpfs experts,\s*([0-9.]+) GB mapped",
-            tail,
-        )
-        if matches:
-            ram_experts, ram_bytes = int(matches[-1][0]), float(matches[-1][1]) * 1e9
-    matches = re.findall(r"physical SSD reads:\s*([0-9.]+) GB", tail, re.I)
-    if matches:
-        ssd_bytes = float(matches[-1]) * 1e9
-    return {
-        "rss_bytes": rss_bytes,
-        "rss_processes": rss_processes,
-        "rammap_experts": ram_experts,
-        "rammap_bytes": ram_bytes,
-        "latest_ssd_bytes": ssd_bytes,
-    }
+    return _processes_managed_process_metrics(
+        record,
+        process_matches=_process_matches,
+        process_group_members=_process_group_members,
+        process_status=lambda pid: _linux_process_status(
+            pid,
+            read_text=_read_text,
+        ),
+    )
 
 
 def _managed_ports_for_plan(plan, base_port=8000):
