@@ -1,6 +1,7 @@
 # CI: run the repo's own dependency-free gate (`make check` = clean + portable
 # CPU build + C unit suites + Python stdlib tests) on the three claimed
-# platforms. No model downloads, no CUDA, no external deps — by design (#140).
+# platforms, then validate the locked Nix package on Linux and macOS. No model
+# downloads or full-model inference — by design (#140).
 name: check
 
 on:
@@ -55,3 +56,26 @@ jobs:
         run: brew install libomp
       - name: make check
         run: make -C c check
+
+  nix:
+    name: Nix flake (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        # cachix/install-nix-action v31.10.7, pinned to its verified release commit.
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate locked, model-free flake
+        run: |
+          nix flake check --no-update-lock-file --print-build-logs
+          nix build --no-link --print-build-logs .#colibri

@@ -456,6 +456,38 @@ Two things that differ per model, both documented in the per-model page:
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 | CLI flags and RAM-disk lifecycle commands | [docs/SETTINGS.md](docs/SETTINGS.md) |
 
+## Development checks
+
+The normal cross-platform gate is model-free:
+
+```bash
+make -C c check
+```
+
+It builds the portable CPU engine and runs the C and Python unit, CLI, and
+packaging suites. It does not require `COLI_MODEL`, download model weights, or
+run full-model inference. The committed Nix flake provides the equivalent
+reproducible Linux/macOS package validation:
+
+```bash
+nix flake check --no-update-lock-file
+nix build --no-link .#colibri
+```
+
+Real Linux RAM-disk validation is explicitly opt-in. Run these only in a
+suitable privileged/private mount environment:
+
+```bash
+cd c
+COLI_RAMDISK_INTEGRATION=1 python3 -m unittest discover -s tests -p 'test_ramdisk_integration.py' -v
+COLI_RAMMAP_E2E_MODEL=/dev/shm/glm_i4 python3 -m unittest discover -s tests -p 'test_rammap_e2e.py' -v
+```
+
+The first gate exercises the real tmpfs lifecycle with a generated tiny
+fixture. The second consumes an existing compatible tmpfs-backed int4 model
+directory supplied by the caller; it never downloads one. Both tests skip when
+their environment gate is absent.
+
 ## What's next
 
 - **Inference-systems research is the product.** The current hierarchy is LRU +
