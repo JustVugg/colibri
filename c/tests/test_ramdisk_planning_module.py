@@ -183,6 +183,110 @@ class PlanningModuleTest(unittest.TestCase):
             plan["blockers"],
         )
 
+    def test_runtime_topology_prefers_the_recorded_placement_contract(self):
+        plan = {
+            "placement": {
+                "engine_cpu_sets": [
+                    {
+                        "node": None,
+                        "physical_cores": 0,
+                        "cpu_list": "8-9",
+                        "cpus": [1],
+                    },
+                    {
+                        "node": 2,
+                        "physical_cores": 3,
+                        "cpu_list": "",
+                        "cpus": [4, 5, 7],
+                    },
+                ],
+                "memory_nodes": [2],
+            },
+            "hardware": {
+                "physical_cores": 32,
+                "effective_cpus": [0, 1],
+                "online_nodes": [0, 1],
+                "nodes": [],
+            },
+        }
+
+        self.assertEqual(planning._node_core_count(plan), 1)
+        self.assertEqual(planning._engine_cpu_list(plan), "8-9")
+        self.assertEqual(planning._memory_node_list(plan), "2")
+        self.assertEqual(planning._node_core_count(plan, node=2), 3)
+        self.assertEqual(
+            planning._engine_cpu_list(plan, node=2),
+            "4-5,7",
+        )
+
+    def test_runtime_topology_falls_back_to_recorded_hardware(self):
+        plan = {
+            "placement": {},
+            "hardware": {
+                "physical_cores": 6,
+                "effective_cpus": [0, 2, 3],
+                "online_nodes": [0, 2],
+                "nodes": [
+                    {
+                        "id": 0,
+                        "physical_cores": 1,
+                        "cpus": [0],
+                    },
+                    {
+                        "id": 2,
+                        "physical_cores": 2,
+                        "cpus": [4, 5],
+                    },
+                ],
+            },
+        }
+
+        self.assertEqual(planning._node_core_count(plan), 6)
+        self.assertEqual(planning._engine_cpu_list(plan), "0,2-3")
+        self.assertEqual(planning._memory_node_list(plan), "0,2")
+        self.assertEqual(planning._node_core_count(plan, node=2), 2)
+        self.assertEqual(planning._engine_cpu_list(plan, node=2), "4-5")
+        self.assertEqual(planning._memory_node_list(plan, node=2), "2")
+
+        plan["hardware"]["effective_cpus"] = []
+        self.assertEqual(planning._engine_cpu_list(plan), "0,4-5")
+
+    def test_runtime_topology_reports_missing_hardware_contracts(self):
+        plan = {
+            "placement": {},
+            "hardware": {
+                "physical_cores": 4,
+                "effective_cpus": [],
+                "online_nodes": [],
+                "nodes": [],
+            },
+        }
+
+        with self.assertRaisesRegex(
+            planning.RamdiskError,
+            "NUMA node 7 is absent",
+        ):
+            planning._node_core_count(plan, node=7)
+        with self.assertRaisesRegex(
+            planning.RamdiskError,
+            "managed engine CPU mask is empty",
+        ):
+            planning._engine_cpu_list(plan)
+        with self.assertRaisesRegex(
+            planning.RamdiskError,
+            "managed memory-node mask is empty",
+        ):
+            planning._memory_node_list(plan)
+
+    def test_shared_single_node_keeps_engine_numa_policy_enabled(self):
+        plan = {
+            "placement": {"memory_nodes": [0]},
+            "hardware": {"online_nodes": [0]},
+        }
+
+        self.assertTrue(planning._managed_numa_enabled(plan))
+        self.assertFalse(planning._managed_numa_enabled(plan, node=0))
+
     def test_importing_planning_does_not_load_host_or_lifecycle_modules(self):
         code = """
 import json

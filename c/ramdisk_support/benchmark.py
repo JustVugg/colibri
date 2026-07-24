@@ -160,6 +160,52 @@ def _parse_profiler(text, elapsed):
     }
 
 
+def _normalized_runtime_knobs(
+    plan,
+    knobs,
+    node=None,
+    *,
+    node_core_count,
+):
+    """Validate the managed benchmark-knob vocabulary for one target."""
+    result = {}
+    thread_limit = node_core_count(plan, node)
+    for key, value in (knobs or {}).items():
+        if key in ("PIPE", "DIRECT", "URING"):
+            parsed = int(value)
+            if parsed not in (0, 1):
+                raise RamdiskError(
+                    "%s benchmark knob must be 0 or 1" % key
+                )
+            result[key] = parsed
+        elif key == "PIPE_WORKERS":
+            parsed = int(value)
+            if not 1 <= parsed <= max(64, thread_limit):
+                raise RamdiskError(
+                    "PIPE_WORKERS benchmark knob is outside its safe range"
+                )
+            result[key] = parsed
+        elif key == "OMP_NUM_THREADS":
+            parsed = int(value)
+            if not 1 <= parsed <= thread_limit:
+                raise RamdiskError(
+                    "OMP_NUM_THREADS=%s exceeds the %s-core benchmark target"
+                    % (parsed, thread_limit)
+                )
+            result[key] = parsed
+        elif key == "OMP_PROC_BIND":
+            if value not in ("close", "spread"):
+                raise RamdiskError(
+                    "OMP_PROC_BIND benchmark knob must be close or spread"
+                )
+            result[key] = value
+        else:
+            raise RamdiskError(
+                "unsupported managed benchmark knob: %s" % key
+            )
+    return result
+
+
 def _benchmark_environment(
     manifest,
     weights_dir,

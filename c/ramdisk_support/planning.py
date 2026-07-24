@@ -329,6 +329,83 @@ def _build_placement(args, hardware, topology):
     }
 
 
+def _node_core_count(plan, node=None):
+    for target in plan.get("placement", {}).get("engine_cpu_sets", []):
+        if target.get("node") == node:
+            return max(1, int(target.get("physical_cores", 0)))
+    if node is None:
+        return max(1, int(plan["hardware"]["physical_cores"]))
+    try:
+        return max(
+            1,
+            int(
+                next(
+                    item["physical_cores"]
+                    for item in plan["hardware"]["nodes"]
+                    if int(item["id"]) == int(node)
+                )
+            ),
+        )
+    except StopIteration:
+        raise RamdiskError(
+            "NUMA node %s is absent from the recorded hardware plan" % node
+        )
+
+
+def _engine_cpu_list(plan, node=None):
+    for target in plan.get("placement", {}).get("engine_cpu_sets", []):
+        if target.get("node") == node:
+            value = target.get("cpu_list")
+            if isinstance(value, str) and value:
+                return value
+            cpus = target.get("cpus")
+            if isinstance(cpus, list) and cpus:
+                return _format_range_list(cpus)
+    if node is None:
+        cpus = plan.get("hardware", {}).get("effective_cpus")
+        if not cpus:
+            cpus = [
+                cpu
+                for row in plan.get("hardware", {}).get("nodes", [])
+                for cpu in row.get("cpus", [])
+            ]
+    else:
+        cpus = next(
+            (
+                row.get("cpus", [])
+                for row in plan.get("hardware", {}).get("nodes", [])
+                if row.get("id") == node
+            ),
+            [],
+        )
+    if not cpus:
+        raise RamdiskError("managed engine CPU mask is empty")
+    return _format_range_list(cpus)
+
+
+def _memory_node_list(plan, node=None):
+    if node is not None:
+        return str(int(node))
+    nodes = plan.get("placement", {}).get(
+        "memory_nodes",
+        plan.get("hardware", {}).get("online_nodes", []),
+    )
+    if not nodes:
+        raise RamdiskError("managed memory-node mask is empty")
+    return _format_range_list(nodes)
+
+
+def _managed_numa_enabled(plan, node=None):
+    """Use the engine policy for every shared plan, including one-node binds."""
+    if node is not None:
+        return False
+    nodes = plan.get("placement", {}).get(
+        "memory_nodes",
+        plan.get("hardware", {}).get("online_nodes", []),
+    )
+    return bool(nodes)
+
+
 def build_plan(
     args,
     hardware=None,

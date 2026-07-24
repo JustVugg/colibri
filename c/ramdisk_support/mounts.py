@@ -307,8 +307,13 @@ def _validate_mount(mount, plan, *, mount_at=None):
     return actual
 
 
-def _default_cgroup_available_memory():
-    cgroup = _discover_cgroup_memory()
+def _default_cgroup_available_memory(*, discover_cgroup_memory=None):
+    discover_cgroup_memory = (
+        _discover_cgroup_memory
+        if discover_cgroup_memory is None
+        else discover_cgroup_memory
+    )
+    cgroup = discover_cgroup_memory()
     if cgroup.get("error"):
         raise RamdiskError(
             "cannot validate cgroup memory headroom: %s"

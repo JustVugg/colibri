@@ -5,8 +5,41 @@ if __package__:
 else:
     from ramdisk_test_support import *  # noqa: F401,F403
 
+from ramdisk_support import mounts as mounts_support
+
 
 class MountAndCopyTest(unittest.TestCase):
+    def test_cgroup_headroom_uses_the_injected_discovery_service(self):
+        discover = mock.Mock(
+            return_value={"available_bytes": 1234, "error": None}
+        )
+
+        self.assertEqual(
+            mounts_support._default_cgroup_available_memory(
+                discover_cgroup_memory=discover,
+            ),
+            1234,
+        )
+        discover.assert_called_once_with()
+
+        with mock.patch.object(
+            ramdisk,
+            "_discover_cgroup_memory",
+            return_value={"available_bytes": 5678, "error": None},
+        ):
+            self.assertEqual(ramdisk._cgroup_available_memory(), 5678)
+
+        with self.assertRaisesRegex(
+            mounts_support.RamdiskError,
+            "cannot validate cgroup memory headroom: unreadable",
+        ):
+            mounts_support._default_cgroup_available_memory(
+                discover_cgroup_memory=lambda: {
+                    "available_bytes": None,
+                    "error": "unreadable",
+                },
+            )
+
     def test_mountinfo_preserves_noncontiguous_mpol_nodemask(self):
         line = (
             "36 25 0:32 / /mnt/colibri-ram rw,noatime - tmpfs tmpfs "
@@ -264,4 +297,3 @@ class MountAndCopyTest(unittest.TestCase):
         with mock.patch.object(ramdisk, "_mount_table", return_value=mounts):
             with self.assertRaisesRegex(ramdisk.RamdiskError, "stacked mounts"):
                 ramdisk._mount_at("/mnt/colibri-test")
-

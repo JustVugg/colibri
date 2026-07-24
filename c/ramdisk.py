@@ -75,6 +75,7 @@ from ramdisk_support.benchmark import (
     _benchmark_environment as _benchmark_make_environment,
     _benchmark_generate as _benchmark_generate_turn,
     _cancellable_engine_type as _benchmark_cancellable_engine_type,
+    _normalized_runtime_knobs as _benchmark_normalized_runtime_knobs,
     _parse_profiler as _benchmark_parse_profiler,
     _score_variant as _benchmark_score_variant,
     _source_build_identity as _benchmark_source_build_identity,
@@ -134,6 +135,7 @@ from ramdisk_support.mounts import (
     _copy_one_affined as _mounts_copy_one_affined,
     _copy_stream,
     _copy_worker_main,
+    _default_cgroup_available_memory as _mounts_default_cgroup_available_memory,
     _host_available_for_mount as _mounts_host_available_for_mount,
     _mount_option_list,
     _mount_tmpfs as _mounts_mount_tmpfs,
@@ -158,7 +160,11 @@ from ramdisk_support.model import (
 )
 from ramdisk_support.planning import (
     _build_placement,
+    _engine_cpu_list as _planning_engine_cpu_list,
     _load_profile,
+    _managed_numa_enabled as _planning_managed_numa_enabled,
+    _memory_node_list as _planning_memory_node_list,
+    _node_core_count as _planning_node_core_count,
     _requested_ids,
     _runtime_reserve,
     _select_partial,
@@ -267,13 +273,9 @@ def _save_manifest(manifest):
 
 
 def _cgroup_available_memory():
-    """Read current hard cgroup headroom, failing closed on a broken contract."""
-    cgroup = _discover_cgroup_memory()
-    if cgroup.get("error"):
-        raise RamdiskError(
-            "cannot validate cgroup memory headroom: %s" % cgroup["error"]
-        )
-    return cgroup.get("available_bytes")
+    return _mounts_default_cgroup_available_memory(
+        discover_cgroup_memory=_discover_cgroup_memory,
+    )
 
 
 def discover_hardware():
@@ -779,108 +781,40 @@ def _parse_profiler(text, elapsed):
 
 
 def _node_core_count(plan, node=None):
-    for target in plan.get("placement", {}).get("engine_cpu_sets", []):
-        if target.get("node") == node:
-            return max(1, int(target.get("physical_cores", 0)))
-    if node is None:
-        return max(1, int(plan["hardware"]["physical_cores"]))
-    try:
-        return max(
-            1,
-            int(
-                next(
-                    item["physical_cores"]
-                    for item in plan["hardware"]["nodes"]
-                    if int(item["id"]) == int(node)
-                )
-            ),
-        )
-    except StopIteration:
-        raise RamdiskError("NUMA node %s is absent from the recorded hardware plan" % node)
+    return _planning_node_core_count(
+        plan,
+        node=node,
+    )
 
 
 def _engine_cpu_list(plan, node=None):
-    for target in plan.get("placement", {}).get("engine_cpu_sets", []):
-        if target.get("node") == node:
-            value = target.get("cpu_list")
-            if isinstance(value, str) and value:
-                return value
-            cpus = target.get("cpus")
-            if isinstance(cpus, list) and cpus:
-                return _format_range_list(cpus)
-    if node is None:
-        cpus = plan.get("hardware", {}).get("effective_cpus")
-        if not cpus:
-            cpus = [
-                cpu
-                for row in plan.get("hardware", {}).get("nodes", [])
-                for cpu in row.get("cpus", [])
-            ]
-    else:
-        cpus = next(
-            (
-                row.get("cpus", [])
-                for row in plan.get("hardware", {}).get("nodes", [])
-                if row.get("id") == node
-            ),
-            [],
-        )
-    if not cpus:
-        raise RamdiskError("managed engine CPU mask is empty")
-    return _format_range_list(cpus)
+    return _planning_engine_cpu_list(
+        plan,
+        node=node,
+    )
 
 
 def _memory_node_list(plan, node=None):
-    if node is not None:
-        return str(int(node))
-    nodes = plan.get("placement", {}).get(
-        "memory_nodes", plan.get("hardware", {}).get("online_nodes", [])
+    return _planning_memory_node_list(
+        plan,
+        node=node,
     )
-    if not nodes:
-        raise RamdiskError("managed memory-node mask is empty")
-    return _format_range_list(nodes)
 
 
 def _managed_numa_enabled(plan, node=None):
-    """Use the engine policy for every shared plan, including one-node binds."""
-    if node is not None:
-        return False
-    nodes = plan.get("placement", {}).get(
-        "memory_nodes", plan.get("hardware", {}).get("online_nodes", [])
+    return _planning_managed_numa_enabled(
+        plan,
+        node=node,
     )
-    return bool(nodes)
 
 
 def _normalized_runtime_knobs(plan, knobs, node=None):
-    """Validate the small benchmark-knob vocabulary before placing it in env."""
-    result = {}
-    thread_limit = _node_core_count(plan, node)
-    for key, value in (knobs or {}).items():
-        if key in ("PIPE", "DIRECT", "URING"):
-            parsed = int(value)
-            if parsed not in (0, 1):
-                raise RamdiskError("%s benchmark knob must be 0 or 1" % key)
-            result[key] = parsed
-        elif key == "PIPE_WORKERS":
-            parsed = int(value)
-            if not 1 <= parsed <= max(64, thread_limit):
-                raise RamdiskError("PIPE_WORKERS benchmark knob is outside its safe range")
-            result[key] = parsed
-        elif key == "OMP_NUM_THREADS":
-            parsed = int(value)
-            if not 1 <= parsed <= thread_limit:
-                raise RamdiskError(
-                    "OMP_NUM_THREADS=%s exceeds the %s-core benchmark target"
-                    % (parsed, thread_limit)
-                )
-            result[key] = parsed
-        elif key == "OMP_PROC_BIND":
-            if value not in ("close", "spread"):
-                raise RamdiskError("OMP_PROC_BIND benchmark knob must be close or spread")
-            result[key] = value
-        else:
-            raise RamdiskError("unsupported managed benchmark knob: %s" % key)
-    return result
+    return _benchmark_normalized_runtime_knobs(
+        plan,
+        knobs,
+        node=node,
+        node_core_count=_node_core_count,
+    )
 
 
 def _benchmark_environment(manifest, weights_dir, state_dir, rammap, node=None, knobs=None):
