@@ -605,7 +605,7 @@ static void attn_scratch_init(){
 }
 // y[S,O] = quantized-weight(w) applied to xin[S,I]. Weights are registered (page-aligned,
 // zero-copy) at model load; resolve to (buffer,offset). Returns false to fall back to CPU.
-static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float* s, int fmt, int I, int O,
+static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float* s, int fmt, int gs, int I, int O,
                       id<MTLBuffer> xin, id<MTLBuffer> yout, int S){
   uint64_t wa=0,sa=0; id<MTLBuffer> wb=resolve(w,&wa); id<MTLBuffer> sb=resolve(s,&sa);
   if(!wb||!sb) return false;
@@ -616,7 +616,7 @@ static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float
   [e setBuffer:xin offset:0 atIndex:2]; [e setBuffer:yout offset:0 atIndex:3];
   int NT=S*O;
   [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5]; [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
-  [e setBytes:&NT length:4 atIndex:8];
+  [e setBytes:&NT length:4 atIndex:8]; [e setBytes:&gs length:4 atIndex:9];
   [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
   return true;
 }
@@ -624,11 +624,11 @@ static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float
 // Weight-pointer bundle for one layer's attention (+optional layer tail). All pointers
 // must be inside registered allocations.
 typedef struct {
-  const void *qa_w; const float *qa_s; int qa_fmt; const float *qa_ln;
-  const void *qb_w; const float *qb_s; int qb_fmt;
-  const void *kva_w; const float *kva_s; int kva_fmt; const float *kva_ln;
-  const void *kvb_w; const float *kvb_s; int kvb_fmt;
-  const void *o_w;  const float *o_s;  int o_fmt;
+  const void *qa_w; const float *qa_s; int qa_fmt; int qa_gs; const float *qa_ln;
+  const void *qb_w; const float *qb_s; int qb_fmt; int qb_gs;
+  const void *kva_w; const float *kva_s; int kva_fmt; int kva_gs; const float *kva_ln;
+  const void *kvb_w; const float *kvb_s; int kvb_fmt; int kvb_gs;
+  const void *o_w;  const float *o_s;  int o_fmt; int o_gs;
 } AttnW;
 
 // Encode the fused attention chain into encoder e. Input: ax_ holds the NORMED x [S,AH].
@@ -651,12 +651,13 @@ static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
       [e setBuffer:acomp_ offset:0 atIndex:0]; [e setBytes:&off length:4 atIndex:1]; [e setBytes:&ss length:4 atIndex:2];
       [e setBuffer:dst offset:doff atIndex:3]; [e setBytes:&n length:4 atIndex:4]; [e setBytes:&n length:4 atIndex:5];
       [e dispatchThreads:MTLSizeMake((size_t)S*n,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; };
-    bind_gemv(e,W->qa_w,W->qa_s,W->qa_fmt,AH,AQLORA,ax_,aqr_,S);
-    bind_gemv(e,W->kva_w,W->kva_s,W->kva_fmt,AH,AKVL+AROPE,ax_,acomp_,S); BAR();
+    bind_gemv(e,W->qa_w,W->qa_s,W->qa_fmt,W->qa_gs,AH,AQLORA,ax_,aqr_,S);
+    bind_gemv(e,W->kva_w,W->kva_s,W->kva_fmt,W->kva_gs,AH,AKVL+AROPE,ax_,acomp_,S); BAR();
     rms(aqr_,0,aqaln_,AQLORA,S); cpy(0,Lb,Loff,AKVL); cpy(AKVL,Rb,Roff,AROPE); BAR();
-    bind_gemv(e,W->qb_w,W->qb_s,W->qb_fmt,AQLORA,AHQH,aqr_,aqf_,S); rms(Lb,Loff,akvaln_,AKVL,S); rope(Rb,Roff,0,AROPE,0,1); BAR();
+    bind_gemv(e,W->qb_w,W->qb_s,W->qb_fmt,W->qb_gs,AQLORA,AHQH,aqr_,aqf_,S); rms(Lb,Loff,akvaln_,AKVL,S); rope(Rb,Roff,0,AROPE,0,1); BAR();
     rope(aqf_,0,ANOPE,AHQH,AQH,AHEADS); BAR();
     [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
+    [e setBytes:&W->kvb_fmt length:4 atIndex:4]; [e setBytes:&W->kvb_gs length:4 atIndex:5];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:Rb offset:roff atIndex:2]; [e setBuffer:aqf_ offset:0 atIndex:3]; [e setBuffer:ascore_ offset:0 atIndex:4];
     [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&pos_base length:4 atIndex:7];
@@ -666,8 +667,9 @@ static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
     [e setComputePipelineState:g_a_clat]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBytes:&T length:4 atIndex:3];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
+    [e setBytes:&W->kvb_fmt length:4 atIndex:4]; [e setBytes:&W->kvb_gs length:4 atIndex:5];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    bind_gemv(e,W->o_w,W->o_s,W->o_fmt,AHVH,AH,actx_,aout_,S);
+    bind_gemv(e,W->o_w,W->o_s,W->o_fmt,W->o_gs,AHVH,AH,actx_,aout_,S);
     return true;
 }
 // Resolve Lc/Rc + kv_b (+pre-check the projection weights). Returns false -> CPU fallback.
@@ -723,14 +725,14 @@ extern "C" int coli_metal_attn_decode(const float* x,
 // idx/w/keff (routing). Returns 0 -> CPU fallback (whole layer falls back).
 extern "C" int coli_metal_layer_decode(float *x,
     const float *in_ln, const float *post_ln,
-    const void* qa_w,const float* qa_s,int qa_fmt,const float* qa_ln,
-    const void* qb_w,const float* qb_s,int qb_fmt,
-    const void* kva_w,const float* kva_s,int kva_fmt,const float* kva_ln,
-    const void* kvb_w,const float* kvb_s,int kvb_fmt,
-    const void* o_w,const float* o_s,int o_fmt,
-    const void* shg_w,const float* shg_s,int shg_fmt,
-    const void* shu_w,const float* shu_s,int shu_fmt,
-    const void* shd_w,const float* shd_s,int shd_fmt,
+    const void* qa_w,const float* qa_s,int qa_fmt,int qa_gs,const float* qa_ln,
+    const void* qb_w,const float* qb_s,int qb_fmt,int qb_gs,
+    const void* kva_w,const float* kva_s,int kva_fmt,int kva_gs,const float* kva_ln,
+    const void* kvb_w,const float* kvb_s,int kvb_fmt,int kvb_gs,
+    const void* o_w,const float* o_s,int o_fmt,int o_gs,
+    const void* shg_w,const float* shg_s,int shg_fmt,int shg_gs,
+    const void* shu_w,const float* shu_s,int shu_fmt,int shu_gs,
+    const void* shd_w,const float* shd_s,int shd_fmt,int shd_gs,
     const float *router_w, const float *router_bias,
     int E, int K, int Ksel, float topp, int normk, float rscale,
     float *Lc, float *Rc, int S, int pos_base, int st0,
@@ -741,7 +743,7 @@ extern "C" int coli_metal_layer_decode(float *x,
   int T=pos_base+S; const int SI=2048;
   @autoreleasepool {
     attn_scratch_init();
-    AttnW W={qa_w,qa_s,qa_fmt,qa_ln,qb_w,qb_s,qb_fmt,kva_w,kva_s,kva_fmt,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt};
+    AttnW W={qa_w,qa_s,qa_fmt,qa_gs,qa_ln,qb_w,qb_s,qb_fmt,qb_gs,kva_w,kva_s,kva_fmt,kva_gs,kva_ln,kvb_w,kvb_s,kvb_fmt,kvb_gs,o_w,o_s,o_fmt,o_gs};
     id<MTLBuffer> Lb,Rb,kvbW,kvbS; size_t loff,roff,kvbwoff,kvbsoff;
     if(!resolve_attn(&W,Lc,Rc,&Lb,&loff,&Rb,&roff,&kvbW,&kvbwoff,&kvbS,&kvbsoff)) return 0;
     uint64_t ina=0,pna=0,rwa=0,rba=0,d;
@@ -778,8 +780,8 @@ extern "C" int coli_metal_layer_decode(float *x,
     [e dispatchThreads:MTLSizeMake((size_t)S*AH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     copyrow(axr_,anrm_,AH); BAR(); rmsw(anrm_,pnB,pnoff,AH,S); BAR();
     // 4) shared expert gate/up + router (all read anrm_, independent)
-    bind_gemv(e,shg_w,shg_s,shg_fmt,AH,SI,anrm_,ash1_,S);
-    bind_gemv(e,shu_w,shu_s,shu_fmt,AH,SI,anrm_,ash2_,S);
+    bind_gemv(e,shg_w,shg_s,shg_fmt,shg_gs,AH,SI,anrm_,ash1_,S);
+    bind_gemv(e,shu_w,shu_s,shu_fmt,shu_gs,AH,SI,anrm_,ash2_,S);
     { int NT=S*E, D=AH; [e setComputePipelineState:g_r_router];
       [e setBuffer:rwB offset:rwoff atIndex:0]; [e setBuffer:anrm_ offset:0 atIndex:1]; [e setBuffer:asig_ offset:0 atIndex:2];
       [e setBytes:&E length:4 atIndex:3]; [e setBytes:&D length:4 atIndex:4]; [e setBytes:&NT length:4 atIndex:5];
@@ -806,7 +808,7 @@ extern "C" int coli_metal_layer_decode(float *x,
       else        [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
     BAR();
     // 6) shared down
-    bind_gemv(e,shd_w,shd_s,shd_fmt,SI,AH,ash1_,ashout_,S);
+    bind_gemv(e,shd_w,shd_s,shd_fmt,shd_gs,SI,AH,ash1_,ashout_,S);
     double tc=mnow();
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] layer cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
