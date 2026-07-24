@@ -11,6 +11,11 @@ blockers, warnings, copy count, memory cost, CPU masks, mount paths, and
 endpoints visible so that the operator can review the exact contract before
 anything is mounted.
 
+For a task-oriented walkthrough of one shared, full-model deployment, follow
+[Run a shared full-model RAM workspace](ramdisk-tui-howto.md). This page
+remains the complete reference for controls, lifecycle semantics, additional
+modes, safety, and development.
+
 ## Requirements and platform scope
 
 The RAM-workspace lifecycle and both terminal frontends are Linux-only. Other
