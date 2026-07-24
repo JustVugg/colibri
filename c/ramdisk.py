@@ -17,7 +17,6 @@ import functools
 import hashlib
 import json
 import math
-import mmap
 import os
 import queue
 import re
@@ -25,7 +24,6 @@ import secrets
 import shutil
 import signal
 import socket
-import stat
 import subprocess
 import sys
 import textwrap
@@ -67,21 +65,53 @@ from ramdisk_support.discovery import (
     discover_hardware as _discover_hardware,
 )
 from ramdisk_support.linux_ops import (
+    _filesystem_for_path as _linux_filesystem_for_path,
+    _fresh_user_binary,
     _kernel_at_least,
     _meminfo,
+    _mount_at as _linux_mount_at,
+    _mount_table,
     _node_meminfo,
+    _noninteractive_privilege as _linux_noninteractive_privilege,
     _physical_cores,
+    _privileged as _linux_privileged,
     _read_cgroup_contract,
     _read_cgroup_value,
     _read_text,
+    _run,
+    _split_mount_options,
     _status_allowed_list,
+    _sudo_ticket_keepalive,
     _thread_sibling_groups,
+    _trusted_system_binary,
+    _unescape_mount,
+    _validate_noninteractive_sudo,
+)
+from ramdisk_support.mounts import (
+    _available_for_mount as _mounts_available_for_mount,
+    _available_memory as _mounts_available_memory,
+    _copy_one as _mounts_copy_one,
+    _copy_one_affined as _mounts_copy_one_affined,
+    _copy_stream,
+    _copy_worker_main,
+    _host_available_for_mount as _mounts_host_available_for_mount,
+    _mount_option_list,
+    _mount_tmpfs as _mounts_mount_tmpfs,
+    _option_present,
+    _populate_mount as _mounts_populate_mount,
+    _reusable_empty_mountpoint,
+    _rollback_interrupted_mount as _mounts_rollback_interrupted_mount,
+    _sample_numa_allocation,
+    _sample_page_indices,
+    _source_still_matches as _mounts_source_still_matches,
+    _umount_path as _mounts_umount_path,
+    _validate_mount as _mounts_validate_mount,
+    _validate_namespace as _mounts_validate_namespace,
 )
 from ramdisk_support.model import (
     EXPERT_RE,
     MAX_ST_HEADER,
     _direct_tensor_set_eligible,
-    _read_safetensors_header,
     _sha256_file,
     _shape_numel,
     scan_model,
@@ -93,7 +123,7 @@ from ramdisk_support.planning import (
     _runtime_reserve,
     _select_partial,
 )
-from ramdisk_support.platform_ops import current_euid
+from ramdisk_support.platform_ops import current_euid, get_platform_ops
 from ramdisk_support.state import (
     _assert_canonical_usage_target as _state_assert_canonical_usage_target,
     _assert_durable_state_dir as _state_assert_durable_state_dir,
@@ -133,20 +163,6 @@ def _exclusive_lifecycle(function):
             return function(*args, **kwargs)
 
     return wrapped
-
-
-def _reusable_empty_mountpoint(path):
-    """Recognize an empty root-owned leaf left by X-mount.mkdir=0755."""
-    try:
-        info = os.stat(path, follow_symlinks=False)
-        return (
-            stat.S_ISDIR(info.st_mode)
-            and info.st_uid == os.stat("/").st_uid
-            and not (info.st_mode & 0o022)
-            and not os.listdir(path)
-        )
-    except OSError:
-        return False
 
 
 def _assert_durable_state_dir(path, plan=None):
@@ -544,7 +560,7 @@ def build_plan(args, hardware=None, model=None):
                 blockers.append("durable %s path must not traverse symbolic links" % label)
             if _path_is_below(durable_path, mount_root, allow_equal=True):
                 blockers.append("durable %s path must be outside every volatile mount" % label)
-            if hardware["linux"]:
+            if hardware["linux"] and get_platform_ops().is_linux:
                 filesystem = _filesystem_for_path(durable_path)
                 if filesystem in ("tmpfs", "ramfs"):
                     blockers.append(
@@ -831,457 +847,101 @@ def _human_plan(plan):
         print("  BLOCKED: %s" % blocker)
 
 
-def _unescape_mount(value):
-    return re.sub(
-        r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value
-    )
-
-
-def _split_mount_options(value):
-    """Split mountinfo options while preserving comma-bearing mpol masks."""
-    result = []
-    for token in value.split(","):
-        if (
-            result
-            and result[-1].startswith("mpol=")
-            and re.fullmatch(r"\d+(?:-\d+)?", token)
-        ):
-            result[-1] += "," + token
-        else:
-            result.append(token)
-    return result
-
-
-def _mount_table(path="/proc/self/mountinfo"):
-    result = []
-    for line in _read_text(path).splitlines():
-        fields = line.split()
-        try:
-            separator = fields.index("-")
-            result.append(
-                {
-                    "mount_id": int(fields[0]),
-                    "parent_id": int(fields[1]),
-                    "device": fields[2],
-                    "root": _unescape_mount(fields[3]),
-                    "path": _unescape_mount(fields[4]),
-                    "options": sorted(set(_split_mount_options(fields[5]))),
-                    "optional": fields[6:separator],
-                    "filesystem": fields[separator + 1],
-                    "source": _unescape_mount(fields[separator + 2]),
-                    "super_options": sorted(set(_split_mount_options(fields[separator + 3]))),
-                }
-            )
-        except (ValueError, IndexError):
-            continue
-    return result
-
-
 def _mount_at(path):
-    path = os.path.normpath(os.path.abspath(path))
-    matches = [
-        mount
-        for mount in _mount_table()
-        if os.path.normpath(mount["path"]) == path
-    ]
-    if len(matches) > 1:
-        raise RamdiskError(
-            "refusing ambiguous stacked mounts at %s (mount ids %s)"
-            % (path, ", ".join(str(item["mount_id"]) for item in matches))
-        )
-    return matches[0] if matches else None
+    return _linux_mount_at(path, mount_table=_mount_table)
 
 
 def _filesystem_for_path(path):
-    """Return the filesystem of the longest mountpoint containing ``path``."""
-    normalized = os.path.normpath(os.path.abspath(path))
-    matches = []
-    for mount in _mount_table():
-        root = os.path.normpath(mount["path"])
-        if _path_is_below(normalized, root, allow_equal=True):
-            matches.append((len(root), mount["filesystem"]))
-    return max(matches)[1] if matches else None
-
-
-def _run(command, **kwargs):
-    kwargs.setdefault("text", True)
-    kwargs.setdefault("capture_output", True)
-    kwargs.setdefault("check", False)
-    return subprocess.run(command, **kwargs)
-
-
-def _trusted_system_binary(name):
-    """Resolve a fixed system executable safe to place after ``sudo --``."""
-    candidates = [
-        os.path.join(prefix, name)
-        for prefix in (
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
-            "/run/current-system/sw/bin",
-            "/run/wrappers/bin",
-            "/nix/var/nix/profiles/default/bin",
-        )
-    ]
-    discovered = shutil.which(name)
-    if discovered:
-        candidates.append(discovered)
-    system_uid = os.stat("/").st_uid  # uid 0 outside user namespaces
-    groups = set(os.getgroups())
-    rejected = []
-    for candidate in candidates:
-        path = os.path.realpath(candidate)
-        if os.path.basename(path) != name:
-            rejected.append(candidate)
-            continue
-        try:
-            info = os.stat(path)
-        except OSError:
-            continue
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_mode & 0o022
-            or info.st_uid != system_uid
-        ):
-            rejected.append(path)
-            continue
-        parent = os.path.dirname(path)
-        unsafe_parent = False
-        while True:
-            parent_info = os.stat(parent)
-            group_writable_by_us = bool(parent_info.st_mode & stat.S_IWGRP and parent_info.st_gid in groups)
-            if (
-                parent_info.st_uid != system_uid
-                or parent_info.st_mode & stat.S_IWOTH
-                or group_writable_by_us
-                or (os.geteuid() != 0 and os.access(parent, os.W_OK))
-            ):
-                unsafe_parent = True
-                break
-            next_parent = os.path.dirname(parent)
-            if next_parent == parent:
-                break
-            parent = next_parent
-        if unsafe_parent:
-            rejected.append(path)
-            continue
-        return path
-    detail = " (rejected writable candidates: %s)" % ", ".join(rejected) if rejected else ""
-    raise RamdiskError("trusted %s executable was not found%s" % (name, detail))
-
-
-def _fresh_user_binary(name):
-    """Resolve an unprivileged helper now, never from serialized manifest data."""
-    path = shutil.which(name)
-    if not path or os.path.basename(path) != name or not os.access(path, os.X_OK):
-        raise RamdiskError("%s was not found on PATH" % name)
-    return os.path.realpath(path)
-
-
-_privilege_local = threading.local()
-
-
-def _validate_noninteractive_sudo(sudo):
-    """Confirm the foreground authorization can be reused without a prompt."""
-    return subprocess.run(
-        [sudo, "-n", "-v"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
+    return _linux_filesystem_for_path(
+        path,
+        mount_table=_mount_table,
     )
-
-
-def _sudo_ticket_keepalive(
-    stop_event,
-    sudo,
-    interval=1.0,
-    failure_event=None,
-    cancel_event=None,
-):
-    """Refresh an already-authorized sudo timestamp during a long operation.
-
-    Refresh immediately, then frequently enough for deliberately short sudo
-    timestamp policies.  A failed non-interactive refresh is terminal for this
-    authorization window: signal cancellable staging work so it reaches its
-    rollback path instead of continuing until cleanup authority is certainly
-    gone.
-    """
-    while not stop_event.is_set():
-        try:
-            result = subprocess.run(
-                [sudo, "-n", "-v"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=5.0,
-            )
-        except (OSError, subprocess.SubprocessError):
-            result = None
-        if result is None or result.returncode:
-            if failure_event is not None:
-                failure_event.set()
-            if cancel_event is not None:
-                cancel_event.set()
-            return
-        if stop_event.wait(interval):
-            return
 
 
 @contextlib.contextmanager
 def _noninteractive_privilege(keepalive=False, cancel_event=None):
-    """Keep a validated sudo ticket alive without prompting from a TUI worker."""
-    previous = getattr(_privilege_local, "noninteractive", False)
-    _privilege_local.noninteractive = True
-    keepalive_stop = None
-    keepalive_failure = None
-    keepalive_thread = None
-    try:
-        if keepalive and not previous and os.geteuid() != 0:
-            sudo = _trusted_system_binary("sudo")
-            keepalive_stop = threading.Event()
-            keepalive_failure = threading.Event()
-            keepalive_thread = threading.Thread(
-                target=_sudo_ticket_keepalive,
-                args=(
-                    keepalive_stop,
-                    sudo,
-                    1.0,
-                    keepalive_failure,
-                    cancel_event,
-                ),
-                name="coli-sudo-ticket-keepalive",
-                daemon=True,
-            )
-            keepalive_thread.start()
+    with _linux_noninteractive_privilege(
+        keepalive=keepalive,
+        cancel_event=cancel_event,
+        trusted_system_binary=_trusted_system_binary,
+        sudo_ticket_keepalive=_sudo_ticket_keepalive,
+    ):
         yield
-    finally:
-        if keepalive_stop is not None:
-            keepalive_stop.set()
-        if keepalive_thread is not None:
-            keepalive_thread.join(timeout=6.0)
-        _privilege_local.noninteractive = previous
 
 
 def _privileged(command, hardware):
-    if os.geteuid() == 0:
-        return command
-    sudo = _trusted_system_binary("sudo")
-    options = ["-n"] if getattr(_privilege_local, "noninteractive", False) else []
-    return [sudo] + options + ["--"] + command
-
-
-def _mount_option_list(plan, mount, thp=None, include_noswap=None):
-    thp = thp or plan["mount_options"]["thp"]
-    if include_noswap is None:
-        include_noswap = plan["mount_options"]["noswap"]
-    options = [
-        "size=%d" % mount["size_bytes"],
-        "huge=%s" % thp,
-        "noatime",
-        "nodev",
-        "nosuid",
-        "noexec",
-        "mode=0700",
-        "uid=%d" % os.getuid(),
-        "gid=%d" % os.getgid(),
-        "mpol=%s" % mount["policy"],
-        # util-linux handles creation as part of mount(8), keeping sudo scoped
-        # to the exact mount command rather than a separate mkdir/chown.
-        # The underlying /mnt directory may remain after unmount because the
-        # invoking user cannot remove a root-owned child of /mnt. Keep that
-        # empty mountpoint traversable/readable for safe prepare→destroy→prepare
-        # reuse; the mounted tmpfs itself remains private via mode=0700 above.
-        "X-mount.mkdir=0755",
-    ]
-    if include_noswap:
-        options.insert(1, "noswap")
-    return options
+    return _linux_privileged(
+        command,
+        hardware,
+        trusted_system_binary=_trusted_system_binary,
+    )
 
 
 def _mount_tmpfs(plan, mount):
-    hardware = plan["hardware"]
-    # Never execute a path recovered from the user-editable manifest under
-    # sudo. Resolve and verify the exact system utility at the point of use.
-    mount_bin = _trusted_system_binary("mount")
-    attempts = []
-    thp = plan["mount_options"]["thp"]
-    noswap = plan["mount_options"]["noswap"]
-    attempts.append((thp, noswap))
-    if thp == "within_size":
-        attempts.append(("advise", noswap))
-    if plan["mount_options"]["allow_swappable"] and noswap:
-        # If an older kernel rejects only ``noswap``, preserve the requested
-        # THP policy. ``advise`` is a fallback for unsupported within_size,
-        # not an accidental side effect of accepting swappable tmpfs.
-        attempts.append((thp, False))
-        if thp == "within_size":
-            attempts.append(("advise", False))
-    seen = set()
-    errors = []
-    for try_thp, try_noswap in attempts:
-        if (try_thp, try_noswap) in seen:
-            continue
-        seen.add((try_thp, try_noswap))
-        options = _mount_option_list(plan, mount, try_thp, try_noswap)
-        command = [mount_bin, "-t", "tmpfs", "-o", ",".join(options), "tmpfs", mount["path"]]
-        try:
-            result = _run(_privileged(command, hardware))
-        except BaseException as interrupted:
-            _rollback_interrupted_mount(
-                plan,
-                mount,
-                try_thp,
-                try_noswap,
-                interrupted,
-            )
-            raise
-        if result.returncode == 0:
-            mount["effective_thp"] = try_thp
-            mount["effective_noswap"] = try_noswap
-            return
-        errors.append(result.stderr.strip() or result.stdout.strip() or "mount failed")
-        # Only option-recognition failures justify the documented fallback.
-        message = (result.stderr + result.stdout).lower()
-        if not any(word in message for word in ("invalid argument", "unknown", "not supported", "wrong fs")):
-            break
-    raise RamdiskError("cannot mount tmpfs at %s: %s" % (mount["path"], "; ".join(errors)))
+    return _mounts_mount_tmpfs(
+        plan,
+        mount,
+        trusted_system_binary=_trusted_system_binary,
+        run=_run,
+        privileged=_privileged,
+        rollback_interrupted_mount=_rollback_interrupted_mount,
+    )
 
 
 def _umount_path(path, hardware):
-    umount = _trusted_system_binary("umount")
-    result = _run(_privileged([umount, "--", path], hardware))
-    if result.returncode:
-        message = result.stderr.strip() or result.stdout.strip() or "umount failed"
-        raise RamdiskError("cannot unmount %s: %s" % (path, message))
+    return _mounts_umount_path(
+        path,
+        hardware,
+        trusted_system_binary=_trusted_system_binary,
+        run=_run,
+        privileged=_privileged,
+    )
 
 
 def _rollback_interrupted_mount(plan, mount, effective_thp, effective_noswap, cause):
-    """Remove a mount that completed just as its helper was interrupted."""
-    actual = _mount_at(mount["path"])
-    if actual is None:
-        return
-    attempted = dict(mount)
-    attempted["effective_thp"] = effective_thp
-    attempted["effective_noswap"] = effective_noswap
-    try:
-        _validate_mount(attempted, plan)
-    except Exception as verification_error:
-        raise RamdiskError(
-            "mount helper was interrupted and a mount now exists at %s, "
-            "but it cannot be attributed safely: %s"
-            % (mount["path"], verification_error)
-        ) from cause
-    try:
-        _umount_path(mount["path"], plan["hardware"])
-    except Exception as cleanup_error:
-        raise RamdiskError(
-            "mount helper was interrupted after tmpfs appeared at %s; "
-            "immediate rollback failed: %s"
-            % (mount["path"], cleanup_error)
-        ) from cause
-
-
-def _option_present(options, name):
-    return any(option == name or option.startswith(name + "=") for option in options)
+    return _mounts_rollback_interrupted_mount(
+        plan,
+        mount,
+        effective_thp,
+        effective_noswap,
+        cause,
+        mount_at=_mount_at,
+        validate_mount=_validate_mount,
+        umount_path=_umount_path,
+    )
 
 
 def _validate_mount(mount, plan):
-    actual = _mount_at(mount["path"])
-    if not actual:
-        raise RamdiskError("expected mount is absent: %s" % mount["path"])
-    if actual["filesystem"] != "tmpfs" or actual["source"] != "tmpfs":
-        raise RamdiskError("refusing foreign mount at %s" % mount["path"])
-    options = set(actual["options"] + actual["super_options"])
-    required = ("noatime", "nodev", "nosuid", "noexec")
-    missing = [name for name in required if not _option_present(options, name)]
-    if mount.get("effective_noswap", plan["mount_options"]["noswap"]):
-        if not _option_present(options, "noswap"):
-            missing.append("noswap")
-    if missing:
-        raise RamdiskError("tmpfs at %s is missing options: %s" % (mount["path"], ", ".join(missing)))
-    mode_ok = any(option in ("mode=700", "mode=0700") for option in options)
-    huge = mount.get("effective_thp", plan["mount_options"]["thp"])
-    policy = mount["policy"].replace("\\,", ",")
-    normalized_options = {option.replace("\\,", ",") for option in options}
-    if not mode_ok or not _option_present(normalized_options, "huge"):
-        raise RamdiskError("tmpfs at %s is missing managed mode/THP options" % mount["path"])
-    if "huge=%s" % huge not in normalized_options:
-        raise RamdiskError("tmpfs at %s has an unexpected THP policy" % mount["path"])
-    if "mpol=%s" % policy not in normalized_options:
-        raise RamdiskError("tmpfs at %s has an unexpected NUMA policy" % mount["path"])
-    actual["all_options"] = sorted(options)
-    return actual
+    return _mounts_validate_mount(
+        mount,
+        plan,
+        mount_at=_mount_at,
+    )
 
 
 def _available_memory():
-    values = _meminfo()
-    available = values.get("MemAvailable", values.get("MemFree", 0))
-    cgroup_available = _cgroup_available_memory()
-    return (
-        min(available, cgroup_available)
-        if cgroup_available is not None
-        else available
+    return _mounts_available_memory(
+        meminfo=_meminfo,
+        cgroup_available_memory=_cgroup_available_memory,
     )
 
 
 def _host_available_for_mount(mount, plan=None):
-    """Return host/NUMA availability without reusing shared cgroup headroom."""
-    if mount.get("node") is None:
-        nodes = (plan or {}).get("placement", {}).get("memory_nodes")
-        if nodes:
-            available = 0
-            for node in nodes:
-                values = _node_meminfo(int(node))
-                available += values.get("MemFree", values.get("MemAvailable", 0))
-            return available
-        values = _meminfo()
-        return values.get("MemAvailable", values.get("MemFree", 0))
-    values = _node_meminfo(int(mount["node"]))
-    return values.get("MemFree", values.get("MemAvailable", 0))
-
-
-def _available_for_mount(mount, plan=None):
-    available = _host_available_for_mount(mount, plan=plan)
-    cgroup_available = _cgroup_available_memory()
-    return (
-        min(available, cgroup_available)
-        if cgroup_available is not None
-        else available
+    return _mounts_host_available_for_mount(
+        mount,
+        plan=plan,
+        meminfo=_meminfo,
+        node_meminfo=_node_meminfo,
     )
 
 
-
-def _copy_stream(src, tmp, expected_size, cancel_event=None):
-    source_fd = os.open(src, os.O_RDONLY)
-    try:
-        destination_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-        try:
-            copied = 0
-            while copied < expected_size:
-                _raise_if_cancelled(cancel_event)
-                data = os.read(source_fd, min(8 * MIB, expected_size - copied))
-                if not data:
-                    raise RamdiskError("source shard was truncated while copying: %s" % src)
-                view = memoryview(data)
-                while view:
-                    written = os.write(destination_fd, view)
-                    if written <= 0:
-                        raise RamdiskError("short write while staging %s" % src)
-                    view = view[written:]
-                copied += len(data)
-            if os.read(source_fd, 1):
-                raise RamdiskError("source shard grew while copying: %s" % src)
-            os.fsync(destination_fd)
-        finally:
-            os.close(destination_fd)
-        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
-            try:
-                os.posix_fadvise(source_fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            except OSError:
-                pass
-    finally:
-        os.close(source_fd)
+def _available_for_mount(mount, plan=None):
+    return _mounts_available_for_mount(
+        mount,
+        plan=plan,
+        host_available_for_mount=_host_available_for_mount,
+        cgroup_available_memory=_cgroup_available_memory,
+    )
 
 
 def _copy_one(
@@ -1293,32 +953,15 @@ def _copy_one(
     available=None,
     cancel_event=None,
 ):
-    available = available or _available_memory
-    _raise_if_cancelled(cancel_event)
-    if available() < reserve_floor:
-        raise RamdiskError("available memory reached the protected reserve before %s" % os.path.basename(src))
-    tmp = destination + ".coli-copy-%d-%s" % (os.getpid(), secrets.token_hex(4))
-    started = time.monotonic()
-    try:
-        _copy_stream(src, tmp, expected_size, cancel_event=cancel_event)
-        os.chmod(tmp, 0o400)
-        if os.path.getsize(tmp) != expected_size:
-            raise RamdiskError("staged size mismatch for %s" % os.path.basename(src))
-        _read_safetensors_header(tmp)
-        os.replace(tmp, destination)
-        if progress:
-            progress(os.path.basename(src), expected_size, time.monotonic() - started)
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
-def _copy_worker_main(src, tmp, expected_size):
-    _copy_stream(src, tmp, int(expected_size))
-    os.chmod(tmp, 0o400)
-    return 0
+    return _mounts_copy_one(
+        src,
+        destination,
+        expected_size,
+        reserve_floor,
+        progress,
+        _available_memory if available is None else available,
+        cancel_event,
+    )
 
 
 def _copy_one_affined(
@@ -1333,258 +976,51 @@ def _copy_one_affined(
     available=None,
     cancel_event=None,
 ):
-    available = available or _available_memory
-    _raise_if_cancelled(cancel_event)
-    if available() < reserve_floor:
-        raise RamdiskError("available memory reached the protected reserve before replica copy")
-    tmp = destination + ".coli-copy-%d-%s" % (os.getpid(), secrets.token_hex(4))
-    started = time.monotonic()
-    command = [
-        numactl,
-        "--physcpubind=%s" % cpu_list,
-        "--membind=%d" % node,
-        sys.executable,
-        os.path.abspath(__file__),
-        "--copy-worker",
+    available = _available_memory if available is None else available
+    return _mounts_copy_one_affined(
         src,
-        tmp,
-        str(expected_size),
-    ]
-    try:
-        if cancel_event is None:
-            result = _run(command)
-        else:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            try:
-                while process.poll() is None:
-                    if cancel_event.wait(0.1):
-                        process.terminate()
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                        _raise_if_cancelled(cancel_event)
-                stdout, stderr = process.communicate()
-            except BaseException:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                raise
-            result = subprocess.CompletedProcess(
-                command,
-                process.returncode,
-                stdout,
-                stderr,
-            )
-        if result.returncode:
-            raise RamdiskError("node-affined replica copy failed: %s" % (result.stderr.strip() or result.stdout.strip()))
-        if os.path.getsize(tmp) != expected_size:
-            raise RamdiskError("replica size mismatch for %s" % os.path.basename(src))
-        _read_safetensors_header(tmp)
-        os.replace(tmp, destination)
-        if progress:
-            progress(os.path.basename(src), expected_size, time.monotonic() - started)
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        destination,
+        expected_size,
+        node,
+        numactl,
+        cpu_list,
+        reserve_floor,
+        progress,
+        available,
+        cancel_event,
+        run=_run,
+        worker_entrypoint=os.path.abspath(__file__),
+    )
 
 
 def _populate_mount(plan, mount, source_root=None, progress=None, cancel_event=None):
-    source_root = source_root or plan["model"]["path"]
-    selected = plan["staging"]["selected_shards"]
-    linked = plan["staging"]["linked_shards"]
-    identities = {item["name"]: item for item in plan["source_shards"]}
-    if mount.get("node") is None:
-        reserve_floor = (
-            plan["reserve"]["runtime_bytes"]
-            + plan["reserve"]["page_table_bytes"]
-            + plan["reserve"]["os_margin_bytes"]
-        )
-    else:
-        node_info = next(item for item in plan["hardware"]["nodes"] if item["id"] == mount["node"])
-        reserve_floor = (
-            plan["reserve"]["runtime_bytes"]
-            + plan["reserve"]["page_table_bytes"]
-            + node_info.get("reserve_bytes", 8 * GIB)
-        )
-    def available():
-        return _available_for_mount(mount, plan=plan)
-    workers = max(1, min(plan["parallel"], len(selected) or 1))
-    admission_lock = threading.Lock()
-    inflight = [0]
-
-    def copy_name(name):
-        _raise_if_cancelled(cancel_event)
-        source = os.path.join(source_root, name)
-        destination = os.path.join(mount["path"], name)
-        expected = identities[name]["size_bytes"]
-        with admission_lock:
-            observed = available()
-            if observed - inflight[0] - expected < reserve_floor:
-                raise RamdiskError("projected shard copies would breach the protected memory reserve")
-            inflight[0] += expected
-        try:
-            if source_root != plan["model"]["path"] and mount["node"] is not None:
-                return _copy_one_affined(
-                    source,
-                    destination,
-                    expected,
-                    mount["node"],
-                    plan["hardware"]["numactl"],
-                    _engine_cpu_list(plan, node=mount["node"]),
-                    reserve_floor,
-                    progress,
-                    available,
-                    cancel_event,
-                )
-            return _copy_one(
-                source,
-                destination,
-                expected,
-                reserve_floor,
-                progress,
-                available,
-                cancel_event,
-            )
-        finally:
-            with admission_lock:
-                inflight[0] -= expected
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(copy_name, name) for name in selected]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
-    _raise_if_cancelled(cancel_event)
-    for name in linked:
-        _raise_if_cancelled(cancel_event)
-        target = os.path.join(plan["model"]["path"], name)
-        destination = os.path.join(mount["path"], name)
-        os.symlink(target, destination)
-
-
-def _sample_page_indices(total_pages, sample_pages, node_count):
-    sample_pages = max(1, min(sample_pages, total_pages))
-    if sample_pages == total_pages:
-        return list(range(total_pages))
-    step = max(1, total_pages // sample_pages)
-    # A stride sharing a divisor with the node count can observe only one
-    # residue of an actually round-robin interleaved mapping. Advance to a
-    # coprime stride, then walk modulo the file page count deterministically.
-    while math.gcd(step, max(1, node_count)) != 1:
-        step += 1
-    indices = []
-    seen = set()
-    value = 0
-    while len(indices) < sample_pages:
-        if value not in seen:
-            indices.append(value)
-            seen.add(value)
-        value = (value + step) % total_pages
-        if value in seen and len(indices) < sample_pages:
-            value = (max(seen) + 1) % total_pages
-    return indices
-
-
-def _sample_numa_allocation(path, max_pages=1024, node_count=1):
-    """Touch a bounded page sample and report its /proc/self/numa_maps nodes."""
-    counts = {}
-    size = os.path.getsize(path)
-    if size <= 0:
-        return counts
-    with open(path, "rb") as stream:
-        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
-            total_pages = max(1, (size + 4095) // 4096)
-            pages = max(1, min(max_pages, total_pages))
-            for page in _sample_page_indices(total_pages, pages, node_count):
-                mapping[min(size - 1, page * 4096)]
-            needle = "file=" + path.replace(" ", "\\040")
-            for line in _read_text("/proc/self/numa_maps").splitlines():
-                if needle not in line and path not in line:
-                    continue
-                for node, value in re.findall(r"\bN(\d+)=(\d+)\b", line):
-                    counts[node] = counts.get(node, 0) + int(value)
-    return counts
+    return _mounts_populate_mount(
+        plan,
+        mount,
+        source_root=source_root,
+        progress=progress,
+        cancel_event=cancel_event,
+        available_for_mount=_available_for_mount,
+        copy_one=_copy_one,
+        copy_one_affined=_copy_one_affined,
+        engine_cpu_list=_engine_cpu_list,
+    )
 
 
 def _validate_namespace(plan, mount, sample_numa=True):
-    expected_names = sorted(item["name"] for item in plan["source_shards"])
-    actual_names = sorted(name for name in os.listdir(mount["path"]) if name.endswith(".safetensors"))
-    if actual_names != expected_names:
-        raise RamdiskError("staged namespace filenames do not match the canonical model")
-    identities = {item["name"]: item for item in plan["source_shards"]}
-    selected = set(plan["staging"]["selected_shards"])
-    linked = set(plan["staging"]["linked_shards"])
-    for name in expected_names:
-        path = os.path.join(mount["path"], name)
-        if name in selected:
-            if os.path.islink(path) or not stat.S_ISREG(os.stat(path).st_mode):
-                raise RamdiskError("staged shard is not a regular tmpfs file: %s" % name)
-            if os.path.getsize(path) != identities[name]["size_bytes"]:
-                raise RamdiskError("staged shard size mismatch: %s" % name)
-            if os.stat(path).st_mode & 0o222:
-                raise RamdiskError("staged shard is writable: %s" % name)
-            raw, _ = _read_safetensors_header(path)
-            if hashlib.sha256(raw).hexdigest() != identities[name]["header_sha256"]:
-                raise RamdiskError("staged shard header mismatch: %s" % name)
-        elif name in linked:
-            if not os.path.islink(path):
-                raise RamdiskError("unstaged shard is not an SSD fallback symlink: %s" % name)
-            canonical = os.path.join(plan["model"]["path"], name)
-            if os.path.realpath(path) != os.path.realpath(canonical):
-                raise RamdiskError("fallback symlink does not target the canonical shard: %s" % name)
-    allocation = {}
-    if not sample_numa:
-        return allocation
-    selected_names = plan["staging"]["selected_shards"]
-    placement_nodes = plan.get("placement", {}).get(
-        "memory_nodes", plan["hardware"]["online_nodes"]
+    return _mounts_validate_namespace(
+        plan,
+        mount,
+        sample_numa=sample_numa,
+        sample_numa_allocation=_sample_numa_allocation,
     )
-    pages_per_shard = max(32, min(1024, 4096 // max(1, len(selected_names))))
-    for name in selected_names:
-        path = os.path.join(mount["path"], name)
-        for node, count in _sample_numa_allocation(
-            path, pages_per_shard, node_count=len(placement_nodes)
-        ).items():
-            allocation[node] = allocation.get(node, 0) + count
-    online_nodes = plan.get("hardware", {}).get("online_nodes", placement_nodes)
-    verify_numa = len(placement_nodes) > 1 or len(online_nodes) > 1
-    if verify_numa:
-        total = sum(allocation.values())
-        if not total:
-            raise RamdiskError("could not verify actual NUMA allocation for staged shards")
-        outside = sum(
-            count for node, count in allocation.items() if int(node) not in placement_nodes
-        )
-        if float(outside) / total > 0.01:
-            raise RamdiskError(
-                "tmpfs sample escaped the reviewed NUMA memory-node mask"
-            )
-        if mount["node"] is not None:
-            local = allocation.get(str(mount["node"]), 0)
-            if float(local) / total < 0.95:
-                raise RamdiskError("node-local tmpfs sample is below 95%% local allocation")
-        elif len(placement_nodes) > 1:
-            ideal = float(total) / len(placement_nodes)
-            if any(
-                abs(allocation.get(str(node), 0) - ideal) / ideal > 0.15
-                for node in placement_nodes
-            ):
-                raise RamdiskError("interleaved tmpfs sample differs by more than 15%% across nodes")
-    return allocation
 
 
 def _source_still_matches(plan):
-    current = scan_model(plan["model"]["path"])
-    if current["fingerprint"] != plan["model"]["fingerprint"]:
-        raise RamdiskError("canonical model changed while staging; refusing to publish the manifest")
+    return _mounts_source_still_matches(
+        plan,
+        scan_model_fn=scan_model,
+    )
 
 
 def _confirm(message, accepted=False):
@@ -5153,7 +4589,7 @@ def _tui(stdscr, initial, cli_path, engine_path):
     def authorize_privileged_mounts():
         """Obtain sudo credentials before a worker can need the controlling TTY."""
         nonlocal message
-        if os.geteuid() == 0:
+        if current_euid() == 0:
             return True
         try:
             sudo = _trusted_system_binary("sudo")
