@@ -79,7 +79,10 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 **`ramdisk`** (Linux only)
 
 Run `coli ramdisk` in a terminal for the guided Textual server console, or select
-one of the equivalent scriptable actions. Source and flat-archive users can
+one of the equivalent scriptable actions. See the
+[RAM-workspace TUI guide](ramdisk-tui.md) for the complete screen workflow,
+keyboard controls, safety model, troubleshooting, and test strategy. Source
+and flat-archive users can
 install the supported interface with
 `python3 -m pip install -r c/requirements-tui.txt` from a source checkout, or
 `python3 -m pip install -r requirements-tui.txt` from an unpacked release
