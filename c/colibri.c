@@ -2390,6 +2390,8 @@ static void model_init_range(Model *m, const char *snap, int cap,
     if(load_boundaries){
         m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
         m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
+        if(c->arch==ARCH_M3) m->lm_head.vk_gemm=1;   /* 1.2 GB int8 read EVERY token: prime
+                                                      * COLI_VK_DENSE material (~28 -> ~3 ms) */
         m->final_norm = ld(m,"model.norm.weight");
     }
     m->L=calloc(c->n_layers,sizeof(Layer));
@@ -4260,6 +4262,31 @@ static void rms_head_g(float *v, const float *w, int n, float eps){  /* per-head
     float r=1.f/sqrtf((float)(ms/n)+eps);
     for(int i=0;i<n;i++) v[i]=v[i]*r*(w[i]+1.f);
 }
+/* f64 dot of two f32 vectors — the MSA indexer score. AVX2 4-lane double FMA:
+ * the scalar loop is the decode hot spot at long context (4 heads x ctx dots of
+ * IDX_D per layer per token; ~4 GFLOP/token at 64K). Lane-order rounding may
+ * differ from the scalar sum by ~1 ulp — selection is a max/top-k over well-
+ * separated scores, so ranking is unaffected (validated by the tiny REF gate). */
+static inline double msa_idx_dot(const float *a, const float *b, int n){
+#ifdef __AVX2__
+    __m256d s0=_mm256_setzero_pd(), s1=_mm256_setzero_pd();
+    int i=0;
+    for(;i+8<=n;i+=8){
+        s0=_mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(a+i)),
+                           _mm256_cvtps_pd(_mm_loadu_ps(b+i)),s0);
+        s1=_mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(a+i+4)),
+                           _mm256_cvtps_pd(_mm_loadu_ps(b+i+4)),s1);
+    }
+    __m256d sv=_mm256_add_pd(s0,s1);
+    __m128d lo=_mm_add_pd(_mm256_castpd256_pd128(sv),_mm256_extractf128_pd(sv,1));
+    double d=_mm_cvtsd_f64(lo)+_mm_cvtsd_f64(_mm_unpackhi_pd(lo,lo));
+    for(;i<n;i++) d+=(double)a[i]*b[i];
+    return d;
+#else
+    double d=0; for(int i=0;i<n;i++) d+=(double)a[i]*b[i];
+    return d;
+#endif
+}
 static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                           KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, NK=c->n_kv_heads, hd=c->head_dim;
@@ -4268,8 +4295,15 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
     float *q=falloc((int64_t)S*H*hd), *k=falloc((int64_t)S*KVd), *v=falloc((int64_t)S*KVd);
     float *ctx=falloc((int64_t)S*H*hd);
     double tp0=now_s();
-    matmul_qt(q,x,&l->q_p,S);
-    matmul_qt(k,x,&l->k_p,S);
+    int qk_vk=0; (void)qk_vk;
+#ifdef COLI_VULKAN
+    /* q+k share x and one submit: k_p's 3 MB rides q_p's dispatch for free (a
+     * lone k submit would cost more than its CPU read, hence no solo offload). */
+    if(g_vulkan && g_vk_dense && l->q_p.vk_gemm && !spec_pinned() && !omp_in_parallel()
+       && (S>=8 || qt_bytes(&l->q_p) >= (int64_t)g_vk_gemm_mb<<20))
+        qk_vk = vk_matmul_pair_qt(&l->q_p,q,&l->k_p,k,x,S);
+#endif
+    if(!qk_vk){ matmul_qt(q,x,&l->q_p,S); matmul_qt(k,x,&l->k_p,S); }
     matmul_qt(v,x,&l->v_p,S);
     /* MSA Lightning Indexer (sparse layers): a small IDX_H-head scoring branch that picks
      * the top-k key BLOCKS per query, so the main attention only reads those blocks. idx_q/
@@ -4301,21 +4335,27 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
     }
     if(is_sparse){                               /* block selection: top-k blocks per (s, index head) */
         sel=malloc((size_t)S*IDX_H*TOPK*sizeof(int));
+        #pragma omp parallel for schedule(static) if(S>4)   /* rows independent; Ic rows <= pos
+                                                             * were all mirrored above */
         for(int s=0;s<S;s++){
             KVState *ks=kvs?kvs[s]:m->kv;
             int pos=positions?positions[s]:pos_base+s, st0=ks->kv_start[layer];
             const float *Ic0=ks->Ic[layer]; int nblk=pos/BLK+1;
-            double *bscore=malloc((size_t)nblk*sizeof(double)); float *iqs=iq+(int64_t)s*IDX_H*IDX_D;
-            for(int hi=0;hi<IDX_H;hi++){
-                const float *ih=iqs+(int64_t)hi*IDX_D;
-                for(int b=0;b<nblk;b++) bscore[b]=-1e300;
-                for(int t=st0;t<=pos;t++){        /* max-pool index score into blocks (f64 like the ref) */
-                    const float *kt=Ic0+(int64_t)t*IDX_D;
-                    double d=0; for(int i=0;i<IDX_D;i++) d+=(double)ih[i]*kt[i];
-                    int b=t/BLK; if(d>bscore[b]) bscore[b]=d;
+            double *bscore=malloc((size_t)IDX_H*nblk*sizeof(double)); float *iqs=iq+(int64_t)s*IDX_H*IDX_D;
+            for(int j=0;j<IDX_H*nblk;j++) bscore[j]=-1e300;
+            for(int t=st0;t<=pos;t++){            /* max-pool index scores into blocks (f64 like the
+                                                   * ref); t-outer: each cached key row is read once
+                                                   * for all IDX_H heads instead of IDX_H times */
+                const float *kt=Ic0+(int64_t)t*IDX_D; int b=t/BLK;
+                for(int hi=0;hi<IDX_H;hi++){
+                    double d=msa_idx_dot(iqs+(int64_t)hi*IDX_D,kt,IDX_D);
+                    if(d>bscore[(int64_t)hi*nblk+b]) bscore[(int64_t)hi*nblk+b]=d;
                 }
+            }
+            for(int hi=0;hi<IDX_H;hi++){
+                double *bs=bscore+(int64_t)hi*nblk;
                 int qb=pos/BLK;                  /* local blocks always selected */
-                for(int lb=0;lb<LOCAL;lb++){ int bb=qb-lb; if(bb>=0) bscore[bb]=1e300; }
+                for(int lb=0;lb<LOCAL;lb++){ int bb=qb-lb; if(bb>=0) bs[bb]=1e300; }
                 int topk = TOPK<nblk?TOPK:nblk;
                 int *sg=&sel[((int64_t)s*IDX_H+hi)*TOPK];
                 for(int j=0;j<TOPK;j++) sg[j]=-1;
@@ -4323,7 +4363,7 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
                     int best=-1; double bv=-1e300;
                     for(int b=0;b<nblk;b++){ int taken=0;
                         for(int p=0;p<j;p++) if(sg[p]==b){taken=1;break;}
-                        if(!taken && bscore[b]>bv){ bv=bscore[b]; best=b; } }
+                        if(!taken && bs[b]>bv){ bv=bs[b]; best=b; } }
                     sg[j]=best;
                 }
             }
@@ -6525,12 +6565,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #endif
     if(!shared_cuda){
 #ifdef COLI_VULKAN
-        /* Whole shared expert as ONE fused submit (gate+up+silu -> down, hidden on-device)
+        /* Whole shared expert as ONE fused submit (gate+up+act -> down, hidden on-device)
          * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
-         * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
+         * (x read once, 1 fence instead of 3). The gate_up shader takes the activation
+         * as a push constant (silu/swigluoai, coli_vk_set_activation) so M3 qualifies;
+         * fmt=4 rides the same grouped-int4 path the expert tier uses. Falls through
+         * to the per-matmul chain on any mismatch. */
         int fsh=l->sh_gate.fmt;
-        if(g_vk_dense && !g_act_swigluoai && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
-           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){   /* fused shader hardcodes silu — M3 uses the per-matmul chain */
+        if(g_vk_dense && !omp_in_parallel() &&
+           (fsh==1||fsh==2||fsh==5||(fsh==4 && l->sh_gate.gs>=8 && l->sh_gate.gs%8==0)) &&
+           l->sh_up.fmt==fsh && l->sh_up.gs==l->sh_gate.gs && l->sh_down.fmt==fsh &&
+           (fsh!=4 || (l->sh_down.gs>=8 && l->sh_down.gs%8==0))){
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
             if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
                coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
@@ -9584,11 +9629,13 @@ static void vk_dense_preload(Model *m){
 
 static void vk_registry_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
-    if(!g_vulkan || g_vk_budget<=0) return;
+    if(!g_vulkan) return;
     /* The fused gate+up shader selects its activation via a push constant — silu for GLM,
      * swigluoai for MiniMax-M3 — so the expert tier runs on any of our arches. Set the
-     * model's choice once here, before the tier fills (all gate_up dispatches read it). */
+     * model's choice BEFORE any early return: the fused shared-expert path dispatches
+     * gate_up too, even when the tier is empty or disabled (COLI_VK_EXPERTS=0). */
     coli_vk_set_activation(g_act_swigluoai, c->swiglu_alpha, c->swiglu_limit);
+    if(g_vk_budget<=0) return;
     int64_t nz=0;
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
     if(!nz){ fprintf(stderr,"[VK] expert tier: no usage history yet — tier empty this run "
