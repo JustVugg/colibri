@@ -1,7 +1,7 @@
 # Cross-Platform RAM-Disk Refactor Design
 
-**Status:** Approved for implementation  
-**Date:** 2026-07-23  
+**Status:** Approved for implementation
+**Date:** 2026-07-23
 **Scope:** Pull request #377 review feedback, cross-platform testability, and maintainability of the RAM-disk control plane
 
 ## Context

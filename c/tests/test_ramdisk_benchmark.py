@@ -573,4 +573,3 @@ class BenchmarkTest(unittest.TestCase):
 
         score.assert_called_once()
         aggregate.assert_not_called()
-

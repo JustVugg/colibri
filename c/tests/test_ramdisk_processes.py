@@ -289,4 +289,3 @@ class ManagedLaunchTest(unittest.TestCase):
 
         merge.assert_called_once()
         self.assertTrue(merge.call_args.kwargs["keep_journal"])
-

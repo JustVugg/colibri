@@ -461,4 +461,3 @@ class StateAndSafetyTest(unittest.TestCase):
         with mock.patch.object(ramdisk, "_filesystem_for_path", return_value="tmpfs"):
             with self.assertRaisesRegex(ramdisk.RamdiskError, "volatile"):
                 ramdisk._load_manifest(required=True)
-

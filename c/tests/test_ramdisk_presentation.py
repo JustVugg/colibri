@@ -620,4 +620,3 @@ class TuiPlacementContractTest(unittest.TestCase):
         rendered = "\n".join(screen.output)
         self.assertIn("Single shared model", rendered)
         self.assertIn("1 complete model copy", rendered)
-

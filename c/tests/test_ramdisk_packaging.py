@@ -410,7 +410,23 @@ class RamdiskPackagingTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("incomplete colocated support bundle", result.stderr)
-        self.assertIn("version.py", result.stderr)
+        self.assertIn("resource_plan.py", result.stderr)
+
+    def test_complete_support_bundle_tolerates_missing_version_metadata(self):
+        with tempfile.TemporaryDirectory() as stage:
+            release_dir = Path(stage) / "release"
+            release_dir.mkdir()
+            shutil.copy2(C_DIR / "coli", release_dir / "coli")
+            copy_support(release_dir, exclude=("version.py",))
+
+            result = subprocess.run(
+                [sys.executable, str(release_dir / "coli"), "--version"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), "colibri unknown")
 
     def test_nix_package_uses_current_engine_and_runs_python_tests(self):
         flake = (ROOT / "flake.nix").read_text(encoding="utf-8")

@@ -530,4 +530,3 @@ class ScanAndPlanTest(unittest.TestCase):
         for nodes in (2, 4):
             indices = ramdisk._sample_page_indices(4096, 256, nodes)
             self.assertEqual({index % nodes for index in indices}, set(range(nodes)))
-
