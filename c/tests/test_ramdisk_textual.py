@@ -641,7 +641,9 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             # this worker. Run this UI-only cancellation test as an already
             # authorized/root operation so the keepalive correctly does not
             # interpret the missing test credential as an expiry.
-            with mock.patch.object(ramdisk.os, "geteuid", return_value=0):
+            with mock.patch.object(
+                ramdisk.os, "geteuid", return_value=0, create=True
+            ):
                 app._begin_operation(
                     "prepare",
                     "Preparing test workspace",
