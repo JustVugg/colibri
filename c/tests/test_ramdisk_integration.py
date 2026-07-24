@@ -77,21 +77,32 @@ class RealTmpfsLifecycleTest(unittest.TestCase):
                 ]
                 with mock.patch.object(ramdisk, "build_plan", return_value=plan):
                     prepared = ramdisk.prepare(args, display_plan=False)
-                self.assertEqual(prepared["state"], "ready")
-                report = ramdisk.status()
-                self.assertTrue(report["source_fingerprint_verified"])
-                self.assertTrue(all(item["verified"] for item in report["mounts"]))
-                self.assertEqual(
-                    {item["filesystem"] for item in report["mounts"]}, {"tmpfs"}
-                )
-                durable_kv = Path(ramdisk._state_root()) / "engines" / "preserved" / ".coli_kv"
-                durable_kv.parent.mkdir(parents=True, mode=0o700)
-                durable_kv.write_bytes(b"durable-test-state")
-                destroyed = ramdisk.destroy(argparse.Namespace(yes=True))
-                self.assertTrue(destroyed["destroyed"])
-                self.assertFalse(os.path.ismount(mount_root))
-                self.assertEqual(ramdisk.status()["state"], "absent")
-                self.assertEqual(durable_kv.read_bytes(), b"durable-test-state")
+                cleanup_needed = True
+                try:
+                    self.assertEqual(prepared["state"], "ready")
+                    report = ramdisk.status()
+                    self.assertTrue(report["source_fingerprint_verified"])
+                    self.assertTrue(all(item["verified"] for item in report["mounts"]))
+                    self.assertEqual(
+                        {item["filesystem"] for item in report["mounts"]}, {"tmpfs"}
+                    )
+                    durable_kv = (
+                        Path(ramdisk._state_root())
+                        / "engines"
+                        / "preserved"
+                        / ".coli_kv"
+                    )
+                    durable_kv.parent.mkdir(parents=True, mode=0o700)
+                    durable_kv.write_bytes(b"durable-test-state")
+                    destroyed = ramdisk.destroy(argparse.Namespace(yes=True))
+                    self.assertTrue(destroyed["destroyed"])
+                    cleanup_needed = False
+                    self.assertFalse(os.path.ismount(mount_root))
+                    self.assertEqual(ramdisk.status()["state"], "absent")
+                    self.assertEqual(durable_kv.read_bytes(), b"durable-test-state")
+                finally:
+                    if cleanup_needed:
+                        ramdisk.destroy(argparse.Namespace(yes=True))
             after_swap = ramdisk.discover_hardware()["swap"]["used_bytes"]
             self.assertLessEqual(after_swap, before_swap)
 
