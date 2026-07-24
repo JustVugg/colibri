@@ -22,12 +22,43 @@ SUPPORT_MODULES = (
     "ramdisk_ui.py",
     "ramdisk_textual.py",
 )
+SUPPORT_PACKAGE = "ramdisk_support"
+REQUIRED_SUPPORT_PACKAGE_MODULES = (
+    "__init__.py",
+    "benchmark.py",
+    "cli.py",
+    "common.py",
+    "curses_ui.py",
+    "discovery.py",
+    "linux_ops.py",
+    "lifecycle.py",
+    "model.py",
+    "mounts.py",
+    "planning.py",
+    "platform_ops.py",
+    "presentation.py",
+    "processes.py",
+    "state.py",
+)
 
 
-def copy_support(destination, exclude=()):
+def copy_support(destination, exclude=(), package_exclude=()):
     for name in SUPPORT_MODULES:
         if name not in exclude:
             shutil.copy2(C_DIR / name, destination / name)
+    if SUPPORT_PACKAGE not in exclude:
+        package_destination = destination / SUPPORT_PACKAGE
+        shutil.copytree(
+            C_DIR / SUPPORT_PACKAGE,
+            package_destination,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        for name in package_exclude:
+            path = package_destination / name
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
 
 class RamdiskPackagingTest(unittest.TestCase):
@@ -47,14 +78,9 @@ class RamdiskPackagingTest(unittest.TestCase):
             for name in ("pyproject.toml", "README.md", "LICENSE"):
                 shutil.copy2(ROOT / name, source / name)
             shutil.copytree(ROOT / "colibri", source / "colibri")
-            for name in (
-                "__init__.py",
-                "coli",
-                "requirements-tui.txt",
-                "download_fp8.py",
-                *SUPPORT_MODULES,
-            ):
+            for name in ("__init__.py", "coli", "requirements-tui.txt", "download_fp8.py"):
                 shutil.copy2(C_DIR / name, runtime / name)
+            copy_support(runtime)
             shutil.copytree(C_DIR / "tools", runtime / "tools")
 
             subprocess.run(
@@ -79,6 +105,8 @@ class RamdiskPackagingTest(unittest.TestCase):
                 members = set(wheel.namelist())
                 for name in ("coli", "requirements-tui.txt", *SUPPORT_MODULES):
                     self.assertIn(f"c/{name}", members)
+                for name in REQUIRED_SUPPORT_PACKAGE_MODULES:
+                    self.assertIn(f"c/{SUPPORT_PACKAGE}/{name}", members)
                 wheel.extractall(installed)
 
             smoke = subprocess.run(
@@ -124,6 +152,11 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn("ramdisk.py", result.stdout)
         self.assertIn("ramdisk_ui.py", result.stdout)
         self.assertIn("ramdisk_textual.py", result.stdout)
+        self.assertIn('rm -rf "', result.stdout)
+        self.assertIn("/ramdisk_support", result.stdout)
+        self.assertIn("install -d -m 755", result.stdout)
+        self.assertIn("install -m 644 ramdisk_support/*.py", result.stdout)
+        self.assertNotIn("cp -R ramdisk_support", result.stdout)
         self.assertIn("requirements-tui.txt", result.stdout)
         self.assertIn("version.py", result.stdout)
         self.assertIn("coli.libexec", result.stdout)
@@ -213,6 +246,10 @@ class RamdiskPackagingTest(unittest.TestCase):
             (stale_dir / "ramdisk_ui.py").write_text(
                 'raise RuntimeError("stale UI loaded")\n', encoding="utf-8"
             )
+            (stale_dir / SUPPORT_PACKAGE / "planning.py").write_text(
+                'raise RuntimeError("stale planning loaded")\n',
+                encoding="utf-8",
+            )
 
             result = subprocess.run(
                 [sys.executable, str(release_dir / "coli"), "ramdisk", "--help"],
@@ -222,6 +259,36 @@ class RamdiskPackagingTest(unittest.TestCase):
             )
 
         self.assertIn("interleaved = one shared model copy", result.stdout)
+
+    def test_symlinked_support_package_cannot_mix_bundle_generations(self):
+        with tempfile.TemporaryDirectory() as stage:
+            root = Path(stage)
+            release_dir = root / "release"
+            sibling_dir = root / "libexec" / "colibri"
+            release_dir.mkdir()
+            sibling_dir.mkdir(parents=True)
+            shutil.copy2(C_DIR / "coli", release_dir / "coli")
+            copy_support(release_dir, exclude=(SUPPORT_PACKAGE,))
+            copy_support(sibling_dir)
+            try:
+                os.symlink(
+                    sibling_dir / SUPPORT_PACKAGE,
+                    release_dir / SUPPORT_PACKAGE,
+                    target_is_directory=True,
+                )
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest("directory symlinks are unavailable: %s" % exc)
+
+            result = subprocess.run(
+                [sys.executable, str(release_dir / "coli"), "ramdisk", "--help"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe colocated support bundle", result.stderr)
+        self.assertIn("ramdisk_support/", result.stderr)
 
     def test_installed_support_wins_over_stale_engine_override_bundle(self):
         with tempfile.TemporaryDirectory() as stage:
@@ -276,6 +343,50 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn("incomplete colocated support bundle", result.stderr)
         self.assertIn("ramdisk_ui.py", result.stderr)
 
+    def test_missing_support_package_cannot_mix_with_complete_sibling_install(self):
+        with tempfile.TemporaryDirectory() as stage:
+            root = Path(stage)
+            release_dir = root / "release"
+            sibling_dir = root / "libexec" / "colibri"
+            release_dir.mkdir()
+            sibling_dir.mkdir(parents=True)
+            shutil.copy2(C_DIR / "coli", release_dir / "coli")
+            copy_support(release_dir, exclude=(SUPPORT_PACKAGE,))
+            copy_support(sibling_dir)
+
+            result = subprocess.run(
+                [sys.executable, str(release_dir / "coli"), "ramdisk", "--help"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incomplete colocated support bundle", result.stderr)
+        self.assertIn("ramdisk_support/", result.stderr)
+
+    def test_partial_support_package_cannot_mix_with_complete_sibling_install(self):
+        with tempfile.TemporaryDirectory() as stage:
+            root = Path(stage)
+            release_dir = root / "release"
+            sibling_dir = root / "libexec" / "colibri"
+            release_dir.mkdir()
+            sibling_dir.mkdir(parents=True)
+            shutil.copy2(C_DIR / "coli", release_dir / "coli")
+            copy_support(release_dir, package_exclude=("planning.py",))
+            copy_support(sibling_dir)
+
+            result = subprocess.run(
+                [sys.executable, str(release_dir / "coli"), "ramdisk", "--help"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incomplete colocated support bundle", result.stderr)
+        self.assertIn("ramdisk_support/planning.py", result.stderr)
+
     def test_partial_launcher_directory_cannot_shadow_complete_engine_bundle(self):
         with tempfile.TemporaryDirectory() as stage:
             root = Path(stage)
@@ -306,12 +417,20 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn("c/ramdisk.py", flake)
         self.assertIn("c/ramdisk_ui.py", flake)
         self.assertIn("c/ramdisk_textual.py", flake)
+        self.assertIn("install -d -m 755 $out/lib/colibri/ramdisk_support", flake)
+        self.assertIn(
+            "install -m 644 c/ramdisk_support/*.py "
+            "$out/lib/colibri/ramdisk_support/",
+            flake,
+        )
+        self.assertNotIn("cp -R c/ramdisk_support", flake)
         self.assertIn("textual", flake)
         self.assertIn('make -C c colibri ARCH="$ARCH"', flake)
         self.assertIn("cp c/colibri", flake)
         self.assertIn('COLI_ENGINE "$out/lib/colibri/colibri"', flake)
         self.assertIn('program = "${colibri}/bin/glm";', flake)
         self.assertIn("nativeCheckInputs = [pythonEnv];", flake)
+        self.assertIn("export PYTHONDONTWRITEBYTECODE=1", flake)
         self.assertIn("make test\n", flake)
         self.assertNotIn("make test-c\n", flake)
 
@@ -324,10 +443,17 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn("cp c/ramdisk.py dist/", workflow)
         self.assertIn("cp c/ramdisk_ui.py dist/", workflow)
         self.assertIn("cp c/ramdisk_textual.py dist/", workflow)
+        self.assertIn("mkdir -p dist/ramdisk_support", workflow)
+        self.assertIn(
+            "cp c/ramdisk_support/*.py dist/ramdisk_support/",
+            workflow,
+        )
+        self.assertNotIn("cp -R c/ramdisk_support", workflow)
         self.assertIn("cp c/requirements-tui.txt dist/", workflow)
         self.assertIn("python3 coli ramdisk --help", workflow)
         self.assertIn(
-            "python3 -m py_compile ramdisk.py ramdisk_ui.py ramdisk_textual.py",
+            "python3 -m compileall -q ramdisk.py ramdisk_ui.py "
+            "ramdisk_textual.py ramdisk_support",
             workflow,
         )
         self.assertIn(
@@ -336,9 +462,32 @@ class RamdiskPackagingTest(unittest.TestCase):
             workflow,
         )
         self.assertIn("import ramdisk_textual", workflow)
+        self.assertIn("pkgutil.walk_packages", workflow)
+        self.assertIn("packaged RAM-disk support contains generated artifacts", workflow)
         self.assertIn('grep -Fq "interleaved = one shared model copy"', workflow)
         self.assertNotIn("python3 coli info 2>&1 || true", workflow)
         self.assertNotIn("make glm ${{ matrix.make_args }}", workflow)
+
+    def test_setuptools_discovers_ramdisk_support_recursively(self):
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"c.ramdisk_support*"', pyproject)
+
+    def test_launcher_bundle_contract_lists_every_support_module(self):
+        discovered = {
+            path.name
+            for path in (C_DIR / SUPPORT_PACKAGE).glob("*.py")
+        }
+        self.assertEqual(discovered, set(REQUIRED_SUPPORT_PACKAGE_MODULES))
+        nested = [
+            path.relative_to(C_DIR / SUPPORT_PACKAGE).as_posix()
+            for path in (C_DIR / SUPPORT_PACKAGE).rglob("*.py")
+            if path.parent != C_DIR / SUPPORT_PACKAGE
+        ]
+        self.assertEqual(
+            nested,
+            [],
+            "release/install packaging intentionally requires a flat support package",
+        )
 
     def test_clean_removes_current_and_legacy_engine_names(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -346,6 +495,14 @@ class RamdiskPackagingTest(unittest.TestCase):
             artifacts = [root / name for name in ("colibri", "colibri.exe", "glm", "glm.exe")]
             tests_dir = root / "tests"
             tests_dir.mkdir()
+            cache_dirs = [
+                root / "__pycache__",
+                root / "ramdisk_support" / "__pycache__",
+                tests_dir / "__pycache__",
+            ]
+            for cache_dir in cache_dirs:
+                cache_dir.mkdir(parents=True)
+                (cache_dir / "stale.pyc").write_bytes(b"bytecode")
             artifacts.extend(
                 tests_dir / name
                 for name in ("test_resource_masks", "test_e8_kernel")
@@ -361,6 +518,7 @@ class RamdiskPackagingTest(unittest.TestCase):
                 check=True,
             )
             self.assertTrue(all(not artifact.exists() for artifact in artifacts))
+            self.assertTrue(all(not cache_dir.exists() for cache_dir in cache_dirs))
 
     def test_environment_reference_documents_rammap_contract(self):
         reference = (ROOT / "docs" / "ENVIRONMENT.md").read_text(encoding="utf-8")

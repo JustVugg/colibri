@@ -53,7 +53,7 @@ version = {attr = "colibri._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["colibri*", "c", "c.tools"]
+include = ["colibri*", "c", "c.tools", "c.ramdisk_support*"]
 namespaces = false
 
 [tool.setuptools.package-data]

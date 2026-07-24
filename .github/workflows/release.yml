@@ -111,6 +111,8 @@ jobs:
           cp c/ramdisk.py dist/
           cp c/ramdisk_ui.py dist/
           cp c/ramdisk_textual.py dist/
+          mkdir -p dist/ramdisk_support
+          cp c/ramdisk_support/*.py dist/ramdisk_support/
           cp c/requirements-tui.txt dist/
           cp LICENSE dist/
           # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
@@ -178,7 +180,11 @@ jobs:
           grep -Fq "interleaved = one shared model copy" ramdisk-help.txt || {
             echo "FAIL: packaged RAM-disk UI modules did not load"; exit 1;
           }
-          python3 -m py_compile ramdisk.py ramdisk_ui.py ramdisk_textual.py
+          test -z "$(find ramdisk_support -type f ! -name '*.py' -print -quit)" || {
+            echo "FAIL: packaged RAM-disk support contains generated artifacts"; exit 1;
+          }
+          python3 -m compileall -q ramdisk.py ramdisk_ui.py ramdisk_textual.py ramdisk_support
+          PYTHONPATH=. python3 -c "import pkgutil, ramdisk_support; [__import__(item.name) for item in pkgutil.walk_packages(ramdisk_support.__path__, ramdisk_support.__name__ + '.')]"
           test -f requirements-tui.txt || {
             echo "FAIL: packaged Textual dependency contract is missing"; exit 1;
           }

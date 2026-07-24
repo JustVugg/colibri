@@ -71,6 +71,24 @@ _SUPPORT_MODULES = (
     "ramdisk_ui.py",
     "ramdisk_textual.py",
 )
+_SUPPORT_PACKAGE = "ramdisk_support"
+_SUPPORT_PACKAGE_MODULES = (
+    "__init__.py",
+    "benchmark.py",
+    "cli.py",
+    "common.py",
+    "curses_ui.py",
+    "discovery.py",
+    "linux_ops.py",
+    "lifecycle.py",
+    "model.py",
+    "mounts.py",
+    "planning.py",
+    "platform_ops.py",
+    "presentation.py",
+    "processes.py",
+    "state.py",
+)
 _engine_module_dir = (
     os.path.dirname(os.path.abspath(os.environ["COLI_ENGINE"]))
     if os.environ.get("COLI_ENGINE")
@@ -80,15 +98,45 @@ _engine_module_dir = (
 def _support_presence(directory):
     if not directory or not os.path.isdir(directory):
         return ()
-    return tuple(
+    present = [
         name for name in _SUPPORT_MODULES if os.path.isfile(os.path.join(directory, name))
-    )
+    ]
+    package_path = os.path.join(directory, _SUPPORT_PACKAGE)
+    if os.path.lexists(package_path):
+        present.append(_SUPPORT_PACKAGE + "/")
+    return tuple(present)
 
 def _complete_support(directory, label):
     present = _support_presence(directory)
     if not present:
         return False
-    missing = tuple(name for name in _SUPPORT_MODULES if name not in present)
+    missing = [name for name in _SUPPORT_MODULES if name not in present]
+    unsafe = [
+        name
+        for name in _SUPPORT_MODULES
+        if os.path.islink(os.path.join(directory, name))
+    ]
+    package_path = os.path.join(directory, _SUPPORT_PACKAGE)
+    if os.path.islink(package_path):
+        unsafe.append(_SUPPORT_PACKAGE + "/")
+    if not os.path.isdir(package_path):
+        missing.append(_SUPPORT_PACKAGE + "/")
+    else:
+        missing.extend(
+            _SUPPORT_PACKAGE + "/" + name
+            for name in _SUPPORT_PACKAGE_MODULES
+            if not os.path.isfile(os.path.join(package_path, name))
+        )
+        unsafe.extend(
+            _SUPPORT_PACKAGE + "/" + name
+            for name in _SUPPORT_PACKAGE_MODULES
+            if os.path.islink(os.path.join(package_path, name))
+        )
+    if unsafe:
+        raise SystemExit(
+            "coli: unsafe %s support bundle at %s; symlinked %s"
+            % (label, directory, ", ".join(unsafe))
+        )
     if missing:
         raise SystemExit(
             "coli: incomplete %s support bundle at %s; missing %s"
@@ -112,8 +160,8 @@ else:
         % _CONVENTIONAL_LIBEXEC
     )
 
-# A support bundle is an atomic versioned unit. Remove every candidate path,
-# including the launcher's automatic sys.path[0], then expose exactly one.
+# Select one complete support directory tree. Remove every competing candidate
+# path, including the launcher's automatic sys.path[0], then expose exactly one.
 for _candidate in (HERE, _LIBEXEC, _CONVENTIONAL_LIBEXEC, _engine_module_dir):
     while _candidate and _candidate in sys.path:
         sys.path.remove(_candidate)
@@ -128,7 +176,7 @@ except ModuleNotFoundError:
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py,
-# ramdisk.py, ramdisk_ui.py, ramdisk_textual.py) and
+# ramdisk.py, ramdisk_ui.py, ramdisk_textual.py, ramdisk_support/) and
 # tools/ all live next to this script — unchanged from before.
 #
 # Installed layout ("make install"): this script is $(PREFIX)/bin/coli,

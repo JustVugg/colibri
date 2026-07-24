@@ -38,7 +38,11 @@ TEST_GLOBS = [
     for suffix in ("", ".exe")
 ]
 # Directories to remove.
-DIRS = ["tests/__pycache__"]
+DIRS = [
+    "__pycache__",
+    "ramdisk_support/__pycache__",
+    "tests/__pycache__",
+]
 
 removed = 0
 for f in FILES:
