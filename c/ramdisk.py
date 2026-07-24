@@ -57,6 +57,18 @@ from ramdisk_support.curses_ui import (
     _tui_review_scroll,
     _tui_wrap_rows,
 )
+from ramdisk_support.cli import (
+    _add_lifecycle_options as _cli_add_lifecycle_options,
+    _cli_exit_after_signal,
+    _cli_termination_guard,
+    _confirm as _cli_confirm,
+    _json_print as _cli_json_print,
+    _load_textual_frontend as _cli_load_textual_frontend,
+    _textual_dependency_missing as _cli_textual_dependency_missing,
+    configure_parser as _cli_configure_parser,
+    dispatch as _cli_dispatch,
+    launch_tui as _cli_launch_tui,
+)
 from ramdisk_support.benchmark import (
     BENCHMARK_PROMPT,
     _aggregate_score as _benchmark_aggregate_score,
@@ -300,121 +312,21 @@ def build_plan(args, hardware=None, model=None):
 
 
 def _add_lifecycle_options(parser, suppress=False):
-    default = argparse.SUPPRESS if suppress else None
-    # ``coli`` already supplies --model/--ctx on the outer ramdisk parser via
-    # its common parent.  Add them only when this module is used standalone;
-    # the action-local parser always receives suppressing copies so the same
-    # options can also appear after ``plan``/``prepare`` without overwriting a
-    # value parsed before the action.
-    if "--model" not in parser._option_string_actions:
-        parser.add_argument("--model", default=default, help="canonical model directory on durable storage")
-    parser.add_argument(
-        "--mode",
-        choices=("full", "partial"),
-        default=argparse.SUPPRESS if suppress else "full",
-        help="stage the full model or profile-selected shard closures",
+    return _cli_add_lifecycle_options(
+        parser,
+        suppress=suppress,
     )
-    parser.add_argument(
-        "--topology",
-        choices=("interleaved", "per-node"),
-        default=argparse.SUPPRESS if suppress else "interleaved",
-        help=(
-            "interleaved = one shared model copy and one engine; per-node = one complete "
-            "copy and independent engine per NUMA node (replication, not sharding)"
-        ),
-    )
-    parser.add_argument(
-        "--memory-nodes",
-        default=default,
-        metavar="NODELIST",
-        help=(
-            "effective NUMA memory nodes (for example 0-3,8); defaults to allowed "
-            "CPU-bearing nodes"
-        ),
-    )
-    parser.add_argument(
-        "--cpu-list",
-        default=default,
-        metavar="CPULIST",
-        help=(
-            "whole-core managed-engine CPUs (for example 0-15,32-47); defaults "
-            "to allowed CPUs on the selected memory nodes"
-        ),
-    )
-    parser.add_argument(
-        "--capacity-gb",
-        type=float,
-        default=default,
-        help="per-copy staging budget; required for partial mode",
-    )
-    parser.add_argument("--profile", default=default, help="compatible .coli_usage text or JSON profile")
-    parser.add_argument(
-        "--mount-root",
-        default=argparse.SUPPRESS if suppress else DEFAULT_MOUNT_ROOT,
-        help="managed tmpfs root below /mnt",
-    )
-    parser.add_argument(
-        "--thp",
-        choices=("auto", "within_size", "advise"),
-        default=argparse.SUPPRESS if suppress else "auto",
-        help="transparent huge-page policy for tmpfs",
-    )
-    parser.add_argument(
-        "--allow-swappable",
-        action="store_true",
-        default=argparse.SUPPRESS if suppress else False,
-        help="allow tmpfs without noswap support",
-    )
-    parser.add_argument(
-        "--prefault",
-        type=int,
-        choices=(0, 1),
-        default=default,
-        help="touch direct mappings at engine startup",
-    )
-    parser.add_argument(
-        "--parallel",
-        type=int,
-        default=argparse.SUPPRESS if suppress else 2,
-        help="concurrent shard-copy workers (does not create replicas)",
-    )
-    if "--ctx" not in parser._option_string_actions:
-        parser.add_argument(
-            "--ctx",
-            type=int,
-            default=argparse.SUPPRESS if suppress else 0,
-            help="managed engine context length (0 = 4096)",
-        )
 
 
 def configure_parser(parser, common_parent=None):
-    """Attach scriptable subcommands; options work before or after the action."""
-    _add_lifecycle_options(parser, suppress=False)
-    after = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
-    _add_lifecycle_options(after, suppress=True)
-    actions = parser.add_subparsers(dest="ramdisk_action", metavar="ACTION")
-    plan = actions.add_parser("plan", parents=[after], help="show an exact staging and reserve plan")
-    plan.add_argument("--json", action="store_true")
-    prepare_parser = actions.add_parser("prepare", parents=[after], help="mount, stage, and validate weights")
-    prepare_parser.add_argument("--yes", action="store_true", help="accept the reviewed plan non-interactively")
-    status_parser = actions.add_parser("status", parents=[after], help="show mounts and managed processes")
-    status_parser.add_argument("--json", action="store_true")
-    benchmark_parser = actions.add_parser("benchmark", parents=[after], help="run equal RAM/SSD scorecards")
-    benchmark_parser.add_argument("--json", action="store_true")
-    start_parser = actions.add_parser("start", parents=[after], help="start managed engine process(es)")
-    start_parser.add_argument(
-        "--base-port",
-        type=int,
-        default=None,
-        help="managed base port (defaults to the prepared deployment's last value)",
+    return _cli_configure_parser(
+        parser,
+        common_parent=common_parent,
     )
-    actions.add_parser("stop", parents=[after], help="stop only verified managed processes")
-    destroy_parser = actions.add_parser("destroy", parents=[after], help="unmount volatile weights safely")
-    destroy_parser.add_argument("--yes", action="store_true")
 
 
 def _json_print(value):
-    print(json.dumps(value, indent=2, sort_keys=True))
+    return _cli_json_print(value)
 
 
 def _human_plan(plan):
@@ -598,13 +510,10 @@ def _source_still_matches(plan):
 
 
 def _confirm(message, accepted=False):
-    if accepted:
-        return
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        raise RamdiskError(message + "; rerun with --yes after reviewing `ramdisk plan`")
-    answer = input(message + " [y/N] ").strip().lower()
-    if answer not in ("y", "yes"):
-        raise RamdiskError("cancelled")
+    return _cli_confirm(
+        message,
+        accepted=accepted,
+    )
 
 
 @_exclusive_lifecycle
@@ -1172,129 +1081,25 @@ def _prepare_confirmation_rows(plan, base_port=8000):
     )
 
 
-@contextlib.contextmanager
-def _cli_termination_guard(cancelable):
-    """Translate service/SSH termination into lifecycle-safe checkpoints.
-
-    Prepare, Start, and Benchmark receive a cooperative cancellation event.
-    Stop and Destroy deliberately finish their verified cleanup transaction
-    before the CLI reports the deferred signal exit code.
-    """
-    state = {
-        "cancel_event": threading.Event(),
-        "signum": None,
-    }
-    previous = {}
-    if threading.current_thread() is threading.main_thread():
-        for name in ("SIGHUP", "SIGTERM"):
-            signum = getattr(signal, name, None)
-            if signum is None:
-                continue
-            try:
-                previous[signum] = signal.getsignal(signum)
-            except (OSError, ValueError):
-                continue
-
-        def request_termination(signum, _frame):
-            if state["signum"] is None:
-                state["signum"] = int(signum)
-            if cancelable:
-                state["cancel_event"].set()
-
-        for signum in tuple(previous):
-            try:
-                signal.signal(signum, request_termination)
-            except (OSError, ValueError):
-                previous.pop(signum, None)
-    try:
-        yield state
-    finally:
-        for signum, handler in previous.items():
-            try:
-                signal.signal(signum, handler)
-            except (OSError, ValueError):
-                pass
-
-
-def _cli_exit_after_signal(termination, normal_code):
-    if termination is not None and termination.get("signum") is not None:
-        return 128 + int(termination["signum"])
-    return normal_code
-
-
 def dispatch(args, cli_path=None, engine_path=None, system=None):
-    action = getattr(args, "ramdisk_action", None)
-    termination = None
-    try:
-        if action == "plan":
-            value = build_plan(args)
-            if getattr(args, "json", False):
-                _json_print(value)
-            else:
-                _human_plan(value)
-            return 2 if value["blockers"] else 0
-        if action == "prepare":
-            with _cli_termination_guard(True) as termination:
-                value = prepare(
-                    args,
-                    cancel_event=termination["cancel_event"],
-                )
-            print("RAM-disk ready: %s" % ", ".join(record["path"] for record in value["mounts"]))
-            return _cli_exit_after_signal(termination, 0)
-        if action == "status":
-            value = status()
-            if getattr(args, "json", False):
-                _json_print(value)
-            else:
-                _human_status(value)
-            return 0
-        if action == "benchmark":
-            with _cli_termination_guard(True) as termination:
-                value = benchmark(
-                    args,
-                    cli_path=cli_path,
-                    engine_path=engine_path,
-                    cancel_event=termination["cancel_event"],
-                )
-            if getattr(args, "json", False):
-                _json_print(value)
-            else:
-                _human_benchmark(value)
-            return _cli_exit_after_signal(termination, 0)
-        if action == "start":
-            with _cli_termination_guard(True) as termination:
-                value = start(
-                    args,
-                    cli_path=cli_path,
-                    engine_path=engine_path,
-                    cancel_event=termination["cancel_event"],
-                )
-            print("managed engine ports: %s" % ", ".join(str(port) for port in value["ports"]))
-            return _cli_exit_after_signal(termination, 0)
-        if action == "stop":
-            with _cli_termination_guard(False) as termination:
-                value = stop(args)
-            if value.get("state") == "error":
-                print(
-                    "managed engine cleanup completed, but the RAM workspace is incomplete; "
-                    "review `coli ramdisk status`, then run destroy",
-                    file=sys.stderr,
-                )
-                return _cli_exit_after_signal(termination, 2)
-            print("managed engines stopped; usage deltas merged")
-            return _cli_exit_after_signal(termination, 0)
-        if action == "destroy":
-            with _cli_termination_guard(False) as termination:
-                value = destroy(args)
-            print("RAM-disk destroyed; durable state and benchmark history preserved")
-            return _cli_exit_after_signal(termination, 0)
-        raise RamdiskError("choose a ramdisk action or run the interactive TUI")
-    except (RamdiskError, OSError, subprocess.SubprocessError) as exc:
-        if getattr(args, "json", False):
-            _json_print({"schema": "colibri.ramdisk.error.v1", "version": 1, "error": str(exc)})
-        else:
-            print("coli ramdisk: %s" % exc, file=sys.stderr)
-        return _cli_exit_after_signal(termination, 2)
+    return _cli_dispatch(
+        args,
+        cli_path=cli_path,
+        engine_path=engine_path,
+        system=system,
+        build_plan=build_plan,
+        prepare=prepare,
+        status=status,
+        benchmark=benchmark,
+        start=start,
+        stop=stop,
+        destroy=destroy,
+        human_plan=_human_plan,
+        human_status=_human_status,
+        human_benchmark=_human_benchmark,
+        json_print=_json_print,
+        termination_guard=_cli_termination_guard,
+    )
 
 
 _tui_worker_guard = threading.Lock()
@@ -1360,15 +1165,11 @@ def _tui(stdscr, initial, cli_path, engine_path):
 
 
 def _load_textual_frontend():
-    """Import the optional frontend without making scriptable commands depend on it."""
-    import ramdisk_textual
-
-    return ramdisk_textual
+    return _cli_load_textual_frontend()
 
 
 def _textual_dependency_missing(error):
-    missing = getattr(error, "name", "") or ""
-    return missing == "textual" or missing.startswith("textual.")
+    return _cli_textual_dependency_missing(error)
 
 
 def _run_tui_frontend(callback):
@@ -1379,53 +1180,29 @@ def _run_tui_frontend(callback):
 
 
 def launch_tui(args, cli_path=None, engine_path=None, system=None):
-    if not sys.platform.startswith("linux"):
-        print("coli ramdisk: the TUI is supported only on Linux", file=sys.stderr)
-        return 2
     global _tui_worker
-    requested_ui = os.environ.get("COLI_RAMDISK_UI", "auto").strip().lower()
-    if requested_ui not in ("auto", "textual", "curses"):
-        print(
-            "coli ramdisk: COLI_RAMDISK_UI must be auto, textual, or curses",
-            file=sys.stderr,
-        )
-        return 2
 
-    textual_frontend = None
-    if requested_ui in ("auto", "textual"):
-        try:
-            textual_frontend = _load_textual_frontend()
-        except ModuleNotFoundError as exc:
-            if not _textual_dependency_missing(exc):
-                raise
-            if requested_ui == "textual":
-                print(
-                    "coli ramdisk: Textual UI requested but Textual is not installed; "
-                    "install the TUI dependency or set COLI_RAMDISK_UI=curses",
-                    file=sys.stderr,
-                )
-                return 2
-
-    try:
-        if textual_frontend is not None:
-            return _run_tui_frontend(
-                lambda: textual_frontend.launch_tui(
-                    args,
-                    cli_path=cli_path,
-                    engine_path=engine_path,
-                    lifecycle=sys.modules[__name__],
-                )
-            )
-        import curses
-
-        with _curses_termination_guard():
-            return _run_tui_frontend(
-                lambda: curses.wrapper(_tui, args, cli_path, engine_path)
-            )
-    finally:
+    def finish_frontend():
+        global _tui_worker
         with _tui_worker_guard:
-            if _tui_worker is not None and not _tui_worker["thread"].is_alive():
+            if (
+                _tui_worker is not None
+                and not _tui_worker["thread"].is_alive()
+            ):
                 _tui_worker = None
+
+    return _cli_launch_tui(
+        args,
+        cli_path=cli_path,
+        engine_path=engine_path,
+        system=system,
+        lifecycle=sys.modules[__name__],
+        run_tui_frontend=_run_tui_frontend,
+        legacy_tui=_tui,
+        curses_termination_guard=_curses_termination_guard,
+        finish_frontend=finish_frontend,
+        load_textual_frontend=_load_textual_frontend,
+    )
 
 
 if __name__ == "__main__":
