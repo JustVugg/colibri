@@ -275,6 +275,8 @@ typedef struct {
      * fault fails at S=1, records 1, and is never retried -- the old behaviour, reached
      * as a special case of the general rule rather than as a separate one. */
     int cuda_fail_s;
+    int vk_gemm;      /* resident tensor eligible for the generic VK dense matmul in
+                       * matmul_qt_ex (marked at load; never set on reused expert slots) */
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -618,6 +620,10 @@ static inline int vk_reg_served(int layer,int eid){
 }
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+static int g_vk_gemm_mb;      /* COLI_VK_GEMM_MB (default 8): minimum resident-weight MB for
+                               * the generic VK dense matmul at decode — the per-call submit
+                               * only beats the CPU's DDR4 read on big tensors. A batched
+                               * forward (S>=8) offloads every vk_gemm-marked tensor. */
 static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
@@ -1173,6 +1179,16 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
                 "narrower calls will still try the GPU\n", w->O,w->I,w->cuda_device,S);
         cuda_disabled_note();
     }
+#endif
+#ifdef COLI_VULKAN
+    /* COLI_VK_DENSE=1: resident dense/attention weights (vk_gemm, marked at load) on the
+     * GPU — M3's GQA q/o projections alone read ~6 GB/token of int8 from DDR4 on the CPU
+     * path. Decode offloads only tensors >= COLI_VK_GEMM_MB (the per-call submit only pays
+     * for itself on big weight reads); a batched prefill (S>=8) offloads every marked
+     * tensor. Routed-expert QTs are slab-transient and never marked. */
+    if(g_vulkan && g_vk_dense && w->vk_gemm && !spec_pinned() && !omp_in_parallel()
+       && (S>=8 || qt_bytes(w) >= (int64_t)g_vk_gemm_mb<<20)
+       && vk_matmul_qt(w,y,x,S)) return;
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     if(w->fmt==4){
@@ -2436,7 +2452,9 @@ static void model_init_range(Model *m, const char *snap, int cap,
             l->idx_k  = qt_load(m,P("self_attn.index_k_proj.weight"), c->index_hd, D, dbits);
             l->idx_qn = ld(m,P("self_attn.index_q_norm.weight"));
             l->idx_kn = ld(m,P("self_attn.index_k_norm.weight"));
+            l->idx_q.vk_gemm=l->idx_k.vk_gemm=1;
         }
+        l->q_p.vk_gemm=l->k_p.vk_gemm=l->v_p.vk_gemm=l->o.vk_gemm=1;   /* COLI_VK_DENSE offload */
         } else {
         l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
@@ -2460,6 +2478,11 @@ static void model_init_range(Model *m, const char *snap, int cap,
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
             qt_planarize(&l->gate_proj); qt_planarize(&l->up_proj); qt_planarize(&l->down_proj);   /* K1 */
+            /* K1 and the VK dense path never claim the same bytes: planar_on() is
+             * hard-off on GPU builds (the backends read q4 in pair layout), so at
+             * most one of the two marks is live in any given binary. */
+            if(c->arch==ARCH_M3)                       /* GLM keeps its wired MLA VK sites */
+                l->gate_proj.vk_gemm=l->up_proj.vk_gemm=l->down_proj.vk_gemm=1;
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
@@ -11193,6 +11216,7 @@ int main(int argc, char **argv){
          * ~6 GB tier + ~8 GB dense leaves headroom for the long-context KV mirror). */
         g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 320;
         g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
+        g_vk_gemm_mb = getenv("COLI_VK_GEMM_MB") ? atoi(getenv("COLI_VK_GEMM_MB")) : 8;
         g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
         fprintf(stderr,"[VK] expert tier active: routed quantized experts on the GPU (budget %d)%s%s\n",
                 g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "",
