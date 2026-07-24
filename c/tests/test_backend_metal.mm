@@ -160,8 +160,8 @@ static int run_attn(int S, int pos_base, const char* name){
     t_gemv4(&ref[(size_t)s*TH],ctx.data(),o.w,o.s,TH,THH*TVH);
   }
   std::vector<float> got((size_t)S*TH);
-  int ok=coli_metal_attn_decode(x.data(), qa.w,qa.s,2,qaln.data(), qb.w,qb.s,2,
-        kva.w,kva.s,2,kvaln.data(), kvb.w,kvb.s,2, o.w,o.s,2,
+  int ok=coli_metal_attn_decode(x.data(), qa.w,qa.s,2,0,qaln.data(), qb.w,qb.s,2,0,
+        kva.w,kva.s,2,0,kvaln.data(), kvb.w,kvb.s,2,0, o.w,o.s,2,0,
         Lc,Rc,S,pos_base,0,eps,theta,ascale,got.data());
   double ma=0,ym=0; for(size_t i=0;i<ref.size();i++){ ma=fmax(ma,fabs(got[i]-ref[i])); ym=fmax(ym,fabs(ref[i])); }
   // also verify the cache write-back (Lc/Rc for the new positions)

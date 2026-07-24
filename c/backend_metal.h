@@ -104,11 +104,11 @@ int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E,
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 void coli_metal_attn_lat(double *ksched, double *gsched);
 int coli_metal_attn_decode(const float *x,
-    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
-    const void *qb_w, const float *qb_s, int qb_fmt,
-    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
-    const void *o_w, const float *o_s, int o_fmt,
+    const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
+    const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
+    const void *o_w, const float *o_s, int o_fmt, int o_gs,
     float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
