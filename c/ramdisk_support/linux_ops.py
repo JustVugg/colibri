@@ -511,6 +511,59 @@ def _process_status(pid, *, read_text=None):
     return read_text("/proc/%d/status" % int(pid))
 
 
+def _busy_mount_references(path):
+    """Return PIDs holding cwd, root, mappings, or descriptors below ``path``."""
+    _require_linux()
+    path = os.path.normpath(path) + os.sep
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        for leaf in ("cwd", "root"):
+            try:
+                target = os.path.realpath(
+                    "/proc/%s/%s" % (entry, leaf)
+                ) + os.sep
+                if target.startswith(path):
+                    found.append(int(entry))
+                    break
+            except OSError:
+                pass
+        if found and found[-1] == int(entry):
+            continue
+        # A process can close the shard fd after mmap(); the mapping remains a
+        # live mount reference and appears only in /proc/<pid>/maps.
+        for line in _read_text("/proc/%s/maps" % entry).splitlines():
+            fields = line.split(None, 5)
+            if len(fields) < 6 or not fields[5].startswith("/"):
+                continue
+            mapped = fields[5]
+            if mapped.endswith(" (deleted)"):
+                mapped = mapped[: -len(" (deleted)")]
+            target = os.path.realpath(mapped) + os.sep
+            if target.startswith(path):
+                found.append(int(entry))
+                break
+        if found and found[-1] == int(entry):
+            continue
+        fd_dir = "/proc/%s/fd" % entry
+        try:
+            descriptors = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.path.realpath(
+                    os.path.join(fd_dir, descriptor)
+                ) + os.sep
+                if target.startswith(path):
+                    found.append(int(entry))
+                    break
+            except OSError:
+                pass
+    return sorted(set(found))
+
+
 class LinuxPlatformOps:
     """Narrow Linux discovery operations with no import-time probes."""
 
@@ -542,6 +595,7 @@ class LinuxPlatformOps:
     process_group_alive = staticmethod(_process_group_alive)
     signal_process_group = staticmethod(_signal_process_group)
     process_status = staticmethod(_process_status)
+    busy_mount_references = staticmethod(_busy_mount_references)
 
     @staticmethod
     def path_exists(path):

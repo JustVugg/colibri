@@ -39,6 +39,12 @@ from .platform_ops import (
 )
 
 
+def _busy_mount_references(path, *, ops=None):
+    """Return processes that keep a managed mount busy."""
+    ops = get_platform_ops() if ops is None else ops
+    return ops.busy_mount_references(path)
+
+
 def _reusable_empty_mountpoint(path):
     """Recognize an empty root-owned leaf left by X-mount.mkdir=0755."""
     try:

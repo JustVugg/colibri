@@ -66,6 +66,7 @@ class UnsupportedPlatformOps:
     process_group_alive = staticmethod(_unsupported_process_operation)
     signal_process_group = staticmethod(_unsupported_process_operation)
     process_status = staticmethod(_unsupported_process_operation)
+    busy_mount_references = staticmethod(_unsupported_process_operation)
 
 
 def get_platform_ops(platform_name=None):

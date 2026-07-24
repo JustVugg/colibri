@@ -85,6 +85,10 @@ process_errors = {}
 for name, operation in (
     ("identity", lambda: ramdisk._proc_identity(1)),
     ("group_alive", lambda: ramdisk._group_alive(1)),
+    (
+        "busy_mounts",
+        lambda: ramdisk._busy_mount_references("/mnt/colibri"),
+    ),
 ):
     try:
         operation()
@@ -95,6 +99,7 @@ for name, operation in (
             "%s unexpectedly used an unsupported process capability" % name
         )
 assert process_errors == {
+    "busy_mounts": UNSUPPORTED_PLATFORM_REASON,
     "identity": UNSUPPORTED_PLATFORM_REASON,
     "group_alive": UNSUPPORTED_PLATFORM_REASON,
 }, process_errors
