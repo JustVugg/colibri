@@ -128,6 +128,31 @@ int main(void){
       fail|=expect("T=NULL: no tokenizer sweep",101,0);
       if(!fail) printf("  T=NULL -> config stops only (validation path untouched)   ok\n"); }
 
+    /* 6. SERVE filters tokenizer-only specials for tool safety, but MUST keep
+     *    every model-declared EOS. This catches the v1.1.1 role-token leak:
+     *    the old code kept only tok_eos=100 and discarded 101/102. */
+    { Cfg c; memset(&c,0,sizeof c);
+      write_cfg(dir,"config.json","[100,101,102]");
+      rm_file(dir,"generation_config.json");
+      load_cfg(&c,dir);
+#ifdef _WIN32
+      _putenv_s("SERVE","1");
+#else
+      setenv("SERVE","1",1);
+#endif
+      stops_arm_tok(&c,100,&T);
+      fail|=expect("SERVE: endoftext",100,1);
+      fail|=expect("SERVE: declared <|user|> EOS",101,1);
+      fail|=expect("SERVE: declared <|observation|> EOS",102,1);
+      fail|=expect("SERVE: tokenizer-only <|assistant|>",103,0);
+      fail|=expect("SERVE: tokenizer-only <sop>",104,0);
+#ifdef _WIN32
+      _putenv_s("SERVE","");
+#else
+      unsetenv("SERVE");
+#endif
+      if(!fail) printf("  SERVE -> all declared EOS kept; tokenizer-only specials filtered   ok\n"); }
+
     rm_file(dir,"config.json"); rm_file(dir,"generation_config.json"); rm_file(dir,"tokenizer.json");
     rmdir(dir);
     if(fail){ printf("test_stops: FAIL\n"); return 1; }

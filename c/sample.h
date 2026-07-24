@@ -116,14 +116,21 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     int nsp = 0;
     if (T) for (int id = 0; id < T->n_ids && g_nstop < 64; id++)
         if (T->id_special[id] && !is_stop(id)) { g_stop[g_nstop++] = id; nsp++; }
-    /* #401: in serve mode keep ONLY <|endoftext|>. Role markers <|user|>/<|observation|>
-     * (config stops + tokenizer special set) are boundaries the Python server owns; as
-     * hard stops they cut generation the moment the model opens a <tool_call> block,
-     * because int4 argmax noise picks a stop-token ID over the correct '<' token. */
+    /* #401: in serve mode discard tokenizer-only special tokens, but preserve
+     * EVERY EOS explicitly declared by config.json/generation_config.json.
+     * GLM-5.2 declares <|endoftext|>, <|user|>, and <|observation|> as EOS.
+     * Keeping only tok_eos leaks <|user|> into CLI/API output and generation
+     * continues until NGEN. Tokenizer-only specials remain filtered so int4
+     * argmax noise cannot turn unrelated control tokens into hard stops. */
     if (getenv("SERVE") && tok_eos >= 0) {
         int kept = 0;
-        for (int i = 0; i < g_nstop; i++) if (g_stop[i] == tok_eos) g_stop[kept++] = g_stop[i];
-        if (kept < g_nstop) fprintf(stderr, "[stop] serve mode: filtered %d non-EOS stop tokens (tool-call safety, #401)\n", g_nstop - kept);
+        for (int i = 0; i < g_nstop; i++) {
+            int declared = g_stop[i] == tok_eos;
+            for (int j = 0; !declared && j < c->n_stop; j++)
+                if (g_stop[i] == c->stop_ids[j]) declared = 1;
+            if (declared) g_stop[kept++] = g_stop[i];
+        }
+        if (kept < g_nstop) fprintf(stderr, "[stop] serve mode: filtered %d tokenizer-only special tokens (tool-call safety, #401)\n", g_nstop - kept);
         g_nstop = kept; nsp = 0;
     }
     fprintf(stderr, "[stop] %d stop tokens:", g_nstop);
