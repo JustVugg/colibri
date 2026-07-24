@@ -19,7 +19,6 @@ import json
 import math
 import mmap
 import os
-import platform
 import queue
 import re
 import secrets
@@ -27,15 +26,96 @@ import shutil
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
 import urllib.error
 import urllib.request
+from ramdisk_support.common import (
+    BENCHMARK_SCHEMA,
+    DEFAULT_MOUNT_ROOT,
+    GIB,
+    MANIFEST_VERSION,
+    MIB,
+    PLAN_SCHEMA,
+    PROFILE_LINE_RE,
+    STATUS_SCHEMA,
+    TMPFS_MAGIC,
+    USAGE_MERGE_RE,
+    RamdiskError,
+    _EngineCleanupError,
+    _OperationCancelled,
+    _format_range_list,
+    _parse_range_list,
+    _path_is_below,
+    _path_without_symlinks,
+    _percentile,
+    _positive_int,
+    _raise_if_cancelled,
+    _utc_now,
+)
+from ramdisk_support.discovery import (
+    _cgroup_ancestors,
+    _cgroup_memberships,
+    _cgroup_mounts,
+    _discover_cgroup_memory,
+    _mountinfo_unescape,
+    _parse_cgroup_bytes,
+    _resolve_cgroup_directory,
+    discover_hardware as _discover_hardware,
+)
+from ramdisk_support.linux_ops import (
+    _kernel_at_least,
+    _meminfo,
+    _node_meminfo,
+    _physical_cores,
+    _read_cgroup_contract,
+    _read_cgroup_value,
+    _read_text,
+    _status_allowed_list,
+    _thread_sibling_groups,
+)
+from ramdisk_support.model import (
+    EXPERT_RE,
+    MAX_ST_HEADER,
+    _direct_tensor_set_eligible,
+    _read_safetensors_header,
+    _sha256_file,
+    _shape_numel,
+    scan_model,
+)
+from ramdisk_support.planning import (
+    _build_placement,
+    _load_profile,
+    _requested_ids,
+    _runtime_reserve,
+    _select_partial,
+)
+from ramdisk_support.platform_ops import current_euid
+from ramdisk_support.state import (
+    _assert_canonical_usage_target as _state_assert_canonical_usage_target,
+    _assert_durable_state_dir as _state_assert_durable_state_dir,
+    _atomic_json,
+    _benchmarks_path,
+    _durable_unlink,
+    _ensure_atomic_parent,
+    _ensure_private_dir,
+    _fsync_directory,
+    _lifecycle_lock,
+    _load_manifest as _state_load_manifest,
+    _manifest_mount_layout,
+    _manifest_path,
+    _merge_usage as _state_merge_usage,
+    _read_json,
+    _recover_delta as _state_recover_delta,
+    _save_manifest as _state_save_manifest,
+    _state_root,
+    _usage_merge_ids,
+    _usage_read,
+    _usage_write,
+)
 from ramdisk_ui import (
     ActionPolicy,
     DeploymentHealth,
@@ -44,81 +124,15 @@ from ramdisk_ui import (
     ReviewIdentity,
 )
 
-try:
-    import fcntl
-except ImportError:  # The command parser must remain importable on Windows.
-    fcntl = None
 
+def _exclusive_lifecycle(function):
+    """Keep decorated facade calls patchable while state owns the lock."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with _lifecycle_lock():
+            return function(*args, **kwargs)
 
-MANIFEST_VERSION = 1
-PLAN_SCHEMA = "colibri.ramdisk.plan.v1"
-STATUS_SCHEMA = "colibri.ramdisk.status.v1"
-BENCHMARK_SCHEMA = "colibri.ramdisk.benchmark.v1"
-DEFAULT_MOUNT_ROOT = "/mnt/colibri-ram"
-GIB = 1 << 30
-MIB = 1 << 20
-MAX_ST_HEADER = 512 * MIB
-TMPFS_MAGIC = 0x01021994
-EXPERT_RE = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
-    r"(gate_proj|up_proj|down_proj)\.weight(\.qs)?$"
-)
-PROFILE_LINE_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s*$")
-USAGE_MERGE_RE = re.compile(r"^# coli-ramdisk-merge ([0-9a-f]{32})$")
-
-
-class RamdiskError(RuntimeError):
-    """An expected, user-actionable lifecycle failure."""
-
-
-class _OperationCancelled(RamdiskError):
-    """A cooperative cancellation that reached a clean lifecycle checkpoint."""
-
-
-class _EngineCleanupError(RamdiskError):
-    """A benchmark engine may still be live, so no later variant may launch."""
-
-
-def _utc_now():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-
-def _state_root():
-    base = os.environ.get("XDG_STATE_HOME")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".local", "state")
-    base = os.path.expanduser(base)
-    if not os.path.isabs(base):
-        raise RamdiskError("XDG_STATE_HOME must be an absolute durable path")
-    return os.path.normpath(os.path.join(base, "colibri", "ramdisk"))
-
-
-def _manifest_path():
-    override = os.environ.get("COLI_RAMDISK_MANIFEST")
-    if override:
-        override = os.path.expanduser(override)
-        if not os.path.isabs(override):
-            raise RamdiskError("COLI_RAMDISK_MANIFEST must be an absolute durable path")
-        return os.path.normpath(override)
-    return os.path.join(_state_root(), "manifest.json")
-
-
-def _benchmarks_path():
-    return os.path.join(_state_root(), "benchmarks.json")
-
-
-def _path_without_symlinks(path):
-    """True when no existing component redirects the reviewed absolute path."""
-    return os.path.isabs(path) and os.path.realpath(path) == os.path.normpath(path)
-
-
-def _path_is_below(path, parent, allow_equal=False):
-    try:
-        normalized = os.path.normpath(os.path.abspath(path))
-        root = os.path.normpath(os.path.abspath(parent))
-        return os.path.commonpath([normalized, root]) == root and (allow_equal or normalized != root)
-    except ValueError:
-        return False
+    return wrapped
 
 
 def _reusable_empty_mountpoint(path):
@@ -135,734 +149,32 @@ def _reusable_empty_mountpoint(path):
         return False
 
 
-def _ensure_private_dir(path):
-    path = os.path.normpath(path)
-    # os.makedirs(..., exist_ok=True) and chmod both follow an existing
-    # symlink. Reject redirected components before either operation, then
-    # verify the completed path again so manager-owned state cannot silently
-    # land on a volatile or attacker-selected target.
-    if not _path_without_symlinks(path):
-        raise RamdiskError("private state path contains a symlink: %s" % path)
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    if not _path_without_symlinks(path):
-        raise RamdiskError("private state path changed through a symlink: %s" % path)
-    info = os.lstat(path)
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise RamdiskError("private state path is not a real directory: %s" % path)
-    os.chmod(path, 0o700)
-
-
 def _assert_durable_state_dir(path, plan=None):
-    """Revalidate a derived engine/benchmark state directory before use."""
-    path = os.path.normpath(path)
-    if not _path_without_symlinks(path):
-        raise RamdiskError("managed state path contains a symlink: %s" % path)
-    if _filesystem_for_path(path) in ("tmpfs", "ramfs"):
-        raise RamdiskError("managed state path is on a volatile filesystem: %s" % path)
-    if plan is not None:
-        for mount in plan.get("mounts", []):
-            weight_path = mount.get("path")
-            if isinstance(weight_path, str) and _path_is_below(
-                os.path.realpath(path), os.path.realpath(weight_path), allow_equal=True
-            ):
-                raise RamdiskError(
-                    "managed state path overlaps volatile weights: %s" % path
-                )
-    return path
-
-
-def _ensure_atomic_parent(path):
-    """Create a missing atomic-write parent without mutating an existing one.
-
-    Atomic JSON is also used for an explicitly overridden manifest and for
-    recovery journals.  Those parents are not necessarily manager-owned, so
-    changing their mode would be both surprising and dangerous (for example,
-    an override directly below /tmp).  Manager-owned state roots are tightened
-    separately through ``_ensure_private_dir``.
-    """
-    if os.path.lexists(path):
-        info = os.lstat(path)
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise RamdiskError("atomic-state parent is not a real directory: %s" % path)
-        return
-    try:
-        os.makedirs(path, mode=0o700)
-    except FileExistsError:
-        info = os.lstat(path)
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise RamdiskError("atomic-state parent is not a real directory: %s" % path)
-        return
-    os.chmod(path, 0o700)
-
-
-_lifecycle_local = threading.local()
-
-
-@contextlib.contextmanager
-def _lifecycle_lock():
-    """Serialize all manifest-changing operations for this invoking user."""
-    depth = getattr(_lifecycle_local, "depth", 0)
-    if depth:
-        _lifecycle_local.depth = depth + 1
-        try:
-            yield
-        finally:
-            _lifecycle_local.depth -= 1
-        return
-    if fcntl is None:
-        raise RamdiskError("RAM-disk lifecycle locking is supported only on Linux")
-    root = _state_root()
-    _ensure_private_dir(root)
-    lock_path = os.path.join(root, "lifecycle.lock")
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RamdiskError("another `coli ramdisk` lifecycle operation is active")
-        _lifecycle_local.depth = 1
-        try:
-            yield
-        finally:
-            _lifecycle_local.depth = 0
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def _exclusive_lifecycle(function):
-    @functools.wraps(function)
-    def wrapped(*args, **kwargs):
-        with _lifecycle_lock():
-            return function(*args, **kwargs)
-
-    return wrapped
-
-
-def _atomic_json(path, value, mode=0o600):
-    parent = os.path.dirname(path)
-    _ensure_atomic_parent(parent)
-    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-        try:
-            dfd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _read_json(path, required=False):
-    try:
-        with open(path, "r", encoding="utf-8") as stream:
-            return json.load(stream)
-    except FileNotFoundError:
-        if required:
-            raise RamdiskError("RAM-disk manifest not found; run `coli ramdisk prepare`")
-        return None
-    except (OSError, ValueError) as exc:
-        raise RamdiskError("cannot read %s: %s" % (path, exc))
-
-
-def _positive_int(value):
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
-def _manifest_mount_layout(plan):
-    """Validate and return the exact v1 mount layout encoded by a plan."""
-    topology = plan.get("topology")
-    root = plan.get("mount_root")
-    planned = plan.get("mounts")
-    model = plan.get("model", {}).get("path")
-    if topology not in ("interleaved", "per-node") or not isinstance(root, str):
-        raise RamdiskError("RAM-disk manifest has an invalid topology")
-    root = os.path.normpath(root)
-    if (
-        not os.path.isabs(root)
-        or not _path_is_below(root, "/mnt")
-        or not _path_without_symlinks(root)
-        or root in ("/mnt", DEFAULT_MOUNT_ROOT + "/..")
-    ):
-        raise RamdiskError("RAM-disk manifest has an unsafe mount root")
-    try:
-        if os.path.commonpath([root, os.path.normpath(model)]) in (root, os.path.normpath(model)):
-            raise RamdiskError("RAM-disk manifest mount root overlaps its canonical model")
-    except (TypeError, ValueError):
-        raise RamdiskError("RAM-disk manifest has incompatible model and mount paths")
-    if not isinstance(planned, list) or not planned:
-        raise RamdiskError("RAM-disk manifest has no planned mounts")
-    planned_nodes = plan.get("placement", {}).get(
-        "memory_nodes", plan.get("hardware", {}).get("online_nodes")
+    return _state_assert_durable_state_dir(
+        path,
+        plan=plan,
+        filesystem_for_path=_filesystem_for_path,
     )
-    if topology == "interleaved":
-        expected = [(None, root)]
-    else:
-        if (
-            not isinstance(planned_nodes, list)
-            or not planned_nodes
-            or any(
-                not isinstance(node, int) or isinstance(node, bool) or node < 0
-                for node in planned_nodes
-            )
-            or len(set(planned_nodes)) != len(planned_nodes)
-        ):
-            raise RamdiskError("RAM-disk manifest has an invalid NUMA node set")
-        expected = [
-            (node, os.path.join(root, "node%d" % node)) for node in planned_nodes
-        ]
-    observed = []
-    for record in planned:
-        if not isinstance(record, dict):
-            raise RamdiskError("RAM-disk manifest has invalid planned mount paths")
-        path = record.get("path")
-        node = record.get("node")
-        if (
-            not isinstance(path, str)
-            or not os.path.isabs(path)
-            or os.path.normpath(path) != path
-            or not _path_without_symlinks(path)
-        ):
-            raise RamdiskError("RAM-disk manifest has invalid planned mount paths")
-        observed.append((node, path))
-    if observed != expected:
-        raise RamdiskError("RAM-disk manifest mounts do not match its topology")
-    return root, expected
 
 
 def _load_manifest(required=False):
-    """Read and minimally validate lifecycle state before it can drive actions."""
-    manifest = _read_json(_manifest_path(), required=required)
-    if manifest is None:
-        return None
-    if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
-        raise RamdiskError("unsupported or malformed RAM-disk manifest")
-    base_port = manifest.get("base_port")
-    if base_port is not None and (
-        isinstance(base_port, bool)
-        or not isinstance(base_port, int)
-        or not 1 <= base_port <= 65535
-    ):
-        raise RamdiskError("RAM-disk manifest has an invalid managed base port")
-    deployment_id = manifest.get("deployment_id")
-    if deployment_id is not None and (
-        not isinstance(deployment_id, str)
-        or not re.fullmatch(r"[0-9a-f]{32}", deployment_id)
-    ):
-        raise RamdiskError("RAM-disk manifest has an invalid deployment identity")
-    plan = manifest.get("plan")
-    mounts = manifest.get("mounts")
-    processes = manifest.get("processes", [])
-    if not isinstance(plan, dict) or not isinstance(mounts, list) or not isinstance(processes, list):
-        raise RamdiskError("RAM-disk manifest is missing lifecycle records")
-    if not isinstance(plan.get("model"), dict) or not isinstance(plan.get("mounts"), list):
-        raise RamdiskError("RAM-disk manifest has an invalid plan")
-    fingerprint = manifest.get("model_fingerprint")
-    if (
-        not isinstance(fingerprint, str)
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint)
-        or plan["model"].get("fingerprint") != fingerprint
-        or not isinstance(plan["model"].get("path"), str)
-        or not os.path.isabs(plan["model"]["path"])
-        or not plan["mounts"]
-    ):
-        raise RamdiskError("RAM-disk manifest has an invalid model identity")
-    mount_root, expected_layout = _manifest_mount_layout(plan)
-    planned_paths = {record["path"] for record in plan["mounts"]}
-    if len(planned_paths) != len(plan["mounts"]):
-        raise RamdiskError("RAM-disk manifest has invalid planned mount paths")
-    mount_by_path = {record["path"]: record for record in plan["mounts"]}
-    for record in mounts:
-        if (
-            not isinstance(record, dict)
-            or not isinstance(record.get("path"), str)
-            or not os.path.isabs(record["path"])
-        ):
-            raise RamdiskError("RAM-disk manifest contains an unsafe mount record")
-        if record["path"] not in planned_paths:
-            raise RamdiskError("RAM-disk manifest mount does not belong to its plan")
-        if record.get("node") != mount_by_path[record["path"]].get("node"):
-            raise RamdiskError("RAM-disk manifest mount has the wrong NUMA node")
-        identity = record.get("identity")
-        if not isinstance(identity, dict) or not _positive_int(identity.get("mount_id")) or not isinstance(identity.get("device"), str):
-            raise RamdiskError("RAM-disk manifest mount is missing its identity")
-    state = manifest.get("state")
-    if state not in ("preparing", "ready", "starting", "running", "stopped", "error"):
-        raise RamdiskError("RAM-disk manifest has an invalid lifecycle state")
-    recorded_paths = {record["path"] for record in mounts}
-    if state in ("ready", "starting", "running", "stopped") and recorded_paths != planned_paths:
-        raise RamdiskError("ready RAM-disk manifest does not contain every planned mount")
-    if state == "running" and len(processes) != len(mounts):
-        raise RamdiskError("running RAM-disk manifest has an incomplete process set")
-    durable = plan.get("durable_state")
-    expected_durable = {
-        "root": _state_root(),
-        "manifest": _manifest_path(),
-        "benchmarks": _benchmarks_path(),
-    }
-    if durable != expected_durable or any(
-        not _path_without_symlinks(path) for path in expected_durable.values()
-    ):
-        raise RamdiskError("RAM-disk manifest has an invalid durable-state identity")
-    if any(_filesystem_for_path(path) in ("tmpfs", "ramfs") for path in expected_durable.values()):
-        raise RamdiskError("RAM-disk durable state is on a volatile filesystem")
-    if any(_path_is_below(path, mount_root, allow_equal=True) for path in expected_durable.values()):
-        raise RamdiskError("RAM-disk durable state overlaps the volatile mount")
-    source_shards = plan.get("source_shards")
-    if not isinstance(source_shards, list) or not source_shards:
-        raise RamdiskError("RAM-disk manifest is missing canonical shard identities")
-    fingerprint_dir = fingerprint.split(":", 1)[1]
-    expected_state_root = os.path.join(_state_root(), "engines", fingerprint_dir)
-    process_keys = {"pid": set(), "pgid": set(), "port": set(), "node": set(), "state_dir": set(), "weights_dir": set()}
-    for record in processes:
-        if not isinstance(record, dict):
-            raise RamdiskError("RAM-disk manifest contains an invalid process record")
-        pid, pgid = record.get("pid"), record.get("pgid")
-        uid, starttime = record.get("uid"), record.get("starttime")
-        nonce, port = record.get("nonce"), record.get("port")
-        node, weights_dir = record.get("node"), record.get("weights_dir")
-        state_dir, command = record.get("state_dir"), record.get("command")
-        mount = next((item for item in plan["mounts"] if item.get("node") == node), None)
-        label = "interleaved" if node is None else "node-%d" % node if isinstance(node, int) else ""
-        expected_state_dir = os.path.join(expected_state_root, label)
-        valid_command = isinstance(command, list) and command and all(isinstance(item, str) and item for item in command)
-        try:
-            model_at = command.index("--model") if valid_command else -1
-            port_at = command.index("--port") if valid_command else -1
-            serves = "serve" in command
-            command_matches = (
-                serves
-                and command[model_at + 1] == plan["model"]["path"]
-                and int(command[port_at + 1]) == port
-            )
-        except (ValueError, IndexError, TypeError):
-            command_matches = False
-        if (
-            not _positive_int(pid)
-            or not _positive_int(pgid)
-            or pid != pgid
-            or uid != os.getuid()
-            or not _positive_int(starttime)
-            or not isinstance(nonce, str)
-            or not re.fullmatch(r"[0-9a-f]{48}", nonce)
-            or not isinstance(port, int)
-            or isinstance(port, bool)
-            or not 1 <= port <= 65535
-            or mount is None
-            or weights_dir != mount["path"]
-            or state_dir != expected_state_dir
-            or not command_matches
-        ):
-            raise RamdiskError("RAM-disk manifest contains an unsafe managed process record")
-        _assert_durable_state_dir(state_dir, plan=plan)
-        for key, value in (
-            ("pid", pid), ("pgid", pgid), ("port", port), ("node", node),
-            ("state_dir", state_dir), ("weights_dir", weights_dir),
-        ):
-            if value in process_keys[key]:
-                raise RamdiskError("RAM-disk manifest contains duplicate managed process records")
-            process_keys[key].add(value)
-    return manifest
+    return _state_load_manifest(
+        required=required,
+        filesystem_for_path=_filesystem_for_path,
+        read_json=_read_json,
+        manifest_path=_manifest_path,
+        state_root=_state_root,
+        benchmarks_path=_benchmarks_path,
+        assert_durable_state_dir=_assert_durable_state_dir,
+    )
 
 
 def _save_manifest(manifest):
-    manifest["updated_at"] = _utc_now()
-    _atomic_json(_manifest_path(), manifest)
-
-
-def _read_text(path, default=""):
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as stream:
-            return stream.read()
-    except OSError:
-        return default
-
-
-def _parse_range_list(value):
-    result = []
-    for item in value.strip().split(","):
-        if not item:
-            continue
-        if "-" in item:
-            left, right = item.split("-", 1)
-            start, end = int(left), int(right)
-            if end < start:
-                raise ValueError("descending range")
-            result.extend(range(start, end + 1))
-        else:
-            result.append(int(item))
-    return sorted(set(result))
-
-
-def _format_range_list(values):
-    values = sorted(set(int(value) for value in values))
-    groups = []
-    for value in values:
-        if not groups or value != groups[-1][1] + 1:
-            groups.append([value, value])
-        else:
-            groups[-1][1] = value
-    return ",".join(
-        str(start) if start == end else "%d-%d" % (start, end)
-        for start, end in groups
+    return _state_save_manifest(
+        manifest,
+        atomic_json=_atomic_json,
+        manifest_path=_manifest_path,
     )
-
-
-def _status_allowed_list(field, fallback):
-    """Read the kernel's effective task mask from ``/proc/self/status``."""
-    status = _read_text("/proc/self/status")
-    match = re.search(r"^%s:\s*(.*?)\s*$" % re.escape(field), status, re.MULTILINE)
-    if match:
-        try:
-            return _parse_range_list(match.group(1))
-        except (TypeError, ValueError):
-            pass
-    return sorted(set(int(value) for value in fallback))
-
-
-def _thread_sibling_groups(cpus):
-    """Return physical-core sibling groups clipped to the supplied CPU mask."""
-    remaining = set(int(cpu) for cpu in cpus)
-    groups = []
-    while remaining:
-        cpu = min(remaining)
-        siblings_text = _read_text(
-            "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list" % cpu,
-            str(cpu),
-        )
-        try:
-            siblings = set(_parse_range_list(siblings_text)) & set(cpus)
-        except ValueError:
-            siblings = {cpu}
-        if not siblings:
-            siblings = {cpu}
-        groups.append(sorted(siblings))
-        remaining.difference_update(siblings)
-    return groups
-
-
-def _meminfo(path="/proc/meminfo"):
-    values = {}
-    for line in _read_text(path).splitlines():
-        match = re.match(r"^([^:]+):\s*(\d+)(?:\s+kB)?", line)
-        if match:
-            values[match.group(1)] = int(match.group(2)) * 1024
-    return values
-
-
-def _mountinfo_unescape(value):
-    """Decode the octal escapes used for paths in ``/proc/*/mountinfo``."""
-    return re.sub(
-        r"\\([0-7]{3})",
-        lambda match: chr(int(match.group(1), 8)),
-        value,
-    )
-
-
-def _cgroup_mounts(mountinfo):
-    """Return normalized cgroup mount records from one mountinfo snapshot."""
-    records = []
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        try:
-            separator = fields.index("-")
-            root = _mountinfo_unescape(fields[3])
-            mountpoint = _mountinfo_unescape(fields[4])
-            mount_options = fields[5].split(",")
-            filesystem = fields[separator + 1]
-            source = fields[separator + 2]
-            super_options = fields[separator + 3].split(",")
-        except (IndexError, ValueError):
-            continue
-        if filesystem not in ("cgroup", "cgroup2"):
-            continue
-        records.append(
-            {
-                "filesystem": filesystem,
-                "root": os.path.normpath(root),
-                "mountpoint": os.path.normpath(mountpoint),
-                "source": source,
-                "mount_options": mount_options,
-                "optional_fields": fields[6:separator],
-                "super_options": super_options,
-            }
-        )
-    return records
-
-
-def _cgroup_memberships(cgroup_text):
-    """Parse v1 controller paths and the v2 unified path."""
-    memberships = {"v1": {}, "v2": None}
-    for line in cgroup_text.splitlines():
-        fields = line.split(":", 2)
-        if len(fields) != 3:
-            continue
-        _, controllers, path = fields
-        if not path.startswith("/"):
-            continue
-        normalized = os.path.normpath(path)
-        if not controllers:
-            memberships["v2"] = normalized
-        else:
-            for controller in controllers.split(","):
-                if controller:
-                    memberships["v1"][controller] = normalized
-    return memberships
-
-
-def _resolve_cgroup_directory(membership, mounts, filesystem, controller=None):
-    """Map a membership path to the most-specific visible cgroup mount."""
-    candidates = []
-    for mount in mounts:
-        if mount["filesystem"] != filesystem:
-            continue
-        controller_options = set(mount["super_options"]) | set(
-            mount["mount_options"]
-        ) | set(mount["source"].split(",")) | set(mount["optional_fields"])
-        if controller is not None and controller not in controller_options:
-            continue
-        root = mount["root"]
-        explicit_root = membership == root or membership.startswith(
-            root.rstrip("/") + "/"
-        )
-        # A cgroup namespace reports /proc/self/cgroup relative to its namespace
-        # root, while mountinfo may retain the underlying cgroupfs mount root.
-        # In that case `/` maps directly to the visible mountpoint.
-        relative = (
-            os.path.relpath(membership, root)
-            if explicit_root
-            else membership.lstrip("/") or "."
-        )
-        resolved = os.path.normpath(os.path.join(mount["mountpoint"], relative))
-        try:
-            contained = os.path.commonpath([resolved, mount["mountpoint"]]) == mount["mountpoint"]
-        except ValueError:
-            contained = False
-        if contained:
-            candidates.append((int(explicit_root), len(root), mount, resolved))
-    if not candidates:
-        return None, None
-    _, _, mount, resolved = max(candidates, key=lambda item: item[:2])
-    return mount, resolved
-
-
-def _cgroup_ancestors(path, mountpoint):
-    """Yield a cgroup and every visible ancestor through its mount root."""
-    current = os.path.normpath(path)
-    root = os.path.normpath(mountpoint)
-    while True:
-        try:
-            if os.path.commonpath([current, root]) != root:
-                raise ValueError("cgroup path escaped its mount")
-        except ValueError:
-            raise RamdiskError("resolved cgroup path is outside its controller mount")
-        yield current
-        if current == root:
-            break
-        parent = os.path.dirname(current)
-        if parent == current:
-            raise RamdiskError("cgroup ancestry did not reach its controller mount")
-        current = parent
-
-
-def _read_cgroup_value(path):
-    """Read one controller file, distinguishing absence from access failure."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="strict") as stream:
-            return stream.read().strip()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise RamdiskError("cannot read cgroup controller file %s: %s" % (path, exc))
-
-
-def _read_cgroup_contract(path):
-    """Read a procfs cgroup contract without treating denial as absence."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="strict") as stream:
-            return stream.read()
-    except (OSError, UnicodeError) as exc:
-        raise RamdiskError("cannot read cgroup contract %s: %s" % (path, exc))
-
-
-def _parse_cgroup_bytes(value, path, unlimited_word=False, v1_unlimited=False):
-    if value is None:
-        return None
-    if unlimited_word and value == "max":
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise RamdiskError("invalid cgroup memory value in %s" % path)
-    if parsed < 0:
-        raise RamdiskError("negative cgroup memory value in %s" % path)
-    # cgroup v1 represents an unlimited limit with a page-aligned value just
-    # below signed LONG_MAX (commonly 9223372036854771712).
-    if v1_unlimited and parsed >= (1 << 60):
-        return None
-    return parsed
-
-
-def _discover_cgroup_memory(cgroup_text=None, mountinfo_text=None):
-    """Return hard/high headroom across every limiting cgroup ancestor.
-
-    A child limit is not the only relevant boundary: an ancestor can have less
-    remaining headroom because sibling workloads are charged to it.  Compare
-    ``limit - current`` at every level and retain the tightest value.
-    """
-    result = {
-        "version": None,
-        "status": "none",
-        "path": None,
-        "mountpoint": None,
-        "limit_bytes": None,
-        "current_bytes": None,
-        "available_bytes": None,
-        "limiting_path": None,
-        "high_bytes": None,
-        "high_available_bytes": None,
-        "high_limiting_path": None,
-        "error": None,
-    }
-    if not sys.platform.startswith("linux"):
-        return result
-    try:
-        if cgroup_text is None:
-            cgroup_text = _read_cgroup_contract("/proc/self/cgroup")
-        if mountinfo_text is None:
-            mountinfo_text = _read_cgroup_contract("/proc/self/mountinfo")
-    except RamdiskError as exc:
-        result.update({"status": "unavailable", "error": str(exc)})
-        return result
-    memberships = _cgroup_memberships(cgroup_text)
-    mounts = _cgroup_mounts(mountinfo_text)
-    version = None
-    membership = None
-    mount = resolved = None
-    if memberships["v2"] is not None:
-        version = 2
-        membership = memberships["v2"]
-        mount, resolved = _resolve_cgroup_directory(
-            membership, mounts, "cgroup2"
-        )
-        # A hybrid host can expose an empty/systemd-only v2 hierarchy while
-        # the memory controller remains on v1. Prefer v1 when the resolved v2
-        # ancestry has no memory controller files at all.
-        v2_memory_visible = (
-            mount is not None
-            and resolved is not None
-            and any(
-                os.path.exists(os.path.join(ancestor, leaf))
-                for ancestor in _cgroup_ancestors(resolved, mount["mountpoint"])
-                for leaf in ("memory.current", "memory.max", "memory.high")
-            )
-        )
-        if "memory" in memberships["v1"] and not v2_memory_visible:
-            v1_membership = memberships["v1"]["memory"]
-            v1_mount, v1_resolved = _resolve_cgroup_directory(
-                v1_membership, mounts, "cgroup", controller="memory"
-            )
-            if v1_mount is not None and v1_resolved is not None:
-                version = 1
-                membership = v1_membership
-                mount, resolved = v1_mount, v1_resolved
-    elif "memory" in memberships["v1"]:
-        version = 1
-        membership = memberships["v1"]["memory"]
-        mount, resolved = _resolve_cgroup_directory(
-            membership, mounts, "cgroup", controller="memory"
-        )
-    if version is None:
-        return result
-    result.update({"version": version, "path": membership})
-    if mount is None or resolved is None:
-        result.update(
-            {
-                "status": "unavailable",
-                "error": "memory cgroup membership has no visible controller mount",
-            }
-        )
-        return result
-    result["mountpoint"] = mount["mountpoint"]
-    try:
-        for ancestor in _cgroup_ancestors(resolved, mount["mountpoint"]):
-            if version == 2:
-                limit_path = os.path.join(ancestor, "memory.max")
-                current_path = os.path.join(ancestor, "memory.current")
-                high_path = os.path.join(ancestor, "memory.high")
-                limit = _parse_cgroup_bytes(
-                    _read_cgroup_value(limit_path), limit_path, unlimited_word=True
-                )
-                high = _parse_cgroup_bytes(
-                    _read_cgroup_value(high_path), high_path, unlimited_word=True
-                )
-            else:
-                limit_path = os.path.join(ancestor, "memory.limit_in_bytes")
-                current_path = os.path.join(ancestor, "memory.usage_in_bytes")
-                limit = _parse_cgroup_bytes(
-                    _read_cgroup_value(limit_path),
-                    limit_path,
-                    v1_unlimited=True,
-                )
-                high = None
-                high_path = None
-            if limit is None and high is None:
-                continue
-            current = _parse_cgroup_bytes(
-                _read_cgroup_value(current_path), current_path
-            )
-            if current is None:
-                raise RamdiskError(
-                    "cgroup memory limit is visible but usage is unavailable at %s"
-                    % ancestor
-                )
-            if limit is not None:
-                available = max(0, limit - current)
-                if (
-                    result["available_bytes"] is None
-                    or available < result["available_bytes"]
-                ):
-                    result.update(
-                        {
-                            "limit_bytes": limit,
-                            "current_bytes": current,
-                            "available_bytes": available,
-                            "limiting_path": ancestor,
-                        }
-                    )
-            if high is not None:
-                high_available = max(0, high - current)
-                if (
-                    result["high_available_bytes"] is None
-                    or high_available < result["high_available_bytes"]
-                ):
-                    result.update(
-                        {
-                            "high_bytes": high,
-                            "high_available_bytes": high_available,
-                            "high_limiting_path": ancestor,
-                        }
-                    )
-        result["status"] = (
-            "limited"
-            if result["available_bytes"] is not None
-            or result["high_available_bytes"] is not None
-            else "unlimited"
-        )
-    except RamdiskError as exc:
-        result.update({"status": "unavailable", "error": str(exc)})
-    return result
 
 
 def _cgroup_available_memory():
@@ -875,701 +187,18 @@ def _cgroup_available_memory():
     return cgroup.get("available_bytes")
 
 
-def _node_meminfo(node):
-    values = {}
-    path = "/sys/devices/system/node/node%d/meminfo" % node
-    for line in _read_text(path).splitlines():
-        match = re.search(r"Node\s+\d+\s+([^:]+):\s*(\d+)\s+kB", line)
-        if match:
-            values[match.group(1)] = int(match.group(2)) * 1024
-    return values
-
-
-def _physical_cores(cpus):
-    cores = set()
-    for cpu in cpus:
-        base = "/sys/devices/system/cpu/cpu%d/topology" % cpu
-        package = _read_text(os.path.join(base, "physical_package_id"), "0").strip()
-        core = _read_text(os.path.join(base, "core_id"), str(cpu)).strip()
-        cores.add((package, core))
-    return max(1, len(cores))
-
-
-def _kernel_at_least(major, minor):
-    match = re.match(r"^(\d+)\.(\d+)", platform.release())
-    return bool(match and (int(match.group(1)), int(match.group(2))) >= (major, minor))
-
-
 def discover_hardware():
-    """Return dependency-free Linux, NUMA, tmpfs, THP, and swap discovery."""
-    linux = sys.platform.startswith("linux")
-    online_text = _read_text("/sys/devices/system/node/online", "0")
-    try:
-        online = _parse_range_list(online_text)
-    except ValueError:
-        online = [0]
-    if not online:
-        online = [0]
-    nodes = []
-    all_cpus = []
-    for node in online:
-        cpus_text = _read_text(
-            "/sys/devices/system/node/node%d/cpulist" % node,
-            _read_text("/sys/devices/system/cpu/online", "0"),
-        )
-        try:
-            cpus = _parse_range_list(cpus_text)
-        except ValueError:
-            cpus = []
-        all_cpus.extend(cpus)
-        memory = _node_meminfo(node)
-        distance = []
-        for word in _read_text(
-            "/sys/devices/system/node/node%d/distance" % node
-        ).split():
-            try:
-                distance.append(int(word))
-            except ValueError:
-                pass
-        nodes.append(
-            {
-                "id": node,
-                "cpus": cpus,
-                "cpu_list": cpus_text.strip(),
-                "physical_cores": _physical_cores(cpus),
-                "memory_total_bytes": memory.get("MemTotal", 0),
-                "memory_available_bytes": memory.get(
-                    "MemFree", memory.get("MemAvailable", 0)
-                ),
-                "distance": distance,
-            }
-        )
-    all_cpus = sorted(set(all_cpus))
-    try:
-        affinity = sorted(int(cpu) for cpu in os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        affinity = _status_allowed_list("Cpus_allowed_list", all_cpus)
-    effective_cpus = sorted(set(affinity) & set(all_cpus))
-    effective_nodes = sorted(
-        set(_status_allowed_list("Mems_allowed_list", online)) & set(online)
-    )
-    core_groups = _thread_sibling_groups(effective_cpus)
-    for node in nodes:
-        node["effective_cpus"] = sorted(
-            set(node["cpus"]) & set(effective_cpus)
-        )
-        node["effective_cpu_list"] = _format_range_list(node["effective_cpus"])
-    memory = _meminfo()
-    swaps = []
-    swap_text = _read_text("/proc/swaps")
-    for line in swap_text.splitlines()[1:]:
-        fields = line.split()
-        if len(fields) >= 5:
-            swaps.append(
-                {
-                    "path": fields[0],
-                    "type": fields[1],
-                    "size_bytes": int(fields[2]) * 1024,
-                    "used_bytes": int(fields[3]) * 1024,
-                }
-            )
-    shmem_enabled = _read_text(
-        "/sys/kernel/mm/transparent_hugepage/shmem_enabled"
-    ).strip()
-    thp_modes = re.findall(r"\[?([A-Za-z_]+)\]?", shmem_enabled)
-    filesystems = _read_text("/proc/filesystems")
-    cgroup_memory = _discover_cgroup_memory()
-    return {
-        "linux": linux,
-        "kernel_release": platform.release(),
-        "online_nodes": online,
-        "effective_nodes": effective_nodes,
-        "effective_cpus": effective_cpus,
-        "effective_cpu_list": _format_range_list(effective_cpus),
-        "effective_mask_source": "kernel-task-status",
-        "core_groups": core_groups,
-        "nodes": nodes,
-        "physical_cores": _physical_cores(all_cpus),
-        "effective_physical_cores": len(core_groups),
-        "memory": {
-            "total_bytes": memory.get("MemTotal", 0),
-            "available_bytes": memory.get("MemAvailable", memory.get("MemFree", 0)),
-        },
-        "cgroup_memory": cgroup_memory,
-        "swap": {
-            "configured": swaps,
-            "used_bytes": sum(item["used_bytes"] for item in swaps),
-        },
-        "tmpfs": {
-            "supported": any(line.strip().endswith("tmpfs") for line in filesystems.splitlines()),
-            # tmpfs noswap was merged in Linux 6.4.  Preparation still treats a
-            # mount(8) rejection as authoritative and never changes global swap.
-            "noswap_supported": linux and _kernel_at_least(6, 4),
-        },
-        "thp": {
-            "shmem_enabled": shmem_enabled,
-            "modes": sorted(set(thp_modes)),
-            "within_size_supported": "within_size" in thp_modes,
-            "advise_supported": "advise" in thp_modes or bool(shmem_enabled),
-        },
-        "numactl": shutil.which("numactl"),
-        "mount": shutil.which("mount"),
-        "umount": shutil.which("umount"),
-        "sudo": shutil.which("sudo"),
-        "hugetlb": {
-            "total_pages": memory.get("HugePages_Total", 0) // 1024,
-            "free_pages": memory.get("HugePages_Free", 0) // 1024,
-            "page_size_bytes": memory.get("Hugepagesize", 0),
-        },
-    }
+    return _discover_hardware()
 
 
-def _read_safetensors_header(path):
-    size = os.path.getsize(path)
-    with open(path, "rb") as stream:
-        raw = stream.read(8)
-        if len(raw) != 8:
-            raise RamdiskError("truncated safetensors file: %s" % path)
-        header_size = struct.unpack("<Q", raw)[0]
-        if header_size <= 1 or header_size > MAX_ST_HEADER or header_size > size - 8:
-            raise RamdiskError("invalid safetensors header length in %s" % path)
-        raw_header = stream.read(header_size)
-        if len(raw_header) != header_size:
-            raise RamdiskError("truncated safetensors header: %s" % path)
-    try:
-        header = json.loads(raw_header.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise RamdiskError("invalid safetensors header in %s: %s" % (path, exc))
-    if not isinstance(header, dict):
-        raise RamdiskError("safetensors header is not an object: %s" % path)
-    data_start = 8 + header_size
-    tensors = {}
-    for name, record in header.items():
-        if name == "__metadata__":
-            continue
-        if not isinstance(record, dict) or "data_offsets" not in record:
-            raise RamdiskError("invalid tensor record %r in %s" % (name, path))
-        offsets = record["data_offsets"]
-        if (
-            not isinstance(offsets, list)
-            or len(offsets) != 2
-            or not all(isinstance(value, int) for value in offsets)
-            or offsets[0] < 0
-            or offsets[1] < offsets[0]
-            or data_start + offsets[1] > size
-        ):
-            raise RamdiskError("invalid tensor offsets for %s in %s" % (name, path))
-        tensors[name] = {
-            "dtype": record.get("dtype"),
-            "shape": record.get("shape"),
-            "offset": data_start + offsets[0],
-            "bytes": offsets[1] - offsets[0],
-        }
-    return raw_header, tensors
 
 
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        while True:
-            chunk = stream.read(8 * MIB)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
-def _shape_numel(shape):
-    if not isinstance(shape, list) or not shape or not all(isinstance(value, int) and value >= 0 for value in shape):
-        return None
-    result = 1
-    for value in shape:
-        result *= value
-    return result
 
 
-def _direct_tensor_set_eligible(entry, config):
-    hidden = int(config["hidden_size"])
-    intermediate = int(config["moe_intermediate_size"])
-    prefix = "model.layers.%d.mlp.experts.%d." % (entry["layer"], entry["expert"])
-    for projection, rows, columns in (
-        ("gate_proj", intermediate, hidden),
-        ("up_proj", intermediate, hidden),
-        ("down_proj", hidden, intermediate),
-    ):
-        weight = entry["tensors"][prefix + projection + ".weight"]
-        scale = entry["tensors"][prefix + projection + ".weight.qs"]
-        if (
-            weight["dtype"] not in ("U8", "I8")
-            or scale["dtype"] != "F32"
-            or weight["offset"] % 4
-            or scale["offset"] % 4
-            or _shape_numel(weight["shape"]) != weight["bytes"]
-            or _shape_numel(scale["shape"]) != scale["bytes"] // 4
-            or scale["bytes"] % 4
-        ):
-            return False
-        weight_bytes = weight["bytes"]
-        scale_values = scale["bytes"] // 4
-        int8_bytes = rows * columns
-        int4_bytes = rows * ((columns + 1) // 2)
-        int2_bytes = rows * ((columns + 3) // 4)
-        if weight_bytes == int8_bytes or weight_bytes == int2_bytes:
-            if scale_values != rows:
-                return False
-        elif weight_bytes == int4_bytes:
-            valid_scales = {rows}
-            for group_size in (16, 32, 48, 64, 96, 128, 192, 256):
-                if group_size <= columns:
-                    valid_scales.add(rows * ((columns + group_size - 1) // group_size))
-            if scale_values not in valid_scales:
-                return False
-        else:
-            return False
-    return True
 
 
-def scan_model(model_dir):
-    """Index shards and each expert's complete six-tensor direct-map closure."""
-    model_dir = os.path.realpath(os.path.abspath(os.path.expanduser(model_dir)))
-    if not os.path.isdir(model_dir):
-        raise RamdiskError("model directory not found: %s" % model_dir)
-    names = sorted(name for name in os.listdir(model_dir) if name.endswith(".safetensors"))
-    if not names:
-        raise RamdiskError("no .safetensors shards found in %s" % model_dir)
-    fingerprint = hashlib.sha256()
-    identity_files = {}
-    required_metadata = ("config.json", "tokenizer.json")
-    optional_metadata = ("generation_config.json", "tokenizer_config.json")
-    for name in required_metadata + optional_metadata:
-        path = os.path.join(model_dir, name)
-        if not os.path.isfile(path):
-            if name in required_metadata:
-                raise RamdiskError("required model metadata is missing: %s" % path)
-            continue
-        digest = _sha256_file(path)
-        size = os.path.getsize(path)
-        identity_files[name] = {"size_bytes": size, "sha256": digest}
-        fingerprint.update(("metadata\0%s\0%d\0%s\n" % (name, size, digest)).encode("utf-8"))
-    config_path = os.path.join(model_dir, "config.json")
-    try:
-        with open(config_path, "r", encoding="utf-8") as stream:
-            config = json.load(stream)
-    except (OSError, ValueError) as exc:
-        raise RamdiskError("cannot parse %s: %s" % (config_path, exc))
-    if not isinstance(config, dict):
-        raise RamdiskError("config.json must contain a JSON object")
-    required_positive = (
-        "hidden_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "n_routed_experts",
-        "num_experts_per_tok",
-        "moe_intermediate_size",
-        "intermediate_size",
-        "kv_lora_rank",
-        "qk_nope_head_dim",
-        "qk_rope_head_dim",
-        "v_head_dim",
-        "n_shared_experts",
-        "vocab_size",
-    )
-    missing = [name for name in required_positive if not isinstance(config.get(name), int) or config[name] <= 0]
-    if missing:
-        raise RamdiskError("config.json is missing positive engine fields: %s" % ", ".join(missing))
-    shards = []
-    experts = {}
-    tensor_bytes = 0
-    expert_tensor_bytes = 0
-    for name in names:
-        path = os.path.join(model_dir, name)
-        if not os.path.isfile(path):
-            raise RamdiskError("shard is not a regular file: %s" % path)
-        st = os.stat(path, follow_symlinks=True)
-        raw_header, tensors = _read_safetensors_header(path)
-        header_digest = hashlib.sha256(raw_header).hexdigest()
-        identity = "%s\0%d\0%d\0%d\0%s\n" % (
-            name,
-            st.st_size,
-            st.st_mtime_ns,
-            st.st_ino,
-            header_digest,
-        )
-        fingerprint.update(identity.encode("utf-8"))
-        shards.append(
-            {
-                "name": name,
-                "path": path,
-                "size_bytes": st.st_size,
-                "device": st.st_dev,
-                "inode": st.st_ino,
-                "mtime_ns": st.st_mtime_ns,
-                "header_sha256": header_digest,
-                "tensor_count": len(tensors),
-            }
-        )
-        for tensor_name, tensor in tensors.items():
-            tensor_bytes += tensor["bytes"]
-            match = EXPERT_RE.match(tensor_name)
-            if not match:
-                continue
-            layer, expert = int(match.group(1)), int(match.group(2))
-            key = "%d:%d" % (layer, expert)
-            entry = experts.setdefault(
-                key,
-                {
-                    "layer": layer,
-                    "expert": expert,
-                    "tensors": {},
-                    "shards": set(),
-                    "tensor_bytes": 0,
-                },
-            )
-            entry["tensors"][tensor_name] = {
-                "shard": name,
-                "bytes": tensor["bytes"],
-                "dtype": tensor["dtype"],
-                "shape": tensor["shape"],
-                "offset": tensor["offset"],
-            }
-            entry["shards"].add(name)
-            entry["tensor_bytes"] += tensor["bytes"]
-            expert_tensor_bytes += tensor["bytes"]
-    complete = {}
-    for key, entry in experts.items():
-        prefix = "model.layers.%d.mlp.experts.%d." % (entry["layer"], entry["expert"])
-        expected = set()
-        for projection in ("gate_proj", "up_proj", "down_proj"):
-            weight = prefix + projection + ".weight"
-            expected.add(weight)
-            expected.add(weight + ".qs")
-        if expected == set(entry["tensors"]):
-            entry["shards"] = sorted(entry["shards"])
-            entry["direct_map_eligible"] = _direct_tensor_set_eligible(entry, config)
-            complete[key] = entry
-    total_bytes = sum(shard["size_bytes"] for shard in shards)
-    return {
-        "path": model_dir,
-        "fingerprint": "sha256:" + fingerprint.hexdigest(),
-        "fingerprint_algorithm": "metadata content plus sorted shard name,size,mtime,inode,header-sha256",
-        "identity_files": identity_files,
-        "shards": shards,
-        "shard_names": names,
-        "total_shard_bytes": total_bytes,
-        "tensor_bytes": tensor_bytes,
-        "dense_tensor_bytes": max(0, tensor_bytes - expert_tensor_bytes),
-        "experts": complete,
-        "complete_experts": len(complete),
-        "config": config,
-    }
-
-
-def _load_profile(path, model):
-    if not path:
-        path = os.path.join(model["path"], ".coli_usage")
-    if not os.path.isfile(path):
-        raise RamdiskError(
-            "partial staging requires .coli_usage or an explicit compatible --profile"
-        )
-    counts = {}
-    fingerprint = None
-    try:
-        with open(path, "r", encoding="utf-8") as stream:
-            text = stream.read()
-        if path.endswith(".json") or text.lstrip().startswith("{"):
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise RamdiskError("profile JSON must contain an object")
-            fingerprint = payload.get("model_fingerprint")
-            rows = payload.get("counts", [])
-            if not isinstance(rows, list):
-                raise RamdiskError("profile JSON counts must be a list")
-            for row in rows:
-                if isinstance(row, dict):
-                    layer, expert, count = row.get("layer"), row.get("expert"), row.get("count")
-                else:
-                    layer, expert, count = row
-                counts["%d:%d" % (int(layer), int(expert))] = int(count)
-        else:
-            for number, line in enumerate(text.splitlines(), 1):
-                if not line.strip() or line.lstrip().startswith("#"):
-                    continue
-                match = PROFILE_LINE_RE.match(line)
-                if not match:
-                    raise RamdiskError("invalid profile line %d in %s" % (number, path))
-                layer, expert, count = (int(value) for value in match.groups())
-                counts["%d:%d" % (layer, expert)] = count
-    except (OSError, ValueError, TypeError) as exc:
-        if isinstance(exc, RamdiskError):
-            raise
-        raise RamdiskError("cannot parse profile %s: %s" % (path, exc))
-    if fingerprint and fingerprint != model["fingerprint"]:
-        raise RamdiskError("profile model fingerprint does not match the selected model")
-    compatible = {key: count for key, count in counts.items() if key in model["experts"] and count > 0}
-    if not compatible:
-        raise RamdiskError("profile contains no experts compatible with this model")
-    return os.path.realpath(path), compatible
-
-
-def _select_partial(model, counts, budget_bytes):
-    shard_sizes = {item["name"]: item["size_bytes"] for item in model["shards"]}
-    # Experts commonly share the same one- or two-shard closure.  Grouping those
-    # closures makes the greedy score both exact and cheap: each candidate gets
-    # credit for every newly completed profiled expert, not just the expert that
-    # happened to nominate the shard set.
-    closure_groups = {}
-    for key in sorted(counts):
-        closure = frozenset(model["experts"][key]["shards"])
-        group = closure_groups.setdefault(closure, {"keys": [], "benefit": 0})
-        group["keys"].append(key)
-        group["benefit"] += counts[key] * model["experts"][key]["tensor_bytes"]
-    selected = set()
-    covered_closures = set()
-    while True:
-        candidates = []
-        for closure in sorted(closure_groups, key=lambda value: tuple(sorted(value))):
-            if closure in covered_closures:
-                continue
-            trial = selected | set(closure)
-            added = trial - selected
-            cost = sum(shard_sizes[name] for name in added)
-            if not added or sum(shard_sizes[name] for name in selected) + cost > budget_bytes:
-                continue
-            newly_covered = [
-                other
-                for other in closure_groups
-                if other not in covered_closures and other.issubset(trial)
-            ]
-            benefit = sum(closure_groups[item]["benefit"] for item in newly_covered)
-            ratio = float(benefit) / float(cost)
-            # The sorted closure tuple is the final deterministic tie-breaker.
-            candidates.append((ratio, benefit, -cost, tuple(sorted(closure)), trial))
-        if not candidates:
-            break
-        _, _, _, _, selected = max(candidates)
-        covered_closures = {
-            closure for closure in closure_groups if closure.issubset(selected)
-        }
-    staged_experts = sorted(
-        key
-        for key, expert in model["experts"].items()
-        if set(expert["shards"]).issubset(selected) and expert["direct_map_eligible"]
-    )
-    return sorted(selected), staged_experts
-
-
-def _runtime_reserve(model, ctx, direct_experts, cache_cap=8, kv_slots=1):
-    config = model.get("config") or {}
-    layers = int(config.get("num_hidden_layers", 0) or 0)
-    kv_lora = int(config.get("kv_lora_rank", 0) or 0)
-    rope = int(config.get("qk_rope_head_dim", 0) or 0)
-    index_dim = int(config.get("index_head_dim", 0) or 0)
-    qk_nope = int(config.get("qk_nope_head_dim", 0) or 0)
-    v_head = int(config.get("v_head_dim", 0) or 0)
-    heads = int(config.get("num_attention_heads", 0) or 0)
-    kv_bytes = (layers + 1) * max(1, ctx) * (kv_lora + rope) * 4 * kv_slots
-    index_bytes = layers * max(1, ctx) * index_dim * 4 * kv_slots
-    attention_scratch = max(1, ctx) * heads * (qk_nope + v_head) * 4
-    dense = model["dense_tensor_bytes"]
-    direct = set(direct_experts)
-    fallback_by_layer = {}
-    for key, expert in model["experts"].items():
-        if key not in direct:
-            fallback_by_layer.setdefault(expert["layer"], []).append(expert["tensor_bytes"])
-    fallback_cache = sum(
-        min(cache_cap, len(sizes)) * max(sizes)
-        for sizes in fallback_by_layer.values()
-        if sizes
-    )
-    max_expert = max((entry["tensor_bytes"] for entry in model["experts"].values()), default=0)
-    working_set = min(64, max((len(sizes) for sizes in fallback_by_layer.values()), default=0)) * max_expert
-    engine_overhead = max(int(1.2e9), dense // 100)
-    return {
-        "dense_bytes": dense,
-        "kv_bytes": kv_bytes,
-        "index_bytes": index_bytes,
-        "attention_scratch_bytes": attention_scratch,
-        "fallback_cache_bytes": fallback_cache,
-        "working_set_bytes": working_set,
-        "engine_overhead_bytes": engine_overhead,
-    }
-
-
-def _requested_ids(value, label, allowed, default):
-    """Normalize an operator range list without ever widening its effective mask."""
-    allowed = sorted(set(int(item) for item in allowed))
-    if value is None or value == "":
-        selected = sorted(set(int(item) for item in default))
-    elif isinstance(value, str):
-        if len(value) > 4096:
-            raise RamdiskError("%s range list is unreasonably long" % label)
-        for token in value.split(","):
-            token = token.strip()
-            match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
-            if not match:
-                raise RamdiskError("%s must be a CPU/NUMA range list such as 0-3,8" % label)
-            start = int(match.group(1))
-            end = int(match.group(2) or start)
-            if end < start:
-                raise RamdiskError("%s contains a descending range" % label)
-            if allowed and (start > allowed[-1] or end > allowed[-1]):
-                raise RamdiskError("%s requests IDs outside the effective host mask" % label)
-        selected = _parse_range_list(value)
-    elif isinstance(value, (list, tuple, set)):
-        if any(
-            isinstance(item, bool) or not isinstance(item, int) or item < 0
-            for item in value
-        ):
-            raise RamdiskError("%s must contain non-negative integer IDs" % label)
-        selected = sorted(set(value))
-    else:
-        raise RamdiskError("%s must be a CPU/NUMA range list" % label)
-    if not selected:
-        raise RamdiskError("%s resolves to an empty effective mask" % label)
-    outside = sorted(set(selected) - set(allowed))
-    if outside:
-        raise RamdiskError(
-            "%s requests IDs outside the effective host mask: %s"
-            % (label, _format_range_list(outside))
-        )
-    return selected
-
-
-def _build_placement(args, hardware, topology):
-    """Resolve selected memory nodes and whole-core CPU masks for one plan."""
-    online_nodes = sorted(set(int(node) for node in hardware.get("online_nodes", [])))
-    node_rows = {
-        int(node["id"]): node
-        for node in hardware.get("nodes", [])
-        if isinstance(node, dict) and isinstance(node.get("id"), int)
-    }
-    all_cpus = sorted(
-        {
-            int(cpu)
-            for node in node_rows.values()
-            for cpu in node.get("cpus", [])
-            if isinstance(cpu, int) and not isinstance(cpu, bool) and cpu >= 0
-        }
-    )
-    effective_nodes = sorted(
-        set(int(node) for node in hardware.get("effective_nodes", online_nodes))
-        & set(online_nodes)
-    )
-    effective_cpus = sorted(
-        set(int(cpu) for cpu in hardware.get("effective_cpus", all_cpus))
-        & set(all_cpus)
-    )
-    if not effective_nodes:
-        raise RamdiskError("the effective cpuset exposes no NUMA memory nodes")
-    if not effective_cpus:
-        raise RamdiskError("the effective cpuset exposes no CPUs")
-
-    default_nodes = [
-        node
-        for node in effective_nodes
-        if set(node_rows.get(node, {}).get("cpus", [])) & set(effective_cpus)
-    ] or effective_nodes
-    memory_nodes = _requested_ids(
-        getattr(args, "memory_nodes", None),
-        "--memory-nodes",
-        effective_nodes,
-        default_nodes,
-    )
-    missing_rows = sorted(set(memory_nodes) - set(node_rows))
-    if missing_rows:
-        raise RamdiskError(
-            "hardware discovery has no details for selected NUMA node(s): %s"
-            % _format_range_list(missing_rows)
-        )
-    default_cpus = sorted(
-        set(effective_cpus)
-        & {
-            int(cpu)
-            for node in memory_nodes
-            for cpu in node_rows.get(node, {}).get("cpus", [])
-        }
-    ) or effective_cpus
-    cpus = _requested_ids(
-        getattr(args, "cpu_list", None),
-        "--cpu-list",
-        effective_cpus,
-        default_cpus,
-    )
-    memory_node_cpus = {
-        int(cpu)
-        for node in memory_nodes
-        for cpu in node_rows.get(node, {}).get("cpus", [])
-    }
-    remote_cpus = sorted(set(cpus) - memory_node_cpus)
-    if topology == "per-node" and remote_cpus:
-        raise RamdiskError(
-            "per-node --cpu-list includes CPUs outside the selected replica nodes: %s"
-            % _format_range_list(remote_cpus)
-        )
-
-    raw_groups = hardware.get("core_groups") or [[cpu] for cpu in effective_cpus]
-    core_groups = []
-    covered = set()
-    for raw_group in raw_groups:
-        group = sorted(set(int(cpu) for cpu in raw_group) & set(effective_cpus))
-        if group and not (set(group) & covered):
-            core_groups.append(group)
-            covered.update(group)
-    core_groups.extend([[cpu] for cpu in effective_cpus if cpu not in covered])
-    selected = set(cpus)
-    split_groups = [
-        group
-        for group in core_groups
-        if selected.intersection(group) and not set(group).issubset(selected)
-    ]
-    if split_groups:
-        raise RamdiskError(
-            "--cpu-list must select whole effective physical cores; split sibling group(s): %s"
-            % ", ".join(_format_range_list(group) for group in split_groups)
-        )
-
-    engine_cpu_sets = []
-    if topology == "interleaved":
-        targets = [(None, cpus)]
-    else:
-        targets = [
-            (
-                node,
-                sorted(set(cpus) & set(node_rows.get(node, {}).get("cpus", []))),
-            )
-            for node in memory_nodes
-        ]
-    for node, engine_cpus in targets:
-        physical_cores = sum(
-            1 for group in core_groups if set(group).issubset(set(engine_cpus))
-        )
-        engine_cpu_sets.append(
-            {
-                "node": node,
-                "cpus": engine_cpus,
-                "cpu_list": _format_range_list(engine_cpus),
-                "physical_cores": physical_cores,
-            }
-        )
-    return {
-        "memory_nodes": memory_nodes,
-        "memory_node_list": _format_range_list(memory_nodes),
-        "cpus": cpus,
-        "cpu_list": _format_range_list(cpus),
-        "engine_cpu_sets": engine_cpu_sets,
-        "effective_nodes": effective_nodes,
-        "effective_node_list": _format_range_list(effective_nodes),
-        "effective_cpus": effective_cpus,
-        "effective_cpu_list": _format_range_list(effective_cpus),
-        "remote_cpus": remote_cpus,
-        "remote_cpu_list": _format_range_list(remote_cpus),
-        "memory_policy": (
-            "equal-interleave"
-            if topology == "interleaved" and len(memory_nodes) > 1
-            else "strict-bind"
-        ),
-        "dimm_control": "informational-only",
-    }
 
 
 def build_plan(args, hardware=None, model=None):
@@ -1777,6 +406,7 @@ def build_plan(args, hardware=None, model=None):
     )
     efficiency = float(resident_expert_bytes) / staged_bytes if staged_bytes else 0.0
     mount_root = os.path.abspath(os.path.expanduser(getattr(args, "mount_root", DEFAULT_MOUNT_ROOT)))
+    invoking_euid = current_euid()
     mount_root_preexisting = os.path.isdir(mount_root) and not os.path.islink(mount_root)
     forbidden_roots = {
         "/",
@@ -1815,7 +445,7 @@ def build_plan(args, hardware=None, model=None):
             blockers.append("mount root exists but is not a real directory")
         elif os.stat(mount_root).st_mode & 0o022:
             blockers.append("existing mount root must not be group/world writable")
-        elif os.geteuid() != 0 and os.access(mount_root, os.W_OK):
+        elif invoking_euid != 0 and os.access(mount_root, os.W_OK):
             blockers.append("existing mount root must not be writable by the invoking user")
         elif topology == "interleaved":
             try:
@@ -1843,7 +473,7 @@ def build_plan(args, hardware=None, model=None):
                 if os.path.islink(parent) or not os.path.isdir(parent):
                     blockers.append("mount root has an unsafe parent: %s" % parent)
                     break
-                if os.geteuid() != 0 and os.access(parent, os.W_OK):
+                if invoking_euid != 0 and os.access(parent, os.W_OK):
                     blockers.append("mount root parent is writable by the invoking user: %s" % parent)
                     break
             if parent == "/mnt":
@@ -1894,7 +524,7 @@ def build_plan(args, hardware=None, model=None):
         if os.path.lexists(path):
             if os.path.islink(path) or not os.path.isdir(path):
                 blockers.append("managed mount path exists but is not a real directory: %s" % path)
-            elif os.geteuid() != 0 and os.access(path, os.W_OK):
+            elif invoking_euid != 0 and os.access(path, os.W_OK):
                 blockers.append("managed mount path is writable by the invoking user: %s" % path)
             else:
                 try:
@@ -1914,12 +544,13 @@ def build_plan(args, hardware=None, model=None):
                 blockers.append("durable %s path must not traverse symbolic links" % label)
             if _path_is_below(durable_path, mount_root, allow_equal=True):
                 blockers.append("durable %s path must be outside every volatile mount" % label)
-            filesystem = _filesystem_for_path(durable_path)
-            if filesystem in ("tmpfs", "ramfs"):
-                blockers.append(
-                    "durable %s path is on volatile %s; use an SSD-backed XDG state directory"
-                    % (label, filesystem)
-                )
+            if hardware["linux"]:
+                filesystem = _filesystem_for_path(durable_path)
+                if filesystem in ("tmpfs", "ramfs"):
+                    blockers.append(
+                        "durable %s path is on volatile %s; use an SSD-backed XDG state directory"
+                        % (label, filesystem)
+                    )
     except (RamdiskError, OSError, subprocess.SubprocessError) as exc:
         blockers.append(str(exc))
     total_staged_bytes = staged_bytes * replica_count
@@ -2620,10 +1251,6 @@ def _available_for_mount(mount, plan=None):
     )
 
 
-def _raise_if_cancelled(cancel_event):
-    if cancel_event is not None and cancel_event.is_set():
-        raise _OperationCancelled("operation cancelled by user at a safe checkpoint")
-
 
 def _copy_stream(src, tmp, expected_size, cancel_event=None):
     source_fd = os.open(src, os.O_RDONLY)
@@ -3226,158 +1853,33 @@ def _process_tree_alive(record, actual):
     return bool(_proc_identity(int(record["pid"])))
 
 
-def _usage_read(path):
-    counts = {}
-    for line in _read_text(path).splitlines():
-        match = PROFILE_LINE_RE.match(line)
-        if match:
-            layer, expert, count = (int(value) for value in match.groups())
-            counts["%d:%d" % (layer, expert)] = count
-    return counts
-
-
-def _usage_merge_ids(path):
-    result = set()
-    for line in _read_text(path).splitlines():
-        match = USAGE_MERGE_RE.match(line.strip())
-        if match:
-            result.add(match.group(1))
-    return result
-
-
-def _fsync_directory(path):
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        pass
-
-
-def _durable_unlink(path):
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        return
-    _fsync_directory(os.path.dirname(path))
-
-
-def _usage_write(path, counts, merge_id=None, merge_ids=None):
-    parent = os.path.dirname(path)
-    # Never recreate a missing canonical model directory during stop/recovery:
-    # doing so would turn a moved model into an empty directory whose only file
-    # is .coli_usage and falsely mark the durable delta as merged. Manager-owned
-    # state directories are created explicitly before this writer is called.
-    if not os.path.isdir(parent):
-        raise RamdiskError("usage-state parent directory is absent: %s" % parent)
-    markers = set(merge_ids or ())
-    if merge_id:
-        markers.add(merge_id)
-    fd, tmp = tempfile.mkstemp(prefix=".usage-", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            for key in sorted(counts, key=lambda item: tuple(int(value) for value in item.split(":"))):
-                layer, expert = key.split(":")
-                stream.write("%s %s %d\n" % (layer, expert, counts[key]))
-            for marker in sorted(markers):
-                # glm's fscanf loop consumes the numeric rows then stops at this
-                # trailing comment. Preserve every still-relevant transaction,
-                # not only the latest node's marker: otherwise a crash between
-                # two node merges can replay the first node's delta.
-                stream.write("# coli-ramdisk-merge %s\n" % marker)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        _fsync_directory(parent)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def _assert_canonical_usage_target(canonical_path, plan=None):
-    parent = os.path.dirname(canonical_path)
-    if not os.path.isdir(parent):
-        raise RamdiskError("canonical model directory is absent; usage delta remains journaled")
-    if plan is not None:
-        if os.path.realpath(parent) != os.path.realpath(plan["model"]["path"]):
-            raise RamdiskError("canonical usage target no longer matches the managed model")
-        _source_still_matches(plan)
+    return _state_assert_canonical_usage_target(
+        canonical_path,
+        plan=plan,
+        source_still_matches=_source_still_matches,
+    )
 
 
 def _merge_usage(record, canonical_path, plan=None, keep_journal=False):
-    _assert_durable_state_dir(record["state_dir"], plan=plan)
-    state_usage = os.path.join(record["state_dir"], ".coli_usage")
-    current = _usage_read(state_usage)
-    baseline = record.get("usage_baseline", {})
-    delta = {key: value - baseline.get(key, 0) for key, value in current.items() if value > baseline.get(key, 0)}
-    delta_path = os.path.join(record["state_dir"], ".coli_usage.delta.json")
-    if os.path.exists(delta_path):
-        _recover_delta(record["state_dir"], canonical_path, plan=plan)
-        return
-    merge_id = record.get("usage_merge_id") or secrets.token_hex(16)
-    record["usage_merge_id"] = merge_id
-    if merge_id in _usage_merge_ids(canonical_path):
-        return
-    if not delta:
-        try:
-            _durable_unlink(delta_path)
-        except OSError:
-            pass
-        return
-    _atomic_json(delta_path, {"version": 1, "id": merge_id, "delta": delta, "created_at": _utc_now()})
-    _assert_canonical_usage_target(canonical_path, plan=plan)
-    lock_path = os.path.join(_state_root(), "usage.lock")
-    _ensure_private_dir(os.path.dirname(lock_path))
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        applied = _usage_merge_ids(canonical_path)
-        if merge_id not in applied:
-            canonical = _usage_read(canonical_path)
-            for key, value in delta.items():
-                canonical[key] = canonical.get(key, 0) + value
-            applied.add(merge_id)
-            _usage_write(canonical_path, canonical, merge_ids=applied)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    if not keep_journal:
-        _durable_unlink(delta_path)
+    return _state_merge_usage(
+        record,
+        canonical_path,
+        plan=plan,
+        keep_journal=keep_journal,
+        filesystem_for_path=_filesystem_for_path,
+        source_still_matches=_source_still_matches,
+    )
 
 
 def _recover_delta(state_dir, canonical_path, plan=None):
-    _assert_durable_state_dir(state_dir, plan=plan)
-    delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
-    payload = _read_json(delta_path)
-    if not payload:
-        return
-    if not isinstance(payload, dict):
-        raise RamdiskError("usage delta journal must contain a JSON object")
-    delta = payload.get("delta", {})
-    if not isinstance(delta, dict):
-        raise RamdiskError("usage delta journal has invalid counts")
-    merge_id = payload.get("id")
-    if not merge_id:
-        raise RamdiskError("usage delta journal is missing its transaction id")
-    if not isinstance(merge_id, str) or not re.fullmatch(r"[0-9a-f]{32}", merge_id):
-        raise RamdiskError("usage delta journal has an invalid transaction id")
-    _assert_canonical_usage_target(canonical_path, plan=plan)
-    lock_path = os.path.join(_state_root(), "usage.lock")
-    _ensure_private_dir(os.path.dirname(lock_path))
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        applied = _usage_merge_ids(canonical_path)
-        if merge_id not in applied:
-            canonical = _usage_read(canonical_path)
-            for key, value in delta.items():
-                canonical[key] = canonical.get(key, 0) + int(value)
-            applied.add(merge_id)
-            _usage_write(canonical_path, canonical, merge_ids=applied)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    _durable_unlink(delta_path)
+    return _state_recover_delta(
+        state_dir,
+        canonical_path,
+        plan=plan,
+        filesystem_for_path=_filesystem_for_path,
+        source_still_matches=_source_still_matches,
+    )
 
 
 def _assert_ready_mounts(manifest):
@@ -4387,13 +2889,6 @@ def _source_build_identity():
         "working_tree_modified": None if status.returncode else bool(status.stdout.strip()),
     }
 
-
-def _percentile(values, percentile):
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = max(0, min(len(ordered) - 1, int(math.ceil(percentile * len(ordered))) - 1))
-    return ordered[index]
 
 
 def _parse_profiler(text, elapsed):
