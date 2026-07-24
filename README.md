@@ -474,6 +474,9 @@ nix flake check --no-update-lock-file
 nix build --no-link .#colibri
 ```
 
+The repository uses Nix directly and does not carry a Devbox configuration;
+`flake.lock` is the single committed dependency lock for this environment.
+
 Real Linux RAM-disk validation is explicitly opt-in. Run these only in a
 suitable privileged/private mount environment:
 

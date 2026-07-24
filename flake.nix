@@ -1,9 +1,8 @@
 {
   description = "colibrì — run GLM-5.2 (744B MoE) on a consumer machine with ~25 GB RAM";
 
-  # Reproducibility: these inputs track a branch, so torch/numpy/etc. float across
-  # rebuilds. For deterministic builds run `nix flake lock` once and COMMIT the
-  # generated flake.lock (it pins each input to a commit SHA). (#D2)
+  # Reproducibility: flake.lock pins each branch input to an exact commit.
+  # Update it intentionally with `nix flake update` and review the lockfile diff.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
