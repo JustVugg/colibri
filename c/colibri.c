@@ -8699,7 +8699,7 @@ static void repin_pass_limit(Model *m,int limit){
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
  * costa ~182 KB/token. File <SNAP>/.coli_kv append-only: header (magic + dimensioni +
- * nrec) e un record per posizione [tok i32][Lc+Rc dei 78 layer][Ic DSA]. A fine turno
+ * nrec) e un record per posizione [tok i32][Lc+Rc dei 78 layer][Ic DSA/MSA]. A fine turno
  * si appendono SOLO le posizioni nuove e si riscrive nrec per ultimo: un crash a meta'
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
