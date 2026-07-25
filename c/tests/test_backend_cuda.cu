@@ -539,6 +539,11 @@ int main(int argc, char **argv) {
     if (count || bytes) { std::fprintf(stderr,"fmt=6 leaked tensors\n"); return 1; }
 
     coli_cuda_shutdown();
-    std::printf("cuda backend: q8/q4/q2/f32/e8 correctness ok on %d device(s)\n", ndev);
+    /* Name every family actually covered: the KV8 (e4m3 absorb, dense + DSA-gather)
+     * and KV_TQ (rotated-int4 absorb) cases run inline above and bail with their own
+     * stderr message on mismatch, so a bare weight-format list here understated what
+     * a green run proves -- and kept understating it as tiers were added (e8 arrived
+     * in the same line from #627 while this branch was out). */
+    std::printf("cuda backend: q8/q4/q2/f32/e8 + KV8 fp8 + KV_TQ int4 correctness ok on %d device(s)\n", ndev);
     return 0;
 }
