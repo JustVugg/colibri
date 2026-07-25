@@ -320,7 +320,9 @@ static int i4_acc512_selftest(void){
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0;
+            #pragma omp simd reduction(+:a)
+            for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
 }
 /* y[S,O] = x[S,I] @ W^T con W quantizzato int8 per-riga + scala[O] (dequant-on-use) */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
