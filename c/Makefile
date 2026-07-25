@@ -333,6 +333,15 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
+# Qwen3.6-35B-A3B Phase-2 engine: Gated Attention + Gated DeltaNet (recurrent
+# linear attention) + streaming MoE. Validates against tools/_ref_dn.py (numpy
+# vs HF oracle) and via DUMP logit-cosine against tools/_ref_dn.py --dump.
+qwen36$(EXE): qwen36.c vulkan_gemv.c st.h json.h compat.h vulkan_gemv.h vulkan_core.h vulkan_gemv_spv.h
+	$(CC) $(CFLAGS) qwen36.c vulkan_gemv.c -o qwen36$(EXE) $(LDFLAGS)
+
+qwen36_serve$(EXE): qwen36_serve.c vulkan_gemv.c st.h json.h compat.h vulkan_gemv.h vulkan_core.h vulkan_gemv_spv.h
+	$(CC) $(CFLAGS) qwen36_serve.c vulkan_gemv.c -o qwen36_serve$(EXE) $(LDFLAGS) -lws2_32 -Wl,--stack,16777216
+
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
@@ -488,13 +497,14 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE)
+install: colibri$(EXE) olmoe$(EXE) qwen36$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 

@@ -68,3 +68,12 @@ olmoe_merged/
 olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
+
+# colibri local weights + vulkan SDK (large, not source)
+/modles/
+/c/vulkan/
+/c/tools/glslang/
+/c/tools/glslang.zip
+/c/tools/vkheaders/
+/c/tools/vk_headers.zip
+/c/tools/vk_tmp/
