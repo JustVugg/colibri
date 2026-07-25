@@ -1,0 +1,13 @@
+{
+ "format": "coli-sft-v1",
+ "tokenizer": "/Users/pavol.bauer/Work/models/glm52_i4",
+ "seed": 0,
+ "samples": {
+  "valid": 2,
+  "train": 38
+ },
+ "tokens": {
+  "valid": 84,
+  "train": 1858
+ }
+}
