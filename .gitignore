@@ -141,3 +141,14 @@ c/*.obj
 # vendor modeling cache for the tiny K3 oracle (maintainer tool)
 c/kimi_k3_tiny/.vendor_kimi_k3/
 c/kimi_k3_tiny/.coli_usage
+c/tests/test_lora
+c/tests/test_lora.exe
+c/tests/test_train_linear
+c/tests/test_train_linear.exe
+c/tests/test_train_tiny
+c/tests/test_train_tiny.exe
+c/tests/test_train_resume
+c/tests/test_train_resume.exe
+c/glm_tiny/
+c/coli_train
+c/coli_train.exe
