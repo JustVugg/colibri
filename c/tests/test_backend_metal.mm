@@ -731,6 +731,97 @@ static int run_silu_mul(size_t n, const char *name) {
   return report_err(g_cpu.data(), g_gpu.data(), n, name, 1e-4);
 }
 
+// ---- training kernel parity (M6): CPU double-precision references ----
+static float frand01(){ return ((rand()%2000)-1000)/1000.f; }
+
+// dx += dequant(W)^T dy, reference in double
+static int run_train_tmul(int fmt, int O, int I, int S, int gs, const char *name){
+  srand(1234);
+  int rb4=(I+1)/2;
+  int G4=4;                                  // fmt code for grouped int4
+  int ng=(gs>0)?(I+gs-1)/gs:1;
+  size_t wn = (fmt==I8)?(size_t)O*I : (fmt==I4||fmt==G4)?(size_t)O*rb4 : (size_t)O*I*4;
+  std::vector<uint8_t> W(wn); std::vector<float> Wf;
+  if (fmt==F32){ Wf.resize((size_t)O*I); for(auto&v:Wf) v=frand01(); }
+  else for(auto&b:W) b=(uint8_t)((fmt==I8)?((rand()%255)-127):(rand()&0xFF));
+  const void *Wp=(fmt==F32)?(const void*)Wf.data():(const void*)W.data();
+  std::vector<float> s((fmt==G4)?(size_t)O*ng:(size_t)O), dy((size_t)S*O), dx0((size_t)S*I);
+  for(auto&v:s) v=0.01f+(rand()%100)/10000.f;
+  for(auto&v:dy) v=frand01();
+  for(auto&v:dx0) v=frand01();
+  std::vector<double> ref(dx0.begin(),dx0.end());
+  for(int si=0;si<S;si++) for(int o=0;o<O;o++){
+    double d=dy[(size_t)si*O+o];
+    for(int i=0;i<I;i++){
+      double w;
+      if(fmt==I8) w=(double)(int8_t)W[(size_t)o*I+i]*s[o];
+      else if(fmt==I4){ uint8_t b=W[(size_t)o*rb4+(i>>1)]; int v=(i&1)?(b>>4):(b&0xF); w=(double)(v-8)*s[o]; }
+      else if(fmt==G4){ uint8_t b=W[(size_t)o*rb4+(i>>1)]; int v=(i&1)?(b>>4):(b&0xF); w=(double)(v-8)*s[(size_t)o*ng+i/gs]; }
+      else w=Wf[(size_t)o*I+i];
+      ref[(size_t)si*I+i]+=w*d;
+    }
+  }
+  std::vector<float> dxg(dx0);
+  if(!coli_metal_train_tmul(dxg.data(),dy.data(),Wp,s.data(),fmt,gs,S,I,O)){
+    printf("  %-24s FAIL (returned 0)\n",name); return 1; }
+  double ma=0,ym=0;
+  for(size_t i=0;i<ref.size();i++){ ma=fmax(ma,fabs(dxg[i]-ref[i])); ym=fmax(ym,fabs(ref[i])); }
+  double nerr=ma/(ym+1e-9);
+  int ok=nerr<1e-4;
+  printf("  %-24s nerr=%.2e  %s\n",name,nerr,ok?"ok":"*** MISMATCH");
+  return ok?0:1;
+}
+
+// z = x A^T ; y += s*z B^T ; then full backward — reference in double
+static int run_train_lora(int S,int I,int O,int rank,const char*name){
+  srand(4321);
+  float scale=2.0f;
+  std::vector<float> A((size_t)rank*I), B((size_t)O*rank), x((size_t)S*I),
+                     y0((size_t)S*O), dy((size_t)S*O), dx0((size_t)S*I),
+                     dA0((size_t)rank*I), dB0((size_t)O*rank);
+  for(auto&v:A)v=frand01(); for(auto&v:B)v=frand01(); for(auto&v:x)v=frand01();
+  for(auto&v:y0)v=frand01(); for(auto&v:dy)v=frand01(); for(auto&v:dx0)v=frand01();
+  for(auto&v:dA0)v=frand01(); for(auto&v:dB0)v=frand01();
+  // reference forward
+  std::vector<double> zr((size_t)S*rank,0), yr(y0.begin(),y0.end());
+  for(int si=0;si<S;si++) for(int r=0;r<rank;r++){
+    double a=0; for(int i=0;i<I;i++) a+=(double)A[(size_t)r*I+i]*x[(size_t)si*I+i];
+    zr[(size_t)si*rank+r]=a; }
+  for(int si=0;si<S;si++) for(int o=0;o<O;o++){
+    double a=0; for(int r=0;r<rank;r++) a+=(double)B[(size_t)o*rank+r]*zr[(size_t)si*rank+r];
+    yr[(size_t)si*O+o]+=scale*a; }
+  // reference backward
+  std::vector<double> dzr((size_t)S*rank,0), dAr(dA0.begin(),dA0.end()),
+                      dBr(dB0.begin(),dB0.end()), dxr(dx0.begin(),dx0.end());
+  for(int si=0;si<S;si++) for(int r=0;r<rank;r++){
+    double a=0; for(int o=0;o<O;o++) a+=(double)B[(size_t)o*rank+r]*dy[(size_t)si*O+o];
+    dzr[(size_t)si*rank+r]=scale*a; }
+  for(int o=0;o<O;o++) for(int r=0;r<rank;r++){
+    double a=0; for(int si=0;si<S;si++) a+=(double)dy[(size_t)si*O+o]*zr[(size_t)si*rank+r];
+    dBr[(size_t)o*rank+r]+=scale*a; }
+  for(int r=0;r<rank;r++) for(int i=0;i<I;i++){
+    double a=0; for(int si=0;si<S;si++) a+=dzr[(size_t)si*rank+r]*(double)x[(size_t)si*I+i];
+    dAr[(size_t)r*I+i]+=a; }
+  for(int si=0;si<S;si++) for(int i=0;i<I;i++){
+    double a=0; for(int r=0;r<rank;r++) a+=dzr[(size_t)si*rank+r]*(double)A[(size_t)r*I+i];
+    dxr[(size_t)si*I+i]+=a; }
+  // metal
+  std::vector<float> zg((size_t)S*rank), yg(y0), dAg(dA0), dBg(dB0), dxg(dx0);
+  if(!coli_metal_train_lora_fwd(yg.data(),zg.data(),x.data(),A.data(),B.data(),scale,S,I,O,rank)){
+    printf("  %-24s FAIL (fwd returned 0)\n",name); return 1; }
+  if(!coli_metal_train_lora_bwd(dAg.data(),dBg.data(),dxg.data(),x.data(),zg.data(),dy.data(),
+                                A.data(),B.data(),scale,S,I,O,rank)){
+    printf("  %-24s FAIL (bwd returned 0)\n",name); return 1; }
+  auto cmp=[&](const std::vector<float>&g,const std::vector<double>&r){
+    double ma=0,ym=0; for(size_t i=0;i<r.size();i++){ ma=fmax(ma,fabs(g[i]-r[i])); ym=fmax(ym,fabs(r[i])); }
+    return ma/(ym+1e-9); };
+  double ez=cmp(zg,zr), ey=cmp(yg,yr), ea=cmp(dAg,dAr), eb=cmp(dBg,dBr), ex=cmp(dxg,dxr);
+  double worst=fmax(fmax(ez,ey),fmax(fmax(ea,eb),ex));
+  int ok=worst<1e-4;
+  printf("  %-24s z=%.1e y=%.1e dA=%.1e dB=%.1e dx=%.1e  %s\n",name,ez,ey,ea,eb,ex,ok?"ok":"*** MISMATCH");
+  return ok?0:1;
+}
+
 int main(void) {
   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
   /* GitHub Actions Apple Silicon runners expose Metal through the Apple
@@ -938,6 +1029,18 @@ int main(void) {
   // reading (both kernels agree bitwise on a selection that requires that check to fire).
   fail |= run_rtop8(5, 4, 200, 0.0f,  1, 1.0f,   "top8 E=200 (lane straddles E boundary)");
   fail |= run_rtop8(0, 1, 257, 0.0f,  1, 1.0f,   "top8 E=257 (>256, auto-serial-fallback)");
+  printf("Metal training kernel tests (M6):\n");
+  fail |= run_train_tmul(I8, 2048,6144,1,0,  "tmul int8 S=1");
+  fail |= run_train_tmul(I4, 2048,6144,1,0,  "tmul int4 S=1");
+  fail |= run_train_tmul(I4, 6144,2048,4,0,  "tmul int4 down S=4");
+  fail |= run_train_tmul(I4, 2050,6146,3,0,  "tmul int4 odd dims");
+  fail |= run_train_tmul(F32,1024,2048,2,0,  "tmul f32 S=2");
+  fail |= run_train_tmul(4,  2048,6144,2,128,"tmul int4 g128 S=2");
+  fail |= run_train_tmul(4,  6144,2048,1,64, "tmul int4 g64 S=1");
+  fail |= run_train_tmul(4,  1024,2050,3,32, "tmul int4 g32 odd I");
+  fail |= run_train_lora(4, 8192,6144,8,  "lora r=8 S=4");
+  fail |= run_train_lora(1, 6144,6144,4,  "lora r=4 S=1");
+  fail |= run_train_lora(7, 2048,1024,32, "lora r=32 S=7 (odd)");
   printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
   coli_metal_shutdown();
   return fail;

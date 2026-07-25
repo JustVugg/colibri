@@ -578,6 +578,87 @@ kernel void kda_state(
   }
   oh[hq + i] = oi;
 }
+
+// ---- training kernels (QLoRA, M6): correctness-first, unfused ----
+// t_tmul: dx[s,i] += sum_o dequant(W[o,i])*scale[o]*dy[s,o] — the frozen-base
+// transpose multiply of backward. One thread per (s,i): adjacent threads read
+// adjacent weight bytes for each o (coalesced); never materializes dequant(W).
+kernel void t_tmul(device const uchar* w      [[buffer(0)]],
+                   device const float* scale  [[buffer(1)]],
+                   device const float* dy     [[buffer(2)]],   // [S,O]
+                   device float*       dx     [[buffer(3)]],   // [S,I] accumulate
+                   constant int& S [[buffer(4)]], constant int& I [[buffer(5)]],
+                   constant int& O [[buffer(6)]], constant int& fmt [[buffer(7)]],
+                   constant int& gs [[buffer(8)]],             // fmt=4 group size
+                   uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)(S*I)) return;
+  int i = gid % I, s = gid / I;
+  device const float* dyr = dy + (long)s*O;
+  float acc = 0.0f;
+  if (fmt == 1) {                                   // int8
+    device const char* wc = (device const char*)w;
+    for (int o = 0; o < O; o++) acc += float(wc[(long)o*I + i]) * scale[o] * dyr[o];
+  } else if (fmt == 2) {                            // int4 packed, rb=(I+1)/2
+    int rb = (I+1)/2, sh = (i&1)*4;
+    for (int o = 0; o < O; o++) {
+      int v = (w[(long)o*rb + (i>>1)] >> sh) & 0xF;
+      acc += float(v-8) * scale[o] * dyr[o];
+    }
+  } else if (fmt == 4) {                            // grouped int4: scale[o*ng + i/gs]
+    int rb = (I+1)/2, sh = (i&1)*4, ng = (I+gs-1)/gs, gi = i/gs;
+    for (int o = 0; o < O; o++) {
+      int v = (w[(long)o*rb + (i>>1)] >> sh) & 0xF;
+      acc += float(v-8) * scale[(long)o*ng + gi] * dyr[o];
+    }
+  } else {                                          // f32 (no scale)
+    device const float* wf = (device const float*)w;
+    for (int o = 0; o < O; o++) acc += wf[(long)o*I + i] * dyr[o];
+  }
+  dx[gid] += acc;
+}
+
+// t_xwt: C[s,o] = beta*C[s,o] + alpha * sum_k W[o,k] X[s,k]   (X @ W^T, f32)
+kernel void t_xwt(device const float* W [[buffer(0)]], device const float* X [[buffer(1)]],
+                  device float* C [[buffer(2)]],
+                  constant int& S [[buffer(3)]], constant int& K [[buffer(4)]],
+                  constant int& O [[buffer(5)]], constant float& alpha [[buffer(6)]],
+                  constant float& beta [[buffer(7)]],
+                  uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)(S*O)) return;
+  int o = gid % O, s = gid / O;
+  device const float* xr = X + (long)s*K; device const float* wr = W + (long)o*K;
+  float acc = 0.0f;
+  for (int k = 0; k < K; k++) acc += wr[k]*xr[k];
+  C[gid] = beta*C[gid] + alpha*acc;
+}
+
+// t_xw: C[s,j] = beta*C[s,j] + alpha * sum_k X[s,k] W[k,j]    (X @ W, f32)
+kernel void t_xw(device const float* W [[buffer(0)]], device const float* X [[buffer(1)]],
+                 device float* C [[buffer(2)]],
+                 constant int& S [[buffer(3)]], constant int& K [[buffer(4)]],
+                 constant int& J [[buffer(5)]], constant float& alpha [[buffer(6)]],
+                 constant float& beta [[buffer(7)]],
+                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)(S*J)) return;
+  int j = gid % J, s = gid / J;
+  device const float* xr = X + (long)s*K;
+  float acc = 0.0f;
+  for (int k = 0; k < K; k++) acc += xr[k]*W[(long)k*J + j];
+  C[gid] = beta*C[gid] + alpha*acc;
+}
+
+// t_outer: C[j,k] += alpha * sum_s P[s,j] Q[s,k]   (P^T @ Q, f32 accumulate)
+kernel void t_outer(device const float* P [[buffer(0)]], device const float* Q [[buffer(1)]],
+                    device float* C [[buffer(2)]],
+                    constant int& S [[buffer(3)]], constant int& J [[buffer(4)]],
+                    constant int& K [[buffer(5)]], constant float& alpha [[buffer(6)]],
+                    uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)(J*K)) return;
+  int k = gid % K, j = gid / K;
+  float acc = 0.0f;
+  for (int s = 0; s < S; s++) acc += P[(long)s*J + j] * Q[(long)s*K + k];
+  C[gid] += alpha*acc;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -625,6 +706,7 @@ static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gat
                                   // standalone coli_metal_rtop8 runner, so no caller can
                                   // reach r_top8_par's 32-lane reduction on an unsafe
                                   // device even by explicitly requesting par=1.
+static id<MTLComputePipelineState> g_t_tmul, g_t_xwt, g_t_xw, g_t_outer;   /* training (M6) */
 static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
@@ -836,6 +918,8 @@ extern "C" int coli_metal_init(void) {
                         "r_top8 in use\n", (unsigned long)[g_r_top8p threadExecutionWidth]);
       g_rtop8_par = 0;
     }
+    g_t_tmul=P("t_tmul"); g_t_xwt=P("t_xwt"); g_t_xw=P("t_xw"); g_t_outer=P("t_outer");
+    if(!g_t_tmul||!g_t_xwt||!g_t_xw||!g_t_outer){ fprintf(stderr,"[metal] training pipelines failed\n"); g_dev=nil; return 0; }
     if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_moe_fwht || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
@@ -1363,6 +1447,124 @@ extern "C" int coli_metal_rtop8(int par, const float *sig, const float *bias, in
     memcpy(idx,bi.contents,(size_t)S*K*4);
     memcpy(w,bw.contents,(size_t)S*K*4);
     memcpy(keff,bk.contents,(size_t)S*4);
+  }
+  return 1;
+}
+
+// ---- training entry points (M6): synchronous, correctness-first, unfused.
+// Inputs go through wrap() (zero-copy when page-aligned, else one copy);
+// accumulate outputs are copied in, updated on GPU, copied back.
+
+extern "C" int coli_metal_train_tmul(float *dx, const float *dy, const void *w, const float *sp,
+                                     int fmt, int gs, int S, int I, int O) {
+  if (!g_dev || !g_t_tmul || (fmt!=0 && fmt!=1 && fmt!=2 && fmt!=4)) return 0;
+  if (fmt==4 && gs<1) return 0;
+  @autoreleasepool {
+    size_t wbytes = (fmt==1)?(size_t)O*I : (fmt==2||fmt==4)?(size_t)O*((I+1)/2) : (size_t)O*I*4;
+    size_t sbytes = (fmt==4)?(size_t)O*((I+gs-1)/gs)*4 : (size_t)O*4;
+    id<MTLBuffer> wb=wrap(w,wbytes);
+    id<MTLBuffer> sb=wrap(sp?sp:(const void*)dx, sp?sbytes:4);   /* fmt0: unused, bind dummy */
+    id<MTLBuffer> dyb=wrap(dy,(size_t)S*O*4);
+    id<MTLBuffer> dxb=[g_dev newBufferWithBytes:dx length:(size_t)S*I*4 options:MTLResourceStorageModeShared];
+    if(!wb||!sb||!dyb||!dxb) return 0;
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:g_t_tmul];
+    [e setBuffer:wb offset:0 atIndex:0]; [e setBuffer:sb offset:0 atIndex:1];
+    [e setBuffer:dyb offset:0 atIndex:2]; [e setBuffer:dxb offset:0 atIndex:3];
+    [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
+    [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
+    [e setBytes:&gs length:4 atIndex:8];
+    size_t n=(size_t)S*I;
+    [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] train_tmul cmdbuf error\n"); return 0; }
+    memcpy(dx,[dxb contents],(size_t)S*I*4);
+  }
+  return 1;
+}
+
+// z[S,rank] = x @ A^T ; y[S,O] += scale * z @ B^T
+extern "C" int coli_metal_train_lora_fwd(float *y, float *z, const float *x,
+                                         const float *A, const float *B, float scale,
+                                         int S, int I, int O, int rank) {
+  if (!g_dev || !g_t_xwt) return 0;
+  @autoreleasepool {
+    id<MTLBuffer> xb=wrap(x,(size_t)S*I*4), Ab=wrap(A,(size_t)rank*I*4), Bb=wrap(B,(size_t)O*rank*4);
+    id<MTLBuffer> zb=[g_dev newBufferWithLength:(size_t)S*rank*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> yb=[g_dev newBufferWithBytes:y length:(size_t)S*O*4 options:MTLResourceStorageModeShared];
+    if(!xb||!Ab||!Bb||!zb||!yb) return 0;
+    float one=1.f, zero=0.f;
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:g_t_xwt];             /* z = x A^T */
+    [e setBuffer:Ab offset:0 atIndex:0]; [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:zb offset:0 atIndex:2];
+    [e setBytes:&S length:4 atIndex:3]; [e setBytes:&I length:4 atIndex:4]; [e setBytes:&rank length:4 atIndex:5];
+    [e setBytes:&one length:4 atIndex:6]; [e setBytes:&zero length:4 atIndex:7];
+    size_t n=(size_t)S*rank;
+    [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [e setComputePipelineState:g_t_xwt];             /* y += scale * z B^T */
+    [e setBuffer:Bb offset:0 atIndex:0]; [e setBuffer:zb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
+    [e setBytes:&S length:4 atIndex:3]; [e setBytes:&rank length:4 atIndex:4]; [e setBytes:&O length:4 atIndex:5];
+    [e setBytes:&scale length:4 atIndex:6]; [e setBytes:&one length:4 atIndex:7];
+    n=(size_t)S*O;
+    [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] lora_fwd cmdbuf error\n"); return 0; }
+    memcpy(z,[zb contents],(size_t)S*rank*4);
+    memcpy(y,[yb contents],(size_t)S*O*4);
+  }
+  return 1;
+}
+
+// dz = scale * dy @ B ; dB += scale * dy^T z ; dA += dz^T x ; dx += dz @ A
+extern "C" int coli_metal_train_lora_bwd(float *dA, float *dB, float *dx,
+                                         const float *x, const float *z, const float *dy,
+                                         const float *A, const float *B, float scale,
+                                         int S, int I, int O, int rank) {
+  if (!g_dev || !g_t_xw || !g_t_outer) return 0;
+  @autoreleasepool {
+    id<MTLBuffer> xb=wrap(x,(size_t)S*I*4), zb=wrap(z,(size_t)S*rank*4), dyb=wrap(dy,(size_t)S*O*4);
+    id<MTLBuffer> Ab=wrap(A,(size_t)rank*I*4), Bb=wrap(B,(size_t)O*rank*4);
+    id<MTLBuffer> dzb=[g_dev newBufferWithLength:(size_t)S*rank*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dAb=[g_dev newBufferWithBytes:dA length:(size_t)rank*I*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dBb=[g_dev newBufferWithBytes:dB length:(size_t)O*rank*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dxb=dx?[g_dev newBufferWithBytes:dx length:(size_t)S*I*4 options:MTLResourceStorageModeShared]:nil;
+    if(!xb||!zb||!dyb||!Ab||!Bb||!dzb||!dAb||!dBb||(dx&&!dxb)) return 0;
+    float one=1.f, zero=0.f;
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    size_t n;
+    [e setComputePipelineState:g_t_xw];              /* dz = scale * dy @ B */
+    [e setBuffer:Bb offset:0 atIndex:0]; [e setBuffer:dyb offset:0 atIndex:1]; [e setBuffer:dzb offset:0 atIndex:2];
+    [e setBytes:&S length:4 atIndex:3]; [e setBytes:&O length:4 atIndex:4]; [e setBytes:&rank length:4 atIndex:5];
+    [e setBytes:&scale length:4 atIndex:6]; [e setBytes:&zero length:4 atIndex:7];
+    n=(size_t)S*rank;
+    [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [e setComputePipelineState:g_t_outer];           /* dB += scale * dy^T z */
+    [e setBuffer:dyb offset:0 atIndex:0]; [e setBuffer:zb offset:0 atIndex:1]; [e setBuffer:dBb offset:0 atIndex:2];
+    [e setBytes:&S length:4 atIndex:3]; [e setBytes:&O length:4 atIndex:4]; [e setBytes:&rank length:4 atIndex:5];
+    [e setBytes:&scale length:4 atIndex:6];
+    n=(size_t)O*rank;
+    [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e setComputePipelineState:g_t_outer];           /* dA += dz^T x */
+    [e setBuffer:dzb offset:0 atIndex:0]; [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:dAb offset:0 atIndex:2];
+    [e setBytes:&S length:4 atIndex:3]; [e setBytes:&rank length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
+    [e setBytes:&one length:4 atIndex:6];
+    n=(size_t)rank*I;
+    [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    if(dx){
+        [e setComputePipelineState:g_t_xw];          /* dx += dz @ A */
+        [e setBuffer:Ab offset:0 atIndex:0]; [e setBuffer:dzb offset:0 atIndex:1]; [e setBuffer:dxb offset:0 atIndex:2];
+        [e setBytes:&S length:4 atIndex:3]; [e setBytes:&rank length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
+        [e setBytes:&one length:4 atIndex:6]; [e setBytes:&one length:4 atIndex:7];
+        n=(size_t)S*I;
+        [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    }
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] lora_bwd cmdbuf error\n"); return 0; }
+    memcpy(dA,[dAb contents],(size_t)rank*I*4);
+    memcpy(dB,[dBb contents],(size_t)O*rank*4);
+    if(dx) memcpy(dx,[dxb contents],(size_t)S*I*4);
   }
   return 1;
 }
