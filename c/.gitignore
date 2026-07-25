@@ -51,3 +51,8 @@ qwen36
 shaders/attention_absorb.spv
 shaders/qmatmul_gate_up.spv
 shaders/rmsnorm.spv
+
+# QLoRA training artifacts
+coli_train
+adapters/
+train_state.bin
