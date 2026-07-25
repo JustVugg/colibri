@@ -160,6 +160,17 @@ int main(void){
         /* subnormal-magnitude row: norm below the guard -> inert (like KV8) */
         for(int i=0;i<n;i++) x[i]=1e-38f;
         CHECK(coli_tq_quant_row(x,q,n,bits)==0.f, "subnormal row -> inert radius 0");
+        /* NON-POWER-OF-TWO width: the radix-2 FWHT cannot represent it, so BOTH codecs
+         * return an inert radius 0 for a perfectly healthy row. That is why colibri.c
+         * refuses to start under KV_TQ when a model's kv_lora/qk_rope are not powers of
+         * two -- without that guard every latent row would silently quantize to zero and
+         * the engine would generate confident garbage. This pins the behavior the guard
+         * is protecting against, so removing the guard cannot become quietly harmless. */
+        for(int i=0;i<n;i++) x[i]=gauss();
+        CHECK(coli_tq_quant_row(x,q,48,bits)==0.f, "non-power-of-two width -> inert (polar)");
+        CHECK(coli_q4_quant_row(x,q,48)==0.f,      "non-power-of-two width -> inert (int4)");
+        CHECK(coli_kvq_quant_row(x,q,48,bits,0)==0.f, "non-power-of-two width -> inert (dispatch codec 0)");
+        CHECK(coli_kvq_quant_row(x,q,48,bits,1)==0.f, "non-power-of-two width -> inert (dispatch codec 1)");
         /* a non-finite radius read from a corrupt file decodes to zero, never NaN */
         for(int i=0;i<n;i++) x[i]=gauss();
         float rad=coli_tq_quant_row(x,q,n,bits);

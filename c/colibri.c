@@ -7131,7 +7131,13 @@ int main(int argc, char **argv){
     { int tqv = getenv("KV_TQ")?atoi(getenv("KV_TQ")):0;
       if(tqv){
         if(g_kv8){ fprintf(stderr,"[KV_TQ] KV8 and KV_TQ are mutually exclusive; KV_TQ wins (KV8 off)\n"); g_kv8=0; }
-        if(tqv<2) tqv=2; if(tqv>6) tqv=6;            /* documented 3|4; clamp to the header's grid range */
+        /* KV_TQ=1 used to clamp UP to 2, silently handing "just turn it on" the
+         * most aggressive, lowest-quality tier. 4 is the recommended one, so a
+         * bare/underspecified value lands there instead; >6 still clamps down to
+         * the header's grid range. */
+        if(tqv<2){ if(tqv!=4) fprintf(stderr,"[KV_TQ] KV_TQ=%d is below the 2..6 grid; using the recommended 4-bit tier\n",tqv);
+                   tqv=4; }
+        if(tqv>6) tqv=6;
         g_tq=1; g_tq_bits=tqv;
         /* rotated int4 is a fixed 4-bit codec (best 4-bit for MLA); other bit widths and
          * KV_TQ_POLAR=1 use PolarQuant (variable bits, paper-faithful). */
@@ -7146,6 +7152,23 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    /* KV_TQ requires power-of-two row widths: both codecs rotate through a
+     * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
+     * other width. On a model whose kv_lora/qk_rope are not powers of two that
+     * would quantize EVERY latent row to zero and generate confident garbage
+     * with no diagnostic -- the exact silent-misread failure the .coli_kv tier
+     * magic exists to prevent. Refuse instead. GLM-5.2 (512/64) is unaffected;
+     * this only fires on a model shape the codec cannot represent. */
+    if(g_tq){
+        int kl=m.c.kv_lora, kr=m.c.qk_rope;
+        if(kl<2||kr<2||(kl&(kl-1))||(kr&(kr-1))){
+            fprintf(stderr,"[KV_TQ] this model's latent rows are kv_lora=%d qk_rope=%d, but the "
+                "rotation needs power-of-two widths (>=2): every row would quantize to zero. "
+                "Refusing to run quantized -- unset KV_TQ (or use KV8=1, which has no width "
+                "constraint).\n", kl, kr);
+            return 2;
+        }
+    }
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
         /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8
          * tokens' worth of routing) is a measured-config constant, not a derived truth.
