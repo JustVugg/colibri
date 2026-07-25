@@ -539,6 +539,7 @@ TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
 	tests/test_edge_adapters_registration$(EXE)
 endif
+TEST_BINS += tests/test_lora$(EXE) tests/test_train_linear$(EXE) tests/test_train_tiny$(EXE) tests/test_train_resume$(EXE)
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
 # (CUDA_DLL/HIP_DLL mutual exclusion is enforced at the HIP_DLL declaration.)
@@ -1700,6 +1701,23 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c sse41_kernels.h colibri.c o
 # Force the grouped-int4 oracle onto the SSE4.1 tier even on an AVX2 host.
 tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h idot.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_lora$(EXE): tests/test_lora.c lora.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_train_linear$(EXE): tests/test_train_linear.c train/qlora_ops.h lora.h sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_tiny$(EXE): tests/test_train_tiny.c train/train_model.h train/qlora_ops.h lora.h sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_resume$(EXE): tests/test_train_resume.c train/train_model.h train/qlora_ops.h train/dataset.h train/checkpoint.h lora.h sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+coli_train$(EXE): train/train_main.c train/train_model.h train/qlora_ops.h train/dataset.h train/checkpoint.h train/budget.h lora.h sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) train/train_main.c $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+coli_train: coli_train$(EXE)
 
 tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h idot.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)

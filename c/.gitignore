@@ -58,3 +58,8 @@ shaders/rmsnorm.spv
 tests/xdna_exec_fixtures/
 tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
+
+# QLoRA training artifacts
+coli_train
+adapters/
+train_state.bin
