@@ -253,6 +253,34 @@ the full 756 GB on disk at once:
 ./coli convert --model /nvme/glm52_i4     # download+convert shard by shard (python, one-time)
 ```
 
+#### Qwen3.6-35B-A3B (35B / 3B active) — community build
+
+A pure-C **Qwen3.6-35B-A3B** runtime (`c/qwen36.c`) is available as a community
+contribution: Gated-Attention (GQA + partial RoPE) + Gated DeltaNet recurrent
+linear attention, with a streaming MoE, an optional **Vulkan** MoE backend
+(int4 unpacked in-shader + float GEMV, works around the AMD integrated-GPU
+`OpSDotKHR` segfault) and resident-expert pinning (`COLIBRI_RESIDENT=1/2`) to
+cut disk IO. Runs on a 16 GB laptop.
+
+Pre-converted colibri containers are on Hugging Face:
+
+- **int8** (~35 GB, lower quant loss): <https://huggingface.co/minne100/qwen36-35b-a3b-colibri-i8>
+- **int4** (~20 GB): <https://huggingface.co/minne100/qwen36-35b-a3b-colibri-i4>
+- conversion toolkit + reference prompts: <https://huggingface.co/datasets/minne100/colibri-qwen36-tools>
+
+```bash
+# build
+cd c && gcc -D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -o qwen36.exe qwen36.c vulkan_gemv.c -lm -fopenmp -static -lpsapi
+# run (uses Vulkan GPU if present, otherwise falls back to CPU)
+SNAP=<model> TOK=<model>/tokenizer.json ./qwen36 8 4 prompt.txt
+```
+
+> Built in PR [#602](https://github.com/JustVugg/colibri/pull/602). On an
+> integrated-GPU 16 GB machine a cold-start benchmark shows **int8 CPU-only is
+> fastest** (~1.08 tok/s, 10.25 GB peak) because the iGPU shares system memory
+> and gains no bandwidth, while int4 pays an unpack penalty; int4 stays half
+> the on-disk size.
+
 ### 3. Run it
 
 ```bash
@@ -289,8 +317,9 @@ and the optional API gateway.
   merged in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
   routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+  **Qwen3.6-35B-A3B** is now available as a community build (PR
+  [#602](https://github.com/JustVugg/colibri/pull/602)); more open-weight
+  families — **Kimi K2** (Moonshot AI), **MiniMax** — are on the roadmap.
 
 ## Supporting the project
 
