@@ -3,695 +3,375 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>colibrì — tiny engine, immense model</title>
-<meta name="description" content="Run GLM-5.2, a 744B-parameter Mixture-of-Experts model, on your own machine — pure C, zero dependencies, experts streamed from disk. Open the model up: run it, study it, improve it.">
-<meta property="og:title" content="colibrì — tiny engine, immense model">
-<meta property="og:description" content="A 744B MoE on consumer hardware: pure C, zero dependencies, 19,456 experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
-<meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
+<title>colibri — a 744B model on hardware you own</title>
+<meta name="description" content="Run GLM-5.2, a 744-billion-parameter Mixture-of-Experts model, on hardware you already own — pure C, zero dependencies, experts streamed from disk.">
+<meta property="og:title" content="colibri — a 744B model on hardware you own">
+<meta property="og:description" content="A 744B MoE on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
 <meta property="og:type" content="website">
+<meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Bytesized&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;1,8..60,400&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#04060c; --bg2:#080c1a; --panel:rgba(13,18,38,.72); --line:#1b2342; --line2:#2a3560;
-  --txt:#e6ebfa; --dim:#8a96bd; --faint:#4a5478;
-  --magenta:#d75fd7; --cyan:#4dd8ff; --gold:#ffb84d; --green:#5ee88f;
-  --mono:ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,Consolas,monospace;
-  --sans:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+  --cream:#F0EDE4; --tan:#E7E0D1; --tan2:#DFD7C6; --card-line:#D2CAB7;
+  --ink:#191817; --ink2:#3c3931; --gray:#726b5e; --faint:#a49c8b;
+  --dark:#141311; --on-dark:#EDE9DF; --on-dark-dim:#a7a094;
+  --hair:#dcd6c8; --clay:#b3603f;
+  --sans:'Hanken Grotesk',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --serif:'Source Serif 4',Georgia,'Times New Roman',serif;
+  --maxw:1200px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--txt);font-family:var(--sans);line-height:1.65;overflow-x:hidden}
-a{color:var(--cyan);text-decoration:none}
-a:hover{text-decoration:underline}
-::selection{background:#7a2d8f;color:#fff}
+body{background:var(--cream);color:var(--ink);font-family:var(--sans);line-height:1.5;
+  -webkit-font-smoothing:antialiased;overflow-x:hidden;font-size:17px}
+a{color:inherit;text-decoration:none}
+::selection{background:rgba(179,96,63,.16)}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(1.3rem,4vw,2.6rem)}
+.serif{font-family:var(--serif)}
 
-/* ---------- nav ---------- */
-nav{position:fixed;top:0;left:0;right:0;z-index:60;display:flex;align-items:center;gap:1.5rem;
-  padding:.85rem clamp(1rem,4vw,3.5rem);transition:background .3s,border-color .3s;
-  border-bottom:1px solid transparent}
-nav.scrolled{background:rgba(4,6,12,.85);backdrop-filter:blur(10px);border-color:var(--line)}
-nav .brand{display:flex;align-items:center;gap:.55rem;font-family:var(--mono);font-weight:700;color:var(--txt);font-size:1rem}
-nav .brand img{width:24px;height:24px}
-nav .links{margin-left:auto;display:flex;gap:1.6rem;font-size:.9rem;font-family:var(--mono)}
-nav .links a{color:var(--dim)} nav .links a:hover{color:var(--txt);text-decoration:none}
-@media(max-width:640px){nav .links a:not(.gh){display:none}}
+/* nav */
+nav{position:fixed;inset:0 0 auto 0;z-index:50;background:rgba(240,237,228,.88);backdrop-filter:blur(10px);transition:border-color .25s;border-bottom:1px solid transparent}
+nav.on{border-color:var(--hair)}
+nav .in{max-width:var(--maxw);margin:0 auto;display:flex;align-items:center;padding:.85rem clamp(1.3rem,4vw,2.6rem)}
+nav .brand{display:flex;align-items:center}
+nav .brand .mark{display:flex;transition:transform .4s cubic-bezier(.4,0,.2,1)}
+nav .brand .mark svg{width:40px;height:40px;display:block}
+nav.on .brand .mark{transform:scale(1.06)}
+nav .brand .word{font-family:'Bytesized',var(--sans);font-weight:400;font-size:2.3em;letter-spacing:.02em;text-transform:uppercase;line-height:1;margin-left:.6rem;
+  max-width:16rem;opacity:1;overflow:hidden;white-space:nowrap;
+  transition:max-width .45s cubic-bezier(.4,0,.2,1),opacity .3s,margin-left .45s cubic-bezier(.4,0,.2,1)}
+nav.on .brand .word{max-width:0;opacity:0;margin-left:0}
+nav .nl{margin-left:auto;display:flex;gap:2rem;align-items:center;font-weight:500;font-size:.96rem}
+nav .nl a:not(.btn){color:var(--ink2)} nav .nl a:not(.btn):hover{color:var(--ink)}
+.btn{font-family:var(--sans);font-weight:600;font-size:.94rem;display:inline-flex;align-items:center;gap:.45rem;
+  background:var(--ink);color:var(--cream);padding:.6rem 1.15rem;border-radius:7px;transition:.15s;border:1.5px solid var(--ink)}
+.btn:hover{background:#000;border-color:#000}
+.btn.ghost{background:transparent;color:var(--ink);border-color:var(--card-line)}
+.btn.ghost:hover{background:transparent;border-color:var(--ink)}
+@media(max-width:820px){nav .nl a:not(.btn){display:none}}
 
-/* ---------- hero ---------- */
-.hero{position:relative;min-height:100svh;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;text-align:center;overflow:hidden;
-  padding:5rem clamp(1rem,4vw,3rem) 4rem}
-#atlas-hero{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;opacity:.5}
-.hero::after{content:'';position:absolute;inset:0;pointer-events:none;
-  background:radial-gradient(ellipse at 50% 55%,transparent 30%,var(--bg) 88%)}
-.hero>*{position:relative;z-index:2}
-.hero .kicker{font-family:var(--mono);font-size:.85rem;letter-spacing:.35em;color:var(--dim);
-  text-transform:uppercase;margin-bottom:1.4rem}
-.hero h1{font-size:clamp(3.4rem,11vw,7.5rem);font-weight:800;letter-spacing:-.03em;line-height:1;
-  background:linear-gradient(120deg,#fff 30%,#c9a0e8 60%,var(--magenta));
-  -webkit-background-clip:text;background-clip:text;color:transparent}
-.hero .tag{font-family:var(--mono);font-size:clamp(1rem,2.4vw,1.35rem);color:var(--txt);margin-top:1.1rem}
-.hero .sub{max-width:44rem;margin:1.3rem auto 0;color:var(--dim);font-size:clamp(.95rem,1.6vw,1.06rem)}
-.hero .sub b{color:var(--txt)}
-.cta{display:flex;gap:.9rem;justify-content:center;margin-top:2.2rem;flex-wrap:wrap}
-.btn{font-family:var(--mono);font-size:.95rem;padding:.7rem 1.5rem;border-radius:10px;border:1px solid var(--line2);
-  color:var(--txt);background:rgba(13,18,38,.6);backdrop-filter:blur(4px);transition:all .18s}
-.btn:hover{border-color:var(--magenta);text-decoration:none;transform:translateY(-2px)}
-.btn.primary{background:linear-gradient(135deg,#8f2da0,#c44ec4);border-color:#c44ec4;box-shadow:0 4px 30px rgba(215,95,215,.25)}
-.stats{display:flex;justify-content:center;gap:clamp(1.4rem,4.5vw,3.6rem);margin-top:3.2rem;flex-wrap:wrap}
-.stats div{font-family:var(--mono)}
-.stats .n{font-size:clamp(1.5rem,3.4vw,2.3rem);font-weight:800;color:var(--txt);letter-spacing:-.02em}
-.stats .l{font-size:.72rem;color:var(--faint);letter-spacing:.14em;text-transform:uppercase;margin-top:.15rem}
-.scrollcue{position:absolute;bottom:1.6rem;left:50%;transform:translateX(-50%);z-index:2;
-  font-family:var(--mono);font-size:.72rem;color:var(--faint);letter-spacing:.2em}
-.scrollcue::after{content:'▾';display:block;text-align:center;animation:cue 1.6s infinite}
-@keyframes cue{50%{transform:translateY(5px);opacity:.4}}
+/* hero */
+.hero{padding:9.5rem 0 4.5rem}
+.hero-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:3rem;align-items:end}
+@media(max-width:860px){.hero-grid{grid-template-columns:1fr;gap:1.6rem}}
+.hero h1{font-weight:800;font-size:clamp(2.6rem,6.2vw,4.7rem);line-height:1.03;letter-spacing:-.03em;text-wrap:balance}
+.hero h1 u{text-decoration:none;border-bottom:.11em solid var(--ink);padding-bottom:.02em}
+.hero .aside{font-family:var(--serif);font-size:clamp(1.1rem,1.7vw,1.32rem);line-height:1.45;color:var(--ink2);max-width:26rem}
+.hero .cta{display:flex;gap:.7rem;margin-top:2.4rem;flex-wrap:wrap}
 
-/* ---------- sections ---------- */
-main{position:relative;z-index:1}
-section{padding:clamp(4rem,11vh,8rem) clamp(1rem,4vw,3rem);max-width:1220px;margin:0 auto}
-.snum{font-family:var(--mono);font-size:.8rem;letter-spacing:.3em;color:var(--magenta);text-transform:uppercase}
-h2{font-size:clamp(1.9rem,4.5vw,3.1rem);font-weight:800;letter-spacing:-.02em;line-height:1.15;margin:.5rem 0 1rem}
-.lead{color:var(--dim);max-width:56rem;font-size:clamp(.98rem,1.7vw,1.12rem);margin-bottom:2.2rem}
-.lead b{color:var(--txt)} .lead .hl{color:var(--gold)}
+/* dark block */
+.block-dark{background:var(--dark);color:var(--on-dark)}
+.block-dark .inner{max-width:860px;margin:0 auto;padding:clamp(4.5rem,10vh,7rem) clamp(1.3rem,4vw,2.6rem);text-align:center}
+.block-dark h2{font-family:var(--serif);font-weight:400;font-size:clamp(2.1rem,5vw,3.4rem);line-height:1.12;letter-spacing:-.01em;text-wrap:balance}
+.block-dark p{color:var(--on-dark-dim);font-size:1.1rem;max-width:38rem;margin:1.1rem auto 0;line-height:1.5}
+.block-dark .btn{background:var(--on-dark);color:var(--dark);border-color:var(--on-dark);margin-top:2rem}
+.block-dark .btn:hover{background:#fff;border-color:#fff}
+.atlas-block{position:relative;overflow:hidden;min-height:720px;display:flex;align-items:center}
+.atlas-block > canvas{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:0;cursor:grab;touch-action:pan-y}
+.atlas-block::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+  background:radial-gradient(ellipse 58% 46% at 50% 48%,rgba(20,19,17,.66),rgba(20,19,17,.12) 72%,transparent)}
+.atlas-block .inner{position:relative;z-index:2;pointer-events:none}
+.atlas-block .inner h2,.atlas-block .inner p{text-shadow:0 2px 26px rgba(20,19,17,.85),0 1px 5px rgba(20,19,17,.8)}
+.atlas-hint{position:absolute;bottom:1.3rem;left:50%;transform:translateX(-50%);z-index:2;pointer-events:none;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.06em;text-align:center;padding:0 1rem}
 
-/* vision */
-#vision{text-align:center;max-width:1000px}
-#vision .manifesto{font-size:clamp(1.5rem,3.6vw,2.5rem);font-weight:700;letter-spacing:-.015em;
-  line-height:1.35;max-width:56rem;margin:0 auto}
-#vision .manifesto em{font-style:normal;background:linear-gradient(120deg,var(--cyan),var(--magenta));
-  -webkit-background-clip:text;background-clip:text;color:transparent}
-#vision .manifesto .dimline{color:var(--dim);font-weight:400;font-size:.72em}
-.pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:1.1rem;margin-top:3.2rem;text-align:left}
-@media(max-width:820px){.pillars{grid-template-columns:1fr}}
-.pillar{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.6rem 1.5rem;
-  backdrop-filter:blur(6px)}
-.pillar .ic{font-size:1.5rem;margin-bottom:.6rem}
-.pillar h3{font-family:var(--mono);font-size:1.02rem;margin-bottom:.45rem}
-.pillar p{font-size:.9rem;color:var(--dim)}
-.pillar p b{color:var(--txt)}
+/* generic section */
+section{padding:clamp(4.5rem,9vh,7rem) 0}
+.eyebrow{font-weight:700;font-size:1.15rem;letter-spacing:-.01em;margin-bottom:2rem}
+.lead{font-family:var(--serif);color:var(--ink2);max-width:44rem;font-size:clamp(1.1rem,1.7vw,1.28rem);line-height:1.5}
 
-/* algorithm */
-.algo-grid{display:grid;grid-template-columns:1.15fr 1fr;gap:2.4rem;align-items:start}
-@media(max-width:920px){.algo-grid{grid-template-columns:1fr}}
-.algo-copy p{color:var(--dim);margin-bottom:1.1rem;font-size:.98rem}
-.algo-copy p b{color:var(--txt)}
-.algo-copy .jit{border-left:3px solid var(--magenta);padding:.2rem 0 .2rem 1.1rem;margin:1.4rem 0;
-  font-size:1.06rem;color:var(--txt)}
-.tierstack{display:flex;flex-direction:column;gap:.7rem;font-family:var(--mono)}
-.tlevel{border:1px solid var(--line);border-radius:14px;padding:1rem 1.2rem;background:var(--panel);
-  display:flex;align-items:center;gap:1rem;backdrop-filter:blur(6px)}
-.tlevel .sw{width:13px;height:13px;border-radius:4px;flex:none}
-.tlevel .tn{font-weight:700;font-size:.95rem;width:4.2rem;flex:none}
-.tlevel .td{font-size:.78rem;color:var(--dim)}
-.tlevel .td b{color:var(--txt)}
-.tarrow{text-align:center;color:var(--faint);font-size:.8rem;letter-spacing:.2em}
-.research{margin-top:2rem;border:1px dashed var(--line2);border-radius:14px;padding:1.1rem 1.3rem;
-  font-size:.9rem;color:var(--dim);background:rgba(215,95,215,.04)}
-.research b{color:var(--gold)}
 
-/* demo */
-.profiles{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1.1rem}
-.profiles button{font-family:var(--mono);font-size:.8rem;padding:.5rem .95rem;border-radius:9px;cursor:pointer;
-  background:var(--panel);border:1px solid var(--line);color:var(--dim);transition:all .15s;backdrop-filter:blur(4px)}
-.profiles button:hover{color:var(--txt);border-color:var(--line2)}
-.profiles button.on{color:var(--txt);border-color:var(--magenta);background:rgba(122,45,143,.25);
-  box-shadow:0 0 18px rgba(215,95,215,.15)}
-.demo-grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:1.1rem}
-@media(max-width:900px){.demo-grid{grid-template-columns:1fr}}
-.win{background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden;min-width:0;
-  backdrop-filter:blur(8px);box-shadow:0 8px 40px rgba(0,0,0,.35)}
-.win.wide{grid-column:1/-1}
-.win .bar{display:flex;align-items:center;gap:.45rem;padding:.6rem .95rem;border-bottom:1px solid var(--line);
-  font-family:var(--mono);font-size:.78rem;color:var(--faint)}
-.win .bar .dot{width:10px;height:10px;border-radius:50%;background:#2a3560}
-.win .bar .dot.r{background:#e4576b}.win .bar .dot.y{background:#e2b34f}.win .bar .dot.g{background:#57c07a}
-.win .bar .ttl{margin-left:.4rem}
-#term{font-family:var(--mono);font-size:.8rem;line-height:1.55;padding:1rem;height:380px;overflow-y:auto;
-  white-space:pre-wrap;word-break:break-word;color:#b9c3e0}
-#term .banner{color:var(--magenta)} #term .bannertxt{color:var(--faint)}
-#term .you{color:var(--gold)} #term .ans{color:#d5dcf0} #term .statline{color:var(--green)}
-#term .cursor{display:inline-block;width:.55em;height:1.05em;background:var(--cyan);vertical-align:-0.18em;
-  animation:blink 1s steps(1) infinite}
-@keyframes blink{50%{opacity:0}}
-.brainwrap{padding:1rem;display:flex;flex-direction:column;gap:.8rem}
-#brain{width:100%;image-rendering:pixelated;border-radius:8px;background:#060918;display:block}
-.meters{display:grid;grid-template-columns:repeat(3,1fr);gap:.6rem;font-family:var(--mono)}
-.meter{background:rgba(8,12,26,.8);border:1px solid var(--line);border-radius:10px;padding:.6rem .75rem}
-.meter .v{font-size:1.3rem;font-weight:800}
-.meter .v small{font-size:.68rem;font-weight:400;color:var(--faint)}
-.meter .k{font-size:.66rem;color:var(--faint);letter-spacing:.08em;text-transform:uppercase}
-#m-toks .v{color:var(--green)} #m-ttft .v{color:var(--cyan)} #m-hit .v{color:var(--gold)}
-.legend{display:flex;gap:1.1rem;font-family:var(--mono);font-size:.72rem;color:var(--dim);flex-wrap:wrap}
-.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:.35rem;vertical-align:-1px}
-.note{font-size:.78rem;color:var(--faint);margin-top:1rem;font-family:var(--mono)}
-#atlas-live{display:block;width:100%;height:300px;cursor:grab;touch-action:pan-y}
-.livewrap{position:relative}
-.livewrap .topicchip{position:absolute;top:.7rem;left:.9rem;font-family:var(--mono);font-size:.72rem;
-  color:var(--txt);background:rgba(8,12,26,.85);border:1px solid var(--line);border-radius:7px;padding:.28rem .65rem}
-.livewrap .topicchip b{color:var(--gold)}
+/* cards (models) */
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:1.4rem;margin-top:.5rem}
+@media(max-width:900px){.cards{grid-template-columns:1fr}}
+.card{background:var(--tan);border-radius:12px;padding:1.7rem 1.6rem 1.6rem;display:flex;flex-direction:column;transition:.16s}
+.card:hover{background:var(--tan2);transform:translateY(-3px)}
+.card h3{font-weight:700;font-size:1.35rem;letter-spacing:-.02em;margin-bottom:.5rem}
+.card .desc{font-family:var(--serif);color:var(--ink2);font-size:1.02rem;line-height:1.45;flex:1}
+.meta{margin-top:1.4rem}
+.meta .row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;padding:.65rem 0;border-top:1px solid var(--card-line)}
+.meta .k{font-weight:700;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--gray)}
+.meta .v{font-family:var(--serif);font-size:.98rem;color:var(--ink)}
+.card .btn{margin-top:1.3rem;align-self:flex-start}
+.card .btn.soon{background:transparent;color:var(--gray);border-color:var(--card-line);pointer-events:none}
 
-/* atlas */
-#atlas-sec{max-width:none;padding-left:0;padding-right:0}
-#atlas-sec .inner{max-width:1220px;margin:0 auto;padding:0 clamp(1rem,4vw,3rem)}
-.atlaswrap{position:relative;margin-top:1.8rem;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
-  background:radial-gradient(ellipse at 50% 40%,#0b1030 0%,var(--bg) 72%)}
-#atlas{display:block;width:100%;height:min(76vh,680px);cursor:grab;touch-action:pan-y}
-canvas.grabbing{cursor:grabbing}
-.alabel{position:absolute;font-family:var(--mono);font-size:.76rem;pointer-events:none;
-  transform:translate(-50%,-50%);text-shadow:0 0 8px #000,0 0 3px #000;white-space:nowrap;transition:opacity .2s}
-.ahint{position:absolute;bottom:.9rem;right:1.3rem;font-family:var(--mono);font-size:.72rem;color:var(--faint)}
-.atl-legend{display:flex;gap:.4rem 1rem;font-family:var(--mono);font-size:.72rem;color:var(--dim);
-  flex-wrap:wrap;max-width:1220px;margin:1.1rem auto 0;padding:0 clamp(1rem,4vw,3rem)}
-.atl-legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:.3rem;vertical-align:-1px}
+/* data list (hardware) */
+.dlist{margin-top:2.4rem;border-top:1px solid var(--hair)}
+.dlist a,.dlist .drow{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:center;
+  padding:1.15rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
+.dlist a:hover{padding-left:.7rem}
+.dlist .name{font-weight:600;font-size:1.08rem;letter-spacing:-.01em}
+.dlist .sub{color:var(--gray);font-size:.9rem;margin-top:.15rem}
+.dlist .spd{font-family:var(--serif);font-size:1.15rem;white-space:nowrap;text-align:right}
+.dlist .hi{color:var(--clay)}
+.dlistnote{font-family:var(--serif);color:var(--gray);margin-top:1.6rem;font-size:1rem}
+.dlistnote a{border-bottom:1px solid var(--card-line)}
 
-/* ladder */
-.ladder{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:.86rem;margin-top:1.6rem}
-.ladder th{color:var(--faint);font-weight:500;text-align:left;font-size:.7rem;letter-spacing:.12em;
-  text-transform:uppercase;padding:.55rem .85rem;border-bottom:1px solid var(--line2)}
-.ladder td{padding:.7rem .85rem;border-bottom:1px solid #121936}
-.ladder td.spd{color:var(--green);font-weight:800;white-space:nowrap}
-.ladder tr:hover td{background:rgba(13,18,38,.6)}
-.ladder .bar-td{width:34%;min-width:120px}
-.ladder .sbar{height:9px;border-radius:5px;background:linear-gradient(90deg,#1f7a4b,var(--green));min-width:3px;
-  box-shadow:0 0 12px rgba(94,232,143,.25)}
+/* split (build) */
+.split{display:grid;grid-template-columns:1fr 1.3fr;gap:3rem;align-items:start}
+@media(max-width:900px){.split{grid-template-columns:1fr;gap:1.5rem}}
+.split h2{font-weight:800;font-size:clamp(1.9rem,3.6vw,2.6rem);line-height:1.08;letter-spacing:-.03em;text-wrap:balance}
+.jlist{border-top:1px solid var(--hair)}
+.jlist a{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:baseline;padding:1.2rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
+.jlist a:hover{padding-left:.7rem}
+.jlist .t{font-weight:600;font-size:1.1rem}
+.jlist .c{font-family:var(--serif);color:var(--gray);font-size:.98rem;white-space:nowrap}
 
-/* models */
-.models{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:1rem;margin-top:2rem}
-.model{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.35rem 1.3rem;
-  backdrop-filter:blur(6px);position:relative}
-.model.live{border-color:#2a6f4b}
-.model .status{font-family:var(--mono);font-size:.66rem;letter-spacing:.14em;text-transform:uppercase;
-  padding:.2rem .55rem;border-radius:20px;position:absolute;top:1.1rem;right:1.1rem}
-.model.live .status{color:var(--green);background:rgba(94,232,143,.1);border:1px solid #2a6f4b}
-.model.soon .status{color:var(--gold);background:rgba(255,184,77,.08);border:1px solid #6f5a2a}
-.model h3{font-size:1.12rem;margin-bottom:.2rem;padding-right:5rem}
-.model .by{font-family:var(--mono);font-size:.74rem;color:var(--faint);margin-bottom:.6rem}
-.model p{font-size:.85rem;color:var(--dim)}
-.thanks{margin-top:2.6rem;border:1px solid var(--line);border-radius:16px;padding:1.5rem 1.7rem;
-  background:linear-gradient(135deg,rgba(215,95,215,.05),rgba(77,216,255,.04))}
-.thanks p{color:var(--dim);font-size:.95rem}
-.thanks p b{color:var(--txt)}
+/* footer */
+footer{background:var(--dark);color:var(--on-dark-dim);padding:4rem 0 3rem}
+.fgrid{display:grid;grid-template-columns:1.3fr repeat(3,1fr);gap:2rem}
+@media(max-width:820px){.fgrid{grid-template-columns:1fr 1fr}}
+footer .mono-mark svg{width:52px;height:52px}
+footer h4{color:var(--on-dark);font-weight:700;font-size:.95rem;margin-bottom:1rem}
+footer ul{list-style:none;display:flex;flex-direction:column;gap:.7rem}
+footer li a{color:var(--on-dark-dim);font-size:.95rem}
+footer li a:hover{color:var(--on-dark)}
+.fbot{max-width:var(--maxw);margin:2.8rem auto 0;padding:1.6rem clamp(1.3rem,4vw,2.6rem) 0;border-top:1px solid #2a2822;
+  display:flex;gap:1.2rem;flex-wrap:wrap;font-size:.88rem;color:var(--on-dark-dim)}
+.fbot .sp{margin-left:auto}
 
-/* contribute */
-#contrib{text-align:center}
-#contrib .lead{margin-left:auto;margin-right:auto}
-.contrib-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1rem;
-  margin-top:2rem;text-align:left}
-.ccard{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.3rem 1.35rem;
-  backdrop-filter:blur(6px);transition:border-color .2s,transform .15s;color:var(--txt);display:block}
-a.ccard:hover{border-color:var(--magenta);text-decoration:none;transform:translateY(-3px)}
-.ccard h3{font-family:var(--mono);font-size:.95rem;margin-bottom:.35rem;color:var(--cyan)}
-.ccard p{font-size:.85rem;color:var(--dim)}
-
-footer{border-top:1px solid var(--line);padding:2.4rem clamp(1rem,4vw,3.5rem);display:flex;gap:1.6rem;flex-wrap:wrap;
-  align-items:center;font-size:.85rem;color:var(--faint);position:relative;z-index:1;font-family:var(--mono)}
-footer .sp{margin-left:auto}
-.reveal{opacity:0;transform:translateY(26px);transition:opacity .7s ease,transform .7s ease}
+.reveal{opacity:0;transform:translateY(20px);transition:opacity .6s ease,transform .6s ease}
 .reveal.in{opacity:1;transform:none}
-@media(prefers-reduced-motion:reduce){
-  .reveal{opacity:1;transform:none;transition:none}
-  #term .cursor{animation:none}
-  .scrollcue::after{animation:none}
-}
+@media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none}}
 </style>
 </head>
 <body>
 
-<nav id="topnav">
-  <a class="brand" href="#"><img src="colibri-icon.svg" alt=""> colibrì</a>
-  <div class="links">
-    <a href="#vision">vision</a>
-    <a href="#algo">algorithm</a>
-    <a href="#demo">demo</a>
-    <a href="#atlas-sec">atlas</a>
-    <a href="#models">models</a>
-    <a class="gh" href="https://github.com/JustVugg/colibri">GitHub ↗</a>
+<!-- colibri mark — monochrome, no box -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#191817">
+    <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
+    <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
+    <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
+    <rect x="0" y="42" width="14" height="14"/><rect x="14" y="42" width="14" height="14"/><rect x="28" y="42" width="14" height="14"/><rect x="42" y="42" width="14" height="14"/><rect x="56" y="42" width="14" height="14"/><rect x="70" y="42" width="14" height="14"/><rect x="84" y="42" width="14" height="14"/><rect x="98" y="42" width="14" height="14"/><rect x="112" y="42" width="14" height="14"/><rect x="126" y="42" width="14" height="14"/>
+    <rect x="56" y="56" width="14" height="14"/><rect x="70" y="56" width="14" height="14"/><rect x="84" y="56" width="14" height="14"/><rect x="98" y="56" width="14" height="14"/><rect x="112" y="56" width="14" height="14"/><rect x="126" y="56" width="14" height="14"/><rect x="140" y="56" width="14" height="14"/>
+    <rect x="70" y="70" width="14" height="14"/><rect x="84" y="70" width="14" height="14"/><rect x="98" y="70" width="14" height="14"/><rect x="112" y="70" width="14" height="14"/><rect x="126" y="70" width="14" height="14"/><rect x="140" y="70" width="14" height="14"/>
+    <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
+    <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
+  </g></symbol>
+  <symbol id="logo-light" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#EDE9DF">
+    <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
+    <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
+    <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
+    <rect x="0" y="42" width="14" height="14"/><rect x="14" y="42" width="14" height="14"/><rect x="28" y="42" width="14" height="14"/><rect x="42" y="42" width="14" height="14"/><rect x="56" y="42" width="14" height="14"/><rect x="70" y="42" width="14" height="14"/><rect x="84" y="42" width="14" height="14"/><rect x="98" y="42" width="14" height="14"/><rect x="112" y="42" width="14" height="14"/><rect x="126" y="42" width="14" height="14"/>
+    <rect x="56" y="56" width="14" height="14"/><rect x="70" y="56" width="14" height="14"/><rect x="84" y="56" width="14" height="14"/><rect x="98" y="56" width="14" height="14"/><rect x="112" y="56" width="14" height="14"/><rect x="126" y="56" width="14" height="14"/><rect x="140" y="56" width="14" height="14"/>
+    <rect x="70" y="70" width="14" height="14"/><rect x="84" y="70" width="14" height="14"/><rect x="98" y="70" width="14" height="14"/><rect x="112" y="70" width="14" height="14"/><rect x="126" y="70" width="14" height="14"/><rect x="140" y="70" width="14" height="14"/>
+    <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
+    <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
+  </g></symbol>
+</svg>
+
+<nav id="nav">
+  <div class="in">
+    <a class="brand" href="#top"><span class="mark"><svg><use href="#logo"/></svg></span><span class="word">colibri</span></a>
+    <div class="nl">
+      <a href="#engine">Engine</a>
+      <a href="#models">Models</a>
+      <a href="#hardware">Hardware</a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a>
+      <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
+    </div>
   </div>
 </nav>
 
-<header class="hero">
-  <canvas id="atlas-hero"></canvas>
-  <div class="kicker">tiny engine · immense model</div>
-  <h1>colibrì</h1>
-  <div class="tag">a 744-billion-parameter mind, on your desk</div>
-  <p class="sub">Run <b>GLM-5.2 — 744B Mixture-of-Experts</b> — on hardware you already own.
-  Pure C, <b>zero dependencies</b>, experts staged just-in-time across VRAM, RAM and disk.
-  The galaxy behind this text is real: the model's <b>measured expert atlas</b>.</p>
-  <div class="cta">
-    <a class="btn primary" href="https://github.com/JustVugg/colibri">★ Star on GitHub</a>
-    <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Quick start →</a>
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <h1>A <u>744-billion-parameter</u> model, running on <u>hardware you own</u></h1>
+    <div class="aside">
+      GLM-5.2 is a 744B Mixture-of-Experts model. colibri runs it in pure C, with zero dependencies,
+      by streaming its experts from disk — no cluster, no cloud, no API key.
+      <div class="cta">
+        <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Quick start →</a>
+      </div>
+    </div>
   </div>
-  <div class="stats">
-    <div><div class="n">744B</div><div class="l">parameters</div></div>
-    <div><div class="n">19,456</div><div class="l">experts</div></div>
-    <div><div class="n">0</div><div class="l">dependencies</div></div>
-    <div><div class="n">25 GB</div><div class="l">min RAM</div></div>
-    <div><div class="n">9.2</div><div class="l">tok/s measured</div></div>
-  </div>
-  <div class="scrollcue">scroll</div>
 </header>
 
-<main>
-
-<section id="vision" class="reveal">
-  <div class="snum">the vision</div>
-  <p class="manifesto">Frontier models should not be sealed inside datacenters.<br>
-  <em>Anyone curious enough should be able to open one up</em> —<br>
-  <span class="dimline">run it, watch every expert fire, and make it better.</span></p>
-  <div class="pillars">
-    <div class="pillar"><div class="ic">⚡</div><h3>Run it</h3>
-      <p>A 744B frontier-class MoE answering on a <b>25 GB machine</b> — the proven floor — up to
-      9+ tok/s on a workstation. No cluster, no cloud bill, no API key.</p></div>
-    <div class="pillar"><div class="ic">🔬</div><h3>Study it</h3>
-      <p>The engine is a <b>microscope</b>: live routing telemetry, per-expert heat, and the first
-      published <b>expert atlas</b> of a 700B-class model — measured on machines like yours.</p></div>
-    <div class="pillar"><div class="ic">🛠</div><h3>Improve it</h3>
-      <p>One C file, readable in an afternoon. Every optimisation this project found came from
-      <b>someone measuring something</b> — the next one can come from you.</p></div>
+<section class="block-dark" id="engine">
+  <div class="inner reveal">
+    <h2>Frontier models should not be sealed inside datacenters.</h2>
+    <p>Anyone curious enough should be able to open one up — run it, watch every expert fire, and make it better.</p>
+    <a class="btn" href="https://github.com/JustVugg/colibri">Read the engine →</a>
   </div>
 </section>
 
-<section id="algo" class="reveal">
-  <div class="snum">01 — the algorithm</div>
-  <h2>A JIT, but for weights</h2>
-  <div class="algo-grid">
-    <div class="algo-copy">
-      <p>A compiler JIT never compiles the whole program — it watches what actually runs
-      and compiles the <b>hot paths</b>, just in time. colibrì applies the same bet to a
-      744B parameter space: a token activates only <b>~40B parameters</b>, and just
-      <b>~11 GB</b> of those change from token to token — the routed experts.</p>
-      <div class="jit">So parameters are not resident state to be held — they are
-      <b>data to be staged</b>, exactly when the router proves they are needed.</div>
-      <p>The engine keeps the dense weights resident and treats the 19,456 experts as a
-      <b>heterogeneous storage hierarchy</b>: measured routing heat decides which experts earn
-      VRAM, which earn pinned RAM, and which stream from NVMe. The router runs a layer
-      ahead, so prefetch hides the staging latency — and because routing has
-      <b>measurable structure</b> (the atlas below), the hierarchy keeps getting the answer right.
-      Like a JIT, it learns your workload: the more you run, the hotter the right experts get.</p>
-      <p>Everything is validated <b>token-exact</b> against the reference transformers
-      implementation — speed never buys drift.</p>
-      <div class="research">⚗ <b>Active research:</b> the next algorithmic step is under way —
-      smarter placement and scheduling beyond LRU + pin, overlap of CPU and GPU expert execution,
-      and routing-aware speculation. Measured, reviewed, and merged in the open.</div>
-    </div>
-    <div class="tierstack">
-      <div class="tlevel"><span class="sw" style="background:var(--gold)"></span>
-        <span class="tn">VRAM</span><span class="td"><b>hottest experts</b> · grouped GPU matmuls ·
-        six 5090s hold the entire routed set — disk reads hit zero</span></div>
-      <div class="tarrow">↑ promote by measured heat ↓ demote</div>
-      <div class="tlevel"><span class="sw" style="background:var(--cyan)"></span>
-        <span class="tn">RAM</span><span class="td"><b>warm set</b> · pinned &amp; wired, learned from
-        your usage · AVX-512/NEON int4 kernels + LRU behind it</span></div>
-      <div class="tarrow">↑ promote ↓ demote</div>
-      <div class="tlevel"><span class="sw" style="background:#5a6aa8"></span>
-        <span class="tn">NVMe</span><span class="td"><b>cold tail</b> · streamed on demand with io_uring,
-        prefetched a layer ahead — how 744B fits a 25 GB machine at all</span></div>
-      <div class="note" style="margin-top:.4rem">token → router picks 8 of 256 experts × 75 layers →
-      gather across tiers → int4 matmul → next token</div>
-    </div>
-  </div>
-</section>
-
-<section id="demo" class="reveal">
-  <div class="snum">02 — the engine, live</div>
-  <h2>Watch it think</h2>
-  <p class="lead">A replay of the engine at work, paced to <b>measured decode speeds</b> from real
-  community hardware. The grid is all <b>19,456 experts</b> (colour = storage tier, brightness =
-  routing heat, routed = white flash); the galaxy below it is the <b>measured atlas</b> —
-  watch different questions light different regions of the mind.</p>
-  <div class="profiles" id="profiles"></div>
-  <div class="demo-grid">
-    <div class="win">
-      <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="ttl">coli chat — <span id="prof-name"></span></span></div>
-      <div id="term"></div>
-    </div>
-    <div class="win">
-      <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="ttl">the brain — 75 MoE layers × 256 experts + MTP</span></div>
-      <div class="brainwrap">
-        <canvas id="brain" width="256" height="76"></canvas>
-        <div class="meters">
-          <div class="meter" id="m-toks"><div class="v">0.0<small> tok/s</small></div><div class="k">decode</div></div>
-          <div class="meter" id="m-ttft"><div class="v">—</div><div class="k">ttft (measured)</div></div>
-          <div class="meter" id="m-hit"><div class="v">—</div><div class="k">resident hit</div></div>
-        </div>
-        <div class="legend">
-          <span><i style="background:var(--gold)"></i>VRAM tier</span>
-          <span><i style="background:var(--cyan)"></i>RAM tier</span>
-          <span><i style="background:#2a3560"></i>disk tier</span>
-          <span><i style="background:#fff"></i>routed now</span>
-        </div>
-      </div>
-    </div>
-    <div class="win wide">
-      <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="ttl">the atlas, live — measured specialists routed by the current topic</span></div>
-      <div class="livewrap">
-        <canvas id="atlas-live"></canvas>
-        <div class="topicchip">routing: <b id="topicnow">—</b></div>
+<section>
+  <div class="wrap reveal">
+    <div class="eyebrow">How it works — a JIT, but for weights</div>
+    <div class="split">
+      <h2>Weights are not state to hold. They are data to stage.</h2>
+      <div>
+        <p class="lead" style="margin-bottom:1.3rem">A token through GLM-5.2 activates only <strong>~40B parameters</strong>, and just
+          <strong>~11 GB</strong> of those change from token to token — the routed experts. colibri keeps the dense weights resident
+          and treats the 19,456 experts as a storage hierarchy: measured routing heat decides which experts earn VRAM, which earn
+          pinned RAM, and which stream from NVMe. The router runs a layer ahead, so prefetch hides the latency.</p>
+        <p class="lead">Everything is validated <strong>token-exact</strong> against the reference transformers implementation —
+          speed never buys drift.</p>
       </div>
     </div>
   </div>
-  <p class="note">Simulation replays a fixed transcript at each profile's measured decode rate
-  (<a href="https://github.com/JustVugg/colibri/issues/82">#82</a>, <a href="https://github.com/JustVugg/colibri/issues/389">#389</a>,
-  <a href="https://github.com/JustVugg/colibri/issues/387">#387</a>, <a href="https://github.com/JustVugg/colibri/issues/273">#273</a>);
-  “—” means that machine's report did not publish the number — nothing here is invented.
-  Atlas flashes sample real measured affinity (atlas&nbsp;v1) for the active topic.</p>
 </section>
 
-<section id="atlas-sec" class="reveal">
-  <div class="inner">
-    <div class="snum">03 — the atlas</div>
-    <h2>Measured, not assumed</h2>
-    <p class="lead">Every point below is a <b>real measured expert</b> from the published
-    <a href="https://gist.github.com/ZacharyZcR/d3e10905072229ed0114b1123120c611">canonical atlas v1</a>:
-    <b>721 canonical specialists</b> confirmed across three independent kernel families
-    (AVX-512&nbsp;VNNI · NEON · AVX2, engine-pinned, replication-gated) plus <b>637 gate-sensitive</b> ones.
-    Position <b>is</b> the measured 10-topic affinity vector — a specialist sits at its topic's anchor,
-    a generalist drifts to the centre. Colour = top topic, large points = canonical. <b>Drag to spin.</b></p>
-  </div>
-  <div class="atlaswrap">
-    <canvas id="atlas"></canvas>
-    <div id="alabels"></div>
-    <div class="ahint">drag to spin · scroll past to release</div>
-  </div>
-  <div class="atl-legend" id="atl-legend"></div>
-</section>
-
-<section id="ladder-sec" class="reveal">
-  <div class="snum">04 — the ladder</div>
-  <h2>Same engine, any hardware</h2>
-  <p class="lead">Measured decode on real community machines — the hardware only changes
-  <b>where the experts live</b>. Every row links to its public report.</p>
-  <table class="ladder">
-    <thead><tr><th>hardware</th><th>decode</th><th></th><th>where the experts live</th></tr></thead>
-    <tbody>
-      <tr><td>6× RTX 5090 · full residency + selective NUMA (<a href="https://github.com/JustVugg/colibri/issues/82">#82</a>)</td><td class="spd">9.0–9.2 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:100%"></div></td><td>all in VRAM+RAM · disk 0</td></tr>
-      <tr><td>2× Xeon Gold 6430 · 1 TB DDR5 · CPU-only (<a href="https://github.com/JustVugg/colibri/issues/389">#389</a>)</td><td class="spd">5.42 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:59%"></div></td><td>every expert pinned in RAM</td></tr>
-      <tr><td>DGX Spark GB10 · 121 GB unified (<a href="https://github.com/JustVugg/colibri/issues/161">#161</a>)</td><td class="spd">3.33 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:36%"></div></td><td>unified memory + CACHE_ROUTE</td></tr>
-      <tr><td>MacBook Pro M5 Max · 128 GB · Metal (<a href="https://github.com/JustVugg/colibri/issues/387">#387</a>)</td><td class="spd">2.0 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:22%"></div></td><td>Metal tier + warm pin</td></tr>
-      <tr><td>Ryzen AI Max+ 395 · 128 GB (<a href="https://github.com/JustVugg/colibri/issues/200">#200</a>)</td><td class="spd">1.83 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:20%"></div></td><td>hot set pinned in RAM</td></tr>
-      <tr><td>Ryzen 9 9950X3D2 · RTX 5090 · Gen5 NVMe (<a href="https://github.com/JustVugg/colibri/issues/120">#120</a>)</td><td class="spd">1.23 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:13%"></div></td><td>28 GB VRAM tier + 11.5 GB/s disk</td></tr>
-      <tr><td>single RTX 5070 Ti laptop-class (<a href="https://github.com/JustVugg/colibri/issues/273">#273</a>)</td><td class="spd">1.07 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:12%"></div></td><td>GPU-resident pipeline</td></tr>
-      <tr><td>25 GB dev box · cold — the proven floor</td><td class="spd">0.05–0.1 tok/s</td>
-        <td class="bar-td"><div class="sbar" style="width:2%"></div></td><td>streamed from NVMe</td></tr>
-    </tbody>
-  </table>
-  <p class="note">…and 15+ more community machines, from an M4 Pro Mac Mini to a 430 GB EPYC server.
-  Full tables, methodology and quality ablations: <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
-</section>
-
-<section id="models" class="reveal">
-  <div class="snum">05 — the models</div>
-  <h2>One engine, more minds coming</h2>
-  <p class="lead">The tiering algorithm is model-agnostic: any Mixture-of-Experts with routed
-  experts can be staged the same way. GLM-5.2 is live today; support for more open-weight
-  families is on the roadmap.</p>
-  <div class="models">
-    <div class="model live"><span class="status">live</span><h3>GLM-5.2</h3><div class="by">Z.ai · 744B MoE</div>
-      <p>The flagship target: int4 container, token-exact vs reference, full atlas published.</p></div>
-    <div class="model live"><span class="status">live</span><h3>OLMoE</h3><div class="by">Allen AI · 7B MoE</div>
-      <p>The small research workhorse — quantization A/Bs and quality ablations run here first.</p></div>
-    <div class="model soon"><span class="status">planned</span><h3>Kimi K2</h3><div class="by">Moonshot AI · 1T MoE</div>
-      <p>The next scale step: a trillion-parameter mind on the same tiered engine.</p></div>
-    <div class="model soon"><span class="status">planned</span><h3>Qwen3 MoE</h3><div class="by">Alibaba Qwen</div>
-      <p>The most widely-deployed open family — broad hardware coverage meets broad adoption.</p></div>
-    <div class="model soon"><span class="status">planned</span><h3>MiniMax</h3><div class="by">MiniMax · MoE</div>
-      <p>Long-context specialists — a different routing profile for the atlas to map.</p></div>
-  </div>
-  <div class="thanks">
-    <p><b>Thank you</b> to the teams whose open weights make this project possible —
-    <b>Z.ai</b> (GLM), <b>Moonshot AI</b> (Kimi), <b>Alibaba Qwen</b>, <b>MiniMax</b>,
-    <b>Allen AI</b> (OLMoE), and everyone releasing frontier-class models in the open.
-    An engine is nothing without a mind to run.</p>
+<section id="models">
+  <div class="wrap reveal">
+    <div class="eyebrow">The models — one engine, more minds coming</div>
+    <div class="cards">
+      <div class="card"><h3>GLM-5.2</h3><p class="desc">The flagship target: an int4 container, token-exact versus reference, with the full expert atlas published.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size · Status</span><span class="v">744B MoE · Live</span></div></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
+      <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse — quantization A/Bs and quality ablations run here first.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">7B MoE · Live</span></div></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
+      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE — mixed-precision staging under test to fit a consumer box.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>DeepSeek</h3><p class="desc">A widely-studied frontier MoE family — the tiered engine's next large-scale target.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">671B–1T MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>Kimi K2</h3><p class="desc">The next scale step: a trillion-parameter model on the same tiered engine.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">1T MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>Qwen3 MoE</h3><p class="desc">The most widely-deployed open family — broad hardware coverage meets broad adoption.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">MoE · Planned</span></div></div>
+        <a class="btn soon">On the roadmap</a></div>
+    </div>
   </div>
 </section>
 
-<section id="contrib" class="reveal">
-  <div class="snum">06 — join in</div>
-  <h2>Come build the microscope</h2>
-  <p class="lead">Every optimisation in this project started with <b>someone measuring something</b> on
-  their own machine — a disk swap, a NUMA experiment, an atlas replication on a Mac Mini.
-  You don't need a datacenter to move frontier-model research. That is the whole point.</p>
-  <div class="contrib-cards">
-    <a class="ccard" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><h3>▸ run a benchmark</h3>
-      <p>Any hardware is a datapoint — the community table grows one issue at a time.</p></a>
-    <a class="ccard" href="https://github.com/JustVugg/colibri/issues"><h3>▸ pick an issue</h3>
-      <p>Kernels, schedulers, the atlas, the dashboard — measured problems, waiting.</p></a>
-    <a class="ccard" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md"><h3>▸ read the engine</h3>
-      <p>One C file plus headers, zero dependencies. Readable in an afternoon — really.</p></a>
+<section class="block-dark atlas-block">
+  <canvas id="atlasCanvas"></canvas>
+  <div class="inner reveal">
+    <h2>The mind, measured.</h2>
+    <p>Every point behind this text is a real measured expert — 13,260 characterised experts, specialists clustering by topic,
+      generalists drifting to the centre. The first expert atlas of a 700B-class model, mapped on ordinary machines.</p>
+  </div>
+  <div class="atlas-hint">drag to spin · position is measured routing affinity, not a learned embedding</div>
+</section>
+
+<section id="hardware">
+  <div class="wrap reveal">
+    <div class="eyebrow">Same engine, any hardware</div>
+    <p class="lead">Measured decode speed on real community machines. The hardware only changes where the experts live, not what the model answers.</p>
+    <div class="dlist">
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">6× RTX 5090 · full residency + NUMA</div><div class="sub">all in VRAM + RAM · disk 0</div></div><div class="spd">9.0–9.2 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">AWS Graviton4 r8g.16xlarge · 64-core aarch64 · CPU-only</div><div class="sub">98% pinned in 512 GB RAM · disk 0</div></div><div class="spd hi">8.0 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">2× Xeon Gold 6430 · 1 TB DDR5 · CPU-only</div><div class="sub">every expert pinned in RAM</div></div><div class="spd">5.42 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">NVIDIA DGX Spark GB10 · 121 GB unified</div><div class="sub">unified memory + CACHE_ROUTE</div></div><div class="spd">3.33 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">MacBook Pro M5 Max · 128 GB · Metal</div><div class="sub">Metal tier + warm pin</div></div><div class="spd">2.0 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">Ryzen 9 9950X3D · RTX 5090 · Gen5 NVMe</div><div class="sub">28 GB VRAM tier + 11.5 GB/s disk</div></div><div class="spd">1.23 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">25 GB dev box · cold — the proven floor</div><div class="sub">streamed from NVMe</div></div><div class="spd">0.05–0.1 tok/s</div></a>
+    </div>
+    <p class="dlistnote">…and 15+ more community machines, from an M4 Pro Mac Mini to a 430 GB EPYC server.
+      Full tables, methodology and quality ablations: <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
   </div>
 </section>
 
-</main>
+<section style="padding-top:0" id="build">
+  <div class="wrap reveal">
+    <div class="split">
+      <h2>Come build the microscope.</h2>
+      <div class="jlist">
+        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Run a benchmark on your hardware</span><span class="c">Any machine is a datapoint</span></a>
+        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Pick an open issue</span><span class="c">Kernels · schedulers · atlas</span></a>
+        <a href="https://github.com/JustVugg/colibri"><span class="t">Read the engine</span><span class="c">One C file · zero dependencies</span></a>
+        <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">Drop-in gateway</span></a>
+      </div>
+    </div>
+  </div>
+</section>
 
 <footer>
-  <span>🐦 colibrì — <a href="https://github.com/JustVugg/colibri/blob/main/LICENSE">Apache 2.0 license</a></span>
-  <a href="https://github.com/JustVugg/colibri">GitHub</a>
-  <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a>
-  <a href="https://github.com/JustVugg/colibri/blob/main/docs/tuning.md">Tuning</a>
-  <span class="sp">the hummingbird: tiny, fast, precise.</span>
+  <div class="wrap">
+    <div class="fgrid">
+      <div class="mono-mark"><svg><use href="#logo-light"/></svg></div>
+      <div><h4>Engine</h4><ul>
+        <li><a href="https://github.com/JustVugg/colibri">GitHub</a></li>
+        <li><a href="https://github.com/JustVugg/colibri#quick-start">Quick start</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a></li>
+      </ul></div>
+      <div><h4>Models</h4><ul>
+        <li><a href="#models">GLM-5.2</a></li><li><a href="#models">OLMoE</a></li>
+        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek</a></li>
+      </ul></div>
+      <div><h4>Project</h4><ul>
+        <li><a href="https://github.com/JustVugg/colibri/issues">Issues</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Community results</a></li>
+        <li><a href="https://github.com/JustVugg/colibri">Apache 2.0 license</a></li>
+      </ul></div>
+    </div>
+    <div class="fbot"><span>colibri — the hummingbird: tiny, fast, precise.</span><span class="sp">Apache 2.0</span></div>
+  </div>
 </footer>
 
 <script>
-'use strict';
-const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
-function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
-  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const nav=document.getElementById('nav');
+addEventListener('scroll',()=>nav.classList.toggle('on',scrollY>16),{passive:true});
+const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.08});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const pimgs=[...document.querySelectorAll('.pf img[data-parallax]')];
+function park(){const vh=innerHeight;for(const img of pimgs){const f=img.closest('.pf').getBoundingClientRect();const c=(f.top+f.height/2-vh/2)/vh;const s=img.classList.contains('sc4')?1.04:1.06;img.style.transform='scale('+s+') translateY('+(c*-2.4)+'%)';}}
+if(!reduce&&pimgs.length){addEventListener('scroll',park,{passive:true});addEventListener('resize',park);park()}
 
-/* ============ MEASURED ATLAS DATA (canonical atlas v1) ============
-   1,358 experts characterised by the tools/expert_atlas harness (#175/#218):
-   721 canonical (strong + same top topic on all of VNNI/NEON/AVX2) and
-   637 gate-sensitive. Each row: [layer, expert, topicIdx, canonical, specx100,
-   [p×100 over the 10 measured categories]] — p is the VNNI affinity vector.
-   Source: gist.github.com/ZacharyZcR/d3e10905072229ed0114b1123120c611 */
-const ATLAS_CATS=["casual_chat", "chinese", "code_python", "code_sql", "german", "json_format", "law", "math_proof", "medicine", "poetry"];
-const ATLAS_RAW=[[7,16,5,1,59,[15,0,0,2,5,74,0,4,0,0]],[8,104,5,1,77,[1,2,2,2,5,83,2,2,0,0]],[8,159,4,1,60,[3,1,1,1,77,11,1,1,0,4]],[10,62,8,1,54,[12,2,0,4,0,0,5,3,74,0]],[11,21,9,1,64,[3,24,0,0,0,0,1,0,0,72]],[11,27,7,1,63,[0,0,5,0,0,7,3,81,5,0]],[11,85,4,1,78,[1,0,3,1,90,0,3,2,1,0]],[11,202,1,1,56,[0,75,3,5,0,2,0,0,6,9]],[11,223,8,1,56,[14,0,0,8,2,3,0,2,71,0]],[11,250,6,1,69,[0,0,0,10,0,0,81,4,4,0]],[12,125,5,1,96,[0,0,0,0,0,99,0,0,1,0]],[12,129,6,1,77,[0,0,0,3,4,0,88,4,1,0]],[12,201,9,1,64,[1,26,0,1,2,0,0,0,1,70]],[12,231,8,1,76,[0,0,0,3,0,0,8,3,86,0]],[14,27,8,1,64,[2,4,0,5,5,0,0,0,85,0]],[14,125,9,1,83,[0,7,1,0,0,0,0,0,0,91]],[15,134,9,1,56,[2,39,2,1,1,0,3,0,0,53]],[15,195,4,1,95,[0,0,1,0,98,0,0,0,1,0]],[16,21,2,1,69,[0,7,64,25,0,0,0,4,0,0]],[16,119,4,1,100,[0,0,0,0,100,0,0,0,0,0]],[16,214,4,1,73,[0,4,0,0,83,0,4,2,4,2]],[16,245,8,1,63,[8,0,1,0,16,0,0,0,75,0]],[17,0,5,1,100,[0,0,0,0,0,100,0,0,0,0]],[17,56,5,1,58,[1,4,3,4,2,78,1,4,1,1]],[17,58,9,1,77,[0,16,1,0,0,0,1,1,0,81]],[17,61,2,1,70,[0,0,68,32,0,0,0,0,0,0]],[17,62,9,1,70,[4,30,0,0,0,0,0,0,0,66]],[17,70,6,1,66,[9,0,3,0,3,4,78,3,0,0]],[17,75,4,1,100,[0,0,0,0,100,0,0,0,0,0]],[17,76,9,1,72,[2,26,0,0,0,0,0,0,0,72]],[17,97,8,1,54,[7,3,3,0,2,0,0,23,62,0]],[17,99,3,1,63,[0,0,14,70,0,16,0,0,0,0]],[17,110,8,1,79,[2,0,0,4,4,0,4,0,86,0]],[17,191,6,1,64,[0,1,1,2,6,2,80,8,0,0]],[17,195,7,1,71,[1,5,0,0,0,0,0,87,0,7]],[17,214,4,1,62,[0,8,2,2,75,0,3,0,10,0]],[18,32,8,1,86,[1,0,0,0,0,0,0,0,99,0]],[18,46,2,1,77,[0,0,90,3,0,5,0,0,2,0]],[18,52,8,1,75,[13,0,4,0,0,0,0,0,83,0]],[18,62,6,1,77,[0,0,0,2,0,0,85,12,0,0]],[18,129,7,1,62,[3,22,0,0,0,0,6,69,0,0]],[18,151,9,1,59,[1,5,0,0,0,0,38,0,0,56]],[18,168,4,1,70,[0,0,3,3,80,0,10,4,0,0]],[18,173,2,1,60,[5,0,72,7,0,3,0,14,0,0]],[18,203,8,1,57,[27,4,0,0,2,2,0,3,62,0]],[18,221,1,1,67,[2,80,0,2,3,0,2,2,2,8]],[18,227,5,1,79,[2,3,0,0,0,87,5,0,0,3]],[18,231,6,1,59,[1,1,0,0,2,15,73,7,0,0]],[18,234,3,1,77,[0,0,0,83,0,15,0,0,2,0]],[19,5,9,1,66,[2,27,0,1,0,0,0,0,0,69]],[19,6,1,1,61,[30,66,5,0,0,0,0,0,0,0]],[19,36,2,1,68,[3,2,83,0,1,0,0,11,0,0]],[19,39,8,1,65,[9,0,3,6,0,9,0,0,72,0]],[19,41,3,1,90,[0,0,1,97,0,2,0,0,1,0]],[19,45,3,1,63,[2,0,23,70,0,4,0,0,0,2]],[19,54,0,1,72,[78,0,0,5,0,0,0,0,18,0]],[19,102,5,1,89,[2,0,0,4,0,94,0,0,0,0]],[19,142,8,1,57,[1,2,3,1,3,0,3,7,78,0]],[19,143,9,1,57,[4,23,1,1,1,0,0,1,3,65]],[19,148,7,1,82,[1,4,1,1,0,0,1,91,2,0]],[19,157,5,1,60,[14,0,1,4,2,78,1,0,0,0]],[19,191,8,1,55,[0,0,2,0,4,0,22,0,66,6]],[19,242,8,1,75,[0,2,0,0,1,0,8,0,89,0]],[20,3,9,1,53,[4,22,3,1,0,1,1,2,1,64]],[20,5,0,1,69,[64,0,0,0,34,0,1,1,0,0]],[20,10,8,1,61,[3,0,7,4,1,0,0,10,75,0]],[20,12,3,1,85,[1,0,0,94,0,4,0,1,1,0]],[20,18,5,1,71,[0,3,1,0,3,85,2,0,1,4]],[20,37,1,1,56,[21,64,0,9,1,0,3,0,0,2]],[20,56,2,1,60,[0,0,67,0,0,15,1,4,13,0]],[20,87,9,1,56,[0,32,1,2,5,0,0,3,0,57]],[20,125,0,1,56,[70,9,0,0,12,0,0,6,0,4]],[20,140,4,1,66,[4,1,2,1,84,0,2,0,5,1]],[20,141,8,1,59,[2,13,2,0,4,0,0,10,69,0]],[20,162,7,1,79,[0,4,0,3,0,0,0,89,2,2]],[20,182,2,1,57,[0,0,69,4,0,8,1,16,1,1]],[21,6,2,1,67,[0,0,78,0,0,6,0,13,3,0]],[21,27,5,1,55,[0,0,26,0,0,60,0,14,0,0]],[21,29,0,1,65,[79,6,0,4,0,0,0,2,4,6]],[21,37,2,1,100,[0,0,100,0,0,0,0,0,0,0]],[21,43,0,1,65,[80,0,4,0,0,4,3,6,0,2]],[21,44,8,1,64,[7,2,0,0,6,0,0,1,82,2]],[21,69,5,1,88,[0,0,4,1,0,93,0,0,1,0]],[21,71,6,1,74,[0,9,1,0,0,4,86,0,0,0]],[21,91,3,1,63,[3,1,1,81,1,2,1,5,1,2]],[21,147,9,1,78,[0,15,0,0,0,0,0,0,0,85]],[21,155,4,1,91,[0,2,0,0,96,0,0,0,0,0]],[21,191,6,1,70,[0,1,1,0,11,2,82,0,1,1]],[21,228,6,1,89,[0,0,2,0,3,0,94,1,0,0]],[21,229,9,1,78,[0,16,0,0,0,0,0,0,0,84]],[21,240,9,1,66,[0,28,2,0,0,1,0,0,0,68]],[21,242,8,1,89,[0,2,0,0,2,0,0,0,96,0]],[21,255,8,1,87,[1,0,0,0,0,0,0,0,99,0]],[22,2,0,1,68,[77,0,5,0,0,0,0,0,0,18]],[22,19,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[22,41,5,1,76,[6,0,17,0,0,77,0,0,0,0]],[22,49,9,1,56,[8,26,0,0,2,2,0,0,1,61]],[22,89,5,1,54,[0,3,5,2,0,68,3,10,8,0]],[22,104,6,1,88,[0,0,1,2,0,0,95,3,0,0]],[22,117,8,1,90,[0,0,0,0,0,0,0,0,100,0]],[22,120,0,1,60,[63,5,0,0,2,2,0,3,25,0]],[22,123,3,1,92,[0,0,0,97,0,2,0,0,0,0]],[22,159,0,1,89,[97,0,0,0,0,0,0,0,3,0]],[22,181,9,1,75,[0,25,0,0,0,0,0,0,0,75]],[22,191,2,1,99,[0,0,100,0,0,0,0,0,0,0]],[22,199,8,1,71,[0,0,0,0,0,0,22,0,78,0]],[22,210,8,1,84,[0,0,0,1,0,1,2,0,95,0]],[22,218,5,1,77,[0,0,0,19,0,81,0,0,0,0]],[22,233,9,1,83,[1,5,0,0,1,0,0,0,0,92]],[23,3,4,1,59,[2,4,3,0,73,0,2,0,4,13]],[23,75,9,1,73,[1,21,0,1,0,0,1,0,0,75]],[23,150,6,1,82,[0,0,0,5,2,2,91,0,1,0]],[24,14,9,1,72,[11,10,0,0,0,0,0,0,0,78]],[24,17,4,1,52,[0,11,13,3,67,3,3,0,0,0]],[24,57,7,1,80,[3,0,8,0,0,0,0,89,0,0]],[24,71,9,1,63,[5,16,0,1,1,0,1,0,0,77]],[24,89,8,1,63,[0,8,0,0,4,0,5,1,76,5]],[25,169,4,1,51,[2,4,5,3,72,0,5,7,2,0]],[25,237,9,1,57,[2,41,0,0,2,0,0,1,0,54]],[25,253,6,1,54,[0,3,2,4,5,10,74,3,0,0]],[26,21,8,1,63,[3,1,1,1,2,0,5,6,80,0]],[26,52,8,1,53,[8,2,2,4,0,0,4,12,67,0]],[26,143,9,1,60,[5,21,0,0,8,0,0,0,0,66]],[26,160,2,1,67,[0,0,68,0,0,0,0,29,0,3]],[26,164,6,1,63,[0,2,3,5,9,4,76,0,0,1]],[26,179,5,1,78,[0,0,6,8,0,86,0,0,0,0]],[27,57,5,1,95,[0,3,0,0,0,96,1,0,0,0]],[27,85,2,1,66,[0,0,66,4,0,0,0,31,0,0]],[27,128,3,1,63,[0,1,4,85,2,2,2,3,0,0]],[27,136,8,1,56,[26,0,0,1,2,6,0,0,65,0]],[27,184,2,1,58,[7,18,70,1,0,1,2,1,1,0]],[27,197,9,1,54,[9,24,0,0,2,2,0,1,1,63]],[27,253,9,1,62,[8,14,0,1,2,0,0,2,1,73]],[28,77,8,1,72,[0,0,0,0,5,3,7,2,82,0]],[28,119,5,1,85,[0,0,0,10,0,89,0,0,0,1]],[28,148,8,1,86,[7,0,0,0,1,0,0,0,92,0]],[28,193,2,1,61,[0,2,62,24,0,12,0,0,0,0]],[28,197,1,1,58,[0,53,0,0,0,6,3,4,0,34]],[28,199,9,1,71,[0,0,2,0,0,0,15,4,0,80]],[29,44,1,1,57,[6,79,0,6,0,0,0,3,6,0]],[29,88,7,1,60,[0,0,15,19,0,1,0,65,0,0]],[29,112,4,1,59,[2,1,1,2,81,0,4,3,2,4]],[29,152,5,1,86,[0,0,0,5,0,93,2,0,0,0]],[29,218,6,1,56,[0,0,1,0,8,24,67,0,0,0]],[29,237,8,1,86,[0,0,1,5,0,0,0,0,94,0]],[30,54,5,1,56,[0,2,4,12,0,66,15,0,2,0]],[30,81,5,1,81,[0,0,0,12,1,85,0,1,0,0]],[30,82,0,1,55,[71,0,0,1,0,14,0,0,3,10]],[30,84,7,1,60,[4,17,1,2,0,0,0,74,1,0]],[30,99,3,1,69,[0,1,7,83,0,4,0,0,1,5]],[30,150,5,1,58,[0,1,35,2,1,59,0,3,0,0]],[30,244,8,1,54,[26,1,8,2,1,0,1,1,60,0]],[31,37,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[31,53,5,1,51,[0,4,0,27,11,55,2,0,0,0]],[31,62,3,1,67,[0,0,24,73,0,1,1,1,1,0]],[31,84,8,1,96,[0,0,0,0,0,0,0,0,100,0]],[31,85,2,1,70,[0,0,72,2,0,26,0,0,0,0]],[31,103,5,1,76,[0,0,0,26,0,74,0,0,0,0]],[31,114,0,1,61,[61,0,2,0,32,4,0,1,0,0]],[31,136,5,1,81,[0,0,4,1,6,89,0,0,0,0]],[31,139,4,1,66,[0,13,0,3,81,0,3,0,0,0]],[31,156,3,1,67,[0,0,3,70,0,24,1,1,0,0]],[31,193,9,1,57,[1,24,0,0,6,1,1,1,0,65]],[31,198,2,1,64,[0,0,76,1,0,18,1,2,3,0]],[31,244,6,1,87,[0,0,0,8,0,0,92,0,0,0]],[32,49,7,1,71,[6,5,0,2,2,0,0,85,1,0]],[32,74,4,1,74,[0,1,0,0,90,5,1,2,1,0]],[32,114,0,1,85,[92,0,2,4,0,0,0,0,3,0]],[32,136,6,1,93,[0,0,0,1,0,2,97,0,0,0]],[32,137,9,1,56,[1,17,1,1,1,4,1,1,1,72]],[32,146,7,1,53,[0,1,1,0,31,16,1,51,0,0]],[32,163,6,1,94,[0,0,0,0,0,0,100,0,0,0]],[32,165,9,1,55,[24,20,0,0,0,0,0,0,0,55]],[32,176,9,1,57,[14,23,1,0,0,0,0,0,0,61]],[32,178,8,1,62,[5,0,1,0,0,12,6,1,73,3]],[32,181,3,1,65,[0,0,0,58,0,40,0,0,2,0]],[32,182,5,1,66,[0,0,44,0,0,54,0,1,1,1]],[32,229,2,1,94,[0,0,100,0,0,0,0,0,0,0]],[32,230,5,1,66,[2,0,0,17,2,67,2,2,2,5]],[33,43,9,1,55,[18,16,3,0,2,1,0,0,0,60]],[33,59,3,1,69,[0,0,38,61,0,1,0,0,0,0]],[33,69,2,1,58,[0,3,66,0,0,28,3,0,0,0]],[33,80,8,1,55,[0,15,1,0,1,0,0,6,72,5]],[33,85,5,1,53,[0,10,0,0,2,66,0,9,0,14]],[33,113,8,1,97,[0,0,0,0,0,0,0,0,100,0]],[33,117,6,1,96,[0,0,0,0,1,0,99,1,0,0]],[33,124,0,1,61,[75,2,0,0,2,13,0,0,8,0]],[33,133,6,1,68,[0,1,0,5,1,18,75,0,0,0]],[33,146,7,1,71,[0,0,45,0,0,0,0,55,0,0]],[33,169,8,1,84,[0,0,2,2,1,0,0,0,95,0]],[33,193,3,1,53,[1,36,5,51,0,6,1,0,0,0]],[33,215,9,1,61,[14,22,0,0,0,0,0,0,0,64]],[33,225,0,1,54,[76,2,0,2,3,0,4,8,4,1]],[33,236,8,1,83,[0,0,0,0,0,2,3,0,94,0]],[33,237,1,1,62,[10,73,1,1,3,7,0,0,0,6]],[33,239,3,1,89,[0,0,0,89,0,7,0,0,4,0]],[34,13,6,1,66,[0,0,14,3,0,2,77,2,2,0]],[34,20,3,1,62,[0,2,18,77,0,3,0,0,0,0]],[34,53,0,1,55,[64,5,2,1,11,0,0,0,0,17]],[34,62,9,1,57,[25,11,0,0,1,1,0,0,3,61]],[34,138,9,1,60,[4,34,0,0,1,0,0,0,0,59]],[34,142,0,1,79,[93,0,0,0,0,0,0,2,2,3]],[34,143,2,1,69,[0,1,68,29,1,0,0,0,1,0]],[34,153,0,1,95,[100,0,0,0,0,0,0,0,0,0]],[34,182,9,1,55,[9,22,0,0,2,0,2,2,0,62]],[34,191,2,1,59,[0,0,66,25,0,4,0,0,5,0]],[34,212,6,1,60,[1,1,1,8,9,1,75,1,1,2]],[34,216,3,1,82,[0,0,0,94,0,6,0,0,0,0]],[34,222,5,1,65,[1,7,0,0,9,75,0,0,0,9]],[34,245,5,1,67,[0,0,0,8,0,71,0,0,4,16]],[34,246,7,1,54,[0,2,7,6,3,0,7,73,2,0]],[34,249,2,1,75,[0,0,78,6,0,16,0,0,0,0]],[34,253,5,1,71,[3,0,8,0,0,85,3,0,0,3]],[35,51,7,1,98,[0,0,0,0,0,0,0,100,0,0]],[35,83,2,1,57,[0,3,58,26,1,12,0,0,1,0]],[35,97,4,1,54,[2,4,6,3,74,1,1,1,1,5]],[35,102,6,1,70,[0,0,2,22,0,0,77,0,0,0]],[35,118,3,1,68,[0,0,0,56,1,42,0,0,1,0]],[35,124,0,1,81,[89,1,0,0,0,1,0,1,1,7]],[35,151,5,1,72,[0,0,23,0,0,77,0,0,0,0]],[35,182,6,1,92,[0,0,1,1,0,3,96,0,0,0]],[36,0,6,1,63,[0,0,0,28,1,2,67,3,0,0]],[36,45,2,1,71,[0,0,75,4,1,1,0,18,1,0]],[36,76,3,1,64,[0,3,5,75,1,5,0,0,11,0]],[36,129,0,1,62,[80,1,3,0,1,3,3,5,1,3]],[36,131,5,1,61,[0,0,38,0,0,59,3,0,0,0]],[36,173,5,1,76,[0,0,15,0,0,80,0,5,0,0]],[36,205,8,1,63,[0,0,3,0,1,14,7,5,70,0]],[36,246,7,1,81,[0,0,8,6,0,0,0,86,0,0]],[37,11,6,1,94,[0,0,0,2,0,0,98,0,0,0]],[37,54,5,1,60,[4,0,1,0,9,72,12,3,0,0]],[37,165,7,1,76,[0,0,29,0,0,0,0,71,0,0]],[37,170,0,1,56,[52,39,1,0,0,0,1,1,0,4]],[37,201,3,1,53,[2,0,4,67,6,7,0,14,0,0]],[37,231,1,1,61,[2,81,4,2,0,0,3,8,0,0]],[37,236,5,1,92,[0,0,4,0,0,96,0,0,0,0]],[37,241,4,1,67,[1,4,2,3,82,4,0,0,3,0]],[37,246,9,1,75,[2,4,0,0,0,8,0,0,0,87]],[37,249,8,1,65,[9,0,1,0,0,0,21,0,68,0]],[37,252,5,1,63,[0,0,3,17,8,72,0,0,0,0]],[38,37,8,1,75,[7,2,3,0,0,0,0,0,88,0]],[38,68,9,1,71,[0,8,0,0,2,5,0,0,0,85]],[38,95,2,1,85,[0,0,95,2,0,3,0,0,0,0]],[38,100,2,1,63,[0,8,77,9,1,4,1,0,1,0]],[38,116,3,1,77,[0,0,0,80,0,12,5,0,2,1]],[38,152,7,1,64,[0,6,6,3,9,0,2,74,0,0]],[38,159,9,1,53,[1,23,1,1,3,2,1,1,1,65]],[38,177,0,1,65,[77,1,0,1,0,10,1,0,0,10]],[38,232,6,1,56,[0,0,0,17,3,12,69,0,0,0]],[39,33,8,1,56,[5,1,2,3,3,0,3,3,77,4]],[39,59,0,1,57,[69,0,2,0,4,5,0,0,0,20]],[39,66,2,1,61,[0,0,63,22,0,15,0,0,0,0]],[39,68,7,1,68,[0,1,0,0,0,1,30,68,0,0]],[39,133,0,1,70,[78,3,2,1,5,0,1,2,0,7]],[39,140,5,1,69,[3,0,1,30,0,66,0,0,0,0]],[39,152,4,1,62,[4,4,6,1,81,0,1,3,1,0]],[39,187,6,1,58,[0,4,0,21,0,0,66,2,1,6]],[39,206,2,1,54,[0,0,49,21,0,0,29,0,1,0]],[39,222,4,1,86,[0,0,3,4,93,0,0,0,0,0]],[39,248,5,1,59,[0,4,0,2,12,73,3,0,6,0]],[40,29,9,1,57,[9,24,1,0,0,0,0,1,0,65]],[40,40,2,1,88,[0,0,96,0,0,4,0,0,0,0]],[40,60,2,1,65,[0,0,60,33,0,0,6,2,0,0]],[40,82,5,1,66,[0,3,0,0,5,83,8,0,0,0]],[40,83,2,1,100,[0,0,100,0,0,0,0,0,0,0]],[40,125,4,1,66,[0,0,7,1,83,2,3,1,0,3]],[40,126,6,1,77,[0,0,0,0,0,14,82,5,0,0]],[40,192,4,1,58,[0,0,2,13,65,0,0,16,0,4]],[40,220,9,1,65,[0,18,1,0,1,4,0,0,0,75]],[40,221,8,1,81,[5,0,0,0,2,0,0,0,93,0]],[40,243,4,1,61,[2,10,1,1,74,3,1,2,0,6]],[40,245,3,1,69,[0,0,0,57,0,41,0,2,0,0]],[41,7,8,1,71,[1,3,0,1,1,7,0,3,82,2]],[41,9,9,1,57,[2,17,0,0,3,9,0,0,1,69]],[41,37,5,1,86,[0,0,5,0,0,94,0,0,1,0]],[41,66,9,1,61,[1,30,0,0,0,0,0,1,1,66]],[41,126,9,1,58,[10,36,0,0,1,0,0,0,0,53]],[41,148,8,1,77,[4,2,0,1,1,0,2,0,91,0]],[41,167,2,1,61,[5,27,64,3,0,0,0,0,1,0]],[41,176,5,1,64,[0,5,0,0,8,75,0,12,0,0]],[41,195,8,1,57,[35,1,0,1,0,0,3,5,57,0]],[41,200,8,1,65,[6,0,2,0,1,15,4,0,73,0]],[41,204,6,1,58,[0,1,0,4,2,25,66,0,0,2]],[41,214,2,1,68,[0,2,72,2,0,21,0,2,0,0]],[41,227,0,1,61,[73,0,2,1,2,19,2,0,2,0]],[41,245,2,1,64,[0,1,76,2,1,0,0,20,0,2]],[41,248,1,1,83,[2,96,0,0,0,0,2,0,0,0]],[42,17,3,1,60,[0,0,14,68,0,17,0,0,0,0]],[42,30,5,1,74,[0,0,0,4,14,82,0,0,0,0]],[42,109,9,1,57,[9,16,1,0,2,2,0,1,0,68]],[42,135,9,1,67,[5,16,0,0,0,1,0,0,0,77]],[42,140,6,1,63,[0,4,0,3,5,1,80,4,1,1]],[42,172,7,1,98,[0,0,0,0,0,0,0,100,0,0]],[42,204,3,1,56,[3,18,7,67,0,6,0,0,0,0]],[42,230,8,1,64,[13,11,0,1,0,1,1,1,73,0]],[43,27,8,1,78,[0,0,0,4,0,4,1,1,88,3]],[43,64,9,1,54,[0,13,1,2,1,1,1,3,5,73]],[43,68,2,1,60,[0,0,54,37,0,7,0,0,1,0]],[43,79,5,1,72,[0,0,25,0,4,71,0,0,0,0]],[43,91,5,1,74,[0,0,0,0,24,76,0,0,0,0]],[43,121,0,1,63,[80,0,4,0,0,7,8,2,0,0]],[43,158,6,1,62,[0,2,4,15,0,0,75,4,0,0]],[43,208,4,1,68,[1,3,2,1,83,1,2,1,4,1]],[43,216,5,1,86,[0,0,3,0,3,94,0,0,0,0]],[43,232,6,1,53,[0,0,1,4,9,2,68,11,6,0]],[43,236,1,1,58,[0,67,0,0,1,21,0,9,0,1]],[44,17,3,1,100,[0,0,0,100,0,0,0,0,0,0]],[44,19,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[44,40,6,1,95,[0,0,1,0,3,0,96,0,0,0]],[44,47,6,1,56,[1,1,2,5,4,2,79,1,5,0]],[44,50,8,1,68,[5,9,3,0,0,4,0,3,77,0]],[44,61,0,1,55,[58,11,0,0,2,0,0,0,1,27]],[44,79,2,1,77,[0,0,84,16,0,0,0,0,0,0]],[44,89,5,1,98,[0,0,0,0,0,100,0,0,0,0]],[44,172,0,1,62,[59,1,0,0,0,0,1,2,0,37]],[44,173,8,1,78,[2,0,0,0,0,0,0,0,89,9]],[45,43,7,1,76,[0,1,2,7,0,1,5,84,0,0]],[45,44,0,1,56,[75,0,5,5,3,0,2,2,4,4]],[45,70,2,1,53,[0,0,64,19,3,8,0,5,0,0]],[45,83,0,1,54,[59,0,0,1,4,1,3,1,28,3]],[45,84,3,1,71,[2,0,35,61,0,2,0,0,0,0]],[45,148,6,1,62,[0,0,3,22,0,0,71,3,1,0]],[45,157,9,1,54,[0,29,3,0,5,4,0,1,0,58]],[45,170,4,1,61,[0,5,5,5,77,0,3,2,0,3]],[45,185,8,1,54,[11,0,1,5,1,6,1,5,70,0]],[45,217,4,1,60,[1,1,5,2,79,0,1,1,0,9]],[45,240,4,1,53,[5,2,5,1,71,3,0,6,7,0]],[46,1,1,1,54,[0,68,2,1,0,9,0,6,0,13]],[46,14,5,1,58,[7,0,0,38,0,52,4,0,0,0]],[46,29,5,1,56,[1,0,1,3,39,54,0,0,0,1]],[46,30,2,1,97,[0,0,99,0,0,0,0,1,0,0]],[46,60,6,1,82,[0,0,1,0,3,2,92,0,0,0]],[46,94,2,1,88,[0,0,92,0,0,5,2,1,0,0]],[46,150,7,1,94,[6,0,0,0,0,0,0,94,0,0]],[46,162,4,1,74,[0,3,2,0,85,2,0,1,1,6]],[46,188,5,1,90,[2,0,1,1,0,96,0,0,0,0]],[46,199,0,1,54,[53,8,0,1,0,0,0,0,2,35]],[46,231,4,1,67,[0,2,8,2,79,0,4,3,2,0]],[46,250,7,1,52,[0,0,23,18,0,5,0,53,0,0]],[47,8,7,1,60,[8,3,0,11,0,0,0,69,9,0]],[47,65,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[47,168,5,1,58,[0,22,0,4,0,67,2,0,5,0]],[48,9,1,1,53,[2,67,0,2,5,0,0,5,0,19]],[48,31,9,1,56,[0,5,0,1,0,6,2,8,2,76]],[48,108,3,1,78,[0,0,11,84,0,2,0,2,0,1]],[48,130,5,1,60,[7,0,0,2,2,77,10,2,1,0]],[48,155,2,1,100,[0,0,100,0,0,0,0,0,0,0]],[48,167,1,1,60,[5,70,5,3,0,0,0,0,16,0]],[48,200,0,1,61,[82,1,0,0,0,2,1,5,4,5]],[48,202,1,1,58,[8,70,6,2,4,8,0,2,0,0]],[49,1,5,1,65,[0,0,4,20,0,71,0,5,0,0]],[49,3,3,1,52,[0,1,2,58,2,32,1,1,3,0]],[49,11,1,1,62,[4,74,2,7,5,0,0,6,2,0]],[49,27,5,1,86,[0,0,0,11,0,89,0,0,0,0]],[49,45,4,1,57,[2,2,4,0,78,0,4,6,3,1]],[49,46,0,1,85,[96,0,0,0,1,0,0,1,0,2]],[49,79,3,1,78,[2,1,0,87,0,0,0,0,0,10]],[49,93,9,1,61,[1,13,1,0,0,7,0,0,0,78]],[49,151,2,1,70,[3,6,82,0,0,0,0,3,6,0]],[49,154,8,1,55,[43,0,1,1,1,4,0,1,49,0]],[49,168,7,1,84,[2,0,0,0,0,0,7,91,0,0]],[49,237,1,1,75,[2,86,0,2,7,0,0,2,0,0]],[50,27,9,1,54,[4,22,0,0,1,3,1,1,2,66]],[50,41,5,1,79,[0,0,13,0,0,87,0,0,0,0]],[50,62,3,1,93,[0,0,0,96,3,0,0,0,0,0]],[50,72,7,1,65,[0,20,3,0,2,2,0,74,0,0]],[50,95,2,1,96,[0,1,97,0,0,0,1,0,1,0]],[50,132,3,1,65,[0,3,0,59,0,28,0,0,9,0]],[50,140,9,1,63,[8,17,0,0,0,1,0,0,0,74]],[50,149,0,1,90,[97,1,0,0,0,0,1,0,0,1]],[50,185,6,1,55,[0,1,2,1,2,0,67,3,8,15]],[50,201,5,1,72,[1,0,0,0,1,80,13,0,6,0]],[50,205,0,1,65,[78,8,1,0,0,1,1,1,0,11]],[50,215,6,1,75,[0,2,1,0,7,1,84,5,1,0]],[50,232,0,1,65,[79,2,0,0,0,3,6,4,2,4]],[50,233,8,1,63,[7,0,1,1,1,17,1,0,74,0]],[51,8,3,1,65,[2,2,4,78,6,1,0,0,7,0]],[51,13,8,1,52,[8,1,0,1,25,0,2,0,63,0]],[51,23,2,1,100,[0,0,100,0,0,0,0,0,0,0]],[51,24,4,1,85,[0,1,0,1,94,1,0,1,0,1]],[51,33,5,1,79,[0,0,0,14,0,86,0,0,0,0]],[51,50,8,1,64,[0,0,0,1,6,0,1,0,81,11]],[51,53,6,1,58,[0,2,2,0,9,0,79,5,2,0]],[51,143,4,1,79,[1,6,0,0,88,0,0,0,0,4]],[51,147,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[51,154,3,1,66,[0,0,0,66,1,0,33,0,0,0]],[51,155,3,1,82,[0,0,9,86,0,0,2,0,0,4]],[51,156,5,1,73,[0,0,0,34,0,66,0,0,0,0]],[51,181,8,1,78,[0,0,2,7,1,2,0,0,89,0]],[51,195,1,1,66,[0,60,3,1,0,0,0,36,0,0]],[51,200,8,1,75,[6,1,0,2,1,2,0,0,88,0]],[51,203,5,1,51,[0,1,0,2,38,48,3,8,0,0]],[51,219,2,1,60,[0,2,76,7,0,9,1,1,3,1]],[51,254,6,1,81,[0,1,0,3,4,1,90,1,0,0]],[52,8,9,1,55,[4,10,0,0,2,0,0,0,14,71]],[52,15,0,1,62,[67,0,0,2,0,1,0,0,28,2]],[52,16,2,1,70,[0,0,58,0,0,0,0,42,0,0]],[52,24,5,1,98,[0,0,0,0,0,99,1,0,0,0]],[52,62,5,1,57,[0,4,0,0,25,62,0,0,0,8]],[52,91,1,1,78,[0,84,0,0,11,0,0,6,0,0]],[52,99,6,1,75,[2,1,1,1,0,0,89,2,0,4]],[52,102,9,1,59,[7,2,0,0,0,7,0,3,5,75]],[52,141,5,1,82,[7,0,0,0,0,91,0,0,2,0]],[52,166,2,1,98,[0,0,100,0,0,0,0,0,0,0]],[52,167,8,1,56,[0,3,3,0,2,0,21,0,69,2]],[52,174,3,1,100,[0,0,0,100,0,0,0,0,0,0]],[52,198,0,1,91,[95,0,1,0,1,2,0,0,0,0]],[52,200,0,1,53,[63,7,0,0,0,0,2,4,1,23]],[52,212,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[52,235,6,1,66,[0,2,2,3,7,2,78,2,4,0]],[52,241,8,1,56,[0,5,2,2,1,4,2,15,69,0]],[52,251,2,1,79,[0,0,78,0,0,22,0,0,0,0]],[53,15,6,1,94,[0,0,0,0,0,0,100,0,0,0]],[53,57,9,1,79,[0,10,1,0,1,0,0,0,0,87]],[53,86,3,1,81,[0,0,0,93,1,3,0,1,0,1]],[53,87,7,1,57,[0,0,13,5,3,0,3,69,3,5]],[53,100,0,1,65,[56,3,0,0,0,0,0,0,0,40]],[53,135,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[53,145,8,1,79,[1,1,1,2,2,2,2,1,88,0]],[53,162,3,1,98,[0,0,0,99,0,1,0,0,0,0]],[53,185,2,1,100,[0,0,100,0,0,0,0,0,0,0]],[53,195,8,1,53,[29,0,1,0,8,3,0,0,58,0]],[53,210,5,1,61,[8,2,0,2,3,78,3,1,2,1]],[54,1,3,1,73,[0,3,2,83,0,13,0,0,0,0]],[54,51,6,1,93,[0,0,0,0,0,0,100,0,0,0]],[54,61,3,1,62,[7,4,14,72,1,0,0,1,1,0]],[54,86,7,1,64,[5,0,0,5,0,16,0,71,3,0]],[54,116,2,1,85,[0,0,92,8,0,0,0,0,0,0]],[54,118,0,1,75,[86,0,5,0,3,0,2,0,5,0]],[54,128,7,1,55,[0,16,0,1,0,9,7,66,1,0]],[54,152,2,1,89,[1,0,96,0,0,0,0,0,0,3]],[54,231,8,1,90,[7,2,0,0,1,0,0,0,90,0]],[54,240,1,1,56,[16,72,1,1,1,2,0,3,0,2]],[55,3,6,1,84,[3,3,0,0,1,0,85,0,7,0]],[55,36,5,1,57,[7,5,2,0,0,70,0,0,0,17]],[55,38,2,1,59,[0,2,63,25,7,0,0,2,0,0]],[55,100,7,1,97,[0,0,0,0,0,0,0,99,1,0]],[55,113,9,1,51,[36,21,0,0,1,0,0,0,0,41]],[55,136,7,1,53,[2,6,2,3,1,1,7,74,1,1]],[55,161,4,1,72,[0,0,4,2,85,2,3,3,0,2]],[55,190,4,1,59,[1,2,2,2,75,1,0,4,1,12]],[55,201,3,1,96,[0,0,0,98,1,0,0,0,0,0]],[55,246,1,1,57,[0,68,3,2,7,0,2,16,2,2]],[55,248,9,1,64,[28,2,1,0,0,0,0,1,2,68]],[56,15,0,1,59,[71,0,0,1,3,0,8,5,1,10]],[56,48,1,1,71,[4,84,5,0,1,1,3,0,1,1]],[56,61,8,1,68,[6,1,0,1,0,6,0,1,84,0]],[56,72,7,1,75,[1,1,5,2,0,0,10,80,0,0]],[56,84,1,1,66,[5,73,13,0,5,4,0,0,0,0]],[56,134,2,1,87,[0,0,96,0,0,0,1,1,1,0]],[56,162,7,1,90,[0,0,0,0,0,0,0,94,6,0]],[56,165,6,1,77,[0,3,0,0,4,0,92,0,1,1]],[56,178,0,1,73,[79,0,0,0,13,0,1,0,0,8]],[56,180,5,1,99,[0,0,0,0,0,100,0,0,0,0]],[56,203,6,1,68,[0,10,2,0,1,0,84,3,0,0]],[56,217,3,1,68,[0,0,1,71,2,22,1,1,2,0]],[56,219,3,1,54,[3,0,4,74,2,1,4,6,6,0]],[56,225,4,1,53,[4,1,1,1,78,3,3,1,3,6]],[56,236,4,1,61,[0,3,1,4,79,1,2,5,3,2]],[57,5,5,1,71,[2,0,1,1,1,84,4,3,3,2]],[57,12,4,1,62,[4,2,2,1,78,4,5,1,1,4]],[57,16,9,1,81,[0,17,0,0,0,0,0,0,0,83]],[57,27,7,1,100,[0,0,0,0,0,0,0,100,0,0]],[57,30,4,1,73,[1,1,2,5,85,1,0,0,1,2]],[57,38,2,1,76,[2,2,83,7,3,3,0,0,0,0]],[57,56,4,1,87,[0,6,2,2,90,0,0,0,0,0]],[57,92,6,1,91,[0,0,0,0,0,0,88,0,12,0]],[57,109,9,1,63,[6,3,2,0,1,0,0,0,4,84]],[57,114,8,1,82,[0,0,0,0,0,8,0,0,92,0]],[57,149,1,1,59,[1,70,2,6,4,0,0,0,0,18]],[57,160,6,1,53,[0,1,3,12,5,0,66,12,1,1]],[57,170,2,1,95,[1,0,98,0,0,0,0,1,0,0]],[57,181,6,1,70,[0,2,2,2,2,1,85,6,0,1]],[57,185,0,1,75,[78,0,0,0,0,0,0,0,0,22]],[57,216,4,1,59,[2,0,0,0,69,22,5,2,0,0]],[57,222,9,1,93,[0,1,0,0,0,2,0,1,0,97]],[57,223,3,1,81,[1,0,6,91,2,0,1,0,0,0]],[58,2,5,1,60,[1,0,27,1,0,66,0,1,1,2]],[58,3,2,1,63,[0,4,80,10,0,0,2,0,2,3]],[58,21,9,1,67,[7,5,1,1,0,1,2,3,0,80]],[58,23,3,1,70,[1,0,0,70,0,28,0,1,0,0]],[58,41,7,1,74,[0,0,1,0,0,9,0,82,0,8]],[58,47,6,1,53,[0,7,4,3,4,4,70,0,1,6]],[58,96,6,1,61,[4,4,1,1,5,0,83,3,0,0]],[58,107,4,1,78,[2,0,2,2,85,0,2,4,0,3]],[58,118,5,1,88,[0,0,5,0,2,93,0,0,0,0]],[58,178,9,1,58,[1,10,7,2,0,2,0,2,1,75]],[58,189,3,1,85,[0,1,0,92,4,3,0,0,0,0]],[58,204,3,1,62,[0,3,29,66,2,0,0,0,0,0]],[58,228,1,1,72,[0,82,5,0,2,0,0,0,5,6]],[58,238,7,1,73,[0,0,0,20,2,0,2,75,0,0]],[58,254,6,1,65,[5,1,5,2,2,2,79,0,2,3]],[59,7,0,1,82,[88,0,0,0,0,4,0,0,7,2]],[59,31,4,1,72,[2,2,2,3,85,0,1,1,2,2]],[59,34,2,1,76,[0,0,84,0,0,10,0,4,1,0]],[59,66,5,1,80,[0,0,0,6,0,89,2,0,2,0]],[59,67,9,1,69,[0,10,0,3,4,0,0,0,0,83]],[59,115,5,1,64,[4,18,0,0,0,74,1,2,2,1]],[59,141,4,1,57,[2,3,0,4,74,2,6,5,2,3]],[59,147,7,1,90,[0,0,5,0,0,0,0,92,0,2]],[59,148,5,1,56,[7,2,0,0,24,60,0,2,5,0]],[59,187,2,1,91,[0,0,95,0,1,3,0,1,1,0]],[59,214,7,1,63,[0,0,3,0,16,0,3,78,0,0]],[60,49,5,1,82,[1,1,0,0,1,89,2,0,1,4]],[60,115,8,1,60,[3,1,7,2,1,4,1,1,78,2]],[60,122,9,1,70,[7,3,1,2,1,2,0,0,0,83]],[60,139,4,1,69,[0,2,2,1,85,2,2,2,2,0]],[60,141,5,1,54,[0,0,38,5,5,50,1,0,0,0]],[60,160,7,1,94,[0,0,7,0,0,0,0,93,0,0]],[60,161,6,1,72,[0,1,1,0,8,3,79,3,4,0]],[60,186,2,1,61,[8,0,68,3,15,2,0,3,0,1]],[60,196,3,1,66,[0,0,0,74,0,16,1,0,1,8]],[60,242,2,1,90,[0,2,95,0,0,0,0,0,2,2]],[61,2,4,1,84,[0,2,1,0,90,0,2,1,0,5]],[61,25,4,1,62,[1,5,1,1,79,1,1,3,5,2]],[61,65,5,1,64,[5,2,0,2,1,84,1,2,1,2]],[61,68,3,1,62,[9,0,0,64,0,3,0,2,0,23]],[61,89,2,1,72,[0,4,83,1,0,11,1,1,0,0]],[61,142,8,1,66,[24,2,0,1,2,2,0,0,69,0]],[61,160,3,1,70,[0,3,1,86,0,1,7,0,1,1]],[61,206,0,1,64,[76,0,0,0,1,4,0,12,0,7]],[61,226,9,1,60,[1,11,1,2,0,4,1,3,0,76]],[62,6,7,1,60,[0,0,11,0,3,8,6,72,0,0]],[62,19,8,1,57,[10,0,2,2,0,26,0,0,59,0]],[62,24,2,1,54,[0,2,66,19,2,0,5,1,5,0]],[62,28,9,1,65,[0,6,1,3,1,10,0,0,0,79]],[62,29,8,1,69,[14,0,0,1,1,3,0,0,80,1]],[62,58,5,1,87,[0,0,0,0,0,94,0,0,2,4]],[62,75,1,1,69,[0,85,0,0,0,0,3,3,3,5]],[62,89,5,1,57,[0,0,0,31,3,59,2,0,4,2]],[62,135,6,1,75,[1,0,0,1,12,1,85,1,1,0]],[62,138,5,1,56,[0,6,0,0,5,71,8,8,0,3]],[62,171,2,1,88,[0,0,93,1,0,1,0,0,1,4]],[62,195,9,1,52,[2,27,0,4,0,4,5,0,0,59]],[62,223,7,1,64,[2,2,2,0,0,2,0,79,2,12]],[62,246,4,1,74,[0,0,0,0,73,0,20,7,0,0]],[63,54,1,1,63,[2,75,0,0,4,0,4,0,0,15]],[63,101,5,1,100,[0,0,0,0,0,100,0,0,0,0]],[63,113,4,1,77,[0,1,1,1,86,1,3,4,2,1]],[63,137,8,1,62,[0,7,0,2,0,7,2,2,74,7]],[63,150,1,1,69,[0,82,1,0,6,0,3,0,1,7]],[63,186,0,1,62,[83,0,1,0,2,7,0,2,4,1]],[63,196,8,1,70,[2,2,1,0,2,2,0,0,91,0]],[63,214,9,1,75,[10,8,0,0,0,0,0,0,0,82]],[63,225,5,1,69,[4,2,1,16,0,76,1,0,0,0]],[63,245,9,1,65,[15,16,0,0,0,0,0,0,0,70]],[63,248,7,1,58,[0,0,5,15,10,2,2,67,0,0]],[64,1,8,1,68,[6,1,2,1,0,2,1,1,85,3]],[64,33,3,1,94,[0,0,0,98,0,0,0,0,2,0]],[64,50,6,1,59,[1,5,0,0,1,9,74,5,5,0]],[64,55,7,1,95,[0,0,0,1,1,0,0,99,0,0]],[64,64,8,1,63,[1,9,1,0,1,5,1,2,78,1]],[64,110,9,1,57,[17,13,0,0,3,0,0,0,0,66]],[64,111,5,1,74,[0,0,0,2,2,84,0,0,4,9]],[64,163,3,1,77,[0,0,0,93,5,0,0,2,0,0]],[64,188,0,1,72,[83,3,0,1,6,0,0,0,1,6]],[64,204,4,1,64,[1,4,1,1,81,0,1,2,1,8]],[64,214,2,1,64,[0,0,66,29,2,0,0,0,2,0]],[64,253,5,1,76,[1,5,0,0,0,91,2,0,0,2]],[65,35,5,1,72,[0,0,0,34,0,66,0,0,0,0]],[65,40,4,1,97,[0,0,0,0,99,1,0,0,0,1]],[65,81,7,1,92,[0,0,0,0,2,0,0,98,0,0]],[65,97,9,1,56,[1,8,3,0,0,6,3,7,0,72]],[65,109,9,1,67,[2,3,0,1,6,0,0,1,1,86]],[65,116,8,1,71,[0,0,0,0,0,11,3,7,79,0]],[65,120,9,1,53,[3,7,2,1,2,5,2,3,1,74]],[65,124,0,1,66,[61,0,0,0,4,1,0,0,31,3]],[65,138,3,1,78,[2,1,3,87,0,1,0,0,2,5]],[65,175,6,1,74,[0,2,5,4,1,1,85,1,1,1]],[65,182,3,1,55,[0,0,13,61,0,23,0,3,0,0]],[65,193,5,1,70,[5,0,2,0,2,86,2,3,2,0]],[65,202,5,1,54,[2,4,0,15,8,68,1,0,3,0]],[65,221,1,1,57,[9,73,1,4,0,3,1,6,3,0]],[65,226,4,1,60,[4,13,0,7,71,5,0,0,0,0]],[65,243,2,1,74,[0,0,71,0,0,0,0,29,0,0]],[66,29,4,1,70,[2,2,1,1,85,6,0,1,0,1]],[66,40,5,1,84,[0,0,0,0,9,89,0,0,2,0]],[66,87,7,1,94,[0,1,0,0,0,0,1,98,0,0]],[66,129,3,1,86,[0,0,0,91,0,5,2,0,2,0]],[66,153,8,1,54,[13,3,5,9,1,0,0,0,70,0]],[66,179,9,1,66,[6,1,1,1,1,1,4,3,4,80]],[67,14,1,1,61,[2,79,0,0,7,0,6,3,3,0]],[67,35,0,1,55,[72,2,2,1,9,0,1,1,5,7]],[67,84,8,1,63,[2,0,11,2,7,4,2,0,70,3]],[67,104,3,1,85,[0,1,0,92,0,6,0,0,1,0]],[67,133,7,1,97,[0,0,2,0,0,0,3,95,0,0]],[67,150,5,1,68,[1,1,0,3,11,80,3,1,0,0]],[67,178,9,1,63,[7,5,0,0,1,0,0,0,11,77]],[67,226,2,1,62,[0,0,55,1,0,0,0,42,0,1]],[67,241,1,1,54,[0,72,2,4,1,2,1,2,2,14]],[68,11,9,1,55,[1,0,0,4,6,3,9,1,1,75]],[68,29,1,1,58,[6,76,6,1,2,0,1,2,6,0]],[68,33,3,1,63,[0,0,0,62,0,34,2,0,2,0]],[68,43,4,1,56,[6,0,2,0,71,3,6,2,4,6]],[68,50,2,1,59,[2,0,74,0,9,0,4,0,2,9]],[68,112,7,1,73,[0,2,0,7,0,0,1,85,4,0]],[68,115,4,1,63,[2,0,6,1,80,3,2,2,0,2]],[68,120,2,1,93,[0,0,96,0,0,0,0,0,0,4]],[68,196,8,1,62,[11,0,4,4,1,2,1,0,77,0]],[68,197,4,1,73,[3,1,2,4,86,1,1,1,1,1]],[68,219,2,1,73,[0,0,73,21,0,5,1,0,0,0]],[68,224,3,1,72,[1,1,0,85,1,8,2,0,0,2]],[68,230,6,1,79,[0,1,0,1,1,2,91,3,0,0]],[69,30,6,1,69,[2,1,4,4,0,2,85,2,0,0]],[69,31,2,1,83,[0,0,90,0,0,0,0,3,0,7]],[69,37,4,1,65,[1,4,1,1,82,6,2,2,1,0]],[69,97,6,1,57,[1,2,3,2,4,1,75,7,5,1]],[69,100,2,1,84,[0,0,89,10,0,0,0,0,1,0]],[69,108,4,1,74,[0,3,0,12,85,0,0,0,0,0]],[69,121,5,1,76,[0,0,0,4,3,85,0,6,0,2]],[69,152,5,1,67,[0,0,14,0,0,78,0,0,5,3]],[69,155,2,1,56,[1,1,62,0,28,8,0,0,0,0]],[69,176,2,1,63,[0,6,70,1,0,7,1,14,1,0]],[69,182,1,1,66,[1,85,1,0,1,10,0,1,1,0]],[69,187,9,1,56,[1,4,4,6,1,1,1,6,0,77]],[70,9,1,1,85,[0,92,0,0,0,0,0,3,5,0]],[70,11,4,1,56,[0,4,2,2,74,4,6,2,3,2]],[70,21,7,1,69,[2,0,3,2,1,0,5,81,4,3]],[70,42,9,1,67,[0,4,1,0,5,1,1,4,1,83]],[70,96,1,1,69,[0,77,2,6,3,7,5,0,0,0]],[70,117,5,1,58,[0,0,0,3,10,76,4,3,3,1]],[70,132,9,1,55,[4,15,2,0,1,3,2,2,0,70]],[70,160,5,1,61,[6,2,2,2,4,74,0,4,0,6]],[70,166,1,1,60,[0,65,18,0,0,3,2,0,12,0]],[70,176,3,1,53,[0,0,24,53,0,20,2,0,1,0]],[70,190,0,1,64,[83,3,0,2,2,5,0,2,2,1]],[70,203,2,1,59,[1,1,53,0,0,1,0,40,0,4]],[70,208,7,1,56,[0,3,2,24,5,0,0,62,0,4]],[70,210,7,1,61,[0,0,0,3,0,0,39,56,0,0]],[70,240,4,1,58,[1,0,2,3,76,3,1,2,11,1]],[71,6,1,1,64,[0,68,0,0,0,4,0,16,0,12]],[71,54,4,1,53,[3,3,0,2,74,4,5,3,4,2]],[71,112,4,1,69,[1,2,4,2,84,4,1,1,1,0]],[71,121,1,1,57,[0,75,3,4,2,4,2,6,2,3]],[71,124,8,1,58,[7,9,1,0,0,7,1,5,71,0]],[71,142,6,1,74,[2,2,0,0,4,0,89,0,2,0]],[71,145,1,1,62,[0,85,2,0,10,3,0,0,0,0]],[71,151,5,1,53,[2,2,0,0,7,72,8,4,6,0]],[71,187,6,1,75,[0,1,1,3,1,1,87,4,2,1]],[71,203,7,1,94,[0,0,0,2,1,0,0,97,0,0]],[71,206,8,1,61,[13,2,5,2,0,6,2,1,70,0]],[71,207,7,1,93,[0,0,12,0,0,0,0,88,0,0]],[71,227,2,1,57,[0,1,70,6,0,1,1,15,3,3]],[71,243,3,1,89,[0,0,2,95,0,1,0,0,0,1]],[72,12,1,1,83,[0,92,0,0,8,0,0,0,0,0]],[72,19,5,1,91,[0,0,0,5,0,91,5,0,0,0]],[72,22,3,1,86,[0,4,2,92,0,0,0,0,0,1]],[72,27,4,1,64,[0,2,1,5,80,2,3,3,3,2]],[72,69,8,1,61,[3,2,0,1,3,4,1,0,84,1]],[72,112,9,1,61,[28,1,1,0,0,1,0,1,0,68]],[72,135,7,1,62,[0,2,4,0,0,20,0,74,0,0]],[72,187,6,1,79,[0,2,1,2,1,1,92,1,1,0]],[72,222,8,1,68,[15,1,0,4,0,2,5,0,74,0]],[72,226,2,1,67,[1,0,75,19,0,1,1,1,2,1]],[72,228,9,1,60,[6,11,3,2,1,1,2,0,1,75]],[72,242,4,1,63,[3,4,2,2,81,1,2,3,2,0]],[73,39,4,1,81,[2,1,1,0,92,1,1,1,1,0]],[73,44,4,1,89,[0,3,0,1,95,0,0,0,1,0]],[73,76,7,1,71,[3,0,4,1,0,2,3,83,2,0]],[73,101,1,1,72,[0,81,0,0,6,7,0,3,3,0]],[73,124,8,1,54,[19,2,3,2,1,1,2,2,70,0]],[73,149,9,1,64,[22,6,0,0,1,1,0,0,0,68]],[73,158,2,1,85,[0,5,93,0,2,0,0,0,0,0]],[73,172,3,1,68,[4,2,0,86,1,0,1,2,0,3]],[73,175,9,1,59,[0,9,1,7,4,4,0,0,0,76]],[74,6,2,1,72,[0,4,86,0,0,0,3,0,0,7]],[74,14,6,1,58,[2,1,1,3,2,4,80,2,2,2]],[74,29,9,1,67,[9,4,1,2,0,1,0,1,2,80]],[74,78,3,1,80,[1,0,2,90,2,0,1,1,0,2]],[74,88,8,1,75,[2,2,3,1,1,1,2,1,87,0]],[74,100,6,1,51,[3,6,4,2,3,5,73,0,2,3]],[74,125,7,1,69,[2,0,13,0,1,1,0,82,1,0]],[74,136,4,1,77,[1,2,1,1,89,1,0,3,1,0]],[74,169,6,1,65,[7,1,2,3,3,1,83,1,0,0]],[74,194,7,1,63,[4,0,2,0,0,0,11,79,1,2]],[74,198,4,1,71,[2,0,2,2,86,1,2,2,2,1]],[74,222,4,1,61,[2,1,2,9,75,1,1,7,3,1]],[74,223,8,1,64,[10,0,0,2,2,4,4,1,77,0]],[74,245,1,1,75,[2,87,0,0,5,3,0,0,2,0]],[74,254,2,1,60,[2,0,65,0,0,25,0,0,7,0]],[75,52,4,1,55,[1,0,1,9,76,3,1,4,4,1]],[75,59,1,1,69,[0,88,4,5,0,0,0,0,3,0]],[75,66,3,1,51,[4,1,1,71,0,4,3,1,8,7]],[75,86,1,1,66,[1,80,7,2,1,0,1,6,1,0]],[75,100,9,1,53,[22,5,1,0,2,6,0,0,3,62]],[75,101,5,1,59,[1,1,0,30,0,66,0,0,1,0]],[75,148,4,1,77,[1,1,0,0,88,2,1,1,5,2]],[75,188,7,1,60,[0,0,13,0,0,29,0,55,3,0]],[75,215,6,1,89,[0,0,0,1,0,1,95,0,2,0]],[75,224,8,1,59,[2,1,6,4,1,20,0,1,66,0]],[76,26,7,1,82,[2,0,0,1,0,0,1,95,1,1]],[76,45,1,1,65,[2,83,2,0,0,5,2,2,2,0]],[76,52,4,1,82,[0,0,0,0,88,1,3,1,4,2]],[76,67,3,1,61,[2,4,1,76,1,0,0,2,1,12]],[76,100,9,1,73,[7,0,0,0,0,3,0,2,1,87]],[76,106,8,1,72,[4,3,3,0,1,0,3,0,87,0]],[76,112,3,1,59,[0,2,0,70,8,6,9,2,2,0]],[76,120,5,1,58,[2,0,12,4,0,71,2,6,4,0]],[76,121,4,1,73,[1,1,1,0,87,1,4,2,2,0]],[76,148,1,1,62,[0,78,10,3,3,0,3,3,0,0]],[76,161,4,1,64,[1,1,5,5,80,2,1,2,1,1]],[77,31,4,1,66,[0,2,1,2,83,3,2,3,3,1]],[77,107,3,1,67,[0,0,3,82,7,5,2,2,0,0]],[77,113,1,1,78,[0,89,4,0,2,0,0,0,5,0]],[77,124,1,1,59,[7,75,0,5,0,11,0,0,3,0]],[77,131,1,1,59,[0,71,2,2,1,17,2,5,1,0]],[77,151,9,1,57,[24,5,2,0,1,4,0,1,2,62]],[77,160,8,1,89,[4,1,0,0,1,1,0,0,93,0]],[77,178,1,1,93,[0,98,0,0,0,2,0,0,0,0]],[77,182,1,1,54,[2,71,0,9,0,2,5,5,5,0]],[77,185,4,1,73,[0,2,5,0,84,5,0,0,2,3]],[77,187,1,1,57,[4,79,3,0,4,1,1,1,3,4]],[77,206,9,1,56,[8,2,3,1,1,2,1,1,4,76]],[77,208,1,1,57,[2,74,4,0,0,9,4,4,2,0]],[77,217,1,1,83,[0,91,1,0,1,6,0,0,0,0]],[77,220,1,1,76,[0,87,2,0,2,4,2,2,2,0]],[77,224,9,1,74,[15,0,0,0,0,2,0,1,0,82]],[77,227,6,1,57,[3,0,2,0,11,7,75,2,0,0]],[77,230,4,1,69,[1,0,2,1,88,1,1,2,2,2]],[77,248,7,1,61,[1,15,0,0,1,6,1,73,1,0]],[77,251,4,1,88,[0,1,1,0,95,0,0,1,1,0]],[3,147,1,0,44,[9,48,2,2,4,0,7,0,16,12]],[8,64,3,0,48,[0,1,19,40,1,37,0,0,2,0]],[9,213,2,0,56,[0,0,53,36,0,7,3,0,0,0]],[10,212,6,0,53,[0,2,1,6,5,5,71,5,1,3]],[11,24,9,0,46,[3,22,1,1,3,1,2,1,1,66]],[11,189,4,0,51,[3,3,3,5,74,0,5,3,3,1]],[12,27,8,0,55,[27,0,12,0,0,0,0,3,57,0]],[12,29,1,0,65,[0,48,2,0,0,0,2,0,0,48]],[12,142,9,0,47,[17,31,0,1,1,0,1,1,3,45]],[12,205,6,0,47,[0,5,4,4,4,0,71,4,7,0]],[12,252,9,0,50,[17,24,2,0,0,0,0,0,3,54]],[13,24,4,0,50,[4,2,3,1,73,4,4,4,4,0]],[14,26,9,0,46,[1,11,4,1,4,3,5,2,1,67]],[14,29,4,0,61,[0,0,3,0,76,3,0,3,3,11]],[14,73,3,0,65,[0,0,0,70,7,23,0,0,0,0]],[14,228,5,0,62,[3,0,4,5,5,78,5,0,0,0]],[15,2,9,0,100,[0,0,0,0,0,0,0,0,0,100]],[15,19,5,0,51,[0,0,22,36,0,40,1,0,0,0]],[15,59,2,0,70,[0,0,82,0,0,0,3,4,11,0]],[15,107,7,0,55,[0,0,2,0,0,0,38,58,2,0]],[15,146,9,0,50,[25,23,0,0,6,0,0,0,0,46]],[15,226,1,0,50,[3,64,3,0,3,3,3,0,20,0]],[16,11,5,0,55,[0,0,0,2,8,75,2,5,8,0]],[16,168,8,0,43,[32,0,9,0,7,0,5,3,44,0]],[17,64,9,0,82,[0,0,0,0,1,0,4,4,0,90]],[17,174,9,0,67,[0,41,0,2,0,2,0,0,0,54]],[17,198,8,0,61,[7,0,0,0,1,0,0,0,87,5]],[18,13,0,0,47,[47,18,0,1,0,0,0,0,1,32]],[18,14,7,0,51,[3,0,0,4,1,20,4,58,9,0]],[18,57,3,0,69,[17,0,5,76,0,0,0,3,0,0]],[18,86,9,0,50,[28,17,0,0,1,1,0,1,1,52]],[18,102,9,0,48,[4,15,2,0,0,12,0,0,0,67]],[18,113,6,0,46,[4,12,2,1,0,8,70,0,3,0]],[18,131,1,0,46,[0,46,24,22,0,2,2,3,0,0]],[18,137,1,0,46,[9,62,0,8,0,0,3,6,12,0]],[18,170,1,0,76,[0,86,0,1,2,0,0,1,9,0]],[18,189,9,0,57,[21,16,0,0,0,0,2,4,0,56]],[19,13,1,0,57,[3,63,20,0,0,0,0,13,0,0]],[19,33,6,0,46,[0,8,2,0,3,34,44,0,2,6]],[19,46,9,0,50,[14,3,0,0,12,4,2,5,0,61]],[19,128,0,0,55,[59,0,0,0,27,0,6,9,0,0]],[19,145,6,0,47,[0,0,5,23,4,10,56,2,0,0]],[19,166,7,0,71,[0,3,0,0,0,0,3,94,0,0]],[19,183,3,0,57,[0,4,0,73,3,6,3,0,11,0]],[19,229,6,0,53,[0,0,0,0,2,41,47,2,7,0]],[20,2,3,0,48,[3,0,17,54,1,2,18,0,2,2]],[20,15,5,0,51,[0,0,0,41,0,49,9,0,1,0]],[20,31,4,0,62,[0,0,3,26,64,0,0,7,0,0]],[20,57,3,0,52,[0,0,33,53,0,0,6,0,8,0]],[20,105,1,0,55,[2,67,2,1,8,0,5,7,0,6]],[20,108,1,0,46,[8,50,5,1,0,0,1,1,0,33]],[20,150,0,0,50,[39,17,0,5,0,0,0,0,3,36]],[20,163,3,0,53,[0,0,12,73,0,4,3,3,6,0]],[20,168,5,0,75,[0,26,0,0,0,74,0,0,0,0]],[20,187,7,0,59,[0,0,8,16,0,0,0,70,3,3]],[20,209,0,0,67,[74,0,0,0,20,0,3,3,0,0]],[20,213,9,0,54,[2,28,6,1,0,0,0,1,0,61]],[20,218,1,0,68,[0,68,0,0,3,0,0,29,0,0]],[20,223,9,0,55,[10,20,2,0,2,0,1,2,0,62]],[20,229,6,0,50,[1,3,4,3,7,4,71,0,0,6]],[20,247,1,0,51,[2,64,3,1,1,0,0,9,0,20]],[21,8,5,0,53,[0,0,6,0,15,71,3,3,3,0]],[21,62,1,0,50,[4,50,2,0,2,3,0,2,0,38]],[21,168,2,0,55,[1,0,70,5,1,3,0,0,0,20]],[21,170,0,0,83,[87,0,0,0,13,0,0,0,0,0]],[21,188,1,0,45,[2,54,2,0,8,3,0,20,11,0]],[21,193,6,0,44,[2,0,0,11,12,1,67,1,4,2]],[21,194,1,0,56,[0,72,8,3,9,0,3,6,0,0]],[21,204,4,0,47,[0,3,23,7,59,3,1,1,3,0]],[21,241,5,0,49,[1,5,0,10,14,63,0,0,3,4]],[21,250,5,0,47,[0,3,0,18,0,65,0,10,0,3]],[22,32,1,0,48,[0,43,0,1,28,0,28,1,0,0]],[22,63,2,0,75,[0,4,85,0,0,0,4,7,0,0]],[22,69,7,0,81,[0,11,0,0,0,0,0,89,0,0]],[22,95,5,0,55,[7,0,0,3,0,60,10,3,17,0]],[22,135,8,0,54,[28,6,3,0,8,0,0,0,55,0]],[22,164,4,0,49,[0,2,3,1,64,8,3,2,9,8]],[22,187,0,0,64,[61,0,0,0,1,3,0,0,34,0]],[22,209,7,0,51,[0,30,0,1,1,0,2,57,8,0]],[22,237,5,0,47,[0,0,13,1,24,55,3,3,1,0]],[23,4,5,0,62,[6,10,6,0,0,76,0,0,0,3]],[23,49,8,0,40,[14,8,3,0,0,1,2,2,69,0]],[23,120,0,0,49,[46,4,1,0,5,2,2,2,0,39]],[23,122,0,0,54,[57,0,2,0,21,5,4,0,0,12]],[23,163,1,0,76,[9,86,3,3,0,0,0,0,0,0]],[24,59,7,0,100,[0,0,0,0,0,0,0,100,0,0]],[24,97,1,0,50,[6,70,6,6,9,0,0,0,3,0]],[24,129,7,0,48,[0,2,0,2,8,0,5,80,2,2]],[24,134,5,0,61,[0,0,0,45,4,48,2,0,0,0]],[24,207,5,0,50,[6,2,1,1,2,75,6,0,6,1]],[24,239,2,0,45,[0,4,35,31,3,5,0,23,0,0]],[25,62,7,0,68,[0,0,19,0,3,3,0,75,0,0]],[25,68,5,0,45,[7,7,6,2,8,61,0,9,0,0]],[25,123,5,0,66,[0,0,2,5,3,81,6,3,0,0]],[25,234,1,0,47,[13,62,4,2,2,0,4,0,5,10]],[26,122,1,0,61,[10,71,0,6,0,0,0,13,0,0]],[26,232,5,0,51,[3,0,9,0,5,64,3,8,8,0]],[27,0,4,0,49,[5,3,0,12,53,2,23,0,2,0]],[27,26,8,0,49,[0,0,11,2,0,25,0,11,50,0]],[27,81,5,0,49,[3,0,0,13,19,61,1,0,0,2]],[27,152,4,0,50,[0,0,0,8,63,8,0,6,0,14]],[27,240,8,0,49,[2,4,3,1,6,3,2,4,74,1]],[28,30,0,0,45,[45,2,0,0,1,10,0,0,29,13]],[28,52,4,0,52,[10,3,0,9,71,0,3,0,3,0]],[28,63,0,0,48,[51,3,0,0,6,3,0,0,0,38]],[28,84,3,0,58,[0,0,0,69,0,17,3,3,3,4]],[28,110,9,0,52,[2,11,0,0,4,0,0,2,0,82]],[28,142,3,0,50,[20,0,36,40,3,0,0,0,0,0]],[28,151,2,0,45,[7,0,57,0,5,28,2,0,0,0]],[28,177,3,0,59,[17,0,14,62,0,0,0,3,3,0]],[28,221,9,0,51,[12,0,0,0,20,0,0,0,0,68]],[29,15,4,0,48,[0,3,2,0,62,2,4,5,5,18]],[29,51,3,0,46,[0,4,3,55,0,32,2,0,4,0]],[29,105,8,0,52,[5,0,5,2,7,0,5,0,71,6]],[29,131,9,0,56,[0,17,0,0,26,0,0,0,0,57]],[29,140,5,0,52,[0,0,8,10,5,67,11,0,0,0]],[29,160,4,0,50,[3,3,3,4,73,2,2,3,2,6]],[29,182,7,0,83,[0,0,0,0,3,4,0,93,0,0]],[29,220,5,0,50,[16,7,0,6,2,61,0,2,7,0]],[29,231,9,0,49,[3,22,1,1,3,2,2,1,0,65]],[30,8,8,0,46,[14,1,1,5,2,1,0,8,69,0]],[30,19,7,0,50,[0,16,0,0,14,1,0,65,0,3]],[30,27,2,0,47,[0,0,64,13,12,0,0,9,2,0]],[30,63,5,0,50,[0,2,10,17,5,62,2,2,2,0]],[30,66,9,0,48,[31,8,0,0,3,7,0,0,0,50]],[30,96,4,0,51,[0,0,15,17,63,1,2,0,0,3]],[30,109,7,0,50,[0,0,9,0,2,33,0,48,0,8]],[30,110,2,0,41,[8,16,50,5,7,7,5,0,3,0]],[30,115,7,0,51,[0,0,5,0,24,0,5,62,5,0]],[30,146,6,0,64,[0,0,3,15,3,0,76,0,3,0]],[30,157,6,0,49,[6,9,6,3,13,0,61,0,3,0]],[30,170,5,0,74,[0,0,30,0,0,70,0,0,0,0]],[30,192,9,0,53,[6,10,0,0,20,0,0,0,0,65]],[30,203,0,0,44,[58,11,2,0,2,5,0,10,5,6]],[30,234,9,0,41,[5,22,12,4,0,0,2,2,9,44]],[30,245,8,0,48,[8,0,8,4,2,0,2,6,70,0]],[31,25,0,0,66,[72,0,17,0,0,0,0,0,0,12]],[31,88,6,0,53,[0,0,0,1,0,18,55,0,26,0]],[31,107,9,0,50,[22,17,0,0,1,0,0,0,3,57]],[31,140,8,0,55,[0,0,0,35,0,21,0,0,44,0]],[31,143,5,0,60,[3,0,0,18,6,67,3,3,0,0]],[31,192,9,0,44,[3,13,2,0,0,10,1,18,0,53]],[31,228,3,0,53,[0,0,42,48,1,7,0,2,0,0]],[31,231,1,0,47,[1,57,2,3,0,1,0,17,0,20]],[31,243,8,0,48,[13,14,0,0,18,0,0,1,53,1]],[31,247,6,0,88,[0,0,0,3,0,3,94,0,0,0]],[31,252,4,0,48,[0,23,0,0,51,0,0,12,3,10]],[32,4,5,0,48,[0,5,0,5,10,63,0,0,0,17]],[32,15,5,0,52,[0,0,0,17,0,63,0,12,9,0]],[32,22,9,0,53,[0,19,5,11,0,0,2,2,0,63]],[32,41,1,0,56,[3,83,0,3,0,5,3,0,3,0]],[32,43,6,0,45,[4,0,2,35,0,4,46,9,0,0]],[32,55,6,0,51,[0,0,0,4,41,7,45,0,3,0]],[32,57,0,0,52,[67,3,6,1,9,0,4,3,4,2]],[32,128,8,0,50,[36,0,5,8,0,0,5,0,47,0]],[32,133,1,0,41,[4,62,2,0,24,3,4,0,0,2]],[32,134,5,0,45,[3,3,12,9,2,62,3,0,1,6]],[32,155,8,0,49,[0,31,0,2,0,0,0,4,42,21]],[32,205,1,0,67,[0,80,2,1,0,0,3,11,3,0]],[32,212,5,0,65,[0,0,0,46,0,54,0,0,0,0]],[32,241,6,0,47,[0,9,0,8,1,1,67,11,3,0]],[33,16,5,0,48,[1,0,3,23,1,64,3,0,1,3]],[33,23,9,0,61,[8,2,0,0,1,0,0,5,0,85]],[33,39,4,0,65,[2,0,3,5,78,11,0,2,0,0]],[33,48,2,0,71,[0,6,87,0,0,4,3,0,0,0]],[33,64,0,0,46,[61,0,2,0,0,0,5,5,27,0]],[33,72,1,0,49,[0,77,2,2,2,0,5,10,0,0]],[33,89,6,0,52,[3,13,0,17,0,0,59,0,0,8]],[33,138,5,0,49,[0,8,0,9,2,56,5,0,20,0]],[33,142,7,0,63,[8,0,3,2,3,0,3,79,3,0]],[33,155,7,0,89,[0,0,0,0,6,0,0,94,0,0]],[33,171,8,0,46,[0,2,2,2,9,2,0,5,70,8]],[33,187,8,0,43,[0,4,2,7,18,1,1,0,67,0]],[33,209,9,0,39,[29,9,4,0,0,9,0,0,16,32]],[33,230,6,0,53,[0,0,12,19,9,0,60,0,0,0]],[34,5,0,0,54,[66,0,15,2,0,0,0,0,17,0]],[34,22,8,0,49,[0,30,12,4,0,3,2,0,49,0]],[34,45,6,0,44,[0,2,3,2,24,0,62,4,4,0]],[34,86,2,0,65,[2,3,83,2,0,2,0,7,0,0]],[34,99,9,0,49,[7,29,2,2,2,9,0,0,0,50]],[34,130,2,0,59,[0,0,61,6,0,29,3,0,0,0]],[34,184,7,0,52,[3,0,6,9,3,4,0,61,13,0]],[34,196,7,0,81,[0,0,0,0,0,3,0,87,0,10]],[34,204,0,0,44,[54,21,0,0,0,10,0,14,0,0]],[34,243,8,0,33,[0,7,6,1,4,0,8,5,69,0]],[34,248,3,0,51,[0,16,2,64,0,4,0,5,0,8]],[35,27,0,0,51,[45,12,0,0,1,0,0,1,0,40]],[35,28,1,0,53,[10,61,10,2,12,0,5,0,0,0]],[35,36,3,0,62,[0,0,0,71,18,11,0,0,0,0]],[35,38,4,0,53,[6,0,0,0,58,0,23,12,0,0]],[35,79,1,0,44,[0,68,10,3,8,6,0,5,0,0]],[35,108,2,0,50,[0,31,52,4,0,1,11,0,0,0]],[35,116,8,0,52,[0,0,2,11,0,19,9,0,58,0]],[35,157,1,0,52,[12,64,5,6,0,0,0,2,0,11]],[35,214,7,0,46,[3,0,3,3,0,29,30,32,0,0]],[35,219,6,0,49,[8,0,6,2,0,36,48,0,0,0]],[35,224,9,0,48,[2,29,4,3,0,1,0,8,1,53]],[35,235,0,0,54,[66,0,7,0,2,3,0,21,0,0]],[36,5,5,0,49,[8,0,7,5,8,66,3,3,0,0]],[36,21,9,0,51,[44,6,0,0,3,0,0,3,0,44]],[36,22,4,0,74,[2,0,0,4,87,2,0,2,4,0]],[36,31,4,0,49,[0,12,2,0,52,0,21,5,8,0]],[36,73,3,0,58,[0,0,43,49,0,5,3,0,0,0]],[36,82,0,0,69,[80,11,7,0,3,0,0,0,0,0]],[36,102,2,0,57,[0,0,56,2,0,0,0,36,0,6]],[36,110,5,0,38,[4,0,15,14,2,49,4,6,6,0]],[36,164,0,0,50,[51,0,3,36,0,3,3,0,0,3]],[36,179,5,0,51,[2,5,4,0,4,64,7,4,0,10]],[36,189,0,0,51,[55,0,0,28,0,11,0,0,0,6]],[36,198,9,0,52,[14,13,0,0,2,7,0,0,0,64]],[36,210,7,0,50,[33,0,6,0,0,0,3,52,0,6]],[36,220,8,0,51,[0,2,0,2,34,0,11,3,49,0]],[36,238,9,0,62,[0,46,0,2,1,1,0,0,0,50]],[37,26,2,0,49,[10,13,65,4,2,0,2,2,2,0]],[37,29,4,0,71,[3,0,0,13,80,0,3,0,0,0]],[37,32,3,0,51,[1,2,0,55,4,0,38,0,0,0]],[37,73,2,0,53,[7,0,62,19,0,5,0,5,0,2]],[37,83,9,0,48,[1,25,1,1,7,3,0,0,0,60]],[37,85,8,0,39,[5,0,0,17,2,2,2,2,67,2]],[37,104,4,0,64,[0,0,0,48,48,0,0,3,0,0]],[37,140,3,0,55,[0,0,0,45,17,36,2,0,0,0]],[37,156,9,0,51,[10,11,0,0,10,2,4,0,2,62]],[37,162,7,0,49,[0,3,12,26,0,0,6,49,3,0]],[37,215,7,0,49,[2,0,0,2,14,29,0,54,0,0]],[37,224,2,0,49,[0,0,58,6,0,0,1,26,8,1]],[37,255,7,0,57,[0,0,0,0,5,0,2,55,2,37]],[38,67,8,0,85,[0,2,0,0,4,0,0,0,92,2]],[38,90,1,0,60,[4,72,0,4,0,1,1,0,0,18]],[38,105,3,0,49,[0,3,0,57,8,3,9,17,3,0]],[38,107,9,0,58,[0,19,0,0,17,0,0,0,0,64]],[38,143,1,0,48,[3,71,12,0,0,3,0,0,6,5]],[38,251,6,0,51,[2,0,11,15,0,3,62,7,0,0]],[38,254,9,0,54,[38,2,2,0,0,0,0,0,8,51]],[39,25,0,0,46,[60,0,24,11,0,0,0,5,0,0]],[39,35,7,0,51,[0,3,27,0,0,12,3,55,0,0]],[39,38,6,0,71,[0,0,0,8,0,2,83,4,2,0]],[39,42,2,0,49,[6,0,48,36,0,11,0,0,0,0]],[39,54,0,0,52,[64,7,0,3,0,0,9,0,17,0]],[39,87,7,0,100,[0,0,0,0,0,0,0,100,0,0]],[39,93,0,0,47,[49,0,4,5,0,2,0,0,17,23]],[39,124,0,0,49,[46,12,32,0,1,2,0,1,0,5]],[39,194,7,0,58,[0,3,3,14,0,1,2,75,2,0]],[39,200,3,0,75,[7,0,7,83,0,2,0,0,0,0]],[39,201,3,0,48,[0,0,18,47,0,30,2,0,0,1]],[39,202,7,0,51,[0,0,0,0,15,1,38,44,0,0]],[39,209,9,0,48,[5,6,1,1,4,0,1,0,19,64]],[39,250,5,0,49,[11,3,0,3,3,70,5,3,0,3]],[40,8,0,0,51,[62,0,0,0,2,5,0,0,0,31]],[40,21,9,0,62,[15,7,2,0,0,0,0,0,0,76]],[40,38,8,0,47,[28,4,0,0,0,1,0,2,59,4]],[40,53,0,0,48,[49,0,2,5,10,1,0,0,1,32]],[40,72,9,0,49,[1,23,0,0,0,8,0,1,8,58]],[40,94,9,0,50,[41,7,1,0,0,5,0,0,0,46]],[40,129,2,0,45,[3,0,56,25,3,0,0,13,0,0]],[40,134,5,0,58,[0,1,7,0,3,76,0,0,0,13]],[40,162,3,0,50,[0,0,5,66,0,20,8,0,0,0]],[40,185,0,0,52,[64,5,1,0,0,0,0,16,15,0]],[40,188,3,0,53,[0,6,23,56,0,15,0,0,0,0]],[40,213,9,0,49,[2,8,0,2,2,24,0,0,0,63]],[41,12,0,0,46,[53,12,0,0,1,3,0,0,11,19]],[41,18,3,0,53,[11,2,0,73,0,0,5,4,5,0]],[41,23,7,0,46,[0,2,12,13,3,0,4,65,1,0]],[41,39,4,0,49,[4,4,5,2,73,0,4,6,3,0]],[41,45,0,0,64,[76,7,3,0,0,4,0,0,0,10]],[41,60,9,0,49,[21,0,1,0,1,0,2,0,28,46]],[41,77,3,0,53,[0,0,37,45,2,16,0,0,0,0]],[41,97,9,0,56,[0,0,6,0,3,3,0,6,6,76]],[41,140,0,0,47,[58,0,8,5,4,7,1,15,0,2]],[41,154,5,0,46,[2,18,2,2,0,45,0,0,3,28]],[41,161,7,0,100,[0,0,0,0,0,0,0,100,0,0]],[41,170,8,0,61,[0,4,0,0,0,31,4,0,62,0]],[41,171,7,0,53,[4,17,3,2,0,0,7,62,6,0]],[41,172,6,0,49,[4,2,2,0,0,9,65,6,9,2]],[41,193,5,0,55,[3,5,0,15,9,68,0,0,0,0]],[41,251,7,0,44,[11,0,17,14,0,3,3,30,23,0]],[42,0,2,0,50,[22,0,49,0,0,26,0,0,3,0]],[42,94,7,0,55,[0,7,4,0,4,11,0,71,3,0]],[42,240,9,0,76,[0,17,0,0,0,0,2,0,0,81]],[43,1,0,0,45,[49,5,3,1,0,0,11,0,1,31]],[43,20,5,0,59,[3,0,39,0,0,54,0,0,0,5]],[43,41,0,0,51,[73,3,9,3,1,1,6,0,3,0]],[43,59,1,0,54,[0,60,8,2,0,0,4,9,15,2]],[43,66,8,0,45,[13,0,1,0,18,0,4,0,62,0]],[43,110,9,0,55,[2,4,2,0,4,0,0,26,0,63]],[43,138,3,0,71,[0,0,0,79,0,3,0,18,0,0]],[43,198,4,0,57,[0,3,0,5,84,4,0,0,5,0]],[43,221,7,0,48,[1,4,0,10,0,1,18,61,6,0]],[43,248,6,0,49,[8,0,0,6,0,8,60,8,11,0]],[44,11,0,0,59,[71,3,3,3,0,0,0,3,0,18]],[44,207,3,0,56,[7,0,9,70,10,5,0,0,0,0]],[44,209,6,0,60,[0,0,0,3,3,24,69,3,0,0]],[44,226,8,0,76,[8,0,0,6,0,0,0,2,85,0]],[44,249,3,0,50,[0,0,0,48,28,15,9,0,0,0]],[45,17,0,0,60,[74,3,18,0,0,0,3,3,0,0]],[45,34,1,0,65,[8,78,0,0,0,5,0,6,0,3]],[45,48,2,0,66,[0,0,70,10,0,0,0,20,0,0]],[45,60,2,0,71,[0,0,59,0,0,0,0,41,0,0]],[45,78,9,0,46,[0,16,1,4,1,2,5,3,0,68]],[45,98,2,0,43,[14,0,44,41,0,0,0,2,0,0]],[45,100,0,0,53,[59,0,1,0,6,23,0,7,0,4]],[45,112,1,0,90,[0,94,0,0,0,0,0,6,0,0]],[45,154,7,0,80,[0,0,0,0,0,10,2,88,0,0]],[45,159,6,0,57,[3,0,0,5,3,5,81,3,0,0]],[46,66,6,0,52,[0,0,5,3,3,0,76,6,7,0]],[46,129,8,0,55,[8,2,1,0,0,18,0,0,72,0]],[46,193,0,0,48,[69,3,8,1,1,3,3,4,3,3]],[46,237,6,0,48,[10,0,14,8,11,0,58,0,0,0]],[46,243,1,0,49,[0,42,0,0,14,1,0,1,1,41]],[47,14,4,0,59,[0,4,0,20,67,10,0,0,0,0]],[47,26,5,0,48,[10,8,0,0,2,61,0,16,3,0]],[47,53,0,0,53,[56,0,2,0,0,32,0,0,3,8]],[47,161,8,0,49,[1,0,2,1,5,18,2,0,65,6]],[47,177,6,0,49,[0,0,9,29,9,0,53,0,0,0]],[47,192,6,0,51,[10,0,0,6,0,0,83,0,0,0]],[47,199,5,0,58,[0,0,22,18,0,60,0,0,0,0]],[47,236,5,0,47,[2,5,0,2,10,67,2,0,1,12]],[48,53,2,0,94,[0,0,97,0,3,0,0,0,0,0]],[48,65,5,0,50,[0,5,0,32,8,52,2,2,0,0]],[48,153,5,0,66,[0,0,0,2,0,51,0,0,47,0]],[48,172,4,0,49,[3,3,4,3,71,2,2,3,3,4]],[48,183,7,0,53,[0,2,0,5,0,13,6,72,2,0]],[48,219,3,0,51,[4,0,12,71,0,4,0,0,8,0]],[48,240,4,0,51,[1,5,3,1,73,2,1,1,3,10]],[49,33,7,0,50,[2,41,2,1,0,1,3,47,3,0]],[49,47,0,0,54,[59,3,0,0,0,3,0,0,29,6]],[49,73,8,0,47,[1,1,0,14,5,1,0,0,72,6]],[49,95,0,0,46,[64,5,0,0,4,2,0,2,0,22]],[49,185,1,0,51,[2,70,4,3,2,9,5,0,3,2]],[49,186,2,0,74,[0,0,71,29,0,0,0,0,0,0]],[49,191,2,0,49,[0,0,62,24,5,2,1,5,2,0]],[49,196,9,0,44,[0,10,4,0,37,0,0,0,2,47]],[49,218,3,0,57,[0,0,40,46,0,14,0,0,0,0]],[49,220,6,0,48,[0,0,9,0,0,20,64,4,0,3]],[49,254,6,0,54,[0,0,0,10,30,11,50,0,0,0]],[50,31,6,0,47,[0,2,6,1,1,23,55,4,4,3]],[50,113,8,0,51,[1,3,4,4,2,5,1,5,73,2]],[50,156,7,0,71,[0,0,22,3,0,0,0,75,0,0]],[50,202,2,0,88,[0,0,93,3,3,0,0,0,0,0]],[50,208,8,0,45,[32,10,7,4,0,2,4,2,40,0]],[50,226,4,0,52,[1,0,1,6,71,12,9,1,0,0]],[50,250,5,0,53,[0,3,3,1,10,68,6,6,2,0]],[51,10,4,0,60,[0,0,18,3,68,0,0,0,0,11]],[51,17,6,0,61,[0,0,0,16,0,6,72,2,4,0]],[51,29,1,0,69,[2,79,5,1,0,0,1,4,8,0]],[51,57,0,0,100,[100,0,0,0,0,0,0,0,0,0]],[51,64,9,0,52,[6,12,0,1,16,2,0,0,0,64]],[51,96,3,0,57,[3,0,0,52,2,0,0,40,3,0]],[51,165,6,0,52,[0,0,0,11,0,0,66,17,6,0]],[51,177,5,0,48,[2,7,0,29,12,45,6,0,0,0]],[51,182,0,0,56,[73,0,2,2,0,5,2,5,0,10]],[51,194,3,0,54,[1,1,31,52,0,13,0,0,2,0]],[51,214,0,0,50,[52,0,0,0,0,32,8,0,0,8]],[51,227,9,0,68,[0,0,3,0,5,15,0,0,0,78]],[51,230,0,0,48,[64,0,9,7,2,0,5,5,8,0]],[51,244,6,0,51,[5,0,0,3,44,0,47,0,2,0]],[52,2,9,0,50,[2,4,3,4,3,5,2,4,5,68]],[52,9,4,0,48,[4,5,4,4,73,1,1,3,3,1]],[52,65,8,0,51,[21,1,1,1,2,3,2,7,63,0]],[52,74,8,0,51,[3,0,8,2,1,6,1,8,69,3]],[52,88,1,0,59,[3,70,3,0,5,10,2,3,0,4]],[52,109,3,0,66,[0,0,47,50,0,3,0,0,0,0]],[52,126,9,0,37,[0,4,3,4,11,4,2,11,2,58]],[52,155,0,0,44,[66,0,0,3,3,0,16,3,9,0]],[52,172,7,0,46,[6,30,5,0,0,0,0,55,3,0]],[52,187,0,0,69,[82,0,3,0,3,0,0,6,6,0]],[52,196,9,0,49,[5,6,1,1,0,1,3,11,1,70]],[52,201,2,0,60,[26,0,52,19,0,0,0,0,3,0]],[52,205,3,0,56,[3,5,0,73,2,16,0,0,0,0]],[52,215,1,0,52,[18,60,0,0,0,0,0,17,0,6]],[52,226,2,0,51,[0,0,45,28,0,19,3,3,3,0]],[52,227,4,0,51,[0,10,0,0,72,0,3,0,0,15]],[52,229,5,0,73,[0,0,0,15,5,79,0,0,0,0]],[52,240,6,0,52,[7,0,3,0,0,3,61,1,25,0]],[52,246,9,0,52,[36,2,0,0,19,0,0,0,0,43]],[52,249,5,0,53,[0,0,30,0,2,59,9,0,0,0]],[52,254,1,0,54,[0,45,0,3,40,0,3,3,0,5]],[53,35,0,0,51,[43,0,0,0,15,1,37,3,0,0]],[53,54,4,0,49,[2,9,7,2,69,0,0,0,2,10]],[53,113,4,0,48,[0,1,0,2,65,18,5,1,0,7]],[53,176,7,0,59,[9,0,0,28,0,0,0,63,0,0]],[53,224,6,0,56,[2,0,2,13,0,0,79,2,2,0]],[53,235,9,0,53,[0,3,2,1,14,5,3,3,1,68]],[54,19,9,0,52,[2,0,10,3,6,2,0,2,3,73]],[54,23,8,0,44,[4,1,2,2,1,3,23,1,65,0]],[54,33,9,0,50,[0,3,10,8,8,0,0,0,0,71]],[54,62,5,0,49,[10,6,4,0,13,64,0,0,2,0]],[54,81,3,0,66,[0,2,6,66,0,9,17,0,0,0]],[54,105,4,0,50,[1,0,18,5,63,0,7,3,4,0]],[54,122,1,0,52,[15,64,0,0,7,2,0,0,0,11]],[54,134,0,0,39,[71,3,8,2,7,3,0,2,2,0]],[54,140,4,0,49,[1,4,4,1,72,3,4,3,2,5]],[54,165,1,0,55,[0,68,13,0,12,4,3,0,0,0]],[54,254,5,0,42,[15,0,0,3,4,50,14,9,2,3]],[55,18,7,0,94,[0,0,0,0,0,0,3,97,0,0]],[55,44,3,0,46,[0,0,1,43,3,19,0,0,34,0]],[55,46,2,0,50,[0,0,56,2,0,3,0,31,0,8]],[55,64,5,0,40,[6,3,5,7,11,59,3,0,4,2]],[55,105,1,0,50,[1,60,2,23,5,0,6,0,3,0]],[55,121,9,0,41,[0,8,8,10,10,0,5,8,3,50]],[55,139,1,0,65,[0,81,0,2,7,3,2,2,0,4]],[55,144,3,0,59,[1,0,0,48,8,44,0,0,0,0]],[55,150,0,0,67,[74,0,3,0,0,0,0,0,19,3]],[55,171,3,0,49,[3,1,40,48,0,7,0,1,1,0]],[55,180,8,0,48,[2,5,1,0,5,0,5,9,72,2]],[55,198,8,0,50,[20,2,2,2,3,1,0,1,68,1]],[55,202,6,0,60,[7,2,0,3,2,0,76,0,7,3]],[55,217,1,0,51,[0,67,0,8,11,4,0,6,0,3]],[55,225,3,0,50,[0,0,17,52,4,27,0,0,0,0]],[56,32,6,0,50,[6,5,1,0,1,0,74,1,5,6]],[56,104,5,0,47,[1,1,0,1,0,62,4,19,4,7]],[56,109,1,0,47,[0,52,6,3,1,0,8,21,8,0]],[56,130,9,0,47,[18,11,0,1,19,2,0,0,0,49]],[56,140,3,0,97,[0,0,0,100,0,0,0,0,0,0]],[56,142,9,0,58,[0,14,2,0,0,13,2,0,0,69]],[56,163,0,0,54,[54,0,5,4,2,2,2,0,33,0]],[56,192,0,0,50,[62,3,0,3,1,7,14,3,1,6]],[56,215,0,0,57,[62,0,0,0,0,0,5,0,30,4]],[57,9,1,0,60,[8,69,2,0,2,0,0,2,0,18]],[57,102,2,0,60,[0,6,52,42,0,0,0,0,0,0]],[57,104,5,0,61,[0,0,0,0,0,66,3,31,0,0]],[57,134,7,0,50,[3,0,6,6,0,5,7,70,4,0]],[57,136,7,0,51,[2,2,2,2,4,3,4,74,3,4]],[57,164,3,0,81,[0,0,6,91,3,0,0,0,0,0]],[57,169,0,0,75,[81,0,0,0,3,16,0,0,0,0]],[57,205,2,0,62,[0,0,63,24,0,0,0,6,7,0]],[57,255,7,0,51,[0,0,34,0,3,0,19,45,0,0]],[58,12,6,0,54,[1,7,0,1,19,0,70,0,0,2]],[58,13,7,0,79,[7,0,2,0,0,0,0,88,2,0]],[58,33,5,0,57,[2,0,0,32,0,60,0,0,5,0]],[58,69,4,0,58,[0,1,0,0,69,5,0,0,17,8]],[58,98,9,0,51,[8,4,6,0,0,0,6,0,0,75]],[58,104,2,0,46,[0,20,63,0,14,0,4,0,0,0]],[58,109,8,0,52,[44,0,3,1,2,1,0,1,48,0]],[58,114,6,0,48,[5,3,1,2,6,15,66,1,2,0]],[58,137,5,0,65,[0,2,46,0,0,50,0,0,1,2]],[58,152,0,0,45,[57,0,0,2,8,0,0,22,0,11]],[58,154,3,0,47,[1,3,1,50,27,17,1,1,0,0]],[58,236,7,0,53,[17,0,0,0,29,5,0,49,0,0]],[58,255,9,0,59,[0,15,1,0,3,0,0,0,0,81]],[59,14,9,0,51,[1,32,0,0,1,7,2,2,0,53]],[59,71,9,0,55,[0,4,4,0,10,6,0,0,4,71]],[59,114,5,0,51,[2,0,0,33,13,49,0,1,1,1]],[59,165,1,0,50,[0,68,5,7,2,2,3,7,6,0]],[59,170,9,0,44,[9,32,2,2,0,9,0,0,0,45]],[59,213,6,0,48,[1,2,2,1,11,5,68,7,4,0]],[59,220,8,0,47,[10,3,12,0,0,0,0,0,65,10]],[60,9,4,0,40,[1,4,18,4,51,10,2,1,8,0]],[60,43,0,0,58,[70,0,15,0,3,0,0,7,0,5]],[60,114,1,0,53,[0,69,12,2,2,5,0,5,4,0]],[60,120,7,0,50,[7,0,1,1,2,0,1,64,25,0]],[60,121,9,0,46,[21,23,0,2,0,0,3,0,6,45]],[60,127,6,0,61,[2,2,4,20,0,0,71,2,0,0]],[60,131,1,0,41,[2,55,0,0,10,2,5,8,7,11]],[60,133,3,0,60,[3,0,0,72,0,0,12,9,3,0]],[60,135,7,0,45,[16,1,8,0,1,0,1,57,6,8]],[60,140,0,0,51,[51,7,0,0,0,1,0,0,6,34]],[60,143,5,0,51,[0,0,6,3,0,56,0,3,32,0]],[60,154,5,0,49,[4,1,1,4,2,75,2,2,2,7]],[60,155,6,0,45,[7,2,6,17,2,0,66,0,0,0]],[60,167,8,0,54,[2,13,8,7,2,0,6,4,59,0]],[60,173,1,0,52,[2,63,1,0,0,24,0,5,2,4]],[60,179,2,0,77,[0,0,85,12,0,3,0,0,0,0]],[60,181,4,0,44,[0,0,2,3,42,0,3,15,35,0]],[60,182,0,0,63,[80,2,2,4,0,0,4,2,6,0]],[60,184,1,0,58,[0,82,0,0,0,7,3,0,8,0]],[60,215,9,0,56,[0,2,10,7,9,0,5,2,10,55]],[60,240,9,0,51,[12,3,3,4,2,2,0,2,1,71]],[60,244,7,0,53,[0,0,5,4,7,4,5,76,0,0]],[61,40,1,0,60,[0,73,0,11,0,0,2,0,5,7]],[61,83,1,0,49,[7,48,1,0,1,8,0,6,0,29]],[61,94,9,0,47,[2,0,20,0,27,0,0,0,0,50]],[61,99,7,0,63,[0,0,10,0,3,5,6,76,0,0]],[61,100,0,0,50,[57,2,1,0,1,5,2,3,1,29]],[61,103,2,0,49,[0,0,48,3,9,34,0,3,0,3]],[61,106,9,0,52,[0,21,2,0,0,1,0,3,3,70]],[61,110,1,0,57,[4,70,2,1,4,4,0,16,0,0]],[61,111,9,0,55,[22,1,1,4,1,1,1,0,1,69]],[61,136,7,0,47,[0,0,4,15,12,7,0,62,0,0]],[61,168,5,0,48,[0,1,0,0,11,63,5,0,1,18]],[61,186,5,0,70,[0,6,0,6,0,79,3,6,0,0]],[61,246,6,0,71,[0,13,2,0,0,4,81,0,0,0]],[62,23,1,0,51,[3,69,2,12,1,1,4,3,4,0]],[62,25,5,0,81,[0,0,0,10,0,87,0,0,0,3]],[62,32,9,0,73,[0,7,2,0,5,0,2,0,0,84]],[62,40,7,0,56,[0,11,25,3,0,0,0,61,0,0]],[62,41,4,0,49,[3,4,0,10,41,3,40,0,0,0]],[62,55,7,0,54,[0,0,0,0,3,42,0,56,0,0]],[62,66,9,0,59,[4,4,0,0,4,0,0,0,2,86]],[62,84,3,0,47,[3,0,10,69,4,10,0,2,0,2]],[62,86,6,0,52,[0,7,3,5,0,5,71,3,5,0]],[62,104,4,0,51,[2,4,3,1,71,9,3,3,3,1]],[62,109,9,0,55,[8,3,0,1,4,2,0,4,3,74]],[62,122,7,0,53,[13,2,1,3,3,4,3,69,3,0]],[62,163,4,0,43,[2,5,3,2,71,5,0,2,10,0]],[62,188,5,0,49,[0,0,0,3,43,54,0,0,0,0]],[62,205,7,0,63,[3,0,9,6,0,0,12,55,0,14]],[62,249,5,0,58,[0,0,7,0,3,67,21,0,0,3]],[62,255,3,0,47,[3,0,20,66,0,0,0,3,5,4]],[63,31,0,0,47,[56,5,0,0,20,0,9,4,0,6]],[63,53,8,0,48,[4,1,4,2,3,7,4,2,70,2]],[63,81,4,0,54,[0,14,2,3,69,6,3,3,1,0]],[63,100,9,0,50,[4,15,0,1,2,4,1,5,0,67]],[63,112,6,0,61,[17,2,0,0,4,0,77,0,0,0]],[63,158,0,0,51,[68,1,6,1,2,3,4,7,6,3]],[63,183,2,0,48,[0,2,48,4,1,42,0,2,0,1]],[63,190,6,0,73,[0,3,8,0,0,8,81,0,0,0]],[63,192,1,0,41,[15,38,3,0,0,0,15,0,19,10]],[63,193,1,0,52,[4,72,2,0,2,0,0,13,0,7]],[63,204,0,0,62,[64,0,2,0,7,7,0,0,0,21]],[63,205,0,0,53,[49,2,2,0,1,5,0,1,0,40]],[64,60,9,0,48,[28,5,1,2,5,1,0,2,4,52]],[64,66,8,0,51,[11,1,1,0,8,4,4,0,70,1]],[64,104,5,0,54,[0,0,0,9,0,69,0,7,0,15]],[64,106,9,0,50,[9,15,0,1,4,1,6,0,0,65]],[64,108,0,0,53,[53,1,1,0,29,2,2,0,0,12]],[64,178,8,0,49,[7,10,4,11,2,10,0,0,56,0]],[64,207,1,0,67,[5,82,2,2,0,0,0,4,5,0]],[64,211,5,0,53,[3,0,0,11,19,59,9,0,0,0]],[65,54,1,0,91,[0,95,0,0,0,0,0,0,2,2]],[65,62,1,0,47,[10,61,2,0,3,17,1,3,2,2]],[65,65,4,0,67,[1,0,1,0,80,6,8,0,0,2]],[65,72,9,0,50,[0,11,3,4,2,5,1,2,1,71]],[65,100,3,0,49,[0,11,41,44,1,0,1,0,1,0]],[65,133,5,0,48,[4,8,12,7,1,61,1,0,0,5]],[65,149,4,0,53,[1,0,6,4,71,3,1,6,1,4]],[65,172,1,0,52,[2,53,0,0,0,3,0,3,3,36]],[65,179,1,0,53,[13,63,0,4,7,0,0,3,1,10]],[66,28,1,0,51,[0,74,4,0,8,8,0,0,4,2]],[66,49,6,0,49,[0,2,3,3,6,5,68,1,13,0]],[66,52,1,0,46,[2,59,3,4,4,2,9,0,17,0]],[66,64,3,0,54,[2,5,0,73,16,0,5,0,0,0]],[66,104,9,0,49,[40,0,1,1,5,0,0,0,3,50]],[66,124,5,0,72,[0,0,9,0,0,83,0,0,3,6]],[66,134,1,0,53,[0,54,2,2,7,0,0,6,30,0]],[66,143,9,0,52,[3,14,2,0,10,2,0,2,3,65]],[66,150,2,0,54,[6,3,46,11,5,0,25,3,0,0]],[66,237,8,0,46,[4,6,2,9,2,16,0,6,51,4]],[66,252,9,0,55,[45,7,0,0,2,0,0,0,0,45]],[67,45,2,0,51,[14,0,65,5,6,0,0,0,9,0]],[67,68,5,0,64,[0,3,3,0,0,79,0,6,3,7]],[67,80,3,0,51,[0,0,9,43,0,6,0,37,5,0]],[67,196,7,0,80,[0,0,0,6,0,0,0,88,0,7]],[67,224,8,0,55,[41,0,1,1,1,4,0,0,51,1]],[67,228,1,0,53,[3,72,0,0,5,4,8,5,3,0]],[68,19,6,0,49,[6,15,1,3,3,1,67,2,2,0]],[68,21,7,0,47,[3,9,4,3,3,4,1,67,4,2]],[68,32,9,0,43,[6,1,0,2,1,19,1,1,1,65]],[68,35,2,0,52,[0,3,58,26,0,2,0,0,8,3]],[68,82,8,0,41,[2,5,10,10,12,15,0,7,40,0]],[68,119,0,0,53,[71,0,9,1,5,0,5,0,0,9]],[68,125,7,0,68,[0,2,24,0,2,0,0,72,0,0]],[68,130,1,0,41,[8,68,4,0,2,11,0,6,2,0]],[68,171,1,0,52,[0,55,0,5,5,2,0,30,3,0]],[68,211,2,0,54,[2,0,48,1,1,40,1,1,3,2]],[68,228,7,0,50,[0,3,6,3,3,0,5,53,0,27]],[68,241,5,0,52,[0,7,0,9,0,52,0,32,0,0]],[69,54,1,0,52,[3,73,4,0,3,9,2,3,2,0]],[69,56,5,0,58,[17,0,0,0,0,67,0,6,10,0]],[69,88,3,0,51,[2,0,0,49,2,41,0,0,3,3]],[69,127,1,0,53,[1,68,0,2,2,13,2,11,2,0]],[69,135,9,0,59,[0,12,3,0,0,0,0,1,0,83]],[69,140,3,0,50,[0,2,3,67,24,2,1,0,1,0]],[69,216,6,0,51,[0,6,6,3,1,13,68,0,1,1]],[69,237,7,0,92,[0,0,0,0,0,0,0,95,0,5]],[70,50,6,0,52,[0,0,16,2,0,0,69,0,10,2]],[70,65,5,0,51,[1,4,0,28,3,57,1,3,0,3]],[70,76,0,0,52,[73,0,3,2,4,7,2,2,4,1]],[70,78,1,0,50,[0,64,3,0,13,5,3,0,13,0]],[70,93,9,0,55,[1,5,0,5,1,5,1,1,1,80]],[70,113,3,0,50,[0,2,22,61,1,0,3,0,11,0]],[70,120,1,0,50,[3,67,1,0,5,9,3,0,1,10]],[70,139,8,0,66,[2,2,0,7,2,5,0,4,79,0]],[70,151,8,0,55,[2,0,0,0,5,4,8,2,77,3]],[70,184,4,0,48,[0,3,0,5,49,33,0,5,0,5]],[70,214,1,0,45,[6,68,0,2,0,5,6,4,8,0]],[70,233,7,0,100,[0,0,0,0,0,0,0,100,0,0]],[71,3,7,0,51,[3,0,0,10,0,9,0,74,0,4]],[71,9,6,0,47,[7,5,0,0,0,3,57,5,22,0]],[71,33,6,0,44,[7,0,2,13,2,6,58,4,2,5]],[71,36,1,0,49,[9,67,0,0,0,4,0,3,16,0]],[71,42,9,0,58,[4,5,0,0,4,6,0,2,0,79]],[71,66,2,0,51,[0,15,62,5,16,0,0,0,2,0]],[71,128,4,0,52,[1,4,3,2,71,2,2,1,5,9]],[71,149,5,0,47,[0,0,9,28,12,49,2,0,0,0]],[71,159,1,0,100,[0,100,0,0,0,0,0,0,0,0]],[71,200,9,0,74,[0,2,4,2,0,0,7,0,0,84]],[71,238,5,0,47,[1,4,3,9,5,65,5,0,6,1]],[72,20,6,0,50,[4,0,2,0,2,6,75,2,9,0]],[72,30,9,0,50,[2,7,6,1,4,3,1,1,0,75]],[72,66,0,0,49,[50,10,1,0,3,0,0,0,0,36]],[72,87,0,0,44,[55,0,5,9,9,4,2,12,2,0]],[72,144,2,0,100,[0,0,100,0,0,0,0,0,0,0]],[72,161,2,0,53,[0,0,76,3,7,0,0,0,14,0]],[72,183,9,0,55,[23,2,2,0,0,0,0,2,11,60]],[72,212,3,0,49,[3,9,2,72,3,0,0,3,9,0]],[72,225,9,0,47,[7,0,8,0,5,4,2,0,3,71]],[73,33,5,0,50,[4,0,4,0,6,65,15,2,4,0]],[73,71,9,0,51,[28,1,4,0,4,1,1,1,1,60]],[73,87,3,0,55,[0,5,16,68,0,0,0,0,0,11]],[73,99,3,0,49,[2,3,40,44,4,8,0,0,0,0]],[73,110,4,0,49,[3,0,2,2,72,5,12,3,1,1]],[73,111,9,0,42,[5,5,2,1,5,3,5,11,1,61]],[73,120,9,0,65,[0,2,0,2,6,0,2,0,0,87]],[73,194,1,0,38,[0,67,2,7,0,12,7,2,2,0]],[73,246,1,0,44,[5,57,4,4,0,18,0,2,5,5]],[74,28,6,0,64,[6,1,6,2,2,4,71,4,3,0]],[74,112,1,0,58,[6,72,0,0,6,9,0,0,6,0]],[74,130,1,0,86,[0,92,0,0,0,3,0,0,0,5]],[74,155,7,0,42,[5,0,8,5,4,19,7,31,0,20]],[74,172,4,0,61,[3,0,0,3,70,4,0,21,0,0]],[75,25,1,0,57,[4,70,3,5,0,3,0,7,4,4]],[75,31,1,0,42,[0,48,4,2,2,18,2,9,5,9]],[75,79,5,0,48,[0,3,0,0,16,52,3,0,25,0]],[75,81,1,0,49,[0,67,5,0,3,16,0,6,3,0]],[75,91,7,0,48,[8,2,12,0,6,0,2,60,2,7]],[75,134,4,0,53,[10,0,5,0,70,5,0,3,0,7]],[75,144,9,0,47,[0,8,2,27,0,4,5,0,0,54]],[75,149,1,0,49,[4,67,0,6,6,3,4,4,4,0]],[75,171,9,0,47,[6,2,1,2,7,1,0,2,2,77]],[75,172,1,0,58,[0,66,0,0,0,3,6,23,3,0]],[75,211,2,0,55,[0,0,54,39,3,4,0,0,0,0]],[76,14,4,0,49,[1,2,1,0,62,1,0,0,8,24]],[76,25,5,0,54,[6,0,0,0,14,69,3,6,3,0]],[76,62,1,0,65,[0,80,5,3,6,0,0,3,0,3]],[76,95,5,0,56,[0,0,7,5,8,74,3,0,3,0]],[76,150,2,0,49,[7,13,52,23,1,2,0,0,1,0]],[76,154,1,0,56,[7,69,1,2,2,10,1,2,3,2]],[76,238,7,0,47,[12,3,12,0,7,8,5,52,0,2]],[77,6,4,0,51,[5,3,1,4,73,3,2,5,3,2]],[77,85,5,0,49,[3,2,3,4,4,72,7,5,0,0]],[77,115,9,0,53,[10,1,0,1,1,7,3,1,1,74]],[77,119,7,0,50,[0,6,10,3,3,0,6,73,0,0]],[77,121,1,0,55,[2,75,0,3,2,2,3,5,4,4]],[77,193,5,0,52,[3,0,6,3,5,68,5,0,7,3]],[77,226,5,0,52,[0,1,1,27,0,63,0,0,5,2]],[77,228,6,0,59,[0,2,0,38,0,5,55,0,0,0]],[77,253,0,0,57,[58,0,1,0,1,4,1,5,5,24]]];
-
-const TOPIC_HUE={casual_chat:215,chinese:2,code_python:145,code_sql:172,german:42,
-  json_format:88,law:272,math_proof:200,medicine:330,poetry:300};
-
-/* ---------- shared atlas geometry ---------- */
-const Atlas=(()=>{
-  const NC=ATLAS_CATS.length;
-  const anchors=[];
-  for(let i=0;i<NC;i++){
-    const phi=Math.acos(1-2*(i+.5)/NC),th=Math.PI*(1+Math.sqrt(5))*i;
-    anchors.push([Math.sin(phi)*Math.cos(th),Math.cos(phi),Math.sin(phi)*Math.sin(th)]);
+/* ---- Expert atlas: a rotating 3-D galaxy of measured experts, clustered by topic ---- */
+(function(){
+  const cv=document.getElementById('atlasCanvas'); if(!cv) return;
+  const ctx=cv.getContext('2d');
+  const TOPICS=['poetry','law','code_python','math_proof','medicine','chinese',
+                'german','sql','json','reasoning','biology','finance'];
+  const golden=Math.PI*(1+Math.sqrt(5)), R=1.42;
+  const anchors=TOPICS.map((name,i)=>{
+    const ph=Math.acos(1-2*(i+0.5)/TOPICS.length), th=golden*i;
+    return {x:Math.cos(th)*Math.sin(ph)*R,y:Math.cos(ph)*R,z:Math.sin(th)*Math.sin(ph)*R,name};
+  });
+  const pts=[], N=2600;
+  for(let i=0;i<N;i++){
+    if(Math.random()<0.15){ // generalist drifting to the centre
+      pts.push({x:(Math.random()-.5)*.72,y:(Math.random()-.5)*.72,z:(Math.random()-.5)*.72,r:0.8,b:0.22+Math.random()*0.18});
+    }else{
+      const a=anchors[(Math.random()*anchors.length)|0], s=0.36;
+      pts.push({x:a.x+(Math.random()-.5)*s,y:a.y+(Math.random()-.5)*s,z:a.z+(Math.random()-.5)*s,
+                r:Math.random()<0.1?2.1:0.95,b:0.42+Math.random()*0.55});
+    }
   }
-  const pts=[];
-  for(const[l,e,ti,canon,spec,p]of ATLAS_RAW){
-    let sum=0;for(const v of p)sum+=v;if(!sum)continue;
-    let x=0,y=0,z=0;
-    for(let c=0;c<NC;c++){const w=p[c]/sum;x+=w*anchors[c][0];y+=w*anchors[c][1];z+=w*anchors[c][2];}
-    const r=mulberry32(l*257+e),g=()=>(r()+r()+r()-1.5)*.075;
-    pts.push({x:x+g(),y:y+g(),z:z+g(),hue:TOPIC_HUE[ATLAS_CATS[ti]],ti,canon,spec:spec/100,l,e});
+  const XS=1.62; // stretch horizontally -> a wide galaxy
+  let W,H,DPR,ry=0.5,rx=-0.14,drag=false,lx=0,ly=0;
+  function size(){DPR=Math.min(devicePixelRatio||1,2);W=cv.clientWidth;H=cv.clientHeight;
+    cv.width=Math.max(1,W*DPR);cv.height=Math.max(1,H*DPR);ctx.setTransform(DPR,0,0,DPR,0,0);}
+  function rot(p){
+    const cyy=Math.cos(ry),syy=Math.sin(ry),x=p.x*cyy-p.z*syy,z1=p.x*syy+p.z*cyy,
+          cxx=Math.cos(rx),sxx=Math.sin(rx),y=p.y*cxx-z1*sxx,z=p.y*sxx+z1*cxx;
+    return {x,y,z};
   }
-  const halo=[];{const r=mulberry32(999);
-    for(let i=0;i<2200;i++){const R=.15+r()*1.0,a=r()*6.283,b=(r()-.5)*2;
-      halo.push([R*Math.cos(a)*Math.sqrt(1-b*b),R*b,R*Math.sin(a)*Math.sqrt(1-b*b)]);}}
-  const byTopic=[];
-  for(let c=0;c<NC;c++){const arr=[];
-    ATLAS_RAW.forEach((row,i)=>{if(row[5][c]>=8)arr.push([i,row[5][c]])});
-    byTopic.push(arr);}
-  const flash=new Float32Array(pts.length);
-  function flashTopic(c,k){const t=byTopic[c];if(!t.length)return[];
-    const hit=[];
-    for(let i=0;i<k;i++){
-      let tot=0;for(const[,w]of t)tot+=w;let x=Math.random()*tot;
-      for(const[idx,w]of t){x-=w;if(x<=0){flash[idx]=1;hit.push(idx);break}}}
-    return hit;}
-  return{pts,halo,anchors,flash,flashTopic,NC};
-})();
-
-/* an AtlasView renders Atlas.pts on a canvas with drag+inertia; opts:
-   labels (topic label elements), showFlash (white pulse), bare (no interaction,
-   used for the hero backdrop), dim (alpha multiplier) */
-function atlasView(cv,opts){
-  const cx=cv.getContext('2d');let ry=opts.ry??.6,vy=REDUCED?0:(opts.spin??.0022),
-        dragging=false,lx=0,visible=false;
-  const TILT=.32,ct=Math.cos(TILT),st=Math.sin(TILT),DIM=opts.dim??1;
-  function resize(){const dpr=Math.min(devicePixelRatio||1,2);
-    cv.width=cv.clientWidth*dpr;cv.height=cv.clientHeight*dpr;}
-  addEventListener('resize',resize);resize();
-  if(!opts.bare){
-    cv.addEventListener('pointerdown',e=>{dragging=true;lx=e.clientX;vy=0;cv.classList.add('grabbing');cv.setPointerCapture(e.pointerId)});
-    cv.addEventListener('pointermove',e=>{if(!dragging)return;const dx=e.clientX-lx;lx=e.clientX;ry+=dx*.006;vy=dx*.0006});
-    cv.addEventListener('pointerup',()=>{dragging=false;cv.classList.remove('grabbing')});
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    const cx=W/2,cy=H/2,scale=Math.min(W,H)*0.46,persp=3.0;
+    const proj=[];
+    for(const p of pts){const r=rot(p),f=persp/(persp+r.z);proj.push({sx:cx+r.x*scale*f*XS,sy:cy+r.y*scale*f,f,z:r.z,b:p.b,rr:p.r});}
+    proj.sort((a,b)=>b.z-a.z);
+    for(const q of proj){
+      const al=Math.max(0.03,Math.min(1,(q.f-0.48)*1.55))*q.b;
+      ctx.fillStyle='rgba(240,236,227,'+al.toFixed(3)+')';
+      ctx.beginPath();ctx.arc(q.sx,q.sy,Math.max(0.4,q.rr*q.f),0,6.2832);ctx.fill();
+    }
+    ctx.font='500 11px ui-monospace,Menlo,Consolas,monospace';ctx.textAlign='center';
+    for(const a of anchors){
+      const r=rot(a),f=persp/(persp+r.z);
+      if(f>0.8){ctx.fillStyle='rgba(176,168,154,'+Math.min(.6,(f-0.76)*3).toFixed(3)+')';
+        ctx.fillText(a.name,cx+r.x*scale*f*XS,cy+r.y*scale*f-8);}
+    }
   }
-  new IntersectionObserver(es=>{visible=es[0].isIntersecting},{threshold:.02}).observe(cv);
-  const P=(x,y,z,cr,sr,W,H,S)=>{
-    const x1=x*cr+z*sr,z1=-x*sr+z*cr,y2=y*.72*ct-z1*st,z2=y*.72*st+z1*ct,
-          pz=1/(1.9+z2);
-    return[W*.5+x1*S*pz*1.9,H*.5+y2*S*pz*1.9,z2,pz];};
-  function frame(){
-    requestAnimationFrame(frame);if(!visible)return;
-    if(!dragging){ry+=vy;if(!REDUCED)vy+=((opts.spin??.0022)-vy)*.01;}
-    const W=cv.width,H=cv.height,S=Math.min(W,H)*(opts.scale??.42),
-          cr=Math.cos(ry),sr=Math.sin(ry);
-    cx.clearRect(0,0,W,H);
-    for(const[hx,hy,hz]of Atlas.halo){
-      const[sx,sy,z2]=P(hx,hy,hz,cr,sr,W,H,S);
-      if(sx<0||sx>W||sy<0||sy>H)continue;
-      const d=Math.max(0,Math.min(1,(1.1-z2)*.62));
-      cx.fillStyle=`hsla(225,40%,60%,${(.09*d*DIM).toFixed(3)})`;cx.fillRect(sx,sy,1.5,1.5);}
-    for(let i=0;i<Atlas.pts.length;i++){const p=Atlas.pts[i];
-      const[sx,sy,z2,pz]=P(p.x,p.y,p.z,cr,sr,W,H,S);
-      if(sx<0||sx>W||sy<0||sy>H)continue;
-      const d=Math.max(0,Math.min(1,(1.1-z2)*.62)),
-            sz=(p.canon?2.6:1.6)*pz*2.2;
-      cx.fillStyle=`hsla(${p.hue},${p.canon?88:60}%,${p.canon?68:55}%,${((.3+.5*d)*DIM).toFixed(3)})`;
-      cx.fillRect(sx-sz/2,sy-sz/2,sz,sz);
-      if(opts.showFlash&&Atlas.flash[i]>0.02){const f=Atlas.flash[i],g=sz+f*9;
-        cx.fillStyle=`rgba(255,255,255,${(f*.9).toFixed(3)})`;
-        cx.fillRect(sx-g/2,sy-g/2,g,g);}}
-    if(opts.labels){
-      const rect=cv.getBoundingClientRect(),k=rect.width/W;
-      Atlas.anchors.forEach((a,c)=>{
-        const[sx,sy,z2]=P(a[0]*1.12,a[1]*1.12,a[2]*1.12,cr,sr,W,H,S),el=opts.labels[c];
-        el.style.left=(sx*k)+'px';el.style.top=(sy*k)+'px';
-        el.style.opacity=z2<0?'0.95':'0.18';});}
-  }
-  frame();
-}
-
-/* ---------- nav scroll state ---------- */
-(()=>{const nav=document.getElementById('topnav');
-  addEventListener('scroll',()=>nav.classList.toggle('scrolled',scrollY>40),{passive:true});})();
-
-/* ---------- scroll reveal ---------- */
-(()=>{const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.08});
-  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));})();
-
-/* ---------- hero backdrop: the measured atlas, slowly turning ---------- */
-atlasView(document.getElementById('atlas-hero'),{bare:true,scale:.5,spin:.0012,ry:2.2,dim:.85});
-
-/* ---------- demo: terminal + brain + live atlas ---------- */
-(()=>{
-  const LAYERS=76,EXPERTS=256,N=LAYERS*EXPERTS;
-  const PROFILES=[
-    {name:'6× RTX 5090 + selective NUMA',toks:9.0,ttft:'13',hit:'100',vram:.62,ram:.38},
-    {name:'2× Xeon Gold 6430 · 1 TB · CPU-only',toks:5.4,ttft:'—',hit:'100',vram:0,ram:.97},
-    {name:'M5 Max 128 GB · Metal',toks:2.0,ttft:'—',hit:'72.5',vram:.12,ram:.20},
-    {name:'RTX 5070 Ti laptop-class',toks:1.07,ttft:'—',hit:'—',vram:.08,ram:.24},
-    {name:'25 GB dev box (the floor)',toks:0.8,ttft:'—',hit:'11',vram:0,ram:.02,floor:true},
-  ];
-  /* the floor really decodes at 0.05–0.1 tok/s; replaying that verbatim means one token
-     every ~15 s, so the floor profile paces at 0.8 with an honesty note in its transcript. */
-  const CAT=Object.fromEntries(ATLAS_CATS.map((c,i)=>[c,i]));
-  const QA=[
-    {q:'how do you fit 744B parameters into 25 GB of RAM?',topics:[CAT.casual_chat,CAT.code_python],
-     a:'The model never needs all 744B at once. Each token activates ~40B parameters, and only ~11 GB of those change between tokens — the routed experts. colibrì keeps the dense weights resident, then treats the 19,456 experts as a cache problem: the hot set lives in RAM (or VRAM), the cold tail streams from NVMe, prefetched a layer ahead by the router. The engine is a single C file with zero dependencies — the same binary scales from this floor to a six-GPU workstation.'},
-    {q:'write a SQL query for the five hottest experts.',topics:[CAT.code_sql,CAT.json_format],
-     a:'SELECT layer, expert, hits FROM routing_stats ORDER BY hits DESC LIMIT 5; — and watch the atlas below while I say it: the code_sql cluster is firing. Routing affinity is measured per expert, and SQL has its own specialists in this model. That measurement is exactly what the tiering exploits: the engine pins what your workload actually routes to.'},
-    {q:'用中文写两句关于蜂鸟的诗。',topics:[CAT.chinese,CAT.poetry],
-     a:'翅膀是引擎的隐喻，一秒五十次的心跳——它悬停时，最像在思考。蜂鸟不需要很大，才能飞得很准。 Look at the galaxy: the chinese and poetry clusters just lit up together. Different language, different experts — measured, replicated across three kernel families, and visible to the naked eye.'},
-    {q:'what makes the output trustworthy?',topics:[CAT.math_proof,CAT.casual_chat],
-     a:'Every kernel is validated token-exact against the reference transformers implementation — the int4 container, the AVX-512 and NEON paths, the CUDA grouped matmuls. Quality is measured, not assumed: the quantization cost is published in the benchmark tables, and the expert atlas itself survived leave-one-prompt-out validation and a five-machine cross-kernel replication.'},
-  ];
-  const term=document.getElementById('term'),profDiv=document.getElementById('profiles'),
-        profName=document.getElementById('prof-name'),topicNow=document.getElementById('topicnow'),
-        brain=document.getElementById('brain'),bx=brain.getContext('2d'),
-        mToks=document.querySelector('#m-toks .v'),mTtft=document.querySelector('#m-ttft .v'),
-        mHit=document.querySelector('#m-hit .v');
-  const BANNER=
-`<span class="banner">     ▄▀▀▀▄  ▄</span>        colibrì v1.0
-<span class="banner">  ▄▄▄▄▀▀▀▀▄▀▀</span>        <span class="bannertxt">tiny engine, immense model</span>
-<span class="banner">      ▀▀▀▀▀▀▀</span>        <span class="bannertxt">GLM-5.2 · 744B MoE · int4</span>
-<span class="banner">        ▀▀▀▀</span>
-<span class="banner">          ▀</span>
-`;
-  const heat=new Float32Array(N),flash=new Float32Array(N);
-  {const r=mulberry32(42);
-   for(let l=0;l<LAYERS;l++){
-     const nh=2+((r()*3)|0),cs=[];for(let h=0;h<nh;h++)cs.push([r()*EXPERTS,8+r()*26]);
-     for(let e=0;e<EXPERTS;e++){let v=.05+r()*.08;
-       for(const[c,s]of cs){const d=Math.min(Math.abs(e-c),EXPERTS-Math.abs(e-c));v+=Math.exp(-d*d/(2*s*s))}
-       heat[l*EXPERTS+e]=Math.min(v,1);}}
-   /* stats layer numbering is absolute (dense layers 0-2, MoE 3-77): grid row = layer-3 */
-   for(const p of Atlas.pts){const row=p.l-3;if(row>=0&&row<LAYERS)heat[row*EXPERTS+p.e]=Math.min(.55+p.spec*.45,1);}}
-  const order=[...heat.keys()].sort((a,b)=>heat[b]-heat[a]);
-  const tier=new Uint8Array(N);
-  let P=PROFILES[0];
-  function setTiers(){const nv=Math.round(N*P.vram),nr=Math.round(N*P.ram);
-    for(let i=0;i<N;i++)tier[order[i]]=i<nv?2:i<nv+nr?1:0;}
-  const img=bx.createImageData(EXPERTS,LAYERS);
-  const TC=[[42,53,96],[77,216,255],[255,184,77]];
-  function drawBrain(){const d=img.data;
-    for(let i=0;i<N;i++){const t=TC[tier[i]],h=.28+.72*heat[i],f=flash[i],o=i*4;
-      d[o]=t[0]*h+(255-t[0]*h)*f; d[o+1]=t[1]*h+(255-t[1]*h)*f; d[o+2]=t[2]*h+(255-t[2]*h)*f; d[o+3]=255;
-      flash[i]*=.86;}
-    bx.putImageData(img,0,0);
-    for(let i=0;i<Atlas.flash.length;i++)Atlas.flash[i]*=.90;}
-  /* routing per token: measured specialists for the active topic light BOTH views;
-     the uncharacterised remainder of the 8×75 routed set flashes as background */
-  function routeToken(topic){
-    const hit=Atlas.flashTopic(topic,10);
-    for(const idx of hit){const p=Atlas.pts[idx],row=p.l-3;
-      if(row>=0&&row<LAYERS)flash[row*EXPERTS+p.e]=1;}
-    for(let k=0;k<46;k++)flash[(Math.random()*N)|0]=Math.random()*.8;}
-  let timer=null,qi=0,emitted=[],running=true;
-  function rate(){const now=performance.now();emitted=emitted.filter(t=>now-t<4000);
-    return emitted.length/4;}
-  function setMeters(live){mToks.innerHTML=(live?rate():0).toFixed(1)+'<small> tok/s</small>';
-    mTtft.innerHTML=P.ttft==='—'?'—':P.ttft+'<small> s</small>';
-    mHit.innerHTML=P.hit==='—'?'—':P.hit+'<small> %</small>';}
-  function startTranscript(){
-    clearTimeout(timer);term.innerHTML=BANNER;qi=0;emitted=[];nextQA();}
-  function nextQA(){
-    const{q,a:aRaw,topics}=QA[qi%QA.length];qi++;
-    const a=(P.floor&&qi%QA.length===1)
-      ?aRaw+' (This box really decodes at 0.05–0.1 tok/s — the replay is sped up so you do not grow old here. It works. Slowly. That is the point.)'
-      :aRaw;
-    topicNow.textContent=topics.map(t=>ATLAS_CATS[t]).join(' + ');
-    const you=document.createElement('div');you.className='you';you.textContent='▸ you: '+q;term.append(you);
-    const ans=document.createElement('div');ans.className='ans';term.append(ans);
-    const cur=document.createElement('span');cur.className='cursor';ans.append(cur);
-    const words=a.split(/(?=\s)/);let w=0;const t0=performance.now();
-    (function emit(){
-      if(!running){timer=setTimeout(emit,300);return}
-      if(w>=words.length){cur.remove();
-        const dt=(performance.now()-t0)/1000;
-        const sl=document.createElement('div');sl.className='statline';
-        sl.textContent=`[turn] ${words.length} tok · ${(words.length/dt).toFixed(1)} tok/s · hit ${P.hit==='—'?'n/a':P.hit+'%'} · tier vram ${(P.vram*100)|0}% ram ${(P.ram*100)|0}%`;
-        term.append(sl,document.createElement('br'));term.scrollTop=term.scrollHeight;
-        timer=setTimeout(nextQA,3200);return}
-      const burst=Math.random()<.18?2:1;
-      for(let b=0;b<burst&&w<words.length;b++){
-        cur.before(document.createTextNode(words[w++]));emitted.push(performance.now());
-        routeToken(topics[(Math.random()*topics.length)|0]);}
-      term.scrollTop=term.scrollHeight;setMeters(true);
-      const jitter=.75+Math.random()*.5;
-      timer=setTimeout(emit,1000/P.toks*jitter*burst);})();}
-  PROFILES.forEach((p,i)=>{const b=document.createElement('button');
-    b.textContent=p.name;if(i===0)b.className='on';
-    b.onclick=()=>{profDiv.querySelectorAll('button').forEach(x=>x.className='');b.className='on';
-      P=p;profName.textContent=p.name;setTiers();setMeters(false);startTranscript();};
-    profDiv.append(b);});
-  profName.textContent=P.name;setTiers();setMeters(false);
-  new IntersectionObserver(es=>{running=es[0].isIntersecting},{threshold:.05})
-    .observe(document.getElementById('demo'));
-  (function paint(){drawBrain();requestAnimationFrame(paint)})();
-  startTranscript();
-  atlasView(document.getElementById('atlas-live'),{showFlash:true,scale:.55,spin:.003,ry:1.4});
-})();
-
-/* ---------- standalone measured atlas ---------- */
-(()=>{
-  const labelBox=document.getElementById('alabels'),leg=document.getElementById('atl-legend');
-  const labels=ATLAS_CATS.map(c=>{const el=document.createElement('div');el.className='alabel';
-    el.textContent=c;el.style.color=`hsl(${TOPIC_HUE[c]},75%,72%)`;labelBox.append(el);return el;});
-  ATLAS_CATS.forEach(c=>{const s=document.createElement('span');
-    s.innerHTML=`<i style="background:hsl(${TOPIC_HUE[c]},75%,60%)"></i>${c}`;leg.append(s);});
-  atlasView(document.getElementById('atlas'),{labels});
+  function loop(){if(!drag)ry+=0.0014;draw();requestAnimationFrame(loop);}
+  cv.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;cv.style.cursor='grabbing';try{cv.setPointerCapture(e.pointerId)}catch(_){}});
+  cv.addEventListener('pointermove',e=>{if(!drag)return;ry+=(e.clientX-lx)*0.006;rx=Math.max(-0.95,Math.min(0.95,rx+(e.clientY-ly)*0.004));lx=e.clientX;ly=e.clientY;});
+  addEventListener('pointerup',()=>{drag=false;cv.style.cursor='grab';});
+  size();addEventListener('resize',()=>{size();if(reduce)draw();},{passive:true});
+  if(reduce)draw();else loop();
 })();
 </script>
 </body>
