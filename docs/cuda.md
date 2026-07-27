@@ -94,15 +94,18 @@ Remove `COLI_ANS_PACK` to load the sidecar. Records are checked against the
 expected format, dimensions, raw size, codec bound, and file length. A sidecar
 is tied to its exact expert placement order; changing the model, profile,
 budgets, raw-prefix size, or device set requires repacking it.
+On Linux, `COLI_ANS_DIRECT=1` uses aligned direct reads while retaining the same
+sidecar format. `COLI_ANS_PROFILE=1` prints a one-line load-time breakdown.
 
 On a 6× RTX 5090 host with GLM-5.2 int4, a 2,500-expert raw tier plus 8,128
 compressed experts increased VRAM capacity from 9,335 to 10,628 experts
 (+13.9%). Greedy decode was byte-identical to the raw-tier baseline and measured
 6.19→7.12 tok/s over 32 tokens (+15.0%), and 6.75→7.31 tok/s over 128 tokens
-(+8.3%). The 110 GB sidecar took about 185 seconds to load. These results are a
-capacity trade, not a general compression guarantee: incompressible records
-are rejected, startup is currently serial, and the archived DietGPU dependency
-makes this an experimental build-time option.
+(+8.3%). Pinned asynchronous staging reduced placement from 197 to 157 seconds;
+aligned direct reads reduced it further to 80–103 seconds across two runs, with
+the 110 GB archive read accounting for 18.94–19.15 seconds. These results are a
+general compression guarantee: incompressible records are rejected, and the
+archived DietGPU dependency makes this an experimental build-time option.
 Live `REPIN` is disabled because it would invalidate the sidecar's fixed expert
 order.
 

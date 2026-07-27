@@ -6441,6 +6441,12 @@ static void pin_load(Model *m, const char *statspath, double gb){
                                     qt_cuda_upload_compressed(&s->d)) :
 #endif
                         (qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d));
+#ifdef COLI_ANS
+                    if(compress&&!uploaded){
+                        fprintf(stderr,"[ANS] sidecar load failed; refusing partial VRAM placement\n");
+                        exit(2);
+                    }
+#endif
                     if(uploaded){
                         int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)

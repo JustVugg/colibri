@@ -5,8 +5,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <chrono>
 #include <mutex>
 #include <vector>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifdef COLI_ANS
 #include <dietgpu/ans/GpuANSCodec.h>
@@ -62,6 +69,8 @@ typedef struct {
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
+    void *ans_host; size_t ans_host_cap;
+    int ans_copy_pending;
     dietgpu::StackDeviceMemory *ans_scratch;
     std::vector<AnsArenaChunk> *ans_chunks;
 #endif
@@ -81,6 +90,17 @@ static std::mutex g_group_stats_mu;
 #ifdef COLI_ANS
 static FILE *g_ans_sidecar;
 static int g_ans_sidecar_pack;
+#if defined(__linux__)
+static int g_ans_direct_fd=-1;
+static off_t g_ans_direct_off;
+#endif
+static uint64_t g_ans_load_records;
+static double g_ans_header_s,g_ans_read_s,g_ans_stage_s,g_ans_enqueue_s;
+static int g_ans_profile_printed;
+static double ans_now_s(){
+    using clock=std::chrono::steady_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
 #endif
 
 static int cuda_ok(cudaError_t err, const char *what) {
@@ -641,6 +661,17 @@ static void *ans_arena_alloc(DeviceContext *ctx,size_t bytes){
     }
     AnsArenaChunk &c=ctx->ans_chunks->back();void *p=c.p+c.used;c.used+=bytes;return p;
 }
+static int ans_host_reserve(DeviceContext *ctx,size_t bytes){
+    if(ctx->ans_copy_pending){
+        if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"ANS sidecar upload synchronize"))return 0;
+        ctx->ans_copy_pending=0;
+    }
+    if(ctx->ans_host_cap>=bytes)return 1;
+    if(ctx->ans_host)cudaFreeHost(ctx->ans_host);
+    ctx->ans_host=nullptr;ctx->ans_host_cap=0;
+    if(!cuda_ok(cudaMallocHost(&ctx->ans_host,bytes),"ANS pinned staging allocation"))return 0;
+    ctx->ans_host_cap=bytes;return 1;
+}
 static int prepare_group_weights(DeviceContext *ctx,
         ColiCudaTensor *const *gates,ColiCudaTensor *const *ups,
         ColiCudaTensor *const *downs,int count,GroupDesc *host){
@@ -650,6 +681,14 @@ static int prepare_group_weights(DeviceContext *ctx,
         for(int k=0;k<3;k++) if(q[k]->compressed){n++;total+=q[k]->weight_bytes;}
     }
     if(!n) return 1;
+    if(!g_ans_profile_printed&&std::getenv("COLI_ANS_PROFILE")){
+        g_ans_profile_printed=1;
+        std::fprintf(stderr,
+            "[ANS] load profile: %llu records | header %.2fs | read %.2fs | "
+            "staging/alloc %.2fs | enqueue %.2fs\n",
+            (unsigned long long)g_ans_load_records,g_ans_header_s,g_ans_read_s,
+            g_ans_stage_s,g_ans_enqueue_s);
+    }
     if(!ctx->ans_scratch||!reserve_bytes(&ctx->ans_raw,&ctx->ans_raw_cap,total)) return 0;
     std::vector<const void*> in; in.reserve(n);
     std::vector<void*> out; out.reserve(n);
@@ -759,10 +798,13 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
 #ifdef COLI_ANS
+        if(ctx->ans_copy_pending)cudaStreamSynchronize(ctx->stream);
+        if(ctx->ans_host)cudaFreeHost(ctx->ans_host);
         if (ctx->ans_raw) cudaFree(ctx->ans_raw);
         if(ctx->ans_chunks){for(auto &c:*ctx->ans_chunks)cudaFree(c.p);delete ctx->ans_chunks;}
         delete ctx->ans_scratch;
         ctx->ans_scratch=nullptr;ctx->ans_chunks=nullptr;ctx->ans_raw=nullptr;ctx->ans_raw_cap=0;
+        ctx->ans_host=nullptr;ctx->ans_host_cap=0;ctx->ans_copy_pending=0;
 #endif
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
@@ -777,6 +819,9 @@ extern "C" void coli_cuda_shutdown(void) {
     g_nctx = 0;
 #ifdef COLI_ANS
     if(g_ans_sidecar){std::fclose(g_ans_sidecar);g_ans_sidecar=nullptr;}
+#if defined(__linux__)
+    if(g_ans_direct_fd>=0){close(g_ans_direct_fd);g_ans_direct_fd=-1;g_ans_direct_off=0;}
+#endif
 #endif
 }
 
@@ -884,6 +929,15 @@ static FILE *ans_sidecar(void){
     if(!path||!*path) return nullptr;
     g_ans_sidecar_pack=std::getenv("COLI_ANS_PACK")&&std::atoi(std::getenv("COLI_ANS_PACK"));
     g_ans_sidecar=std::fopen(path,g_ans_sidecar_pack?"wb":"rb");
+#if defined(__linux__)
+    if(g_ans_sidecar&&!g_ans_sidecar_pack&&std::getenv("COLI_ANS_DIRECT")&&
+       std::atoi(std::getenv("COLI_ANS_DIRECT"))){
+        g_ans_direct_fd=open(path,O_RDONLY|O_DIRECT);
+        if(g_ans_direct_fd<0)std::fprintf(stderr,"[ANS] O_DIRECT unavailable; using buffered sidecar\n");
+    }
+    if(g_ans_sidecar&&!g_ans_sidecar_pack&&g_ans_direct_fd<0)
+        posix_fadvise(fileno(g_ans_sidecar),0,0,POSIX_FADV_SEQUENTIAL);
+#endif
     return g_ans_sidecar;
 }
 extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
@@ -893,31 +947,87 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
     if(sidecar&&!g_ans_sidecar_pack){
         AnsSidecarHeader h{};
         size_t expected=((size_t)I+1)/2*(size_t)O;
-        if(std::fread(&h,sizeof(h),1,sidecar)!=1||h.magic!=0x31534e41u||
+        double t0=ans_now_s();
+#if defined(__linux__)
+        size_t direct_delta=0,direct_bytes=0,direct_data=0;
+        if(g_ans_direct_fd>=0){
+            alignas(4096) uint8_t first[8192];
+            off_t start=g_ans_direct_off&~off_t(4095);
+            direct_delta=(size_t)(g_ans_direct_off-start);
+            ssize_t got=pread(g_ans_direct_fd,first,sizeof(first),start);
+            if(got<(ssize_t)(direct_delta+sizeof(h))){
+                std::fprintf(stderr,"[ANS] direct header read failed at %lld: got %lld errno %d\n",
+                    (long long)g_ans_direct_off,(long long)got,errno);
+                return 0;
+            }
+            std::memcpy(&h,first+direct_delta,sizeof(h));
+        }else
+#endif
+        if(std::fread(&h,sizeof(h),1,sidecar)!=1)return 0;
+        if(h.magic!=0x31534e41u||
            h.fmt!=(uint32_t)fmt||h.I!=(uint32_t)I||h.O!=(uint32_t)O||
            expected>UINT32_MAX||h.raw_bytes!=(uint32_t)expected||
            !h.archive_bytes||h.archive_bytes>dietgpu::getMaxCompressedSize(h.raw_bytes)){
             std::fprintf(stderr,"[ANS] invalid or mismatched sidecar record\n");
             return 0;
         }
-        std::vector<uint8_t> archive(h.archive_bytes);
-        if(std::fread(archive.data(),archive.size(),1,sidecar)!=1){
-            std::fprintf(stderr,"[ANS] truncated sidecar record\n");
-            return 0;
-        }
+        g_ans_header_s+=ans_now_s()-t0;
         DeviceContext *ctx=find_ctx(device); if(!ctx||!select_ctx(ctx)) return 0;
         ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t)); if(!t)return 0;
         t->fmt=fmt;t->I=I;t->O=O;t->device=device;t->weight_bytes=h.raw_bytes;
         t->scale_count=(size_t)O;t->archive_bytes=h.archive_bytes;t->compressed=1;
+        t0=ans_now_s();
         t->weights=ans_arena_alloc(ctx,h.archive_bytes);
-        if(!t->weights||
-           !cuda_ok(cudaMemcpy(t->weights,archive.data(),h.archive_bytes,cudaMemcpyHostToDevice),
-                    "ANS sidecar upload")||
-           !cuda_ok(cudaMalloc(&t->scales,(size_t)O*sizeof(float)),"ANS sidecar scales")||
-           !cuda_ok(cudaMemcpy(t->scales,scales,(size_t)O*sizeof(float),cudaMemcpyHostToDevice),
-                    "ANS sidecar scale upload")){
+        size_t scale_bytes=(size_t)O*sizeof(float),scale_off;
+#if defined(__linux__)
+        if(g_ans_direct_fd>=0){
+            size_t record_bytes=sizeof(h)+(size_t)h.archive_bytes;
+            direct_data=direct_delta+sizeof(h);
+            direct_bytes=(direct_delta+record_bytes+4095)&~size_t(4095);
+            scale_off=(direct_bytes+255)&~size_t(255);
+        }else
+#endif
+            scale_off=(h.archive_bytes+255)&~size_t(255);
+        if(!t->weights||!ans_host_reserve(ctx,scale_off+scale_bytes)||
+           !cuda_ok(cudaMalloc(&t->scales,scale_bytes),"ANS sidecar scales")){
             coli_cuda_tensor_free(t);return 0;
         }
+        g_ans_stage_s+=ans_now_s()-t0;
+        t0=ans_now_s();
+#if defined(__linux__)
+        if(g_ans_direct_fd>=0){
+            off_t start=g_ans_direct_off&~off_t(4095);
+            ssize_t got=pread(g_ans_direct_fd,ctx->ans_host,direct_bytes,start);
+            if(got<(ssize_t)(direct_data+h.archive_bytes)){
+                std::fprintf(stderr,
+                    "[ANS] direct record read failed at %lld: need %zu got %lld errno %d\n",
+                    (long long)g_ans_direct_off,direct_data+h.archive_bytes,
+                    (long long)got,errno);
+                coli_cuda_tensor_free(t);return 0;
+            }
+            g_ans_direct_off+=(off_t)sizeof(h)+(off_t)h.archive_bytes;
+        }else
+#endif
+        if(std::fread(ctx->ans_host,h.archive_bytes,1,sidecar)!=1){
+            std::fprintf(stderr,"[ANS] truncated sidecar record\n");
+            coli_cuda_tensor_free(t);return 0;
+        }
+        g_ans_read_s+=ans_now_s()-t0;
+        std::memcpy((uint8_t*)ctx->ans_host+scale_off,scales,scale_bytes);
+        t0=ans_now_s();
+        void *archive_src=
+#if defined(__linux__)
+            g_ans_direct_fd>=0?(uint8_t*)ctx->ans_host+direct_data:
+#endif
+            ctx->ans_host;
+        if(!cuda_ok(cudaMemcpyAsync(t->weights,archive_src,h.archive_bytes,
+                                   cudaMemcpyHostToDevice,ctx->stream),"ANS sidecar upload")||
+           !cuda_ok(cudaMemcpyAsync(t->scales,(uint8_t*)ctx->ans_host+scale_off,scale_bytes,
+                                   cudaMemcpyHostToDevice,ctx->stream),"ANS sidecar scale upload")){
+            coli_cuda_tensor_free(t);return 0;
+        }
+        g_ans_enqueue_s+=ans_now_s()-t0;g_ans_load_records++;
+        ctx->ans_copy_pending=1;
         t->tracked=1;ctx->tensor_count++;ctx->tensor_bytes+=h.archive_bytes+(size_t)O*sizeof(float);
         *tensor=t;return 1;
     }
