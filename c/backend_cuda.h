@@ -47,6 +47,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+#ifdef COLI_ANS
+/* Experimental Linux-only GPU-resident entropy tier. The archive remains in
+ * VRAM and is decoded into per-device scratch immediately before a grouped
+ * expert launch. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
+                            const void *weights, const float *scales,
+                            int fmt, int I, int O, int device);
+#endif
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.

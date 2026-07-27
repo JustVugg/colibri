@@ -6,6 +6,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
+
+#ifdef COLI_ANS
+#include <dietgpu/ans/GpuANSCodec.h>
+#include <dietgpu/utils/StackDeviceMemory.h>
+#endif
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include <sys/stat.h>
@@ -27,10 +33,18 @@ struct ColiCudaTensor {
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
     size_t scale_count;        /* floats in `scales`: O per-row, O*ng grouped */
     int tracked;
+    int weights_owned;
+#ifdef COLI_ANS
+    size_t archive_bytes;
+    int compressed;
+#endif
     RaggedKVEntry ragged[512];
     int ragged_count;
 };
 
+#ifdef COLI_ANS
+struct AnsArenaChunk { uint8_t *p; size_t used,cap; };
+#endif
 typedef struct {
     int device;
     int compute_major,compute_minor;
@@ -46,6 +60,11 @@ typedef struct {
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
+#ifdef COLI_ANS
+    void *ans_raw; size_t ans_raw_cap;
+    dietgpu::StackDeviceMemory *ans_scratch;
+    std::vector<AnsArenaChunk> *ans_chunks;
+#endif
 } DeviceContext;
 
 typedef struct {
@@ -59,6 +78,10 @@ static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
 static std::mutex g_group_stats_mu;
+#ifdef COLI_ANS
+static FILE *g_ans_sidecar;
+static int g_ans_sidecar_pack;
+#endif
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -607,6 +630,50 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
+#ifdef COLI_ANS
+static void *ans_arena_alloc(DeviceContext *ctx,size_t bytes){
+    bytes=(bytes+255)&~size_t(255);
+    if(!ctx->ans_chunks)ctx->ans_chunks=new std::vector<AnsArenaChunk>;
+    if(ctx->ans_chunks->empty()||ctx->ans_chunks->back().cap-ctx->ans_chunks->back().used<bytes){
+        size_t cap=256ull<<20;if(cap<bytes)cap=bytes;
+        uint8_t *p=nullptr;if(!cuda_ok(cudaMalloc(&p,cap),"ANS arena chunk"))return nullptr;
+        ctx->ans_chunks->push_back({p,0,cap});
+    }
+    AnsArenaChunk &c=ctx->ans_chunks->back();void *p=c.p+c.used;c.used+=bytes;return p;
+}
+static int prepare_group_weights(DeviceContext *ctx,
+        ColiCudaTensor *const *gates,ColiCudaTensor *const *ups,
+        ColiCudaTensor *const *downs,int count,GroupDesc *host){
+    int n=0; size_t total=0;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *q[3]={gates[c],ups[c],downs[c]};
+        for(int k=0;k<3;k++) if(q[k]->compressed){n++;total+=q[k]->weight_bytes;}
+    }
+    if(!n) return 1;
+    if(!ctx->ans_scratch||!reserve_bytes(&ctx->ans_raw,&ctx->ans_raw_cap,total)) return 0;
+    std::vector<const void*> in; in.reserve(n);
+    std::vector<void*> out; out.reserve(n);
+    std::vector<uint32_t> cap; cap.reserve(n);
+    size_t off=0;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *q[3]={gates[c],ups[c],downs[c]};
+        const void **dst[3]={&host[c].g,&host[c].u,&host[c].d};
+        for(int k=0;k<3;k++) if(q[k]->compressed){
+            void *raw=(uint8_t*)ctx->ans_raw+off;
+            in.push_back(q[k]->weights);out.push_back(raw);cap.push_back((uint32_t)q[k]->weight_bytes);
+            *dst[k]=raw;off+=q[k]->weight_bytes;
+        }
+    }
+    dietgpu::ANSCodecConfig config(11,false);
+    dietgpu::ansDecodeBatchPointer(*ctx->ans_scratch,config,(uint32_t)n,in.data(),out.data(),
+                                   cap.data(),nullptr,nullptr,ctx->stream);
+    return cuda_ok(cudaGetLastError(),"ANS expert decode launch");
+}
+#else
+static int prepare_group_weights(DeviceContext *,ColiCudaTensor *const *,
+        ColiCudaTensor *const *,ColiCudaTensor *const *,int,GroupDesc *){return 1;}
+#endif
+
 /* Publish quant.h's E8 codebook to every configured device. __constant__ memory
  * is per-device, so this walks the contexts; the engine calls it once after init
  * rather than the backend carrying a second copy of the table that could drift
@@ -661,6 +728,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             g_nctx=0;return 0;
         }
+#ifdef COLI_ANS
+        if(std::getenv("CUDA_RAW_EXPERTS")){
+            ctx->ans_scratch = new dietgpu::StackDeviceMemory(device, 1ull << 30);
+            ctx->ans_chunks = new std::vector<AnsArenaChunk>;
+        }
+#endif
         g_nctx++;
         std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                      device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
@@ -685,6 +758,12 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
+#ifdef COLI_ANS
+        if (ctx->ans_raw) cudaFree(ctx->ans_raw);
+        if(ctx->ans_chunks){for(auto &c:*ctx->ans_chunks)cudaFree(c.p);delete ctx->ans_chunks;}
+        delete ctx->ans_scratch;
+        ctx->ans_scratch=nullptr;ctx->ans_chunks=nullptr;ctx->ans_raw=nullptr;ctx->ans_raw_cap=0;
+#endif
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
@@ -696,6 +775,9 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
+#ifdef COLI_ANS
+    if(g_ans_sidecar){std::fclose(g_ans_sidecar);g_ans_sidecar=nullptr;}
+#endif
 }
 
 extern "C" int coli_cuda_device_count(void) { return g_nctx; }
@@ -765,6 +847,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         coli_cuda_tensor_free(t);
         return 0;
     }
+    t->weights_owned=1;
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
@@ -791,10 +874,105 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     return r;
 }
 
+#ifdef COLI_ANS
+struct AnsSidecarHeader {
+    uint32_t magic,raw_bytes,archive_bytes,fmt,I,O;
+};
+static FILE *ans_sidecar(void){
+    if(g_ans_sidecar) return g_ans_sidecar;
+    const char *path=std::getenv("COLI_ANS_SIDECAR");
+    if(!path||!*path) return nullptr;
+    g_ans_sidecar_pack=std::getenv("COLI_ANS_PACK")&&std::atoi(std::getenv("COLI_ANS_PACK"));
+    g_ans_sidecar=std::fopen(path,g_ans_sidecar_pack?"wb":"rb");
+    return g_ans_sidecar;
+}
+extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
+        const void *weights,const float *scales,int fmt,int I,int O,int device){
+    if(fmt!=2 || !tensor || *tensor) return 0;  /* prototype: per-row int4 experts only */
+    FILE *sidecar=ans_sidecar();
+    if(sidecar&&!g_ans_sidecar_pack){
+        AnsSidecarHeader h{};
+        size_t expected=((size_t)I+1)/2*(size_t)O;
+        if(std::fread(&h,sizeof(h),1,sidecar)!=1||h.magic!=0x31534e41u||
+           h.fmt!=(uint32_t)fmt||h.I!=(uint32_t)I||h.O!=(uint32_t)O||
+           expected>UINT32_MAX||h.raw_bytes!=(uint32_t)expected||
+           !h.archive_bytes||h.archive_bytes>dietgpu::getMaxCompressedSize(h.raw_bytes)){
+            std::fprintf(stderr,"[ANS] invalid or mismatched sidecar record\n");
+            return 0;
+        }
+        std::vector<uint8_t> archive(h.archive_bytes);
+        if(std::fread(archive.data(),archive.size(),1,sidecar)!=1){
+            std::fprintf(stderr,"[ANS] truncated sidecar record\n");
+            return 0;
+        }
+        DeviceContext *ctx=find_ctx(device); if(!ctx||!select_ctx(ctx)) return 0;
+        ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t)); if(!t)return 0;
+        t->fmt=fmt;t->I=I;t->O=O;t->device=device;t->weight_bytes=h.raw_bytes;
+        t->scale_count=(size_t)O;t->archive_bytes=h.archive_bytes;t->compressed=1;
+        t->weights=ans_arena_alloc(ctx,h.archive_bytes);
+        if(!t->weights||
+           !cuda_ok(cudaMemcpy(t->weights,archive.data(),h.archive_bytes,cudaMemcpyHostToDevice),
+                    "ANS sidecar upload")||
+           !cuda_ok(cudaMalloc(&t->scales,(size_t)O*sizeof(float)),"ANS sidecar scales")||
+           !cuda_ok(cudaMemcpy(t->scales,scales,(size_t)O*sizeof(float),cudaMemcpyHostToDevice),
+                    "ANS sidecar scale upload")){
+            coli_cuda_tensor_free(t);return 0;
+        }
+        t->tracked=1;ctx->tensor_count++;ctx->tensor_bytes+=h.archive_bytes+(size_t)O*sizeof(float);
+        *tensor=t;return 1;
+    }
+    if(!sidecar||!g_ans_sidecar_pack) return 0;
+    if(!coli_cuda_tensor_upload(tensor,weights,scales,fmt,I,O,device)) return 0;
+    ColiCudaTensor *t=*tensor;
+    DeviceContext *ctx=find_ctx(device);
+    if(!ctx||!ctx->ans_scratch||!select_ctx(ctx)){ coli_cuda_tensor_free(t);*tensor=nullptr;return 0; }
+    uint32_t raw=(uint32_t)t->weight_bytes;
+    uint32_t bound=dietgpu::getMaxCompressedSize(raw), *dsize=nullptr;
+    void *tmp=nullptr;
+    if(!cuda_ok(cudaMalloc(&tmp,bound),"ANS archive allocation")||
+       !cuda_ok(cudaMalloc(&dsize,sizeof(*dsize)),"ANS size allocation")){
+        if(tmp)cudaFree(tmp);if(dsize)cudaFree(dsize);coli_cuda_tensor_free(t);*tensor=nullptr;return 0;
+    }
+    dietgpu::ANSCodecConfig config(11,false);
+    /* tensor_upload converted offset-binary nibbles on the legacy stream.
+     * ctx->stream is explicitly non-blocking, so it does not inherit the
+     * legacy-stream dependency. Finish that one-time conversion before the
+     * encoder reads the bytes. */
+    if(!cuda_ok(cudaStreamSynchronize(0),"ANS source conversion synchronize")){
+        cudaFree(tmp);cudaFree(dsize);coli_cuda_tensor_free(t);*tensor=nullptr;return 0;
+    }
+    dietgpu::ansEncodeBatchStride(*ctx->ans_scratch,config,1,t->weights,raw,raw,nullptr,
+                                  tmp,bound,dsize,ctx->stream);
+    uint32_t used=0;
+    int ok=cuda_ok(cudaMemcpyAsync(&used,dsize,sizeof(used),cudaMemcpyDeviceToHost,ctx->stream),
+                   "ANS size download")&&
+           cuda_ok(cudaStreamSynchronize(ctx->stream),"ANS encode synchronize")&&used>0&&used<raw;
+    cudaFree(dsize);
+    if(!ok){cudaFree(tmp);coli_cuda_tensor_free(t);*tensor=nullptr;return 0;}
+    if(g_ans_sidecar_pack){
+        std::vector<uint8_t> archive(used);
+        AnsSidecarHeader h{0x31534e41u,raw,used,(uint32_t)fmt,(uint32_t)I,(uint32_t)O};
+        ok=cuda_ok(cudaMemcpy(archive.data(),tmp,used,cudaMemcpyDeviceToHost),"ANS sidecar download")&&
+           std::fwrite(&h,sizeof(h),1,sidecar)==1&&
+           std::fwrite(archive.data(),archive.size(),1,sidecar)==1;
+        cudaFree(tmp);coli_cuda_tensor_free(t);*tensor=nullptr;
+        if(!ok)return 0;
+        t=(ColiCudaTensor*)std::calloc(1,sizeof(*t));if(!t)return 0;
+        t->fmt=fmt;t->I=I;t->O=O;t->device=device;t->weight_bytes=raw;
+        t->archive_bytes=used;t->compressed=1;*tensor=t;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
     if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
+#ifdef COLI_ANS
+    if(tensor->compressed) return 0;
+#endif
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
     if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
@@ -804,7 +982,6 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
     /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
      * the fallback below would otherwise copy O floats out of a NULL host pointer. */
     return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
@@ -943,6 +1120,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
@@ -1099,6 +1277,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     }
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
+    if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
@@ -1315,12 +1494,17 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         /* Must mirror the upload's accounting exactly: fmt=6 never charged for a
          * scale buffer, and over-subtracting here trips the >= guard below, which
          * silently leaves the tensor's bytes on the device counter forever. */
-        size_t bytes = tensor->weight_bytes +
+        size_t storage_bytes =
+#ifdef COLI_ANS
+            tensor->compressed ? tensor->archive_bytes :
+#endif
+            tensor->weight_bytes;
+        size_t bytes = storage_bytes +
             ((tensor->fmt && tensor->fmt != 6) ? (size_t)tensor->O * ng * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
-    if (tensor->weights) cudaFree(tensor->weights);
+    if (tensor->weights&&tensor->weights_owned) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
     for(int i=0;i<tensor->ragged_count;i++){
         if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
@@ -1332,7 +1516,12 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
     int ng = tensor->ng > 0 ? tensor->ng : 1;
-    return tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+    size_t storage_bytes =
+#ifdef COLI_ANS
+        tensor->compressed ? tensor->archive_bytes :
+#endif
+        tensor->weight_bytes;
+    return storage_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
@@ -1576,6 +1765,7 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
     }
     if(!all_s4) return 0;                       /* resident path: per-row int4 only */
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
     if(!ctx->ev_done_ok){
         if(!cuda_ok(cudaEventCreateWithFlags(&ctx->ev_done,cudaEventDisableTiming),
                     "resident group event")) return 0;

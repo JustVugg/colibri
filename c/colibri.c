@@ -290,6 +290,7 @@ static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
+static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -309,6 +310,12 @@ static int qt_cuda_upload(QT *t){
         return coli_cuda_tensor_upload_g(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
+#ifdef COLI_ANS
+static int qt_cuda_upload_compressed(QT *t){
+    if(t->fmt!=2) return 0;
+    return coli_cuda_tensor_upload_compressed(&t->cuda,t->q4,t->s,t->fmt,t->I,t->O,t->cuda_device);
+}
+#endif
 static int qt_cuda_update(QT *t){
     const void *weights=t->fmt==0?(const void*)t->qf:
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
@@ -6365,6 +6372,13 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
         prefix_est=(int)(budget/eb)+g_cuda_ndev;
+#ifdef COLI_ANS
+        if(g_cuda_raw_experts>=0){
+            int raw=g_cuda_raw_experts;
+            if((double)raw*eb>budget) raw=(int)(budget/eb);
+            prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
+        }
+#endif
         npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
     }
 #endif
@@ -6406,17 +6420,28 @@ static void pin_load(Model *m, const char *statspath, double gb){
             int li=r[a].l;
             { ESlot *s=&m->pin[li][slot_of[a]];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
+                int compress=0;
+#ifdef COLI_ANS
+                compress=g_cuda_raw_experts>=0&&a>=g_cuda_raw_experts;
+#endif
+                int64_t projected=compress?need*80/100:need;
+                if(m->gpu_expert_bytes+projected>budget) break;
                 int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
                 for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
                     int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=projected &&
                         (best<0||placed_b[i]<placed_b[best])) best=i;
                     if(best<0) break;
                     tried[best]=1;
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                    int uploaded=
+#ifdef COLI_ANS
+                        compress ? (qt_cuda_upload_compressed(&s->g)&&qt_cuda_upload_compressed(&s->u)&&
+                                    qt_cuda_upload_compressed(&s->d)) :
+#endif
+                        (qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d));
+                    if(uploaded){
                         int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -6883,8 +6908,22 @@ int main(int argc, char **argv){
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
     g_cuda_reserve_gb=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):2.0;
+#ifdef COLI_ANS
+    g_cuda_raw_experts=getenv("CUDA_RAW_EXPERTS")?atoi(getenv("CUDA_RAW_EXPERTS")):-1;
+    if(g_cuda_raw_experts>=0&&(!getenv("COLI_ANS_SIDECAR")||!*getenv("COLI_ANS_SIDECAR"))){
+        fprintf(stderr,"COLI_ANS_SIDECAR is required when CUDA_RAW_EXPERTS is set\n");
+        return 1;
+    }
+    if(g_cuda_raw_experts>=0&&g_repin){
+        fprintf(stderr,"REPIN is incompatible with the fixed-order ANS sidecar\n");
+        return 1;
+    }
+#endif
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
+#ifdef COLI_ANS
+    if(g_cuda_raw_experts>=0) g_repin=0;
+#endif
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
@@ -7013,6 +7052,13 @@ int main(int argc, char **argv){
             pin_load(&m,pin,pin_gb&&!strcmp(pin_gb,"all")?-1.0:pin_gb?atof(pin_gb):10.0);   /* PIN_GB=all (#80) */
         }
     }
+#if defined(COLI_CUDA) && defined(COLI_ANS)
+    if(getenv("COLI_ANS_PACK")&&atoi(getenv("COLI_ANS_PACK"))){
+        fprintf(stderr,"[ANS] sidecar packing complete; exiting before inference\n");
+        coli_cuda_shutdown();
+        return 0;
+    }
+#endif
     if(getenv("COUPLE")&&*getenv("COUPLE")){    /* coupling-scored cross-layer prefetch (#176) */
         g_couple_k=getenv("COUPLE_K")?atoi(getenv("COUPLE_K")):8;
         if(g_couple_k<1)g_couple_k=1; if(g_couple_k>32)g_couple_k=32;
