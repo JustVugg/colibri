@@ -2070,7 +2070,19 @@ static void expert_host_release(Model *m, ESlot *s){
      * fixed at the original expert_load site. fslab is plain malloc/falloc
      * on the CPU path, so its free() stays plain (Metal path frees it before
      * re-alloc and never reaches here with an aligned fslab on _WIN32). */
-    if(s->aslab){ s->slab=NULL; s->fslab=NULL; }  /* arena slice (#419): detach, keep caps, never free */
+    if(s->aslab){
+#ifdef __linux__
+        /* The arena owns the virtual address, not the resident pages.  A GPU
+         * slot no longer needs its host copy after the synchronous H2D upload.
+         * Keeping those anonymous pages resident made every live REPIN pass
+         * grow RSS by one swapped batch (~300 MB at 16 experts).  DONTNEED
+         * preserves the reusable slice while returning its pages to Linux;
+         * expert_host_ensure reloads them before the slot can run on CPU. */
+        madvise(s->slab,(size_t)s->slab_cap,MADV_DONTNEED);
+        madvise(s->fslab,(size_t)s->fslab_cap*sizeof(float),MADV_DONTNEED);
+#endif
+        s->slab=NULL; s->fslab=NULL;               /* detach, keep caps/arena ownership */
+    }
     else { compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; }
     QT *q[3]={&s->g,&s->u,&s->d};
     for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
