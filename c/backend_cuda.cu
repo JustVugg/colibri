@@ -450,6 +450,59 @@ __device__ static void unpack_s4(uint8_t v,float *lo,float *hi){
     int a=v&15,b=v>>4; *lo=(float)(a&8?a-16:a); *hi=(float)(b&8?b-16:b);
 }
 
+__device__ static float warp_sum(float v){
+    for(int n=16;n;n>>=1)v+=__shfl_down_sync(0xffffffffu,v,n);
+    return v;
+}
+
+/* Decode-oriented W4 path following WarpDecode's token-centric mapping:
+ * one warp owns one output neuron, so an 8-warp block produces 8 adjacent
+ * outputs without block-wide barriers. The resident row-major W4 layout is
+ * already contiguous for this access pattern; an offline permutation is not
+ * required for this first A/B. */
+__global__ static void grouped_hidden_w4_warp(float *gate,float *up,const float *x,
+                                              const GroupDesc *desc,int I,int D){
+    int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    int o=(int)blockIdx.x*8+warp,s=blockIdx.y,c=blockIdx.z;
+    GroupDesc d=desc[c];if(o>=I||s>=d.rows)return;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*((D+1)/2);
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*((D+1)/2);
+    const float *xs=x+(size_t)(d.offset+s)*D;float ga[8]={},ua[8]={};
+    /* These are the eight logical lanes lane+32*k of the old 256-thread
+     * block. Keeping their stride and reduction order makes the warp mapping
+     * bit-identical to grouped_hidden_w4_dual. */
+    for(int k=0;k<8;k++)for(int b=lane+32*k;b<(D+1)/2;b+=256){float g0,g1,u0,u1;
+        unpack_s4(gr[b],&g0,&g1);unpack_s4(ur[b],&u0,&u1);
+        int i=b*2;ga[k]+=xs[i]*g0;ua[k]+=xs[i]*u0;
+        if(i+1<D){ga[k]+=xs[i+1]*g1;ua[k]+=xs[i+1]*u1;}
+    }
+    for(int k=0;k<4;k++){ga[k]+=ga[k+4];ua[k]+=ua[k+4];}
+    for(int k=0;k<2;k++){ga[k]+=ga[k+2];ua[k]+=ua[k+2];}
+    ga[0]+=ga[1];ua[0]+=ua[1];
+    ga[0]=warp_sum(ga[0]);ua[0]=warp_sum(ua[0]);
+    if(!lane){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=ga[0]*d.gs[o],u=ua[0]*d.us[o];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;
+    }
+}
+
+__global__ static void grouped_down_w4_warp(float *y,const float *x,
+                                            const GroupDesc *desc,int D,int I){
+    int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    int o=(int)blockIdx.x*8+warp,s=blockIdx.y,c=blockIdx.z;
+    GroupDesc d=desc[c];if(o>=D||s>=d.rows)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*((I+1)/2);
+    const float *xs=x+(size_t)(d.offset+s)*I;float sum[8]={};
+    for(int k=0;k<8;k++)for(int b=lane+32*k;b<(I+1)/2;b+=256){float a,z;
+        unpack_s4(row[b],&a,&z);int i=b*2;
+        sum[k]+=xs[i]*a;if(i+1<I)sum[k]+=xs[i+1]*z;
+    }
+    for(int k=0;k<4;k++)sum[k]+=sum[k+4];
+    for(int k=0;k<2;k++)sum[k]+=sum[k+2];
+    sum[0]+=sum[1];sum[0]=warp_sum(sum[0]);
+    if(!lane)y[(size_t)(d.offset+s)*D+o]=sum[0]*d.ds[o];
+}
+
 /* Exact low-row W4A32 path. It consumes each packed weight byte once instead
  * of routing both nibbles through weight_at(), preserving FP32 activations. */
 __global__ static void grouped_hidden_w4(float *y,const float *x,const GroupDesc *desc,
@@ -1309,15 +1362,20 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
             off16+=r;
         }
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        int warp_decode=COLI_GPU_HAS_WARP32&&getenv("COLI_CUDA_WARP_DECODE")&&
+                        atoi(getenv("COLI_CUDA_WARP_DECODE"));
+        dim3 hg((unsigned)(warp_decode?(I+7)/8:I),(unsigned)max_rows,(unsigned)count);
+        dim3 og((unsigned)(warp_decode?(D+7)/8:D),(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
-        if(dual)grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        if(warp_decode)grouped_hidden_w4_warp<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        else if(dual)grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
         else{   /* non-dual path has no fused epilogue: silu stays a kernel here */
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
             silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         }
-        grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        if(warp_decode)grouped_down_w4_warp<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        else grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_q4&&any_g4){
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
          * ride along as the ng=1 special case. silu fused in the dual epilogue. */

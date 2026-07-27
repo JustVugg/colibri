@@ -41,6 +41,10 @@ distributing or on machines with an unsupported iGPU visible to the runtime
   header) because gfx GPUs report `compute_major >= 7` and a runtime check
   alone would select empty kernel bodies under HIP. On AMD, all compute uses
   the portable kernels; rocWMMA matrix-core support is a possible follow-up.
+- `COLI_CUDA_WARP_DECODE=1` — opt-in low-row INT4 decode kernel on NVIDIA.
+  Maps one output neuron to one 32-lane warp and eight adjacent outputs to
+  each block, while preserving the original 256-thread accumulation order.
+  This removes block-wide barriers without changing results bit-for-bit.
 
 ## Validation
 

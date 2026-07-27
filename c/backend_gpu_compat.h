@@ -27,6 +27,7 @@
 #if __has_include(<rocwmma/rocwmma.hpp>)
 #include <rocwmma/rocwmma.hpp>
 #define COLI_GPU_HAS_WMMA        1
+#define COLI_GPU_HAS_WARP32      0
 #define __CUDA_ARCH__            700
 #define __half                  rocwmma::float16_t
 namespace nvcuda { namespace wmma = ::rocwmma; }
@@ -77,6 +78,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #include <cuda_runtime.h>
 #include <mma.h>
 #define COLI_GPU_HAS_WMMA        1
+#define COLI_GPU_HAS_WARP32      1
 #endif
 
 #endif /* COLIBRI_BACKEND_GPU_COMPAT_H */
