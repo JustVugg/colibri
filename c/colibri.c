@@ -2371,6 +2371,32 @@ done:
     free(chost);                              /* gli scratch device restano al contesto */
     return ok;
 }
+
+/* Decode-scale prefix only: upload x once and reuse it for q_a and kv_a. Keep
+ * the stock CPU RMSNorm between q_a and q_b so greedy output stays exact, then
+ * return Q/comp to the stock attention path. */
+static int attn_pipe_prefix(Model *m,Layer *l,const float *x,int S,float *QR,float *Q,float *comp){
+    Cfg *c=&m->c; int D=c->hidden,ql=c->q_lora,kvl=c->kv_lora,R=c->qk_rope;
+    int dev=l->q_a.cuda_device;
+    if(S<1||S>4||dev<0||l->q_b.cuda_device!=dev||l->kv_a.cuda_device!=dev) return 0;
+    size_t xb=(size_t)S*D*4,qrb=(size_t)S*ql*4;
+    size_t qb=(size_t)S*c->n_heads*c->qk_head*4,cb=(size_t)S*(kvl+R)*4;
+    float *xd=coli_cuda_pipe_scratch(dev,0,xb);
+    float *qrd=coli_cuda_pipe_scratch(dev,1,qrb);
+    float *qd=coli_cuda_pipe_scratch(dev,2,qb);
+    float *cd=coli_cuda_pipe_scratch(dev,3,cb);
+    if(!xd||!qrd||!qd||!cd) return 0;
+    if(!coli_cuda_pipe_upload(dev,xd,x,xb)||
+       !coli_cuda_pipe_gemm(l->q_a.cuda,qrd,xd,S)||
+       !coli_cuda_pipe_download(dev,qrd,QR,qrb)) return 0;
+    for(int s=0;s<S;s++) rmsnorm(QR+(int64_t)s*ql,QR+(int64_t)s*ql,l->q_a_ln,ql,c->eps);
+    if(!coli_cuda_pipe_upload(dev,qrd,QR,qrb)||
+       !coli_cuda_pipe_gemm(l->q_b.cuda,qd,qrd,S)||
+       !coli_cuda_pipe_gemm(l->kv_a.cuda,cd,xd,S)||
+       !coli_cuda_pipe_download(dev,qd,Q,qb)||
+       !coli_cuda_pipe_download(dev,cd,comp,cb)) return 0;
+    return 1;
+}
 #endif
 
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
@@ -2429,7 +2455,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * batch-union. matmul_qt_ex(...,0) keeps them on the EXACT int4 kernel: letting S>1 pull
      * them into IDOT is much faster but costs ~12% perplexity (measured). Batching alone is
      * bit-identical to upstream; the kernel switch is not. */
-    int pipe_done=0;
+    int pipe_done=0,prefix_done=0;
 #ifdef COLI_CUDA
     if(g_cuda_pipe&&!kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
        !(m->has_dsa&&pos_base+S>c->index_topk)&&
@@ -2438,8 +2464,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
        qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
        qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o))
         pipe_done=attn_pipe_prefill(m,l,layer,x,0,S,pos_base,out,NULL);
+    if(!pipe_done&&getenv("COLI_CUDA_ATTN_PREFIX")&&atoi(getenv("COLI_CUDA_ATTN_PREFIX"))&&
+       !kvs&&S<=4&&g_cuda_enabled&&
+       (!m->has_dsa||pos_base+S<=c->index_topk)&&
+       l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
+       qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a))
+        prefix_done=attn_pipe_prefix(m,l,x,S,QR,Q,comp);
 #endif
-    if(!pipe_done){
+    if(!pipe_done&&!prefix_done){
         matmul_qt_ex(QR, x, &l->q_a, S, 0);
         for(int s=0;s<S;s++){ float *qr=QR+(int64_t)s*c->q_lora;
             rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b legge il residuo NORMATO */

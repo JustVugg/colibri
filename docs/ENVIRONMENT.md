@@ -98,6 +98,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
 | `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
+| `COLI_CUDA_ATTN_PREFIX` | off | Reuse one uploaded decode activation across `q_a` and `kv_a` while preserving the stock CPU RMSNorm path. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |
