@@ -32,6 +32,7 @@
 #define __half                  rocwmma::float16_t
 namespace nvcuda { namespace wmma = ::rocwmma; }
 #define __syncwarp()            __syncthreads()
+#define __shfl_down_sync(mask, value, delta) __shfl_down(value, delta)
 #else
 #error "rocWMMA headers not found. Install rocwmma-dev (or rocm-hip-runtime-dev) to build with HIP."
 #endif
