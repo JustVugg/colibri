@@ -52,6 +52,11 @@ typedef struct {
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
+    int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
+                          * Han excluded from the letter classes, no '/' tail in the punct rule */
+    int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
+                          * pair whose CONCATENATION has the lowest vocab id — exactly
+                          * tiktoken's byte_pair_encode, no recovered merges to diverge */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -110,7 +115,8 @@ static void tok_load(Tok *T, const char *path){
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
+    if(!vocab){ fprintf(stderr,"tokenizer.json: missing model.vocab\n"); exit(1); }
+    if(!merges||merges->len==0){ T->rankbpe=1; merges=NULL; }
 
     /* id massimo per dimensionare id2str. Gli id vengono da un tokenizer.json di
      * mirror non fidato: un id NEGATIVO indicizzerebbe id2str[id] SOTTO l'allocazione
@@ -144,9 +150,9 @@ static void tok_load(Tok *T, const char *path){
         T->id2str[id]=(char*)k;
     }
     /* merges: "left\0right" -> rank=i */
-    int mc=1; while(mc < merges->len*2) mc<<=1;
+    int mc=1; while(merges && mc < merges->len*2) mc<<=1;
     hm_init(&T->merges, mc);
-    for(int i=0;i<merges->len;i++){
+    if(merges) for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
         if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
            pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
@@ -181,6 +187,7 @@ static void tok_load(Tok *T, const char *path){
             jval *pat=json_get(ps->kids[i],"pattern");
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
         }
     }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
@@ -206,8 +213,13 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
         int best=INT_MAX, bp=-1;
         for(int i=0;i+1<ns;i++){
             int ll=slen[i], rl=slen[i+1];
-            memcpy(kbuf,s+soff[i],ll); kbuf[ll]=0; memcpy(kbuf+ll+1,s+soff[i+1],rl);
-            int rk=hm_get(&T->merges,kbuf,ll+1+rl);
+            int rk;
+            if(T->rankbpe){                                /* tiktoken: rank of the CONCATENATION */
+                rk=hm_get(&T->vocab,s+soff[i],ll+rl);      /* contigui in s */
+            } else {
+                memcpy(kbuf,s+soff[i],ll); kbuf[ll]=0; memcpy(kbuf+ll+1,s+soff[i+1],rl);
+                rk=hm_get(&T->merges,kbuf,ll+1+rl);
+            }
             if(rk>=0 && rk<best){ best=rk; bp=i; }
         }
         if(bp<0) break;
@@ -378,6 +390,113 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
     free(cp); free(off);
 }
 
+/* ---------- pre-tokenizer Kimi (K3 / tiktoken tokenization_kimi.py) ----------
+ * Split regex (fancy-regex, with && class intersection):
+ *   H: [\p{Han}]+
+ *   A: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *   B: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *   C: \p{N}{1,3}   D: ' ?[^\s\p{L}\p{N}]+[\r\n]*'   E: \s*[\r\n]+   F: \s+(?!\S)   G: \s+
+ * Identical to o200k except: Han runs are their own chunks, Han never joins a
+ * letter run (it is \p{Lo}, so it must be masked out of S1/S2), and rule D has
+ * no '/' in its newline tail. A Han codepoint can ONLY match rule H: it is
+ * \p{L}, so it is excluded from the optional prefix, from rule D's
+ * [^\s\p{L}\p{N}]+ and from \p{N} — on Han-free text this family therefore
+ * tokenizes exactly like o200k minus the '/' tail. */
+static int is_han(uint32_t c){
+    /* Script=Han ranges (Unicode 15) */
+    static const uint32_t r[][2]={
+        {0x2E80,0x2E99},{0x2E9B,0x2EF3},{0x2F00,0x2FD5},{0x3005,0x3005},
+        {0x3007,0x3007},{0x3021,0x3029},{0x3038,0x303B},{0x3400,0x4DBF},
+        {0x4E00,0x9FFF},{0xF900,0xFA6D},{0xFA70,0xFAD9},{0x16FE2,0x16FE3},
+        {0x16FF0,0x16FF1},{0x20000,0x2A6DF},{0x2A700,0x2B739},{0x2B740,0x2B81D},
+        {0x2B820,0x2CEA1},{0x2CEB0,0x2EBE0},{0x2EBF0,0x2EE5D},{0x2F800,0x2FA1D},
+        {0x30000,0x3134A},{0x31350,0x323AF}};
+    if(c<0x2E80) return 0;
+    int lo=0, hi=(int)(sizeof(r)/sizeof(r[0]))-1;
+    while(lo<=hi){ int mid=(lo+hi)/2;
+        if(c<r[mid][0]) hi=mid-1; else if(c>r[mid][1]) lo=mid+1; else return 1; }
+    return 0;
+}
+#define KM_S1(c) ((is_U(c)||is_X(c)) && !is_han(c))
+#define KM_S2(c) ((is_X(c)||(is_L(c)&&!is_U(c))) && !is_han(c))
+/* end (cp index) of branch A|B match at i, or -1 — o2_letters with Han-masked classes */
+static int km_letters(const uint32_t *cp, int n, int i){
+    for(int pfx=1; pfx>=0; pfx--){
+        int j0=i;
+        if(pfx){
+            uint32_t c=cp[i];
+            if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
+            j0=i+1;
+        }
+        int m1=j0; while(m1<n && KM_S1(cp[m1])) m1++;
+        for(int s=m1; s>=j0; s--){
+            if(s<n && KM_S2(cp[s])){
+                int k=s+1; while(k<n && KM_S2(cp[k])) k++;
+                return o2_contraction(cp,n,k);
+            }
+        }
+    }
+    for(int pfx=1; pfx>=0; pfx--){
+        int j0=i;
+        if(pfx){
+            uint32_t c=cp[i];
+            if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
+            j0=i+1;
+        }
+        int m1=j0; while(m1<n && KM_S1(cp[m1])) m1++;
+        if(m1>j0){
+            int k=m1; while(k<n && KM_S2(cp[k])) k++;
+            return o2_contraction(cp,n,k);
+        }
+    }
+    return -1;
+}
+
+static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    #define ISNL(c) ((c)=='\r'||(c)=='\n')
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        /* H: [\p{Han}]+ */
+        if(is_han(c)){ int j=i; while(j<n && is_han(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* A|B: letter runs, Han excluded */
+        {
+            int e=km_letters(cp,n,i);
+            if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* C: \p{N}{1,3} */
+        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n]*'  (no '/' tail, unlike o200k) */
+        {
+            int j=i;
+            if(c==' ' && j+1<n && !is_S(cp[j+1]) && !is_L(cp[j+1]) && !is_N(cp[j+1])) j++;
+            if(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])){
+                while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++;
+                while(j<n && ISNL(cp[j])) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        /* E: \s*[\r\n]+  F: \s+(?!\S)  G: \s+ */
+        {
+            int r=i; while(r<n && is_S(cp[r])) r++;
+            if(r>i){ int last=-1; for(int j=i;j<r;j++) if(ISNL(cp[j])) last=j;
+                if(last>=0){ i=last+1; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+                int end = (r<n) ? r-1 : r;
+                if(end<=i) end=i+1;
+                i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        i++;
+        bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    #undef ISNL
+    free(cp); free(off);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -392,8 +511,9 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
-            else         pretok_chunk(T,p,i,chunk_end,out,&no,max);
+            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
+            else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
+            else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;
