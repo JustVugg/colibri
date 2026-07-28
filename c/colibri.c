@@ -1974,6 +1974,31 @@ static int expert_classify(Model *m, int layer, int eid){
     uint32_t age=m->eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
     return age>g_direct_heat_ticks ? DC_COLD : DC_WARM;         /* '>' not '>=': ties lean warm */
 }
+#if defined(_WIN32) && defined(COLI_CUDA)
+/* COLI_DSTORAGE=1: serve the coalesced expert slab read via DirectStorage
+ * instead of pread. Pure transport swap — the bytes land in the same slab the
+ * expert cache already owns; unavailable/failed DS falls back to pread. */
+static _Atomic int g_ds_host_state = -1;          /* -1 unknown, -2 resolving, 0 off, 1 on */
+static _Atomic int64_t g_ds_loads, g_ds_bytes;    /* DS-served slab reads */
+static int ds_host_on(void){
+    int v=atomic_load_explicit(&g_ds_host_state,memory_order_acquire);
+    if(v>=0) return v;
+    /* First thread claims the resolve (misses race in from OMP threads);
+     * losers take pread for this load and see the state on their next miss. */
+    int expect=-1;
+    if(!atomic_compare_exchange_strong_explicit(&g_ds_host_state,&expect,-2,
+                                                memory_order_acq_rel,memory_order_acquire))
+        return atomic_load_explicit(&g_ds_host_state,memory_order_acquire)>0;
+    const char *e=getenv("COLI_DSTORAGE");
+    int want = e && atoi(e);
+    int on = want ? coli_cuda_ds_init() : 0;
+    if(want)
+        fprintf(stderr, on ? "[DS] expert disk loads via DirectStorage\n"
+                           : "[DS] COLI_DSTORAGE=1 but DirectStorage is unavailable - using pread\n");
+    atomic_store_explicit(&g_ds_host_state,on,memory_order_release);
+    return on;
+}
+#endif
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
@@ -2143,7 +2168,26 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     int64_t pos[3]; int done=0, dc_direct=0;
     if(contig){
         int64_t off0=tw[ord[0]]->off;
+#if defined(_WIN32) && defined(COLI_CUDA)
+        /* DirectStorage transport (COLI_DSTORAGE=1, default off): primary
+         * replica only — the dual-SSD mirror keeps its stock pread path. */
+        if(rep==0 && ds_host_on()){
+            const char *dpath=NULL;
+            for(int i=0;i<m->S.nfd;i++) if(m->S.fds[i]==tw[ord[0]]->fd){ dpath=m->S.paths[i]; break; }
+            if(dpath && coli_cuda_ds_read_host(dpath,(unsigned long long)off0,
+                                               (unsigned long long)wtot,s->slab)){
+                pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes;
+                pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
+                atomic_fetch_add_explicit(&g_ds_loads,1,memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_ds_bytes,wtot,memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mir_bytes[0],wtot,memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mir_nread[0],1,memory_order_relaxed);
+            }
+        }
+        int dfd = (!done && g_direct) ? st_direct_fd_rep(&m->S, tw[ord[0]]->fd, rep) : -1;
+#else
         int dfd = g_direct ? st_direct_fd_rep(&m->S, tw[ord[0]]->fd, rep) : -1;
+#endif
         if(dfd>=0){                              /* O_DIRECT: offset/len allineati a 4K */
             int64_t base=off0 & ~4095LL, need=(off0-base)+wtot;
             int64_t len=(need+4095)&~4095LL;
@@ -6254,6 +6298,12 @@ static void profile_print(Model *m, double elapsed){
         edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
+#if defined(_WIN32) && defined(COLI_CUDA)
+    if(atomic_load_explicit(&g_ds_loads,memory_order_relaxed))
+        printf("DS: %lld expert load(s) / %.2f GB served via DirectStorage\n",
+            (long long)atomic_load_explicit(&g_ds_loads,memory_order_relaxed),
+            atomic_load_explicit(&g_ds_bytes,memory_order_relaxed)/1e9);
+#endif
     if(g_prof)printf("P0-EXEC: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | router %.3fs | residual P2P %.3fs / %llu hop | orchestration %.3fs\n",
         m->t_ecpu,m->t_ecpu>0?m->cpu_expert_bytes/1e9/m->t_ecpu:0.0,
         (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,

@@ -79,6 +79,15 @@ typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
+typedef int (*fn_ds_init)(void);
+typedef unsigned long long (*fn_ds_budget)(void);
+typedef void *(*fn_ds_arena_alloc)(unsigned long long bytes);
+typedef void *(*fn_ds_arena_ptr)(unsigned long long off);
+typedef int (*fn_ds_read)(const char *path,unsigned long long off,
+                          unsigned long long size,unsigned long long dst_off);
+typedef int (*fn_ds_read_host)(const char *path,unsigned long long off,
+                               unsigned long long size,void *dst);
+typedef int (*fn_ds_submit_wait)(unsigned timeout_ms);
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
@@ -134,6 +143,13 @@ static struct {
     fn_pipe_alloc pipe_alloc;
     fn_pipe_copy2d pipe_copy2d;
     fn_pipe_download pipe_download;
+    fn_ds_init ds_init;                 /* OPTIONAL: DirectStorage depot transport */
+    fn_ds_budget ds_budget;
+    fn_ds_arena_alloc ds_arena_alloc;
+    fn_ds_arena_ptr ds_arena_ptr;
+    fn_ds_read ds_read;
+    fn_ds_read_host ds_read_host;
+    fn_ds_submit_wait ds_submit_wait;
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
     fn_pipe_peer_copy pipe_peer_copy;
@@ -267,6 +283,13 @@ static int coli_cuda_load(void){
     RESOLVE(tensor_update, fn_tensor_update)
     #undef RESOLVE
 
+    RESOLVE_OPT(ds_init, fn_ds_init)
+    RESOLVE_OPT(ds_budget, fn_ds_budget)
+    RESOLVE_OPT(ds_arena_alloc, fn_ds_arena_alloc)
+    RESOLVE_OPT(ds_arena_ptr, fn_ds_arena_ptr)
+    RESOLVE_OPT(ds_read, fn_ds_read)
+    RESOLVE_OPT(ds_read_host, fn_ds_read_host)
+    RESOLVE_OPT(ds_submit_wait, fn_ds_submit_wait)
     g_cuda.available = 1;
     return 1;
 }
@@ -452,6 +475,37 @@ int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src, int
 int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_download(device, src, dst, bytes);
+}
+
+int coli_cuda_ds_init(void){
+    if(!coli_cuda_load() || !g_cuda.ds_init) return 0;
+    return g_cuda.ds_init();
+}
+unsigned long long coli_cuda_ds_budget(void){
+    if(!g_cuda.available || !g_cuda.ds_budget) return 0;
+    return g_cuda.ds_budget();
+}
+void *coli_cuda_ds_arena_alloc(unsigned long long bytes){
+    if(!g_cuda.available || !g_cuda.ds_arena_alloc) return NULL;
+    return g_cuda.ds_arena_alloc(bytes);
+}
+void *coli_cuda_ds_arena_ptr(unsigned long long off){
+    if(!g_cuda.available || !g_cuda.ds_arena_ptr) return NULL;
+    return g_cuda.ds_arena_ptr(off);
+}
+int coli_cuda_ds_read(const char *path,unsigned long long off,
+                      unsigned long long size,unsigned long long dst_off){
+    if(!g_cuda.available || !g_cuda.ds_read) return 0;
+    return g_cuda.ds_read(path, off, size, dst_off);
+}
+int coli_cuda_ds_read_host(const char *path,unsigned long long off,
+                           unsigned long long size,void *dst){
+    if(!g_cuda.available || !g_cuda.ds_read_host) return 0;
+    return g_cuda.ds_read_host(path, off, size, dst);
+}
+int coli_cuda_ds_submit_wait(unsigned timeout_ms){
+    if(!g_cuda.available || !g_cuda.ds_submit_wait) return 0;
+    return g_cuda.ds_submit_wait(timeout_ms);
 }
 
 void coli_cuda_pipe_free(int device,void *p){

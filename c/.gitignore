@@ -36,3 +36,7 @@ tests/test_pipe_block
 *.bak
 
 coli_cuda*.dll
+
+# DirectStorage redistributables (from the nuget package, not vendored)
+dstorage.dll
+dstoragecore.dll

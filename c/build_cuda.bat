@@ -15,6 +15,10 @@ rem   CUDA_PATH   CUDA toolkit root. Normally set by the CUDA installer.
 rem   CCBIN       Directory containing the cl.exe nvcc should use as host
 rem               compiler. Set this to force a specific toolset.
 rem   ALLOW_UNSUPPORTED  =1 adds -allow-unsupported-compiler.
+rem   DSTORAGE_HOME  Extracted Microsoft.Direct3D.DirectStorage nuget
+rem               (include/ + lib/x64) - adds the disk->VRAM DMA transport.
+rem               Optional: without it the DLL builds and works unchanged
+rem               (the DirectStorage entry points are optional exports).
 rem ---------------------------------------------------------------------------
 setlocal
 
@@ -82,12 +86,30 @@ rem Add -L<cuda>\lib\x64 for cudart only when CUDA_PATH is known.
 set "CUDA_LIB="
 if not "%CUDA_PATH%"=="" set "CUDA_LIB=-L"%CUDA_PATH%\lib\x64""
 
+rem --- DirectStorage (optional): disk->VRAM DMA transport -------------------
+set "DS_SRC="
+set "DS_FLAGS="
+set "DS_NOTE="
+if "%DSTORAGE_HOME%"=="" goto ds_done
+if not exist "%~dp0backend_dstorage.cpp" (
+    echo NOTE: DSTORAGE_HOME is set but this tree has no backend_dstorage.cpp - ignoring.
+    goto ds_done
+)
+if not exist "%DSTORAGE_HOME%\include\dstorage.h" (
+    echo WARNING: DSTORAGE_HOME is set but include\dstorage.h is missing under it - ignoring.>&2
+    goto ds_done
+)
+set "DS_SRC=backend_dstorage.cpp"
+set "DS_FLAGS=-I"%DSTORAGE_HOME%\include" -L"%DSTORAGE_HOME%\lib\x64" -ldstorage -ld3d12 -ldxgi"
+set "DS_NOTE=with DirectStorage "
+:ds_done
+
 rem --- Build ----------------------------------------------------------------
 rem Build in the script's own directory so backend_cuda.cu resolves and the DLL
 rem lands next to colibri.exe.
 pushd "%~dp0"
 
-echo Building coli_cuda.dll for %CUDA_ARCH% ...
+echo Building coli_cuda.dll %DS_NOTE%for %CUDA_ARCH% ...
 rem -Xcompiler=-W3 sets the MSVC host-compiler warning level.
 rem -cudart static links the CUDA runtime INTO the DLL. Without it the DLL
 rem needs cudart64_XX.dll at load time, which on CUDA 13.x lives in bin\x64
@@ -96,7 +118,8 @@ rem back to CPU while looking healthy.
 "%NVCC%" -O3 -std=c++17 -arch=%CUDA_ARCH% -Xcompiler=-W3 -shared ^
     %CCBIN_FLAG% %UNSUPPORTED_FLAG% ^
     -DCOLI_CUDA_BUILDING_DLL %CUDA_LIB% -cudart static ^
-    backend_cuda.cu -o coli_cuda.dll
+    %DS_FLAGS% ^
+    backend_cuda.cu %DS_SRC% -o coli_cuda.dll
 set "RC=%ERRORLEVEL%"
 
 popd

@@ -140,6 +140,21 @@ COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+/* DirectStorage depot transport (Windows-only, OPTIONAL exports): the arena
+ * becomes a shared D3D12 buffer imported into CUDA; ds_read DMA-writes a raw
+ * shard-file region into it at dst_off (no engine RAM transit). Single-thread
+ * producer; ds_submit_wait fences a batch. */
+COLI_CUDA_DLLEXPORT int   coli_cuda_ds_init(void);
+COLI_CUDA_DLLEXPORT unsigned long long coli_cuda_ds_budget(void);
+COLI_CUDA_DLLEXPORT void *coli_cuda_ds_arena_alloc(unsigned long long bytes);
+COLI_CUDA_DLLEXPORT void *coli_cuda_ds_arena_ptr(unsigned long long off);
+COLI_CUDA_DLLEXPORT int   coli_cuda_ds_read(const char *path, unsigned long long off,
+                                            unsigned long long size, unsigned long long dst_off);
+/* Host-destination twin of ds_read: DMA a shard-file region into engine RAM.
+ * Thread-safe (internal lock); returns 1 ok, 0 error (caller falls back to pread). */
+COLI_CUDA_DLLEXPORT int   coli_cuda_ds_read_host(const char *path, unsigned long long off,
+                                                 unsigned long long size, void *dst);
+COLI_CUDA_DLLEXPORT int   coli_cuda_ds_submit_wait(unsigned timeout_ms);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,

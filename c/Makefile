@@ -416,15 +416,35 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the API symbols are exported.
-cuda-dll: backend_cuda.cu backend_cuda.h
+#
+# DIRECTSTORAGE (optional): backend_dstorage.cpp adds the disk->VRAM DMA
+# transport. Needs the DirectStorage SDK (not part of the CUDA/Windows SDK):
+#   nuget install Microsoft.Direct3D.DirectStorage -OutputDirectory deps
+#   make cuda-dll DSTORAGE_HOME=deps/<pkg>/native
+# Without it the DLL builds and works: the entry points are optional exports
+# and the engine falls back to the CPU-staged store fill.
+DSTORAGE_HOME ?=
+ifneq ($(DSTORAGE_HOME),)
+DS_SRC   = backend_dstorage.cpp
+DS_FLAGS = -I"$(DSTORAGE_HOME)/include" -L"$(DSTORAGE_HOME)/lib/x64" -ldstorage -ld3d12 -ldxgi
+DS_NOTE  = with DirectStorage
+else
+DS_SRC   =
+DS_FLAGS =
+DS_NOTE  = WITHOUT DirectStorage (set DSTORAGE_HOME to enable disk->VRAM DMA)
+endif
+
+cuda-dll: backend_cuda.cu backend_cuda.h $(DS_SRC)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@echo "building coli_cuda.dll $(DS_NOTE)"
 	@# -cudart static links the CUDA runtime INTO the DLL: cudart64_XX.dll lives
 	@# in bin\x64 on CUDA 13.x (not on PATH), so a dynamic link made LoadLibrary
 	@# fail silently and every Windows run fell back to CPU while looking healthy.
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -cudart static \
-		backend_cuda.cu -o coli_cuda.dll
+		$(DS_FLAGS) \
+		backend_cuda.cu $(DS_SRC) -o coli_cuda.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
