@@ -24,6 +24,7 @@ from .common import (
     _utc_now,
 )
 from .platform_ops import current_uid, get_platform_ops
+from .accelerator import _managed_accelerator_contract
 
 
 try:
@@ -336,6 +337,7 @@ def _load_manifest(
         or not plan["mounts"]
     ):
         raise RamdiskError("RAM-disk manifest has an invalid model identity")
+    _managed_accelerator_contract(plan)
     mount_root, _ = _manifest_mount_layout(plan)
     planned_paths = {record["path"] for record in plan["mounts"]}
     if len(planned_paths) != len(plan["mounts"]):

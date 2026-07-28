@@ -535,10 +535,12 @@ class TuiPlacementContractTest(unittest.TestCase):
                 return b""
 
         with ModelFixture() as fixture:
+            initial = plan_args(fixture.root)
+            initial.ramdisk_preset = "single"
             hardware = hardware_fixture(nodes=2)
             model = ramdisk.scan_model(str(fixture.root))
             plan = ramdisk.build_plan(
-                plan_args(fixture.root), hardware=hardware, model=model
+                initial, hardware=hardware, model=model
             )
             report = {
                 "present": False,
@@ -555,14 +557,14 @@ class TuiPlacementContractTest(unittest.TestCase):
                 curses, "curs_set"
             ), mock.patch.object(curses, "echo"), mock.patch.object(curses, "noecho"):
                 result = ramdisk._tui(
-                    screen, plan_args(fixture.root), "/fake/coli", "/fake/engine"
+                    screen, initial, "/fake/coli", "/fake/engine"
                 )
 
         self.assertEqual(result, 0)
         self.assertEqual(screen.getstr_call[1], 2)
         self.assertGreaterEqual(screen.getstr_call[2], 34)
 
-    def test_tui_has_no_single_key_path_into_replica_mode(self):
+    def test_tui_has_no_hidden_topology_toggle_after_preset_selection(self):
         class FakeScreen:
             def __init__(self):
                 self.keys = iter((ord("t"), ord("q")))
@@ -587,10 +589,12 @@ class TuiPlacementContractTest(unittest.TestCase):
                 return next(self.keys)
 
         with ModelFixture() as fixture:
+            initial = plan_args(fixture.root)
+            initial.ramdisk_preset = "single"
             hardware = hardware_fixture(nodes=4)
             model = ramdisk.scan_model(str(fixture.root))
             plan = ramdisk.build_plan(
-                plan_args(fixture.root), hardware=hardware, model=model
+                initial, hardware=hardware, model=model
             )
             report = {
                 "present": False,
@@ -612,7 +616,7 @@ class TuiPlacementContractTest(unittest.TestCase):
                 ramdisk, "status", return_value=report
             ):
                 result = ramdisk._tui(
-                    screen, plan_args(fixture.root), "/fake/coli", "/fake/engine"
+                    screen, initial, "/fake/coli", "/fake/engine"
                 )
 
         self.assertEqual(result, 0)

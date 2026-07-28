@@ -292,6 +292,80 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_first_run_preset_choice_populates_and_jumps_to_review(self):
+        snapshot = absent_snapshot()
+        resolved_args = app_args(
+            ramdisk_preset="gpu-fastest",
+            ramdisk_preset_label="Fastest GPU staging",
+            ramdisk_preset_reason="GPU-local fixture.",
+        )
+        resolved_args.managed_accelerator = None
+        resolved_plan = plan_fixture()
+        resolved_plan["preset"] = {
+            "id": "gpu-fastest",
+            "label": "Fastest GPU staging",
+            "state": "selected",
+            "reason": "GPU-local fixture.",
+            "fallback": None,
+        }
+        resolver = mock.Mock(
+            return_value={
+                "args": resolved_args,
+                "plan": resolved_plan,
+            }
+        )
+        app = ramdisk_textual.RamdiskTextualApp(
+            app_args(),
+            lifecycle=ramdisk,
+            initial_snapshot=snapshot,
+            auto_refresh=False,
+            show_preset_prompt=True,
+            privilege_authorizer=lambda app: False,
+        )
+        with mock.patch.object(
+            ramdisk,
+            "discover_hardware",
+            return_value=snapshot.hardware,
+        ), mock.patch.object(
+            ramdisk,
+            "scan_model",
+            return_value=mock.sentinel.model,
+        ), mock.patch.object(
+            ramdisk,
+            "resolve_preset",
+            resolver,
+        ):
+            async with app.run_test(size=(100, 32)) as pilot:
+                await pilot.pause()
+                self.assertIsInstance(app.screen, ramdisk_textual.PresetScreen)
+                await pilot.press("enter")
+                await pilot.pause()
+
+        resolver.assert_called_once()
+        self.assertEqual(
+            resolver.call_args.args[0],
+            ramdisk.PRESET_GPU_FASTEST,
+        )
+        self.assertEqual(app.current_step, 4)
+        self.assertEqual(app.args.ramdisk_preset, "gpu-fastest")
+        self.assertEqual(app.snapshot.plan["preset"]["state"], "selected")
+
+    async def test_existing_manifest_skips_first_run_preset_choice(self):
+        app = ramdisk_textual.RamdiskTextualApp(
+            app_args(),
+            lifecycle=ramdisk,
+            initial_snapshot=active_snapshot(),
+            auto_refresh=False,
+            show_preset_prompt=True,
+            privilege_authorizer=lambda app: False,
+        )
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            self.assertNotIsInstance(
+                app.screen,
+                ramdisk_textual.PresetScreen,
+            )
+
     async def test_numbered_wizard_keeps_shared_contract_visible(self):
         app = self.make_app(absent_snapshot())
         async with app.run_test(size=(100, 32)) as pilot:

@@ -261,25 +261,51 @@ def _assert_effective_masks_unchanged(
     """Refuse launch after the reviewed cgroup/cpuset contract drifts."""
     hardware = plan.get("hardware", {})
     placement = plan.get("placement")
-    if (
-        not placement
-        or hardware.get("effective_mask_source")
-        != "kernel-task-status"
-    ):
+    accelerator = plan.get("managed_accelerator") or {}
+    check_masks = bool(
+        placement
+        and hardware.get("effective_mask_source")
+        == "kernel-task-status"
+    )
+    check_gpus = accelerator.get("mode") == "cuda"
+    if not check_masks and not check_gpus:
         return
     if discover_hardware is None:
         raise RamdiskError("hardware discovery is unavailable")
     current = discover_hardware()
-    expected_nodes = list(placement.get("effective_nodes", []))
-    expected_cpus = list(placement.get("effective_cpus", []))
-    if (
-        list(current.get("effective_nodes", [])) != expected_nodes
-        or list(current.get("effective_cpus", [])) != expected_cpus
-    ):
-        raise RamdiskError(
-            "effective CPU/NUMA mask changed since preparation; "
-            "destroy and review a fresh plan"
-        )
+    if check_masks:
+        expected_nodes = list(placement.get("effective_nodes", []))
+        expected_cpus = list(placement.get("effective_cpus", []))
+        if (
+            list(current.get("effective_nodes", [])) != expected_nodes
+            or list(current.get("effective_cpus", [])) != expected_cpus
+        ):
+            raise RamdiskError(
+                "effective CPU/NUMA mask changed since preparation; "
+                "destroy and review a fresh plan"
+            )
+    if check_gpus:
+        observed = {
+            int(device["index"]): device
+            for device in current.get("gpus", [])
+            if isinstance(device, dict)
+            and isinstance(device.get("index"), int)
+            and not isinstance(device.get("index"), bool)
+        }
+        effective_nodes = set(current.get("effective_nodes") or [])
+        for expected in accelerator.get("devices") or []:
+            index = expected.get("index")
+            device = observed.get(index)
+            if (
+                device is None
+                or device.get("pci_bus_id") != expected.get("pci_bus_id")
+                or device.get("numa_node") != expected.get("numa_node")
+                or device.get("numa_node") not in effective_nodes
+            ):
+                raise RamdiskError(
+                    "managed GPU/NUMA identity changed since preparation; "
+                    "destroy and review a fresh plan"
+                )
 
 
 def _group_alive(pgid):

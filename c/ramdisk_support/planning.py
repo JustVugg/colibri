@@ -406,6 +406,107 @@ def _managed_numa_enabled(plan, node=None):
     return bool(nodes)
 
 
+def _normalize_managed_accelerator(args, hardware, placement):
+    """Normalize an internal preset accelerator draft into a plan contract."""
+    raw = getattr(args, "managed_accelerator", None)
+    if raw is None:
+        return {
+            "mode": "cpu",
+            "devices": [],
+            "mmap": False,
+            "rammap": True,
+            "async_copy": False,
+            "vram_budget": None,
+            "capability": "not-requested",
+        }
+    if not isinstance(raw, dict) or raw.get("mode") != "cuda":
+        raise RamdiskError("managed accelerator draft is malformed")
+    devices = raw.get("devices")
+    if not isinstance(devices, list) or not devices:
+        raise RamdiskError("managed CUDA staging requires at least one GPU")
+    discovered = {
+        int(device["index"]): device
+        for device in hardware.get("gpus", [])
+        if isinstance(device, dict)
+        and isinstance(device.get("index"), int)
+        and not isinstance(device.get("index"), bool)
+    }
+    selected_nodes = set(placement["memory_nodes"])
+    normalized = []
+    seen = set()
+    for device in devices:
+        if not isinstance(device, dict):
+            raise RamdiskError("managed accelerator device record is malformed")
+        index = device.get("index")
+        node = device.get("numa_node")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index in seen
+        ):
+            raise RamdiskError("managed accelerator GPU indices are invalid")
+        if index not in discovered:
+            raise RamdiskError(
+                "managed accelerator GPU %d is absent from hardware discovery"
+                % index
+            )
+        observed = discovered[index]
+        if (
+            not isinstance(node, int)
+            or isinstance(node, bool)
+            or node not in selected_nodes
+            or observed.get("numa_node") != node
+        ):
+            raise RamdiskError(
+                "managed accelerator GPU %d is outside the reviewed NUMA placement"
+                % index
+            )
+        pci_bus_id = str(device.get("pci_bus_id") or "")
+        if pci_bus_id != str(observed.get("pci_bus_id") or ""):
+            raise RamdiskError(
+                "managed accelerator GPU %d PCI identity changed" % index
+            )
+        seen.add(index)
+        normalized.append(
+            {
+                "index": index,
+                "name": str(observed.get("name") or device.get("name") or ""),
+                "pci_bus_id": pci_bus_id,
+                "numa_node": node,
+            }
+        )
+    if raw.get("vram_budget") != "auto":
+        raise RamdiskError("managed CUDA VRAM budget must be auto")
+    if raw.get("mmap") is not True or raw.get("rammap") is not False:
+        raise RamdiskError(
+            "managed CUDA staging requires mmap and disables direct RAM-map"
+        )
+    return {
+        "mode": "cuda",
+        "devices": normalized,
+        "mmap": True,
+        "rammap": False,
+        "async_copy": bool(raw.get("async_copy", True)),
+        "vram_budget": "auto",
+        "capability": str(raw.get("capability") or "unverified"),
+    }
+
+
+def _preset_metadata(args):
+    preset_id = getattr(args, "ramdisk_preset", None)
+    if not preset_id:
+        return None
+    label = getattr(args, "ramdisk_preset_label", None) or str(preset_id)
+    return {
+        "id": str(preset_id),
+        "label": str(label),
+        "state": "custom" if preset_id == "custom" else "selected",
+        "reason": str(getattr(args, "ramdisk_preset_reason", "") or ""),
+        "fallback": getattr(args, "ramdisk_preset_fallback", None),
+    }
+
+
 def build_plan(
     args,
     hardware=None,
@@ -434,6 +535,11 @@ def build_plan(
     if mode not in ("full", "partial") or topology not in ("interleaved", "per-node"):
         raise RamdiskError("invalid RAM-disk mode or topology")
     placement = build_placement(args, hardware, topology)
+    managed_accelerator = _normalize_managed_accelerator(
+        args,
+        hardware,
+        placement,
+    )
     if capacity_gb is not None and (
         isinstance(capacity_gb, bool)
         or not isinstance(capacity_gb, (int, float))
@@ -533,6 +639,14 @@ def build_plan(
     required_global = staged_bytes + runtime_bytes + page_tables + global_margin
     blockers = []
     warnings = []
+    if (
+        managed_accelerator["mode"] == "cuda"
+        and managed_accelerator["capability"] != "available"
+    ):
+        warnings.append(
+            "CUDA engine capability was not proven during planning; "
+            "managed start will fail closed if the backend is unavailable"
+        )
     if cgroup_memory.get("error"):
         blockers.append(
             "cannot validate cgroup memory headroom: %s"
@@ -886,6 +1000,8 @@ def build_plan(
             "autopin": 0,
             "cap_raise": 0,
         },
+        "managed_accelerator": managed_accelerator,
+        "preset": _preset_metadata(args),
         "blockers": sorted(set(blockers)),
         "warnings": warnings,
         "durable_state": durable_state,

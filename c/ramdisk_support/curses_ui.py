@@ -91,6 +91,7 @@ def _tui(
     _tui_help_rows = bindings._tui_help_rows
     _tui_idle_action_hint = bindings._tui_idle_action_hint
     _tui_plan_rows = bindings._tui_plan_rows
+    _tui_preset_rows = bindings._tui_preset_rows
     _tui_settings_rows = bindings._tui_settings_rows
     _validate_noninteractive_sudo = bindings._validate_noninteractive_sudo
     benchmark = bindings.benchmark
@@ -98,7 +99,9 @@ def _tui(
     current_euid = bindings.current_euid
     destroy = bindings.destroy
     discover_hardware = bindings.discover_hardware
+    mark_preset_custom = bindings.mark_preset_custom
     prepare = bindings.prepare
+    resolve_preset = bindings.resolve_preset
     scan_model = bindings.scan_model
     start = bindings.start
     status = bindings.status
@@ -118,6 +121,8 @@ def _tui(
         ("parallel", 2),
         ("ctx", 0),
         ("base_port", 8000),
+        ("memory_nodes", None),
+        ("cpu_list", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, value)
@@ -185,6 +190,10 @@ def _tui(
     quit_when_idle = False
     quit_exit_code = 0
     operation_lock = threading.Lock()
+    preset_prompt_pending = not bool(
+        getattr(args, "ramdisk_preset", None)
+    )
+    preset_prompt_suppressed = False
 
     def safe_add(row, column, value, limit, attribute=0):
         height, width = stdscr.getmaxyx()
@@ -466,6 +475,7 @@ def _tui(
                     return quit_exit_code
 
         plan = report = hardware = None
+        preset_selecting = False
         rows = []
         try:
             if (
@@ -484,6 +494,7 @@ def _tui(
             report = report_cache
             active = bool(report.get("present"))
             if active:
+                preset_prompt_suppressed = True
                 if active_manifest_cache is None:
                     active_manifest_cache = _load_manifest(required=True)
                 plan = active_manifest_cache["plan"]
@@ -509,34 +520,43 @@ def _tui(
                     )
             else:
                 active_deployment_identity = None
-                if model_cache is None:
-                    model_cache = scan_model(args.model)
-                plan_key = (
-                    args.mode,
-                    args.topology,
-                    args.mount_root,
-                    args.capacity_gb,
-                    args.profile,
-                    args.allow_swappable,
-                    args.thp,
-                    args.prefault,
-                    args.parallel,
-                    args.ctx,
-                    hardware_checked,
+                preset_selecting = bool(
+                    preset_prompt_pending
+                    and not preset_prompt_suppressed
                 )
-                if (
-                    plan_cache is None
-                    or plan_key != plan_key_cache
-                ):
-                    plan_cache = build_plan(
-                        args,
-                        hardware=hardware,
-                        model=model_cache,
+                if not preset_selecting:
+                    if model_cache is None:
+                        model_cache = scan_model(args.model)
+                    plan_key = (
+                        args.mode,
+                        args.topology,
+                        args.mount_root,
+                        args.capacity_gb,
+                        args.profile,
+                        args.allow_swappable,
+                        args.thp,
+                        args.prefault,
+                        args.parallel,
+                        args.ctx,
+                        args.memory_nodes,
+                        args.cpu_list,
+                        repr(getattr(args, "managed_accelerator", None)),
+                        getattr(args, "ramdisk_preset", None),
+                        hardware_checked,
                     )
-                    plan_key_cache = plan_key
-                plan = plan_cache
+                    if (
+                        plan_cache is None
+                        or plan_key != plan_key_cache
+                    ):
+                        plan_cache = build_plan(
+                            args,
+                            hardware=hardware,
+                            model=model_cache,
+                        )
+                        plan_key_cache = plan_key
+                    plan = plan_cache
 
-            if pending_action == "prepare":
+            if pending_action == "prepare" and plan is not None:
                 current_token = _plan_confirmation_token(plan)
                 current_review = ReviewIdentity.for_prepare(
                     current_token,
@@ -554,7 +574,9 @@ def _tui(
                 if pending_action == "prepare"
                 else None
             )
-            if help_open:
+            if preset_selecting:
+                rows = _tui_preset_rows()
+            elif help_open:
                 rows = _tui_help_rows()
             elif screen == 0:
                 rows = _tui_plan_rows(
@@ -744,6 +766,8 @@ def _tui(
             )
         elif help_open:
             action_hint = "[?] close help"
+        elif preset_selecting:
+            action_hint = "[Enter] default · [1-4] choose"
         else:
             action_hint = _tui_idle_action_hint(
                 screen,
@@ -802,6 +826,48 @@ def _tui(
                 "Cancellation requested; waiting for "
                 "rollback/cleanup checkpoints."
             )
+            continue
+        if preset_selecting:
+            choices = tuple(
+                preset_id
+                for preset_id, _label, _description
+                in bindings.PRESET_CHOICES
+            )
+            if key in (10, 13, curses.KEY_ENTER):
+                preset_id = choices[0]
+            elif ord("1") <= key <= ord("4"):
+                preset_id = choices[key - ord("1")]
+            else:
+                message = (
+                    "Choose 1-4, or press Enter for Fastest GPU staging."
+                )
+                continue
+            try:
+                if model_cache is None:
+                    model_cache = scan_model(args.model)
+                result = resolve_preset(
+                    preset_id,
+                    args,
+                    hardware=hardware,
+                    model=model_cache,
+                    cli_path=cli_path,
+                    engine_path=engine_path,
+                )
+                vars(args).clear()
+                vars(args).update(vars(result["args"]))
+                plan_cache = result["plan"]
+                plan_key_cache = None
+                preset_prompt_pending = False
+                scroll = 0
+                message = (
+                    "%s populated the draft; review the exact plan."
+                    % result["plan"].get("preset", {}).get(
+                        "label",
+                        "Preset",
+                    )
+                )
+            except (OSError, ValueError, RamdiskError) as exc:
+                message = "Preset could not be resolved: %s" % exc
             continue
         if key == ord("?"):
             if pending_action == "prepare":
@@ -1219,6 +1285,8 @@ def _tui(
         except (TypeError, ValueError) as exc:
             message = "Invalid setting: %s" % exc
         if changed:
+            if key != ord("P"):
+                mark_preset_custom(args)
             cancel_confirmation()
             plan_cache = plan_key_cache = None
             scroll = 0

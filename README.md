@@ -399,6 +399,11 @@ one-time converter, optional API gateway, and RAM-disk control plane.
 
 `coli ramdisk` opens a guided server console that makes the copy count, selected
 NUMA memory nodes, whole-core CPU mask, and endpoints explicit before staging.
+For a new workspace its default Fastest GPU staging preset discovers GPU-local
+NUMA nodes, keeps one shared model copy and engine, and reviews CUDA mmap with
+asynchronous RAM-to-VRAM copies and automatic VRAM sizing. Single-copy, minimal
+profile-guided, and explicit per-node replica presets are also available;
+automatic placement never selects replicas.
 It can stage the full model or profile-selected shard closures into THP-enabled
 tmpfs, launch one shared engine or explicitly requested node replicas, and
 benchmark persistent SSD/slab/direct-map paths. It keeps KV and usage state on

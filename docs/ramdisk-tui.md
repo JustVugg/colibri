@@ -73,6 +73,30 @@ silently hidden.
 
 ## The placement contract
 
+When no prepared workspace exists, both terminal interfaces begin with one
+preset question:
+
+- **Fastest GPU staging** (default) discovers NVIDIA GPUs, keeps one shared
+  model copy and one engine, and selects only the effective NUMA nodes local to
+  those GPUs. It first attempts full staging, then uses a compatible usage
+  profile to fit a partial plan. The reviewed engine contract uses CUDA mmap,
+  asynchronous RAM-to-VRAM copies, and automatic VRAM sizing.
+- **Single copy RAM** keeps one shared copy and engine using the ordinary
+  effective NUMA placement.
+- **Minimal** requests a profile-guided partial plan sized to the largest
+  safely admitted shard closure. Without a compatible usage profile it
+  produces a blocked review with instructions instead of silently choosing
+  another layout.
+- **Multiple copies RAM** explicitly selects one complete copy and independent
+  engine per chosen node.
+
+If GPU discovery, PCI-to-NUMA locality, or the CUDA engine capability cannot be
+used safely, Fastest GPU staging falls back visibly to the single-copy plan. It
+never chooses replicas. A prepared workspace skips the preset question and
+opens with its persisted placement. Selecting a preset jumps directly to
+Review; the advanced steps remain editable, and an edit marks the preset as
+Custom.
+
 The rail at the top of the Textual interface summarizes the consequences of
 the current plan:
 
@@ -86,10 +110,16 @@ does not multiply the model.
 
 `per-node` topology means one complete staged copy and one independent engine
 per selected node. It is replication, not model sharding, so the TUI marks it
-as a danger state and shows the multiplied RAM and endpoint count. The TUI
-cannot enable replication: it must be requested explicitly at launch with
-`--topology per-node`. The interface can switch such a draft back to shared
-placement.
+as a danger state and shows the multiplied RAM and endpoint count. It is
+available only through the explicit Multiple copies RAM startup choice or the
+`--topology per-node` CLI option; automatic placement never enables it. The
+interface can switch such a draft back to shared placement.
+
+Multiple tmpfs mounts are independent filesystems, not a RAID stripe. The GPU
+preset therefore uses one shared interleaved source over the GPU-local nodes
+instead of striping mounts. With GPUs attached to different NUMA domains, a
+single shared tensor can still have pages remote from one GPU; exact per-GPU
+tensor placement requires engine-level placement rather than extra ramdisks.
 
 Memory and CPU selections use Linux range-list syntax. The planner validates
 memory nodes against the effective NUMA mask and CPU selections as complete

@@ -5,7 +5,8 @@ from __future__ import print_function
 import hashlib
 import json
 
-from .common import GIB
+from .common import GIB, _format_range_list
+from .presets import PRESET_CHOICES
 from ramdisk_ui import (
     ActionPolicy,
     DeploymentHealth,
@@ -104,6 +105,17 @@ def _placement_summary(plan, base_port=8000):
 def _human_plan(plan):
     placement = _placement_summary(plan)
     print("RAM-disk plan: %s" % placement["title"])
+    preset = plan.get("preset") or {}
+    if preset:
+        print(
+            "  preset: %s%s"
+            % (
+                preset.get("label", preset.get("id", "Custom")),
+                " (Custom)" if preset.get("state") == "custom" else "",
+            )
+        )
+        if preset.get("reason"):
+            print("  preset decision: %s" % preset["reason"])
     print("  model: %s" % plan["model"]["path"])
     print("  placement: %s" % placement["cost"])
     print("  endpoints after start: %s" % placement["endpoints"])
@@ -129,6 +141,30 @@ def _human_plan(plan):
             plan["staging"]["direct_mapped_expert_count"],
         )
     )
+    accelerator = plan.get("managed_accelerator") or {}
+    if accelerator.get("mode") == "cuda":
+        print(
+            "  accelerator: CUDA GPU(s) %s; GPU-local NUMA %s; "
+            "mmap upload; VRAM budget auto"
+            % (
+                ", ".join(
+                    "%s (%s)"
+                    % (
+                        device["index"],
+                        device.get("name") or "unnamed",
+                    )
+                    for device in accelerator.get("devices", [])
+                ),
+                _format_range_list(
+                    sorted(
+                        {
+                            int(device["numa_node"])
+                            for device in accelerator.get("devices", [])
+                        }
+                    )
+                ),
+            )
+        )
     print(
         "  total staged + OS/runtime projection: %.2f GiB; "
         "available: %.2f GiB"
@@ -325,6 +361,8 @@ def _plan_confirmation_token(plan):
         "prefault": plan.get("prefault"),
         "parallel": plan.get("parallel"),
         "managed_runtime": plan.get("managed_runtime"),
+        "managed_accelerator": plan.get("managed_accelerator"),
+        "preset": plan.get("preset"),
     }
     payload = json.dumps(
         reviewed,
@@ -519,6 +557,29 @@ def _tui_plan_rows(
                 placement["explanation"],
             ),
             ("normal", ""),
+            *(
+                [
+                    (
+                        "accent",
+                        "PRESET · %s%s"
+                        % (
+                            plan["preset"].get("label", "Custom"),
+                            (
+                                " · CUSTOM"
+                                if plan["preset"].get("state") == "custom"
+                                else ""
+                            ),
+                        ),
+                    ),
+                    (
+                        "dim",
+                        plan["preset"].get("reason") or "Reviewed draft values.",
+                    ),
+                    ("normal", ""),
+                ]
+                if plan.get("preset")
+                else []
+            ),
             (
                 "heading",
                 "STAGING · %s"
@@ -552,6 +613,43 @@ def _tui_plan_rows(
             ),
         ]
     )
+    accelerator = plan.get("managed_accelerator") or {}
+    if accelerator.get("mode") == "cuda":
+        devices = accelerator.get("devices", [])
+        rows.extend(
+            [
+                (
+                    "heading",
+                    "GPU STAGING · one shared source, one multi-GPU engine",
+                ),
+                (
+                    "accent",
+                    "GPU(s) %s · PCI/NUMA %s"
+                    % (
+                        " · ".join(
+                            "%s %s"
+                            % (
+                                device["index"],
+                                device.get("name") or "unnamed",
+                            )
+                            for device in devices
+                        ),
+                        " · ".join(
+                            "%s → N%s"
+                            % (
+                                device.get("pci_bus_id", "?"),
+                                device.get("numa_node", "?"),
+                            )
+                            for device in devices
+                        ),
+                    ),
+                ),
+                (
+                    "normal",
+                    "COLI_MMAP upload · async CUDA copies · automatic VRAM tier",
+                ),
+            ]
+        )
     if plan["mode"] == "partial":
         rows.append(
             (
@@ -929,6 +1027,21 @@ def _tui_settings_rows(
     base_port=8000,
 ):
     rows = [("heading", "WORKSPACE SETTINGS")]
+    preset = plan.get("preset") or {}
+    if preset:
+        rows.extend(
+            [
+                (
+                    "accent" if preset.get("state") != "custom" else "warn",
+                    "Preset · %s%s"
+                    % (
+                        preset.get("label", preset.get("id", "Custom")),
+                        " · Custom" if preset.get("state") == "custom" else "",
+                    ),
+                ),
+                ("dim", preset.get("reason") or "Advanced draft values."),
+            ]
+        )
     if report.get("present"):
         placement = _placement_summary(plan, base_port)
         can_change_port = report.get("state") in (
@@ -979,8 +1092,8 @@ def _tui_settings_rows(
         rows.append(
             (
                 "dim",
-                "Replica mode is deliberately CLI-only: pass "
-                "--topology per-node after reviewing its explicit help.",
+                "Replica mode is explicit-only: choose Multiple NUMA "
+                "replicas at startup or pass --topology per-node.",
             )
         )
     rows.extend(
@@ -1037,6 +1150,43 @@ def _tui_settings_rows(
                 "dim",
                 "Full mode always stages the full model; capacity "
                 "changes only apply to partial mode.",
+            ),
+        ]
+    )
+    return rows
+
+
+def _tui_preset_rows():
+    rows = [
+        ("heading", "WHAT SHOULD COLIBRI OPTIMIZE?"),
+        (
+            "dim",
+            "Choose once to prepopulate the draft. Nothing is mounted or copied.",
+        ),
+        ("normal", ""),
+    ]
+    for index, (_preset_id, label, description) in enumerate(
+        PRESET_CHOICES,
+        1,
+    ):
+        rows.append(
+            (
+                "accent" if index == 1 else "normal",
+                "[%d] %s%s"
+                % (
+                    index,
+                    label,
+                    " · default" if index == 1 else "",
+                ),
+            )
+        )
+        rows.append(("dim", "    %s" % description))
+    rows.extend(
+        [
+            ("normal", ""),
+            (
+                "dim",
+                "Enter selects Fastest GPU staging. Advanced settings remain editable.",
             ),
         ]
     )

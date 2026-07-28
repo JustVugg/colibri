@@ -220,7 +220,14 @@ def _benchmark_environment(
     memory_node_list,
     managed_numa_enabled,
     normalized_runtime_knobs,
+    apply_managed_accelerator_environment=None,
 ):
+    if apply_managed_accelerator_environment is None:
+        from .accelerator import _apply_managed_accelerator_environment
+
+        apply_managed_accelerator_environment = (
+            _apply_managed_accelerator_environment
+        )
     plan = manifest["plan"]
     runtime = plan.get("managed_runtime", {})
     environment = environ.copy()
@@ -251,10 +258,6 @@ def _benchmark_environment(
         {
             "COLI_WEIGHTS_DIR": weights_dir,
             "COLI_STATE_DIR": state_dir,
-            "COLI_RAMMAP": "1" if rammap else "0",
-            "COLI_RAM_PREFAULT": str(
-                plan["prefault"] if rammap else 0
-            ),
             "COLI_NUMA": (
                 "1"
                 if managed_numa_enabled(plan, node)
@@ -292,6 +295,18 @@ def _benchmark_environment(
             "COLI_KV_SLOTS": "1",
             "PROF": "1",
         }
+    )
+    applied_accelerator = apply_managed_accelerator_environment(
+        environment,
+        plan,
+    )
+    if applied_accelerator.get("COLI_CUDA") == "0":
+        environment["COLI_MMAP"] = "0"
+        environment["COLI_RAMMAP"] = "1" if rammap else "0"
+    environment["COLI_RAM_PREFAULT"] = str(
+        plan["prefault"]
+        if environment.get("COLI_RAMMAP") == "1"
+        else 0
     )
     for key, value in normalized_runtime_knobs(
         plan,

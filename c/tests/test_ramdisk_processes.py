@@ -133,6 +133,131 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual([record["port"] for record in result["processes"]], [8100, 8101])
         self.assertEqual(result["base_port"], 8100)
 
+    def test_gpu_plan_launch_applies_reviewed_devices_and_mmap_path(self):
+        captures = []
+        nonce = "d" * 48
+
+        class FakeSocket:
+            def bind(self, address):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            pid = 4200
+
+            def poll(self):
+                return None
+
+        def popen(command, **kwargs):
+            captures.append(dict(kwargs["env"]))
+            return FakeProcess()
+
+        identity = {
+            "pid": 4200,
+            "pgid": 4200,
+            "uid": host_uid(),
+            "starttime": 14200,
+            "nonce": nonce,
+        }
+        with ModelFixture() as fixture, canonical_temporary_directory() as state:
+            hardware = hardware_fixture()
+            hardware["gpus"] = [
+                {
+                    "index": 2,
+                    "name": "GPU 2",
+                    "pci_bus_id": "0000:41:00.0",
+                    "numa_node": 0,
+                    "locality": "resolved",
+                    "total_bytes": 32 * ramdisk.GIB,
+                    "free_bytes": 28 * ramdisk.GIB,
+                }
+            ]
+            model = ramdisk.scan_model(str(fixture.root))
+            result = ramdisk._resolve_preset(
+                ramdisk.PRESET_GPU_FASTEST,
+                plan_args(fixture.root),
+                hardware=hardware,
+                model=model,
+                build_plan=ramdisk.build_plan,
+                load_profile=ramdisk._load_profile,
+                cuda_capable=True,
+            )
+            plan = result["plan"]
+            manifest = {
+                "state": "ready",
+                "base_port": 8000,
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(plan["mounts"][0])],
+                "processes": [],
+            }
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "XDG_STATE_HOME": state,
+                    "COLI_GPUS": "7,8",
+                    "CUDA_EXPERT_GB": "4",
+                    "COLI_RAMMAP": "1",
+                },
+            ), mock.patch.object(
+                ramdisk, "_filesystem_for_path", return_value="ext4"
+            ), mock.patch.object(
+                ramdisk, "_load_manifest", return_value=manifest
+            ), mock.patch.object(
+                ramdisk, "_assert_effective_masks_unchanged"
+            ), mock.patch.object(
+                ramdisk, "_assert_ready_mounts"
+            ), mock.patch.object(
+                ramdisk, "_save_manifest"
+            ), mock.patch.object(
+                ramdisk, "_admit_concurrent_runtimes"
+            ), mock.patch.object(
+                ramdisk, "_recover_delta"
+            ), mock.patch.object(
+                ramdisk, "_usage_read", return_value={}
+            ), mock.patch.object(
+                ramdisk, "_usage_write"
+            ), mock.patch.object(
+                ramdisk.socket,
+                "socket",
+                side_effect=lambda *args, **kwargs: FakeSocket(),
+            ), mock.patch.object(
+                ramdisk.subprocess,
+                "Popen",
+                side_effect=popen,
+            ), mock.patch.object(
+                ramdisk,
+                "_proc_identity",
+                return_value=identity,
+            ), mock.patch.object(
+                ramdisk, "_wait_managed_ready"
+            ), mock.patch.object(
+                ramdisk.secrets, "token_hex", return_value=nonce
+            ):
+                launched = ramdisk.start.__wrapped__(
+                    argparse.Namespace(base_port=None),
+                    cli_path=sys.executable,
+                )
+        self.addCleanup(ramdisk._forget_managed_child, 4200)
+
+        self.assertEqual(launched["state"], "running")
+        self.assertEqual(len(captures), 1)
+        environment = captures[0]
+        self.assertEqual(environment["COLI_CUDA"], "1")
+        self.assertEqual(environment["COLI_GPU"], "2")
+        self.assertNotIn("COLI_GPUS", environment)
+        self.assertEqual(environment["CUDA_EXPERT_GB"], "auto")
+        self.assertEqual(environment["COLI_MMAP"], "1")
+        self.assertEqual(environment["COLI_RAMMAP"], "0")
+        self.assertEqual(environment["COLI_RAM_PREFAULT"], "0")
+        self.assertEqual(environment["PIN"], "auto")
+        self.assertEqual(
+            launched["processes"][0]["accelerator_environment"]["COLI_GPU"],
+            "2",
+        )
+
     def test_clean_start_cancellation_restores_retryable_manifest(self):
         cancel = threading.Event()
         nonce = "c" * 48

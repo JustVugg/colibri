@@ -28,6 +28,7 @@ class _FakeCurses:
     KEY_UP = 1004
     KEY_NPAGE = 1005
     KEY_PPAGE = 1006
+    KEY_ENTER = 1007
 
     @staticmethod
     def color_pair(pair):
@@ -152,6 +153,7 @@ class CursesUiModuleTest(unittest.TestCase):
 
         with ModelFixture() as fixture:
             initial = plan_args(fixture.root)
+            initial.ramdisk_preset = "single"
             hardware = hardware_fixture(nodes=2)
             model = ramdisk.scan_model(str(fixture.root))
             plan = ramdisk.build_plan(
@@ -230,6 +232,86 @@ class CursesUiModuleTest(unittest.TestCase):
         self.assertIsNone(bindings.worker_values[1])
         self.assertIsNone(bindings._tui_worker)
         prepare.assert_called_once()
+
+    def test_first_run_choice_uses_shared_resolver_before_plan_review(self):
+        fake_curses = _FakeCurses()
+        bindings = _RecordingBindings(ramdisk)
+
+        with ModelFixture() as fixture:
+            initial = plan_args(fixture.root)
+            hardware = hardware_fixture(nodes=2)
+            model = ramdisk.scan_model(str(fixture.root))
+            plan = ramdisk.build_plan(
+                initial,
+                hardware=hardware,
+                model=model,
+            )
+            resolved_args = argparse.Namespace(**vars(initial))
+            resolved_args.ramdisk_preset = "single"
+            resolved_args.ramdisk_preset_label = "Single RAM copy"
+            resolved_args.ramdisk_preset_reason = "Fixture selection."
+            resolved_args.ramdisk_preset_fallback = None
+            resolved_args.managed_accelerator = None
+            plan["preset"] = {
+                "id": "single",
+                "label": "Single RAM copy",
+                "state": "selected",
+                "reason": "Fixture selection.",
+                "fallback": None,
+            }
+            resolver = mock.Mock(
+                return_value={"args": resolved_args, "plan": plan}
+            )
+            report = {
+                "present": False,
+                "state": "absent",
+                "mounts": [],
+                "processes": [],
+                "deep_validation": True,
+            }
+            screen = _FakeScreen([ord("2"), ord("q")])
+
+            with (
+                mock.patch.dict(sys.modules, {"curses": fake_curses}),
+                mock.patch.object(
+                    ramdisk,
+                    "discover_hardware",
+                    return_value=hardware,
+                ),
+                mock.patch.object(
+                    ramdisk,
+                    "scan_model",
+                    return_value=model,
+                ),
+                mock.patch.object(
+                    ramdisk,
+                    "build_plan",
+                    return_value=plan,
+                ),
+                mock.patch.object(
+                    ramdisk,
+                    "resolve_preset",
+                    resolver,
+                ),
+                mock.patch.object(
+                    ramdisk,
+                    "status",
+                    return_value=report,
+                ),
+            ):
+                result = curses_ui._tui(
+                    screen,
+                    initial,
+                    "/coli",
+                    "/engine",
+                    bindings=bindings,
+                )
+
+        self.assertEqual(result, 0)
+        resolver.assert_called_once()
+        self.assertEqual(resolver.call_args.args[0], "single")
+        rendered = "\n".join(item[2] for item in screen.output)
+        self.assertIn("WHAT SHOULD COLIBRI OPTIMIZE?", rendered)
 
     def test_frontend_failure_uses_the_binding_owned_worker(self):
         interface_error = RuntimeError("display failed")

@@ -28,6 +28,10 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Static
 
+from ramdisk_support.presets import (
+    PRESET_CHOICES,
+    PRESET_GPU_FASTEST,
+)
 from ramdisk_ui import (
     ActionPermission,
     ActionPolicy,
@@ -121,6 +125,34 @@ class LifecycleSession:
                 self._first_status = True
             if model:
                 self._model = None
+
+    def resolve_preset(
+        self,
+        preset_id: str,
+        *,
+        cli_path: Optional[str] = None,
+        engine_path: Optional[str] = None,
+    ) -> Mapping[str, Any]:
+        with self._lock:
+            if self._hardware is None:
+                self._hardware = self.lifecycle.discover_hardware()
+                self._hardware_checked = time.monotonic()
+            if self._model is None:
+                self._model = self.lifecycle.scan_model(self.args.model)
+            result = self.lifecycle.resolve_preset(
+                preset_id,
+                self.args,
+                hardware=self._hardware,
+                model=self._model,
+                cli_path=cli_path,
+                engine_path=engine_path,
+            )
+            resolved_args = result["args"]
+            vars(self.args).clear()
+            vars(self.args).update(vars(resolved_args))
+            self._plan = result["plan"]
+            self._plan_key = None
+            return result
 
     def refresh(self, *, deep: bool = False, model: bool = False) -> ConsoleSnapshot:
         with self._lock:
@@ -575,6 +607,29 @@ def review_facts(
         engine_masks = _engine_cpu_masks(plan)
         if engine_masks:
             _line(text, "Per-engine CPU masks", engine_masks)
+        accelerator = plan.get("managed_accelerator") or {}
+        if accelerator.get("mode") == "cuda":
+            _line(
+                text,
+                "Managed GPUs",
+                _format_list(
+                    [
+                        "%s (%s)"
+                        % (
+                            device.get("index"),
+                            device.get("name") or "unnamed",
+                        )
+                        for device in accelerator.get("devices", [])
+                    ]
+                ),
+                style="bold",
+            )
+            _line(
+                text,
+                "RAM → VRAM source",
+                "mmap · async · automatic VRAM tier",
+                style="bold",
+            )
     _line(text, "Mount paths", _format_list(identity.mount_paths))
     if contract.is_replication:
         text.append(
@@ -591,6 +646,113 @@ def review_facts(
         )
     text.append("\n\nThis review expires in 10 seconds.", style="#91a7a6")
     return text
+
+
+class PresetScreen(ModalScreen[Optional[str]]):
+    """One first-run intent question that only populates a draft."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Advanced setup"),
+        Binding("q", "cancel", "Advanced setup"),
+        Binding("enter", "select_default", "Select default"),
+        Binding("1", "select_index(0)", "Fastest GPU staging", show=False),
+        Binding("2", "select_index(1)", "Single RAM copy", show=False),
+        Binding("3", "select_index(2)", "Minimal RAM", show=False),
+        Binding("4", "select_index(3)", "Multiple replicas", show=False),
+    ]
+
+    CSS = """
+    PresetScreen {
+        align: center middle;
+        background: rgba(5, 9, 13, 0.78);
+    }
+    #preset-card {
+        width: 76;
+        max-width: 94%;
+        height: auto;
+        max-height: 94%;
+        padding: 1 2;
+        background: #18222d;
+        border: tall #63bec2;
+    }
+    #preset-title {
+        height: 2;
+        color: #63bec2;
+        text-style: bold;
+    }
+    #preset-help {
+        height: auto;
+        color: #91a7a6;
+        margin-bottom: 1;
+    }
+    .preset-choice {
+        width: 100%;
+        height: 3;
+        margin-bottom: 1;
+    }
+    #preset-cancel {
+        width: 100%;
+        height: 3;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="preset-card"):
+            yield Static(
+                "WHAT SHOULD COLIBRI OPTIMIZE?",
+                id="preset-title",
+            )
+            yield Static(
+                "This only prepopulates a draft. You will review the exact "
+                "plan before anything is mounted or copied.",
+                id="preset-help",
+            )
+            for index, (preset_id, label, description) in enumerate(
+                PRESET_CHOICES,
+                1,
+            ):
+                yield Button(
+                    "%d  %s%s\n%s"
+                    % (
+                        index,
+                        label,
+                        " · default" if index == 1 else "",
+                        description,
+                    ),
+                    id="preset-%s" % preset_id,
+                    classes="preset-choice",
+                    variant="primary" if index == 1 else "default",
+                )
+            yield Button(
+                "Continue with advanced setup",
+                id="preset-cancel",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(
+            "#preset-%s" % PRESET_GPU_FASTEST,
+            Button,
+        ).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_select_default(self) -> None:
+        self.dismiss(PRESET_GPU_FASTEST)
+
+    def action_select_index(self, index: int) -> None:
+        try:
+            self.dismiss(PRESET_CHOICES[int(index)][0])
+        except (IndexError, TypeError, ValueError):
+            return
+
+    @on(Button.Pressed)
+    def _button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "preset-cancel":
+            self.dismiss(None)
+        elif button_id.startswith("preset-"):
+            self.dismiss(button_id.removeprefix("preset-"))
 
 
 class ContractReviewScreen(ModalScreen[bool]):
@@ -943,6 +1105,7 @@ class RamdiskTextualApp(App[int]):
         lifecycle: Any = None,
         initial_snapshot: Optional[ConsoleSnapshot] = None,
         auto_refresh: bool = True,
+        show_preset_prompt: Optional[bool] = None,
         privilege_authorizer: Optional[
             Callable[["RamdiskTextualApp"], Any]
         ] = None,
@@ -955,6 +1118,16 @@ class RamdiskTextualApp(App[int]):
         self.session = LifecycleSession(self.lifecycle, self.args)
         self.snapshot = initial_snapshot or ConsoleSnapshot.loading(self.args.base_port)
         self.refresh_enabled = bool(auto_refresh)
+        self._preset_prompt_enabled = (
+            initial_snapshot is None
+            if show_preset_prompt is None
+            else bool(show_preset_prompt)
+        )
+        self._preset_prompted = bool(
+            getattr(self.args, "ramdisk_preset", None)
+            or self.snapshot.report.get("present")
+        )
+        self._preset_screen_open = False
         self.privilege_authorizer = privilege_authorizer
         self.current_step = 0
         self.policy = ActionPolicy.from_state(
@@ -1107,6 +1280,7 @@ class RamdiskTextualApp(App[int]):
                     self._previous_signal_handlers.pop(signum, None)
         self._apply_snapshot(self.snapshot)
         self._show_step(0)
+        self._maybe_prompt_preset()
         if self.refresh_enabled:
             self.set_interval(2.0, self._automatic_refresh)
             self._request_refresh(deep=True, model=True)
@@ -1233,6 +1407,59 @@ class RamdiskTextualApp(App[int]):
         )
         self._sync_controls()
         self._update_action_policy()
+        self._maybe_prompt_preset()
+
+    def _maybe_prompt_preset(self) -> None:
+        if (
+            not self._preset_prompt_enabled
+            or self._preset_prompted
+            or self._preset_screen_open
+            or not self.is_mounted
+            or self.snapshot.plan is None
+            or self.snapshot.report.get("state") == "loading"
+        ):
+            return
+        if self.snapshot.report.get("present"):
+            self._preset_prompted = True
+            return
+        self._preset_prompted = True
+        self._preset_screen_open = True
+        self.push_screen(PresetScreen(), self._preset_selected)
+
+    def _preset_selected(self, preset_id: Optional[str]) -> None:
+        self._preset_screen_open = False
+        if preset_id is None:
+            self._set_message(
+                "Advanced setup retained; no preset values were applied."
+            )
+            return
+        try:
+            result = self.session.resolve_preset(
+                preset_id,
+                cli_path=self.cli_path,
+                engine_path=self.engine_path,
+            )
+        except (OSError, ValueError, self.lifecycle.RamdiskError) as exc:
+            self._set_message(
+                "Preset could not be resolved: %s. No lifecycle action was taken."
+                % exc
+            )
+            return
+        self._plan_stale = False
+        self._apply_snapshot(
+            replace(
+                self.snapshot,
+                plan=result["plan"],
+                error="",
+            )
+        )
+        self._show_step(4)
+        preset = result["plan"].get("preset") or {}
+        self._set_message(
+            "%s populated the draft. Review the exact plan; advanced "
+            "settings remain editable."
+            % preset.get("label", "Preset")
+        )
 
     def _sync_input(self, selector: str, value: Any) -> None:
         widget = self.query_one(selector, Input)
@@ -1662,6 +1889,9 @@ class RamdiskTextualApp(App[int]):
 
     def _settings_changed(self, message: str, *, rebuild: bool = True) -> None:
         if rebuild:
+            marker = getattr(self.lifecycle, "mark_preset_custom", None)
+            if marker is not None:
+                marker(self.args)
             self.session.invalidate()
             self._plan_stale = True
         self._pending_review = None

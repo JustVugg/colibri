@@ -2,11 +2,157 @@
 
 from __future__ import print_function
 
+import csv
+import io
 import posixpath
 import re
+import subprocess
 
 from .common import RamdiskError, _format_range_list, _parse_range_list
 from .platform_ops import get_platform_ops
+
+
+def _normalize_pci_bus_id(value):
+    """Return Linux's canonical PCI domain:bus:device.function spelling."""
+    match = re.fullmatch(
+        r"\s*([0-9A-Fa-f]{1,8}):([0-9A-Fa-f]{1,2}):"
+        r"([0-9A-Fa-f]{1,2})\.([0-7])\s*",
+        str(value),
+    )
+    if not match:
+        return None
+    domain, bus, device, function = (
+        int(item, 16) for item in match.groups()
+    )
+    if domain > 0xFFFF or bus > 0xFF or device > 0x1F:
+        return None
+    return "%04x:%02x:%02x.%x" % (
+        domain,
+        bus,
+        device,
+        function,
+    )
+
+
+def _discover_gpus(
+    effective_nodes,
+    *,
+    ops=None,
+    run=None,
+):
+    """Discover NVIDIA devices and resolve their PCI-local Linux NUMA nodes."""
+    ops = get_platform_ops() if ops is None else ops
+    if not ops.is_linux:
+        return {
+            "status": "unsupported",
+            "error": "GPU NUMA discovery is supported only on Linux",
+            "devices": [],
+        }
+    run = subprocess.run if run is None else run
+    executable = ops.executable_path("nvidia-smi")
+    if not executable:
+        return {
+            "status": "unavailable",
+            "error": "nvidia-smi is not available",
+            "devices": [],
+        }
+    command = [
+        executable,
+        "--query-gpu=index,name,pci.bus_id,memory.total,memory.free",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "status": "unavailable",
+            "error": "cannot query NVIDIA GPUs: %s" % exc,
+            "devices": [],
+        }
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        return {
+            "status": "unavailable",
+            "error": (
+                "nvidia-smi GPU query failed"
+                + (": %s" % detail if detail else "")
+            ),
+            "devices": [],
+        }
+
+    allowed = sorted(set(int(node) for node in effective_nodes))
+    devices = []
+    malformed = 0
+    for fields in csv.reader(io.StringIO(result.stdout or "")):
+        fields = [field.strip() for field in fields]
+        if len(fields) != 5:
+            malformed += 1
+            continue
+        try:
+            index = int(fields[0])
+            total_mib = int(fields[3])
+            free_mib = int(fields[4])
+        except ValueError:
+            malformed += 1
+            continue
+        pci_bus_id = _normalize_pci_bus_id(fields[2])
+        if index < 0 or total_mib < 0 or free_mib < 0 or pci_bus_id is None:
+            malformed += 1
+            continue
+        raw_node = ops.read_text(
+            "/sys/bus/pci/devices/%s/numa_node" % pci_bus_id,
+            "",
+        ).strip()
+        try:
+            numa_node = int(raw_node)
+        except ValueError:
+            numa_node = None
+        if numa_node == -1 and len(allowed) == 1:
+            numa_node = allowed[0]
+            locality = "single-node"
+        elif numa_node is None or numa_node < 0:
+            numa_node = None
+            locality = "unknown"
+        elif numa_node not in allowed:
+            locality = "outside-effective-mask"
+        else:
+            locality = "resolved"
+        devices.append(
+            {
+                "index": index,
+                "name": fields[1],
+                "pci_bus_id": pci_bus_id,
+                "numa_node": numa_node,
+                "locality": locality,
+                "total_bytes": total_mib * 1024 * 1024,
+                "free_bytes": free_mib * 1024 * 1024,
+            }
+        )
+    devices.sort(key=lambda item: item["index"])
+    if devices:
+        status = "available" if not malformed else "partial"
+        error = (
+            None
+            if not malformed
+            else "%d malformed nvidia-smi row(s) were ignored" % malformed
+        )
+    elif malformed:
+        status = "unavailable"
+        error = "nvidia-smi returned no valid GPU rows"
+    else:
+        status = "none"
+        error = None
+    return {
+        "status": status,
+        "error": error,
+        "devices": devices,
+    }
 
 
 def _mountinfo_unescape(value):
@@ -356,6 +502,11 @@ def _unsupported_hardware(ops):
             "advise_supported": False,
         },
         "numactl": None,
+        "gpus": [],
+        "gpu_discovery": {
+            "status": "unsupported",
+            "error": "GPU NUMA discovery is supported only on Linux",
+        },
         "mount": None,
         "umount": None,
         "sudo": None,
@@ -367,7 +518,7 @@ def _unsupported_hardware(ops):
     }
 
 
-def discover_hardware(ops=None):
+def discover_hardware(ops=None, gpu_discovery=None):
     """Return normalized Linux discovery or explicit unsupported capabilities."""
     ops = get_platform_ops() if ops is None else ops
     if not ops.is_linux:
@@ -447,6 +598,11 @@ def discover_hardware(ops=None):
     thp_modes = re.findall(r"\[?([A-Za-z_]+)\]?", shmem_enabled)
     filesystems = ops.read_text("/proc/filesystems")
     cgroup_memory = _discover_cgroup_memory_with_ops(ops=ops)
+    gpu_report = (
+        _discover_gpus(effective_nodes, ops=ops)
+        if gpu_discovery is None
+        else gpu_discovery(effective_nodes, ops=ops)
+    )
     return {
         "linux": True,
         "capabilities": ops.capabilities(),
@@ -486,6 +642,11 @@ def discover_hardware(ops=None):
             "advise_supported": "advise" in thp_modes or bool(shmem_enabled),
         },
         "numactl": ops.executable_path("numactl"),
+        "gpus": list(gpu_report.get("devices") or []),
+        "gpu_discovery": {
+            "status": gpu_report.get("status", "unavailable"),
+            "error": gpu_report.get("error"),
+        },
         "mount": ops.executable_path("mount"),
         "umount": ops.executable_path("umount"),
         "sudo": ops.executable_path("sudo"),

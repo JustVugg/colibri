@@ -346,6 +346,7 @@ def start(
     engine_cpu_list,
     node_core_count,
     normalized_runtime_knobs,
+    apply_managed_accelerator_environment=None,
     proc_identity,
     wait_managed_ready,
     track_managed_child,
@@ -353,6 +354,12 @@ def start(
     terminate_direct_child,
     forget_managed_child,
 ):
+    if apply_managed_accelerator_environment is None:
+        from .accelerator import _apply_managed_accelerator_environment
+
+        apply_managed_accelerator_environment = (
+            _apply_managed_accelerator_environment
+        )
     manifest = load_manifest(required=True)
     _raise_if_cancelled(cancel_event)
     if manifest.get("state") not in ("ready", "stopped"):
@@ -574,8 +581,6 @@ def start(
                 {
                     "COLI_WEIGHTS_DIR": mount["path"],
                     "COLI_STATE_DIR": state_dir,
-                    "COLI_RAMMAP": "1",
-                    "COLI_RAM_PREFAULT": str(plan["prefault"]),
                     "COLI_MANAGED_NONCE": nonce,
                     "COLI_NUMA": (
                         "1"
@@ -634,6 +639,15 @@ def start(
             )
             for key, value in applied_runtime_knobs.items():
                 environment[key] = str(value)
+            applied_accelerator = apply_managed_accelerator_environment(
+                environment,
+                plan,
+            )
+            environment["COLI_RAM_PREFAULT"] = str(
+                plan["prefault"]
+                if applied_accelerator.get("COLI_RAMMAP") == "1"
+                else 0
+            )
             command = [
                 cli_path,
                 "serve",
@@ -715,6 +729,7 @@ def start(
                 "started_at": _utc_now(),
                 "log": log_path,
                 "runtime_knobs": applied_runtime_knobs,
+                "accelerator_environment": applied_accelerator,
             }
             context["record"] = record
             records.append(record)

@@ -82,11 +82,18 @@ from ramdisk_support.benchmark import (
     _system_score as _benchmark_system_score,
     run_benchmark as _run_benchmark,
 )
+from ramdisk_support.accelerator import (
+    ACCELERATOR_ENVIRONMENT_KEYS,
+    _apply_managed_accelerator_environment,
+    _managed_accelerator_contract,
+    _managed_accelerator_environment,
+)
 from ramdisk_support.discovery import (
     _cgroup_ancestors,
     _cgroup_memberships,
     _cgroup_mounts,
     _discover_cgroup_memory,
+    _discover_gpus,
     _mountinfo_unescape,
     _parse_cgroup_bytes,
     _resolve_cgroup_directory,
@@ -170,6 +177,16 @@ from ramdisk_support.planning import (
     _select_partial,
     build_plan as _planning_build_plan,
 )
+from ramdisk_support.presets import (
+    PRESET_CHOICES,
+    PRESET_GPU_FASTEST,
+    PRESET_MINIMAL,
+    PRESET_REPLICAS,
+    PRESET_SINGLE,
+    _engine_cuda_capable,
+    mark_preset_custom,
+    resolve_preset as _resolve_preset,
+)
 from ramdisk_support.presentation import (
     _human_benchmark as _presentation_human_benchmark,
     _human_plan as _presentation_human_plan,
@@ -185,6 +202,7 @@ from ramdisk_support.presentation import (
     _tui_help_rows as _presentation_tui_help_rows,
     _tui_idle_action_hint as _presentation_tui_idle_action_hint,
     _tui_plan_rows as _presentation_tui_plan_rows,
+    _tui_preset_rows as _presentation_tui_preset_rows,
     _tui_settings_rows as _presentation_tui_settings_rows,
 )
 from ramdisk_support.processes import (
@@ -310,6 +328,37 @@ def build_plan(args, hardware=None, model=None):
         benchmarks_path=_benchmarks_path,
         current_euid=current_euid,
         get_platform_ops=get_platform_ops,
+    )
+
+
+def resolve_preset(
+    preset_id,
+    args,
+    hardware=None,
+    model=None,
+    cli_path=None,
+    engine_path=None,
+):
+    hardware = hardware or discover_hardware()
+    model = model or scan_model(args.model)
+    cuda_capable = None
+    if preset_id == PRESET_GPU_FASTEST:
+        try:
+            resolved_engine = _resolve_engine_path(
+                cli_path or os.path.join(os.path.dirname(__file__), "coli"),
+                engine_path=engine_path,
+            )
+        except RamdiskError:
+            resolved_engine = engine_path
+        cuda_capable = _engine_cuda_capable(resolved_engine)
+    return _resolve_preset(
+        preset_id,
+        args,
+        hardware=hardware,
+        model=model,
+        build_plan=build_plan,
+        load_profile=_load_profile,
+        cuda_capable=cuda_capable,
     )
 
 
@@ -697,6 +746,9 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
         engine_cpu_list=_engine_cpu_list,
         node_core_count=_node_core_count,
         normalized_runtime_knobs=_normalized_runtime_knobs,
+        apply_managed_accelerator_environment=(
+            _apply_managed_accelerator_environment
+        ),
         proc_identity=_proc_identity,
         wait_managed_ready=_wait_managed_ready,
         track_managed_child=_track_managed_child,
@@ -831,6 +883,9 @@ def _benchmark_environment(manifest, weights_dir, state_dir, rammap, node=None, 
         memory_node_list=_memory_node_list,
         managed_numa_enabled=_managed_numa_enabled,
         normalized_runtime_knobs=_normalized_runtime_knobs,
+        apply_managed_accelerator_environment=(
+            _apply_managed_accelerator_environment
+        ),
     )
 
 
@@ -1048,6 +1103,10 @@ def _tui_plan_rows(plan, report, active=False, base_port=8000, confirmation=None
         base_port=base_port,
         confirmation=confirmation,
     )
+
+
+def _tui_preset_rows():
+    return _presentation_tui_preset_rows()
 
 
 def _tui_hardware_rows(hardware):

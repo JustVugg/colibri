@@ -91,11 +91,23 @@ one-release curses interface only when Textual is unavailable;
 `COLI_RAMDISK_UI=textual` or `curses` selects one explicitly.
 
 The console walks through Inspect → Placement → Capacity → Runtime → Review →
-Operate. A live backplane rail always shows the resulting copy count, memory
-nodes, engine count, and ports. The normal `interleaved` plan is shown as **one
-shared model copy and one engine** whose RAM pages span the selected NUMA nodes.
-Replica placement cannot be enabled by an accidental TUI toggle; request
-`--topology per-node` explicitly to review its full-copy and endpoint multiplier.
+Operate. Before those steps, a new workspace asks for one preset: **Fastest GPU
+staging** (default), **Single copy RAM**, **Minimal**, or the explicit
+**Multiple copies RAM** option. Fastest GPU staging selects only effective NUMA
+nodes local to the discovered GPUs, keeps one shared copy and engine, attempts
+full then profile-guided partial staging, and reviews a managed CUDA mmap,
+asynchronous copy, and automatic-VRAM contract. It falls back visibly to Single
+copy RAM when GPU locality or CUDA capability cannot be established; automatic
+placement never selects replicas. Minimal blocks with profile instructions when
+no compatible profile is available. Existing prepared workspaces skip the
+preset question.
+
+A live backplane rail always shows the resulting copy count, memory nodes,
+engine count, and ports. The normal `interleaved` plan is shown as **one shared
+model copy and one engine** whose RAM pages span the selected NUMA nodes.
+Replica placement requires either the explicit Multiple copies RAM startup
+choice or `--topology per-node`, so its full-copy and endpoint multiplier is
+always reviewed.
 Memory-node and whole-core CPU range lists are validated against the invoking
 process's effective cgroup/cpuset masks. Once prepared, the persisted placement
 is shown as the active deployment and its weight settings stay locked until it
@@ -112,7 +124,10 @@ Linux memory policy addresses NUMA nodes, not individual DIMMs or channels.
 DIMM/channel data is therefore informational: populate symmetric firmware-
 recommended DIMM/channel pairs, then use `--memory-nodes` to select the NUMA
 domains they expose. Colibri never rewrites the host-global weighted-interleave
-weights.
+weights. Multiple tmpfs mounts are independent filesystems rather than a RAID
+stripe. One interleaved source across two GPU-local nodes can still serve remote
+pages to either GPU; eliminating that requires tensor-aware placement in the
+engine, not additional ramdisks.
 Prepare, Start, and Benchmark remain navigable while they run and can be
 cancelled with `c`; Colibri waits for a rollback/cleanup checkpoint before
 returning control. `q` requests the same safe cancellation and exits only after

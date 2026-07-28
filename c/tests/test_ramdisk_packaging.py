@@ -25,6 +25,7 @@ SUPPORT_MODULES = (
 SUPPORT_PACKAGE = "ramdisk_support"
 REQUIRED_SUPPORT_PACKAGE_MODULES = (
     "__init__.py",
+    "accelerator.py",
     "benchmark.py",
     "cli.py",
     "common.py",
@@ -37,6 +38,7 @@ REQUIRED_SUPPORT_PACKAGE_MODULES = (
     "planning.py",
     "platform_ops.py",
     "presentation.py",
+    "presets.py",
     "processes.py",
     "state.py",
 )
