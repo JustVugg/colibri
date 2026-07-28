@@ -65,7 +65,13 @@ Experts are streamed straight from the safetensors shards through a per-layer
 LRU (`K3_EXPERT_GB`). Measured layout facts the engine exploits: the six
 tensors of an expert are stored back-to-back (one expert = one `pread`), and
 experts are *not* id-ordered inside a shard, so loads are issued in disk-offset
-order. Note that K3's router was trained with Quantile Balancing (deliberately
+order. A token's misses are read **in parallel** (OMP over working-set slots)
+and by default with **O_DIRECT** (`K3_DIRECT=0` for buffered): the resident
+weights leave little page-cache headroom, and flat routing means cached reads
+mostly cannot be reused anyway — measured on the 93-layer model this took
+expert reads from ~1.8 to ~6.3 GB/s (drive ceiling 7.1) and decode from ~21
+to ~9.4 s/token. The LRU slot floor is 1 (experts are consumed one at a time),
+so `K3_EXPERT_GB` is honored even at tiny budgets. Note that K3's router was trained with Quantile Balancing (deliberately
 flat expert usage), so LRU hit rates are structurally lower than on models
 with skewed routing — expect the expert tier to be bandwidth-bound.
 
@@ -86,7 +92,11 @@ interrupted runs resume per shard. `--verify-full` re-reads every expert byte
 and compares against the source.
 
 The engine auto-detects container tensors (dtype U8 + `.qs` sidecar) and skips
-load-time quantization: measured on two layers, init drops **30.4 s → 0.6 s**;
+load-time quantization. Setting `K3_BITS=4` **explicitly** on an int8 container
+downcasts the int8 matrices to int4-g64 at load (~35 vs ~57 GiB resident on
+the 93-layer model — fits next to a desktop session; the int8 grid is 16x
+finer than int4, so the double-quant noise ~ direct int4). Unset `K3_BITS`
+keeps the container's own bits. Startup: measured on two layers, init drops **30.4 s → 0.6 s**;
 on the full model this removes a 10–15 minute quantization pass. Quantized
 values are bit-identical to the load-time path (verified by hidden-state
 trace), so the two formats are numerically interchangeable.
@@ -138,6 +148,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_MLA_BITS` | 8 | load-time bits for MLA projections |
 | `K3_HEAD_BITS` | 8 | load-time bits for lm_head |
 | `K3_EXPERT_GB` | 8 | routed-expert LRU budget |
+| `K3_DIRECT` | 1 | O_DIRECT expert reads (0 = buffered + WILLNEED) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
 | `K3_MAXT` | prompt+ngen | context capacity |
 | `K3_LAYERS` | all | truncate the stack (validation) |

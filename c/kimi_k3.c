@@ -40,6 +40,7 @@
  *   K3_MLA_BITS=8|4|32   MLA projections (default 8)
  *   K3_HEAD_BITS=8|4|32  lm_head (default 8)
  *   K3_EXPERT_GB=N       routed-expert LRU cache budget (default 8)
+ *   K3_DIRECT=0|1        O_DIRECT expert reads (default 1; buffered fallback)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
  *   K3_MAXT=N            KV/context capacity (default prompt+ngen)
@@ -112,7 +113,9 @@ typedef struct {
 
 /* ---------- routed-expert streaming (native MXFP4 from the HF shards) ---- */
 typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;  /* w1p w1s w2p w2s w3p w3s */
-typedef struct { int eid; uint8_t *buf; uint64_t used; } Slot;
+typedef struct { int eid; uint8_t *buf, *base; uint64_t used; } Slot;
+                          /* base = 4K-aligned allocation (O_DIRECT target);
+                           * buf = expert data view inside it (= base + off%4K) */
 typedef struct { Slot *s; int n, cap; } LCache;
 
 typedef struct {
@@ -123,6 +126,8 @@ typedef struct {
     float *final_norm, *out_sw;
     W lm_head;
     int has_head;
+    Slot ws[64];                          /* working set: parallel loads land here,
+                                           * then swap into the layer LRU */
     /* KDA state */
     float **kstate;                       /* [layer] -> [heads*hd*hd], S[k][v] */
     float **cwq, **cwk, **cwv;            /* conv windows [proj*conv_k], oldest first */
@@ -192,6 +197,9 @@ static float w_rowdot(const W *w, int r, const float *x){
 }
 
 #define QCHUNK 1024                      /* rows per load-quantize pass */
+static int g_bits_env=0;                 /* K3_BITS explicitly set: enables the
+                                          * int8-container -> int4 load downcast */
+static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     char nm[512]; snprintf(nm,sizeof(nm),"%s%s",m->pfx,name);
     st_tensor *t=st_find(&m->S,nm);
@@ -199,11 +207,39 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     memset(w,0,sizeof(*w)); w->O=O; w->I=I;
     if(t->dtype==3){
         /* repacked container (tools/k3_repack.py): pre-quantized U8 + .qs f32
-         * scales — no load-time quantization, K3_BITS is ignored for these */
+         * scales — no load-time quantization, K3_BITS is ignored for these
+         * (except the explicit =4 downcast below) */
         char qn[560]; snprintf(qn,sizeof(qn),"%s.qs",nm);
         st_tensor *ts=st_find(&m->S,qn);
         if(!ts){ fprintf(stderr,"%s: quantized (U8) but no %s scale sidecar\n",nm,qn); exit(1); }
         if(t->nbytes==(int64_t)O*I && ts->numel==O){                  /* int8 per-row */
+            if(g_bits_env && bits==4 && I%64==0){
+                /* EXPLICIT K3_BITS=4 on an int8 container: downcast to int4-g64
+                 * at load. Halves resident RAM (the 62 GB box cannot hold the
+                 * 93-layer non-expert set at int8 next to a desktop session);
+                 * the int8 grid is 16x finer than int4, so the double-quant
+                 * noise ~ the direct-int4 noise. Unset K3_BITS keeps the
+                 * container's own bits — the default is untouched. */
+                int gs=64, rb=I/2, ng=I/gs;
+                int8_t *q8=malloc((size_t)O*I); float *s8=falloc(O);
+                if(!q8){fprintf(stderr,"OOM int8 tmp %s\n",nm);exit(1);}
+                st_read_raw(&m->S,nm,q8,1); st_read_f32(&m->S,qn,s8,0);
+                w->fmt=4; w->gs=gs;
+                w->q4=malloc((int64_t)O*rb); w->s=falloc((int64_t)O*ng);
+                if(!w->q4){fprintf(stderr,"OOM int4 %s\n",nm);exit(1);}
+                for(int r=0;r<O;r++){
+                    const int8_t *src=q8+(int64_t)r*I; float sc8=s8[r];
+                    uint8_t *dst=w->q4+(int64_t)r*rb; float *scl=w->s+(int64_t)r*ng;
+                    for(int g=0;g<ng;g++){ const int8_t *gp=src+g*gs;
+                        int am=0; for(int i=0;i<gs;i++){ int a=gp[i]<0?-gp[i]:gp[i]; if(a>am)am=a; }
+                        float s=am*sc8/7.f; if(s<1e-20f)s=1e-20f; scl[g]=s; float inv=sc8/s;
+                        for(int i=0;i<gs;i+=2){
+                            int v0=(int)lrintf(gp[i]*inv);   if(v0>7)v0=7; if(v0<-8)v0=-8;
+                            int v1=(int)lrintf(gp[i+1]*inv); if(v1>7)v1=7; if(v1<-8)v1=-8;
+                            dst[(g*gs+i)>>1]=(uint8_t)((v0+8)|((v1+8)<<4)); } } }
+                free(q8); free(s8);
+                return;
+            }
             w->fmt=1; w->q8=malloc((size_t)O*I);
             if(!w->q8){fprintf(stderr,"OOM int8 %s\n",nm);exit(1);}
             st_read_raw(&m->S,nm,w->q8,1);
@@ -370,6 +406,8 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
        st_has(&m->S,"language_model.model.layers.0.input_layernorm.weight"))
         snprintf(m->pfx,sizeof(m->pfx),"language_model.");
     if((c->n_layers+c->res_bs-1)/c->res_bs+1>16){ fprintf(stderr,"attn_res: too many blocks\n"); exit(1); }
+    g_bits_env = getenv("K3_BITS")!=NULL;
+    g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
     int bits   = getenv("K3_BITS")?atoi(getenv("K3_BITS")):4;
     int mbits  = getenv("K3_MLA_BITS")?atoi(getenv("K3_MLA_BITS")):8;
     int hbits  = getenv("K3_HEAD_BITS")?atoi(getenv("K3_HEAD_BITS")):8;
@@ -467,7 +505,12 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     double egb = getenv("K3_EXPERT_GB")?atof(getenv("K3_EXPERT_GB")):8.0;
     int nmoe=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nmoe++;
     int cap=(int)((egb*1e9)/((double)m->e_slot*(nmoe?nmoe:1)));
-    if(cap<c->topk) cap=c->topk;
+    /* floor 1, NOT topk: experts are loaded and consumed one at a time inside
+     * a token, so slots never need to hold a whole top-k set. A topk floor
+     * would silently commit topk*nmoe slots (~26 GB on the 93-layer model)
+     * regardless of K3_EXPERT_GB. */
+    if(cap<1) cap=1;
+    if(cap>c->n_experts) cap=c->n_experts;
     m->ecache=calloc(c->n_layers,sizeof(LCache));
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
         m->ecache[i].cap=cap; m->ecache[i].s=calloc(cap,sizeof(Slot));
@@ -598,36 +641,101 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos, flo
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
 }
 
-/* ---------- routed experts: LRU + direct pread from the HF shards ---------- */
-static Slot *expert_get(Model *m, int li, int eid){
+/* ---------- routed experts: LRU + pread from the shards ----------
+ * Loads are issued in PARALLEL (OMP over the token's misses, working-set
+ * slots) and, when K3_DIRECT=1 (default) and st.h has an O_DIRECT twin fd,
+ * bypass the page cache: measured on the box 7.1 GB/s direct vs 2.9 buffered
+ * (and ~1.8 effective once the resident weights leave no cache headroom). */
+static Slot *slot_find(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
     for(int i=0;i<lc->n;i++) if(lc->s[i].eid==eid){ m->hits++; lc->s[i].used=++m->clock; return &lc->s[i]; }
-    m->miss++;
-    Slot *s;
-    if(lc->n<lc->cap){ s=&lc->s[lc->n++]; }
-    else { int lru=0; for(int i=1;i<lc->n;i++) if(lc->s[i].used<lc->s[lru].used) lru=i; s=&lc->s[lru]; }
-    if(!s->buf){ s->buf=malloc(m->e_slot); if(!s->buf){fprintf(stderr,"OOM expert slot\n");exit(1);} }
+    return NULL;
+}
+static void expert_read(Model *m, int li, int eid, Slot *s){
+    if(!s->base){
+        if(posix_memalign((void**)&s->base,4096,(size_t)m->e_slot+8192)){
+            fprintf(stderr,"OOM expert slot\n"); exit(1); }
+    }
     ERef *er=&m->eref[(int64_t)li*m->c.n_experts+eid];
     int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
-    double t0=now_s();
     if(er->fd[0]<0){ fprintf(stderr,"[K3] expert L%d E%d missing on disk\n",li,eid); exit(1); }
     if(er->contig){
-        st_pread_full(er->fd[0],s->buf,m->e_slot,er->off[0],"pread expert");
+        int dfd = g_k3_direct ? st_direct_fd(&m->S,er->fd[0]) : -1;
+        if(dfd>=0){
+            /* aligned window read; sub-4K head/tail slack handled explicitly.
+             * The tail past the last aligned block (or past EOF) is fetched
+             * with a tiny buffered pread — O_DIRECT wants aligned lengths. */
+            int64_t a0=er->off[0]&~4095LL, pad=er->off[0]-a0;
+            int64_t want=pad+m->e_slot;
+            struct stat sb;
+            int64_t dlen=(want+4095)&~4095LL;
+            if(fstat(dfd,&sb)==0 && a0+dlen>sb.st_size) dlen=(sb.st_size-a0)&~4095LL;
+            if(dlen>0) st_pread_full(dfd,s->base,dlen,a0,"pread expert direct");
+            if(dlen<want)
+                st_pread_full(er->fd[0],s->base+dlen,want-dlen,a0+dlen,"pread expert tail");
+            s->buf=s->base+pad;
+        } else {
+            st_pread_full(er->fd[0],s->base,m->e_slot,er->off[0],"pread expert");
+            s->buf=s->base;
+        }
     } else {
-        uint8_t *dst=s->buf;
+        uint8_t *dst=s->base;
         for(int k=0;k<6;k++){
             if(er->fd[k]<0){ fprintf(stderr,"[K3] expert L%d E%d tensor %d missing on disk\n",li,eid,k); exit(1); }
             st_pread_full(er->fd[k],dst,sizes[k],er->off[k],"pread expert");
             dst+=sizes[k];
         }
+        s->buf=s->base;
     }
-    m->ebytes+=m->e_slot; m->t_eload+=now_s()-t0;
-    s->eid=eid; s->used=++m->clock;
-    return s;
+    s->eid=eid;
 }
 
 static inline float situf_(float g, float u, float b1, float b2){
     return b1*tanhf(g/b1)*sigmoidf_(g) * b2*tanhf(u/b2);
+}
+
+/* u += wk * E(z) for one loaded expert slot (SiTU-GLU in the latent).
+ * gate/up are [moe_inter] scratch, hz is [latent] scratch. */
+static void expert_apply(Model *m, Slot *s, const float *z, float wk,
+                         float *u, float *gate, float *up, float *hz){
+    Cfg *c=&m->c;
+    uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
+            *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+    matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
+    matmul_mxfp4(up,z,w3p,w3s,1,c->latent,c->moe_inter);
+    for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
+    matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent);
+    for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
+}
+
+/* the full routed-expert pass for one token+layer: resolve (LRU hit or
+ * working-set slot), load misses IN PARALLEL, compute, promote into the LRU. */
+static void experts_run(Model *m, int li, int n, const int *ids, const float *w,
+                        const float *z, float *u, float *gate, float *up, float *hz){
+    Slot *use[64]; int missk[64]; int nmiss=0;
+    for(int j=0;j<n;j++){
+        use[j]=slot_find(m,li,ids[j]);
+        if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; }
+    }
+    if(nmiss){
+        double t0=now_s();
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int q=0;q<nmiss;q++) expert_read(m,li,ids[missk[q]],&m->ws[q]);
+        m->t_eload+=now_s()-t0;
+        m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
+    }
+    for(int j=0;j<n;j++)
+        expert_apply(m,use[j],z,w[j],u,gate,up,hz);
+    /* promotion: swap the freshly-read slots into the layer LRU */
+    LCache *lc=&m->ecache[li];
+    int promo = nmiss<lc->cap ? nmiss : lc->cap;
+    for(int a=0;a<promo;a++){
+        int q=nmiss-1-a; Slot *dst;
+        if(lc->n<lc->cap) dst=&lc->s[lc->n++];
+        else { int lru=0; for(int i=1;i<lc->n;i++) if(lc->s[i].used<lc->s[lru].used) lru=i; dst=&lc->s[lru]; }
+        Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
+        dst->used=++m->clock;
+    }
 }
 
 static void moe_forward(Model *m, Layer *l, int li, const float *x, float *out){
@@ -648,33 +756,25 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, float *out){
     }
     { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];
       for(int kk=0;kk<K;kk++) wsel[kk]/=(sm+1e-20f); }
-    /* prefetch every selected expert, then load in DISK-OFFSET order (experts
-     * are NOT id-ordered inside the HF shards — measured 169/895 out-of-order) */
-    for(int kk=0;kk<K;kk++){
-        ERef *er=&m->eref[(int64_t)li*E+idx[kk]];
-        int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
-        if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
-        else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
-    }
+    /* keep loads in DISK-OFFSET order (experts are NOT id-ordered inside the
+     * HF shards — measured 169/895; helps the buffered fallback, harmless
+     * under O_DIRECT). WILLNEED prefetch only for the buffered path. */
     for(int a2=0;a2<K-1;a2++) for(int b2=a2+1;b2<K;b2++){
         ERef *ea=&m->eref[(int64_t)li*E+idx[a2]], *eb=&m->eref[(int64_t)li*E+idx[b2]];
         if(eb->fd[0]<ea->fd[0]||(eb->fd[0]==ea->fd[0]&&eb->off[0]<ea->off[0])){
             int t=idx[a2];idx[a2]=idx[b2];idx[b2]=t; float tw=wsel[a2];wsel[a2]=wsel[b2];wsel[b2]=tw; }
     }
+    if(!g_k3_direct)
+        for(int kk=0;kk<K;kk++){
+            ERef *er=&m->eref[(int64_t)li*E+idx[kk]];
+            int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
+            if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
+            else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
+        }
     float *z=falloc(LT), *u=falloc(LT), *gate=falloc(MI), *up=falloc(MI), *hz=falloc(LT);
     w_matmul(z,x,&o->lat_down,1);
     memset(u,0,LT*sizeof(float));
-    for(int kk=0;kk<K;kk++){
-        Slot *s=expert_get(m,li,idx[kk]);
-        uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
-                *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
-        matmul_mxfp4(gate,z,w1p,w1s,1,LT,MI);
-        matmul_mxfp4(up,z,w3p,w3s,1,LT,MI);
-        for(int i=0;i<MI;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
-        matmul_mxfp4(hz,gate,w2p,w2s,1,MI,LT);
-        float wk=wsel[kk];
-        for(int i=0;i<LT;i++) u[i]+=wk*hz[i];
-    }
+    experts_run(m,li,K,idx,wsel,z,u,gate,up,hz);
     rmsnorm_(u,u,o->lat_norm,LT,c->eps);
     w_matmul(out,u,&o->lat_up,1);
     /* shared experts at full width */
