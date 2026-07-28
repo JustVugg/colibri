@@ -43,6 +43,8 @@
  *   K3_DIRECT=0|1        O_DIRECT expert reads (default 1; buffered fallback)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
+ *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
+ *                        bit-width comparisons; use with --ngen 0)
  *   K3_MAXT=N            KV/context capacity (default prompt+ngen)
  *   COLI_TEMP=F          0 = greedy (default), else softmax temperature
  */
@@ -919,12 +921,19 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] prompt: %d tokens | ngen %d | temp %.2f\n",np,ngen,temp);
     int max_t=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):np+ngen;
     kv_alloc(&m,max_t);
+    FILE *lfp=NULL;
+    if(getenv("K3_LOGITS")){
+        lfp=fopen(getenv("K3_LOGITS"),"wb");
+        if(!lfp){ perror(getenv("K3_LOGITS")); return 1; }
+    }
     double t0=now_s(); float *lo=NULL;
     for(int i=0;i<np;i++){
         if(lo) free(lo);
         lo=step(&m,ids[i],i);
+        if(lfp&&lo) fwrite(lo,sizeof(float),(size_t)m.c.vocab,lfp);
         fprintf(stderr,"\r[K3] prefill %d/%d (%.1fs)",i+1,np,now_s()-t0);
     }
+    if(lfp) fclose(lfp);
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
     if(!m.has_head||!lo){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
