@@ -58,6 +58,7 @@
 #endif
 #include "tok.h"
 #include "tier.h"
+#include "arch.h"                                  /* model-arch selection seam */
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
@@ -97,98 +98,10 @@ static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pr
  * there -- see coli_resolve_cap() and cap_for_ram()'s CAP_RAISE default. */
 static int g_ssd_fast;
 
-typedef struct {
-    int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
-    int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
-    int n_group, topk_group, norm_topk;
-    int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
-    int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
-    int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
-    float eps, theta, attn_scale, routed_scale;
-} Cfg;
-
-/* tensore [O,I] in uno di tre formati:
- *   fmt=0 F32   -> qf
- *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
- *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
- * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64,
- * 6 E8/IQ3 lattice, 8 FP8-E4M3 (native, passthrough -- see quant.h). fmt=7 is
- * MXFP4 (Kimi K3 Vulkan tier, #676/#705, backend_vulkan.c) -- claimed upstream,
- * never a QT format here, deliberately absent from this struct's dispatch.
- * fmt=8 is a PUBLIC ordinal: it developed under the PRIVATE ORDINAL BLOCK
- * convention below as fmt=100, graduated to fmt=7 when the maintainer assigned
- * that ordinal on #524, and was renumbered to 8 after #705 merged claiming 7
- * for MXFP4 while this PR was still open (see the convention comment below).
- * q4 ospita int4/int2/int3 packed. fmt=4 (grouped int4, #242): per-row nibbles + one f32
- * scale per group of `gs` inputs (s has O*ceil(I/gs) entries).
- * fmt=6 (E8/IQ3 lattice, #452): 98B per 256 weights = 3.0625 bits/weight, grid
- * indices + parity-packed signs + sub-scales + fp16 super-scale, ALL inside q4 —
- * `s` is unused for this format (see quant.h E8_* and tools/iq3_pack.py).
- * fmt=5 (int3, per-GROUP scales, group=64, see quant.h I3_*): values in [-4,3] stored per
- * 64-input group as 24 bytes = 16B low plane (2 bits/val, int2 layout) + 8B high plane
- * (1 bit/val), plus ONE f32 scale PER GROUP (s has O*ceil(I/64) entries, not O). 3.5
- * bits/weight effective — the quality/size sweet spot measured in the #132 ablation.
- * fmt=8 (native FP8-e4m3 passthrough, resident/quality-core tier -- see quant.h's
- * FP8_BLOCK/e4m3_decode/matmul_fp8): q8 holds O*I raw e4m3 bytes, ONE byte per weight,
- * byte-identical layout to fmt=1's weight bytes (q4 is unused/NULL, same as fmt=1) --
- * disambiguated from fmt=1 (and, at small [O,I], from fmt=6 -- see below) purely by
- * scale geometry, see qt_resolve_fmt's "THE DESIGN LANDMINE" comment further down.
- * s holds ONE f32 scale PER 128x128 BLOCK, ceil(O/128)*ceil(I/128) entries total
- * (row-major: block-row-major then block-col), NOT O and NOT O*ceil(I/gs) --
- * qt_bytes()/qt_scale_bytes() below are the authoritative byte-count formulas. The
- * scale ENCODING is itself a declared PROPERTY of this format, not a hardcoded
- * constant -- f32 (4 bytes/block, what's above) is the value THIS build
- * implements; qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment
- * documents why (a DeepSeek-V4 checkpoint ships this identical weight geometry
- * with a UE8M0 scale encoding instead) and how an unimplemented encoding is
- * recognized and refused by name rather than silently misread.
- * gs is unused (0) for fmt=8, same as fmt 1/2/3. */
-/* ---- PRIVATE ORDINAL BLOCK CONVENTION ------------------------------------
- * fmt values 0-8 are upstream-assigned, public, stable ordinals -- do not
- * reuse or renumber them (fmt=8 is the newest member -- see "renumbered"
- * above). fmt values 100+ remain this repo's PRIVATE/EXPERIMENTAL
- * block for any OTHER in-flight format proposal: ordinals a branch mints for
- * itself during development so it can't collide with a number upstream claims
- * out from under it. That collision has now bitten this SAME format twice:
- * first when #465's E8/IQ3 proposal claimed its original private number,
- * fmt=6, upstream while this branch was still developing against it (forcing
- * the re-mint to fmt=100 -- see upstream_contribution/FORMATS_registry_draft.md
- * for the incident that prompted the rule); and again when #705 merged MXFP4
- * as fmt=7 while this PR sat open already holding the maintainer-assigned
- * ordinal 7 from #524, forcing the 7 -> 8 renumber recorded here. Ordinals
- * are only settled by MERGE into dev, not by assignment on an open PR --
- * docs/FORMATS.md (PR 2 of this pair) is the registry meant to make the
- * next claim visible before it lands.
- *
- * A PRIVATE-BLOCK ordinal is an internal enum value only -- qt_resolve_fmt
- * (below) infers format purely from byte arithmetic; the container on disk
- * carries no format ordinal at all. (A self-describing container stamp that
- * would persist a format's NAME, not its ordinal, is a follow-up proposal --
- * see qt_resolve_fmt's own note on where that plumbing would attach -- not
- * present in this build.) Nothing outside this binary's own compiled code
- * ever observes a 100+ number, so renumbering one later (e.g. when a format
- * is upstreamed and assigned a real public ordinal, as has now happened twice
- * for fmt=8) is a pure find-and-replace with zero on-disk or cross-version
- * compatibility impact.
- *
- * Rule for adding a new format to this branch or a future one: claim the next
- * unused 100+ integer, never a number already claimed upstream (check dev AND
- * open PRs before picking one -- dev alone was not enough to prevent either of
- * fmt=8's two renumbers) or by another in-flight private format. Never ship a
- * 100+ ordinal as a public default/committed-upstream value -- the real
- * ordinal is only settled when the format MERGES into dev, exactly as fmt=8's
- * two renumbers demonstrate. */
-typedef struct {
-    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
-#ifdef COLI_CUDA
-    ColiCudaTensor *cuda;
-#endif
-#ifdef COLI_VULKAN
-    ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
-#endif
-    int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
-} QT;
+/* Cfg, QT, Layer, ESlot, KVState, DecodeRow, Model live in engine.h. Included
+ * HERE — after st.h and backend_cuda.h, whose types (shards, ColiCudaTensor,
+ * COLI_CUDA_MAX_DEVICES) engine.h references. */
+#include "engine.h"
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==0) return n*4;
@@ -288,134 +201,6 @@ static void qt_wire_split(const QT *t, int64_t *weight_b, int64_t *scale_b){
     *scale_b = qt_scale_bytes(t);
     *weight_b = qt_bytes(t) - *scale_b;
 }
-
-typedef struct {
-    float *in_ln, *post_ln;
-    /* MLA (densa, quantizzata) */
-    QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
-#ifdef COLI_CUDA
-    ColiCudaTensor *kv_b_shard[COLI_CUDA_MAX_DEVICES];
-    int shard_h0[COLI_CUDA_MAX_DEVICES],shard_hn[COLI_CUDA_MAX_DEVICES],n_kv_b_shard;
-    int shared_w4a16_failed;
-#endif
-    int sparse;
-    /* dense mlp (sparse==0) */
-    QT gate_proj, up_proj, down_proj;
-    /* moe (sparse==1) */
-    float *router, *router_bias;                 /* router f32 (sensibile) */
-#ifdef COLI_CUDA
-    void *router_cuda, *router_bias_cuda;        /* device router (#431 PR-A), lazy-uploaded */
-    int router_cuda_bad;                         /* upload failed once: stay on the CPU router */
-#endif
-    QT sh_gate, sh_up, sh_down;                  /* shared expert */
-} Layer;
-
-/* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
- * VISTE dentro `slab` (una sola pread coalescente); nel fallback hanno buffer propri.
- * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
- * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
-typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used;
-                 /* pin-arena backing (#419): when set, slab/fslab are interior
-                  * slices of a per-layer arena and must never be free()d —
-                  * expert_host_release detaches them, expert_host_ensure
-                  * re-attaches. NULL for every individually-allocated slot. */
-                 uint8_t *aslab; float *afslab; } ESlot;
-
-typedef struct {
-    float **Lc, **Rc, **Ic;
-    int *kv_start, max_t;
-    int disk_nrec;
-    char disk_path[2048];
-    FILE *disk_fp;       /* kept-open handle: fopen once, fwrite per turn, fclose at exit (#4) */
-    uint8_t *disk_buf;   /* staging buffer: one contiguous record per position (#1) */
-    int64_t disk_buf_cap;
-} KVState;
-
-typedef struct {
-    KVState *kv;
-    int token, pos;
-} DecodeRow;
-
-typedef struct {
-    Cfg c; shards S;
-    int ebits, dbits;                            /* bit expert / bit densa */
-    QT embed, lm_head; float *final_norm;
-    Layer *L;
-    /* KV-cache MLA COMPRESSA: per token si tiene solo il latente normato [kv_lora] e
-     * k_rot [qk_rope] (576 vs 32768 valori/token). k_nope e value si ricostruiscono al
-     * volo con kv_b. E' cio' che rende gestibile il contesto su 15 GB (64 teste, no GQA). */
-    float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
-    int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
-    KVState *kv;
-    ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
-    float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
-    float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
-#ifdef COLI_VULKAN
-    int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
-#endif
-    ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
-    ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
-    uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
-    uint32_t **eheat;                            /* calore recente per promotion/demotion live */
-    uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
-    /* DISK-CLASS: PRIVATE recency state, read only by expert_classify(). Private --
-     * not the real elast/eaccess_clock -- kept fully separate so DISK-CLASS's bookkeeping
-     * can never read from or write into stock eviction state: every DISK-CLASS write lives
-     * inside its own need_classify/dc_on gate, so "byte-identical with PROF=0" is provable
-     * by construction instead of by argument. (Historical note: when this was first written,
-     * the Metal pre-routed FASE A path (g_pre_idx) never bumped the real elast/eaccess_clock
-     * -- on Metal decode the real clock froze at end of prefill, so REPIN's LRU tie-breaker
-     * ran on stale recency for the rest of the run. That was an upstream defect; it has since
-     * been reported and fixed (#417, cfcc742) -- FASE A now bumps the real clock too. The
-     * private clock is retained anyway: separation from stock state is the stronger property,
-     * independent of whether the real clock is correct.) elast_dc/eaccess_clock_dc tick in
-     * BOTH FASE A paths, under the same need_classify gate, at the same rate the real clock
-     * ticks on the CPU path (one per selected (position,expert)) -- so the
-     * COLI_DISKCLASS_WINDOW window keeps its meaning in every mode. elast_pre snapshots
-     * elast_dc just BEFORE this call's own bump (see the touched[] guard in FASE A) --
-     * classifying against the live array would read the bump routing just made a few lines
-     * above the load that needed it, so a giant cold prefill burst would score every expert
-     * "just accessed" and get called warm. Recency alone (not eheat's access COUNT): a count
-     * never decays, so an expert hot early in a long session would keep reading "warm" long
-     * after it dropped out of the working set. Same shape/allocation as elast; NULL for dense
-     * layers. */
-    uint32_t **elast_dc, **elast_pre, eaccess_clock_dc;
-    /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
-    int has_dsa;
-    QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
-    float **ix_knw, **ix_knb;                    /* k_norm (LayerNorm, eps 1e-6) */
-    float **Ic;                                  /* alias KVState: cache indexer [max_t*hd] */
-    int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
-    /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
-    int has_mtp; Layer mtpL; QT eh_proj;
-    float *enorm, *hnorm, *mtp_norm;
-    float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
-    uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
-    int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
-    uint64_t eclock, hits, miss, ereq;
-    uint64_t hit_pin, hit_ecache;                /* split di hits per tier (#336): pin vs LRU ecache */
-    uint64_t hit_vk;                             /* VK VRAM tier hits (registry-served, no RAM load) */
-    uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
-    uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
-    uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
-    uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
-    double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
-    double t_ewait, t_emm, t_ecpu, t_egpu, t_route, t_p2p, t_attn, t_kvb, t_head;
-    uint64_t n_p2p;                              /* P0 execution profile: tier split + residual hops */
-    uint64_t cpu_expert_rows; int64_t cpu_expert_bytes;
-                                                 /* profiling: dove va il tempo (wall del
-                                                  * thread di compute; il servizio disco
-                                                  * overlappato vive in g_edisk_ns) */
-    double t_aproj,t_acore,t_aout;                     /* attention breakdown */
-    int64_t resident_bytes;
-    /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
-     * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
-    int ld_ctx;
-    uint64_t miss_draft, miss_absorb;            /* miss in moe() per contesto */
-    uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
-    uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
-} Model;
 
 #include "quant.h"
 static int g_no_fused_pair=0;
@@ -1011,6 +796,7 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
                           * non vengono stampate. Solo misura: nessun effetto sull'output. */
 
 #include "sample.h"
+#include "antiprompt.h"                            /* text-level stop sequences (role-marker leak) */
 #include "kv_persist.h"
 #include "telemetry.h"
 
@@ -1206,6 +992,11 @@ static jval* cfg_root(const char *snap, char **arena){
     if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",p,(long)got,n);
     return json_parse(b,arena);
 }
+/* Selected model architecture. Set in load_cfg from config.json's
+ * "architectures"; the engine refuses an unregistered model before touching weights. */
+static const ModelArch *g_arch=NULL;
+static ModelOps g_ops;                       /* forward-pass vtable, bound from g_arch in load_cfg */
+static void model_ops_bind(const ModelArch *a);   /* defined after attention_rows/moe */
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
 static void load_cfg(Cfg *c, const char *snap){
     char *ar=NULL; jval *r=cfg_root(snap,&ar);
@@ -1217,6 +1008,34 @@ static void load_cfg(Cfg *c, const char *snap){
     c->qk_nope=gi(r,"qk_nope_head_dim"); c->qk_rope=gi(r,"qk_rope_head_dim");
     c->v_head=gi(r,"v_head_dim"); c->n_shared=gi(r,"n_shared_experts"); c->vocab=gi(r,"vocab_size");
     c->n_group=gi(r,"n_group"); c->topk_group=gi(r,"topk_group");
+    /* Architecture gate: select the model family from config.json's
+     * "architectures" and refuse anything unregistered up front, instead of
+     * silently mis-reading a different model's weights. */
+    { jval *ap=json_get(r,"architectures");
+      const char *an=(ap&&ap->t==J_ARR&&ap->len>0&&ap->kids[0]->t==J_STR)?ap->kids[0]->str:NULL;
+      /* Fallback to "model_type": HF configs always carry it, but "architectures"
+       * can be null (e.g. the tiny make_glm_oracle.py fixture). */
+      if(!an){ jval *mt=json_get(r,"model_type"); if(mt&&mt->t==J_STR) an=mt->str; }
+      /* Unknown NAMES are refused. A config with NEITHER field predates the
+       * registry (the engine was GLM-only) and must keep loading: assume the
+       * historical default and say so. */
+      int arch_assumed = 0;
+      if(!an){ an="GlmMoeDsaForCausalLM"; arch_assumed=1; }
+      g_arch=model_arch_select(an);
+      if(!g_arch){
+          fprintf(stderr,"colibri: unsupported model architecture: \"%s\"\n  supported: %s\n",
+                  an, model_arch_supported());
+          exit(1);
+      }
+      if(arch_assumed)
+          fprintf(stderr,"colibri: no 'architectures'/'model_type' in config.json - "
+                         "assuming %s\n", g_arch->name);
+      if(g_arch->kv_compressed && c->kv_lora<=0)
+          fprintf(stderr,"colibri: warning: arch %s expects compressed KV but kv_lora_rank=%d\n",
+                  g_arch->name,c->kv_lora);
+      fprintf(stderr,"[arch] %s -> %s\n", g_arch->name, g_arch->family);
+      model_ops_bind(g_arch);                    /* select the forward-pass vtable */
+    }
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
@@ -3846,7 +3665,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
-        for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+(l->router_bias?l->router_bias[e]:0.f); }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         if(do_cache_route){
@@ -4901,7 +4720,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         rmsnorm(nrm, hc, l->post_ln, D, c->eps);
         free(snrm); free(sg); free(su); free(sout); free(hc);
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + l->router_bias[e];
+        for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + (l->router_bias?l->router_bias[e]:0.f);
         int *pred = la_pred[2][target];
         for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
@@ -4915,7 +4734,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
     /* Baseline kinds 0 and 1: pure router on the given state */
     rmsnorm(nrm,h,l->post_ln,D,c->eps);
     matmul(ch,nrm,l->router,1,D,E);
-    for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+    for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+(l->router_bias?l->router_bias[e]:0.f);
     int *pred=la_pred[kind][target];
     for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
         for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
@@ -5258,7 +5077,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             rmsnorm(nrm, xs, l->post_ln, D, c->eps);
         }
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+(l->router_bias?l->router_bias[e]:0.f);
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
@@ -5438,6 +5257,16 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
 }
 #endif
 
+/* Bind the forward-pass vtable from the selected architecture. GLM — and any
+ * MLA/DSA family the engine core handles natively — uses the built-in attention
+ * and MoE; another arch overrides these with its own implementations here, e.g.:
+ *   if(!strcmp(a->name,"NewMoeForCausalLM")){
+ *       g_ops.attention_rows = new_attention_rows; g_ops.moe = new_moe; } */
+static void model_ops_bind(const ModelArch *a){
+    g_ops.attention_rows = attention_rows;       /* GLM / engine-core default */
+    g_ops.moe            = moe;
+    (void)a;
+}
 static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int pos_base,
                                KVState *const *kvs, const int *positions, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
@@ -5531,7 +5360,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     }
 #endif
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
-    attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
+    g_ops.attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
@@ -5539,7 +5368,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
         la_predict(m,li+1,x,2);  /* two-step: shared-expert-corrected prediction */
     }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
-    if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    if(l->sparse) g_ops.moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
@@ -6028,6 +5857,13 @@ static int grammar_draft(GrDraft *g, int *draft, int cap){
  * killing the engine; :more can continue the interrupted answer. Armed only
  * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
 static volatile sig_atomic_t g_intr=0;
+/* Text antiprompt hit (set by emit_stream, read by spec_decode). Distinct from g_intr:
+ * g_intr is a user Ctrl-C, g_astop is the model emitting a stop STRING. */
+static volatile sig_atomic_t g_astop=0;
+/* Default needles: the GLM/ChatML role delimiters a turn should never contain. When
+ * Qwen3 lands, model_ops_bind can point this at its <|im_start|>/<|im_end|> set.
+ * Override or disable with COLI_ANTIPROMPT (';'-separated; empty/"off"/"0" = off). */
+#define COLI_ANTIPROMPT_DEFAULT "<|user|>;<|assistant|>;<|observation|>;<|system|>"
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
 static void intr_install(void){
@@ -6051,6 +5887,7 @@ static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
+    g_astop=0;                           /* fresh per decode burst; emit_stream raises it */
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
     /* #163: draft del modello attivi -> pin della famiglia di kernel per draft+verifica.
@@ -6066,11 +5903,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
-    while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
-        /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
+    while(emitted<n_new && !done && !g_intr && !g_astop && !g_mux_stop && !g_mux_cancel){
+        /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678); g_astop: antiprompt (hold-back) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
+        if(g_astop) break;                          /* emitted text completed a stop string */
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
@@ -6140,6 +5978,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
             gr_feed(&g_grd,draft[k]); k++;
+            if(g_astop){ done=1; break; }               /* stop string inside an accepted draft */
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
@@ -6166,11 +6005,19 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 typedef struct { int *dst; int n; } EmitStore;
 static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
 /* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
-typedef struct { Tok *T; Model *m; double t0; int count; int quiet; } EmitStream;
+typedef struct { Tok *T; Model *m; double t0; int count; int quiet; Antiprompt ap; } EmitStream;
 static void emit_stream(int t, void *ud){
     EmitStream *e=(EmitStream*)ud; char dec[64];
-    int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
-    if(!e->quiet && ++e->count%16==0){ double tt=e->m->hits+e->m->miss;
+    int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0;
+    /* Stream through the antiprompt filter: prints the safe prefix, holds back a short
+     * tail, and drops the delimiter + rest on a match (raising g_astop so spec_decode
+     * stops). Never prints the role marker the model leaked as text. */
+    if(ap_push(&e->ap,dec,dn,stdout)) g_astop=1;
+    fflush(stdout);
+    /* COLI_TPS_EVERY: heartbeat cadence in tokens (0 = silent). */
+    static int every=-1;
+    if(every<0){ const char *v=getenv("COLI_TPS_EVERY"); every=v?atoi(v):8; if(every<0) every=8; }
+    if(!e->quiet && every && ++e->count%every==0){ double tt=e->m->hits+e->m->miss;
         if(g_cache_route && e->m->route_slots){
             double swap=100.0*e->m->route_swaps/e->m->route_slots;
             fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
@@ -6182,6 +6029,13 @@ static void emit_stream(int t, void *ud){
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         }
     }
+}
+/* Init an EmitStream and arm its text antiprompt in one place (so a new call site
+ * can't forget ap_config, and to sidestep aggregate-init warnings for the ap field). */
+static void emit_stream_init(EmitStream *e, Tok *T, Model *m, double t0, int quiet){
+    memset(e,0,sizeof(*e));
+    e->T=T; e->m=m; e->t0=t0; e->quiet=quiet;
+    ap_config(&e->ap, (g_arch&&g_arch->chat_antiprompt)?g_arch->chat_antiprompt:COLI_ANTIPROMPT_DEFAULT);
 }
 
 /* teacher-forcing: un solo forward su ids[S], argmax per posizione in pred[S] */
@@ -6589,7 +6443,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
+    int eos=tok_id_of(&T, (g_arch&&g_arch->chat_eos&&g_arch->chat_eos[0])?g_arch->chat_eos:"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
@@ -6631,9 +6485,10 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
     double t=now_s();
-    EmitStream es={&T,m,t,0,0};
+    EmitStream es; emit_stream_init(&es,&T,m,t,0);
     grammar_reset(&g_grd);
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL,NULL);
+    ap_flush(&es.ap, stdout);                        /* emit any held tail (no match this turn) */
     double dt=now_s()-t;
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
@@ -7230,7 +7085,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
+    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T, (g_arch&&g_arch->chat_eos&&g_arch->chat_eos[0])?g_arch->chat_eos:"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
@@ -7408,7 +7263,7 @@ static void run_serve(Model *m, const char *snap){
 #endif
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
+    int eos=tok_id_of(&T, (g_arch&&g_arch->chat_eos&&g_arch->chat_eos[0])?g_arch->chat_eos:"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
@@ -7445,9 +7300,9 @@ static void run_serve(Model *m, const char *snap){
             uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
             ProfBase pb; if(g_prof) prof_base(m,&pb);
             float *logit=step(m,hist+len-1,1,len-1);
-            EmitStream es={&T,m,now_s(),0,1};
+            EmitStream es; emit_stream_init(&es,&T,m,now_s(),1);
             int prod=0;
-            if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len,NULL);
+            if(cur>0){ prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len,NULL); ap_flush(&es.ap,stdout); }
             else free(logit);
             double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
@@ -7483,10 +7338,15 @@ static void run_serve(Model *m, const char *snap){
             g_temp=(float)rt; g_nuc=(float)rp;
         } else { active=0; sc=&ctx[0]; kv_bind(m,&sc->kv); }
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
-        /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
-         * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
-         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita. */
-        const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
+        /* Chat template comes from the selected arch (arch.h chat_* fields): GLM uses
+         * [gMASK]<sop> + <|user|>..<|assistant|>..<think></think>; Qwen uses ChatML
+         * <|im_start|>..<|im_end|>. Wrong template = the model babbles and never stops.
+         * THINK=1 opens the reasoning block; the default suppresses it (nothink). */
+        const char *a_prefix = (g_arch&&g_arch->chat_prefix)? g_arch->chat_prefix : "[gMASK]<sop>";
+        const char *a_turn   = (g_arch&&g_arch->chat_turn)?   g_arch->chat_turn   : "<|user|>%s<|assistant|>%s";
+        const char *tk = (getenv("THINK")&&atoi(getenv("THINK")))
+            ? ((g_arch&&g_arch->chat_think)?   g_arch->chat_think   : "<think>")
+            : ((g_arch&&g_arch->chat_nothink)? g_arch->chat_nothink : "<think></think>");
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
@@ -7503,12 +7363,13 @@ static void run_serve(Model *m, const char *snap){
                 active,len,prompt_tokens,k);
             free(tmp);
         } else {
-            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
+            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"%s",a_prefix);
+                       bl+=snprintf(buf+bl,(1<<16)-bl,a_turn,input,tk); }
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
             if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
-                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
+                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"%s",a_prefix);
+                                 bl+=snprintf(buf+bl,(1<<16)-bl,a_turn,input,tk); }
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
                 prompt_tokens=k;
@@ -7527,10 +7388,10 @@ static void run_serve(Model *m, const char *snap){
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
-        EmitStream es={&T,m,now_s(),0,1};
+        EmitStream es; emit_stream_init(&es,&T,m,now_s(),1);
         int prod=0;
         grammar_reset(&g_grd);                         /* nuova risposta = nuovo documento (MORE invece continua) */
-        if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len,NULL);
+        if(cur>0){ prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len,NULL); ap_flush(&es.ap,stdout); }
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
         double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
