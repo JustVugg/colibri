@@ -45,6 +45,7 @@
  *   K3_PIPE=0|1          overlap expert loads with compute (default 1)
  *   K3_LOAD_THREADS=N    loader threads for K3_PIPE (default 4)
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
+ *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
  *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
@@ -552,108 +553,154 @@ static void res_mix(float *out, const float *prefix, const float *bres, int nb, 
     for(int d=0;d<D;d++){ float a=0; for(int e=0;e<=nb;e++) a+=sc[e]*v[e][d]; out[d]=a; }
 }
 
-/* ---------- KDA layer (single token) ---------- */
-static void kda_forward(Model *m, Layer *l, int li, const float *x, float *out){
+/* ---------- KDA layer (chunk of C tokens; projections batched, recurrence
+ * sequential per token, AVX2 on the state sweeps) ---------- */
+static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Kda *a=&l->a;
     int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
-    float *q=falloc(P), *k=falloc(P), *v=falloc(P), *gp=falloc(P), *on=falloc(P);
-    float *t1=falloc(c->kda_hd), *graw=falloc(P), *braw=falloc(H);
-    w_matmul(q,x,&a->q,1); w_matmul(k,x,&a->k,1); w_matmul(v,x,&a->v,1);
-    w_matmul(gp,x,&a->g,1);
-    matmul(t1,x,a->fa,1,c->hidden,c->kda_hd);
-    matmul(graw,t1,a->fb,1,c->kda_hd,P);
-    matmul(braw,x,a->bp,1,c->hidden,H);
-    /* depthwise causal conv (window: oldest..newest) + SiLU, window rolls forward */
-    float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
-    float *vecs[3]={q,k,v}; float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
-    for(int t=0;t<3;t++){
-        float *win=wins[t], *vec=vecs[t]; const float *cw=taps[t];
-        #pragma omp parallel for schedule(static)
-        for(int d=0;d<P;d++){
-            float *wd=win+(int64_t)d*K;
-            for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
-            wd[K-1]=vec[d];
-            float acc=0; const float *cd=cw+(int64_t)d*K;
-            for(int j=0;j<K;j++) acc+=cd[j]*wd[j];
-            vec[d]=siluf_(acc);
-        }
-    }
+    float *q=falloc((int64_t)C*P), *k=falloc((int64_t)C*P), *v=falloc((int64_t)C*P);
+    float *gp=falloc((int64_t)C*P), *on=falloc((int64_t)C*P);
+    float *t1=falloc((int64_t)C*c->kda_hd), *graw=falloc((int64_t)C*P), *braw=falloc((int64_t)C*H);
+    w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
+    w_matmul(gp,x,&a->g,C);
+    matmul(t1,x,a->fa,C,c->hidden,c->kda_hd);
+    matmul(graw,t1,a->fb,C,c->kda_hd,P);
+    matmul(braw,x,a->bp,C,c->hidden,H);
     float qscale=1.f/sqrtf((float)hd);
-    #pragma omp parallel for schedule(static)
-    for(int h=0;h<H;h++){
-        const float *qh=q+(int64_t)h*hd, *kh=k+(int64_t)h*hd, *vh=v+(int64_t)h*hd;
-        float qn[512], kn[512], alpha[512], kS[512], vt[512], oh[512];
-        float sq=0,sk=0;
-        for(int i=0;i<hd;i++){ sq+=qh[i]*qh[i]; sk+=kh[i]*kh[i]; }
-        sq=1.f/sqrtf(sq+1e-6f); sk=1.f/sqrtf(sk+1e-6f);
-        for(int i=0;i<hd;i++){ qn[i]=qh[i]*sq*qscale; kn[i]=kh[i]*sk; }
-        for(int i=0;i<hd;i++){
-            float z=graw[(int64_t)h*hd+i]+a->dt[(int64_t)h*hd+i];
-            alpha[i]=expf(c->gate_lb*sigmoidf_(a->A[h]*z));
+    for(int t=0;t<C;t++){
+        float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
+        float *gpt=gp+(int64_t)t*P, *ont=on+(int64_t)t*P;
+        const float *rgt=graw+(int64_t)t*P, *bt=braw+(int64_t)t*H;
+        /* depthwise causal conv (window: oldest..newest) + SiLU, rolls forward */
+        float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
+        float *vecs[3]={qt,kt,tv}; float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
+        for(int w2=0;w2<3;w2++){
+            float *win=wins[w2], *vec=vecs[w2]; const float *cw=taps[w2];
+            #pragma omp parallel for schedule(static)
+            for(int d=0;d<P;d++){
+                float *wd=win+(int64_t)d*K;
+                for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
+                wd[K-1]=vec[d];
+                float acc=0; const float *cd=cw+(int64_t)d*K;
+                for(int j=0;j<K;j++) acc+=cd[j]*wd[j];
+                vec[d]=siluf_(acc);
+            }
         }
-        float beta=sigmoidf_(braw[h]);
-        float *S=m->kstate[li]+(int64_t)h*hd*hd;
-        memset(kS,0,hd*sizeof(float));
-        for(int kk=0;kk<hd;kk++){
-            float *row=S+(int64_t)kk*hd; float al=alpha[kk], kv=kn[kk];
-            for(int vv=0;vv<hd;vv++){ row[vv]*=al; kS[vv]+=kv*row[vv]; }
+        #pragma omp parallel for schedule(static)
+        for(int h=0;h<H;h++){
+            const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
+            float qn[512], kn[512], alpha[512], kS[512], vt[512], oh[512];
+            float sq=0,sk=0;
+            for(int i=0;i<hd;i++){ sq+=qh[i]*qh[i]; sk+=kh[i]*kh[i]; }
+            sq=1.f/sqrtf(sq+1e-6f); sk=1.f/sqrtf(sk+1e-6f);
+            for(int i=0;i<hd;i++){ qn[i]=qh[i]*sq*qscale; kn[i]=kh[i]*sk; }
+            for(int i=0;i<hd;i++){
+                float z=rgt[(int64_t)h*hd+i]+a->dt[(int64_t)h*hd+i];
+                alpha[i]=expf(c->gate_lb*sigmoidf_(a->A[h]*z));
+            }
+            float beta=sigmoidf_(bt[h]);
+            float *S=m->kstate[li]+(int64_t)h*hd*hd;
+            memset(kS,0,sizeof(kS));
+#ifdef __AVX2__
+            if(!(hd&7)){
+                for(int kk=0;kk<hd;kk++){
+                    float *row=S+(int64_t)kk*hd;
+                    __m256 al8=_mm256_set1_ps(alpha[kk]), kv8=_mm256_set1_ps(kn[kk]);
+                    for(int vv=0;vv<hd;vv+=8){
+                        __m256 r=_mm256_mul_ps(_mm256_loadu_ps(row+vv),al8);
+                        _mm256_storeu_ps(row+vv,r);
+                        _mm256_storeu_ps(kS+vv,_mm256_fmadd_ps(kv8,r,_mm256_loadu_ps(kS+vv)));
+                    }
+                }
+                for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
+                memset(oh,0,sizeof(oh));
+                for(int kk=0;kk<hd;kk++){
+                    float *row=S+(int64_t)kk*hd;
+                    __m256 kv8=_mm256_set1_ps(kn[kk]), qq8=_mm256_set1_ps(qn[kk]);
+                    for(int vv=0;vv<hd;vv+=8){
+                        __m256 r=_mm256_fmadd_ps(kv8,_mm256_loadu_ps(vt+vv),_mm256_loadu_ps(row+vv));
+                        _mm256_storeu_ps(row+vv,r);
+                        _mm256_storeu_ps(oh+vv,_mm256_fmadd_ps(qq8,r,_mm256_loadu_ps(oh+vv)));
+                    }
+                }
+            } else {
+#endif
+            for(int kk=0;kk<hd;kk++){
+                float *row=S+(int64_t)kk*hd; float al=alpha[kk], kv=kn[kk];
+                for(int vv=0;vv<hd;vv++){ row[vv]*=al; kS[vv]+=kv*row[vv]; }
+            }
+            for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
+            memset(oh,0,sizeof(oh));
+            for(int kk=0;kk<hd;kk++){
+                float *row=S+(int64_t)kk*hd; float kv=kn[kk], qq=qn[kk];
+                for(int vv=0;vv<hd;vv++){ row[vv]+=kv*vt[vv]; oh[vv]+=qq*row[vv]; }
+            }
+#ifdef __AVX2__
+            }
+#endif
+            /* per-head RMSNorm * sigmoid(full-rank gate) */
+            double ms=0; for(int vv=0;vv<hd;vv++) ms+=(double)oh[vv]*oh[vv];
+            float r=1.f/sqrtf((float)(ms/hd)+c->eps);
+            float *dst=ont+(int64_t)h*hd;
+            for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
         }
-        for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
-        memset(oh,0,hd*sizeof(float));
-        for(int kk=0;kk<hd;kk++){
-            float *row=S+(int64_t)kk*hd; float kv=kn[kk], qq=qn[kk];
-            for(int vv=0;vv<hd;vv++){ row[vv]+=kv*vt[vv]; oh[vv]+=qq*row[vv]; }
-        }
-        /* per-head RMSNorm * sigmoid(full-rank gate) */
-        double ms=0; for(int vv=0;vv<hd;vv++) ms+=(double)oh[vv]*oh[vv];
-        float r=1.f/sqrtf((float)(ms/hd)+c->eps);
-        float *dst=on+(int64_t)h*hd;
-        for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gp[(int64_t)h*hd+vv]);
     }
-    w_matmul(out,on,&a->o,1);
+    w_matmul(out,on,&a->o,C);
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
 }
 
-/* ---------- gated MLA layer (single token, NoPE, absorb) ---------- */
-static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos, float *out){
+/* ---------- gated MLA layer (chunk of C tokens, NoPE, absorb; projections
+ * batched, per-token causal attention — token t attends to 0..pos0+t) ------ */
+static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, int C, float *out){
     Cfg *c=&m->c; Mla *a=&l->m;
     int H=c->n_heads, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora, qr=c->qk_rope;
-    float *qa=falloc(c->q_lora), *qv=falloc((int64_t)H*qh), *ckv=falloc(kvl+qr);
-    float *gv=falloc((int64_t)H*vh), *ctx=falloc((int64_t)H*vh);
-    w_matmul(qa,x,&a->qa,1);
-    rmsnorm_(qa,qa,a->qa_ln,c->q_lora,c->eps);
-    w_matmul(qv,qa,&a->qb,1);
-    w_matmul(ckv,x,&a->kva,1);
-    float *Lrow=m->Lc[li]+(int64_t)pos*kvl, *Rrow=m->Rc[li]+(int64_t)pos*qr;
-    rmsnorm_(Lrow,ckv,a->kva_ln,kvl,c->eps);
-    memcpy(Rrow,ckv+kvl,qr*sizeof(float));           /* NoPE: cached raw, no rotation */
-    w_matmul(gv,x,&a->g,1);
-    int nt=pos+1;
-    #pragma omp parallel for schedule(static)
-    for(int h=0;h<H;h++){
-        const float *qp=qv+(int64_t)h*qh, *qrp=qp+c->qk_nope;
-        int rbase=h*(c->qk_nope+vh);
-        float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
-        for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
-        float *sc=falloc(nt);
-        for(int t=0;t<nt;t++){
-            const float *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
-            float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
-            for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
-            sc[t]=s2*c->attn_scale;
-        }
-        softmax_(sc,nt);
-        float clat[4096]; memset(clat,0,kvl*sizeof(float));
-        for(int t=0;t<nt;t++){
-            const float *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
-            for(int i=0;i<kvl;i++) clat[i]+=s2*Lt[i];
-        }
-        free(sc);
-        float *cx=ctx+(int64_t)h*vh;
-        for(int d=0;d<vh;d++)
-            cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gv[(int64_t)h*vh+d]);
+    float *qa=falloc((int64_t)C*c->q_lora), *qv=falloc((int64_t)C*H*qh);
+    float *ckv=falloc((int64_t)C*(kvl+qr));
+    float *gv=falloc((int64_t)C*H*vh), *ctx=falloc((int64_t)C*H*vh);
+    w_matmul(qa,x,&a->qa,C);
+    for(int t=0;t<C;t++)
+        rmsnorm_(qa+(int64_t)t*c->q_lora,qa+(int64_t)t*c->q_lora,a->qa_ln,c->q_lora,c->eps);
+    w_matmul(qv,qa,&a->qb,C);
+    w_matmul(ckv,x,&a->kva,C);
+    for(int t=0;t<C;t++){                            /* append the whole chunk to the
+                                                      * cache first: token t's scores
+                                                      * only read rows 0..pos0+t */
+        float *Lrow=m->Lc[li]+(int64_t)(pos0+t)*kvl, *Rrow=m->Rc[li]+(int64_t)(pos0+t)*qr;
+        const float *cv=ckv+(int64_t)t*(kvl+qr);
+        rmsnorm_(Lrow,cv,a->kva_ln,kvl,c->eps);
+        memcpy(Rrow,cv+kvl,qr*sizeof(float));        /* NoPE: cached raw, no rotation */
     }
-    w_matmul(out,ctx,&a->o,1);
+    w_matmul(gv,x,&a->g,C);
+    for(int tt=0;tt<C;tt++){
+        int nt=pos0+tt+1;
+        const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
+        float *ctxt=ctx+(int64_t)tt*H*vh;
+        #pragma omp parallel for schedule(static)
+        for(int h=0;h<H;h++){
+            const float *qp=qvt+(int64_t)h*qh, *qrp=qp+c->qk_nope;
+            int rbase=h*(c->qk_nope+vh);
+            float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
+            for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
+            float *sc=falloc(nt);
+            for(int t=0;t<nt;t++){
+                const float *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
+                for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
+                sc[t]=s2*c->attn_scale;
+            }
+            softmax_(sc,nt);
+            float clat[4096]; memset(clat,0,kvl*sizeof(float));
+            for(int t=0;t<nt;t++){
+                const float *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
+                for(int i=0;i<kvl;i++) clat[i]+=s2*Lt[i];
+            }
+            free(sc);
+            float *cx=ctxt+(int64_t)h*vh;
+            for(int d=0;d<vh;d++)
+                cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
+        }
+    }
+    w_matmul(out,ctx,&a->o,C);
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
 }
 
@@ -780,178 +827,252 @@ static void lp_submit(Model *m, int n){
     pthread_mutex_unlock(&g_lp.mx);
 }
 
-/* the full routed-expert pass for one token+layer: resolve (LRU hit or
- * working-set slot), load misses (pipelined with compute under K3_PIPE,
- * else all-parallel up front), compute, promote into the LRU. */
-static void experts_run(Model *m, int li, int n, const int *ids, const float *w,
-                        const float *z, float *u, float *gate, float *up, float *hz){
-    Slot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
-    for(int j=0;j<n;j++){
-        use[j]=slot_find(m,li,ids[j]); qof[j]=-1;
-        if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
-    }
-    if(nmiss){
-        if(g_k3_pipe){
-            if(!g_lp.started) lp_start();
+/* the general expert pass for one layer over a CHUNK of positions: nu unique
+ * experts, expert j applied to pcnt[j] positions (poslist/wlist rows starting
+ * at pfirst[j]). Loads run in blocks of <=LP_MAX working-set slots, pipelined
+ * with compute under K3_PIPE (expert j's matmuls overlap expert j+1's read),
+ * else all-parallel up front. Z/U are [C, stride] position-major. */
+static void experts_apply_union(Model *m, int li, int nu, const int *uids,
+                                const int *pfirst, const int *pcnt,
+                                const int *poslist, const float *wlist,
+                                const float *Z, int stride, float *U,
+                                float *gate, float *up, float *hz){
+    for(int base=0;base<nu;base+=LP_MAX){
+        int nb=nu-base<LP_MAX?nu-base:LP_MAX;
+        Slot *use[LP_MAX]; int missk[LP_MAX]; int qof[LP_MAX]; int nmiss=0;
+        for(int j=0;j<nb;j++){
+            use[j]=slot_find(m,li,uids[base+j]); qof[j]=-1;
+            if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
         }
-        if(g_k3_pipe){
-            for(int q=0;q<nmiss;q++){
-                g_lp.job[q].li=li; g_lp.job[q].eid=ids[missk[q]]; g_lp.job[q].s=&m->ws[q];
+        if(nmiss){
+            if(g_k3_pipe && !g_lp.started) lp_start();
+            if(g_k3_pipe){
+                for(int q=0;q<nmiss;q++){
+                    g_lp.job[q].li=li; g_lp.job[q].eid=uids[base+missk[q]]; g_lp.job[q].s=&m->ws[q];
+                }
+                lp_submit(m,nmiss);
+            } else {
+                double t0=now_s();
+                #pragma omp parallel for schedule(dynamic,1)
+                for(int q=0;q<nmiss;q++) expert_read(m,li,uids[base+missk[q]],&m->ws[q]);
+                m->t_eload+=now_s()-t0;
             }
-            lp_submit(m,nmiss);
-        } else {
-            double t0=now_s();
-            #pragma omp parallel for schedule(dynamic,1)
-            for(int q=0;q<nmiss;q++) expert_read(m,li,ids[missk[q]],&m->ws[q]);
-            m->t_eload+=now_s()-t0;
+            m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
         }
-        m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
-    }
-    for(int j=0;j<n;j++){
-        if(g_k3_pipe && qof[j]>=0 &&
-           !atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire)){
-            double t0=now_s();          /* t_eload = UN-hidden I/O (wait) time */
-            while(!atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire))
-                usleep(50);
-            m->t_eload+=now_s()-t0;
+        for(int j=0;j<nb;j++){
+            if(g_k3_pipe && qof[j]>=0 &&
+               !atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire)){
+                double t0=now_s();      /* t_eload = UN-hidden I/O (wait) time */
+                while(!atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire))
+                    usleep(50);
+                m->t_eload+=now_s()-t0;
+            }
+            int f=pfirst[base+j];
+            for(int p2=0;p2<pcnt[base+j];p2++){
+                int t=poslist[f+p2];
+                expert_apply(m,use[j],Z+(int64_t)t*stride,wlist[f+p2],
+                             U+(int64_t)t*stride,gate,up,hz);
+            }
         }
-        expert_apply(m,use[j],z,w[j],u,gate,up,hz);
-    }
-    /* promotion: swap the freshly-read slots into the layer LRU */
-    LCache *lc=&m->ecache[li];
-    int promo = nmiss<lc->cap ? nmiss : lc->cap;
-    for(int a=0;a<promo;a++){
-        int q=nmiss-1-a; Slot *dst;
-        if(lc->n<lc->cap) dst=&lc->s[lc->n++];
-        else { int lru=0; for(int i=1;i<lc->n;i++) if(lc->s[i].used<lc->s[lru].used) lru=i; dst=&lc->s[lru]; }
-        Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
-        dst->used=++m->clock;
+        /* promotion: swap the freshly-read slots into the layer LRU */
+        LCache *lc=&m->ecache[li];
+        int promo = nmiss<lc->cap ? nmiss : lc->cap;
+        for(int a=0;a<promo;a++){
+            int q=nmiss-1-a; Slot *dst;
+            if(lc->n<lc->cap) dst=&lc->s[lc->n++];
+            else { int lru=0; for(int i=1;i<lc->n;i++) if(lc->s[i].used<lc->s[lru].used) lru=i; dst=&lc->s[lru]; }
+            Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
+            dst->used=++m->clock;
+        }
     }
 }
 
-static void moe_forward(Model *m, Layer *l, int li, const float *x, float *out){
+static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
-    float *sco=falloc(E);
-    matmul(sco,x,o->router,1,c->hidden,E);
-    for(int e=0;e<E;e++) sco[e]=sigmoidf_(sco[e]);
-    int idx[64]; float wsel[64];
-    for(int kk=0;kk<K;kk++){
-        int best=-1; float bv=-1e30f;
-        for(int e=0;e<E;e++){
-            int taken=0; for(int j=0;j<kk;j++) if(idx[j]==e){taken=1;break;}
-            float sv=sco[e]+o->rbias[e];
-            if(!taken&&sv>bv){ bv=sv; best=e; }
-        }
-        idx[kk]=best; wsel[kk]=sco[best];             /* weight = RAW sigmoid score */
-    }
-    { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];
-      for(int kk=0;kk<K;kk++) wsel[kk]/=(sm+1e-20f); }
-    /* K3_TOPP: drop the low-weight tail of the top-16 — the only lever that
-     * cuts expert I/O AND compute proportionally. Weights renormalize over
-     * the kept set (GLM's TOPP semantics). Quality-gate via K3_LOGITS. */
-    if(g_k3_topp>0.f && g_k3_topp<1.f){
-        for(int a2=1;a2<K;a2++){ int e=idx[a2]; float w2=wsel[a2]; int b2=a2-1;
-            while(b2>=0&&wsel[b2]<w2){ idx[b2+1]=idx[b2]; wsel[b2+1]=wsel[b2]; b2--; }
-            idx[b2+1]=e; wsel[b2+1]=w2; }
-        float cum=0; int keep=K;
-        for(int kk=0;kk<K;kk++){ cum+=wsel[kk]; if(cum>=g_k3_topp){ keep=kk+1; break; } }
-        if(keep<K){
-            float sm=0; for(int kk=0;kk<keep;kk++) sm+=wsel[kk];
-            for(int kk=0;kk<keep;kk++) wsel[kk]/=(sm+1e-20f);
-            K=keep;
-        }
-    }
-    /* keep loads in DISK-OFFSET order (experts are NOT id-ordered inside the
-     * HF shards — measured 169/895; helps the buffered fallback, harmless
-     * under O_DIRECT). WILLNEED prefetch only for the buffered path. */
-    for(int a2=0;a2<K-1;a2++) for(int b2=a2+1;b2<K;b2++){
-        ERef *ea=&m->eref[(int64_t)li*E+idx[a2]], *eb=&m->eref[(int64_t)li*E+idx[b2]];
-        if(eb->fd[0]<ea->fd[0]||(eb->fd[0]==ea->fd[0]&&eb->off[0]<ea->off[0])){
-            int t=idx[a2];idx[a2]=idx[b2];idx[b2]=t; float tw=wsel[a2];wsel[a2]=wsel[b2];wsel[b2]=tw; }
-    }
-    if(!g_k3_direct)
+    float *sco=falloc((int64_t)C*E);
+    matmul(sco,x,o->router,C,c->hidden,E);
+    int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
+    int *keff=malloc((size_t)C*sizeof(int));
+    if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
+    for(int t=0;t<C;t++){
+        float *st=sco+(int64_t)t*E;
+        for(int e=0;e<E;e++) st[e]=sigmoidf_(st[e]);
+        int *idx=idxs+(int64_t)t*K; float *wsel=wsels+(int64_t)t*K;
         for(int kk=0;kk<K;kk++){
-            ERef *er=&m->eref[(int64_t)li*E+idx[kk]];
-            int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
-            if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
-            else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
+            int best=-1; float bv=-1e30f;
+            for(int e=0;e<E;e++){
+                int taken=0; for(int j=0;j<kk;j++) if(idx[j]==e){taken=1;break;}
+                float sv=st[e]+o->rbias[e];
+                if(!taken&&sv>bv){ bv=sv; best=e; }
+            }
+            idx[kk]=best; wsel[kk]=st[best];          /* weight = RAW sigmoid score */
         }
-    float *z=falloc(LT), *u=falloc(LT), *gate=falloc(MI), *up=falloc(MI), *hz=falloc(LT);
-    w_matmul(z,x,&o->lat_down,1);
-    memset(u,0,LT*sizeof(float));
-    experts_run(m,li,K,idx,wsel,z,u,gate,up,hz);
-    rmsnorm_(u,u,o->lat_norm,LT,c->eps);
-    w_matmul(out,u,&o->lat_up,1);
+        { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];
+          for(int kk=0;kk<K;kk++) wsel[kk]/=(sm+1e-20f); }
+        int Kt=K;
+        /* K3_TOPP: drop the low-weight tail — the only lever that cuts expert
+         * I/O AND compute proportionally. Weights renormalize over the kept
+         * set (GLM's TOPP semantics). Quality-gate via K3_LOGITS. */
+        if(g_k3_topp>0.f && g_k3_topp<1.f){
+            for(int a2=1;a2<Kt;a2++){ int e=idx[a2]; float w2=wsel[a2]; int b2=a2-1;
+                while(b2>=0&&wsel[b2]<w2){ idx[b2+1]=idx[b2]; wsel[b2+1]=wsel[b2]; b2--; }
+                idx[b2+1]=e; wsel[b2+1]=w2; }
+            float cum=0; int keep=Kt;
+            for(int kk=0;kk<Kt;kk++){ cum+=wsel[kk]; if(cum>=g_k3_topp){ keep=kk+1; break; } }
+            if(keep<Kt){
+                float sm=0; for(int kk=0;kk<keep;kk++) sm+=wsel[kk];
+                for(int kk=0;kk<keep;kk++) wsel[kk]/=(sm+1e-20f);
+                Kt=keep;
+            }
+        }
+        keff[t]=Kt;
+    }
+    float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
+    float *gate=falloc(MI), *up=falloc(MI), *hz=falloc(LT);
+    w_matmul(z,x,&o->lat_down,C);
+    memset(u,0,(size_t)C*LT*sizeof(float));
+    /* union across the chunk: each unique expert loads ONCE and applies to
+     * every position that selected it (position lists via counting sort).
+     * With QB-flat routing the dedup is modest (~15% at C=32), but the loads
+     * arrive as one deep burst for the NVMe and the dense side above/below
+     * batches perfectly. */
+    {
+        int *map=malloc((size_t)E*sizeof(int));
+        int *uid=malloc((size_t)C*K*sizeof(int));
+        int *pcnt=malloc((size_t)C*K*sizeof(int)), *pfirst=malloc((size_t)C*K*sizeof(int));
+        int *poslist=malloc((size_t)C*K*sizeof(int)); float *wlist=falloc((int64_t)C*K);
+        int *cur=malloc((size_t)C*K*sizeof(int));
+        if(!map||!uid||!pcnt||!pfirst||!poslist||!cur){fprintf(stderr,"OOM moe union\n");exit(1);}
+        for(int e=0;e<E;e++) map[e]=-1;
+        int nu=0;
+        for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
+            int e=idxs[(int64_t)t*K+kk];
+            if(map[e]<0){ map[e]=nu; uid[nu]=e; pcnt[nu]=0; nu++; }
+            pcnt[map[e]]++;
+        }
+        int acc=0;
+        for(int j=0;j<nu;j++){ pfirst[j]=acc; cur[j]=acc; acc+=pcnt[j]; }
+        for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
+            int j=map[idxs[(int64_t)t*K+kk]];
+            poslist[cur[j]]=t; wlist[cur[j]]=wsels[(int64_t)t*K+kk]; cur[j]++;
+        }
+        /* keep loads in DISK-OFFSET order (experts are NOT id-ordered inside
+         * the HF shards — measured 169/895); permute the list heads with the
+         * ids. WILLNEED prefetch only for the buffered path. */
+        for(int a2=0;a2<nu-1;a2++) for(int b2=a2+1;b2<nu;b2++){
+            ERef *ea=&m->eref[(int64_t)li*E+uid[a2]], *eb=&m->eref[(int64_t)li*E+uid[b2]];
+            if(eb->fd[0]<ea->fd[0]||(eb->fd[0]==ea->fd[0]&&eb->off[0]<ea->off[0])){
+                int tt=uid[a2];uid[a2]=uid[b2];uid[b2]=tt;
+                tt=pcnt[a2];pcnt[a2]=pcnt[b2];pcnt[b2]=tt;
+                tt=pfirst[a2];pfirst[a2]=pfirst[b2];pfirst[b2]=tt; }
+        }
+        if(!g_k3_direct)
+            for(int j=0;j<nu;j++){
+                ERef *er=&m->eref[(int64_t)li*E+uid[j]];
+                int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
+                if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
+                else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
+            }
+        experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,u,gate,up,hz);
+        free(map);free(uid);free(pcnt);free(pfirst);free(poslist);free(wlist);free(cur);
+    }
+    for(int t=0;t<C;t++)
+        rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
+    w_matmul(out,u,&o->lat_up,C);
     /* shared experts at full width */
     int shi=MI*c->n_shared;
-    float *sg=falloc(shi), *su=falloc(shi), *sd=falloc(c->hidden);
-    w_matmul(sg,x,&o->sh_gate,1); w_matmul(su,x,&o->sh_up,1);
-    for(int i=0;i<shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
-    w_matmul(sd,sg,&o->sh_down,1);
-    for(int d=0;d<c->hidden;d++) out[d]+=sd[d];
-    free(sco);free(z);free(u);free(gate);free(up);free(hz);free(sg);free(su);free(sd);
+    float *sg=falloc((int64_t)C*shi), *su=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
+    w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
+    for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
+    w_matmul(sd,sg,&o->sh_down,C);
+    for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
+    free(sco);free(idxs);free(wsels);free(keff);
+    free(z);free(u);free(gate);free(up);free(hz);free(sg);free(su);free(sd);
 }
 
-static void dense_forward(Model *m, Layer *l, const float *x, float *out){
+static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out){
     Cfg *c=&m->c; int DI=c->dense_inter;
-    float *g=falloc(DI), *u=falloc(DI);
-    w_matmul(g,x,&l->d_gate,1); w_matmul(u,x,&l->d_up,1);
-    for(int i=0;i<DI;i++) g[i]=situf_(g[i],u[i],c->situ_b1,c->situ_b2);
-    w_matmul(out,g,&l->d_down,1);
+    float *g=falloc((int64_t)C*DI), *u=falloc((int64_t)C*DI);
+    w_matmul(g,x,&l->d_gate,C); w_matmul(u,x,&l->d_up,C);
+    for(int64_t i=0;i<(int64_t)C*DI;i++) g[i]=situf_(g[i],u[i],c->situ_b1,c->situ_b2);
+    w_matmul(out,g,&l->d_down,C);
     free(g);free(u);
 }
 
-/* ---------- one token through the stack; returns logits (or NULL pre-head) --- */
+/* ---------- a CHUNK of C tokens through the stack, layer-major: every dense
+ * matmul batches over the chunk (weights stream from RAM once per chunk), the
+ * MoE loads each unique expert once. Sequential state (KDA recurrence, MLA
+ * cache, AttnRes bookkeeping) advances per token inside each layer, which is
+ * exactly the original order — chunked results are bit-identical to C=1.
+ * Returns the LAST position's logits (falloc'd), or NULL pre-head. ---------- */
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
-static float *step(Model *m, int id, int pos){
+static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
+static float *step_chunk(Model *m, const int *ids, int pos0, int C){
     Cfg *c=&m->c; int D=c->hidden;
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
-    float *hidden=falloc(D), *bres=falloc((int64_t)nbmax*D), *prefix=falloc(D);
-    float *nrm=falloc(D), *att=falloc(D), *mix=falloc(D), *mlp=falloc(D);
+    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
+    float *prefix=falloc((int64_t)C*D), *nrm=falloc((int64_t)C*D);
+    float *att=falloc((int64_t)C*D), *mix=falloc(D), *mlp=falloc((int64_t)C*D);
     int nb=0;
-    if(g_x0){
-        if(pos>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos,g_x0_n); exit(1); }
-        memcpy(hidden,g_x0+(int64_t)pos*D,D*sizeof(float));
-    } else {
-        char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
-        st_read_slice_f32(&m->S,nm,(int64_t)id*D,D,hidden,0);
+    for(int t=0;t<C;t++){
+        if(g_x0){
+            if(pos0+t>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos0+t,g_x0_n); exit(1); }
+            memcpy(hidden+(int64_t)t*D,g_x0+(int64_t)(pos0+t)*D,D*sizeof(float));
+        } else {
+            char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
+            st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
+        }
     }
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
-        memcpy(prefix,hidden,D*sizeof(float));            /* prefix_sum at entry */
-        int have_prefix=1;
-        if(nb>0) res_mix(hidden,prefix,bres,nb,D,l->attn_sw,c->eps);
-        if(i%c->res_bs==0){
-            memcpy(bres+(int64_t)nb*D,prefix,D*sizeof(float)); nb++;
-            have_prefix=0;
+        int snap=(i%c->res_bs==0);                    /* block boundary: same for all t */
+        for(int t=0;t<C;t++){
+            float *h=hidden+(int64_t)t*D, *p=prefix+(int64_t)t*D;
+            memcpy(p,h,D*sizeof(float));              /* prefix_sum at entry */
+            if(nb>0) res_mix(h,p,bres+(int64_t)t*nbmax*D,nb,D,l->attn_sw,c->eps);
+            if(snap) memcpy(bres+(int64_t)t*nbmax*D+(int64_t)nb*D,p,D*sizeof(float));
+            rmsnorm_(nrm+(int64_t)t*D,h,l->in_ln,D,c->eps);
         }
+        int have_prefix=!snap;
+        if(snap) nb++;
         double t0=now_s();
-        for(int d=0;d<D;d++) nrm[d]=hidden[d];
-        rmsnorm_(nrm,nrm,l->in_ln,D,c->eps);
-        if(l->kda) kda_forward(m,l,i,nrm,att);
-        else       mla_forward(m,l,i,nrm,pos,att);
+        if(l->kda) kda_forward(m,l,i,nrm,C,att);
+        else       mla_forward(m,l,i,nrm,pos0,C,att);
         m->t_attn+=now_s()-t0;
-        if(have_prefix){ for(int d=0;d<D;d++) prefix[d]+=att[d]; }
-        else           { memcpy(prefix,att,D*sizeof(float)); }
-        res_mix(mix,prefix,bres,nb,D,l->mlp_sw,c->eps);
-        rmsnorm_(nrm,mix,l->post_ln,D,c->eps);
+        for(int t=0;t<C;t++){
+            float *p=prefix+(int64_t)t*D, *a=att+(int64_t)t*D;
+            if(have_prefix){ for(int d=0;d<D;d++) p[d]+=a[d]; }
+            else           { memcpy(p,a,D*sizeof(float)); }
+            res_mix(mix,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
+            rmsnorm_(nrm+(int64_t)t*D,mix,l->post_ln,D,c->eps);
+        }
         t0=now_s();
-        if(l->sparse) moe_forward(m,l,i,nrm,mlp);
-        else          dense_forward(m,l,nrm,mlp);
+        if(l->sparse) moe_forward(m,l,i,nrm,C,mlp);
+        else          dense_forward(m,l,nrm,C,mlp);
         m->t_moe+=now_s()-t0;
-        for(int d=0;d<D;d++) prefix[d]+=mlp[d];
-        memcpy(hidden,prefix,D*sizeof(float));
-        if(m->trace) fwrite(hidden,sizeof(float),D,m->trace);
+        for(int t=0;t<C;t++){
+            float *p=prefix+(int64_t)t*D;
+            for(int d=0;d<D;d++) p[d]+=mlp[(int64_t)t*D+d];
+            memcpy(hidden+(int64_t)t*D,p,D*sizeof(float));
+            if(m->trace) fwrite(hidden+(int64_t)t*D,sizeof(float),D,m->trace);
+        }
     }
     float *logits=NULL;
     if(m->has_head){
         double t0=now_s();
-        res_mix(mix,hidden,bres,nb,D,m->out_sw,c->eps);
-        rmsnorm_(mix,mix,m->final_norm,D,c->eps);
-        if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
-        logits=falloc(c->vocab);
-        w_matmul(logits,mix,&m->lm_head,1);
+        for(int t=0;t<C;t++){
+            /* head only where needed: the chunk's last token (feeds sampling)
+             * and every position when K3_LOGITS dumps teacher-forced logits */
+            if(!g_lfp && t<C-1) continue;
+            res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
+            rmsnorm_(mix,mix,m->final_norm,D,c->eps);
+            if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
+            float *lo=falloc(c->vocab);
+            w_matmul(lo,mix,&m->lm_head,1);
+            if(g_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_lfp);
+            if(t==C-1) logits=lo; else free(lo);
+        }
         m->t_head+=now_s()-t0;
     }
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
@@ -1025,19 +1146,25 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] prompt: %d tokens | ngen %d | temp %.2f\n",np,ngen,temp);
     int max_t=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):np+ngen;
     kv_alloc(&m,max_t);
-    FILE *lfp=NULL;
     if(getenv("K3_LOGITS")){
-        lfp=fopen(getenv("K3_LOGITS"),"wb");
-        if(!lfp){ perror(getenv("K3_LOGITS")); return 1; }
+        g_lfp=fopen(getenv("K3_LOGITS"),"wb");
+        if(!g_lfp){ perror(getenv("K3_LOGITS")); return 1; }
+    }
+    int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
+    if(chunk<1) chunk=1;
+    if(chunk>512) chunk=512;
+    if(m.trace && chunk>1){
+        chunk=1;                       /* trace rows are token-major by contract */
+        fprintf(stderr,"[K3] K3_TRACE set: prefill chunk forced to 1\n");
     }
     double t0=now_s(); float *lo=NULL;
-    for(int i=0;i<np;i++){
+    for(int i=0;i<np;i+=chunk){
+        int Cc=np-i<chunk?np-i:chunk;
         if(lo) free(lo);
-        lo=step(&m,ids[i],i);
-        if(lfp&&lo) fwrite(lo,sizeof(float),(size_t)m.c.vocab,lfp);
-        fprintf(stderr,"\r[K3] prefill %d/%d (%.1fs)",i+1,np,now_s()-t0);
+        lo=step_chunk(&m,ids+i,i,Cc);
+        fprintf(stderr,"\r[K3] prefill %d/%d (%.1fs)",i+Cc,np,now_s()-t0);
     }
-    if(lfp) fclose(lfp);
+    if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
     if(!m.has_head||!lo){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
@@ -1055,7 +1182,7 @@ int main(int argc, char **argv){
         ntok++;
         if(is_eos){ fprintf(stderr,"\n[K3] eos\n"); break; }
         if(np+ntok>=max_t){ fprintf(stderr,"\n[K3] context full\n"); break; }
-        lo=step(&m,t,np+ntok-1);
+        lo=step_chunk(&m,&t,np+ntok-1,1);
         double el=now_s()-tg;
         fprintf(stderr,"  [tok %d: %.1fs/tok, hit %.0f%%, %.1f GB read]\n",
                 ntok,el/ntok,100.0*m.hits/(m.hits+m.miss+1e-9),m.ebytes/1e9);

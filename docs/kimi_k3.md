@@ -159,6 +159,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
 | `K3_LOAD_THREADS` | 4 | loader threads for `K3_PIPE` |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
+| `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
 | `K3_MAXT` | prompt+ngen | context capacity |
 | `K3_LAYERS` | all | truncate the stack (validation) |
@@ -166,10 +167,23 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_X0` | — | inject input rows, bypass embedding (validation) |
 | `COLI_TEMP` | 0 | 0 = greedy, else softmax temperature |
 
+## Chunked prefill
+
+Prefill processes the prompt in chunks of `K3_CHUNK` tokens, layer-major:
+every dense matmul batches over the chunk (each weight matrix streams from
+RAM once per chunk instead of once per token), the MoE loads each unique
+expert of the chunk once (measured at C=32 on real text: 2.7x dedup —
+neighbouring tokens share experts far more than QB-flat routing suggests —
+9.6 instead of 25.8 GB/token), and the lm_head runs only on the chunk's last
+token. Sequential state (KDA recurrence, MLA cache, AttnRes bookkeeping)
+advances per token inside each layer in the original order, so chunked
+results are **bit-identical** to token-at-a-time (verified: 125-position
+teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
+~5.3 -> **2.0 s/token** at C=32. The KDA state-update sweeps are AVX2
+(scalar fallback for head dims not divisible by 8).
+
 ## Current limitations
 
-- Single-token stepping only (prefill is sequential; no chunked KDA, no
-  batched MLA prefill).
+- Decode is single-token (no speculative decoding — K3 has no MTP head).
 - CPU only (no CUDA/Metal/Vulkan tier), scalar KDA inner loops.
 - No chat template handling; prompts are raw text after `[BOS]`.
-- No speculative decoding (K3 has no MTP head).
