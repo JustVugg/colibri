@@ -1306,6 +1306,81 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
     }
 }
 
+/* IDOT variant of matmul_mxfp4: per-32-group int8 activation quantization +
+ * integer dots. The doubled e2m1 values are exact int8 (same LUT as the float
+ * path), so a group reduces to maddubs(|w|, sign(x,w)) like dot_i4i8 — no
+ * per-weight int->float conversion. Group-exact scale folding:
+ *     y = sum_g idot_g * (2^(e8-127) * 0.5) * xscale_g
+ * Activation-quant noise (~0.4%/group) rides on top of the e2m1 grid; gate
+ * with K3_IDOT=0 in the K3 engine for exact-float A/B. */
+static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+                            int S, int I, int O){
+    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
+    int rb=I/2, ng=I/32;
+    int8_t *xq=(int8_t*)malloc((size_t)S*I);
+    float *xsc=(float*)malloc((size_t)S*ng*sizeof(float));
+    if(!xq||!xsc){ fprintf(stderr,"OOM mxfp4 idot scratch\n"); exit(1); }
+    for(int s=0;s<S;s++)
+        for(int g=0;g<ng;g++){
+            const float *xg=x+(int64_t)s*I+g*32;
+            float am=0; for(int i=0;i<32;i++){ float a=fabsf(xg[i]); if(a>am)am=a; }
+            float sc=am/127.f; if(sc<1e-20f)sc=1e-20f;
+            xsc[(int64_t)s*ng+g]=sc; float inv=1.f/sc;
+            int8_t *qg=xq+(int64_t)s*I+g*32;
+            for(int i=0;i<32;i++){
+                int v=(int)lrintf(xg[i]*inv);
+                if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
+            }
+        }
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const uint8_t *scl=e8s+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const int8_t *xr=xq+(int64_t)s*I;
+            const float *xsr=xsc+(int64_t)s*ng;
+#ifdef __AVX2__
+            {
+                const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+                const __m128i m4=_mm_set1_epi8(0x0F);
+                const __m256i ones=_mm256_set1_epi16(1);
+                __m256 acc=_mm256_setzero_ps();
+                for(int g=0;g<ng;g++){
+                    __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
+                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));
+                    __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));
+                    __m256i wv=_mm256_set_m128i(n1,n0);        /* signed doubled e2m1 */
+                    __m256i xv=_mm256_loadu_si256((const __m256i*)(xr+g*32));
+                    /* |w| <= 12, |x| <= 127: pair sums <= 3048, no int16 overflow */
+                    __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),
+                                                   _mm256_sign_epi8(xv,wv));
+                    acc=_mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(p,ones)),
+                                        _mm256_set1_ps(mx4_scale(scl[g])*0.5f*xsr[g]),acc);
+                }
+                y[(int64_t)s*O+o]=hsum256(acc);
+                continue;
+            }
+#endif
+            {
+                static const int8_t l2[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+                float a=0;
+                for(int g=0;g<ng;g++){
+                    const int8_t *qg=xr+g*32;
+                    int32_t gi=0;
+                    for(int i=0;i<32;i+=2){
+                        uint8_t byte=w[(g*32+i)>>1];
+                        gi+=(int32_t)l2[byte&0xF]*qg[i]+(int32_t)l2[byte>>4]*qg[i+1];
+                    }
+                    a+=(float)gi*(mx4_scale(scl[g])*0.5f*xsr[g]);
+                }
+                y[(int64_t)s*O+o]=a;
+            }
+        }
+    }
+    free(xq); free(xsc);
+}
+
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
