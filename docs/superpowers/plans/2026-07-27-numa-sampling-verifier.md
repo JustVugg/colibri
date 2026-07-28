@@ -69,10 +69,10 @@ Steps:
    masking so output is stable across Python versions and processes.
 2. Preserve `_sample_page_indices` input clamping and the full-file fast path.
 3. Divide the page range into `sample_pages` non-overlapping integer strata.
-4. For each of 32 fixed salts, select one mixed offset from every stratum.
-5. Score each candidate by its worst relative node-residue deviation across
+4. Within each stratum, produce 32 mixed offsets from fixed salts.
+5. Score each offset by the projected running node-residue balance across
    eligible page orders 0 through 9.
-6. Return the lowest-scoring candidate; break equal scores by the lowest salt.
+6. Select the lowest-scoring offset; break equal scores by the lowest salt.
 7. Keep the single-node path simple because it needs coverage, not balance
    optimization.
 8. Re-run the regression from Task 1 and confirm it passes.

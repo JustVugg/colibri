@@ -62,23 +62,25 @@ function. Non-overlapping strata guarantee unique indices and retain coverage
 across the file; mixed offsets prevent the low page-index bits from becoming
 constant or periodic at a transparent-huge-page boundary.
 
-Thirty-two fixed salts are evaluated. For each candidate set, the selector
-models the Linux interleave residue at page orders 0 through 9:
+Within each stratum, 32 fixed-salt offsets are evaluated. For each offset, the
+selector models the Linux interleave residue at page orders 0 through 9:
 
 ```text
 (page_index >> order) % node_count
 ```
 
-The candidate's score is the worst relative deviation from an equal residue
-count over those orders. An order participates only when the file contains at
-least seven allocation units per selected node at that order:
+The offset's score is the worst absolute distance from the running equal-share
+target over those orders, followed by the sum of squared distances as a stable
+secondary score. An order participates only when the file contains at least
+seven allocation units per selected node at that order:
 
 ```text
 ceil(total_pages / (1 << order)) >= 7 * node_count
 ```
 
 Seven is `ceil(1 / 0.15)`, so one allocation unit cannot by itself exceed the
-15% tolerance. The lowest-scoring candidate wins, with the smallest salt as a
+15% tolerance. The lowest-scoring offset is added to the sample and its residue
+counts become the running state for the next stratum. The smallest salt is the
 deterministic tie breaker.
 
 This is a selection-only change. `_sample_numa_allocation` continues to touch
