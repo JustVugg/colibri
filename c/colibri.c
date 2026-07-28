@@ -7168,6 +7168,15 @@ int main(int argc, char **argv){
                 "constraint).\n", kl, kr);
             return 2;
         }
+        /* The attention consumers stage dequantized/rotated rows in 512-wide
+         * stack buffers (qtl/qtr, Lf/Rf); a wider power-of-two row would pass
+         * the check above and overflow them. Same refuse-don't-corrupt rule. */
+        if(kl>512||kr>512){
+            fprintf(stderr,"[KV_TQ] this model's latent rows are kv_lora=%d qk_rope=%d, but the "
+                "quantized-KV attention path stages rows in 512-wide buffers. Refusing to run "
+                "quantized -- unset KV_TQ (or use KV8=1, which has no width constraint).\n", kl, kr);
+            return 2;
+        }
     }
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
         /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8

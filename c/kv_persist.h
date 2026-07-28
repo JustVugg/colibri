@@ -124,7 +124,9 @@ static void kv_disk_append(Model *m, const int *hist, int len){
 /* Bonifica una riga fp8 letta da disco: l'encoder non emette MAI i codici NaN e4m3
  * (0x7F/0xFF), ma un file corrotto potrebbe — la GPU (__nv_cvt) li decodifica NaN. */
 static inline void kv8_sanitize_row(uint8_t *b, int n, float *sc){
-    if(!(fabsf(*sc)<3.4e38f)){ memset(b,0,(size_t)n); *sc=1.f; return; }
+    /* l'encoder emette solo scale > 0: una scala negativa (file corrotto)
+     * invertirebbe il segno dell'intera riga -- riga inerte, come il gemello TQ */
+    if(!(*sc>0.f && *sc<3.4e38f)){ memset(b,0,(size_t)n); *sc=1.f; return; }
     for(int i=0;i<n;i++) if((b[i]&0x7F)==0x7F) b[i]=0;
 }
 /* v3: raggio non finito o negativo -> riga inerte (coli_kvq_dequant_row rende zero). */
