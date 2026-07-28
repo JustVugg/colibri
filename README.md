@@ -397,19 +397,13 @@ On Windows the portable commands work with syntax such as
 The engine runtime remains pure C. Python is used by the standard-library CLI,
 one-time converter, optional API gateway, and RAM-disk control plane.
 
-`coli ramdisk` opens a guided server console that makes the copy count, selected
-NUMA memory nodes, whole-core CPU mask, and endpoints explicit before staging.
-For a new workspace its default Fastest GPU staging preset discovers GPU-local
-NUMA nodes, keeps one shared model copy and engine, and reviews CUDA mmap with
-asynchronous RAM-to-VRAM copies and automatic VRAM sizing. Single-copy, minimal
-profile-guided, and explicit per-node replica presets are also available;
-automatic placement never selects replicas.
-It can stage the full model or profile-selected shard closures into THP-enabled
-tmpfs, launch one shared engine or explicitly requested node replicas, and
-benchmark persistent SSD/slab/direct-map paths. It keeps KV and usage state on
-an absolute SSD-backed XDG state path and never changes global swap, HugeTLB, or
-host-wide weighted-interleave settings. Linux placement is NUMA-node based;
-individual DIMMs/channels are inventory, not allocation targets.
+`coli ramdisk` opens a guided Linux RAM-workspace console. A new workspace asks
+for **Fastest GPU staging** (default), **Single RAM copy**, **Minimal RAM**, or
+**Multiple NUMA replicas**. Each choice produces a draft that shows the exact
+copy count, NUMA nodes, CPU mask, RAM cost, engines, and endpoints before
+anything is mounted. GPU-aware placement falls back visibly to a shared
+single-copy plan when it cannot prove a safe CUDA/NUMA layout; it never selects
+replicas automatically.
 
 #### The same commands run any of the models
 

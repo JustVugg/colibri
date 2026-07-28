@@ -81,14 +81,14 @@ preset question:
   those GPUs. It first attempts full staging, then uses a compatible usage
   profile to fit a partial plan. The reviewed engine contract uses CUDA mmap,
   asynchronous RAM-to-VRAM copies, and automatic VRAM sizing.
-- **Single copy RAM** keeps one shared copy and engine using the ordinary
+- **Single RAM copy** keeps one shared copy and engine using the ordinary
   effective NUMA placement.
-- **Minimal** requests a profile-guided partial plan sized to the largest
+- **Minimal RAM** requests a profile-guided partial plan sized to the largest
   safely admitted shard closure. Without a compatible usage profile it
   produces a blocked review with instructions instead of silently choosing
   another layout.
-- **Multiple copies RAM** explicitly selects one complete copy and independent
-  engine per chosen node.
+- **Multiple NUMA replicas** explicitly selects one complete copy and
+  independent engine per chosen node.
 
 If GPU discovery, PCI-to-NUMA locality, or the CUDA engine capability cannot be
 used safely, Fastest GPU staging falls back visibly to the single-copy plan. It
@@ -111,9 +111,9 @@ does not multiply the model.
 `per-node` topology means one complete staged copy and one independent engine
 per selected node. It is replication, not model sharding, so the TUI marks it
 as a danger state and shows the multiplied RAM and endpoint count. It is
-available only through the explicit Multiple copies RAM startup choice or the
-`--topology per-node` CLI option; automatic placement never enables it. The
-interface can switch such a draft back to shared placement.
+available only through the explicit **Multiple NUMA replicas** startup choice
+or the `--topology per-node` CLI option; automatic placement never enables it.
+The interface can switch such a draft back to shared placement.
 
 Multiple tmpfs mounts are independent filesystems, not a RAID stripe. The GPU
 preset therefore uses one shared interleaved source over the GPU-local nodes

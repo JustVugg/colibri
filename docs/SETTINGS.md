@@ -2,7 +2,9 @@
 
 Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The underlying Colibri engine is driven by environment variables — see [ENVIRONMENT.md](ENVIRONMENT.md).
 
-**Updated for the contribution based on `upstream/dev @ 21e7a35`** (argparse definitions in `c/coli` and `c/openai_server.py`). See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate.
+The base CLI inventory tracks `upstream/dev @ 21e7a35`. The `ramdisk` section
+is verified against `c/coli` and `c/ramdisk_support/cli.py` in this source tree.
+See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) for the refresh procedure.
 
 ---
 
@@ -78,60 +80,33 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 
 **`ramdisk`** (Linux only)
 
-Run `coli ramdisk` in a terminal for the guided Textual server console, or select
-one of the equivalent scriptable actions. See the
-[RAM-workspace TUI guide](ramdisk-tui.md) for the complete screen workflow,
-keyboard controls, safety model, troubleshooting, and test strategy. Source
-and flat-archive users can
-install the supported interface with
-`python3 -m pip install -r c/requirements-tui.txt` from a source checkout, or
-`python3 -m pip install -r requirements-tui.txt` from an unpacked release
-archive. `COLI_RAMDISK_UI=auto` is the default and falls back to the
-one-release curses interface only when Textual is unavailable;
-`COLI_RAMDISK_UI=textual` or `curses` selects one explicitly.
+Omit an action to open the guided terminal interface. New workspaces offer four
+presets; each one creates a reviewable draft and performs no lifecycle action
+by itself.
 
-The console walks through Inspect → Placement → Capacity → Runtime → Review →
-Operate. Before those steps, a new workspace asks for one preset: **Fastest GPU
-staging** (default), **Single copy RAM**, **Minimal**, or the explicit
-**Multiple copies RAM** option. Fastest GPU staging selects only effective NUMA
-nodes local to the discovered GPUs, keeps one shared copy and engine, attempts
-full then profile-guided partial staging, and reviews a managed CUDA mmap,
-asynchronous copy, and automatic-VRAM contract. It falls back visibly to Single
-copy RAM when GPU locality or CUDA capability cannot be established; automatic
-placement never selects replicas. Minimal blocks with profile instructions when
-no compatible profile is available. Existing prepared workspaces skip the
-preset question.
+| Preset | Result |
+|---|---|
+| **Fastest GPU staging** (default) | One shared copy and engine on usable GPU-local NUMA nodes. It tries full staging, then a compatible profile-guided partial plan. Unsafe or unproven CUDA/NUMA discovery falls back visibly to **Single RAM copy**. |
+| **Single RAM copy** | One full shared copy and one engine using the normal effective NUMA placement. |
+| **Minimal RAM** | The largest safely admitted profile-guided partial staging set. A missing or incompatible profile produces a blocker. |
+| **Multiple NUMA replicas** | One complete copy and independent engine per selected NUMA node. This is the only preset that selects replicas. |
 
-A live backplane rail always shows the resulting copy count, memory nodes,
-engine count, and ports. The normal `interleaved` plan is shown as **one shared
-model copy and one engine** whose RAM pages span the selected NUMA nodes.
-Replica placement requires either the explicit Multiple copies RAM startup
-choice or `--topology per-node`, so its full-copy and endpoint multiplier is
-always reviewed.
-Memory-node and whole-core CPU range lists are validated against the invoking
-process's effective cgroup/cpuset masks. Once prepared, the persisted placement
-is shown as the active deployment and its weight settings stay locked until it
-is destroyed. Mount policies use Linux static-node IDs, and Start/Benchmark
-refuse to run if the effective CPU or memory-node masks changed after Prepare.
-Capacity admission is also cgroup-aware: on cgroup v2 it uses the tightest
-`memory.max - memory.current` headroom across the current cgroup and every
-limiting ancestor; cgroup v1 memory limits receive the equivalent check.
-`memory.high` is reported as a reclaim/throttling warning rather than a hard
-limit. Host/NUMA availability and cgroup headroom are both enforced, using the
-smaller value.
+Prepared workspaces skip the preset question and load their persisted
+placement. Editing a preset-populated draft marks it **Custom**. See the
+[operator reference](ramdisk-tui.md) for controls and lifecycle semantics, or
+the [shared full-model how-to](ramdisk-tui-howto.md) for a complete walkthrough.
 
-Linux memory policy addresses NUMA nodes, not individual DIMMs or channels.
-DIMM/channel data is therefore informational: populate symmetric firmware-
-recommended DIMM/channel pairs, then use `--memory-nodes` to select the NUMA
-domains they expose. Colibri never rewrites the host-global weighted-interleave
-weights. Multiple tmpfs mounts are independent filesystems rather than a RAID
-stripe. One interleaved source across two GPU-local nodes can still serve remote
-pages to either GPU; eliminating that requires tensor-aware placement in the
-engine, not additional ramdisks.
-Prepare, Start, and Benchmark remain navigable while they run and can be
-cancelled with `c`; Colibri waits for a rollback/cleanup checkpoint before
-returning control. `q` requests the same safe cancellation and exits only after
-cleanup succeeds; cleanup failures remain visible in the TUI.
+The scriptable actions use the same planner and lifecycle:
+
+| Action | Purpose |
+|---|---|
+| `plan` | Print the exact staging and reserve plan. |
+| `prepare` | Mount, stage, and validate the reviewed weights. |
+| `status` | Report managed mounts and processes. |
+| `benchmark` | Compare eligible SSD, tmpfs/slab, and direct-map paths. |
+| `start` | Start the persisted managed deployment. |
+| `stop` | Stop only identity-verified managed processes. |
+| `destroy` | Unmount the verified volatile workspace. |
 
 ```sh
 coli ramdisk plan --model /models/glm --memory-nodes 0,2 --cpu-list 0-31,64-95 --json
@@ -142,23 +117,6 @@ coli ramdisk benchmark --json
 coli ramdisk stop
 coli ramdisk destroy --yes
 ```
-
-`benchmark` requires managed engines to be stopped so SSD, tmpfs/slab, direct
-RAM-map, and per-node aggregate runs all use the same deterministic controls.
-The best safe I/O knobs are saved per topology and reused by `start`; managed
-engines use exactly the reviewed whole-core CPU masks. The engine preserves
-those masks through its OpenMP self-reexec instead of widening back to every
-online CPU.
-Partial plans also show the profile coverage of shard-closure staging beside a
-same-budget hot-expert `PIN` estimate, making shard-granularity waste explicit.
-System scorecards report mount-specific tmpfs allocation; tmpfs does not expose
-per-mount THP counters, so huge-page coverage is labeled as host-global.
-Saved benchmark reports include the source revision and dirty-tree state, exact
-command, hardware and storage details, warm-up count, measured-run count, and
-median throughput required for reproducible comparisons.
-Linux physical-read accounting carries an explicit validity bit: unavailable
-`/proc/self/io` data is shown as `n/a` and cannot satisfy the full-mode
-zero-SSD-read acceptance check.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -173,27 +131,16 @@ zero-SSD-read acceptance check.
 | `--thp` | `auto` | tmpfs THP policy: `auto` prefers `within_size`, or select `within_size`/`advise` explicitly. Unsupported `within_size` mounts retry with `advise`. |
 | `--prefault` | `1` for managed full mode, otherwise `0` | Prefault direct mappings at engine startup. |
 | `--parallel` | `2` | Bounded shard-copy worker count. |
+| `--ctx` | `0` (`4096`) | Context length reserved for each managed engine. |
 | `plan/status/benchmark --json` | off | Emit a versioned machine-readable report. |
 | `prepare/destroy --yes` | off | Confirm reviewed mount or cleanup work in non-interactive scripts. |
 | `start --base-port` | prepared value (`8000` initially) | Interleaved port, or base plus NUMA node id for replicas; omitted restarts preserve the previous value. |
 
-Planning and status are unprivileged. In the TUI, preparation and destruction
-validate sudo once in the foreground; their background workers then use
-non-interactive sudo only for the exact `mount`/`umount` commands, so a password
-prompt can never collide with the interface. Colibri verifies that the ticket
-is reusable before mounting and refreshes it without prompting while a long
-copy is active, preserving rollback authority. `SIGHUP`/`SIGTERM` request
-cooperative rollback for Prepare/Start/Benchmark; Stop/Destroy finish their
-verified cleanup transaction before returning the signal exit code. Model files and durable
-`.coli_usage`/`.coli_kv*` state remain on SSD and are never modified by staging.
-Linux interleave can fall back to other allowed nodes under severe pressure;
-Colibri reduces that risk with an admission reserve and rejects staging when its
-post-copy page sample materially escapes the reviewed mask. A cgroup/cpuset remains the
-hard host-level boundary when strict isolation is required.
-Set `XDG_STATE_HOME` to an absolute SSD-backed path: tmpfs/ramfs state locations
-and locations beneath the weight mount are rejected. `X-mount.mkdir=0755` may
-leave an empty root-owned directory below `/mnt` after unmount; the mounted tmpfs
-itself is still private (`mode=0700`) and that empty directory is safe to reuse.
+Options may appear before or after the action. Planning and status are
+unprivileged. Prepare and Destroy require reusable foreground sudo
+authorization for verified `mount`/`umount` operations. Model files and durable
+`.coli_usage`, `.coli_kv*`, and benchmark state remain outside the volatile
+workspace. `XDG_STATE_HOME`, when set, must be an absolute durable path.
 
 **`bench`**: `[tasks...]` (positional), `--limit 40`, `--data <bench dir>`.
 **`plan` / `doctor`**: `--json`.

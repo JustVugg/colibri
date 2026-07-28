@@ -2,7 +2,10 @@
 
 Reference for the environment variables read by the colibrì engine.
 
-**Generated from `dev @ d5327e2`** by scanning every `getenv()` site in `c/colibri.c` and the other C sources (`c/olmoe.c`, `c/backend_cuda.cu`, `c/backend_metal.mm`). Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
+The base inventory was generated from `dev @ d5327e2`. The RAM-workspace
+entries are verified against this source tree. Defaults and behavior are taken
+from source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) for the refresh
+procedure.
 
 ## Which program reads these?
 
@@ -258,6 +261,19 @@ These are read by the Python programs (not the C engine), so they don't appear i
 | `COLI_RAW` | `0` | `coli` raw output mode. |
 
 > **Debugging an OpenCode session:** `COLI_DEBUG=1` watches the model's output stream; `COLI_DEBUG=2` shows both sides (prompt + output) as a transcript. Add `COLI_TOOL_SALVAGE=1` on int4 to catch mangled tool calls.
+
+### RAM-workspace control plane
+
+These variables configure the Linux `coli ramdisk` interface and its durable
+control state:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_RAMDISK_UI` | `auto` | TUI frontend: `auto` uses Textual when installed and otherwise curses; `textual` or `curses` requires that frontend. |
+| `XDG_STATE_HOME` | `~/.local/state` | Durable state base. RAM-workspace state lives below `colibri/ramdisk`; the value must resolve to an absolute non-volatile path. |
+| `COLI_RAMDISK_MANIFEST` | `$XDG_STATE_HOME/colibri/ramdisk/manifest.json` | Absolute durable override for the managed deployment manifest. |
+| `COLI_RAMDISK_START_TIMEOUT` | `7200` | Managed-engine startup timeout in seconds; accepted range is 1–86400. |
+| `COLI_BUILD_COMMIT` | auto-detected | Optional revision label stored in reproducible benchmark reports when Git metadata is unavailable or should be overridden. |
 
 ## Set by the CLI (don't usually set by hand)
 

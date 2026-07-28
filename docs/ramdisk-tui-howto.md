@@ -3,7 +3,7 @@
 This how-to walks through one complete RAM-workspace lifecycle in the Textual
 interface:
 
-`launch → inspect → prepare → start → verify → stop → destroy`
+`launch → choose a preset → review → prepare → start → verify → stop → destroy`
 
 It is for Linux operators who are comfortable in a terminal and have a host
 large enough to stage the complete model. The result is one model copy placed
@@ -63,8 +63,6 @@ source-checkout console with an absolute path to your model:
 ```sh
 COLI_RAMDISK_UI=textual ./c/coli ramdisk \
   --model /absolute/path/to/model \
-  --mode full \
-  --topology interleaved \
   --mount-root /mnt/colibri-ram
 ```
 
@@ -73,14 +71,17 @@ If Colibri is already installed, invoke `coli` from `PATH` instead:
 ```sh
 COLI_RAMDISK_UI=textual coli ramdisk \
   --model /absolute/path/to/model \
-  --mode full \
-  --topology interleaved \
   --mount-root /mnt/colibri-ram
 ```
 
 An installed package still needs a compatible native engine. If its installer
 did not provide one, set `COLI_ENGINE` to the engine's absolute path before
 launching.
+
+When the preset prompt opens, choose **Single RAM copy**. It populates a full,
+shared draft with one model copy and one engine, then opens **Review**. Nothing
+is mounted or copied yet. Use the numbered tabs or **Back** to inspect and edit
+the draft before preparing it.
 
 Planning and inspection are unprivileged. On **Inspect**, wait for the model
 and host scan to finish. Confirm that the canonical model path and discovered
@@ -93,8 +94,9 @@ use deterministic example data. Verify every value on your host.*
 
 ## 2. Review the full shared plan
 
-Use the numbered tabs, `Left` and `Right`, or the **Back** and **Next** buttons
-to review all five planning steps.
+The preset opens **Review**, but you should still use the numbered tabs,
+`Left` and `Right`, or the **Back** and **Next** buttons to review all five
+planning steps.
 
 1. On **Inspect**, confirm the canonical model, shard count, effective CPUs,
    and available NUMA nodes.
