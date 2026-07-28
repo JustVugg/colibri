@@ -34,3 +34,5 @@ tests/test_pipe_block
 *.exp
 *.pdb
 *.bak
+
+coli_cuda*.dll

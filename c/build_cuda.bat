@@ -89,9 +89,13 @@ pushd "%~dp0"
 
 echo Building coli_cuda.dll for %CUDA_ARCH% ...
 rem -Xcompiler=-W3 sets the MSVC host-compiler warning level.
+rem -cudart static links the CUDA runtime INTO the DLL. Without it the DLL
+rem needs cudart64_XX.dll at load time, which on CUDA 13.x lives in bin\x64
+rem (not on PATH), so LoadLibrary failed silently and every Windows run fell
+rem back to CPU while looking healthy.
 "%NVCC%" -O3 -std=c++17 -arch=%CUDA_ARCH% -Xcompiler=-W3 -shared ^
     %CCBIN_FLAG% %UNSUPPORTED_FLAG% ^
-    -DCOLI_CUDA_BUILDING_DLL %CUDA_LIB% -lcudart ^
+    -DCOLI_CUDA_BUILDING_DLL %CUDA_LIB% -cudart static ^
     backend_cuda.cu -o coli_cuda.dll
 set "RC=%ERRORLEVEL%"
 

@@ -541,6 +541,8 @@ static void prof_base(Model *m, ProfBase *b){
     dc_wall_read(b->dc_wall_ns,&b->dc_wall_all_ns);
 }
 
+static int64_t g_pin_ram_bytes;   /* bytes pin_load placed in RAM (cap warning quotes it) */
+
 static float *falloc(int64_t n){
     /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
      * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
@@ -8074,6 +8076,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
         m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
     }
+    g_pin_ram_bytes=(int64_t)(npin-m->gpu_expert_count)*eb;   /* what pinning actually placed in RAM */
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
@@ -8173,16 +8176,29 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * funzione esiste per evitare. Il kernel uccide con SIGKILL: nessun errore,
      * nessun log, il motore muore muto (issue #305). Dirlo, e fermarsi se il picco
      * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
-    if(floored){
+    if(floored || capmax==1){
         double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
         /* eb is printed because it is the one term nobody can check from outside:
          * every projection here divides by it, so a wrong width is indistinguishable
          * from a wrong budget in this message (#766). */
-        fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
-            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB).%s\n",
-            ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
-            m->resident_bytes/1e9,slack/1e9,(double)eb/1e6,
-            getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
+        /* Quote the actual shortfall instead of blaming PIN_GB (often not the
+         * binding constraint). Fires whenever cap==1, floored or not: one slot
+         * per layer is useless either way. */
+        double need2 = 2.0*(double)nsp*eb - (ram_gb*1e9 - (double)m->resident_bytes - slack);
+        if(floored)
+            fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB "
+                "is %.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB). ",
+                ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
+                m->resident_bytes/1e9,slack/1e9,(double)eb/1e6);
+        else
+            fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: this budget affords exactly one cache "
+                "slot (resident %.1f GB + reserve %.1f GB leaves %.1f GB, expert %.1f MB). ",
+                ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,
+                (ram_gb*1e9-(double)m->resident_bytes-slack)/1e9,(double)eb/1e6);
+        fprintf(stderr,"The expert cache holds ONE expert per layer (%d total): +%.1f GB of "
+            "budget would buy a second slot (--ram %.1f), and pinned experts account for "
+            "%.1f GB of the resident set.\n",
+            nsp,need2/1e9,ram_gb+need2/1e9,(double)g_pin_ram_bytes/1e9);
 #ifdef COLI_CUDA
         /* #686: on a single GPU that also holds host copies of the VRAM tier, the
          * thing inflating the resident set is often those copies rather than

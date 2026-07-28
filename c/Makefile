@@ -415,12 +415,15 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
-# __declspec(dllexport) so the 15 API symbols are exported.
+# __declspec(dllexport) so the API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@# -cudart static links the CUDA runtime INTO the DLL: cudart64_XX.dll lives
+	@# in bin\x64 on CUDA 13.x (not on PATH), so a dynamic link made LoadLibrary
+	@# fail silently and every Windows run fell back to CPU while looking healthy.
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
-		-L"$(CUDA_HOME)/lib/x64" -lcudart \
+		-L"$(CUDA_HOME)/lib/x64" -cudart static \
 		backend_cuda.cu -o coli_cuda.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
