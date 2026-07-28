@@ -71,7 +71,13 @@ weights leave little page-cache headroom, and flat routing means cached reads
 mostly cannot be reused anyway — measured on the 93-layer model this took
 expert reads from ~1.8 to ~6.3 GB/s (drive ceiling 7.1) and decode from ~21
 to ~9.4 s/token. The LRU slot floor is 1 (experts are consumed one at a time),
-so `K3_EXPERT_GB` is honored even at tiny budgets. Note that K3's router was trained with Quantile Balancing (deliberately
+so `K3_EXPERT_GB` is honored even at tiny budgets. On top of that, `K3_PIPE`
+(default on) runs the reads on loader threads so expert j's matmuls overlap
+expert j+1's pread, `K3_IDOT` (default on) computes the expert matmuls with
+per-32-group int8-quantized activations via integer dots (the e2m1 doubled
+values are exact int8 — same trick as `dot_i4i8`), and `K3_TOPP` optionally
+drops the low-weight tail of the top-16 (renormalized; quality-gate any
+setting with a `K3_LOGITS` A/B first). Note that K3's router was trained with Quantile Balancing (deliberately
 flat expert usage), so LRU hit rates are structurally lower than on models
 with skewed routing — expect the expert tier to be bandwidth-bound.
 
@@ -149,6 +155,10 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_HEAD_BITS` | 8 | load-time bits for lm_head |
 | `K3_EXPERT_GB` | 8 | routed-expert LRU budget |
 | `K3_DIRECT` | 1 | O_DIRECT expert reads (0 = buffered + WILLNEED) |
+| `K3_IDOT` | 1 | int8-activation expert matmuls (0 = exact-float kernel) |
+| `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
+| `K3_LOAD_THREADS` | 4 | loader threads for `K3_PIPE` |
+| `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
 | `K3_MAXT` | prompt+ngen | context capacity |
 | `K3_LAYERS` | all | truncate the stack (validation) |

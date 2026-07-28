@@ -41,6 +41,10 @@
  *   K3_HEAD_BITS=8|4|32  lm_head (default 8)
  *   K3_EXPERT_GB=N       routed-expert LRU cache budget (default 8)
  *   K3_DIRECT=0|1        O_DIRECT expert reads (default 1; buffered fallback)
+ *   K3_IDOT=0|1          int8-activation expert matmuls (default 1; 0 = float)
+ *   K3_PIPE=0|1          overlap expert loads with compute (default 1)
+ *   K3_LOAD_THREADS=N    loader threads for K3_PIPE (default 4)
+ *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
  *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
@@ -58,6 +62,8 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include <pthread.h>
+#include <stdatomic.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -202,6 +208,9 @@ static float w_rowdot(const W *w, int r, const float *x){
 static int g_bits_env=0;                 /* K3_BITS explicitly set: enables the
                                           * int8-container -> int4 load downcast */
 static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
+static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
+static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
+static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
 static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     char nm[512]; snprintf(nm,sizeof(nm),"%s%s",m->pfx,name);
     st_tensor *t=st_find(&m->S,nm);
@@ -410,6 +419,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     if((c->n_layers+c->res_bs-1)/c->res_bs+1>16){ fprintf(stderr,"attn_res: too many blocks\n"); exit(1); }
     g_bits_env = getenv("K3_BITS")!=NULL;
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
+    g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
+    g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
+    g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
+    if(g_k3_topp>0.f)
+        fprintf(stderr,"[K3] TOPP=%.2f: routed experts pruned to cumulative weight (quality lever — A/B with K3_LOGITS)\n",g_k3_topp);
     int bits   = getenv("K3_BITS")?atoi(getenv("K3_BITS")):4;
     int mbits  = getenv("K3_MLA_BITS")?atoi(getenv("K3_MLA_BITS")):8;
     int hbits  = getenv("K3_HEAD_BITS")?atoi(getenv("K3_HEAD_BITS")):8;
@@ -703,31 +717,106 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     Cfg *c=&m->c;
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
-    matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
-    matmul_mxfp4(up,z,w3p,w3s,1,c->latent,c->moe_inter);
+    void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)
+        = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4;
+    mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
+    mm(up,z,w3p,w3s,1,c->latent,c->moe_inter);
     for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
-    matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent);
+    mm(hz,gate,w2p,w2s,1,c->moe_inter,c->latent);
     for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
 }
 
+/* ---------- async loader pool (K3_PIPE): expert preads overlap compute ----
+ * A batch of jobs is submitted per token+layer; the compute loop below waits
+ * per-expert on its ready flag, so expert j's math runs while j+1.. load.
+ * One batch in flight at a time (the submitter consumes every job before the
+ * next submit), so the flags need no generation counter. */
+#define LP_MAX 64
+typedef struct { int li, eid; Slot *s; } LJob;
+static struct {
+    pthread_t th[16]; int nth, started;
+    pthread_mutex_t mx; pthread_cond_t cv;
+    Model *m;
+    LJob job[LP_MAX];
+    _Atomic int ready[LP_MAX];
+    _Atomic int next; int count;
+} g_lp = { .mx=PTHREAD_MUTEX_INITIALIZER, .cv=PTHREAD_COND_INITIALIZER };
+
+static void *lp_main(void *arg){
+    (void)arg;
+    for(;;){
+        pthread_mutex_lock(&g_lp.mx);
+        while(atomic_load_explicit(&g_lp.next,memory_order_relaxed)>=g_lp.count)
+            pthread_cond_wait(&g_lp.cv,&g_lp.mx);
+        int idx=atomic_fetch_add_explicit(&g_lp.next,1,memory_order_relaxed);
+        pthread_mutex_unlock(&g_lp.mx);
+        if(idx>=g_lp.count) continue;
+        LJob *j=&g_lp.job[idx];
+        expert_read(g_lp.m,j->li,j->eid,j->s);
+        atomic_store_explicit(&g_lp.ready[idx],1,memory_order_release);
+    }
+    return NULL;
+}
+static void lp_start(void){
+    if(g_lp.started) return;
+    g_lp.nth = getenv("K3_LOAD_THREADS")?atoi(getenv("K3_LOAD_THREADS")):4;
+    if(g_lp.nth<1) g_lp.nth=1;
+    if(g_lp.nth>16) g_lp.nth=16;
+    g_lp.count=0; atomic_store(&g_lp.next,0);
+    for(int i=0;i<g_lp.nth;i++)
+        if(pthread_create(&g_lp.th[i],NULL,lp_main,NULL)){
+            fprintf(stderr,"[K3] K3_PIPE: pthread_create failed, falling back\n");
+            g_k3_pipe=0; g_lp.nth=i; break;
+        }
+    g_lp.started=1;
+}
+static void lp_submit(Model *m, int n){
+    pthread_mutex_lock(&g_lp.mx);
+    g_lp.m=m;
+    for(int q=0;q<n;q++) atomic_store_explicit(&g_lp.ready[q],0,memory_order_relaxed);
+    atomic_store_explicit(&g_lp.next,0,memory_order_relaxed);
+    g_lp.count=n;
+    pthread_cond_broadcast(&g_lp.cv);
+    pthread_mutex_unlock(&g_lp.mx);
+}
+
 /* the full routed-expert pass for one token+layer: resolve (LRU hit or
- * working-set slot), load misses IN PARALLEL, compute, promote into the LRU. */
+ * working-set slot), load misses (pipelined with compute under K3_PIPE,
+ * else all-parallel up front), compute, promote into the LRU. */
 static void experts_run(Model *m, int li, int n, const int *ids, const float *w,
                         const float *z, float *u, float *gate, float *up, float *hz){
-    Slot *use[64]; int missk[64]; int nmiss=0;
+    Slot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
     for(int j=0;j<n;j++){
-        use[j]=slot_find(m,li,ids[j]);
-        if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; }
+        use[j]=slot_find(m,li,ids[j]); qof[j]=-1;
+        if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
     }
     if(nmiss){
-        double t0=now_s();
-        #pragma omp parallel for schedule(dynamic,1)
-        for(int q=0;q<nmiss;q++) expert_read(m,li,ids[missk[q]],&m->ws[q]);
-        m->t_eload+=now_s()-t0;
+        if(g_k3_pipe){
+            if(!g_lp.started) lp_start();
+        }
+        if(g_k3_pipe){
+            for(int q=0;q<nmiss;q++){
+                g_lp.job[q].li=li; g_lp.job[q].eid=ids[missk[q]]; g_lp.job[q].s=&m->ws[q];
+            }
+            lp_submit(m,nmiss);
+        } else {
+            double t0=now_s();
+            #pragma omp parallel for schedule(dynamic,1)
+            for(int q=0;q<nmiss;q++) expert_read(m,li,ids[missk[q]],&m->ws[q]);
+            m->t_eload+=now_s()-t0;
+        }
         m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
     }
-    for(int j=0;j<n;j++)
+    for(int j=0;j<n;j++){
+        if(g_k3_pipe && qof[j]>=0 &&
+           !atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire)){
+            double t0=now_s();          /* t_eload = UN-hidden I/O (wait) time */
+            while(!atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire))
+                usleep(50);
+            m->t_eload+=now_s()-t0;
+        }
         expert_apply(m,use[j],z,w[j],u,gate,up,hz);
+    }
     /* promotion: swap the freshly-read slots into the layer LRU */
     LCache *lc=&m->ecache[li];
     int promo = nmiss<lc->cap ? nmiss : lc->cap;
@@ -758,6 +847,21 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, float *out){
     }
     { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];
       for(int kk=0;kk<K;kk++) wsel[kk]/=(sm+1e-20f); }
+    /* K3_TOPP: drop the low-weight tail of the top-16 — the only lever that
+     * cuts expert I/O AND compute proportionally. Weights renormalize over
+     * the kept set (GLM's TOPP semantics). Quality-gate via K3_LOGITS. */
+    if(g_k3_topp>0.f && g_k3_topp<1.f){
+        for(int a2=1;a2<K;a2++){ int e=idx[a2]; float w2=wsel[a2]; int b2=a2-1;
+            while(b2>=0&&wsel[b2]<w2){ idx[b2+1]=idx[b2]; wsel[b2+1]=wsel[b2]; b2--; }
+            idx[b2+1]=e; wsel[b2+1]=w2; }
+        float cum=0; int keep=K;
+        for(int kk=0;kk<K;kk++){ cum+=wsel[kk]; if(cum>=g_k3_topp){ keep=kk+1; break; } }
+        if(keep<K){
+            float sm=0; for(int kk=0;kk<keep;kk++) sm+=wsel[kk];
+            for(int kk=0;kk<keep;kk++) wsel[kk]/=(sm+1e-20f);
+            K=keep;
+        }
+    }
     /* keep loads in DISK-OFFSET order (experts are NOT id-ordered inside the
      * HF shards — measured 169/895; helps the buffered fallback, harmless
      * under O_DIRECT). WILLNEED prefetch only for the buffered path. */
