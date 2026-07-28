@@ -46,6 +46,7 @@
  *   K3_LOAD_THREADS=N    loader threads for K3_PIPE (default 4)
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
  *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
+ *   K3_THINK=0|1         chat mode: open the think channel (default 1)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
  *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
@@ -1099,16 +1100,73 @@ static int sample_tok(const float *lo, int V, float temp){
     free(p); return pick;
 }
 
+/* ---------- K3 XTML chat format (faithful to the shipped encoding_k3.py) --
+ * Only <|open|>, <|close|>, <|sep|>, <|end_of_msg|> are special TOKENS; tag
+ * names and attributes are ordinary text, encoded as the same standalone
+ * segments as the reference (segment boundaries are token boundaries). A
+ * turn renders as
+ *   <|open|>message role="user"<|sep|>TEXT<|close|>message<|sep|><|end_of_msg|>
+ * and the generation prompt opens the assistant message plus its structural
+ * thinking channel:
+ *   <|open|>message role="assistant"<|sep|><|open|>think<|sep|>
+ * (K3_THINK=0 opens <response> directly = non-thinking mode). The model then
+ * closes think, opens response, and finishes with <|end_of_msg|> (the eos). */
+typedef struct { Tok *T; int *ids; int n, cap;
+                 int sp_open, sp_close, sp_sep, sp_eom; } ChatB;
+static void cb_special(ChatB *b, int id){
+    if(b->n>=b->cap){ fprintf(stderr,"chat prompt too long\n"); exit(1); }
+    b->ids[b->n++]=id;
+}
+static void cb_text(ChatB *b, const char *s){
+    if(!*s) return;
+    b->n+=tok_encode(b->T,s,(int)strlen(s),b->ids+b->n,b->cap-b->n);
+}
+static void cb_open(ChatB *b, const char *tag, const char *role){
+    cb_special(b,b->sp_open); cb_text(b,tag);
+    if(role){ cb_text(b," role"); cb_text(b,"=\""); cb_text(b,role); cb_text(b,"\""); }
+    cb_special(b,b->sp_sep);
+}
+static void cb_close(ChatB *b, const char *tag){
+    cb_special(b,b->sp_close); cb_text(b,tag); cb_special(b,b->sp_sep);
+}
+static int chat_special(Tok *T, const char *s){
+    int l=(int)strlen(s);
+    for(int i=0;i<T->nsp;i++)
+        if(T->sp[i].len==l && !memcmp(T->sp[i].str,s,l)) return T->sp[i].id;
+    return -1;
+}
+/* returns prompt length; sp[4] = {open, close, sep, end_of_msg} ids */
+static int chat_build(Tok *T, const char *sys, const char *user, int thinking,
+                      int *ids, int cap, int *sp){
+    ChatB b={T,ids,0,cap,
+        chat_special(T,"<|open|>"), chat_special(T,"<|close|>"),
+        chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>")};
+    if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0){
+        fprintf(stderr,"chat: XTML special tokens not in tokenizer.json\n"); exit(1); }
+    sp[0]=b.sp_open; sp[1]=b.sp_close; sp[2]=b.sp_sep; sp[3]=b.sp_eom;
+    if(sys&&*sys){
+        cb_open(&b,"message","system"); cb_text(&b,sys);
+        cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+    }
+    cb_open(&b,"message","user"); cb_text(&b,user);
+    cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+    cb_open(&b,"message","assistant");
+    cb_open(&b,thinking?"think":"response",NULL);
+    return b.n;
+}
+
 int main(int argc, char **argv){
     if(argc<2){
         fprintf(stderr,"usage: %s <model_dir> [prompt] [--ids \"1 2 3\"] [--ngen N]\n",argv[0]);
         return 1;
     }
-    const char *snap=argv[1], *prompt=NULL, *idstr=NULL;
-    int ngen=32;
+    const char *snap=argv[1], *prompt=NULL, *idstr=NULL, *sysmsg=NULL;
+    int ngen=32, chat=0;
     for(int i=2;i<argc;i++){
         if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--ids")&&i+1<argc) idstr=argv[++i];
+        else if(!strcmp(argv[i],"--chat")) chat=1;
+        else if(!strcmp(argv[i],"--system")&&i+1<argc) sysmsg=argv[++i];
         else if(!prompt) prompt=argv[i];
     }
     float temp=getenv("COLI_TEMP")?(float)atof(getenv("COLI_TEMP")):0.f;
@@ -1135,9 +1193,21 @@ int main(int argc, char **argv){
     { char tp[2048]; snprintf(tp,sizeof(tp),"%s/tokenizer.json",snap);
       FILE *f=fopen(tp,"rb"); if(f){ fclose(f); tok_load(&T,tp); has_tok=1;
           fprintf(stderr,"[K3] tokenizer.json loaded (family=%s)\n",T.kimi?"kimi":(T.o200k?"o200k":"cl100k")); } }
+    int sp[4]={-1,-1,-1,-1};
+    int think=getenv("K3_THINK")?atoi(getenv("K3_THINK")):1;
     if(idstr){
         const char *p=idstr;
         while(*p&&np<65536){ while(*p==' '||*p==',')p++; if(!*p)break; ids[np++]=(int)strtol(p,(char**)&p,10); }
+    } else if(chat){
+        if(!has_tok){ fprintf(stderr,"--chat needs tokenizer.json\n"); return 1; }
+        if(!prompt){ fprintf(stderr,"--chat needs a user message\n"); return 1; }
+        if(m.c.bos>=0) ids[np++]=m.c.bos;
+        np+=chat_build(&T,sysmsg,prompt,think,ids+np,65536-np,sp);
+        if(getenv("K3_CHAT_IDS")){
+            fprintf(stderr,"[K3] chat ids:");
+            for(int i=0;i<np;i++) fprintf(stderr," %d",ids[i]);
+            fprintf(stderr,"\n");
+        }
     } else if(prompt){
         if(!has_tok){ fprintf(stderr,"no tokenizer.json — pass --ids (generate one with tools/k3_tokenizer.py)\n"); return 1; }
         if(m.c.bos>=0) ids[np++]=m.c.bos;
@@ -1173,12 +1243,33 @@ int main(int argc, char **argv){
     }
     double tg=now_s(); int ntok=0;
     char buf[512];
+    /* chat print filter: hide the XTML structure, label the channels.
+     * Structural runs are <|open|>/<|close|> TAGTEXT <|sep|> — suppress them
+     * and print a channel banner when the response channel opens. */
+    int xsup=0, xopen=0; char xtag[64]; int xtl=0;
+    if(chat&&think){ printf("[think] "); fflush(stdout); }
     for(int s=0;s<ngen;s++){
         int t=sample_tok(lo,m.c.vocab,temp);
         free(lo); lo=NULL;
         int is_eos=0; for(int e=0;e<m.c.n_eos;e++) if(t==m.c.eos[e]) is_eos=1;
-        if(has_tok){ int n2=tok_decode(&T,&t,1,buf,sizeof(buf)-1); fwrite(buf,1,n2,stdout); fflush(stdout); }
-        else { printf("%d ",t); fflush(stdout); }
+        int show=1;
+        if(chat&&sp[0]>=0){
+            if(t==sp[0]||t==sp[1]){ xsup=1; xopen=(t==sp[0]); xtl=0; show=0; }
+            else if(t==sp[2]){
+                if(xsup){ xsup=0; xtag[xtl]=0;
+                    if(xopen&&!strcmp(xtag,"response")){ printf("\n\n[response] "); fflush(stdout); }
+                }
+                show=0;
+            } else if(xsup){
+                if(has_tok){ int n2=tok_decode(&T,&t,1,buf,sizeof(buf)-1);
+                    if(xtl+n2<(int)sizeof(xtag)){ memcpy(xtag+xtl,buf,n2); xtl+=n2; } }
+                show=0;
+            } else if(t==sp[3]) show=0;
+        }
+        if(show){
+            if(has_tok){ int n2=tok_decode(&T,&t,1,buf,sizeof(buf)-1); fwrite(buf,1,n2,stdout); fflush(stdout); }
+            else { printf("%d ",t); fflush(stdout); }
+        }
         ntok++;
         if(is_eos){ fprintf(stderr,"\n[K3] eos\n"); break; }
         if(np+ntok>=max_t){ fprintf(stderr,"\n[K3] context full\n"); break; }

@@ -160,6 +160,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_LOAD_THREADS` | 4 | loader threads for `K3_PIPE` |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
+| `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
 | `K3_MAXT` | prompt+ngen | context capacity |
 | `K3_LAYERS` | all | truncate the stack (validation) |
@@ -182,8 +183,33 @@ teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 ~5.3 -> **2.0 s/token** at C=32. The KDA state-update sweeps are AVX2
 (scalar fallback for head dims not divisible by 8).
 
+## Chat mode (`--chat`)
+
+```
+./kimi_k3 <model_dir> --chat "your question" [--system "..."] --ngen 300
+```
+
+K3's chat format ("XTML", from the checkpoint's own `encoding_k3.py`) uses
+only four special tokens — `<|open|>`, `<|close|>`, `<|sep|>`,
+`<|end_of_msg|>` — around ordinary-text tag names and attributes:
+
+```
+<|open|>message role="user"<|sep|>TEXT<|close|>message<|sep|><|end_of_msg|>
+<|open|>message role="assistant"<|sep|><|open|>think<|sep|>        <- generation prompt
+```
+
+The assistant's thinking is a *structural* channel (preserved across turns in
+multi-turn use); `K3_THINK=0` opens `<response>` directly instead. The C
+builder mirrors the reference segment-for-segment (segment boundaries are
+token boundaries) and was verified **token-exact** against `encoding_k3.py` +
+tiktoken for system/no-system and thinking/non-thinking prompts. At decode
+the CLI hides the XTML structure and prints `[think]` / `[response]` channel
+banners; generation stops at `<|end_of_msg|>` (the eos).
+
 ## Current limitations
 
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
+- `--chat` renders a single system+user turn (no multi-turn CLI loop, no
+  tool-call rendering — the format supports both; see `encoding_k3.py`).
 - CPU only (no CUDA/Metal/Vulkan tier), scalar KDA inner loops.
 - No chat template handling; prompts are raw text after `[BOS]`.
