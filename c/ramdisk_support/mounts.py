@@ -4,7 +4,6 @@ from __future__ import print_function
 
 import concurrent.futures
 import hashlib
-import math
 import mmap
 import os
 import re
@@ -743,23 +742,91 @@ def _populate_mount(
         os.symlink(target, destination)
 
 
+def _mix_sample_value(value):
+    """Return a stable, well-distributed unsigned 64-bit value."""
+    mask = (1 << 64) - 1
+    value = (value + 0x9E3779B97F4A7C15) & mask
+    value = (
+        (value ^ (value >> 30))
+        * 0xBF58476D1CE4E5B9
+    ) & mask
+    value = (
+        (value ^ (value >> 27))
+        * 0x94D049BB133111EB
+    ) & mask
+    return value ^ (value >> 31)
+
+
 def _sample_page_indices(total_pages, sample_pages, node_count):
     sample_pages = max(1, min(sample_pages, total_pages))
     if sample_pages == total_pages:
         return list(range(total_pages))
-    step = max(1, total_pages // sample_pages)
-    while math.gcd(step, max(1, node_count)) != 1:
-        step += 1
+    node_count = max(1, node_count)
+    if node_count == 1:
+        return [
+            ((2 * sample + 1) * total_pages)
+            // (2 * sample_pages)
+            for sample in range(sample_pages)
+        ]
+
+    eligible_orders = [
+        order
+        for order in range(10)
+        if (
+            total_pages + (1 << order) - 1
+        ) // (1 << order) >= 7 * node_count
+    ]
+    residue_counts = {
+        order: [0] * node_count
+        for order in eligible_orders
+    }
+    seed = _mix_sample_value(
+        total_pages
+        ^ (sample_pages << 32)
+        ^ node_count
+    )
     indices = []
-    seen = set()
-    value = 0
-    while len(indices) < sample_pages:
-        if value not in seen:
-            indices.append(value)
-            seen.add(value)
-        value = (value + step) % total_pages
-        if value in seen and len(indices) < sample_pages:
-            value = (max(seen) + 1) % total_pages
+    for sample in range(sample_pages):
+        lower = sample * total_pages // sample_pages
+        upper = (sample + 1) * total_pages // sample_pages
+        target = float(sample + 1) / node_count
+        best = None
+        for salt in range(32):
+            value = lower + (
+                _mix_sample_value(
+                    seed + sample * 32 + salt
+                )
+                % (upper - lower)
+            )
+            maximum_distance = 0.0
+            squared_distance = 0.0
+            for order in eligible_orders:
+                residue = (value >> order) % node_count
+                for node, count in enumerate(
+                    residue_counts[order]
+                ):
+                    projected = count + (
+                        1 if node == residue else 0
+                    )
+                    distance = abs(projected - target)
+                    maximum_distance = max(
+                        maximum_distance,
+                        distance,
+                    )
+                    squared_distance += distance * distance
+            score = (
+                maximum_distance,
+                squared_distance,
+                salt,
+            )
+            if best is None or score < best[0]:
+                best = (score, value)
+        value = best[1]
+        indices.append(value)
+        for order in eligible_orders:
+            residue_counts[order][
+                (value >> order) % node_count
+            ] += 1
     return indices
 
 
@@ -928,19 +995,33 @@ def _validate_namespace(
             local = allocation.get(str(mount["node"]), 0)
             if float(local) / total < 0.95:
                 raise RamdiskError(
-                    "node-local tmpfs sample is below 95%% local allocation"
+                    "node-local tmpfs sample is below 95% local allocation"
                 )
         elif len(placement_nodes) > 1:
             ideal = float(total) / len(placement_nodes)
-            if any(
+            deviations = [
                 abs(allocation.get(str(node), 0) - ideal)
                 / ideal
-                > 0.15
                 for node in placement_nodes
-            ):
+            ]
+            maximum_deviation = max(deviations)
+            if maximum_deviation > 0.15:
+                node_pages = ", ".join(
+                    "%s=%d"
+                    % (
+                        node,
+                        allocation.get(str(node), 0),
+                    )
+                    for node in placement_nodes
+                )
                 raise RamdiskError(
-                    "interleaved tmpfs sample differs by more than "
-                    "15%% across nodes"
+                    "interleaved tmpfs sample is imbalanced: "
+                    "node pages %s; maximum deviation %.1f%% "
+                    "exceeds 15%%"
+                    % (
+                        node_pages,
+                        maximum_deviation * 100.0,
+                    )
                 )
     return allocation
 

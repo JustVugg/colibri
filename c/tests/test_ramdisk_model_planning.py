@@ -526,7 +526,54 @@ class ScanAndPlanTest(unittest.TestCase):
             with self.assertRaisesRegex(ramdisk.RamdiskError, "changed since preparation"):
                 ramdisk._assert_effective_masks_unchanged(plan)
 
-    def test_numa_sampling_stride_visits_every_round_robin_residue(self):
+    def test_numa_sampling_avoids_page_order_resonance(self):
+        total_pages = 1 << 20
+        sample_pages = 256
         for nodes in (2, 4):
-            indices = ramdisk._sample_page_indices(4096, 256, nodes)
-            self.assertEqual({index % nodes for index in indices}, set(range(nodes)))
+            indices = ramdisk._sample_page_indices(
+                total_pages,
+                sample_pages,
+                nodes,
+            )
+            self.assertEqual(
+                indices,
+                ramdisk._sample_page_indices(
+                    total_pages,
+                    sample_pages,
+                    nodes,
+                ),
+            )
+            self.assertEqual(len(indices), sample_pages)
+            self.assertEqual(len(set(indices)), sample_pages)
+            self.assertTrue(
+                all(0 <= index < total_pages for index in indices)
+            )
+            for order in range(10):
+                allocation_units = (
+                    total_pages + (1 << order) - 1
+                ) // (1 << order)
+                if allocation_units < 7 * nodes:
+                    continue
+                counts = [
+                    sum(
+                        1
+                        for index in indices
+                        if (index >> order) % nodes == node
+                    )
+                    for node in range(nodes)
+                ]
+                ideal = float(sample_pages) / nodes
+                deviation = max(
+                    abs(count - ideal) / ideal
+                    for count in counts
+                )
+                self.assertLessEqual(
+                    deviation,
+                    0.15,
+                    "order %d across %d nodes: %r"
+                    % (order, nodes, counts),
+                )
+        self.assertEqual(
+            ramdisk._sample_page_indices(8, 20, 4),
+            list(range(8)),
+        )

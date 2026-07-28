@@ -30,7 +30,7 @@ Steps:
 
    ```bash
    python -m unittest \
-     c.tests.test_ramdisk_model_planning.RamdiskPlanningTest.test_numa_sampling_avoids_page_order_resonance
+     c.tests.test_ramdisk_model_planning.ScanAndPlanTest.test_numa_sampling_avoids_page_order_resonance
    ```
 
 6. Confirm the existing fixed-stride implementation fails at the THP order.

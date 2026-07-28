@@ -9,6 +9,12 @@ from ramdisk_support import mounts as mounts_support
 
 
 class MountAndCopyTest(unittest.TestCase):
+    def _stage_fixture_namespace(self, fixture, destination):
+        for source in fixture.root.glob("*.safetensors"):
+            target = Path(destination) / source.name
+            shutil.copy2(source, target)
+            target.chmod(0o400)
+
     def test_cgroup_headroom_uses_the_injected_discovery_service(self):
         discover = mock.Mock(
             return_value={"available_bytes": 1234, "error": None}
@@ -274,10 +280,7 @@ class MountAndCopyTest(unittest.TestCase):
                 plan_args(fixture.root, memory_nodes="0"),
                 hardware=hardware_fixture(nodes=2),
             )
-            for source in fixture.root.glob("*.safetensors"):
-                target = Path(destination) / source.name
-                shutil.copy2(source, target)
-                target.chmod(0o400)
+            self._stage_fixture_namespace(fixture, destination)
             mount = {"path": destination, "node": None}
             with mock.patch.object(
                 ramdisk,
@@ -288,6 +291,63 @@ class MountAndCopyTest(unittest.TestCase):
                     ramdisk.RamdiskError, "escaped the reviewed NUMA"
                 ):
                     ramdisk._validate_namespace(plan, mount)
+
+    def test_interleaved_namespace_accepts_balanced_sample(self):
+        with ModelFixture() as fixture, canonical_temporary_directory() as destination:
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root),
+                hardware=hardware_fixture(nodes=2),
+            )
+            self._stage_fixture_namespace(fixture, destination)
+            mount = {"path": destination, "node": None}
+            with mock.patch.object(
+                ramdisk,
+                "_sample_numa_allocation",
+                return_value={"0": 50, "1": 50},
+            ):
+                self.assertEqual(
+                    ramdisk._validate_namespace(plan, mount),
+                    {"0": 100, "1": 100},
+                )
+
+    def test_interleaved_namespace_reports_imbalanced_sample(self):
+        with ModelFixture() as fixture, canonical_temporary_directory() as destination:
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root),
+                hardware=hardware_fixture(nodes=2),
+            )
+            self._stage_fixture_namespace(fixture, destination)
+            mount = {"path": destination, "node": None}
+            with mock.patch.object(
+                ramdisk,
+                "_sample_numa_allocation",
+                return_value={"0": 60, "1": 40},
+            ):
+                with self.assertRaises(ramdisk.RamdiskError) as raised:
+                    ramdisk._validate_namespace(plan, mount)
+            message = str(raised.exception)
+            self.assertIn("0=120, 1=80", message)
+            self.assertIn("20.0%", message)
+            self.assertIn("exceeds 15%", message)
+            self.assertNotIn("%%", message)
+
+    def test_node_local_namespace_uses_single_percent_sign(self):
+        with ModelFixture() as fixture, canonical_temporary_directory() as destination:
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root, topology="per-node"),
+                hardware=hardware_fixture(nodes=2),
+            )
+            self._stage_fixture_namespace(fixture, destination)
+            mount = {"path": destination, "node": 0}
+            with mock.patch.object(
+                ramdisk,
+                "_sample_numa_allocation",
+                return_value={"0": 90, "1": 10},
+            ):
+                with self.assertRaises(ramdisk.RamdiskError) as raised:
+                    ramdisk._validate_namespace(plan, mount)
+            self.assertIn("95% local allocation", str(raised.exception))
+            self.assertNotIn("%%", str(raised.exception))
 
     def test_mount_lookup_rejects_stacked_exact_paths(self):
         mounts = [
