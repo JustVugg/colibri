@@ -62,6 +62,7 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <unistd.h>
 #endif
 #include <pthread.h>
@@ -1090,14 +1091,24 @@ static void kv_alloc(Model *m, int max_t){
     }
 }
 
-static int sample_tok(const float *lo, int V, float temp){
+typedef struct { float p; int id; } SampleProb;
+static int sample_prob_desc(const void *a,const void *b){
+    float d=((const SampleProb*)b)->p-((const SampleProb*)a)->p;
+    return d>0?1:d<0?-1:0;
+}
+static int sample_tok(const float *lo, int V, float temp, float top_p){
     if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
-    float *p=falloc(V); float mx=lo[0];
+    SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
+    if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
-    double s=0; for(int i=0;i<V;i++){ p[i]=expf((lo[i]-mx)/temp); s+=p[i]; }
-    double r=((double)rand()/RAND_MAX)*s, acc=0; int pick=V-1;
-    for(int i=0;i<V;i++){ acc+=p[i]; if(acc>=r){ pick=i; break; } }
-    free(p); return pick;
+    double sum=0;
+    for(int i=0;i<V;i++){ float p=expf((lo[i]-mx)/temp); sum+=p; rank[i]=(SampleProb){p,i}; }
+    qsort(rank,(size_t)V,sizeof(SampleProb),sample_prob_desc);
+    double cut=(top_p>0.f&&top_p<1.f)?top_p*sum:sum, kept=0; int n=0;
+    while(n<V&&kept<cut) kept+=rank[n++].p;
+    double r=((double)rand()/RAND_MAX)*kept, acc=0; int pick=rank[0].id;
+    for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
+    free(rank); return pick;
 }
 
 /* ---------- K3 XTML chat format (faithful to the shipped encoding_k3.py) --
@@ -1155,19 +1166,258 @@ static int chat_build(Tok *T, const char *sys, const char *user, int thinking,
     return b.n;
 }
 
+static void chat_message(ChatB *b, const char *role, const char *text, int assistant){
+    cb_open(b,"message",role);
+    if(assistant) cb_open(b,"response",NULL);
+    cb_text(b,text);
+    if(assistant) cb_close(b,"response");
+    cb_close(b,"message");
+    cb_special(b,b->sp_eom);
+}
+
+static void chat_assistant(ChatB *b, const char *reasoning, const char *text){
+    cb_open(b,"message","assistant");
+    cb_open(b,"think",NULL); cb_text(b,reasoning); cb_close(b,"think");
+    cb_open(b,"response",NULL); cb_text(b,text); cb_close(b,"response");
+    cb_close(b,"message"); cb_special(b,b->sp_eom);
+}
+
+/* Internal gateway payload. Length framing keeps arbitrary UTF-8/newlines in
+ * message content while preserving the segment boundaries required by K3's
+ * rank-BPE chat template:
+ *   K3CHAT1\n
+ *   M <role> <utf8-bytes>\n<content> ...
+ *   G <thinking>\n
+ */
+static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
+                           int *ids, int cap, int *sp){
+    ChatB b={T,ids,0,cap,
+        chat_special(T,"<|open|>"), chat_special(T,"<|close|>"),
+        chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>")};
+    if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0) return -1;
+    sp[0]=b.sp_open; sp[1]=b.sp_close; sp[2]=b.sp_sep; sp[3]=b.sp_eom;
+    const char *p=wire, *end=wire+nwire;
+    if(nwire<8||memcmp(p,"K3CHAT1\n",8)) return -1;
+    p+=8; *thinking=0;
+    while(p<end){
+        const char *nl=memchr(p,'\n',(size_t)(end-p));
+        if(!nl) return -1;
+        if(*p=='G'){
+            int v=0;
+            if(sscanf(p,"G %d",&v)!=1) return -1;
+            *thinking=!!v; p=nl+1; break;
+        }
+        if(*p=='A'){
+            int nr=-1, nt=-1;
+            if(sscanf(p,"A %d %d",&nr,&nt)!=2||nr<0||nt<0||nl+1+nr+nt>end) return -1;
+            char *reason=malloc((size_t)nr+1), *text=malloc((size_t)nt+1);
+            if(!reason||!text){ fprintf(stderr,"OOM chat assistant\n"); exit(1); }
+            memcpy(reason,nl+1,(size_t)nr); reason[nr]=0;
+            memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
+            chat_assistant(&b,reason,text);
+            free(reason); free(text); p=nl+1+nr+nt; continue;
+        }
+        char role[16]; int nb=-1;
+        if(sscanf(p,"M %15s %d",role,&nb)!=2||nb<0||nl+1+nb>end) return -1;
+        char *text=malloc((size_t)nb+1);
+        if(!text){ fprintf(stderr,"OOM chat message\n"); exit(1); }
+        memcpy(text,nl+1,(size_t)nb); text[nb]=0;
+        const char *r=!strcmp(role,"developer")?"system":role;
+        if(strcmp(r,"system")&&strcmp(r,"user")&&strcmp(r,"assistant")){ free(text); return -1; }
+        chat_message(&b,r,text,!strcmp(r,"assistant"));
+        free(text); p=nl+1+nb;
+    }
+    cb_open(&b,"message","assistant");
+    cb_open(&b,*thinking?"think":"response",NULL);
+    return b.n;
+}
+
+/* ---------- serve mode: shared openai_server.py protocol ---------- */
+typedef struct {
+    char id[64];
+    int max_tok;
+    float temp, top_p;
+    char *payload;
+    int plen;
+} ServeReq;
+
+static void model_state_reset(Model *m){
+    Cfg *c=&m->c;
+    for(int i=0;i<c->n_layers;i++){
+        if(m->L[i].kda){
+            memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
+            memset(m->cwq[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+            memset(m->cwk[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+            memset(m->cwv[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+        }
+        if(m->Lc&&m->Lc[i]) free(m->Lc[i]);
+        if(m->Rc&&m->Rc[i]) free(m->Rc[i]);
+    }
+    free(m->Lc); free(m->Rc);
+    m->Lc=NULL; m->Rc=NULL; m->max_t=0;
+}
+
+static int serve_stdin_readable(void){
+    fd_set r; struct timeval tv={0,0};
+    FD_ZERO(&r); FD_SET(0,&r);
+    return select(1,&r,NULL,NULL,&tv)>0;
+}
+
+static int serve_read_req(ServeReq *q, const char *active){
+    char line[512], cmd[16], id[64];
+    if(!fgets(line,sizeof(line),stdin)) return -1;
+    if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
+    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return active&&!strcmp(active,id);
+    if(strcmp(cmd,"SUBMIT")) return 0;
+    int slot, plen, max_tok; float temp, top_p;
+    if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5||
+       plen<0||plen>(1<<24)||max_tok<1){
+        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
+    }
+    (void)slot;
+    char *payload=malloc((size_t)plen+1);
+    if(!payload){ printf("ERROR %s out of memory\n",id); fflush(stdout); return 0; }
+    if(fread(payload,1,(size_t)plen,stdin)!=(size_t)plen){ free(payload); return -1; }
+    (void)fgetc(stdin); payload[plen]=0;
+    snprintf(q->id,sizeof(q->id),"%s",id);
+    q->max_tok=max_tok; q->temp=temp; q->top_p=top_p;
+    q->payload=payload; q->plen=plen;
+    return 2;
+}
+
+static void serve_data(const char *id, const char *p, int n){
+    if(n<=0) return;
+    printf("DATA %s %d\n",id,n);
+    fwrite(p,1,(size_t)n,stdout); fputc('\n',stdout); fflush(stdout);
+}
+
+static void serve_one(Model *m, Tok *T, ServeReq *q){
+    int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
+    if(!ids){ printf("ERROR %s out of memory\n",q->id); fflush(stdout); return; }
+    int sp[4]={-1,-1,-1,-1}, chat=0, thinking=0;
+    if(m->c.bos>=0) ids[np++]=m->c.bos;
+    if(q->plen>=8&&!memcmp(q->payload,"K3CHAT1\n",8)){
+        int n=chat_build_wire(T,q->payload,q->plen,&thinking,ids+np,cap-np,sp);
+        if(n<0){ printf("ERROR %s invalid K3 chat payload\n",q->id); fflush(stdout); free(ids); return; }
+        np+=n; chat=1;
+    } else {
+        np+=tok_encode(T,q->payload,q->plen,ids+np,cap-np);
+    }
+    int max_ctx=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):8192;
+    if(np<1||np+q->max_tok>max_ctx){
+        printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
+               q->id,np,q->max_tok,max_ctx);
+        fflush(stdout); free(ids); return;
+    }
+    printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+    model_state_reset(m);
+    kv_alloc(m,np+q->max_tok+8);
+    int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
+    if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+    double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
+    uint64_t hit0=m->hits, miss0=m->miss;
+    float *lo=NULL;
+    for(int i=0;i<np;i+=chunk){
+        int C=np-i<chunk?np-i:chunk;
+        free(lo); lo=step_chunk(m,ids+i,i,C);
+    }
+    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
+    char buf[512], xtag[64];
+    double tg=now_s();
+    for(int s=0;s<q->max_tok&&!cancelled;s++){
+        int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
+        free(lo); lo=NULL;
+        int eos=0; for(int i=0;i<m->c.n_eos;i++) if(tk==m->c.eos[i]) eos=1;
+        int show=!eos;
+        if(chat&&sp[0]>=0){
+            if(tk==sp[0]||tk==sp[1]){
+                xsup=1; xopen=(tk==sp[0]); xtl=0; show=0;
+            } else if(tk==sp[2]){
+                if(xsup){
+                    xsup=0; xtag[xtl]=0;
+                    if(xopen&&!strcmp(xtag,"response")&&thinking)
+                        serve_data(q->id,"</think>",8);
+                }
+                show=0;
+            } else if(xsup){
+                int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
+                if(xtl+nb<(int)sizeof(xtag)){ memcpy(xtag+xtl,buf,(size_t)nb); xtl+=nb; }
+                show=0;
+            } else if(tk==sp[3]) show=0;
+        }
+        if(show){
+            int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
+            serve_data(q->id,buf,nb);
+        }
+        if(!eos) gen++;
+        while(serve_stdin_readable()){
+            ServeReq queued={0};
+            int r=serve_read_req(&queued,q->id);
+            if(r<0){ cancelled=1; break; }
+            if(r==1) cancelled=1;
+            if(r==2){
+                printf("ERROR %s engine busy\n",queued.id); fflush(stdout); free(queued.payload);
+            }
+        }
+        if(cancelled){ limited=0; break; }
+        if(eos){ limited=0; break; }
+        if(s+1<q->max_tok) lo=step_chunk(m,&tk,np+s,1);
+    }
+    free(lo); free(ids);
+    double dt=now_s()-t0, decode=now_s()-tg;
+    uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
+           decode>0?gen/decode:0.0,total?100.0*hits/total:0.0,rss_gb(),np,limited);
+    double moe=m->t_moe-e0, disk=m->t_eload-d0;
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
+           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
+    fflush(stdout);
+}
+
+static void serve_loop(Model *m, Tok *T){
+    setvbuf(stdin,NULL,_IONBF,0);
+    fputs("\x01\x01READY\x01\x01\n",stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n",rss_gb());
+    fflush(stdout);
+    for(;;){
+        ServeReq q={0}; int r;
+        do r=serve_read_req(&q,NULL); while(r==0);
+        if(r<0) return;
+        if(r==2){ serve_one(m,T,&q); free(q.payload); }
+    }
+}
+
 int main(int argc, char **argv){
-    if(argc<2){
+    int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
+    if(!serving&&argc<2){
         fprintf(stderr,"usage: %s <model_dir> [prompt] [--ids \"1 2 3\"] [--ngen N]\n",argv[0]);
         return 1;
     }
-    const char *snap=argv[1], *prompt=NULL, *idstr=NULL, *sysmsg=NULL;
+    const char *snap=serving?getenv("SNAP"):argv[1], *prompt=NULL, *idstr=NULL, *sysmsg=NULL, *wirepath=NULL;
+    if(!snap||!*snap){ fprintf(stderr,"set SNAP=<Kimi K3 snapshot directory>\n"); return 1; }
     int ngen=32, chat=0;
-    for(int i=2;i<argc;i++){
+    for(int i=serving?1:2;i<argc;i++){
         if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--ids")&&i+1<argc) idstr=argv[++i];
         else if(!strcmp(argv[i],"--chat")) chat=1;
         else if(!strcmp(argv[i],"--system")&&i+1<argc) sysmsg=argv[++i];
+        else if(!strcmp(argv[i],"--wire-test")&&i+1<argc) wirepath=argv[++i];
         else if(!prompt) prompt=argv[i];
+    }
+    if(wirepath){
+        char tp[2048]; snprintf(tp,sizeof(tp),"%s/tokenizer.json",snap);
+        Tok wt; tok_load(&wt,tp);
+        FILE *wf=fopen(wirepath,"rb"); if(!wf){ perror(wirepath); return 1; }
+        fseek(wf,0,SEEK_END); long wn=ftell(wf); fseek(wf,0,SEEK_SET);
+        if(wn<0||wn>(1<<24)){ fprintf(stderr,"wire payload too large\n"); fclose(wf); return 1; }
+        char *wire=malloc((size_t)wn+1); int *wid=malloc(65536*sizeof(int));
+        if(!wire||!wid){ fprintf(stderr,"OOM wire test\n"); return 1; }
+        if(fread(wire,1,(size_t)wn,wf)!=(size_t)wn){ fprintf(stderr,"short wire read\n"); return 1; }
+        fclose(wf); wire[wn]=0;
+        int thinking=0, wsp[4], n=chat_build_wire(&wt,wire,(int)wn,&thinking,wid,65536,wsp);
+        if(n<0){ fprintf(stderr,"invalid K3 chat wire payload\n"); return 1; }
+        for(int i=0;i<n;i++) printf("%s%d",i?" ":"",wid[i]);
+        printf("\n"); free(wire); free(wid); return 0;
     }
     float temp=getenv("COLI_TEMP")?(float)atof(getenv("COLI_TEMP")):0.f;
     int nlayers=getenv("K3_LAYERS")?atoi(getenv("K3_LAYERS")):0;
@@ -1193,6 +1443,11 @@ int main(int argc, char **argv){
     { char tp[2048]; snprintf(tp,sizeof(tp),"%s/tokenizer.json",snap);
       FILE *f=fopen(tp,"rb"); if(f){ fclose(f); tok_load(&T,tp); has_tok=1;
           fprintf(stderr,"[K3] tokenizer.json loaded (family=%s)\n",T.kimi?"kimi":(T.o200k?"o200k":"cl100k")); } }
+    if(serving){
+        if(!has_tok){ fprintf(stderr,"serve mode needs tokenizer.json\n"); return 1; }
+        serve_loop(&m,&T);
+        return 0;
+    }
     int sp[4]={-1,-1,-1,-1};
     int think=getenv("K3_THINK")?atoi(getenv("K3_THINK")):1;
     if(idstr){
@@ -1249,7 +1504,7 @@ int main(int argc, char **argv){
     int xsup=0, xopen=0; char xtag[64]; int xtl=0;
     if(chat&&think){ printf("[think] "); fflush(stdout); }
     for(int s=0;s<ngen;s++){
-        int t=sample_tok(lo,m.c.vocab,temp);
+        int t=sample_tok(lo,m.c.vocab,temp,1.f);
         free(lo); lo=NULL;
         int is_eos=0; for(int e=0;e<m.c.n_eos;e++) if(t==m.c.eos[e]) is_eos=1;
         int show=1;

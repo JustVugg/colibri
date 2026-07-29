@@ -374,7 +374,7 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
+ARCH = "glm"   # set in main(): "glm" | "inkling" | "kimi" (auto-detected)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -455,6 +455,42 @@ def split_inkling(text):
         reasoning.append(think)
         text = pre + after
     return _INK_MARKER.sub("", text), _INK_MARKER.sub("", "".join(reasoning))
+
+
+def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                     tool_choice=None):
+    """Validated multi-turn K3 payload for the C engine.
+
+    K3's rank-BPE makes ordinary-text segment boundaries part of the tokenizer
+    contract. This private length-framed payload preserves roles, UTF-8 bytes,
+    and message boundaries; kimi_k3.c constructs the native XTML tokens.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the Kimi K3 engine yet.",
+                       "tools", "unsupported_parameter")
+    parts = ["K3CHAT1\n"]
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        reasoning = message.get("reasoning_content") if role == "assistant" else None
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise APIError(400, "`reasoning_content` must be a string.",
+                           f"messages.{index}.reasoning_content")
+        if role == "assistant" and enable_thinking:
+            reasoning = reasoning or ""
+            parts.append(f"A {len(reasoning.encode('utf-8'))} {len(text.encode('utf-8'))}\n"
+                         f"{reasoning or ''}{text}")
+        else:
+            parts.append(f"M {role} {len(text.encode('utf-8'))}\n{text}")
+    parts.append(f"G {1 if enable_thinking else 0}\n")
+    return "".join(parts)
 
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1696,10 +1732,10 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH == "inkling":
-            # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
+        if grammar is not None and ARCH in ("inkling", "kimi"):
+            # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
-            raise APIError(400, "`response_format` grammars are not supported by the Inkling "
+            raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
                                 "engine yet.", "response_format", "unsupported_parameter")
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
@@ -1995,7 +2031,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = render_chat_inkling if ARCH == "inkling" else render_chat
+        renderer = (render_chat_inkling if ARCH == "inkling" else
+                    render_chat_kimi if ARCH == "kimi" else render_chat)
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
@@ -2267,6 +2304,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
+    if ARCH in ("inkling", "kimi") and kv_slots != 1:
+        raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
         # a compute-heavy API to the network. Refuse unless explicitly overridden.
@@ -2302,7 +2341,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2327,11 +2366,14 @@ def main():
     if ARCH == "auto":
         try:
             with open(Path(args.model) / "config.json") as fh:
-                ARCH = "inkling" if "inkling" in (json.load(fh).get("model_type") or "") else "glm"
+                model_type = (json.load(fh).get("model_type") or "").lower()
+                ARCH = ("inkling" if "inkling" in model_type else
+                        "kimi" if "kimi" in model_type else "glm")
         except OSError:
             ARCH = "glm"
     if args.model_id is None:
-        args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
+        args.model_id = ("inkling-colibri" if ARCH == "inkling" else
+                         "kimi-k3-colibri" if ARCH == "kimi" else "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

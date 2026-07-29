@@ -16,7 +16,8 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, conversation_cache_slot, generation_options,
                            parse_tool_calls, read_engine_turn,
-                           render_chat, serve, split_thinking_reply, stop_policy)
+                           render_chat, render_chat_kimi, serve,
+                           split_thinking_reply, stop_policy)
 
 
 class FakeEngine:
@@ -77,6 +78,37 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(
             render_chat([{"role": "user", "content": "Hi"}], True, "high"),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
+        )
+
+    def test_kimi_payload_preserves_utf8_lengths_and_turns(self):
+        prompt = render_chat_kimi([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "你好\nKimi"},
+            {"role": "assistant", "content": "你好。"},
+            {"role": "user", "content": "Continue"},
+        ], enable_thinking=True)
+        self.assertEqual(
+            prompt,
+            "K3CHAT1\n"
+            "M system 11\nBe precise."
+            "M user 11\n你好\nKimi"
+            "A 0 9\n你好。"
+            "M user 8\nContinue"
+            "G 1\n",
+        )
+
+    def test_kimi_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_kimi([{"role": "user", "content": "Hi"}],
+                             tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_kimi([{"role": "tool", "content": "result"}])
+
+    def test_kimi_preserves_prior_reasoning_channel(self):
+        self.assertEqual(
+            render_chat_kimi([{"role": "assistant", "reasoning_content": "why",
+                               "content": "answer"}], enable_thinking=True),
+            "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
 
     def test_validates_generation_limits(self):
@@ -637,6 +669,28 @@ class HTTPTest(unittest.TestCase):
         self.assertIsNotNone(queue_wait)
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
         self.assertEqual(self.engine.calls[-1][4], 1)
+
+    def test_kimi_chat_completion_uses_multiturn_wire_payload(self):
+        with patch("openai_server.ARCH", "kimi"):
+            with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "你好"},
+                    {"role": "assistant", "content": "你好。"},
+                    {"role": "user", "content": "Continue"},
+                ],
+                "enable_thinking": False,
+            }) as response:
+                body = json.load(response)
+        self.assertEqual(body["choices"][0]["message"]["content"], "Héllo")
+        self.assertEqual(
+            self.engine.calls[-1][0],
+            "K3CHAT1\n"
+            "M user 6\n你好"
+            "M assistant 9\n你好。"
+            "M user 8\nContinue"
+            "G 0\n",
+        )
 
     def test_chat_completion_stops_across_engine_chunks(self):
         before = self.engine.stop_requests

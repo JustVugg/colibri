@@ -1,0 +1,7 @@
+K3CHAT1
+M system 11
+Be precise.M user 11
+你好
+KimiA 7 9
+because你好。M user 8
+ContinueG 1
