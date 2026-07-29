@@ -3,7 +3,9 @@
  * token id del riferimento (ref.json) -> valida il core prima di scalare a GLM-5.2.
  *
  * Densa (embed, attn, router, norme, lm_head) residente in RAM (float32).
- * Expert letti dal disco on-demand via pread+fadvise(DONTNEED), cache LRU per-layer.
+ * Expert letti dal disco on-demand via pread, cache LRU per-layer; le pagine
+ * restano nel page cache cosi' i miss LRU non tornano su disco (EXPERT_DROP=1
+ * ripristina fadvise(DONTNEED) per macchine con poca RAM).
  * Matmul multi-thread con OpenMP (niente BLAS).
  *
  * ENV VARS:
@@ -14,6 +16,8 @@
  *   SMOOTH=F      : EMA coefficient for routing momentum (default 0.3, range 0.0-0.95)
  *   CONF_LIMIT=F  : cumulative gate probability threshold for prefetch cutoff (default 0.92)
  *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
+ *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
+ *                    for RAM-tight boxes); 0=keep pages cached (default)
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -93,6 +97,7 @@ static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
+static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
@@ -406,7 +411,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
-    st_read_raw(&m->S, nm, s->g, 1);
+    st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }
 
@@ -970,6 +975,7 @@ int main(int argc, char **argv) {
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
+    g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
