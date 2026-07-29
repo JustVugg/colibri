@@ -377,6 +377,45 @@ static void cuda_disabled_note(void){
         "[CUDA] per device for dense + attention + workspace). See issue #687.\n",
         CUDA_DISABLED_LOUD_AT);
 }
+/* #687: a resident-tensor upload that OOMs disables that tensor for the WHOLE run and
+ * silently drops it to CPU, while the expert tier keeps the VRAM it took. The tier is
+ * the side that can give memory back: it re-adapts every 16 tokens under REPIN, and an
+ * evicted expert simply reloads from disk (expert_host_ensure). So trade the coldest few
+ * experts for the dense path and retry once, instead of losing the GPU for the run. */
+static Model *g_model;                 /* set after model_init; mirrors pilot_m */
+static void expert_host_ensure(Model *m, int layer, ESlot *s);
+static long g_cuda_evicted;            /* total experts traded away, for the cap + report */
+static int cuda_evict_coldest(int device, int64_t need_bytes){
+    Model *m=g_model;
+    enum { EVICT_CAP = 1024 };         /* never thrash the tier away wholesale */
+    if(!m||need_bytes<1||g_cuda_evicted>=EVICT_CAP) return 0;
+    int freed=0; int64_t got=0;
+    /* free at least what this tensor needs, with headroom for the allocator: a fixed
+     * expert count rescues the small tensors and leaves the big ones behind. */
+    while(got<need_bytes*2 && g_cuda_evicted<EVICT_CAP){
+        int bl=-1,bz=-1,have=0; uint32_t bh=0;
+        for(int l=0;l<=m->c.n_layers;l++){
+            ESlot *P=m->pin[l]; if(!P) continue;
+            for(int z=0;z<m->npin[l];z++){
+                ESlot *s=&P[z];
+                if(!s->g.cuda||s->g.cuda_device!=device) continue;
+                uint32_t h=(s->eid>=0&&s->eid<m->c.n_experts)?m->eheat[l][s->eid]:0;
+                if(!have||h<bh){ have=1; bh=h; bl=l; bz=z; }
+            }
+        }
+        if(!have) break;                                   /* nothing left on this device */
+        ESlot *s=&m->pin[bl][bz];
+        int64_t was=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                   +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                   +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+        expert_host_ensure(m,bl,s);        /* CUDA_RELEASE_HOST may have freed the host copy */
+        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+        m->gpu_expert_count--; m->gpu_expert_bytes-=was;
+        freed++; g_cuda_evicted++; got+=was;
+    }
+    return freed;
+}
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 #endif
 #ifdef COLI_VULKAN
@@ -694,6 +733,19 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
+        /* #687: give the tier a chance to hand memory back before losing this tensor. */
+        /* The failed attempt may have left a partially-uploaded tensor behind: the
+         * retry would then reuse it instead of re-uploading, and compute on garbage.
+         * Drop it first so the retry starts from a clean allocation. */
+        qt_cuda_reset(w);
+        if(cuda_evict_coldest(w->cuda_device,qt_bytes(w))>0 &&
+           coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)){
+            static int said;
+            if(!said){ said=1;
+                fprintf(stderr,"[CUDA] resident tensor upload recovered after evicting cold experts;"
+                    " the tier gave VRAM back (#687). Set an explicit CUDA_EXPERT_GB to avoid this.\n"); }
+            return;
+        }
         w->cuda_failed=1;
         if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
             fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
@@ -7917,6 +7969,9 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+#ifdef COLI_CUDA
+    g_model=&m;                                    /* #687: evictor needs the tier */
+#endif
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
         /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8
          * tokens' worth of routing) is a measured-config constant, not a derived truth.
