@@ -114,7 +114,7 @@ class RamdiskTuiCaptureRenderTest(unittest.IsolatedAsyncioTestCase):
         ready_again = await capture._capture_step(
             name="04-ready.svg",
             state="ready",
-            step_key="6",
+            step_key="7",
             expected_text=("State", "ready", "Deployment health", "verified"),
             title="Colibri RAM workspace — Ready",
             lifecycle=capture.RefusingLifecycle(),

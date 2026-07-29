@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import csv
 import io
+import os
 import posixpath
 import re
 import subprocess
@@ -39,14 +40,33 @@ def _discover_gpus(
     *,
     ops=None,
     run=None,
+    environ=None,
 ):
     """Discover NVIDIA devices and resolve their PCI-local Linux NUMA nodes."""
     ops = get_platform_ops() if ops is None else ops
+    environ = os.environ if environ is None else environ
+    visibility_present = "CUDA_VISIBLE_DEVICES" in environ
+    visibility_value = (
+        str(environ.get("CUDA_VISIBLE_DEVICES") or "")
+        if visibility_present
+        else None
+    )
+    visibility = {
+        "cuda_visible_devices_present": visibility_present,
+        "cuda_visible_devices": visibility_value,
+        "selection_error": (
+            "ambient CUDA_VISIBLE_DEVICES prevents safe physical GPU "
+            "selection; relaunch the RAM TUI with it unset"
+            if visibility_present
+            else None
+        ),
+    }
     if not ops.is_linux:
         return {
             "status": "unsupported",
             "error": "GPU NUMA discovery is supported only on Linux",
             "devices": [],
+            **visibility,
         }
     run = subprocess.run if run is None else run
     executable = ops.executable_path("nvidia-smi")
@@ -55,10 +75,11 @@ def _discover_gpus(
             "status": "unavailable",
             "error": "nvidia-smi is not available",
             "devices": [],
+            **visibility,
         }
     command = [
         executable,
-        "--query-gpu=index,name,pci.bus_id,memory.total,memory.free",
+        "--query-gpu=index,name,uuid,pci.bus_id,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -74,6 +95,7 @@ def _discover_gpus(
             "status": "unavailable",
             "error": "cannot query NVIDIA GPUs: %s" % exc,
             "devices": [],
+            **visibility,
         }
     if result.returncode:
         detail = (result.stderr or result.stdout or "").strip()
@@ -84,27 +106,43 @@ def _discover_gpus(
                 + (": %s" % detail if detail else "")
             ),
             "devices": [],
+            **visibility,
         }
 
     allowed = sorted(set(int(node) for node in effective_nodes))
     devices = []
     malformed = 0
+    seen_indices = set()
+    seen_uuids = set()
     for fields in csv.reader(io.StringIO(result.stdout or "")):
         fields = [field.strip() for field in fields]
-        if len(fields) != 5:
+        if len(fields) != 6:
             malformed += 1
             continue
         try:
             index = int(fields[0])
-            total_mib = int(fields[3])
-            free_mib = int(fields[4])
+            total_mib = int(fields[4])
+            free_mib = int(fields[5])
         except ValueError:
             malformed += 1
             continue
-        pci_bus_id = _normalize_pci_bus_id(fields[2])
-        if index < 0 or total_mib < 0 or free_mib < 0 or pci_bus_id is None:
+        uuid = fields[2]
+        pci_bus_id = _normalize_pci_bus_id(fields[3])
+        if (
+            index < 0
+            or index in seen_indices
+            or total_mib < 0
+            or free_mib < 0
+            or free_mib > total_mib
+            or not uuid
+            or uuid.lower() == "n/a"
+            or uuid in seen_uuids
+            or pci_bus_id is None
+        ):
             malformed += 1
             continue
+        seen_indices.add(index)
+        seen_uuids.add(uuid)
         raw_node = ops.read_text(
             "/sys/bus/pci/devices/%s/numa_node" % pci_bus_id,
             "",
@@ -127,6 +165,7 @@ def _discover_gpus(
             {
                 "index": index,
                 "name": fields[1],
+                "uuid": uuid,
                 "pci_bus_id": pci_bus_id,
                 "numa_node": numa_node,
                 "locality": locality,
@@ -152,6 +191,7 @@ def _discover_gpus(
         "status": status,
         "error": error,
         "devices": devices,
+        **visibility,
     }
 
 
@@ -646,6 +686,13 @@ def discover_hardware(ops=None, gpu_discovery=None):
         "gpu_discovery": {
             "status": gpu_report.get("status", "unavailable"),
             "error": gpu_report.get("error"),
+            "cuda_visible_devices_present": bool(
+                gpu_report.get("cuda_visible_devices_present")
+            ),
+            "cuda_visible_devices": gpu_report.get(
+                "cuda_visible_devices"
+            ),
+            "selection_error": gpu_report.get("selection_error"),
         },
         "mount": ops.executable_path("mount"),
         "umount": ops.executable_path("umount"),

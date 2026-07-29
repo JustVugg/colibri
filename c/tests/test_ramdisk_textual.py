@@ -22,7 +22,7 @@ TEXTUAL_AVAILABLE = importlib.util.find_spec("textual") is not None
 if TEXTUAL_AVAILABLE:
     import ramdisk_textual
     from textual.screen import Screen
-    from textual.widgets import Button, Input, Static
+    from textual.widgets import Button, Input, SelectionList, Static
 else:
     ramdisk_textual = None
 
@@ -133,6 +133,75 @@ def hardware_fixture(nodes=4):
     }
 
 
+def gpu_hardware_fixture():
+    hardware = hardware_fixture(nodes=3)
+    hardware["gpu_discovery"] = {"status": "available", "error": None}
+    hardware["gpus"] = [
+        {
+            "index": 0,
+            "uuid": "GPU-0000",
+            "name": "RTX 5090 A",
+            "pci_bus_id": "0000:01:00.0",
+            "numa_node": 0,
+            "locality": "resolved",
+            "total_bytes": 32 * ramdisk.GIB,
+            "free_bytes": 30 * ramdisk.GIB,
+        },
+        {
+            "index": 1,
+            "uuid": "GPU-1111",
+            "name": "RTX 5090 B",
+            "pci_bus_id": "0000:02:00.0",
+            "numa_node": 1,
+            "locality": "outside-effective-mask",
+            "total_bytes": 32 * ramdisk.GIB,
+            "free_bytes": 28 * ramdisk.GIB,
+        },
+        {
+            "index": 2,
+            "uuid": "GPU-2222",
+            "name": "RTX 5090 C",
+            "pci_bus_id": "0000:03:00.0",
+            "numa_node": 2,
+            "locality": "resolved",
+            "total_bytes": 32 * ramdisk.GIB,
+            "free_bytes": 29 * ramdisk.GIB,
+        },
+    ]
+    return hardware
+
+
+def gpu_snapshot():
+    snapshot = absent_snapshot(nodes=3)
+    plan = dict(snapshot.plan)
+    plan["model"] = dict(plan["model"])
+    plan["model"]["dense_tensor_bytes"] = 20 * ramdisk.GIB
+    plan["managed_accelerator"] = {
+        "mode": "cuda",
+        "layout": "experts-only",
+        "devices": [
+            {
+                "index": index,
+                "uuid": f"GPU-{index * 1111:04d}",
+                "name": f"RTX 5090 {'AC'[position]}",
+                "pci_bus_id": f"0000:0{index + 1}:00.0",
+                "numa_node": index,
+            }
+            for position, index in enumerate((0, 2))
+        ],
+        "mmap": True,
+        "rammap": False,
+        "async_copy": True,
+        "vram_budget": "auto",
+        "capability": "available",
+    }
+    return dataclasses.replace(
+        snapshot,
+        plan=plan,
+        hardware=gpu_hardware_fixture(),
+    )
+
+
 def absent_snapshot(topology="interleaved", nodes=4):
     return ramdisk_textual.ConsoleSnapshot(
         plan=plan_fixture(topology, nodes),
@@ -204,6 +273,9 @@ def app_args(**overrides):
         "base_port": 8000,
         "memory_nodes": None,
         "cpu_list": None,
+        "gpu": None,
+        "gpu_layout": "experts-only",
+        "gpu_placement": "auto",
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -281,6 +353,116 @@ class BackendSelectionTest(unittest.TestCase):
 
 
 @unittest.skipUnless(TEXTUAL_AVAILABLE, "Textual is not installed")
+class LifecycleSessionConcurrencyTest(unittest.TestCase):
+    def test_hardware_discovery_does_not_hold_the_edit_lock(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def discover_hardware():
+            started.set()
+            release.wait(2)
+            return hardware_fixture()
+
+        lifecycle = SimpleNamespace(
+            discover_hardware=discover_hardware,
+            scan_model=mock.Mock(return_value={"name": "test"}),
+            status=mock.Mock(
+                return_value={"present": False, "state": "absent"}
+            ),
+            build_plan=mock.Mock(return_value=plan_fixture()),
+        )
+        session = ramdisk_textual.LifecycleSession(
+            lifecycle,
+            app_args(),
+        )
+        errors = []
+
+        def refresh():
+            try:
+                session.refresh()
+            except Exception as exc:
+                errors.append(exc)
+
+        refresh_thread = threading.Thread(target=refresh)
+        refresh_thread.start()
+        self.assertTrue(started.wait(1))
+
+        invalidated = threading.Event()
+        invalidate_thread = threading.Thread(
+            target=lambda: (
+                session.invalidate(),
+                invalidated.set(),
+            )
+        )
+        invalidate_thread.start()
+        self.assertTrue(
+            invalidated.wait(0.25),
+            "hardware discovery held the session edit lock",
+        )
+        release.set()
+        refresh_thread.join(2)
+        invalidate_thread.join(2)
+
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(invalidate_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIn("inputs changed", str(errors[0]))
+
+    def test_runtime_probe_does_not_hold_the_edit_lock(self):
+        lifecycle = SimpleNamespace(
+            discover_hardware=mock.Mock(return_value=hardware_fixture()),
+            scan_model=mock.Mock(return_value={"name": "test"}),
+            status=mock.Mock(
+                return_value={"present": False, "state": "absent"}
+            ),
+            build_plan=mock.Mock(return_value=plan_fixture()),
+        )
+        session = ramdisk_textual.LifecycleSession(
+            lifecycle,
+            app_args(),
+        )
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def sample(**_kwargs):
+            started.set()
+            release.wait(2)
+            return {}
+
+        session._runtime_monitor = SimpleNamespace(sample=sample)
+
+        def refresh():
+            try:
+                session.refresh()
+            except Exception as exc:  # pragma: no cover - assertion aid
+                errors.append(exc)
+
+        refresh_thread = threading.Thread(target=refresh)
+        refresh_thread.start()
+        self.assertTrue(started.wait(1))
+
+        invalidated = threading.Event()
+
+        def invalidate():
+            session.invalidate()
+            invalidated.set()
+
+        invalidate_thread = threading.Thread(target=invalidate)
+        invalidate_thread.start()
+        self.assertTrue(
+            invalidated.wait(0.25),
+            "runtime probe held the session edit lock",
+        )
+        release.set()
+        refresh_thread.join(2)
+        invalidate_thread.join(2)
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(invalidate_thread.is_alive())
+        self.assertEqual(errors, [])
+
+
+@unittest.skipUnless(TEXTUAL_AVAILABLE, "Textual is not installed")
 class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
     def make_app(self, snapshot, **kwargs):
         return ramdisk_textual.RamdiskTextualApp(
@@ -292,7 +474,7 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
-    async def test_first_run_preset_choice_populates_and_jumps_to_review(self):
+    async def test_first_run_gpu_preset_populates_and_jumps_to_accelerators(self):
         snapshot = absent_snapshot()
         resolved_args = app_args(
             ramdisk_preset="gpu-fastest",
@@ -346,7 +528,7 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             resolver.call_args.args[0],
             ramdisk.PRESET_GPU_FASTEST,
         )
-        self.assertEqual(app.current_step, 4)
+        self.assertEqual(app.current_step, 1)
         self.assertEqual(app.args.ramdisk_preset, "gpu-fastest")
         self.assertEqual(app.snapshot.plan["preset"]["state"], "selected")
 
@@ -375,6 +557,7 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
                 [app.query_one(f"#step-{step_id}", Button).id for step_id, _ in ramdisk_textual.STEPS],
                 [
                     "step-inspect",
+                    "step-accelerators",
                     "step-placement",
                     "step-capacity",
                     "step-runtime",
@@ -390,7 +573,7 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
 
             await pilot.click("#step-placement")
             await pilot.pause()
-            self.assertEqual(app.current_step, 1)
+            self.assertEqual(app.current_step, 2)
             body = str(app.query_one("#step-body", Static).content)
             self.assertIn("Memory NUMA nodes", body)
             self.assertIn("Whole-core CPU list", body)
@@ -411,6 +594,281 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Effective CPUs", body)
             self.assertIn("NUMA distance", body)
             self.assertIn("N0:10", body)
+
+    async def test_accelerators_show_selected_disabled_and_projected_vram(self):
+        app = self.make_app(gpu_snapshot())
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.click("#step-accelerators")
+            await pilot.pause()
+
+            body = str(app.query_one("#step-body", Static).content)
+            self.assertIn("Hot experts only", body)
+            self.assertIn("● GPU 0", body)
+            self.assertIn("× GPU 1", body)
+            self.assertIn("● GPU 2", body)
+            self.assertIn("outside this process's effective mask", body)
+            self.assertIn("PROJECTED VRAM", body)
+            self.assertIn("2.00 GiB per card", body)
+            self.assertIn("Exact per-card model residency", body)
+
+            selection = app.query_one("#gpu-selection", SelectionList)
+            self.assertEqual(set(selection.selected), {0, 2})
+            self.assertTrue(selection.get_option_at_index(1).disabled)
+            self.assertTrue(
+                app.query_one(
+                    "#gpu-layout-experts-only",
+                    Button,
+                ).has_class("gpu-layout-active")
+            )
+
+    async def test_layout_control_uses_shared_gpu_selection_contract(self):
+        snapshot = gpu_snapshot()
+        app = self.make_app(snapshot)
+
+        def apply_selection(
+            args,
+            hardware,
+            selector=None,
+            layout=None,
+            *,
+            cuda_capable=None,
+            reset_placement=True,
+        ):
+            args.gpu = selector
+            args.gpu_layout = layout
+            args.managed_accelerator = {
+                "mode": "cuda",
+                "layout": layout,
+                "devices": [
+                    device
+                    for device in snapshot.plan["managed_accelerator"]["devices"]
+                    if str(device["index"]) in selector.split(",")
+                ],
+            }
+            return args
+
+        with mock.patch.object(
+            ramdisk,
+            "apply_gpu_selection",
+            side_effect=apply_selection,
+            create=True,
+        ) as apply_gpu:
+            async with app.run_test(size=(110, 36)) as pilot:
+                await pilot.click("#step-accelerators")
+                app._request_refresh = mock.Mock()
+                layout_button = app.query_one(
+                    "#gpu-layout-dense-attention",
+                    Button,
+                )
+                layout_button.scroll_visible(animate=False)
+                await pilot.pause()
+                await pilot.click("#gpu-layout-dense-attention")
+                await pilot.pause()
+
+                self.assertEqual(app.args.gpu, "0,2")
+                self.assertEqual(app.args.gpu_layout, "dense-attention")
+                apply_gpu.assert_called_once_with(
+                    app.args,
+                    snapshot.hardware,
+                    selector="0,2",
+                    layout="dense-attention",
+                    cuda_capable=None,
+                    reset_placement=False,
+                )
+                app._request_refresh.assert_called_once_with()
+
+    async def test_prepared_workspace_locks_gpu_selection(self):
+        draft = gpu_snapshot()
+        active = active_snapshot()
+        manifest = dict(active.manifest)
+        manifest["plan"] = draft.plan
+        active = dataclasses.replace(
+            active,
+            plan=draft.plan,
+            hardware=draft.hardware,
+            manifest=manifest,
+        )
+        app = self.make_app(active)
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.click("#step-accelerators")
+            await pilot.pause()
+
+            self.assertTrue(
+                app.query_one("#gpu-selection", SelectionList).disabled
+            )
+            self.assertTrue(
+                app.query_one(
+                    "#gpu-layout-dense-attention",
+                    Button,
+                ).disabled
+            )
+            self.assertTrue(
+                app.query_one("#gpu-reset-local", Button).disabled
+            )
+
+    def test_operate_renders_service_card_and_request_telemetry(self):
+        draft = gpu_snapshot()
+        snapshot = dataclasses.replace(
+            draft,
+            report={
+                "present": True,
+                "state": "running",
+                "mounts": [],
+                "processes": [{"pid": 1234, "port": 8000}],
+                "ports": [8000],
+            },
+            runtime={
+                "service": {
+                    "state": "serving",
+                    "label": "all managed endpoints are healthy",
+                    "active": 1,
+                    "queued": 2,
+                    "endpoints": [
+                        {
+                            "port": 8000,
+                            "process_verified": True,
+                            "health_ok": True,
+                            "profile_ok": True,
+                        }
+                    ],
+                    "stale": False,
+                },
+                "tiers": {
+                    "vram": 120,
+                    "ram": 40,
+                    "disk": 16,
+                    "vram_gb": 48.0,
+                    "ram_gb": 24.0,
+                },
+                "tiers_stale": False,
+                "gpus": [
+                    {
+                        "index": 0,
+                        "selected": True,
+                        "name": "RTX 5090 A",
+                        "utilization_percent": 87,
+                        "memory_used_bytes": 28 * ramdisk.GIB,
+                        "memory_free_bytes": 4 * ramdisk.GIB,
+                        "memory_total_bytes": 32 * ramdisk.GIB,
+                        "process_vram_bytes": 27 * ramdisk.GIB,
+                        "model_resident_bytes": 25 * ramdisk.GIB,
+                        "expert_bytes": 20 * ramdisk.GIB,
+                        "expert_count": 60,
+                        "non_expert_bytes": 5 * ramdisk.GIB,
+                        "card_stale": False,
+                        "model_stale": False,
+                        "process_stale": False,
+                    }
+                ],
+                "latest_profile": {
+                    "tokens_per_second": 18.25,
+                    "ttft_ms": 72.5,
+                    "expert_disk_s": 0.2,
+                    "attention_s": 0.1,
+                },
+                "freshness": {},
+            },
+        )
+
+        rendered = str(ramdisk_textual.render_step(snapshot, "operate"))
+        self.assertIn("SERVING ✓", rendered)
+        self.assertIn("Active requests", rendered)
+        self.assertIn("Queued requests", rendered)
+        self.assertIn("87% card-wide", rendered)
+        self.assertIn("GPU 0 · SELECTED", rendered)
+        self.assertIn("Colibri process", rendered)
+        self.assertIn("Model resident", rendered)
+        self.assertIn("60 · 20.00 GiB", rendered)
+        self.assertIn("120 experts · 44.70 GiB", rendered)
+        self.assertIn("40 experts · 22.35 GiB", rendered)
+        self.assertIn("18.25 tok/s", rendered)
+        self.assertIn("72.5 ms", rendered)
+
+    def test_operate_stale_footer_uses_each_channels_timestamp(self):
+        draft = gpu_snapshot()
+        runtime = {
+            "service": {
+                "state": "degraded",
+                "label": "DEGRADED",
+                "endpoints": [],
+                "active": None,
+                "queued": None,
+                "stale": True,
+            },
+            "gpus": [],
+            "freshness": {
+                "cards": {"stale": True, "observed_at": 1000.0},
+                "model": {"stale": True, "observed_at": 2000.0},
+                "process": {"stale": False, "observed_at": 3000.0},
+            },
+        }
+        snapshot = dataclasses.replace(draft, runtime=runtime)
+
+        rendered = str(ramdisk_textual.render_step(snapshot, "operate"))
+
+        self.assertIn(
+            "cards (last successful sample: %s)"
+            % ramdisk_textual._format_observed_at(1000.0),
+            rendered,
+        )
+        self.assertIn(
+            "model (last successful sample: %s)"
+            % ramdisk_textual._format_observed_at(2000.0),
+            rendered,
+        )
+        self.assertNotIn(
+            "cards (last successful sample: %s)"
+            % ramdisk_textual._format_observed_at(3000.0),
+            rendered,
+        )
+
+    def test_operate_marks_every_tier_stale_and_unknown_experts_unavailable(self):
+        draft = gpu_snapshot()
+        runtime = {
+            "service": {
+                "state": "serving",
+                "label": "SERVING",
+                "endpoints": [],
+                "active": 0,
+                "queued": 0,
+                "stale": False,
+            },
+            "tiers": {
+                "vram": 4,
+                "ram": 3,
+                "disk": 2,
+                "vram_gb": 2.0,
+                "ram_gb": 1.5,
+            },
+            "tiers_stale": True,
+            "gpus": [
+                {
+                    "index": 0,
+                    "selected": True,
+                    "name": "RTX",
+                    "model_resident_bytes": None,
+                    "expert_count": None,
+                    "expert_bytes": None,
+                    "non_expert_bytes": None,
+                    "card_stale": False,
+                    "model_stale": True,
+                    "process_stale": False,
+                }
+            ],
+            "freshness": {},
+        }
+
+        rendered = str(
+            ramdisk_textual.render_step(
+                dataclasses.replace(draft, runtime=runtime),
+                "operate",
+            )
+        )
+
+        self.assertIn("RAM", rendered)
+        self.assertIn("3 experts · 1.40 GiB · STALE", rendered)
+        self.assertIn("2 experts · STALE", rendered)
+        self.assertIn("unavailable · unknown · STALE", rendered)
 
     async def test_raw_placement_ranges_are_replanned_by_lifecycle(self):
         app = self.make_app(absent_snapshot())
@@ -453,7 +911,7 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.args.memory_nodes, "1-3")
             self.assertEqual(memory.value, "1-3")
-            self.assertEqual(app.current_step, 2)
+            self.assertEqual(app.current_step, 3)
             app._request_refresh.assert_called_once_with()
 
     async def test_invalid_unsubmitted_field_blocks_navigation(self):
@@ -468,7 +926,7 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             await pilot.click("#next-step")
             await pilot.pause()
 
-            self.assertEqual(app.current_step, 2)
+            self.assertEqual(app.current_step, 3)
             self.assertEqual(capacity.value, "not-a-number")
             self.assertIn(
                 "Invalid setting",
@@ -521,6 +979,17 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
 
             request_refresh.assert_not_called()
             self.assertFalse(app._refresh_pending)
+
+    async def test_automatic_poll_continues_during_lifecycle_operation(self):
+        app = self.make_app(absent_snapshot())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app._refresh_inflight = False
+            app.operation = {"action": "start"}
+            with mock.patch.object(app, "_request_refresh") as request_refresh:
+                app._automatic_refresh()
+
+            request_refresh.assert_called_once_with()
 
     async def test_runtime_step_shows_the_planned_huge_page_policy(self):
         app = self.make_app(absent_snapshot())

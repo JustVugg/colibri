@@ -6,7 +6,8 @@ import argparse
 import copy
 import os
 
-from .common import GIB, MIB, RamdiskError, _format_range_list
+from .accelerator import apply_gpu_selection, eligible_gpu_devices
+from .common import GIB, MIB, RamdiskError
 
 
 PRESET_GPU_FASTEST = "gpu-fastest"
@@ -68,6 +69,8 @@ def _set_common(draft, preset_id):
     draft.ramdisk_preset_reason = ""
     draft.ramdisk_preset_fallback = None
     draft.managed_accelerator = None
+    draft.gpu = "none"
+    draft.gpu_layout = "experts-only"
     draft.prefault = None
     return draft
 
@@ -96,63 +99,25 @@ def _replica_draft(args):
     return draft
 
 
-def _gpu_local_draft(args, hardware, devices, cuda_capable):
+def _gpu_local_draft(args, hardware, selector, cuda_capable):
+    layout = getattr(args, "gpu_layout", None)
     draft = _set_common(_namespace(args), PRESET_GPU_FASTEST)
-    nodes = []
-    for device in devices:
-        node = int(device["numa_node"])
-        if node not in nodes:
-            nodes.append(node)
-    node_rows = {
-        int(row["id"]): row
-        for row in hardware.get("nodes", [])
-        if isinstance(row, dict) and isinstance(row.get("id"), int)
-    }
-    cpus = set()
-    for node in nodes:
-        row = node_rows.get(node, {})
-        node_cpus = (
-            row.get("effective_cpus", [])
-            if "effective_cpus" in row
-            else row.get("cpus", [])
-        )
-        cpus.update(int(cpu) for cpu in node_cpus)
-    cpus = sorted(cpus)
-    if not cpus:
-        raise RamdiskError(
-            "GPU-local NUMA nodes expose no complete effective CPU cores"
-        )
     draft.mode = "full"
-    draft.topology = "interleaved"
     draft.capacity_gb = None
-    draft.memory_nodes = _format_range_list(nodes)
-    draft.cpu_list = _format_range_list(cpus)
-    draft.managed_accelerator = {
-        "mode": "cuda",
-        "devices": [
-            {
-                "index": int(device["index"]),
-                "name": str(device["name"]),
-                "pci_bus_id": str(device["pci_bus_id"]),
-                "numa_node": int(device["numa_node"]),
-            }
-            for device in devices
-        ],
-        "mmap": True,
-        "rammap": False,
-        "async_copy": True,
-        "vram_budget": "auto",
-        "capability": (
-            "available"
-            if cuda_capable is True
-            else "unverified"
-        ),
-    }
+    apply_gpu_selection(
+        draft,
+        hardware,
+        selector=selector,
+        layout=layout,
+        cuda_capable=cuda_capable,
+        reset_placement=True,
+    )
+    devices = draft.managed_accelerator["devices"]
     draft.ramdisk_preset_reason = (
         "One shared model copy across GPU-local NUMA node(s) %s; "
         "one managed engine uses GPU(s) %s."
         % (
-            _format_range_list(nodes),
+            draft.memory_nodes,
             ",".join(str(device["index"]) for device in devices),
         )
     )
@@ -345,15 +310,14 @@ def resolve_preset(
 
     if preset_id == PRESET_GPU_FASTEST:
         devices = list(hardware.get("gpus") or [])
-        effective_nodes = set(hardware.get("effective_nodes") or [])
-        usable = [
-            device
-            for device in devices
-            if device.get("locality") in ("resolved", "single-node")
-            and device.get("numa_node") in effective_nodes
-        ]
+        usable = eligible_gpu_devices(hardware)
+        selector = getattr(args, "gpu", None) or "auto"
+        if isinstance(selector, str):
+            selector = selector.strip().lower()
         fallback_reason = None
-        if cuda_capable is False:
+        if selector == "none":
+            fallback_reason = "GPU staging was disabled by --gpu none"
+        elif cuda_capable is False:
             fallback_reason = (
                 "the selected engine does not contain the CUDA backend"
             )
@@ -361,14 +325,14 @@ def resolve_preset(
             fallback_reason = (
                 "CUDA engine capability could not be established"
             )
-        elif not devices:
+        elif not usable:
             fallback_reason = (
                 hardware.get("gpu_discovery", {}).get("error")
-                or "no NVIDIA GPU was detected"
-            )
-        elif len(usable) != len(devices):
-            fallback_reason = (
-                "one or more GPU PCI devices have no usable NUMA-local node"
+                or (
+                    "no usable NVIDIA GPU was detected"
+                    if devices
+                    else "no NVIDIA GPU was detected"
+                )
             )
         if fallback_reason:
             draft = _single_draft(args, PRESET_GPU_FASTEST)
@@ -386,7 +350,7 @@ def resolve_preset(
         draft = _gpu_local_draft(
             args,
             hardware,
-            usable,
+            selector,
             cuda_capable,
         )
     else:

@@ -3,11 +3,11 @@
 This how-to walks through one complete RAM-workspace lifecycle in the Textual
 interface:
 
-`launch → choose a preset → review → prepare → start → verify → stop → destroy`
+`launch → select GPUs → review → prepare → start → verify → stop → destroy`
 
 It is for Linux operators who are comfortable in a terminal and have a host
 large enough to stage the complete model. The result is one model copy placed
-across the selected NUMA nodes and one managed engine.
+across the selected GPU-local NUMA nodes and one managed CUDA engine.
 
 This guide does not cover partial staging, per-node replication, benchmarking,
 or performance tuning. See the [RAM-workspace TUI reference](ramdisk-tui.md)
@@ -18,7 +18,8 @@ for those modes and the complete control reference.
 You need:
 
 - a Linux host with visible NUMA and cgroup information;
-- a compatible Colibri engine;
+- one or more NVIDIA GPUs visible to `nvidia-smi`;
+- a CUDA-capable Colibri engine;
 - a canonical model directory on durable storage;
 - enough host, NUMA-node, and cgroup memory headroom for the complete staged
   model, runtime overhead, page tables, and the operating-system reserve;
@@ -54,7 +55,7 @@ From a source checkout, install the Python package and build the engine once:
 ```sh
 cd /path/to/colibri
 python3 -m pip install -e .
-make -C c colibri
+make -C c CUDA=1
 ```
 
 The editable install includes the supported Textual dependency. Launch the
@@ -63,7 +64,9 @@ source-checkout console with an absolute path to your model:
 ```sh
 COLI_RAMDISK_UI=textual ./c/coli ramdisk \
   --model /absolute/path/to/model \
-  --mount-root /mnt/colibri-ram
+  --mount-root /mnt/colibri-ram \
+  --gpu auto \
+  --gpu-layout experts-only
 ```
 
 If Colibri is already installed, invoke `coli` from `PATH` instead:
@@ -71,17 +74,24 @@ If Colibri is already installed, invoke `coli` from `PATH` instead:
 ```sh
 COLI_RAMDISK_UI=textual coli ramdisk \
   --model /absolute/path/to/model \
-  --mount-root /mnt/colibri-ram
+  --mount-root /mnt/colibri-ram \
+  --gpu auto \
+  --gpu-layout experts-only
 ```
 
 An installed package still needs a compatible native engine. If its installer
 did not provide one, set `COLI_ENGINE` to the engine's absolute path before
 launching.
 
-When the preset prompt opens, choose **Single RAM copy**. It populates a full,
-shared draft with one model copy and one engine, then opens **Review**. Nothing
-is mounted or copied yet. Use the numbered tabs or **Back** to inspect and edit
-the draft before preparing it.
+Launch with `CUDA_VISIBLE_DEVICES` unset. The RAM-workspace planner selects
+physical cards by stable UUID and creates its own reviewed visible-device
+mapping; it fails closed rather than composing that mapping with an ambient
+mask.
+
+When the preset prompt opens, choose **Fastest GPU staging**. It populates a
+full, shared draft with one model copy and one engine, selects every eligible
+NVIDIA GPU, and opens **Accelerators**. Nothing is mounted, copied, or started
+yet.
 
 Planning and inspection are unprivileged. On **Inspect**, wait for the model
 and host scan to finish. Confirm that the canonical model path and discovered
@@ -92,22 +102,34 @@ hardware describe the intended host.
 *Illustrative capture: hardware, capacity, paths, identifiers, and endpoints
 use deterministic example data. Verify every value on your host.*
 
-## 2. Review the full shared plan
+## 2. Select accelerators and review the plan
 
-The preset opens **Review**, but you should still use the numbered tabs,
-`Left` and `Right`, or the **Back** and **Next** buttons to review all five
-planning steps.
+Use the numbered tabs, `Left` and `Right`, or the **Back** and **Next** buttons
+to review all seven steps.
 
 1. On **Inspect**, confirm the canonical model, shard count, effective CPUs,
    and available NUMA nodes.
-2. On **Placement**, select the intended memory nodes and a whole-core CPU
+2. On **Accelerators**, select the exact GPUs that the managed engine may use.
+   The preset selects all eligible cards by default. An unusable card is
+   disabled and shows why it cannot be selected.
+3. Keep **Hot experts only** for this stable workflow. Dense tensors remain on
+   the CPU while usage-ranked hot experts occupy the automatic VRAM tier.
+   **Dense + GPU attention** and **Dense + sharded attention** are experimental;
+   sharded attention requires at least two selected cards.
+4. On **Placement**, confirm the GPU-local memory nodes and whole-core CPU
    list. Confirm that the mount root is the safe path you prepared.
-3. On **Capacity**, select **Stage full model**. Check the total staged RAM,
+5. On **Capacity**, select **Stage full model**. Check the total staged RAM,
    runtime requirement, current headroom, and operating-system reserve.
-4. On **Runtime**, confirm the base port, context length, copy-worker count,
+6. On **Runtime**, confirm the base port, context length, copy-worker count,
    prefault setting, and huge-page policy. Copy workers affect staging speed;
    they do not create additional model copies.
-5. On **Review**, compare the exact contract with what you intend to deploy.
+7. On **Review**, compare the exact contract with what you intend to deploy.
+
+While placement remains automatic, changing the GPU selection also selects
+the GPU-local NUMA nodes and their effective whole-core CPUs. Editing either
+placement field makes those masks custom; later GPU changes preserve them.
+The plan is blocked if a selected GPU falls outside the custom memory-node
+mask. Use **Reset to GPU-local** to derive both masks again.
 
 Before continuing, the contract must show:
 
@@ -115,6 +137,8 @@ Before continuing, the contract must show:
 - full staging mode;
 - one complete staged copy;
 - one managed engine;
+- the intended GPU indices and stable device identities;
+- model placement `Hot experts only`;
 - the intended memory NUMA nodes;
 - a complete physical-core CPU selection;
 - the canonical model and mount paths;
@@ -134,8 +158,8 @@ use deterministic example data. Verify every value on your host.*
 ## 3. Prepare the workspace
 
 On **Review**, select **Prepare RAM workspace**. The confirmation repeats the
-copy count, RAM cost, engine count, ports, NUMA nodes, whole-core CPU list, and
-mount paths.
+copy count, RAM cost, engine count, ports, selected GPUs, model placement,
+NUMA nodes, whole-core CPU list, and mount paths.
 
 The confirmation is bound to the exact plan and expires after ten seconds.
 Select **Prepare RAM workspace** in the confirmation only if every value still
@@ -181,12 +205,50 @@ Verify:
 - the state is `running`;
 - the managed-process count is one;
 - the mount-record count matches the reviewed contract; and
-- deployment health is `verified`.
+- deployment health is `verified`; and
+- the serving banner reads `SERVING ✓`.
 
 The `verified` health state means that Colibri matched the managed process
 identity, verified the tmpfs mount and staged namespace, and confirmed that the
 durable model still matches the prepared source fingerprint. The CPU mask
 remains the whole-core mask accepted on **Review**.
+
+`SERVING ✓` is a separate, live assertion: the managed process identity is
+verified and every expected endpoint has returned `{"status":"ok"}` from
+`GET /health`. A merely `running` lifecycle state does not make that claim.
+
+The console samples serving and GPU telemetry every two seconds. In
+**Operate**, verify:
+
+- active and queued request counts;
+- aggregate expert placement across VRAM, RAM, and disk;
+- card-wide utilization and total/used/free VRAM for each selected GPU;
+- VRAM attributed to the verified Colibri process group;
+- exact model-resident, hot-expert, and non-expert bytes reported by the
+  engine; and
+- aggregate request-wide tok/s, TTFT, and phase timings after the first request
+  completes.
+
+The card-wide value includes the driver and other processes. Colibri process
+VRAM includes all allocations attributed to the managed processes.
+Model-resident VRAM is the engine-owned tensor allocation, divided into
+hot-expert and non-expert bytes. These values answer different questions and
+are not expected to match.
+
+Review shows capacity estimates based on free VRAM, the projected dense set,
+and a 2 GiB reserve per selected card. Operate shows the exact placement after
+the engine loads. Aggregate tok/s and TTFT describe the completed request as a
+whole; Colibri does not claim per-card token rates.
+
+If a sample fails, the last successful value remains visible with `STALE` and
+its observation time. `DEGRADED` means at least one expected endpoint is not
+currently proven healthy. Stop and Destroy remain available according to the
+lifecycle state even when monitoring is stale.
+
+During an active request, model-placement and tier values are marked stale
+because lazy uploads or repinning can still change them. They become fresh
+again only after the request is quiescent and every engine publishes a newer
+GPU placement sequence.
 
 ![The Operate step showing one verified managed engine in the running state](media/ramdisk-tui/05-running.svg)
 
@@ -257,6 +319,20 @@ host administrator; Colibri will not open a background password prompt.
 The process's cgroup or cpuset boundary no longer matches the prepared
 contract. Restore the original boundary, or stop and destroy the workspace
 before preparing a new plan.
+
+**The banner says `DEGRADED` or telemetry is stale**
+
+Read the endpoint row in **Operate**. Confirm that the managed process identity
+is verified and that every reviewed loopback port answers `GET /health`.
+Correct an API-key mismatch in the TUI environment if the server requires one.
+Card telemetry also requires a working `nvidia-smi`. Stale monitoring does not
+by itself authorize a lifecycle mutation.
+
+**A previously prepared GPU workspace says its ordinal mapping is unsafe**
+
+Older manifests did not persist the UUID-to-logical-ordinal mapping required
+for unambiguous launch and telemetry attribution. Stop the deployment, Destroy
+the RAM workspace, and Prepare it again with this version.
 
 **Cancellation or rollback is still active**
 

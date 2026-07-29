@@ -182,6 +182,7 @@ def documentation_plan() -> dict[str, Any]:
             "name": "GLM-5.2 Colibri INT4",
             "fingerprint": "sha256:docs-example-7f3a9d21",
             "shard_count": 144,
+            "dense_tensor_bytes": 18 * GIB,
         },
         "staging": {
             "selected_shards": [
@@ -208,6 +209,40 @@ def documentation_plan() -> dict[str, Any]:
             "available_bytes": 744 * GIB,
         },
         "managed_runtime": {"ctx": 8192},
+        "managed_accelerator": {
+            "mode": "cuda",
+            "layout": "experts-only",
+            "devices": [
+                {
+                    "index": 0,
+                    "uuid": "GPU-docs-0000",
+                    "name": "NVIDIA RTX 5090",
+                    "pci_bus_id": "0000:41:00.0",
+                    "numa_node": 0,
+                },
+                {
+                    "index": 1,
+                    "uuid": "GPU-docs-1111",
+                    "name": "NVIDIA RTX 5090",
+                    "pci_bus_id": "0000:61:00.0",
+                    "numa_node": 1,
+                },
+            ],
+            "mmap": True,
+            "rammap": False,
+            "async_copy": True,
+            "vram_budget": "auto",
+            "capability": "available",
+        },
+        "accelerator_projection": {
+            "dense_tensor_bytes": 18 * GIB,
+            "dense_gpu_bytes": 0,
+            "vram_reserve_per_device_bytes": 2 * GIB,
+            "selected_free_bytes": 60 * GIB,
+            "selected_total_bytes": 64 * GIB,
+            "expert_headroom_bytes": 56 * GIB,
+            "exact_per_device_at_runtime": True,
+        },
         "mount_options": {"thp": "within_size"},
         "mounts": [{"path": SHARED_MOUNT, "node": None}],
         "blockers": [],
@@ -248,6 +283,29 @@ def documentation_hardware() -> dict[str, Any]:
             "available_bytes": 744 * GIB,
             "total_bytes": 768 * GIB,
         },
+        "gpu_discovery": {"status": "available", "error": None},
+        "gpus": [
+            {
+                "index": 0,
+                "uuid": "GPU-docs-0000",
+                "name": "NVIDIA RTX 5090",
+                "pci_bus_id": "0000:41:00.0",
+                "numa_node": 0,
+                "locality": "resolved",
+                "total_bytes": 32 * GIB,
+                "free_bytes": 30 * GIB,
+            },
+            {
+                "index": 1,
+                "uuid": "GPU-docs-1111",
+                "name": "NVIDIA RTX 5090",
+                "pci_bus_id": "0000:61:00.0",
+                "numa_node": 1,
+                "locality": "resolved",
+                "total_bytes": 32 * GIB,
+                "free_bytes": 30 * GIB,
+            },
+        ],
     }
 
 
@@ -311,6 +369,89 @@ def documentation_snapshot(state: str) -> ramdisk_textual.ConsoleSnapshot:
                 },
             }
         )
+    running = state == "running"
+    runtime = {
+        "service": {
+            "state": "serving" if running else "stopped",
+            "label": "SERVING" if running else "STOPPED",
+            "endpoints": (
+                [
+                    {
+                        "port": 8000,
+                        "node": None,
+                        "pid": 42420,
+                        "url": "http://127.0.0.1:8000",
+                        "process_verified": True,
+                        "health_ok": True,
+                        "profile_ok": True,
+                        "error": None,
+                    }
+                ]
+                if running
+                else []
+            ),
+            "active": 1 if running else 0,
+            "queued": 0,
+            "error": None,
+            "stale": False,
+            "observed_at": 1784916000.0,
+        },
+        "gpus": [
+            {
+                "index": index,
+                "uuid": f"GPU-docs-{index * 1111:04d}",
+                "pci_bus_id": (
+                    "0000:41:00.0" if index == 0 else "0000:61:00.0"
+                ),
+                "name": "NVIDIA RTX 5090",
+                "selected": True,
+                "numa_node": index,
+                "utilization_percent": (82.0 - index * 7) if running else 0.0,
+                "memory_used_bytes": (29 - index) * GIB if running else 2 * GIB,
+                "memory_free_bytes": (3 + index) * GIB if running else 30 * GIB,
+                "memory_total_bytes": 32 * GIB,
+                "process_vram_bytes": (28 - index) * GIB if running else 0,
+                "model_resident_bytes": (26 - index) * GIB if running else 0,
+                "expert_bytes": (22 - index) * GIB if running else 0,
+                "expert_count": (64 - index * 4) if running else 0,
+                "non_expert_bytes": 4 * GIB if running else 0,
+                "card_stale": False,
+                "model_stale": False,
+                "process_stale": False,
+                "observed_at": 1784916000.0,
+            }
+            for index in (0, 1)
+        ],
+        "tiers": (
+            {
+                "vram": 124,
+                "ram": 96,
+                "disk": 36,
+                "vram_gb": 43.0,
+                "ram_gb": 76.0,
+            }
+            if running
+            else None
+        ),
+        "tiers_stale": False,
+        "latest_profile": (
+            {
+                "tokens_per_second": 17.8,
+                "ttft_ms": 84.0,
+                "expert_disk_s": 0.18,
+                "expert_wait_s": 0.04,
+                "expert_matmul_s": 0.72,
+                "attention_s": 0.31,
+                "lm_head_s": 0.05,
+            }
+            if running
+            else None
+        ),
+        "profile_stale": False,
+        "process_rss_bytes": 31 * GIB if running else 0,
+        "process_stale": False,
+        "freshness": {},
+    }
     return ramdisk_textual.ConsoleSnapshot(
         plan=plan,
         report={
@@ -332,6 +473,7 @@ def documentation_snapshot(state: str) -> ramdisk_textual.ConsoleSnapshot:
         },
         hardware=documentation_hardware(),
         manifest=documentation_manifest(),
+        runtime=runtime,
         base_port=8000,
     )
 
@@ -354,6 +496,9 @@ def documentation_args() -> argparse.Namespace:
         base_port=8000,
         memory_nodes="0-1",
         cpu_list="0-127",
+        gpu="0,1",
+        gpu_layout="experts-only",
+        gpu_placement="auto",
     )
 
 
@@ -443,7 +588,7 @@ async def _capture_prepare_confirmation(
         await pilot.pause()
         if app.screen.has_class("too-small"):
             raise CaptureSafetyError(f"{name} used an unsafe viewport")
-        await pilot.press("5")
+        await pilot.press("6")
         await pilot.pause()
         prepare = app.query_one("#action-prepare", Button)
         prepare.scroll_visible(animate=False)
@@ -492,7 +637,7 @@ async def render_screenshots() -> CaptureBundle:
     screenshots["02-review.svg"] = await _capture_step(
         name="02-review.svg",
         state="absent",
-        step_key="5",
+        step_key="6",
         expected_text=(
             "Nothing changes until Prepare is confirmed.",
             "Shared contract confirmed",
@@ -507,8 +652,14 @@ async def render_screenshots() -> CaptureBundle:
     screenshots["04-ready.svg"] = await _capture_step(
         name="04-ready.svg",
         state="ready",
-        step_key="6",
-        expected_text=("State", "ready", "Deployment health", "verified"),
+        step_key="7",
+        expected_text=(
+            "STOPPED",
+            "State",
+            "ready",
+            "Deployment health",
+            "verified",
+        ),
         title="Colibri RAM workspace — Ready",
         lifecycle=lifecycle,
         privilege=privilege,
@@ -517,8 +668,14 @@ async def render_screenshots() -> CaptureBundle:
     screenshots["05-running.svg"] = await _capture_step(
         name="05-running.svg",
         state="running",
-        step_key="6",
-        expected_text=("State", "running", "Managed processes", "verified"),
+        step_key="7",
+        expected_text=(
+            "SERVING",
+            "State",
+            "running",
+            "Managed processes",
+            "verified",
+        ),
         title="Colibri RAM workspace — Running",
         lifecycle=lifecycle,
         privilege=privilege,
@@ -527,8 +684,14 @@ async def render_screenshots() -> CaptureBundle:
     screenshots["06-stopped.svg"] = await _capture_step(
         name="06-stopped.svg",
         state="stopped",
-        step_key="6",
-        expected_text=("State", "stopped", "Mount records", "verified"),
+        step_key="7",
+        expected_text=(
+            "STOPPED",
+            "State",
+            "stopped",
+            "Mount records",
+            "verified",
+        ),
         title="Colibri RAM workspace — Stopped",
         lifecycle=lifecycle,
         privilege=privilege,
@@ -537,8 +700,14 @@ async def render_screenshots() -> CaptureBundle:
     screenshots["07-absent.svg"] = await _capture_step(
         name="07-absent.svg",
         state="absent",
-        step_key="6",
-        expected_text=("State", "absent", "Deployment health", "not prepared"),
+        step_key="7",
+        expected_text=(
+            "STOPPED",
+            "State",
+            "absent",
+            "Deployment health",
+            "not prepared",
+        ),
         title="Colibri RAM workspace — Destroyed",
         lifecycle=lifecycle,
         privilege=privilege,

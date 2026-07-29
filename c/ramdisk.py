@@ -84,9 +84,17 @@ from ramdisk_support.benchmark import (
 )
 from ramdisk_support.accelerator import (
     ACCELERATOR_ENVIRONMENT_KEYS,
+    GPU_LAYOUT_CHOICES,
+    GPU_LAYOUT_DENSE_ATTENTION,
+    GPU_LAYOUT_DENSE_ATTENTION_SHARDED,
+    GPU_LAYOUT_EXPERTS_ONLY,
+    GPU_VRAM_RESERVE_BYTES,
     _apply_managed_accelerator_environment,
     _managed_accelerator_contract,
     _managed_accelerator_environment,
+    apply_gpu_selection,
+    eligible_gpu_devices,
+    gpu_device_eligibility,
 )
 from ramdisk_support.discovery import (
     _cgroup_ancestors,

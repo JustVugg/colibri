@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 
+from .accelerator import GPU_LAYOUT_CHOICES, GPU_LAYOUT_EXPERTS_ONLY
 from .common import DEFAULT_MOUNT_ROOT, RamdiskError
 
 
@@ -108,6 +109,26 @@ def _add_lifecycle_options(parser, suppress=False):
             type=int,
             default=argparse.SUPPRESS if suppress else 0,
             help="managed engine context length (0 = 4096)",
+        )
+    if "--gpu" not in parser._option_string_actions:
+        parser.add_argument(
+            "--gpu",
+            default=default,
+            help="auto, none, or an exact device list such as 0,1",
+        )
+    if "--gpu-layout" not in parser._option_string_actions:
+        parser.add_argument(
+            "--gpu-layout",
+            choices=GPU_LAYOUT_CHOICES,
+            default=(
+                argparse.SUPPRESS
+                if suppress
+                else GPU_LAYOUT_EXPERTS_ONLY
+            ),
+            help=(
+                "experts-only (stable), dense-attention, or "
+                "dense-attention-sharded (experimental)"
+            ),
         )
 
 

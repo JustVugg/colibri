@@ -74,6 +74,7 @@ _SUPPORT_MODULES = (
 _SUPPORT_PACKAGE = "ramdisk_support"
 _SUPPORT_PACKAGE_MODULES = (
     "__init__.py",
+    "accelerator.py",
     "benchmark.py",
     "cli.py",
     "common.py",
@@ -86,7 +87,9 @@ _SUPPORT_PACKAGE_MODULES = (
     "planning.py",
     "platform_ops.py",
     "presentation.py",
+    "presets.py",
     "processes.py",
+    "runtime_monitor.py",
     "state.py",
 )
 _engine_module_dir = (

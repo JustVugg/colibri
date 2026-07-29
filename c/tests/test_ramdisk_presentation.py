@@ -45,6 +45,68 @@ class TuiPlacementContractTest(unittest.TestCase):
         self.assertIn("1 complete model copy", confirmation)
         self.assertIn("1 engine on port 8000", confirmation)
 
+    def test_gpu_review_names_exact_devices_layout_and_projection(self):
+        with ModelFixture() as fixture:
+            hardware = hardware_fixture(nodes=2)
+            hardware["gpus"] = [
+                {
+                    "index": index,
+                    "name": "GPU %d" % index,
+                    "uuid": "GPU-test-%d" % index,
+                    "pci_bus_id": bus,
+                    "numa_node": index,
+                    "locality": "resolved",
+                    "total_bytes": 32 * ramdisk.GIB,
+                    "free_bytes": 28 * ramdisk.GIB,
+                }
+                for index, bus in (
+                    (0, "0000:41:00.0"),
+                    (1, "0000:c1:00.0"),
+                )
+            ]
+            hardware["gpu_discovery"] = {
+                "status": "available",
+                "error": None,
+            }
+            plan = ramdisk.build_plan(
+                plan_args(
+                    fixture.root,
+                    gpu="0,1",
+                    gpu_layout="dense-attention-sharded",
+                ),
+                hardware=hardware,
+            )
+
+        confirmation = ramdisk._prepare_confirmation(plan, base_port=8000)
+        confirmation_rows = "\n".join(
+            line
+            for _style, line in ramdisk._prepare_confirmation_rows(
+                plan,
+                base_port=8000,
+            )
+        )
+        plan_rows = "\n".join(
+            line
+            for _style, line in ramdisk._tui_plan_rows(
+                plan,
+                {"present": False, "state": "absent"},
+            )
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ramdisk._human_plan(plan)
+
+        for rendered in (
+            confirmation,
+            confirmation_rows,
+            plan_rows,
+            output.getvalue(),
+        ):
+            self.assertIn("0,1", rendered)
+            self.assertIn("dense-attention-sharded", rendered)
+        self.assertIn("Projected dense VRAM", confirmation)
+        self.assertIn("expert headroom", plan_rows)
+
     def test_four_node_replica_mode_names_every_full_copy_and_endpoint(self):
         with ModelFixture() as fixture:
             shared = ramdisk.build_plan(

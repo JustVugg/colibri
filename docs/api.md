@@ -75,6 +75,73 @@ errors before streaming headers are sent. `GET /health` exposes
 active/queued/completed/rejected counters, and successful generation responses
 include `x-colibri-queue-wait-ms`.
 
+## Operational telemetry
+
+`GET /health` is the serving liveness probe. Its public response is:
+
+```json
+{"status": "ok"}
+```
+
+The server returns HTTP 503 with `status: error` when the engine is absent,
+its dispatcher failed, polling the child fails, or the child has exited. A
+live Python wrapper around a dead engine is therefore not reported as serving.
+
+When no `COLI_API_KEY` is configured, the same response also includes detailed
+runtime telemetry. When a key is configured, send a valid
+`Authorization: Bearer` or `x-api-key` credential to receive those fields; an
+unauthenticated health probe still receives public liveness only.
+
+| Field | Meaning |
+|---|---|
+| `scheduler` | Active, queued, completed, and rejected request counters. |
+| `kv_slots` | Configured engine KV-context count. |
+| `tiers` | Aggregate expert counts in VRAM, RAM, and disk plus resident VRAM/RAM GB. |
+| `hwinfo` | Latest engine CPU, RAM, GPU-count, and aggregate VRAM snapshot. |
+| `gpus` | Latest accepted per-device engine telemetry. |
+| `gpus_seq` | Monotonic change counter for accepted `GPUS` or `GPUDETAIL` records. |
+
+A `gpus` item produced from `GPUDETAIL` has:
+
+| Field | Meaning |
+|---|---|
+| `device` | Logical CUDA ordinal inside the engine's visible-device list. |
+| `identity` | Backend UUID/PCI identity, or `null` when the engine emitted `-`. |
+| `total_bytes` / `free_bytes` / `used_bytes` | Integer-byte device-memory snapshot taken by the engine. |
+| `model_bytes` | Exact bytes in model tensor allocations on this device. |
+| `expert_bytes` / `expert_count` | Resident hot-expert bytes and complete expert count. |
+| `nonexpert_bytes` | Other model tensor bytes; `expert_bytes + nonexpert_bytes = model_bytes`. |
+
+The server accepts a `GPUDETAIL` snapshot atomically only when device ordinals
+are unique, every byte count is nonnegative, free/model bytes do not exceed
+total bytes, and the expert/non-expert sum equals model bytes. A device whose
+engine-side memory query fails is omitted rather than represented by invented
+capacity; clients should treat an incomplete selected-device set as stale.
+
+For compatibility with older engines, a legacy `GPUS` item instead contains
+`device`, `identity`, `used_gb`, `total_gb`, and `expert_count`. Clients should
+inspect the available keys rather than infer model bytes from legacy
+card-wide usage.
+
+`GET /profile` returns:
+
+```json
+{"seq": 1, "turns": []}
+```
+
+`turns` is an in-memory rolling window of at most 120 completed requests.
+Each modern record contains `wall_s`, `prompt_tokens`, `completion_tokens`,
+`expert_disk_s`, `expert_wait_s`, `expert_matmul_s`, `attention_s`,
+`lm_head_s`, and `forwards`. The matching `DONE` frame enriches it with
+`tokens_per_second`, `cache_hit_percent`, `rss_gb`, and `length_limited`.
+Extended producers can also supply `forward_p50_ms`, `forward_p99_ms`,
+`physical_ssd_bytes`, `physical_ssd_valid`, `rammap_experts`, `rammap_bytes`,
+`ttft_ms`, and `prefault_seconds`.
+
+Profile throughput and TTFT describe the completed request/engine as a whole.
+They are not per-GPU measurements, and no profile row is published for an
+in-flight or aborted request without a matching completed `PROF`/`DONE` pair.
+
 ## Anthropic-protocol endpoint (`/v1/messages`)
 
 The same server also speaks the **Anthropic Messages API**, so clients that only talk

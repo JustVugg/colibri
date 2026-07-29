@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 
+from .accelerator import _same_gpu_identity
 from .common import (
     GIB,
     RamdiskError,
@@ -298,7 +299,7 @@ def _assert_effective_masks_unchanged(
             device = observed.get(index)
             if (
                 device is None
-                or device.get("pci_bus_id") != expected.get("pci_bus_id")
+                or not _same_gpu_identity(expected, device)
                 or device.get("numa_node") != expected.get("numa_node")
                 or device.get("numa_node") not in effective_nodes
             ):

@@ -9,6 +9,14 @@ import os
 import re
 import subprocess
 
+from .accelerator import (
+    GPU_LAYOUT_EXPERTS_ONLY,
+    GPU_LAYOUT_DENSE_ATTENTION_SHARDED,
+    GPU_VRAM_RESERVE_BYTES,
+    _normalize_gpu_layout,
+    _same_gpu_identity,
+    apply_gpu_selection,
+)
 from .common import (
     DEFAULT_MOUNT_ROOT,
     GIB,
@@ -412,6 +420,7 @@ def _normalize_managed_accelerator(args, hardware, placement):
     if raw is None:
         return {
             "mode": "cpu",
+            "layout": GPU_LAYOUT_EXPERTS_ONLY,
             "devices": [],
             "mmap": False,
             "rammap": True,
@@ -421,6 +430,7 @@ def _normalize_managed_accelerator(args, hardware, placement):
         }
     if not isinstance(raw, dict) or raw.get("mode") != "cuda":
         raise RamdiskError("managed accelerator draft is malformed")
+    layout = _normalize_gpu_layout(raw.get("layout"))
     devices = raw.get("devices")
     if not isinstance(devices, list) or not devices:
         raise RamdiskError("managed CUDA staging requires at least one GPU")
@@ -434,7 +444,7 @@ def _normalize_managed_accelerator(args, hardware, placement):
     selected_nodes = set(placement["memory_nodes"])
     normalized = []
     seen = set()
-    for device in devices:
+    for cuda_ordinal, device in enumerate(devices):
         if not isinstance(device, dict):
             raise RamdiskError("managed accelerator device record is malformed")
         index = device.get("index")
@@ -462,16 +472,23 @@ def _normalize_managed_accelerator(args, hardware, placement):
                 "managed accelerator GPU %d is outside the reviewed NUMA placement"
                 % index
             )
-        pci_bus_id = str(device.get("pci_bus_id") or "")
-        if pci_bus_id != str(observed.get("pci_bus_id") or ""):
+        if not _same_gpu_identity(device, observed):
             raise RamdiskError(
-                "managed accelerator GPU %d PCI identity changed" % index
+                "managed accelerator GPU %d identity changed" % index
+            )
+        pci_bus_id = str(observed.get("pci_bus_id") or "")
+        uuid = str(observed.get("uuid") or device.get("uuid") or "")
+        if not uuid:
+            raise RamdiskError(
+                "managed accelerator GPU %d has no stable UUID" % index
             )
         seen.add(index)
         normalized.append(
             {
                 "index": index,
+                "cuda_ordinal": cuda_ordinal,
                 "name": str(observed.get("name") or device.get("name") or ""),
+                "uuid": uuid,
                 "pci_bus_id": pci_bus_id,
                 "numa_node": node,
             }
@@ -482,14 +499,114 @@ def _normalize_managed_accelerator(args, hardware, placement):
         raise RamdiskError(
             "managed CUDA staging requires mmap and disables direct RAM-map"
         )
+    if (
+        layout == GPU_LAYOUT_DENSE_ATTENTION_SHARDED
+        and len(normalized) < 2
+    ):
+        raise RamdiskError(
+            "dense-attention-sharded requires at least two selected GPUs"
+        )
     return {
         "mode": "cuda",
+        "layout": layout,
         "devices": normalized,
         "mmap": True,
         "rammap": False,
         "async_copy": bool(raw.get("async_copy", True)),
         "vram_budget": "auto",
         "capability": str(raw.get("capability") or "unverified"),
+    }
+
+
+def _accelerator_projection(contract, hardware, model):
+    discovered = {
+        int(device["index"]): device
+        for device in hardware.get("gpus") or []
+        if isinstance(device, dict)
+        and isinstance(device.get("index"), int)
+        and not isinstance(device.get("index"), bool)
+    }
+    selected = [
+        discovered.get(device["index"], {})
+        for device in contract["devices"]
+    ]
+    selected_free = sum(int(device.get("free_bytes") or 0) for device in selected)
+    selected_total = sum(
+        int(device.get("total_bytes") or 0) for device in selected
+    )
+    dense_tensor_bytes = int(model.get("dense_tensor_bytes") or 0)
+    dense_gpu_bytes = (
+        dense_tensor_bytes
+        if contract["mode"] == "cuda"
+        and contract["layout"] != GPU_LAYOUT_EXPERTS_ONLY
+        else 0
+    )
+    reserve_bytes = (
+        GPU_VRAM_RESERVE_BYTES * len(selected)
+        if contract["mode"] == "cuda"
+        else 0
+    )
+    per_device = []
+    device_count = len(selected)
+    for position, (contract_device, device) in enumerate(
+        zip(contract["devices"], selected)
+    ):
+        dense_share = 0
+        if dense_gpu_bytes and device_count:
+            dense_share = (
+                dense_gpu_bytes // device_count
+                + (
+                    1
+                    if position < dense_gpu_bytes % device_count
+                    else 0
+                )
+            )
+        free_bytes = int(device.get("free_bytes") or 0)
+        required_bytes = (
+            GPU_VRAM_RESERVE_BYTES + dense_share
+            if contract["mode"] == "cuda"
+            else 0
+        )
+        per_device.append(
+            {
+                "index": contract_device["index"],
+                "uuid": contract_device.get("uuid", ""),
+                "free_bytes": free_bytes,
+                "total_bytes": int(device.get("total_bytes") or 0),
+                "projected_dense_bytes": dense_share,
+                "reserve_bytes": (
+                    GPU_VRAM_RESERVE_BYTES
+                    if contract["mode"] == "cuda"
+                    else 0
+                ),
+                "expert_headroom_bytes": max(
+                    0,
+                    free_bytes - required_bytes,
+                ),
+                "admission_ok": free_bytes >= required_bytes,
+            }
+        )
+    return {
+        "dense_tensor_bytes": dense_tensor_bytes,
+        "dense_gpu_bytes": dense_gpu_bytes,
+        "vram_reserve_per_device_bytes": (
+            GPU_VRAM_RESERVE_BYTES
+            if contract["mode"] == "cuda"
+            else 0
+        ),
+        "selected_free_bytes": selected_free,
+        "selected_total_bytes": selected_total,
+        "expert_headroom_bytes": max(
+            0,
+            selected_free - reserve_bytes - dense_gpu_bytes,
+        ),
+        "per_device": per_device,
+        "admission_scope": (
+            "balanced-estimate"
+            if dense_gpu_bytes
+            else "exact-reserve-only"
+        ),
+        "exact_per_device_at_runtime": contract["mode"] == "cuda",
     }
 
 
@@ -528,6 +645,44 @@ def build_plan(
 ):
     """Build a RAM-disk deployment plan using facade-supplied host services."""
     hardware = copy.deepcopy(hardware or discover_hardware())
+    requested_gpu = getattr(args, "gpu", None)
+    if requested_gpu is not None:
+        requested_cpu = (
+            isinstance(requested_gpu, str)
+            and requested_gpu.strip().lower() == "none"
+        )
+        if (
+            not requested_cpu
+            and getattr(args, "topology", "interleaved")
+            != "interleaved"
+        ):
+            raise RamdiskError(
+                "managed CUDA staging requires interleaved topology"
+            )
+        planning_args = copy.deepcopy(args)
+        existing = getattr(args, "managed_accelerator", None) or {}
+        apply_gpu_selection(
+            planning_args,
+            hardware,
+            selector=requested_gpu,
+            layout=getattr(args, "gpu_layout", None),
+            cuda_capable=(
+                True
+                if existing.get("capability") == "available"
+                else None
+            ),
+            reset_placement=(
+                getattr(args, "memory_nodes", None) in (None, "")
+                and getattr(args, "cpu_list", None) in (None, "")
+            ),
+        )
+        args = planning_args
+    elif (
+        getattr(args, "gpu_layout", GPU_LAYOUT_EXPERTS_ONLY)
+        != GPU_LAYOUT_EXPERTS_ONLY
+        and getattr(args, "managed_accelerator", None) is None
+    ):
+        raise RamdiskError("--gpu-layout requires --gpu auto or a device list")
     model = model or scan_model(args.model)
     mode = getattr(args, "mode", "full")
     topology = getattr(args, "topology", "interleaved")
@@ -539,6 +694,18 @@ def build_plan(
         args,
         hardware,
         placement,
+    )
+    if (
+        managed_accelerator["mode"] == "cuda"
+        and topology != "interleaved"
+    ):
+        raise RamdiskError(
+            "managed CUDA staging requires interleaved topology"
+        )
+    accelerator_projection = _accelerator_projection(
+        managed_accelerator,
+        hardware,
+        model,
     )
     if capacity_gb is not None and (
         isinstance(capacity_gb, bool)
@@ -639,6 +806,35 @@ def build_plan(
     required_global = staged_bytes + runtime_bytes + page_tables + global_margin
     blockers = []
     warnings = []
+    projection = accelerator_projection
+    if (
+        managed_accelerator["mode"] == "cuda"
+        and managed_accelerator["layout"] != GPU_LAYOUT_EXPERTS_ONLY
+        and (
+            projection["dense_gpu_bytes"]
+            + (
+                len(managed_accelerator["devices"])
+                * projection["vram_reserve_per_device_bytes"]
+            )
+            > projection["selected_free_bytes"]
+            or any(
+                not device["admission_ok"]
+                for device in projection["per_device"]
+            )
+        )
+    ):
+        blockers.append(
+            "selected GPU free VRAM cannot hold the projected dense tensors "
+            "and per-device reserve"
+        )
+    if (
+        managed_accelerator["mode"] == "cuda"
+        and managed_accelerator["layout"] != GPU_LAYOUT_EXPERTS_ONLY
+    ):
+        warnings.append(
+            "per-card dense VRAM admission is a balanced estimate; "
+            "Operate reports exact tensor placement and any CPU fallback"
+        )
     if (
         managed_accelerator["mode"] == "cuda"
         and managed_accelerator["capability"] != "available"
@@ -933,6 +1129,7 @@ def build_plan(
             "fingerprint_algorithm": model["fingerprint_algorithm"],
             "shard_count": len(model["shards"]),
             "total_shard_bytes": model["total_shard_bytes"],
+            "dense_tensor_bytes": model["dense_tensor_bytes"],
             "complete_experts": model["complete_experts"],
         },
         "profile": {
@@ -1001,6 +1198,7 @@ def build_plan(
             "cap_raise": 0,
         },
         "managed_accelerator": managed_accelerator,
+        "accelerator_projection": accelerator_projection,
         "preset": _preset_metadata(args),
         "blockers": sorted(set(blockers)),
         "warnings": warnings,

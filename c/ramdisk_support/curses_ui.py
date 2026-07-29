@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 import argparse
+import copy
 import contextlib
 import math
 import signal
@@ -19,15 +20,26 @@ from .common import (
     RamdiskError,
     _OperationCancelled,
 )
+from .runtime_monitor import RuntimeMonitor
 from ramdisk_ui import ActionPolicy, ReviewIdentity
 
 
 _TUI_SCREENS = (
     "Plan",
     "Hardware",
+    "GPUs",
     "Activity",
     "Benchmarks",
     "Settings",
+)
+
+_GPU_LAYOUTS = (
+    ("experts-only", "Hot experts only"),
+    ("dense-attention", "Dense + GPU attention · experimental"),
+    (
+        "dense-attention-sharded",
+        "Dense + sharded attention · experimental",
+    ),
 )
 
 
@@ -60,6 +72,551 @@ def _tui_wrap_rows(rows, width):
             for part in (parts or [leading])
         )
     return wrapped
+
+
+def _metric_gib(value):
+    if value is None:
+        return "n/a"
+    try:
+        return "%.1f GiB" % (float(value) / GIB)
+    except (TypeError, ValueError, OverflowError):
+        return "n/a"
+
+
+def _runtime_failure_snapshot(previous, error, observed_at=None):
+    """Retain the last sample without leaving it looking live after a crash."""
+    snapshot = copy.deepcopy(previous) if isinstance(previous, dict) else {}
+    message = "runtime sampler failed: %s" % (
+        str(error).strip() or type(error).__name__
+    )
+    service = snapshot.setdefault("service", {})
+    service.update(
+        {
+            "state": "degraded",
+            "label": "DEGRADED",
+            "active": service.get("active"),
+            "queued": service.get("queued"),
+            "endpoints": list(service.get("endpoints") or ()),
+            "error": message,
+            "stale": True,
+            "observed_at": service.get("observed_at"),
+        }
+    )
+    freshness = snapshot.setdefault("freshness", {})
+    for channel in (
+        "service",
+        "cards",
+        "model",
+        "tiers",
+        "profile",
+        "process",
+    ):
+        prior = freshness.get(channel)
+        prior = prior if isinstance(prior, dict) else {}
+        freshness[channel] = {
+            "stale": True,
+            "observed_at": prior.get("observed_at"),
+            "error": message,
+        }
+    for card in snapshot.get("gpus") or ():
+        if isinstance(card, dict):
+            card["card_stale"] = True
+            card["model_stale"] = True
+            card["process_stale"] = True
+    snapshot["tiers_stale"] = True
+    snapshot["profile_stale"] = True
+    snapshot["process_stale"] = True
+    snapshot["sampler_error_at"] = (
+        float(observed_at) if observed_at is not None else time.time()
+    )
+    return snapshot
+
+
+def _metric_percent(value):
+    if value is None:
+        return "n/a"
+    try:
+        return "%.0f%%" % float(value)
+    except (TypeError, ValueError, OverflowError):
+        return "n/a"
+
+
+def _metric_observed_at(value):
+    try:
+        return time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(float(value)),
+        )
+    except (OSError, OverflowError, TypeError, ValueError):
+        return "unknown time"
+
+
+def _gpu_eligibility(device, hardware):
+    """Dependency-free fallback for builds without the shared selector."""
+    if not isinstance(device, dict):
+        return False, "malformed discovery record"
+    index = device.get("index")
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+    ):
+        return False, "invalid device index"
+    discovery = hardware.get("gpu_discovery") or {}
+    if discovery.get("cuda_visible_devices_present"):
+        return False, (
+            discovery.get("selection_error")
+            or "ambient CUDA_VISIBLE_DEVICES prevents safe GPU selection"
+        )
+    node = device.get("numa_node")
+    effective = set(hardware.get("effective_nodes") or ())
+    if device.get("locality") not in ("resolved", "single-node"):
+        return False, "NUMA locality is unavailable"
+    if (
+        isinstance(node, bool)
+        or not isinstance(node, int)
+        or node not in effective
+    ):
+        return False, "NUMA node is outside the effective host mask"
+    return True, None
+
+
+def _same_gpu_identity(left, right):
+    left_uuid = str(left.get("uuid") or "").lower()
+    right_uuid = str(right.get("uuid") or "").lower()
+    if left_uuid and right_uuid:
+        return left_uuid == right_uuid
+    left_pci = str(
+        left.get("pci_bus_id")
+        or left.get("pci")
+        or left.get("bus_id")
+        or ""
+    ).lower()
+    right_pci = str(
+        right.get("pci_bus_id")
+        or right.get("pci")
+        or right.get("bus_id")
+        or ""
+    ).lower()
+    if left_pci and right_pci:
+        return left_pci == right_pci
+    if (left_uuid or left_pci) and (right_uuid or right_pci):
+        return False
+    return left.get("index") == right.get("index")
+
+
+def _selected_gpu_indices(args, plan, active=False):
+    planned = (plan or {}).get("managed_accelerator") or {}
+    draft = getattr(args, "managed_accelerator", None) or {}
+    contract = planned if active else (draft or planned)
+    return {
+        int(device["index"])
+        for device in contract.get("devices") or ()
+        if isinstance(device, dict)
+        and isinstance(device.get("index"), int)
+        and not isinstance(device.get("index"), bool)
+    }
+
+
+def _gpu_layout(args, plan, active=False):
+    planned = (plan or {}).get("managed_accelerator") or {}
+    draft = getattr(args, "managed_accelerator", None) or {}
+    contract = planned if active else (draft or planned)
+    return str(
+        contract.get("layout")
+        or getattr(args, "gpu_layout", None)
+        or "experts-only"
+    )
+
+
+def _apply_tui_gpu_selection(
+    bindings,
+    args,
+    hardware,
+    selected,
+    layout,
+    *,
+    reset_placement,
+):
+    """Apply a curses draft edit through the shared planning contract."""
+    apply_selection = getattr(bindings, "apply_gpu_selection", None)
+    if apply_selection is None:
+        raise RamdiskError(
+            "this Colibri build does not expose managed GPU selection"
+        )
+    selector = (
+        "none"
+        if not selected
+        else ",".join(str(index) for index in sorted(selected))
+    )
+    apply_selection(
+        args,
+        hardware,
+        selector=selector,
+        layout=layout,
+        cuda_capable=(
+            True
+            if (
+                getattr(args, "managed_accelerator", None) or {}
+            ).get("capability") == "available"
+            else None
+        ),
+        reset_placement=reset_placement,
+    )
+    args.gpu_placement = (
+        "auto"
+        if reset_placement
+        else getattr(args, "gpu_placement", "custom")
+    )
+    marker = getattr(bindings, "mark_preset_custom", None)
+    if marker is not None:
+        marker(args)
+    return selector
+
+
+def _tui_gpu_rows(
+    hardware,
+    args,
+    plan,
+    report,
+    runtime,
+    cursor=0,
+):
+    """Render compact selection and live per-card metrics."""
+    hardware = hardware or {}
+    active = bool((report or {}).get("present"))
+    devices = sorted(
+        [
+            device
+            for device in (hardware or {}).get("gpus") or ()
+            if isinstance(device, dict)
+        ],
+        key=lambda device: int(device.get("index", 1 << 30)),
+    )
+    planned = (plan or {}).get("managed_accelerator") or {}
+    draft = getattr(args, "managed_accelerator", None) or {}
+    selected_devices = list(
+        (planned if active else (draft or planned)).get("devices") or ()
+    )
+    for selected_device in selected_devices:
+        if not any(
+            _same_gpu_identity(selected_device, device)
+            for device in devices
+        ):
+            devices.append(dict(selected_device))
+    devices.sort(key=lambda device: int(device.get("index", 1 << 30)))
+    layout = _gpu_layout(args, plan, active=active)
+    layout_label = dict(_GPU_LAYOUTS).get(layout, layout)
+    rows = [
+        (
+            "heading",
+            "ACCELERATORS · %s"
+            % ("LOCKED BY ACTIVE DEPLOYMENT" if active else "SELECT CARDS"),
+        ),
+        (
+            "accent" if selected_devices else "dim",
+            "Layout · %s" % layout_label,
+        ),
+    ]
+    if active:
+        rows.append(
+            (
+                "dim",
+                "Destroy the RAM workspace before changing cards or layout.",
+            )
+        )
+    else:
+        rows.extend(
+            [
+                (
+                    "dim",
+                    "↑/↓ card · Space toggle · [g] layout · "
+                    "[a] all + GPU-local · [u] reset locality · [c] CPU",
+                ),
+                (
+                    "dim",
+                    "At least one card is required for GPU serving. "
+                    "Dense layouts are experimental.",
+                ),
+            ]
+        )
+    rows.append(("normal", ""))
+
+    runtime_rows = [
+        item
+        for item in (runtime or {}).get("gpus") or ()
+        if isinstance(item, dict)
+    ]
+    if not devices:
+        rows.append(
+            (
+                "warn",
+                (hardware.get("gpu_discovery") or {}).get("error")
+                or "No NVIDIA GPUs were discovered.",
+            )
+        )
+        return rows
+    cursor = max(0, min(int(cursor), len(devices) - 1))
+    for position, device in enumerate(devices):
+        index = int(device["index"])
+        eligible, reason = _gpu_eligibility(device, hardware)
+        is_selected = any(
+            _same_gpu_identity(device, selected_device)
+            for selected_device in selected_devices
+        )
+        marker = "▶" if position == cursor and not active else " "
+        checkbox = (
+            "[×]"
+            if is_selected
+            else "[ ]"
+            if eligible
+            else "[-]"
+        )
+        free_bytes = device.get("free_bytes")
+        total_bytes = device.get("total_bytes")
+        card = next(
+            (
+                row
+                for row in runtime_rows
+                if _same_gpu_identity(device, row)
+            ),
+            {},
+        )
+        if card.get("memory_free_bytes") is not None:
+            free_bytes = card["memory_free_bytes"]
+        if card.get("memory_total_bytes") is not None:
+            total_bytes = card["memory_total_bytes"]
+        style = (
+            "warn"
+            if not eligible
+            else "accent"
+            if is_selected
+            else "normal"
+        )
+        rows.append(
+            (
+                style,
+                "%s %s GPU %d · %s · %s · free %s / %s · NUMA %s"
+                % (
+                    marker,
+                    checkbox,
+                    index,
+                    device.get("name") or "NVIDIA GPU",
+                    device.get("uuid")
+                    or device.get("pci_bus_id")
+                    or "identity unavailable",
+                    _metric_gib(free_bytes),
+                    _metric_gib(total_bytes),
+                    device.get("numa_node", "n/a"),
+                ),
+            )
+        )
+        if not eligible:
+            rows.append(("warn", "    unavailable · %s" % reason))
+        if card:
+            stale_parts = []
+            if card.get("card_stale"):
+                stale_parts.append(
+                    "card stale (last %s)"
+                    % _metric_observed_at(card.get("observed_at"))
+                )
+            if card.get("model_stale"):
+                stale_parts.append("model stale")
+            if card.get("process_stale"):
+                stale_parts.append("process stale")
+            rows.append(
+                (
+                    "warn" if stale_parts else "dim",
+                    "    card %s · used %s · Colibri %s · model %s"
+                    "%s"
+                    % (
+                        _metric_percent(
+                            card.get("utilization_percent")
+                        ),
+                        _metric_gib(card.get("memory_used_bytes")),
+                        _metric_gib(card.get("process_vram_bytes")),
+                        _metric_gib(
+                            card.get("model_resident_bytes")
+                        ),
+                        (
+                            " · " + " · ".join(stale_parts)
+                            if stale_parts
+                            else ""
+                        ),
+                    ),
+                )
+            )
+            rows.append(
+                (
+                    "dim",
+                    "    experts %s / %s · non-expert %s"
+                    % (
+                        card.get("expert_count")
+                        if card.get("expert_count") is not None
+                        else "n/a",
+                        _metric_gib(card.get("expert_bytes")),
+                        _metric_gib(card.get("non_expert_bytes")),
+                    ),
+                )
+            )
+    return rows
+
+
+def _tui_runtime_rows(runtime):
+    """Render serving proof and aggregate request/resource telemetry."""
+    if not runtime:
+        return [
+            ("heading", "COLIBRI SERVING · SAMPLING"),
+            ("dim", "Waiting for the first runtime telemetry sample."),
+            ("normal", ""),
+        ]
+    service = runtime.get("service") or {}
+    state = service.get("state", "degraded")
+    style = {
+        "serving": "good",
+        "starting": "warn",
+        "stopped": "dim",
+        "degraded": "bad",
+    }.get(state, "warn")
+    rows = [
+        (
+            "heading",
+            "COLIBRI SERVING · %s" % service.get("label", state.upper()),
+        ),
+        (
+            style,
+            "API %s · active %s · queued %s · process RSS %s%s"
+            % (
+                "healthy" if state == "serving" else state,
+                service.get("active")
+                if service.get("active") is not None
+                else "n/a",
+                service.get("queued")
+                if service.get("queued") is not None
+                else "n/a",
+                _metric_gib(runtime.get("process_rss_bytes")),
+                " · stale"
+                if service.get("stale") or runtime.get("process_stale")
+                else "",
+            ),
+        ),
+    ]
+    for endpoint in service.get("endpoints") or ():
+        rows.append(
+            (
+                "good"
+                if endpoint.get("process_verified")
+                and endpoint.get("health_ok")
+                else "bad",
+                "  %s · process %s · health %s"
+                % (
+                    endpoint.get("url"),
+                    "verified"
+                    if endpoint.get("process_verified")
+                    else "unverified",
+                    "ok" if endpoint.get("health_ok") else "unavailable",
+                ),
+            )
+        )
+    if service.get("error"):
+        rows.append(("warn", "  %s" % service["error"]))
+    tiers = runtime.get("tiers") or {}
+    rows.extend(
+        [
+            ("normal", ""),
+            ("heading", "MODEL PLACEMENT"),
+            (
+                "warn" if runtime.get("tiers_stale") else "normal",
+                "Experts · VRAM %s (%s) · RAM %s (%s) · disk %s%s"
+                % (
+                    tiers.get("vram", "n/a"),
+                    (
+                        "%.1f GB" % float(tiers["vram_gb"])
+                        if tiers.get("vram_gb") is not None
+                        else "n/a"
+                    ),
+                    tiers.get("ram", "n/a"),
+                    (
+                        "%.1f GB" % float(tiers["ram_gb"])
+                        if tiers.get("ram_gb") is not None
+                        else "n/a"
+                    ),
+                    tiers.get("disk", "n/a"),
+                    " · stale" if runtime.get("tiers_stale") else "",
+                ),
+            ),
+        ]
+    )
+    profile = runtime.get("latest_profile")
+    if profile:
+        rows.extend(
+            [
+                ("normal", ""),
+                ("heading", "LATEST COMPLETED REQUEST"),
+                (
+                    "warn" if runtime.get("profile_stale") else "normal",
+                    "%s tok/s · TTFT %s ms · wall %s s%s"
+                    % (
+                        (
+                            "%.2f"
+                            % float(profile["tokens_per_second"])
+                            if profile.get("tokens_per_second") is not None
+                            else "n/a"
+                        ),
+                        (
+                            "%.1f" % float(profile["ttft_ms"])
+                            if profile.get("ttft_ms") is not None
+                            else "n/a"
+                        ),
+                        (
+                            "%.2f" % float(profile["wall_s"])
+                            if profile.get("wall_s") is not None
+                            else "n/a"
+                        ),
+                        " · stale"
+                        if runtime.get("profile_stale")
+                        else "",
+                    ),
+                ),
+                (
+                    "dim",
+                    "Expert disk/wait/matmul %s/%s/%s s · "
+                    "attention/head %s/%s s"
+                    % tuple(
+                        (
+                            "%.2f" % float(profile[key])
+                            if profile.get(key) is not None
+                            else "n/a"
+                        )
+                        for key in (
+                            "expert_disk_s",
+                            "expert_wait_s",
+                            "expert_matmul_s",
+                            "attention_s",
+                            "lm_head_s",
+                        )
+                    ),
+                ),
+            ]
+        )
+    else:
+        rows.append(("dim", "No completed profiled request yet."))
+    freshness = runtime.get("freshness") or {}
+    for name, channel in freshness.items():
+        if not isinstance(channel, dict) or not channel.get("stale"):
+            continue
+        rows.append(
+            (
+                "warn",
+                "%s telemetry stale · last successful sample %s"
+                % (
+                    name,
+                    _metric_observed_at(channel.get("observed_at")),
+                ),
+            )
+        )
+    rows.append(("normal", ""))
+    return rows
 
 
 def _tui(
@@ -123,9 +680,17 @@ def _tui(
         ("base_port", 8000),
         ("memory_nodes", None),
         ("cpu_list", None),
+        ("gpu", None),
+        ("gpu_layout", "experts-only"),
     ):
         if not hasattr(args, name):
             setattr(args, name, value)
+    if not hasattr(args, "gpu_placement"):
+        args.gpu_placement = (
+            "custom"
+            if args.memory_nodes is not None or args.cpu_list is not None
+            else "auto"
+        )
 
     try:
         curses.curs_set(0)
@@ -185,6 +750,16 @@ def _tui(
     history_cache = None
     metrics_cache = {}
     hardware_checked = report_checked = metrics_checked = 0.0
+    runtime_monitor = RuntimeMonitor()
+    runtime_snapshot = None
+    runtime_checked = 0.0
+    runtime_job = None
+    runtime_generation = 0
+    runtime_lock = threading.Lock()
+    hardware_job = None
+    hardware_generation = 0
+    hardware_lock = threading.Lock()
+    gpu_cursor = 0
     deep_status_refresh = True
     operation = None
     quit_when_idle = False
@@ -219,13 +794,17 @@ def _tui(
     def invalidate(deep=False, model=False):
         nonlocal hardware_cache, model_cache, plan_cache, plan_key_cache
         nonlocal report_cache, active_manifest_cache, history_cache
-        nonlocal deep_status_refresh
+        nonlocal deep_status_refresh, hardware_checked
+        nonlocal hardware_generation
         plan_cache = plan_key_cache = None
         report_cache = active_manifest_cache = history_cache = None
         if model:
             model_cache = None
         if deep:
-            hardware_cache = None
+            # Keep the last snapshot visible while a replacement is discovered
+            # off the input thread.
+            hardware_checked = 0.0
+            hardware_generation += 1
             deep_status_refresh = True
 
     def cancel_confirmation():
@@ -291,6 +870,114 @@ def _tui(
     def update_operation(op, detail):
         with operation_lock:
             op["detail"] = detail
+
+    def harvest_runtime_poll():
+        nonlocal runtime_job, runtime_snapshot, runtime_checked
+        if runtime_job is None:
+            return
+        with runtime_lock:
+            if not runtime_job["done"]:
+                return
+            result = runtime_job["result"]
+            generation = runtime_job["generation"]
+            runtime_job = None
+        runtime_checked = time.monotonic()
+        if result is not None and generation == runtime_generation:
+            runtime_snapshot = result
+
+    def harvest_hardware_poll():
+        nonlocal hardware_job, hardware_cache, hardware_checked
+        nonlocal plan_cache, plan_key_cache, message
+        if hardware_job is None:
+            return
+        with hardware_lock:
+            if not hardware_job["done"]:
+                return
+            result = hardware_job["result"]
+            error = hardware_job["error"]
+            generation = hardware_job["generation"]
+            hardware_job = None
+        hardware_checked = time.monotonic()
+        if generation != hardware_generation:
+            return
+        if result is not None:
+            hardware_cache = result
+            plan_cache = plan_key_cache = None
+        elif error is not None:
+            message = (
+                "Hardware refresh failed; retaining the last snapshot: %s"
+                % error
+            )
+
+    def begin_hardware_poll():
+        nonlocal hardware_job
+        if hardware_job is not None:
+            return
+        job = {
+            "done": False,
+            "result": None,
+            "error": None,
+            "generation": hardware_generation,
+        }
+
+        def runner():
+            try:
+                result = discover_hardware()
+                error = None
+            except Exception as exc:
+                result = None
+                error = exc
+            with hardware_lock:
+                job["result"] = result
+                job["error"] = error
+                job["done"] = True
+
+        hardware_job = job
+        thread = threading.Thread(
+            target=runner,
+            name="coli-ramdisk-hardware-discovery",
+        )
+        thread.daemon = True
+        job["thread"] = thread
+        thread.start()
+
+    def begin_runtime_poll(manifest, report, plan, hardware, checked):
+        nonlocal runtime_job, runtime_checked
+        if runtime_job is not None:
+            return
+        job = {
+            "done": False,
+            "result": None,
+            "generation": runtime_generation,
+            "previous": copy.deepcopy(runtime_snapshot),
+        }
+
+        def runner():
+            try:
+                result = runtime_monitor.sample(
+                    manifest,
+                    report,
+                    plan,
+                    hardware,
+                )
+            except Exception as exc:
+                result = _runtime_failure_snapshot(
+                    job["previous"],
+                    exc,
+                )
+            with runtime_lock:
+                job["result"] = result
+                job["done"] = True
+
+        runtime_job = job
+        runtime_checked = checked
+        thread = threading.Thread(
+            target=runner,
+            name="coli-ramdisk-runtime-monitor",
+        )
+        thread.daemon = True
+        job["thread"] = thread
+        thread.start()
 
     def prompt_value(label, current):
         nonlocal message
@@ -398,6 +1085,8 @@ def _tui(
 
     while True:
         now = time.monotonic()
+        harvest_hardware_poll()
+        harvest_runtime_poll()
         if operation is not None:
             with operation_lock:
                 finished = operation["done"]
@@ -478,13 +1167,15 @@ def _tui(
         preset_selecting = False
         rows = []
         try:
-            if (
-                hardware_cache is None
-                or now - hardware_checked >= 30.0
-            ):
+            if hardware_cache is None:
                 hardware_cache = discover_hardware()
                 hardware_checked = now
                 plan_key_cache = None
+            elif (
+                hardware_job is None
+                and now - hardware_checked >= 30.0
+            ):
+                begin_hardware_poll()
             hardware = hardware_cache
             if report_cache is None or now - report_checked >= 2.0:
                 report_cache = status(deep=deep_status_refresh)
@@ -504,6 +1195,9 @@ def _tui(
                     active_manifest_cache.get("created_at"),
                 )
                 if deployment_identity != active_deployment_identity:
+                    runtime_generation += 1
+                    runtime_snapshot = None
+                    runtime_checked = 0.0
                     args.base_port = _persisted_base_port(
                         active_manifest_cache
                     )
@@ -519,6 +1213,10 @@ def _tui(
                         - int(first.get("node") or 0)
                     )
             else:
+                if active_deployment_identity is not None:
+                    runtime_generation += 1
+                    runtime_snapshot = None
+                    runtime_checked = 0.0
                 active_deployment_identity = None
                 preset_selecting = bool(
                     preset_prompt_pending
@@ -574,10 +1272,41 @@ def _tui(
                 if pending_action == "prepare"
                 else None
             )
+            if (
+                not preset_selecting
+                and plan is not None
+                and runtime_job is None
+                and now - runtime_checked >= 2.0
+            ):
+                begin_runtime_poll(
+                    copy.deepcopy(active_manifest_cache)
+                    if active
+                    else None,
+                    copy.deepcopy(report),
+                    copy.deepcopy(plan),
+                    copy.deepcopy(hardware),
+                    now,
+                )
             if preset_selecting:
                 rows = _tui_preset_rows()
             elif help_open:
-                rows = _tui_help_rows()
+                rows = _tui_help_rows() + [
+                    ("normal", ""),
+                    ("heading", "GPUs PAGE"),
+                    (
+                        "normal",
+                        "↑/↓ · choose card    Space · toggle selected card",
+                    ),
+                    (
+                        "normal",
+                        "g · cycle placement layout    "
+                        "a/u · select all or reset GPU-local placement",
+                    ),
+                    (
+                        "normal",
+                        "c · switch draft to CPU-only serving",
+                    ),
+                ]
             elif screen == 0:
                 rows = _tui_plan_rows(
                     plan,
@@ -589,6 +1318,15 @@ def _tui(
             elif screen == 1:
                 rows = _tui_hardware_rows(hardware)
             elif screen == 2:
+                rows = _tui_gpu_rows(
+                    hardware,
+                    args,
+                    plan,
+                    report,
+                    runtime_snapshot,
+                    cursor=gpu_cursor,
+                )
+            elif screen == 3:
                 if now - metrics_checked >= 2.0:
                     metrics_cache = {
                         process.get("pid"): _managed_process_metrics(
@@ -598,12 +1336,14 @@ def _tui(
                         if process.get("pid") is not None
                     }
                     metrics_checked = now
-                rows = _tui_activity_rows(
+                rows = _tui_runtime_rows(
+                    runtime_snapshot
+                ) + _tui_activity_rows(
                     report,
                     hardware,
                     metrics_cache,
                 )
-            elif screen == 3:
+            elif screen == 4:
                 if history_cache is None:
                     history_cache = (
                         _read_json(_benchmarks_path())
@@ -768,15 +1508,25 @@ def _tui(
             action_hint = "[?] close help"
         elif preset_selecting:
             action_hint = "[Enter] default · [1-4] choose"
+        elif screen == 2 and not (report or {}).get("present"):
+            action_hint = (
+                "[Space] select  [g] layout  [a] all  [u] GPU-local"
+            )
         else:
+            policy_screen = screen - 1 if screen >= 3 else screen
             action_hint = _tui_idle_action_hint(
-                screen,
+                policy_screen,
                 plan,
                 report,
             )
-        footer = (
-            "%s · ←/→ pages · ↑/↓ scroll · [?] help · [q] quit"
-            % action_hint
+        navigation = (
+            "←/→ pages · ↑/↓ cards · PgUp/PgDn scroll"
+            if screen == 2 and not help_open
+            else "←/→ pages · ↑/↓ scroll"
+        )
+        footer = "%s · %s · [?] help · [q] quit" % (
+            action_hint,
+            navigation,
         )
         safe_add(
             height - 2,
@@ -855,6 +1605,11 @@ def _tui(
                 )
                 vars(args).clear()
                 vars(args).update(vars(result["args"]))
+                args.gpu_placement = (
+                    "auto"
+                    if getattr(args, "managed_accelerator", None)
+                    else getattr(args, "gpu_placement", "auto")
+                )
                 plan_cache = result["plan"]
                 plan_key_cache = None
                 preset_prompt_pending = False
@@ -898,6 +1653,23 @@ def _tui(
             help_open = False
             scroll = 0
             continue
+        if (
+            screen == 2
+            and not help_open
+            and key in (ord("j"), curses.KEY_DOWN)
+        ):
+            gpu_cursor = min(
+                max(0, len((hardware or {}).get("gpus") or ()) - 1),
+                gpu_cursor + 1,
+            )
+            continue
+        if (
+            screen == 2
+            and not help_open
+            and key in (ord("k"), curses.KEY_UP)
+        ):
+            gpu_cursor = max(0, gpu_cursor - 1)
+            continue
         if key in (ord("j"), curses.KEY_DOWN):
             scroll = _tui_review_scroll(
                 pending_action,
@@ -934,6 +1706,119 @@ def _tui(
             continue
         if operation is not None:
             message = "A lifecycle operation is already running."
+            continue
+
+        if screen == 2 and key in (
+            ord(" "),
+            ord("g"),
+            ord("a"),
+            ord("u"),
+            ord("c"),
+        ):
+            if report.get("present"):
+                message = (
+                    "GPU selection is locked by the active deployment; "
+                    "Destroy it before editing."
+                )
+                continue
+            devices = sorted(
+                [
+                    device
+                    for device in (hardware or {}).get("gpus") or ()
+                    if isinstance(device, dict)
+                ],
+                key=lambda device: int(device.get("index", 1 << 30)),
+            )
+            gpu_cursor = max(
+                0,
+                min(gpu_cursor, max(0, len(devices) - 1)),
+            )
+            selected = _selected_gpu_indices(args, plan)
+            layout = _gpu_layout(args, plan)
+            reset_placement = (
+                getattr(args, "gpu_placement", "auto") != "custom"
+            )
+            try:
+                if key == ord(" "):
+                    if not devices:
+                        raise RamdiskError("no NVIDIA GPU was discovered")
+                    device = devices[gpu_cursor]
+                    eligible, reason = _gpu_eligibility(device, hardware)
+                    if not eligible:
+                        raise RamdiskError(
+                            "GPU %s is unavailable: %s"
+                            % (device.get("index"), reason)
+                        )
+                    index = int(device["index"])
+                    if index in selected:
+                        selected.remove(index)
+                    else:
+                        selected.add(index)
+                    if not selected:
+                        raise RamdiskError(
+                            "a GPU layout requires at least one card; "
+                            "press c for CPU-only serving"
+                        )
+                elif key == ord("a"):
+                    selected = {
+                        int(device["index"])
+                        for device in devices
+                        if _gpu_eligibility(device, hardware)[0]
+                    }
+                    if not selected:
+                        raise RamdiskError(
+                            "no usable NVIDIA GPU was discovered"
+                        )
+                    reset_placement = True
+                elif key == ord("u"):
+                    if not selected:
+                        raise RamdiskError(
+                            "select at least one GPU before resetting locality"
+                        )
+                    reset_placement = True
+                elif key == ord("c"):
+                    selected = set()
+                    layout = "experts-only"
+                    reset_placement = True
+                else:
+                    if not selected:
+                        raise RamdiskError(
+                            "select at least one GPU before changing layout"
+                        )
+                    choices = [
+                        value for value, _label in _GPU_LAYOUTS
+                    ]
+                    if len(selected) < 2:
+                        choices.remove("dense-attention-sharded")
+                    layout = choices[
+                        (choices.index(layout) + 1) % len(choices)
+                    ]
+                selector = _apply_tui_gpu_selection(
+                    bindings,
+                    args,
+                    hardware,
+                    selected,
+                    layout,
+                    reset_placement=reset_placement,
+                )
+                cancel_confirmation()
+                plan_cache = plan_key_cache = None
+                scroll = 0
+                if selector == "none":
+                    message = "Managed serving changed to CPU only."
+                else:
+                    message = (
+                        "Managed GPUs %s · %s%s"
+                        % (
+                            selector,
+                            dict(_GPU_LAYOUTS).get(layout, layout),
+                            " · placement reset to GPU-local"
+                            if reset_placement
+                            else " · custom placement preserved",
+                        )
+                    )
+            except (OSError, TypeError, ValueError, RamdiskError) as exc:
+                message = "GPU selection was not changed: %s" % exc
             continue
 
         if key == ord("p") and screen == 0:
@@ -1116,7 +2001,7 @@ def _tui(
                     )
             continue
 
-        if key == ord("b") and screen == 3:
+        if key == ord("b") and screen == 4:
             action_policy = ActionPolicy.from_state(plan, report)
             if not action_policy.benchmark.enabled:
                 message = action_policy.benchmark.reason
@@ -1138,7 +2023,7 @@ def _tui(
                 )
             continue
 
-        if screen != 4:
+        if screen != 5:
             continue
         action_policy = ActionPolicy.from_state(plan, report)
         if not action_policy.edit_weights.enabled and (

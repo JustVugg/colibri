@@ -21,13 +21,15 @@ summarized at the end. Line formats below are quoted from the emitting `printf`s
 \x01\x01READY\x01\x01
 STAT 0 0.00 0.0 <rss_gb>
 HWINFO <cores> <ram_total_gb> <ram_avail_gb> <ngpu> <vram_total_gb> <cpu_name>|<gpu_name>
+GPUS <n> (<used_gb> <total_gb> <experts>)×n
+GPUDETAIL 1 <n> (<ordinal> <identity-or-dash> <total_bytes> <free_bytes> <model_bytes> <expert_bytes> <nonexpert_bytes> <expert_count>)×n
 TIERS <vram_experts> <ram_experts> <disk_experts> <vram_gb> <ram_gb>
 EMAP <rows> <cols> <hex>
 ```
 
-The server must not send requests before `READY`. `HWINFO`/`TIERS`/`EMAP` are
-telemetry (see below) and may grow — **servers must ignore line kinds they do not
-recognize**; that is the protocol's forward-compatibility rule.
+The server must not send requests before `READY`. The remaining records are
+telemetry (see below) and may grow — **servers must ignore line kinds they do
+not recognize**; that is the protocol's forward-compatibility rule.
 
 ## Requests (server → engine)
 
@@ -72,9 +74,11 @@ Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQU
 `CANCELLED`. A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
 is persisted.
 
-Immediately before each `DONE` the engine emits a telemetry block for the finished
-turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats below).
-`.coli_usage` is persisted at every turn end, not only at exit.
+Immediately before each `DONE` the engine emits a telemetry block for the
+finished turn: `HWINFO`, legacy `GPUS`, `GPUDETAIL`, `TIERS`, `EMAP`, `HITS`,
+and `PROF` (formats below). `GPUS` and `GPUDETAIL` are therefore emitted both
+during startup and before every `DONE`. `.coli_usage` is persisted at every
+turn end, not only at exit.
 
 ## Telemetry lines
 
@@ -88,10 +92,24 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 | `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |
 | `ENTROPY` | `ENTROPY <h0> <h1> …` | per-sparse-layer routing entropy of the turn, bits |
 | `GPUS` | `GPUS <n> (<used_gb> <total_gb> <experts>)×n` | per-device VRAM + resident expert count (CUDA builds) |
+| `GPUDETAIL` | `GPUDETAIL 1 <n> (<ordinal> <identity-or-dash> <total_bytes> <free_bytes> <model_bytes> <expert_bytes> <nonexpert_bytes> <expert_count>)×n` | versioned, integer-byte per-device placement. `ordinal` is the logical index in the engine's visible CUDA device list; `identity` is `-` when the backend cannot provide a UUID/PCI identity; `model_bytes = expert_bytes + nonexpert_bytes`. |
 | `TOPK` | `TOPK <id> 5 (<logprob> <hextext>)×5` | token text hex-encoded so the line stays line-shaped |
 | `REPIN` | `REPIN <layer> <eid> <old_tier> <gpu>` | one line per hot-store swap (`REPIN=n` mode) |
 
+`GPUS` remains on the wire for older consumers. New control-plane consumers
+should prefer `GPUDETAIL` for model-resident bytes and treat card-wide live
+utilization/process memory as a separate sampler concern.
+
+The emitter publishes legacy `GPUS 0` when any selected device lacks a valid
+memory sample, because that format has only implicit positions. `GPUDETAIL`
+can retain valid devices because each row carries an explicit ordinal; omitted
+selected ordinals make the control-plane snapshot incomplete and stale.
+Consumers must reject duplicate ordinals, negative counts, `free_bytes` or
+`model_bytes` above `total_bytes`, and a model/component sum mismatch.
+
 All telemetry is advisory: servers render what they know and skip the rest.
+An unknown telemetry kind or unsupported `GPUDETAIL` version is ignored. A
+malformed record of a known, supported kind is a protocol error.
 
 ## HTTP surface (`openai_server.py`)
 
@@ -99,6 +117,12 @@ All telemetry is advisory: servers render what they know and skip the rest.
   SSE frame `data: {"colibri": {stats, perf, topk, entropy, gpus, repin}}` immediately
   before `data: [DONE]`; non-streaming responses attach the same object as a
   `"colibri"` field.
+- `GET /health` — public liveness; returns 503/`status: error` if the dispatcher
+  or engine child has failed. Authenticated requests (or servers with no
+  configured API key) also receive scheduler, tier, hardware, `gpus`, and
+  `gpus_seq` telemetry.
+- `GET /profile` — the rolling completed-turn `PROF` records enriched with
+  `DONE` throughput, cache, RSS, and length-limit fields.
 - `GET /experts` — the latest `EMAP`/`HITS` state: `{rows, cols, map, hits, seq,
   gpus, entropy, repin}`.
 - `GET /*` — static hosting of `web/dist` (SPA fallback, path-traversal-safe), plus

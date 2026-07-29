@@ -1717,7 +1717,13 @@ extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
         tensor->compressed ? tensor->archive_bytes :
 #endif
         tensor->weight_bytes;
-    return storage_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+    /* Report exactly what upload charged to the device counter.  In
+     * particular, fmt=6/E8 stores scales inside each weight block and has no
+     * separate scale allocation. */
+    return storage_bytes +
+        ((tensor->fmt && tensor->fmt != 6)
+             ? (size_t)tensor->O * ng * sizeof(float)
+             : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

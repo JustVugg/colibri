@@ -50,7 +50,24 @@ invoke `coli` from `PATH` instead:
 ./coli ramdisk --model /models/glm
 ./coli ramdisk --model /models/glm --mode partial --capacity-gb 96
 ./coli ramdisk --model /models/glm --memory-nodes 0,2 --cpu-list 0-31,64-95
+./coli ramdisk --model /models/glm --gpu 0,2 --gpu-layout experts-only
 ```
+
+`--gpu auto` selects every eligible NVIDIA GPU. `--gpu none` requests
+CPU-only serving. Otherwise pass an exact comma-separated index/range list,
+such as `--gpu 0,2-3`. `--gpu-layout` accepts `experts-only`,
+`dense-attention`, or `dense-attention-sharded`. These options work before or
+after a scriptable lifecycle action:
+
+```sh
+./coli ramdisk --gpu 0,2 plan --model /models/glm
+./coli ramdisk plan --model /models/glm --gpu 0,2
+```
+
+Managed physical-card selection requires `CUDA_VISIBLE_DEVICES` to be unset
+when the TUI is launched. The reviewed plan persists stable GPU UUIDs, sets its
+own visible-device list at Start, and addresses the resulting logical devices
+as `0..n-1`. It never assumes that an NVML physical index is a CUDA ordinal.
 
 `COLI_RAMDISK_UI` selects the frontend:
 
@@ -76,11 +93,12 @@ silently hidden.
 When no prepared workspace exists, both terminal interfaces begin with one
 preset question:
 
-- **Fastest GPU staging** (default) discovers NVIDIA GPUs, keeps one shared
-  model copy and one engine, and selects only the effective NUMA nodes local to
-  those GPUs. It first attempts full staging, then uses a compatible usage
-  profile to fit a partial plan. The reviewed engine contract uses CUDA mmap,
-  asynchronous RAM-to-VRAM copies, and automatic VRAM sizing.
+- **Fastest GPU staging** (default) discovers NVIDIA GPUs, selects every
+  eligible card unless `--gpu` names a subset, keeps one shared model copy and
+  one engine, and selects only the effective NUMA nodes local to those GPUs. It
+  first attempts full staging, then uses a compatible usage profile to fit a
+  partial plan. The reviewed engine contract uses CUDA mmap, asynchronous
+  RAM-to-VRAM copies, and automatic VRAM sizing.
 - **Single RAM copy** keeps one shared copy and engine using the ordinary
   effective NUMA placement.
 - **Minimal RAM** requests a profile-guided partial plan sized to the largest
@@ -90,11 +108,17 @@ preset question:
 - **Multiple NUMA replicas** explicitly selects one complete copy and
   independent engine per chosen node.
 
-If GPU discovery, PCI-to-NUMA locality, or the CUDA engine capability cannot be
-used safely, Fastest GPU staging falls back visibly to the single-copy plan. It
-never chooses replicas. A prepared workspace skips the preset question and
-opens with its persisted placement. Selecting a preset jumps directly to
-Review; the advanced steps remain editable, and an edit marks the preset as
+Each discovered card shows its index, name, free/total VRAM, UUID, PCI
+identity, and NUMA node. A card with unresolved locality or a NUMA node outside
+the effective host mask is disabled with the exact reason. An unusable,
+unselected card does not prevent other eligible cards from being used.
+Explicitly selecting an unavailable index is an error.
+
+If no eligible GPU exists, CUDA capability is unavailable or unproven, or
+`--gpu none` disables CUDA, Fastest GPU staging falls back visibly to the
+single-copy plan. It never chooses replicas. A prepared workspace skips the
+preset question and opens with its persisted placement. The GPU preset opens
+Accelerators; the other presets open Review. Advanced edits mark the preset as
 Custom.
 
 The rail at the top of the Textual interface summarizes the consequences of
@@ -121,6 +145,28 @@ instead of striping mounts. With GPUs attached to different NUMA domains, a
 single shared tensor can still have pages remote from one GPU; exact per-GPU
 tensor placement requires engine-level placement rather than extra ramdisks.
 
+### GPU model placement
+
+The accelerator layout controls which model components may occupy the selected
+GPUs:
+
+| Layout | Stability | Placement |
+|---|---|---|
+| `experts-only` | Stable default | Dense tensors and attention stay on CPU. Usage-ranked hot experts are uploaded to the selected GPUs. |
+| `dense-attention` | Experimental | Dense tensors are assigned across the GPUs and attention runs on GPU. Hot experts continue to use the automatic VRAM tier. |
+| `dense-attention-sharded` | Experimental, at least two GPUs | The dense/attention mode also shards KV-b attention heads across the selected devices. |
+
+Expert tensors are kept whole. The engine ranks complete expert triplets using
+the compatible usage history and balances them across selected devices by
+resident bytes. It does not shard one expert across cards. Remaining experts
+occupy the RAM and disk tiers shown by runtime telemetry.
+
+Changing the selected devices automatically derives memory nodes and
+whole-core CPUs from GPU locality until either placement field is edited.
+After that edit, the masks are custom and GPU changes preserve them. Every
+selected GPU must remain inside the reviewed memory-node mask; use **Reset to
+GPU-local** to replace custom masks with the derived values.
+
 Memory and CPU selections use Linux range-list syntax. The planner validates
 memory nodes against the effective NUMA mask and CPU selections as complete
 physical-core sibling groups inside the effective cpuset. DIMM and channel
@@ -128,22 +174,28 @@ inventory is informational; Linux memory policy is expressed in NUMA nodes.
 
 ## Textual workflow
 
-The six numbered steps form one plan-and-operate workflow. The placement rail
+The seven numbered steps form one plan-and-operate workflow. The placement rail
 remains visible throughout.
 
 1. **Inspect** shows the canonical model, selected shard count, host memory,
    effective cores, NUMA nodes, per-node capacity, CPU lists, and NUMA
    distances.
-2. **Placement** edits memory nodes, whole-core CPUs, and the managed mount
+2. **Accelerators** selects eligible NVIDIA GPUs and one model-placement
+   layout. It shows disabled-device reasons and a balanced per-card projection
+   of free VRAM, dense placement, 2 GiB/card reserve, and expert headroom.
+3. **Placement** edits memory nodes, whole-core CPUs, and the managed mount
    root. It shows whether any selected CPUs imply remote-memory access.
-3. **Capacity** chooses full or profile-guided staging and shows staged RAM,
+4. **Capacity** chooses full or profile-guided staging and shows staged RAM,
    runtime reserve, current headroom, blockers, and warnings.
-4. **Runtime** edits the base port, copy-worker count, context length, prefault
+5. **Runtime** edits the base port, copy-worker count, context length, prefault
    setting, tmpfs huge-page policy, and whether swappable tmpfs is allowed.
-5. **Review** repeats the exact copies, total RAM, engines, ports, nodes, CPU
-   masks, and mount paths. Prepare opens a token-bound confirmation that
-   expires after ten seconds.
-6. **Operate** shows verified lifecycle actions and explains why unavailable
+6. **Review** repeats the exact copies, total RAM, engines, ports, GPUs,
+   placement layout, nodes, CPU masks, and mount paths. Its VRAM values are
+   planning estimates; exact per-card model placement is available after
+   Start. Prepare opens a token-bound confirmation that expires after ten
+   seconds.
+7. **Operate** proves serving health, displays live resources and exact model
+   placement, shows verified lifecycle actions, and explains why unavailable
    actions are disabled.
 
 Submit an input with Enter, or navigate away from the step. Navigation commits
@@ -151,18 +203,19 @@ valid pending input and rebuilds the authoritative plan. Invalid input keeps
 you on the current step and leaves lifecycle actions disabled while the plan
 is stale.
 
-Once a workspace is prepared, its weight-placement settings are read from the
-persisted manifest and remain locked until Destroy. A base port may be changed
-while the workspace is ready or stopped, but not while managed engines are
-running. The console refreshes status automatically; use a deep refresh when
-you need hardware, source-fingerprint, and NUMA namespace validation repeated.
+Once a workspace is prepared, its GPU selection, model layout, and other
+weight-placement settings are read from the persisted manifest and remain
+locked until Destroy. A base port may be changed while the workspace is ready
+or stopped, but not while managed engines are running. The console refreshes
+status and runtime telemetry automatically; use a deep refresh when you need
+hardware, source-fingerprint, and NUMA namespace validation repeated.
 
 ### Textual controls
 
 | Control | Action |
 |---|---|
 | `Left` / `Right` | Previous or next step. |
-| `1` through `6` | Open Inspect through Operate. |
+| `1` through `7` | Open Inspect through Operate. |
 | `r` | Deep-refresh hardware, model plan, and lifecycle validation. |
 | `c` | Request cancellation of Prepare, Start, or Benchmark. |
 | `q` or `Esc` | Request a safe quit. In an input, ordinary text keys remain input. |
@@ -212,12 +265,62 @@ incomplete/error workspace. A fast status check verifies current mounts and
 managed process identities. Deep refresh also checks the source fingerprint
 and staged namespaces.
 
+Lifecycle state and serving state are separate. `running` says that the
+persisted process identity is present. `SERVING ✓` additionally requires every
+expected managed process to pass identity verification and every expected
+loopback endpoint to return `status: ok` from `/health`. One failed endpoint
+produces `DEGRADED`; a launch still in progress produces `STARTING`.
+
 The scriptable equivalent is:
 
 ```sh
 ./coli ramdisk start --base-port 8000
 ./coli ramdisk status --json
 ```
+
+### Runtime monitoring
+
+Both frontends sample runtime state every two seconds. HTTP requests are sent
+only to loopback ports validated from the manifest; process metrics are
+attributed only after persisted UID, process-group, and nonce checks pass. If
+`COLI_API_KEY` protects the managed server, the monitor uses the same
+environment value. Without a configured key, detailed health telemetry is
+available directly.
+
+Operate reports three deliberately different VRAM measurements:
+
+| Measurement | Source | Meaning |
+|---|---|---|
+| Device VRAM | `nvidia-smi` GPU sample | Card-wide used/free/total memory, including the driver and every process. |
+| Colibri process VRAM | `nvidia-smi` compute applications | Memory attributed to verified managed-process PIDs. |
+| Model resident | Engine `GPUDETAIL` telemetry | Exact model tensor allocations, divided into hot-expert and non-expert bytes. |
+
+The model view also reports aggregate expert counts and bytes in VRAM and RAM,
+plus experts still served from disk. The latest completed request supplies
+aggregate, request-wide tok/s and TTFT plus expert-disk, expert-wait,
+expert-matmul, attention, and LM-head timing. These metrics describe the
+engine/request as a whole; there is no per-card tok/s measurement.
+
+Card, model, profile, process, and service freshness are tracked separately.
+On a failed sample, the last successful value remains visible with `STALE` and
+its observation time. Monitoring is advisory: stale telemetry never disables
+Stop or Destroy when the lifecycle policy otherwise allows them.
+
+Model placement and tier telemetry remain stale while requests are active.
+After activity reaches zero, every selected engine must advance its
+`gpus_seq` before those channels become fresh again. Every expected endpoint
+must also provide complete scheduler, tier, and selected-device rows;
+otherwise aggregate values are withheld or retained as stale rather than
+silently undercounted. If more than one engine's profile sequence advances in
+the same poll, the displayed completed request is marked stale/ambiguous
+because endpoint-local sequence numbers do not establish a cross-engine
+completion order.
+
+The v1 selector and live sampler target NVIDIA physical devices. AMD and
+MIG-instance-specific selection or attribution are not supported. The TUI does
+not sample temperature or power, draw historical charts, or persist card
+telemetry. It shows the latest sample and latest completed request; the
+server's in-memory `/profile` window remains available separately.
 
 ### Benchmark
 
@@ -337,17 +440,19 @@ KV/usage state and benchmark history.
 
 ## Curses compatibility interface
 
-The curses frontend exposes the same lifecycle and safety rules through five
-pages: Plan, Hardware, Activity, Benchmark, and Settings. Press `?` for its
-built-in help.
+The curses frontend exposes the same lifecycle and safety rules through six
+pages: Plan, Hardware, GPUs, Activity, Benchmarks, and Settings. Press `?` for
+its built-in help.
 
 | Key | Action |
 |---|---|
 | `Left` / `Right` or `h` / `l` | Change page. |
 | `Up` / `Down` or `j` / `k` | Scroll; Page Up and Page Down move a viewport. |
+| `Space` | On the editable GPUs page, toggle the highlighted eligible card. |
+| `g` / `a` / `u` / `c` | On the editable GPUs page, cycle layout, select all eligible cards, reset GPU-local placement, or choose CPU-only serving. |
 | `p` | Review and prepare from the Plan page; press again within ten seconds to confirm. |
 | `s` / `x` / `d` | Start, stop, or review/destroy. Destroy also requires a second press within ten seconds. |
-| `b` | Benchmark from the Benchmark page. |
+| `b` | Benchmark from the Benchmarks page. |
 | `R` | Deep refresh. |
 | `c` | Cancel a cancellable active operation. |
 | `?` | Open or close help. |
@@ -391,8 +496,23 @@ workspace.
 **Settings are locked.**
 
 Prepared weight settings are immutable. Stop any running engines, then Destroy
-the workspace before changing placement or staging settings. The base port can
-be edited while ready or stopped.
+the workspace before changing GPUs, model layout, placement, or staging
+settings. The base port can be edited while ready or stopped.
+
+**Serving is degraded or a metric is stale.**
+
+Inspect every endpoint row in Operate or Activity. A serving endpoint needs a
+verified managed process and a successful `/health` response. Confirm that the
+TUI inherited the configured `COLI_API_KEY`. GPU card and process telemetry
+also require a working `nvidia-smi`. Correct the cause and wait for the next
+two-second sample; lifecycle cleanup remains state-driven.
+
+**A legacy GPU plan cannot be started safely.**
+
+Stop and Destroy the prepared workspace, then Prepare it again. Current plans
+persist the UUID and logical CUDA ordinal for every selected card; older plans
+without that mapping are deliberately not launched or used for model
+attribution.
 
 **Benchmark is disabled.**
 

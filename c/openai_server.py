@@ -1267,11 +1267,15 @@ class Engine:
         self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
+        self.gpus = []
+        self.gpus_seq = 0
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        self._pending_profile = None
+        self._pending_done_profile = None
         self._wait_until_ready(self.process, ready_timeout)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -1289,6 +1293,16 @@ class Engine:
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
         }
+
+    def _publish_profile(self, profile, stats):
+        profile.update({
+            "tokens_per_second": stats["tokens_per_second"],
+            "cache_hit_percent": stats["cache_hit_percent"],
+            "rss_gb": stats["rss_gb"],
+            "length_limited": stats["length_limited"],
+        })
+        self.profile.append(profile)
+        self.profile_seq += 1
 
     def _fail_pending(self, error):
         with self.pending_lock:
@@ -1342,6 +1356,17 @@ class Engine:
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    profile = self._pending_profile
+                    self._pending_profile = None
+                    if profile is not None:
+                        self._pending_done_profile = None
+                        self._publish_profile(profile, stats)
+                    else:
+                        # Inkling emits DONE immediately before PROF, while
+                        # the mux engine emits PROF immediately before DONE.
+                        # Retain one adjacent DONE snapshot so both producers
+                        # publish the same /profile schema.
+                        self._pending_done_profile = dict(stats)
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -1359,7 +1384,8 @@ class Engine:
                     self.hits = fields[3]
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
-                    # per-turn phase timings: where the engine spent this turn's wall time
+                    # PROF has no request id. The mux engine emits it immediately
+                    # before DONE and Inkling emits it immediately after DONE.
                     profile = {
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
@@ -1390,21 +1416,107 @@ class Engine:
                             "ttft_ms": float(fields[15]),
                             "prefault_seconds": float(fields[16]),
                         })
-                    self.profile.append(profile)
-                    self.profile_seq += 1
+                    stats = self._pending_done_profile
+                    self._pending_done_profile = None
+                    if stats is not None:
+                        self._pending_profile = None
+                        self._publish_profile(profile, stats)
+                    else:
+                        self._pending_profile = profile
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5])}
+                elif kind == "GPUS" and len(fields) >= 2:
+                    # Legacy advisory telemetry: triples are card-wide used/total
+                    # decimal GB and Colibri resident expert count.  Preserve it
+                    # for older engines while GPUDETAIL supplies byte-exact data.
+                    count = int(fields[1])
+                    if count < 0 or len(fields) != 2 + count * 3:
+                        raise RuntimeError(f"invalid engine GPUS: {' '.join(fields)}")
+                    devices = []
+                    for index in range(count):
+                        offset = 2 + index * 3
+                        used_gb = float(fields[offset])
+                        total_gb = float(fields[offset + 1])
+                        expert_count = int(fields[offset + 2])
+                        if (not math.isfinite(used_gb) or not math.isfinite(total_gb) or
+                                used_gb < 0 or total_gb < 0 or expert_count < 0):
+                            raise RuntimeError(f"invalid engine GPUS: {' '.join(fields)}")
+                        devices.append({
+                            "device": index,
+                            "identity": None,
+                            "used_gb": used_gb,
+                            "total_gb": total_gb,
+                            "expert_count": expert_count,
+                        })
+                    self.gpus = devices
+                    self.gpus_seq += 1
+                elif kind == "GPUDETAIL" and len(fields) >= 3:
+                    version = int(fields[1])
+                    count = int(fields[2])
+                    if count < 0:
+                        raise RuntimeError(f"invalid engine GPUDETAIL: {' '.join(fields)}")
+                    if version != 1:
+                        # A newer advisory schema is not protocol corruption.  Its
+                        # versioned body is deliberately opaque to this server.
+                        continue
+                    if len(fields) != 3 + count * 8:
+                        raise RuntimeError(f"invalid engine GPUDETAIL: {' '.join(fields)}")
+                    devices = []
+                    seen_devices = set()
+                    for index in range(count):
+                        offset = 3 + index * 8
+                        values = [int(value) for value in fields[offset + 2:offset + 8]]
+                        if any(value < 0 for value in values):
+                            raise RuntimeError(
+                                f"invalid engine GPUDETAIL: {' '.join(fields)}"
+                            )
+                        total_bytes, free_bytes, model_bytes, expert_bytes, \
+                            nonexpert_bytes, expert_count = values
+                        device = int(fields[offset])
+                        if (
+                            device < 0
+                            or device in seen_devices
+                            or free_bytes > total_bytes
+                            or model_bytes > total_bytes
+                            or expert_bytes + nonexpert_bytes != model_bytes
+                        ):
+                            raise RuntimeError(
+                                f"invalid engine GPUDETAIL: {' '.join(fields)}"
+                            )
+                        seen_devices.add(device)
+                        devices.append({
+                            "device": device,
+                            "identity": None if fields[offset + 1] == "-" else fields[offset + 1],
+                            "total_bytes": total_bytes,
+                            "free_bytes": free_bytes,
+                            "used_bytes": max(0, total_bytes - free_bytes),
+                            "model_bytes": model_bytes,
+                            "expert_bytes": expert_bytes,
+                            "nonexpert_bytes": nonexpert_bytes,
+                            "expert_count": expert_count,
+                        })
+                    self.gpus = devices
+                    self.gpus_seq += 1
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    self._pending_profile = None
+                    self._pending_done_profile = None
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
                         events.put(("error", _engine_error(fields[2:], message)))
-                else:
+                elif kind in {
+                    "DATA", "ACCEPT", "DONE", "HWINFO", "EMAP", "HITS",
+                    "PROF", "TIERS", "GPUS", "GPUDETAIL", "ERROR",
+                }:
+                    # Unknown advisory kinds are intentionally ignored, but a
+                    # malformed frame of a kind this server understands is fatal.
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
+                else:
+                    continue
         except Exception as error:
             if not self.closed:
                 self.dispatcher_error = error
@@ -1511,6 +1623,31 @@ class Engine:
 
 def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
+
+
+def _engine_health_error(engine):
+    """Return a stable public reason when the serving engine is unavailable."""
+    if engine is None:
+        return "engine-unavailable"
+    if getattr(engine, "dispatcher_error", None) is not None:
+        return "dispatcher-error"
+    if getattr(engine, "closed", False):
+        return "engine-closed"
+    sentinel = object()
+    process = getattr(engine, "process", sentinel)
+    if process is sentinel:
+        # Lightweight in-process engines used by embedders/tests do not have a
+        # subprocess. Their generate() implementation is the serving engine.
+        return None
+    if process is None or not callable(getattr(process, "poll", None)):
+        return "process-status-unavailable"
+    try:
+        returncode = process.poll()
+    except (OSError, subprocess.SubprocessError):
+        return "process-status-unavailable"
+    if returncode is not None:
+        return "process-exited"
+    return None
 
 
 class APIServer(ThreadingHTTPServer):
@@ -1731,6 +1868,15 @@ class APIHandler(BaseHTTPRequestHandler):
             self._check_host()
             path = urlsplit(self.path).path
             if path == "/health":
+                engine = self.server.engine
+                engine_error = _engine_health_error(engine)
+                if engine_error is not None:
+                    self.send_json(
+                        503,
+                        {"status": "error", "reason": engine_error},
+                        request_id,
+                    )
+                    return
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
@@ -1738,10 +1884,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
-                    tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                    tiers = getattr(engine, "tiers", None) if engine else None
                     if tiers: payload["tiers"] = tiers
-                    hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                    hwinfo = getattr(engine, "hwinfo", None) if engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    payload["gpus"] = list(getattr(engine, "gpus", ()) or ()) if engine else []
+                    payload["gpus_seq"] = getattr(engine, "gpus_seq", 0) if engine else 0
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":

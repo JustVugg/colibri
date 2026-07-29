@@ -121,7 +121,14 @@ class CursesUiModuleTest(unittest.TestCase):
     def test_scroll_and_wrap_contracts_are_owned_by_the_module(self):
         self.assertEqual(
             curses_ui._TUI_SCREENS,
-            ("Plan", "Hardware", "Activity", "Benchmarks", "Settings"),
+            (
+                "Plan",
+                "Hardware",
+                "GPUs",
+                "Activity",
+                "Benchmarks",
+                "Settings",
+            ),
         )
         self.assertEqual(
             curses_ui._tui_review_scroll("prepare", 30),
@@ -141,6 +148,326 @@ class CursesUiModuleTest(unittest.TestCase):
                 ("dim", "  need wrapping"),
             ],
         )
+
+    def test_gpu_page_distinguishes_card_process_and_model_metrics(self):
+        hardware = hardware_fixture(nodes=2)
+        hardware["gpus"] = [
+            {
+                "index": 2,
+                "uuid": "GPU-aaaa",
+                "name": "RTX 5090",
+                "pci_bus_id": "0000:41:00.0",
+                "numa_node": 0,
+                "locality": "resolved",
+                "free_bytes": 28 * ramdisk.GIB,
+                "total_bytes": 32 * ramdisk.GIB,
+            }
+        ]
+        accelerator = {
+            "mode": "cuda",
+            "layout": "experts-only",
+            "devices": [dict(hardware["gpus"][0])],
+        }
+        args = argparse.Namespace(
+            managed_accelerator=accelerator,
+            gpu_layout="experts-only",
+        )
+        runtime = {
+            "gpus": [
+                {
+                    "index": 2,
+                    "utilization_percent": 73,
+                    "memory_used_bytes": 24 * ramdisk.GIB,
+                    "memory_free_bytes": 8 * ramdisk.GIB,
+                    "memory_total_bytes": 32 * ramdisk.GIB,
+                    "process_vram_bytes": 20 * ramdisk.GIB,
+                    "model_resident_bytes": 18 * ramdisk.GIB,
+                    "expert_bytes": 16 * ramdisk.GIB,
+                    "expert_count": 48,
+                    "non_expert_bytes": 2 * ramdisk.GIB,
+                    "card_stale": False,
+                    "model_stale": False,
+                    "process_stale": False,
+                }
+            ]
+        }
+
+        rows = curses_ui._tui_gpu_rows(
+            hardware,
+            args,
+            {"managed_accelerator": accelerator},
+            {"present": False},
+            runtime,
+        )
+        rendered = "\n".join(text for _style, text in rows)
+
+        self.assertIn("ACCELERATORS · SELECT CARDS", rendered)
+        self.assertIn("[×] GPU 2", rendered)
+        self.assertIn("card 73%", rendered)
+        self.assertIn("Colibri 20.0 GiB", rendered)
+        self.assertIn("model 18.0 GiB", rendered)
+        self.assertIn("experts 48 / 16.0 GiB", rendered)
+
+        locked = curses_ui._tui_gpu_rows(
+            hardware,
+            args,
+            {"managed_accelerator": accelerator},
+            {"present": True},
+            runtime,
+        )
+        self.assertIn(
+            "LOCKED BY ACTIVE DEPLOYMENT",
+            "\n".join(text for _style, text in locked),
+        )
+
+    def test_gpu_page_does_not_merge_replacement_card_by_reused_index(self):
+        hardware = hardware_fixture(nodes=1)
+        replacement = {
+            "index": 2,
+            "uuid": "GPU-new",
+            "name": "Replacement",
+            "pci_bus_id": "0000:42:00.0",
+            "numa_node": 0,
+            "locality": "resolved",
+            "free_bytes": 30 * ramdisk.GIB,
+            "total_bytes": 32 * ramdisk.GIB,
+        }
+        selected = {
+            "index": 2,
+            "uuid": "GPU-old",
+            "name": "Reviewed",
+            "pci_bus_id": "0000:41:00.0",
+            "numa_node": 0,
+            "locality": "resolved",
+        }
+        hardware["gpus"] = [replacement]
+        accelerator = {
+            "mode": "cuda",
+            "layout": "experts-only",
+            "devices": [selected],
+        }
+        runtime = {
+            "gpus": [
+                {
+                    **replacement,
+                    "model_resident_bytes": ramdisk.GIB,
+                },
+                {
+                    **selected,
+                    "model_resident_bytes": 18 * ramdisk.GIB,
+                    "card_stale": True,
+                    "observed_at": 1000.0,
+                },
+            ]
+        }
+
+        rows = curses_ui._tui_gpu_rows(
+            hardware,
+            argparse.Namespace(
+                managed_accelerator=accelerator,
+                gpu_layout="experts-only",
+            ),
+            {"managed_accelerator": accelerator},
+            {"present": True},
+            runtime,
+        )
+        headings = [
+            index
+            for index, (_style, text) in enumerate(rows)
+            if " GPU 2 · " in text
+        ]
+
+        self.assertEqual(len(headings), 2)
+        first = "\n".join(text for _style, text in rows[headings[0]:headings[1]])
+        second = "\n".join(text for _style, text in rows[headings[1]:])
+        self.assertIn("GPU-new", first)
+        self.assertIn("model 1.0 GiB", first)
+        self.assertIn("GPU-old", second)
+        self.assertIn("model 18.0 GiB", second)
+
+    def test_unavailable_selected_card_still_shows_bound_runtime_metrics(self):
+        hardware = hardware_fixture(nodes=1)
+        selected = {
+            "index": 2,
+            "uuid": "GPU-old",
+            "name": "Reviewed",
+            "pci_bus_id": "0000:41:00.0",
+            "numa_node": 0,
+            "locality": "unavailable",
+        }
+        hardware["gpus"] = []
+        accelerator = {
+            "mode": "cuda",
+            "layout": "experts-only",
+            "devices": [selected],
+        }
+
+        rows = curses_ui._tui_gpu_rows(
+            hardware,
+            argparse.Namespace(
+                managed_accelerator=accelerator,
+                gpu_layout="experts-only",
+            ),
+            {"managed_accelerator": accelerator},
+            {"present": True},
+            {
+                "gpus": [
+                    {
+                        **selected,
+                        "utilization_percent": 65,
+                        "model_resident_bytes": 12 * ramdisk.GIB,
+                    }
+                ]
+            },
+        )
+        rendered = "\n".join(text for _style, text in rows)
+
+        self.assertIn("unavailable", rendered)
+        self.assertIn("card 65%", rendered)
+        self.assertIn("model 12.0 GiB", rendered)
+
+    def test_runtime_sampler_failure_marks_retained_snapshot_degraded(self):
+        prior = {
+            "service": {
+                "state": "serving",
+                "label": "SERVING",
+                "active": 1,
+                "queued": 0,
+                "endpoints": [{"url": "http://127.0.0.1:8000"}],
+                "observed_at": 1000.0,
+            },
+            "gpus": [
+                {
+                    "index": 2,
+                    "card_stale": False,
+                    "model_stale": False,
+                    "process_stale": False,
+                }
+            ],
+            "tiers_stale": False,
+            "profile_stale": False,
+            "process_stale": False,
+            "freshness": {
+                channel: {
+                    "stale": False,
+                    "observed_at": 1000.0,
+                    "error": None,
+                }
+                for channel in (
+                    "service",
+                    "cards",
+                    "model",
+                    "tiers",
+                    "profile",
+                    "process",
+                )
+            },
+        }
+
+        failed = curses_ui._runtime_failure_snapshot(
+            prior,
+            RuntimeError("boom"),
+            observed_at=1002.0,
+        )
+
+        self.assertEqual(failed["service"]["state"], "degraded")
+        self.assertTrue(failed["service"]["stale"])
+        self.assertEqual(failed["service"]["observed_at"], 1000.0)
+        self.assertIn("boom", failed["service"]["error"])
+        self.assertTrue(
+            all(
+                failed["freshness"][channel]["stale"]
+                for channel in failed["freshness"]
+            )
+        )
+        self.assertTrue(failed["gpus"][0]["card_stale"])
+        self.assertTrue(failed["gpus"][0]["model_stale"])
+        self.assertTrue(failed["gpus"][0]["process_stale"])
+        self.assertTrue(failed["tiers_stale"])
+        self.assertTrue(failed["profile_stale"])
+        self.assertTrue(failed["process_stale"])
+        self.assertEqual(failed["sampler_error_at"], 1002.0)
+        self.assertEqual(prior["service"]["state"], "serving")
+
+    def test_gpu_draft_edits_use_shared_selector_and_mark_custom(self):
+        args = argparse.Namespace(
+            gpu_placement="custom",
+            managed_accelerator={"capability": "available"},
+        )
+        apply_selection = mock.Mock()
+        marker = mock.Mock()
+        bindings = SimpleNamespace(
+            apply_gpu_selection=apply_selection,
+            mark_preset_custom=marker,
+        )
+
+        selector = curses_ui._apply_tui_gpu_selection(
+            bindings,
+            args,
+            {"gpus": []},
+            {3, 1},
+            "dense-attention",
+            reset_placement=False,
+        )
+
+        self.assertEqual(selector, "1,3")
+        apply_selection.assert_called_once_with(
+            args,
+            {"gpus": []},
+            selector="1,3",
+            layout="dense-attention",
+            cuda_capable=True,
+            reset_placement=False,
+        )
+        marker.assert_called_once_with(args)
+        self.assertEqual(args.gpu_placement, "custom")
+
+    def test_activity_runtime_rows_show_serving_and_latest_request(self):
+        rows = curses_ui._tui_runtime_rows(
+            {
+                "service": {
+                    "state": "serving",
+                    "label": "SERVING",
+                    "active": 1,
+                    "queued": 2,
+                    "stale": False,
+                    "endpoints": [
+                        {
+                            "url": "http://127.0.0.1:8000",
+                            "process_verified": True,
+                            "health_ok": True,
+                        }
+                    ],
+                },
+                "process_rss_bytes": 5 * ramdisk.GIB,
+                "tiers": {
+                    "vram": 48,
+                    "ram": 12,
+                    "disk": 4,
+                    "vram_gb": 24.0,
+                    "ram_gb": 6.0,
+                },
+                "tiers_stale": False,
+                "latest_profile": {
+                    "tokens_per_second": 18.5,
+                    "ttft_ms": 52.0,
+                    "wall_s": 2.0,
+                    "expert_disk_s": 0.2,
+                    "expert_wait_s": 0.1,
+                    "expert_matmul_s": 0.5,
+                    "attention_s": 0.3,
+                    "lm_head_s": 0.1,
+                },
+                "profile_stale": False,
+            }
+        )
+        rendered = "\n".join(text for _style, text in rows)
+
+        self.assertIn("COLIBRI SERVING · SERVING", rendered)
+        self.assertIn("active 1 · queued 2", rendered)
+        self.assertIn("VRAM 48", rendered)
+        self.assertIn("18.50 tok/s", rendered)
+        self.assertIn("TTFT 52.0 ms", rendered)
 
     def test_tui_publishes_and_clears_workers_on_the_injected_binding(self):
         fake_curses = _FakeCurses()

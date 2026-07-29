@@ -39,6 +39,37 @@ class CliModuleTest(unittest.TestCase):
         self.assertEqual(after.memory_nodes, "0,2")
         self.assertEqual(after.cpu_list, "0-7,16-23")
 
+    def test_gpu_selection_and_layout_work_before_and_after_action(self):
+        parser = argparse.ArgumentParser(prog="coli ramdisk")
+        cli.configure_parser(parser)
+
+        before = parser.parse_args(
+            [
+                "--gpu",
+                "0,2",
+                "--gpu-layout",
+                "dense-attention",
+                "plan",
+            ]
+        )
+        after = parser.parse_args(
+            [
+                "plan",
+                "--gpu",
+                "1",
+                "--gpu-layout",
+                "dense-attention-sharded",
+            ]
+        )
+
+        self.assertEqual(before.gpu, "0,2")
+        self.assertEqual(before.gpu_layout, "dense-attention")
+        self.assertEqual(after.gpu, "1")
+        self.assertEqual(
+            after.gpu_layout,
+            "dense-attention-sharded",
+        )
+
     def test_dispatch_injects_cancellation_and_rendering_dependencies(self):
         args = argparse.Namespace(
             ramdisk_action="benchmark",

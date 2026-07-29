@@ -622,7 +622,152 @@ class DispatcherTest(unittest.TestCase):
             "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
             "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+            "tokens_per_second": 4.8, "cache_hit_percent": 0.0,
+            "rss_gb": 1.0, "length_limited": False,
         }])
+
+    def test_records_inkling_done_then_prof_profile_order(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"DONE " + request_id
+                + b" STAT 12 4.8 25 1.0 7 0\n"
+            )
+            process.stdout.feed(
+                b"PROF 2.500 7 12 0.400 0.100 0.900 "
+                b"0.600 0.200 15\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        for _ in range(100):
+            if engine.profile_seq:
+                break
+            threading.Event().wait(0.01)
+        engine.close()
+
+        self.assertEqual(engine.profile_seq, 1)
+        profile = list(engine.profile)[0]
+        self.assertEqual(profile["prompt_tokens"], 7)
+        self.assertEqual(profile["completion_tokens"], 12)
+        self.assertEqual(profile["tokens_per_second"], 4.8)
+        self.assertEqual(profile["cache_hit_percent"], 25.0)
+
+    def test_records_legacy_and_detailed_gpu_telemetry(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"GPUS 2 0.600 1.000 3 1.300 2.000 6\n"
+                b"GPUDETAIL 1 2 "
+                b"2 - 1000 400 500 300 200 3 "
+                b"5 GPU-abc 2000 700 900 600 300 6\n"
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+        self.assertEqual(engine.gpus_seq, 2)
+        self.assertEqual(engine.gpus, [
+            {
+                "device": 2, "identity": None,
+                "total_bytes": 1000, "free_bytes": 400, "used_bytes": 600,
+                "model_bytes": 500, "expert_bytes": 300, "nonexpert_bytes": 200,
+                "expert_count": 3,
+            },
+            {
+                "device": 5, "identity": "GPU-abc",
+                "total_bytes": 2000, "free_bytes": 700, "used_bytes": 1300,
+                "model_bytes": 900, "expert_bytes": 600, "nonexpert_bytes": 300,
+                "expert_count": 6,
+            },
+        ])
+
+    def test_legacy_gpu_telemetry_remains_available_without_detail_frame(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"GPUS 1 1.250 24.000 7\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.gpus_seq, 1)
+        self.assertEqual(engine.gpus, [{
+            "device": 0, "identity": None, "used_gb": 1.25,
+            "total_gb": 24.0, "expert_count": 7,
+        }])
+
+    def test_empty_gpu_detail_reports_cpu_only_engine(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"GPUS 0\nGPUDETAIL 1 0\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.gpus, [])
+        self.assertEqual(engine.gpus_seq, 2)
+
+    def test_ignores_unknown_advisory_telemetry(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"FUTURE_TELEMETRY any shape is advisory\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(stats["tokens_per_second"], 2.5)
+
+    def test_malformed_known_gpu_telemetry_stops_dispatcher(self):
+        def respond(process, _frame):
+            process.stdout.feed(b"GPUDETAIL 1 1 0 - 100\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "GPUDETAIL"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+    def test_gpu_detail_rejects_duplicate_and_impossible_device_rows(self):
+        frames = {
+            "duplicate ordinal": (
+                b"GPUDETAIL 1 2 "
+                b"0 - 1000 400 500 300 200 3 "
+                b"0 - 2000 700 900 600 300 6\n"
+            ),
+            "free exceeds total": (
+                b"GPUDETAIL 1 1 0 - 1000 1001 500 300 200 3\n"
+            ),
+            "model exceeds total": (
+                b"GPUDETAIL 1 1 0 - 1000 400 1001 600 401 6\n"
+            ),
+        }
+        for label, telemetry in frames.items():
+            with self.subTest(label=label):
+                def respond(process, _frame, telemetry=telemetry):
+                    process.stdout.feed(telemetry)
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "GPUDETAIL"):
+                    engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+                engine.close()
 
     def test_records_extended_persistent_benchmark_telemetry(self):
         def respond(process, frame):
@@ -831,6 +976,53 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+        self.assertEqual(health["gpus"], [])
+        self.assertEqual(health["gpus_seq"], 0)
+
+    def test_health_exposes_gpu_details_only_to_authenticated_callers(self):
+        gpu = {
+            "device": 2, "identity": "GPU-abc",
+            "total_bytes": 1000, "free_bytes": 400, "used_bytes": 600,
+            "model_bytes": 500, "expert_bytes": 300, "nonexpert_bytes": 200,
+            "expert_count": 3,
+        }
+        self.engine.gpus = [gpu]
+        self.engine.gpus_seq = 7
+        try:
+            with self.request("/health") as response:
+                health = json.load(response)
+            self.assertEqual(health["gpus"], [gpu])
+            self.assertEqual(health["gpus_seq"], 7)
+
+            with urlopen(self.base + "/health", timeout=2) as response:
+                public = json.load(response)
+            self.assertEqual(public, {"status": "ok"})
+        finally:
+            del self.engine.gpus, self.engine.gpus_seq
+
+    def test_health_is_unavailable_after_dispatcher_or_child_failure(self):
+        failures = (
+            ("dispatcher-error", RuntimeError("engine reader failed"), None),
+            ("process-exited", None, 17),
+        )
+        for reason, dispatcher_error, returncode in failures:
+            with self.subTest(reason=reason):
+                self.engine.dispatcher_error = dispatcher_error
+                self.engine.process = type(
+                    "ProcessState",
+                    (),
+                    {"poll": lambda _self, value=returncode: value},
+                )()
+                try:
+                    with self.assertRaises(HTTPError) as caught:
+                        urlopen(self.base + "/health", timeout=2)
+                    self.assertEqual(caught.exception.code, 503)
+                    self.assertEqual(
+                        json.load(caught.exception),
+                        {"status": "error", "reason": reason},
+                    )
+                finally:
+                    del self.engine.dispatcher_error, self.engine.process
 
     def test_profile_reports_recent_turns_without_auth(self):
         with urlopen(self.base + "/profile", timeout=2) as response:
@@ -1012,6 +1204,12 @@ class StaticServingTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
         self.assertEqual(caught.exception.code, 404)
+
+    def test_health_without_configured_key_exposes_gpu_telemetry_shape(self):
+        with urlopen(self.base + "/health", timeout=2) as response:
+            health = json.load(response)
+        self.assertEqual(health["gpus"], [])
+        self.assertEqual(health["gpus_seq"], 0)
 
 
 class SchedulerHTTPTest(unittest.TestCase):

@@ -167,6 +167,7 @@ class ManagedLaunchTest(unittest.TestCase):
                 {
                     "index": 2,
                     "name": "GPU 2",
+                    "uuid": "GPU-test-2",
                     "pci_bus_id": "0000:41:00.0",
                     "numa_node": 0,
                     "locality": "resolved",
@@ -239,6 +240,7 @@ class ManagedLaunchTest(unittest.TestCase):
                 launched = ramdisk.start.__wrapped__(
                     argparse.Namespace(base_port=None),
                     cli_path=sys.executable,
+                    engine_path=sys.executable,
                 )
         self.addCleanup(ramdisk._forget_managed_child, 4200)
 
@@ -246,16 +248,25 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(len(captures), 1)
         environment = captures[0]
         self.assertEqual(environment["COLI_CUDA"], "1")
-        self.assertEqual(environment["COLI_GPU"], "2")
+        self.assertEqual(environment["COLI_GPU"], "0")
         self.assertNotIn("COLI_GPUS", environment)
+        self.assertEqual(
+            environment["CUDA_VISIBLE_DEVICES"],
+            "GPU-test-2",
+        )
         self.assertEqual(environment["CUDA_EXPERT_GB"], "auto")
+        self.assertEqual(environment["REPIN"], "16")
         self.assertEqual(environment["COLI_MMAP"], "1")
         self.assertEqual(environment["COLI_RAMMAP"], "0")
         self.assertEqual(environment["COLI_RAM_PREFAULT"], "0")
         self.assertEqual(environment["PIN"], "auto")
         self.assertEqual(
+            environment["COLI_ENGINE"],
+            os.path.realpath(sys.executable),
+        )
+        self.assertEqual(
             launched["processes"][0]["accelerator_environment"]["COLI_GPU"],
-            "2",
+            "0",
         )
 
     def test_clean_start_cancellation_restores_retryable_manifest(self):

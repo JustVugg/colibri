@@ -102,6 +102,47 @@ def _placement_summary(plan, base_port=8000):
     }
 
 
+def _accelerator_review(plan):
+    accelerator = plan.get("managed_accelerator") or {}
+    if accelerator.get("mode") != "cuda":
+        return None
+    devices = accelerator.get("devices") or []
+    projection = plan.get("accelerator_projection") or {}
+    dense_gpu_bytes = projection.get("dense_gpu_bytes")
+    expert_headroom_bytes = projection.get("expert_headroom_bytes")
+    reserve_per_device = projection.get(
+        "vram_reserve_per_device_bytes"
+    )
+    has_projection = all(
+        isinstance(value, int)
+        for value in (
+            dense_gpu_bytes,
+            expert_headroom_bytes,
+            reserve_per_device,
+        )
+    )
+    return {
+        "devices": devices,
+        "indices": ",".join(str(device["index"]) for device in devices),
+        "layout": str(accelerator.get("layout") or "experts-only"),
+        "dense_gpu_gib": (
+            float(dense_gpu_bytes) / GIB
+            if has_projection
+            else None
+        ),
+        "expert_headroom_gib": (
+            float(expert_headroom_bytes) / GIB
+            if has_projection
+            else None
+        ),
+        "reserve_per_device_gib": (
+            float(reserve_per_device) / GIB
+            if has_projection
+            else None
+        ),
+    }
+
+
 def _human_plan(plan):
     placement = _placement_summary(plan)
     print("RAM-disk plan: %s" % placement["title"])
@@ -141,30 +182,42 @@ def _human_plan(plan):
             plan["staging"]["direct_mapped_expert_count"],
         )
     )
-    accelerator = plan.get("managed_accelerator") or {}
-    if accelerator.get("mode") == "cuda":
+    accelerator = _accelerator_review(plan)
+    if accelerator is not None:
         print(
-            "  accelerator: CUDA GPU(s) %s; GPU-local NUMA %s; "
-            "mmap upload; VRAM budget auto"
+            "  accelerator: CUDA selected GPU indices %s; devices %s; "
+            "layout %s; GPU-local NUMA %s; mmap upload; VRAM budget auto"
             % (
+                accelerator["indices"],
                 ", ".join(
                     "%s (%s)"
                     % (
                         device["index"],
                         device.get("name") or "unnamed",
                     )
-                    for device in accelerator.get("devices", [])
+                    for device in accelerator["devices"]
                 ),
+                accelerator["layout"],
                 _format_range_list(
                     sorted(
                         {
                             int(device["numa_node"])
-                            for device in accelerator.get("devices", [])
+                            for device in accelerator["devices"]
                         }
                     )
                 ),
             )
         )
+        if accelerator["dense_gpu_gib"] is not None:
+            print(
+                "  GPU projection: dense %.2f GiB; expert headroom %.2f GiB; "
+                "reserve %.2f GiB/card"
+                % (
+                    accelerator["dense_gpu_gib"],
+                    accelerator["expert_headroom_gib"],
+                    accelerator["reserve_per_device_gib"],
+                )
+            )
     print(
         "  total staged + OS/runtime projection: %.2f GiB; "
         "available: %.2f GiB"
@@ -436,10 +489,30 @@ def _prepare_confirmation(plan, base_port=8000):
     )
     if contract.is_shared:
         nodes = len(contract.numa_nodes)
+        accelerator = _accelerator_review(plan)
+        accelerator_text = ""
+        if accelerator is not None:
+            accelerator_text = (
+                "GPU(s) %s use layout %s. "
+                % (
+                    accelerator["indices"],
+                    accelerator["layout"],
+                )
+            )
+            if accelerator["dense_gpu_gib"] is not None:
+                accelerator_text += (
+                    "Projected dense VRAM %.2f GiB and expert headroom "
+                    "%.2f GiB after %.2f GiB/card reserve. "
+                    % (
+                        accelerator["dense_gpu_gib"],
+                        accelerator["expert_headroom_gib"],
+                        accelerator["reserve_per_device_gib"],
+                    )
+                )
         return (
             "CONFIRM SHARED PLAN: stage %d %s copy (%.2f GiB) at %s, "
             "spread across %d NUMA %s. Memory nodes %s; engine CPUs %s. "
-            "Start will launch 1 engine on %s. tmpfs size is a cap, THP "
+            "%sStart will launch 1 engine on %s. tmpfs size is a cap, THP "
             "is requested rather than guaranteed, and copy workers do not "
             "create replicas. Press p again within 10s."
             % (
@@ -454,6 +527,7 @@ def _prepare_confirmation(plan, base_port=8000):
                     "all",
                 ),
                 plan.get("placement", {}).get("cpu_list", "all"),
+                accelerator_text,
                 placement["endpoints"],
             )
         )
@@ -497,6 +571,7 @@ def _prepare_confirmation_rows(plan, base_port=8000):
             copies,
             "copy" if copies == 1 else "copies",
         )
+    accelerator = None
     if contract.is_replication:
         placement_text = "DANGER · replication, not sharding"
         engines_text = "%d independent engines" % engines
@@ -510,7 +585,11 @@ def _prepare_confirmation_rows(plan, base_port=8000):
             engines,
             placement["endpoints"],
         )
-    return [
+        accelerator = _accelerator_review(plan)
+        if accelerator is not None:
+            engines_text += " · GPU(s) %s" % accelerator["indices"]
+            placement_text += " · layout %s" % accelerator["layout"]
+    rows = [
         ("warn", "REVIEW · %s" % copies_text),
         ("warn", "START · %s" % engines_text),
         (
@@ -518,6 +597,24 @@ def _prepare_confirmation_rows(plan, base_port=8000):
             placement_text,
         ),
     ]
+    if (
+        not contract.is_replication
+        and accelerator is not None
+        and accelerator["dense_gpu_gib"] is not None
+    ):
+        rows.append(
+            (
+                "normal",
+                "VRAM · dense %.2f GiB · expert headroom %.2f GiB · "
+                "reserve %.2f GiB/card"
+                % (
+                    accelerator["dense_gpu_gib"],
+                    accelerator["expert_headroom_gib"],
+                    accelerator["reserve_per_device_gib"],
+                ),
+            )
+        )
+    return rows
 
 
 def _tui_plan_rows(
@@ -613,9 +710,9 @@ def _tui_plan_rows(
             ),
         ]
     )
-    accelerator = plan.get("managed_accelerator") or {}
-    if accelerator.get("mode") == "cuda":
-        devices = accelerator.get("devices", [])
+    accelerator = _accelerator_review(plan)
+    if accelerator is not None:
+        devices = accelerator["devices"]
         rows.extend(
             [
                 (
@@ -646,10 +743,28 @@ def _tui_plan_rows(
                 ),
                 (
                     "normal",
-                    "COLI_MMAP upload · async CUDA copies · automatic VRAM tier",
+                    "Selected GPU indices %s · layout %s · "
+                    "COLI_MMAP upload · async CUDA copies"
+                    % (
+                        accelerator["indices"],
+                        accelerator["layout"],
+                    ),
                 ),
             ]
         )
+        if accelerator["dense_gpu_gib"] is not None:
+            rows.append(
+                (
+                    "normal",
+                    "Projected dense VRAM %.2f GiB · expert headroom "
+                    "%.2f GiB · reserve %.2f GiB/card"
+                    % (
+                        accelerator["dense_gpu_gib"],
+                        accelerator["expert_headroom_gib"],
+                        accelerator["reserve_per_device_gib"],
+                    ),
+                )
+            )
     if plan["mode"] == "partial":
         rows.append(
             (

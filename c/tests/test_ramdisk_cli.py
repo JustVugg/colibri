@@ -85,6 +85,32 @@ class RamdiskCliTest(unittest.TestCase):
         self.assertEqual(before["args"].model, "/tmp/model-before")
         self.assertEqual(after["args"].model, "/tmp/model-after")
 
+    def test_gpu_options_work_before_and_after_action(self):
+        before = self.parsed_dispatch(
+            "ramdisk",
+            "--gpu",
+            "0,2",
+            "--gpu-layout",
+            "dense-attention",
+            "plan",
+        )
+        after = self.parsed_dispatch(
+            "ramdisk",
+            "plan",
+            "--gpu",
+            "1,3",
+            "--gpu-layout",
+            "dense-attention-sharded",
+        )
+
+        self.assertEqual(before["args"].gpu, "0,2")
+        self.assertEqual(before["args"].gpu_layout, "dense-attention")
+        self.assertEqual(after["args"].gpu, "1,3")
+        self.assertEqual(
+            after["args"].gpu_layout,
+            "dense-attention-sharded",
+        )
+
     def test_planning_knobs_reach_dispatch(self):
         captured = self.parsed_dispatch(
             "ramdisk",

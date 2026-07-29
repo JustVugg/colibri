@@ -26,12 +26,14 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, Static
+from textual.widgets import Button, Footer, Input, SelectionList, Static
+from textual.widgets.selection_list import Selection
 
 from ramdisk_support.presets import (
     PRESET_CHOICES,
     PRESET_GPU_FASTEST,
 )
+from ramdisk_support.runtime_monitor import RuntimeMonitor
 from ramdisk_ui import (
     ActionPermission,
     ActionPolicy,
@@ -45,14 +47,27 @@ from ramdisk_ui import (
 
 GIB = 1 << 30
 MIB = 1 << 20
+GPU_RESERVE_BYTES = 2 * GIB
+GPU_LAYOUTS = (
+    ("experts-only", "Hot experts only", "stable"),
+    ("dense-attention", "Dense + GPU attention", "experimental"),
+    (
+        "dense-attention-sharded",
+        "Dense + sharded attention",
+        "experimental · multi-GPU",
+    ),
+)
+GPU_LAYOUT_LABELS = {key: label for key, label, _ in GPU_LAYOUTS}
 STEPS = (
     ("inspect", "Inspect"),
+    ("accelerators", "Accelerators"),
     ("placement", "Placement"),
     ("capacity", "Capacity"),
     ("runtime", "Runtime"),
     ("review", "Review"),
     ("operate", "Operate"),
 )
+STEP_TAB_LABELS = {"accelerators": "GPUs"}
 
 
 @dataclass(frozen=True)
@@ -64,6 +79,7 @@ class ConsoleSnapshot:
     hardware: Mapping[str, Any]
     manifest: Optional[Mapping[str, Any]] = None
     history: Optional[Mapping[str, Any]] = None
+    runtime: Optional[Mapping[str, Any]] = None
     base_port: int = 8000
     error: str = ""
 
@@ -93,6 +109,9 @@ def _normalize_args(initial: argparse.Namespace) -> argparse.Namespace:
         ("base_port", 8000),
         ("memory_nodes", None),
         ("cpu_list", None),
+        ("gpu", None),
+        ("gpu_layout", "experts-only"),
+        ("gpu_placement", "auto"),
     )
     for name, value in defaults:
         if not hasattr(args, name):
@@ -115,9 +134,13 @@ class LifecycleSession:
         self._plan_key: Optional[tuple[Any, ...]] = None
         self._hardware_checked = 0.0
         self._first_status = True
+        self._revision = 0
+        self._runtime_monitor = RuntimeMonitor()
+        self._monitor_lock = threading.Lock()
 
     def invalidate(self, *, deep: bool = False, model: bool = False) -> None:
         with self._lock:
+            self._revision += 1
             self._plan = None
             self._plan_key = None
             if deep:
@@ -152,76 +175,191 @@ class LifecycleSession:
             vars(self.args).update(vars(resolved_args))
             self._plan = result["plan"]
             self._plan_key = None
+            self._revision += 1
             return result
 
-    def refresh(self, *, deep: bool = False, model: bool = False) -> ConsoleSnapshot:
+    def _refresh_inputs(
+        self,
+        *,
+        deep: bool = False,
+        model: bool = False,
+    ) -> tuple[
+        Optional[Mapping[str, Any]],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Optional[Mapping[str, Any]],
+        int,
+    ]:
+        # Capture cache state quickly, then perform all potentially blocking
+        # discovery/filesystem work without holding the edit lock.
         with self._lock:
-            if model:
-                self._model = None
-            now = time.monotonic()
-            if deep or self._hardware is None or now - self._hardware_checked >= 30.0:
-                self._hardware = self.lifecycle.discover_hardware()
-                self._hardware_checked = now
-                self._plan = None
-                self._plan_key = None
+            revision = self._revision
+            args = argparse.Namespace(**vars(self.args))
+            hardware = None if deep else self._hardware
+            hardware_checked = self._hardware_checked
+            scanned_model = None if model else self._model
+            cached_plan = None if deep else self._plan
+            cached_plan_key = None if deep else self._plan_key
+            first_status = self._first_status
 
-            report = self.lifecycle.status(deep=bool(deep or self._first_status))
-            self._first_status = False
-            manifest = None
-            if report.get("present"):
-                manifest = self.lifecycle._load_manifest(required=True)
-                plan = manifest["plan"]
-                self.args.base_port = self.lifecycle._persisted_base_port(manifest)
-                processes = tuple(report.get("processes", ()))
-                if (
-                    report.get("state") in ("running", "starting")
-                    and processes
-                    and processes[0].get("port") is not None
-                ):
-                    first = processes[0]
-                    self.args.base_port = int(first["port"]) - int(
-                        first.get("node") or 0
-                    )
-            else:
-                if self._model is None:
-                    self._model = self.lifecycle.scan_model(self.args.model)
-                plan_key = (
-                    self.args.mode,
-                    self.args.topology,
-                    self.args.mount_root,
-                    self.args.capacity_gb,
-                    self.args.profile,
-                    self.args.allow_swappable,
-                    self.args.thp,
-                    self.args.prefault,
-                    self.args.parallel,
-                    self.args.ctx,
-                    self.args.memory_nodes,
-                    self.args.cpu_list,
-                    self._hardware_checked,
-                )
-                if self._plan is None or self._plan_key != plan_key:
-                    self._plan = self.lifecycle.build_plan(
-                        self.args,
-                        hardware=self._hardware,
-                        model=self._model,
-                    )
-                    self._plan_key = plan_key
-                plan = self._plan
+        now = time.monotonic()
+        hardware_changed = (
+            deep
+            or hardware is None
+            or now - hardware_checked >= 30.0
+        )
+        if hardware_changed:
+            hardware = self.lifecycle.discover_hardware()
+            hardware_checked = now
+            cached_plan = None
+            cached_plan_key = None
 
-            history = None
-            read_json = getattr(self.lifecycle, "_read_json", None)
-            benchmark_path = getattr(self.lifecycle, "_benchmarks_path", None)
-            if read_json is not None and benchmark_path is not None:
-                history = read_json(benchmark_path()) or {"results": []}
-            return ConsoleSnapshot(
-                plan=plan,
-                report=report,
-                hardware=self._hardware or {},
-                manifest=manifest,
-                history=history,
-                base_port=int(self.args.base_port),
+        report = self.lifecycle.status(deep=bool(deep or first_status))
+        manifest = None
+        next_plan = cached_plan
+        next_plan_key = cached_plan_key
+        base_port = int(args.base_port)
+        if report.get("present"):
+            manifest = self.lifecycle._load_manifest(required=True)
+            plan = manifest["plan"]
+            base_port = int(
+                self.lifecycle._persisted_base_port(manifest)
             )
+            processes = tuple(report.get("processes", ()))
+            if (
+                report.get("state") in ("running", "starting")
+                and processes
+                and processes[0].get("port") is not None
+            ):
+                first = processes[0]
+                base_port = int(first["port"]) - int(
+                    first.get("node") or 0
+                )
+        else:
+            if scanned_model is None:
+                scanned_model = self.lifecycle.scan_model(args.model)
+            plan_key = (
+                args.mode,
+                args.topology,
+                args.mount_root,
+                args.capacity_gb,
+                args.profile,
+                args.allow_swappable,
+                args.thp,
+                args.prefault,
+                args.parallel,
+                args.ctx,
+                args.memory_nodes,
+                args.cpu_list,
+                getattr(args, "gpu", "auto"),
+                getattr(args, "gpu_layout", "experts-only"),
+                getattr(args, "gpu_placement", "auto"),
+                repr(getattr(args, "managed_accelerator", None)),
+                hardware_checked,
+            )
+            if next_plan is None or next_plan_key != plan_key:
+                next_plan = self.lifecycle.build_plan(
+                    args,
+                    hardware=hardware,
+                    model=scanned_model,
+                )
+                next_plan_key = plan_key
+            plan = next_plan
+
+        history = None
+        read_json = getattr(self.lifecycle, "_read_json", None)
+        benchmark_path = getattr(self.lifecycle, "_benchmarks_path", None)
+        if read_json is not None and benchmark_path is not None:
+            history = read_json(benchmark_path()) or {"results": []}
+
+        with self._lock:
+            if revision != self._revision:
+                raise RuntimeError(
+                    "session inputs changed during refresh; retrying with "
+                    "the new configuration"
+                )
+            self._hardware = hardware
+            self._hardware_checked = hardware_checked
+            self._model = scanned_model
+            self._first_status = False
+            if not report.get("present"):
+                self._plan = next_plan
+                self._plan_key = next_plan_key
+            self.args.base_port = base_port
+        return (
+            manifest,
+            report,
+            plan,
+            hardware or {},
+            history,
+            base_port,
+        )
+
+    def refresh(self, *, deep: bool = False, model: bool = False) -> ConsoleSnapshot:
+        (
+            manifest,
+            report,
+            plan,
+            hardware,
+            history,
+            base_port,
+        ) = self._refresh_inputs(deep=deep, model=model)
+        # Endpoint and nvidia-smi probes can each wait on a bounded timeout.
+        # Keep them outside the session lock so UI edits/invalidation remain
+        # responsive while the background refresh is sampling telemetry.
+        try:
+            with self._monitor_lock:
+                runtime = self._runtime_monitor.sample(
+                    manifest=manifest,
+                    report=report,
+                    plan=plan,
+                    hardware=hardware,
+                )
+        except Exception as exc:
+            runtime = {
+                "service": {
+                    "state": (
+                        "stopped"
+                        if report.get("state") in (
+                            "absent",
+                            "ready",
+                            "stopped",
+                        )
+                        else "degraded"
+                    ),
+                    "label": "TELEMETRY UNAVAILABLE",
+                    "endpoints": [],
+                    "active": None,
+                    "queued": None,
+                    "error": str(exc),
+                    "stale": True,
+                    "observed_at": None,
+                },
+                "gpus": [],
+                "tiers": None,
+                "tiers_stale": True,
+                "latest_profile": None,
+                "profile_stale": True,
+                "process_rss_bytes": None,
+                "process_stale": True,
+                "freshness": {
+                    "service": {
+                        "stale": True,
+                        "observed_at": None,
+                        "error": str(exc),
+                    }
+                },
+            }
+        return ConsoleSnapshot(
+            plan=plan,
+            report=report,
+            hardware=hardware,
+            manifest=manifest,
+            history=history,
+            runtime=runtime,
+            base_port=base_port,
+        )
 
 
 def _format_gib(value: Any) -> str:
@@ -241,6 +379,80 @@ def _format_list(values: Any, *, empty: str = "none") -> str:
     except TypeError:
         rendered = str(values)
     return rendered or empty
+
+
+def _format_percent(value: Any) -> str:
+    try:
+        return f"{float(value):.0f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _format_observed_at(value: Any) -> str:
+    try:
+        return time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(float(value)),
+        )
+    except (OSError, OverflowError, TypeError, ValueError):
+        return "unknown time"
+
+
+def _gpu_eligible(
+    device: Mapping[str, Any],
+    hardware: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    discovery = (hardware or {}).get("gpu_discovery") or {}
+    if discovery.get("cuda_visible_devices_present"):
+        return False
+    return (
+        isinstance(device.get("index"), int)
+        and not isinstance(device.get("index"), bool)
+        and isinstance(device.get("numa_node"), int)
+        and not isinstance(device.get("numa_node"), bool)
+        and device.get("locality") in ("resolved", "single-node")
+    )
+
+
+def _gpu_unavailable_reason(
+    device: Mapping[str, Any],
+    hardware: Optional[Mapping[str, Any]] = None,
+) -> str:
+    discovery = (hardware or {}).get("gpu_discovery") or {}
+    if discovery.get("cuda_visible_devices_present"):
+        return str(
+            discovery.get("selection_error")
+            or "ambient CUDA_VISIBLE_DEVICES prevents safe GPU selection"
+        )
+    locality = device.get("locality")
+    if locality == "outside-effective-mask":
+        return "NUMA node is outside this process's effective mask"
+    if locality == "unknown":
+        return "Linux NUMA locality is unknown"
+    if not isinstance(device.get("numa_node"), int):
+        return "no usable NUMA node"
+    return str(device.get("unavailable_reason") or "not eligible")
+
+
+def _selected_gpu_indices(plan: Mapping[str, Any]) -> tuple[int, ...]:
+    accelerator = plan.get("managed_accelerator") or {}
+    if accelerator.get("mode") != "cuda":
+        return ()
+    values = []
+    for device in accelerator.get("devices") or ():
+        index = device.get("index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            values.append(index)
+    return tuple(values)
+
+
+def _runtime_value(runtime: Mapping[str, Any], *keys: str) -> Any:
+    value: Any = runtime
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
 
 
 def _line(
@@ -418,6 +630,112 @@ def render_step(snapshot: ConsoleSnapshot, step: str) -> Text:
             "\nNUMA nodes control RAM placement. CPU cores do not create model copies.",
             style="bold #d7a84e",
         )
+    elif step == "accelerators":
+        accelerator = plan.get("managed_accelerator") or {}
+        selected = set(_selected_gpu_indices(plan))
+        layout = str(accelerator.get("layout") or "experts-only")
+        text.append(
+            "Choose the NVIDIA devices used by the managed Colibri engine.\n",
+            style="#d7e4e3",
+        )
+        _section(text, "Model placement")
+        _line(
+            text,
+            "Mode",
+            GPU_LAYOUT_LABELS.get(layout, layout),
+            style=(
+                "bold #73be8b"
+                if layout == "experts-only"
+                else "bold #d7a84e"
+            ),
+        )
+        if layout == "experts-only":
+            _line(text, "Dense tensors", "CPU")
+            _line(text, "GPU allocation", "usage-ranked hot experts")
+        elif layout == "dense-attention":
+            _line(text, "Dense tensors", "GPU round-robin")
+            _line(text, "Attention", "GPU")
+        else:
+            _line(text, "Dense tensors", "GPU round-robin")
+            _line(text, "Attention", "GPU · KV-b heads sharded")
+
+        _section(text, "NVIDIA inventory")
+        devices = tuple(hardware.get("gpus") or ())
+        if not devices:
+            discovery = hardware.get("gpu_discovery") or {}
+            text.append(
+                str(discovery.get("error") or "No NVIDIA devices discovered."),
+                style="#d7a84e",
+            )
+            text.append("\nCPU serving remains available.")
+        for device in devices:
+            index = device.get("index", "?")
+            eligible = _gpu_eligible(device, hardware)
+            marker = "●" if index in selected else ("○" if eligible else "×")
+            style = (
+                "bold #63bec2"
+                if index in selected
+                else ("#d7e4e3" if eligible else "#e2675a")
+            )
+            free = _format_gib(device.get("free_bytes"))
+            total = _format_gib(device.get("total_bytes"))
+            node = device.get("numa_node")
+            _line(
+                text,
+                f"{marker} GPU {index}",
+                f"{device.get('name') or 'unnamed'} · {free} free / {total} · N{node}",
+                style=style,
+            )
+            _line(
+                text,
+                "  Identity",
+                f"{device.get('uuid') or 'UUID unavailable'} · {device.get('pci_bus_id') or 'PCI unknown'}",
+            )
+            if not eligible:
+                _line(
+                    text,
+                    "  Disabled",
+                    _gpu_unavailable_reason(device, hardware),
+                    style="#e98d85",
+                )
+
+        if selected:
+            selected_rows = [
+                device
+                for device in devices
+                if device.get("index") in selected
+            ]
+            selected_free = sum(
+                int(device.get("free_bytes") or 0) for device in selected_rows
+            )
+            reserve = len(selected_rows) * GPU_RESERVE_BYTES
+            dense_bytes = int(model.get("dense_tensor_bytes") or 0)
+            dense_projection = dense_bytes if layout != "experts-only" else 0
+            expert_headroom = max(0, selected_free - reserve - dense_projection)
+            _section(text, "Projected VRAM")
+            _line(text, "Selected free", _format_gib(selected_free))
+            _line(
+                text,
+                "Safety reserve",
+                f"{_format_gib(reserve)} · 2.00 GiB per card",
+            )
+            _line(
+                text,
+                "Projected dense",
+                _format_gib(dense_projection)
+                if dense_projection
+                else "CPU · no dense VRAM projection",
+            )
+            _line(
+                text,
+                "Auto expert headroom",
+                _format_gib(expert_headroom),
+                style="bold #73be8b",
+            )
+        text.append(
+            "\nExact per-card model residency appears in Operate after the engine loads.",
+            style="#91a7a6",
+        )
     elif step == "placement":
         text.append("Choose where memory pages and whole CPU cores may run.\n")
         _section(text, "Placement contract")
@@ -521,6 +839,46 @@ def render_step(snapshot: ConsoleSnapshot, step: str) -> Text:
         _line(text, "Memory NUMA nodes", _format_list(_selected_memory_nodes(plan)))
         _line(text, "Whole-core CPU list", _selected_cpu_list(plan))
         _line(text, "Mount paths", _format_list(contract.mount_paths))
+        accelerator = plan.get("managed_accelerator") or {}
+        if accelerator.get("mode") == "cuda":
+            _line(
+                text,
+                "Managed GPUs",
+                _format_list(_selected_gpu_indices(plan)),
+            )
+            _line(
+                text,
+                "Model placement",
+                GPU_LAYOUT_LABELS.get(
+                    str(accelerator.get("layout") or "experts-only"),
+                    accelerator.get("layout"),
+                ),
+            )
+            projection = plan.get("accelerator_projection") or {}
+            if projection:
+                _line(
+                    text,
+                    "Selected free VRAM",
+                    _format_gib(projection.get("selected_free_bytes")),
+                )
+                _line(
+                    text,
+                    "Projected dense VRAM",
+                    (
+                        _format_gib(projection.get("dense_gpu_bytes"))
+                        if projection.get("dense_gpu_bytes")
+                        else "CPU"
+                    ),
+                )
+                _line(
+                    text,
+                    "Projected expert headroom",
+                    _format_gib(projection.get("expert_headroom_bytes")),
+                )
+                text.append(
+                    "\nPer-card allocation becomes exact after Start.",
+                    style="#91a7a6",
+                )
         if contract.is_replication:
             text.append(
                 "\nREPLICA REVIEW: the full staged set is copied once per node. "
@@ -536,12 +894,96 @@ def render_step(snapshot: ConsoleSnapshot, step: str) -> Text:
             )
     else:
         state = report.get("state", "unknown")
-        text.append("Operate only the deployment Colibri can verify.\n")
+        runtime = snapshot.runtime or {}
+        service = runtime.get("service") or {}
+        fallback_service_state = {
+            "starting": "starting",
+            "running": "degraded",
+        }.get(str(state), "stopped")
+        service_state = str(
+            service.get("state") or fallback_service_state
+        )
+        service_labels = {
+            "serving": ("SERVING ✓", "bold #73be8b"),
+            "starting": ("STARTING", "bold #d7a84e"),
+            "degraded": ("DEGRADED", "bold #e2675a"),
+            "stopped": ("STOPPED", "#91a7a6"),
+        }
+        service_label, service_style = service_labels.get(
+            service_state,
+            (service_state.upper(), "#d7a84e"),
+        )
+        text.append(service_label, style=service_style)
+        text.append("  ")
+        text.append(
+            str(
+                service.get("summary")
+                or {
+                    "serving": "all managed endpoints are healthy",
+                    "starting": "managed endpoints are starting",
+                    "degraded": "a managed endpoint needs attention",
+                    "stopped": "no managed endpoint is serving",
+                }.get(service_state, "managed endpoint status")
+            ),
+            style="#d7e4e3",
+        )
+        text.append("\n")
         _section(text, "Lifecycle")
         _line(text, "State", state, style="bold")
         _line(text, "Mount records", len(report.get("mounts", ())))
         _line(text, "Managed processes", len(report.get("processes", ())))
         _line(text, "Ports", _format_list(report.get("ports", contract.ports)))
+        if runtime.get("process_rss_bytes") is not None:
+            _line(
+                text,
+                "Process-group RSS",
+                "%s%s"
+                % (
+                    _format_gib(runtime.get("process_rss_bytes")),
+                    " · STALE" if runtime.get("process_stale") else "",
+                ),
+            )
+        scheduler = service.get("scheduler") or runtime.get("scheduler") or {}
+        active = service.get("active", scheduler.get("active"))
+        queued = service.get(
+            "queued",
+            scheduler.get("queued", scheduler.get("queue_depth")),
+        )
+        if active is not None or queued is not None:
+            _line(text, "Active requests", active if active is not None else "—")
+            _line(
+                text,
+                "Queued requests",
+                queued if queued is not None else "—",
+            )
+        endpoints = tuple(service.get("endpoints") or ())
+        for endpoint in endpoints:
+            endpoint_state = endpoint.get("state")
+            if endpoint_state is None:
+                endpoint_state = (
+                    "healthy"
+                    if endpoint.get("health_ok")
+                    else (
+                        "process unverified"
+                        if not endpoint.get("process_verified", True)
+                        else "unreachable"
+                    )
+                )
+            _line(
+                text,
+                f"Endpoint {endpoint.get('port', '?')}",
+                endpoint_state,
+                style=(
+                    "#73be8b"
+                    if endpoint_state in ("healthy", "serving", "ok")
+                    else "#e2675a"
+                ),
+            )
+        if service.get("error"):
+            text.append(
+                f"\nService check: {service['error']}",
+                style="#e2675a",
+            )
         if report.get("present"):
             try:
                 health = DeploymentHealth.from_report(plan, report)
@@ -558,6 +1000,199 @@ def render_step(snapshot: ConsoleSnapshot, step: str) -> Text:
             _line(text, "Deployment health", "not prepared")
         if report.get("error"):
             text.append(f"\n{report['error']}", style="#e2675a")
+
+        tiers = runtime.get("tiers") or _runtime_value(
+            runtime, "service", "tiers"
+        )
+        if tiers:
+            _section(text, "Expert placement")
+            tiers_suffix = " · STALE" if runtime.get("tiers_stale") else ""
+            _line(
+                text,
+                "VRAM",
+                f"{tiers.get('vram', 0)} experts · {_format_gib(tiers.get('vram_bytes', int(float(tiers.get('vram_gb') or 0) * 1_000_000_000)))}{tiers_suffix}",
+            )
+            _line(
+                text,
+                "RAM",
+                f"{tiers.get('ram', 0)} experts · {_format_gib(tiers.get('ram_bytes', int(float(tiers.get('ram_gb') or 0) * 1_000_000_000)))}{tiers_suffix}",
+            )
+            _line(
+                text,
+                "Disk",
+                f"{tiers.get('disk', 0)} experts{tiers_suffix}",
+            )
+
+        gpu_rows = tuple(runtime.get("gpus") or ())
+        if gpu_rows:
+            _section(text, "Graphics cards")
+            for gpu in gpu_rows:
+                index = gpu.get("index", "?")
+                selection = (
+                    "SELECTED"
+                    if gpu.get("selected")
+                    else "not selected"
+                )
+                card_stale = bool(
+                    gpu.get("stale") or gpu.get("card_stale")
+                )
+                model_stale = bool(gpu.get("model_stale"))
+                process_stale = bool(gpu.get("process_stale"))
+                suffix = " · STALE" if card_stale else ""
+                _line(
+                    text,
+                    f"GPU {index} · {selection}",
+                    f"{gpu.get('name') or 'unnamed'} · {_format_percent(gpu.get('utilization_percent', gpu.get('utilization')))} card-wide{suffix}",
+                    style="#d7a84e" if card_stale else "bold #63bec2",
+                )
+                total_bytes = gpu.get("total_bytes")
+                if total_bytes is None:
+                    total_bytes = gpu.get("memory_total_bytes")
+                used_bytes = gpu.get("used_bytes")
+                if used_bytes is None:
+                    used_bytes = gpu.get("memory_used_bytes")
+                free_bytes = gpu.get("free_bytes")
+                if free_bytes is None:
+                    free_bytes = gpu.get("memory_free_bytes")
+                if any(value is not None for value in (used_bytes, free_bytes, total_bytes)):
+                    _line(
+                        text,
+                        "  Device VRAM",
+                        f"{_format_gib(used_bytes)} used · {_format_gib(free_bytes)} free / {_format_gib(total_bytes)}",
+                    )
+                _line(
+                    text,
+                    "  Colibri process",
+                    "%s%s"
+                    % (
+                        _format_gib(
+                            gpu.get(
+                                "process_bytes",
+                                gpu.get(
+                                    "colibri_process_bytes",
+                                    gpu.get("process_vram_bytes"),
+                                ),
+                            )
+                        ),
+                        " · STALE" if process_stale else "",
+                    ),
+                )
+                _line(
+                    text,
+                    "  Model resident",
+                    "%s%s"
+                    % (
+                        _format_gib(
+                            gpu.get(
+                                "model_bytes",
+                                gpu.get("model_resident_bytes"),
+                            )
+                        ),
+                        " · STALE" if model_stale else "",
+                    ),
+                    style=(
+                        "bold #d7a84e"
+                        if model_stale
+                        else "bold #d7e4e3"
+                    ),
+                )
+                _line(
+                    text,
+                    "  Hot experts",
+                    "%s · %s%s"
+                    % (
+                        (
+                            gpu.get("expert_count")
+                            if gpu.get("expert_count") is not None
+                            else "unavailable"
+                        ),
+                        _format_gib(gpu.get("expert_bytes")),
+                        " · STALE" if model_stale else "",
+                    ),
+                )
+                _line(
+                    text,
+                    "  Non-expert",
+                    "%s%s"
+                    % (
+                        _format_gib(
+                            gpu.get(
+                                "nonexpert_bytes",
+                                gpu.get("non_expert_bytes"),
+                            )
+                        ),
+                        " · STALE" if model_stale else "",
+                    ),
+                )
+
+        profile = runtime.get("latest_profile") or runtime.get("profile") or {}
+        if profile:
+            _section(text, "Latest completed request")
+            profile_stale = bool(runtime.get("profile_stale"))
+            _line(
+                text,
+                "Throughput",
+                (
+                    (
+                        f"{float(profile['tokens_per_second']):.2f} tok/s"
+                        + (" · STALE" if profile_stale else "")
+                    )
+                    if profile.get("tokens_per_second") is not None
+                    else "unavailable"
+                ),
+                style=(
+                    "bold #d7a84e"
+                    if profile_stale
+                    else "bold #73be8b"
+                ),
+            )
+            _line(
+                text,
+                "TTFT",
+                (
+                    f"{float(profile['ttft_ms']):.1f} ms"
+                    if profile.get("ttft_ms") is not None
+                    else "unavailable"
+                ),
+            )
+            phases = (
+                ("Expert disk", "expert_disk_s"),
+                ("Expert wait", "expert_wait_s"),
+                ("Expert matmul", "expert_matmul_s"),
+                ("Attention", "attention_s"),
+                ("LM head", "lm_head_s"),
+            )
+            for label, key in phases:
+                if profile.get(key) is not None:
+                    _line(text, label, f"{float(profile[key]):.3f} s")
+        elif service_state == "serving":
+            text.append(
+                "\nWaiting for the first completed request to report throughput.",
+                style="#91a7a6",
+            )
+        freshness = runtime.get("freshness") or {}
+        stale_channels = [
+            name
+            for name, channel in freshness.items()
+            if isinstance(channel, Mapping) and channel.get("stale")
+        ]
+        if stale_channels:
+            stale_details = []
+            for name in stale_channels:
+                channel = freshness[name]
+                stale_details.append(
+                    "%s (last successful sample: %s)"
+                    % (
+                        name,
+                        _format_observed_at(
+                            channel.get("observed_at")
+                        ),
+                    )
+                )
+            text.append(
+                "\nStale telemetry: %s." % ", ".join(stale_details),
+                style="bold #d7a84e",
+            )
         history = snapshot.history or {}
         results = tuple(history.get("results", ()))
         if results:
@@ -972,6 +1607,35 @@ class RamdiskTextualApp(App[int]):
     .choice-row Button {
         margin-right: 1;
     }
+    #gpu-selection {
+        height: auto;
+        min-height: 3;
+        max-height: 12;
+        margin-bottom: 1;
+        background: #0c1218;
+        border: tall #304554;
+    }
+    #gpu-selection:focus {
+        border: tall $cyan;
+    }
+    .gpu-layout-row {
+        height: auto;
+    }
+    .gpu-layout-row Button {
+        width: 1fr;
+        min-width: 18;
+    }
+    .gpu-layout-active {
+        background: #244d4f;
+        color: $ink;
+        text-style: bold;
+        border: tall $cyan;
+    }
+    #accelerator-note {
+        height: auto;
+        color: $muted;
+        margin-top: 1;
+    }
     #placement-note {
         height: auto;
         color: $muted;
@@ -1089,11 +1753,12 @@ class RamdiskTextualApp(App[int]):
         Binding("left", "previous_step", "Previous", show=False),
         Binding("right", "next_step", "Next", show=False),
         Binding("1", "show_step(0)", "Inspect", show=False),
-        Binding("2", "show_step(1)", "Placement", show=False),
-        Binding("3", "show_step(2)", "Capacity", show=False),
-        Binding("4", "show_step(3)", "Runtime", show=False),
-        Binding("5", "show_step(4)", "Review", show=False),
-        Binding("6", "show_step(5)", "Operate", show=False),
+        Binding("2", "show_step(1)", "Accelerators", show=False),
+        Binding("3", "show_step(2)", "Placement", show=False),
+        Binding("4", "show_step(3)", "Capacity", show=False),
+        Binding("5", "show_step(4)", "Runtime", show=False),
+        Binding("6", "show_step(5)", "Review", show=False),
+        Binding("7", "show_step(6)", "Operate", show=False),
     ]
 
     def __init__(
@@ -1141,6 +1806,10 @@ class RamdiskTextualApp(App[int]):
         self._refresh_pending_model = False
         self._dirty_inputs: set[str] = set()
         self._syncing_inputs = False
+        self._syncing_gpus = False
+        self._gpu_options_signature = self._gpu_selection_signature(
+            self.snapshot
+        )
         self._base_port_override: Optional[int] = None
         self._plan_stale = False
         self._quit_when_idle = False
@@ -1149,6 +1818,63 @@ class RamdiskTextualApp(App[int]):
         self._previous_signal_handlers: dict[int, Any] = {}
         self._message = (
             "Shared placement is the default: one model copy and one engine."
+        )
+
+    def _gpu_selections(
+        self,
+        snapshot: ConsoleSnapshot,
+    ) -> tuple[Selection[int], ...]:
+        plan = snapshot.plan or {}
+        selected = set(_selected_gpu_indices(plan))
+        selections = []
+        for device in snapshot.hardware.get("gpus") or ():
+            index = device.get("index")
+            if not isinstance(index, int) or isinstance(index, bool):
+                continue
+            eligible = _gpu_eligible(device, snapshot.hardware)
+            node = device.get("numa_node")
+            label = (
+                f"GPU {index} · {device.get('name') or 'unnamed'} · "
+                f"{_format_gib(device.get('free_bytes'))} free / "
+                f"{_format_gib(device.get('total_bytes'))} · N{node}"
+            )
+            if not eligible:
+                label += (
+                    " · disabled: "
+                    + _gpu_unavailable_reason(
+                        device,
+                        snapshot.hardware,
+                    )
+                )
+            selections.append(
+                Selection(
+                    label,
+                    index,
+                    index in selected,
+                    id=f"gpu-option-{index}",
+                    disabled=not eligible,
+                )
+            )
+        return tuple(selections)
+
+    def _gpu_selection_signature(
+        self,
+        snapshot: ConsoleSnapshot,
+    ) -> tuple[Any, ...]:
+        selected = set(_selected_gpu_indices(snapshot.plan or {}))
+        return tuple(
+            (
+                device.get("index"),
+                device.get("uuid"),
+                device.get("pci_bus_id"),
+                device.get("name"),
+                device.get("numa_node"),
+                device.get("locality"),
+                device.get("free_bytes"),
+                device.get("total_bytes"),
+                device.get("index") in selected,
+            )
+            for device in snapshot.hardware.get("gpus") or ()
         )
 
     def compose(self) -> ComposeResult:
@@ -1166,12 +1892,43 @@ class RamdiskTextualApp(App[int]):
         with Horizontal(id="step-nav"):
             for index, (step_id, label) in enumerate(STEPS, 1):
                 yield Button(
-                    f"{index} {label}",
+                    f"{index} {STEP_TAB_LABELS.get(step_id, label)}",
                     id=f"step-{step_id}",
                     classes="step-tab",
                 )
         with VerticalScroll(id="step-scroll"):
             yield Static(render_step(self.snapshot, STEPS[0][0]), id="step-body")
+            with Vertical(id="accelerator-controls", classes="control-panel"):
+                yield Static("GPU SELECTION", classes="control-title")
+                yield SelectionList[int](
+                    *self._gpu_selections(self.snapshot),
+                    id="gpu-selection",
+                )
+                with Horizontal(classes="choice-row gpu-layout-row"):
+                    yield Button(
+                        "Hot experts only",
+                        id="gpu-layout-experts-only",
+                    )
+                    yield Button(
+                        "Dense + GPU attention",
+                        id="gpu-layout-dense-attention",
+                    )
+                    yield Button(
+                        "Dense + sharded attention",
+                        id="gpu-layout-dense-attention-sharded",
+                    )
+                with Horizontal(classes="choice-row"):
+                    yield Button(
+                        "Reset to GPU-local",
+                        id="gpu-reset-local",
+                        variant="primary",
+                    )
+                    yield Button("Use CPU only", id="gpu-use-cpu")
+                yield Static(
+                    "Space toggles a card. Device selection and model placement "
+                    "become immutable after Prepare.",
+                    id="accelerator-note",
+                )
             with Vertical(id="placement-controls", classes="control-panel"):
                 yield Static("PLACEMENT INPUTS", classes="control-title")
                 with Horizontal(classes="field-row"):
@@ -1261,7 +2018,7 @@ class RamdiskTextualApp(App[int]):
         yield Static(self._message, id="message")
         with Horizontal(id="wizard-controls"):
             yield Button("← Back", id="previous-step")
-            yield Static("STEP 1 OF 6", id="step-counter")
+            yield Static("STEP 1 OF 7", id="step-counter")
             yield Button("Next →", id="next-step", variant="primary")
         yield Footer()
 
@@ -1316,10 +2073,15 @@ class RamdiskTextualApp(App[int]):
         root_screen.set_class(too_small, "too-small")
         for index, (step_id, label) in enumerate(STEPS, 1):
             button = self.query_one(f"#step-{step_id}", Button)
-            button.label = str(index) if event.size.width < 64 else f"{index} {label}"
+            tab_label = STEP_TAB_LABELS.get(step_id, label)
+            button.label = (
+                str(index)
+                if event.size.width < 96
+                else f"{index} {tab_label}"
+            )
 
     def _automatic_refresh(self) -> None:
-        if self.operation is None and not self._refresh_inflight:
+        if not self._refresh_inflight:
             self._request_refresh()
 
     def _request_refresh(self, *, deep: bool = False, model: bool = False) -> None:
@@ -1453,11 +2215,18 @@ class RamdiskTextualApp(App[int]):
                 error="",
             )
         )
-        self._show_step(4)
         preset = result["plan"].get("preset") or {}
+        self._show_step(
+            1 if preset.get("id") == PRESET_GPU_FASTEST else 5
+        )
         self._set_message(
-            "%s populated the draft. Review the exact plan; advanced "
-            "settings remain editable."
+            (
+                "%s populated the draft. Select the exact cards and model "
+                "placement before review."
+                if preset.get("id") == PRESET_GPU_FASTEST
+                else "%s populated the draft. Review the exact plan; advanced "
+                "settings remain editable."
+            )
             % preset.get("label", "Preset")
         )
 
@@ -1484,6 +2253,42 @@ class RamdiskTextualApp(App[int]):
         policy = ActionPolicy.from_state(self.snapshot.plan, self.snapshot.report)
         operation_locked = self.operation is not None
         weight_locked = operation_locked or not policy.edit_weights.enabled
+        gpu_selection = self.query_one(
+            "#gpu-selection",
+            SelectionList,
+        )
+        gpu_signature = self._gpu_selection_signature(self.snapshot)
+        if gpu_signature != self._gpu_options_signature:
+            self._syncing_gpus = True
+            try:
+                gpu_selection.clear_options()
+                gpu_selection.add_options(self._gpu_selections(self.snapshot))
+                self._gpu_options_signature = gpu_signature
+            finally:
+                self._syncing_gpus = False
+        gpu_selection.disabled = weight_locked
+        snapshot_accelerator = (
+            (self.snapshot.plan or {}).get("managed_accelerator") or {}
+        )
+        layout = str(
+            snapshot_accelerator.get(
+                "layout",
+                getattr(self.args, "gpu_layout", "experts-only"),
+            )
+            or "experts-only"
+        )
+        for layout_id, _, _ in GPU_LAYOUTS:
+            button = self.query_one(
+                f"#gpu-layout-{layout_id}",
+                Button,
+            )
+            button.set_class(
+                layout_id == layout,
+                "gpu-layout-active",
+            )
+            button.disabled = weight_locked
+        self.query_one("#gpu-reset-local", Button).disabled = weight_locked
+        self.query_one("#gpu-use-cpu", Button).disabled = weight_locked
         for selector in (
             "#memory-nodes",
             "#cpu-list",
@@ -1568,6 +2373,7 @@ class RamdiskTextualApp(App[int]):
                 step_id == active_id, "step-active"
             )
         panel_for_step = {
+            "accelerators": "#accelerator-controls",
             "placement": "#placement-controls",
             "capacity": "#capacity-controls",
             "runtime": "#runtime-controls",
@@ -1662,6 +2468,46 @@ class RamdiskTextualApp(App[int]):
             self.action_previous_step()
         elif button_id == "next-step":
             self.action_next_step()
+        elif button_id.startswith("gpu-layout-"):
+            layout = button_id.removeprefix("gpu-layout-")
+            selected = tuple(
+                self.query_one(
+                    "#gpu-selection",
+                    SelectionList,
+                ).selected
+            )
+            if not selected:
+                self._set_message(
+                    "Select at least one eligible GPU before choosing a GPU layout."
+                )
+            else:
+                self._apply_gpu_configuration(
+                    ",".join(str(index) for index in sorted(selected)),
+                    layout=layout,
+                    reset_placement=False,
+                )
+        elif button_id == "gpu-reset-local":
+            selected = tuple(
+                self.query_one(
+                    "#gpu-selection",
+                    SelectionList,
+                ).selected
+            )
+            if not selected:
+                self._set_message(
+                    "Select at least one eligible GPU before resetting placement."
+                )
+            else:
+                self._apply_gpu_configuration(
+                    ",".join(str(index) for index in sorted(selected)),
+                    reset_placement=True,
+                )
+        elif button_id == "gpu-use-cpu":
+            self._apply_gpu_configuration(
+                "none",
+                layout="experts-only",
+                reset_placement=True,
+            )
         elif button_id == "use-shared":
             if self._can_edit_weights():
                 self.args.topology = "interleaved"
@@ -1718,6 +2564,32 @@ class RamdiskTextualApp(App[int]):
             self._benchmark()
         elif button_id == "action-destroy":
             self._open_destroy_review()
+
+    @on(SelectionList.SelectedChanged)
+    def _gpu_selection_changed(
+        self,
+        event: SelectionList.SelectedChanged,
+    ) -> None:
+        if self._syncing_gpus or event.selection_list.id != "gpu-selection":
+            return
+        selected = tuple(event.selection_list.selected)
+        planned = set(_selected_gpu_indices(self.snapshot.plan or {}))
+        if set(selected) == planned:
+            return
+        if not selected:
+            self._set_message(
+                "A GPU layout requires at least one card. Use “Use CPU only” "
+                "to switch serving modes explicitly."
+            )
+            self._gpu_options_signature = None
+            self._sync_controls()
+            return
+        self._apply_gpu_configuration(
+            ",".join(str(index) for index in sorted(selected)),
+            reset_placement=(
+                getattr(self.args, "gpu_placement", "auto") != "custom"
+            ),
+        )
 
     @on(Input.Changed)
     def _input_changed(self, event: Input.Changed) -> None:
@@ -1854,6 +2726,11 @@ class RamdiskTextualApp(App[int]):
             if is_base_port:
                 self._base_port_override = int(value)
                 self.snapshot = replace(self.snapshot, base_port=int(value))
+        if any(
+            attribute in ("memory_nodes", "cpu_list")
+            for attribute, _, _, _ in parsed
+        ):
+            self.args.gpu_placement = "custom"
         for field in wanted:
             self._dirty_inputs.discard(field)
 
@@ -1886,6 +2763,84 @@ class RamdiskTextualApp(App[int]):
             return True
         self._set_message(self.policy.edit_weights.reason)
         return False
+
+    def _apply_gpu_configuration(
+        self,
+        selector: str,
+        *,
+        layout: Optional[str] = None,
+        reset_placement: bool,
+    ) -> None:
+        if not self._can_edit_weights():
+            self._gpu_options_signature = None
+            self._sync_controls()
+            return
+        apply_selection = getattr(
+            self.lifecycle,
+            "apply_gpu_selection",
+            None,
+        )
+        if apply_selection is None:
+            self._set_message(
+                "This Colibri build does not expose managed GPU selection."
+            )
+            self._gpu_options_signature = None
+            self._sync_controls()
+            return
+        try:
+            apply_selection(
+                self.args,
+                self.snapshot.hardware,
+                selector=selector,
+                layout=(
+                    layout
+                    if layout is not None
+                    else getattr(
+                        self.args,
+                        "gpu_layout",
+                        "experts-only",
+                    )
+                ),
+                cuda_capable=(
+                    True
+                    if (
+                        getattr(
+                            self.args,
+                            "managed_accelerator",
+                            None,
+                        )
+                        or {}
+                    ).get("capability") == "available"
+                    else None
+                ),
+                reset_placement=reset_placement,
+            )
+        except (OSError, TypeError, ValueError, self.lifecycle.RamdiskError) as exc:
+            self._set_message(
+                f"GPU selection was not changed: {exc}"
+            )
+            self._gpu_options_signature = None
+            self._sync_controls()
+            return
+        self.args.gpu_placement = (
+            "auto" if reset_placement else getattr(
+                self.args,
+                "gpu_placement",
+                "custom",
+            )
+        )
+        if selector == "none":
+            message = "Managed serving changed to CPU only."
+        else:
+            message = (
+                f"Managed GPUs changed to {selector}; "
+                f"{GPU_LAYOUT_LABELS.get(str(self.args.gpu_layout), self.args.gpu_layout)}."
+            )
+            if reset_placement:
+                message += " NUMA and CPU masks reset to GPU-local."
+            elif self.args.gpu_placement == "custom":
+                message += " Custom NUMA and CPU masks were preserved."
+        self._settings_changed(message)
 
     def _settings_changed(self, message: str, *, rebuild: bool = True) -> None:
         if rebuild:

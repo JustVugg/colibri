@@ -40,6 +40,7 @@ REQUIRED_SUPPORT_PACKAGE_MODULES = (
     "presentation.py",
     "presets.py",
     "processes.py",
+    "runtime_monitor.py",
     "state.py",
 )
 

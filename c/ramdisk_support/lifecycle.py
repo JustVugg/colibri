@@ -371,6 +371,19 @@ def start(
     assert_ready_mounts(manifest)
     plan = manifest["plan"]
     cli_path = cli_path or default_cli_path
+    resolved_engine_path = None
+    if engine_path is not None:
+        resolved_engine_path = os.path.realpath(
+            os.path.abspath(str(engine_path))
+        )
+        if (
+            not os.path.isfile(resolved_engine_path)
+            or not os.access(resolved_engine_path, os.X_OK)
+        ):
+            raise RamdiskError(
+                "reviewed engine is not an executable file: %s"
+                % resolved_engine_path
+            )
     model = plan["model"]["path"]
     canonical_usage = os.path.join(model, ".coli_usage")
     foreign = []
@@ -612,6 +625,7 @@ def start(
                 }
             )
             for inherited in (
+                "COLI_ENGINE",
                 "COLI_MMAP",
                 "PIN",
                 "PIN_GB",
@@ -632,6 +646,8 @@ def start(
                 "URING",
             ):
                 environment.pop(inherited, None)
+            if resolved_engine_path is not None:
+                environment["COLI_ENGINE"] = resolved_engine_path
             applied_runtime_knobs = normalized_runtime_knobs(
                 plan,
                 saved_runtime_knobs,
