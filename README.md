@@ -402,6 +402,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mi
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
 ./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
 ./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
+./coli chat --no-persistence --model /nvme/glm52_i4  # disable runtime persistence of KV and usage history
 ```
 
 On Windows the same commands work with `python coli chat --model D:\glm52_i4`.

@@ -25,6 +25,7 @@ Format: `VAR` — default — effect.
 | `TOPP` | `0` (off) | Top-p filter (`0` = use `NUCLEUS`). |
 | `SEED` | unset → seeded from clock + PID | RNG seed for sampling. **Unset = different every run.** Set a fixed value for reproducible sampling. |
 | `KVSAVE` | `1` (on) | Persist the KV cache to `<model>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
+| `COLI_PERSIST` | `1` (on) | Enable runtime persistence of KV and usage history. `COLI_PERSIST=0` disables runtime persistence, equivalent to `coli --no-persistence`. |
 | `KV_SLOTS` | `1` | Number of independent KV conversation slots (1–16), used in serve mode. |
 | `THINK` | `0` (off) | Emit a `<think>` reasoning block. `THINK=1` turns on visible reasoning. |
 | `MTP` | on | Multi-Token Prediction (speculative draft head). `MTP=0` disables it. |

@@ -40,6 +40,10 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--no-autopin` | off | `AUTOPIN=0` | Disable automatic hot-store pinning from usage history. |
 | `--cap` | `0` (auto) | `<cap>` argv | Expert-cache cap (starting point; see `CAP_RAISE`). `0` lets the engine pick: `8` historically, `1` on Metal + macOS when the model volume measures fast (F_NOCACHE probe ≥ `COLI_SSD_FAST_GBS`, cached in `<model>/.coli_ssd` — #379). An explicit value always wins. |
 | `--no-persist` | off | `COLI_PERSIST=0` | Disable persistence entirely, including usage-history save/load and `.coli_kv` writes. |
+| `--no-persist` | off | `KVSAVE=0` | Disable runtime KV and usage-history persistence to reduce SSD writes. |
+| `--no-persistence` | off | `KVSAVE=0`, `AUTOPIN=0`, `COLI_PERSIST=0` | Disable runtime KV and usage-history persistence to reduce SSD writes. |
+| `--cap` | `8` | `<cap>` argv | Expert-cache cap (starting point; see `CAP_RAISE`). |
+
 | `--ngen` | `1024` | `NGEN` | Max tokens to generate. |
 | `--temp` | none (`0`=greedy; engine default 1.0) | `TEMP` | Sampling temperature. |
 | `--topp` | `0` | `TOPP` | Top-p filter. |

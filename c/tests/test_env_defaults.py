@@ -27,7 +27,8 @@ _loader.exec_module(coli)
 def args(**over):
     base = dict(model="X", policy="quality", ram=0, ngen=0, topp=0, topk=0,
                 temp=None, repin=0, ctx=0, auto_tier=False, gpu=None, vram=0,
-                no_kv_save=False, no_autopin=False, no_persist=False)
+                no_kv_save=False, no_autopin=False, no_persist=False,
+                enable_persistence=True)
     base.update(over)
     return types.SimpleNamespace(**base)
 

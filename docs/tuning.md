@@ -24,6 +24,7 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 | `COLI_NUMA=1` | interleave resident weights across NUMA nodes on multi-socket hosts ([#82](https://github.com/JustVugg/colibri/issues/82)) |
 | `CACHE_ROUTE=1` | cache-aware max-rank routing (opt-in, [#199](https://github.com/JustVugg/colibri/issues/199)) |
 | `AUTOPIN=0` | disable the learning cache's auto-pin |
+| `COLI_PERSIST=0` | disable runtime persistence of usage history and KV state; `--no-persistence` sets this plus `KVSAVE=0` and `AUTOPIN=0`. |
 | `CAP_RAISE=0` | don't auto-grow the expert cache |
 | `KVSAVE=0` | disable KV-cache persistence |
 | `TF=1` | teacher-forcing validation |
