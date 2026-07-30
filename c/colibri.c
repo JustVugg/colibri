@@ -67,6 +67,7 @@
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
 #endif
+static int g_decode_batch;   /* ragged multi-session decode, not contiguous prefill */
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -4025,7 +4026,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #ifdef COLI_CUDA
         int transient_done[64]={0};
         if(!metal_done && !xexp_done && !vk_active && group_enabled &&
-           g_cuda_enabled && g_cuda_transient_prefill && S>1 &&
+           g_cuda_enabled && g_cuda_transient_prefill && S>1 && !g_decode_batch &&
            g_cuda_ndev>1 && !omp_in_parallel()){
             int tr_j[64],tr_n[64],tr_off[64],tr_ok[64]={0},tr_count=0,tr_total=0;
             for(int j=0;j<nb;j++){
@@ -5257,7 +5258,9 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         kvs[s]=rows[s].kv; positions[s]=rows[s].pos;
         embed_row(m,rows[s].token,x+(int64_t)s*D);
     }
+    g_decode_batch=1;
     layers_forward_rows(m,x,S,0,kvs,positions);
+    g_decode_batch=0;
     float *norm=falloc((int64_t)S*D);
     for(int s=0;s<S;s++)
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
