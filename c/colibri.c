@@ -355,6 +355,14 @@ static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+typedef struct {
+    ColiCudaTensor *tensor;
+    int fmt, I, O;
+} CudaTransientTensor;
+static CudaTransientTensor g_cuda_transient[COLI_CUDA_MAX_DEVICES][3];
+static int g_cuda_transient_prefill, g_cuda_transient_min_rows=1;
+static uint64_t g_cuda_transient_calls, g_cuda_transient_rows;
+static double g_cuda_transient_upload_s, g_cuda_transient_compute_s;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
@@ -421,6 +429,56 @@ static int qt_cuda_update(QT *t){
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
+static double now_s(void);
+static void cuda_transient_cleanup(void){
+    for(int di=0;di<COLI_CUDA_MAX_DEVICES;di++) for(int k=0;k<3;k++){
+        coli_cuda_tensor_free(g_cuda_transient[di][k].tensor);
+        g_cuda_transient[di][k].tensor=NULL;
+    }
+}
+/* Prefill-only spill tier: reuse one three-tensor staging set per device and replace
+ * its weights for every cold INT4 expert. Each OpenMP worker owns one device, so upload
+ * and compute overlap across a PCIe multi-GPU machine without sharing CUDA handles. */
+static int cuda_transient_expert(ESlot *e, float *y, const float *x, int rows, int di){
+    if(!g_cuda_transient_prefill || rows<g_cuda_transient_min_rows ||
+       di<0 || di>=g_cuda_ndev ||
+       e->g.fmt!=2 || e->u.fmt!=2 || e->d.fmt!=2) return 0;
+    QT *q[3]={&e->g,&e->u,&e->d};
+    int ok=1, device=g_cuda_devices[di];
+    double t0=now_s();
+    for(int k=0;k<3&&ok;k++){
+        CudaTransientTensor *slot=&g_cuda_transient[di][k];
+        if(slot->tensor && (slot->fmt!=q[k]->fmt || slot->I!=q[k]->I || slot->O!=q[k]->O)){
+            coli_cuda_tensor_free(slot->tensor);
+            slot->tensor=NULL;
+        }
+        if(!slot->tensor){
+            ok=coli_cuda_tensor_upload(&slot->tensor,q[k]->q4,q[k]->s,
+                                       q[k]->fmt,q[k]->I,q[k]->O,device);
+            if(ok){ slot->fmt=q[k]->fmt; slot->I=q[k]->I; slot->O=q[k]->O; }
+        } else {
+            ok=coli_cuda_tensor_update(slot->tensor,q[k]->q4,q[k]->s);
+        }
+    }
+    double upload=now_s()-t0;
+    #pragma omp atomic
+    g_cuda_transient_upload_s+=upload;
+    if(!ok) return 0;
+    t0=now_s();
+    ok=coli_cuda_expert_mlp(g_cuda_transient[di][0].tensor,
+                            g_cuda_transient[di][1].tensor,
+                            g_cuda_transient[di][2].tensor,y,x,rows);
+    double compute=now_s()-t0;
+    #pragma omp atomic
+    g_cuda_transient_compute_s+=compute;
+    if(ok){
+        #pragma omp atomic
+        g_cuda_transient_calls++;
+        #pragma omp atomic
+        g_cuda_transient_rows+=(uint64_t)rows;
+    }
+    return ok;
+}
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -442,6 +500,11 @@ static void cuda_stats_print(void){
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
+    if(g_cuda_transient_calls) fprintf(stderr,
+        "[CUDA] transient prefill experts: %llu call, %llu rows | upload %.1f ms | compute %.1f ms\n",
+        (unsigned long long)g_cuda_transient_calls,
+        (unsigned long long)g_cuda_transient_rows,
+        g_cuda_transient_upload_s*1e3,g_cuda_transient_compute_s*1e3);
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
         "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
         g_ovl_issue,g_ovl_cpu,g_ovl_take);
@@ -3490,7 +3553,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
      * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
-    int group_enabled = S<=64 || (g_cuda_pipe && S<=4096);
+    int group_enabled = S<=64 || ((g_cuda_pipe || g_cuda_transient_prefill) && S<=4096);
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
     int *group_row=group_enabled?xalloc((size_t)64*S*sizeof(int),"moe group_row"):NULL;
@@ -3924,9 +3987,59 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(g_prof) g_vkb_acc+=now_s()-t_take0;   /* take-wait (t_egpu) + result accumulate */
         }
 #endif
+#ifdef COLI_CUDA
+        int transient_done[64]={0};
+        if(!metal_done && !xexp_done && !vk_active && group_enabled &&
+           g_cuda_enabled && g_cuda_transient_prefill && S>1 &&
+           g_cuda_ndev>1 && !omp_in_parallel()){
+            int tr_j[64],tr_n[64],tr_off[64],tr_ok[64]={0},tr_count=0,tr_total=0;
+            for(int j=0;j<nb;j++){
+                ESlot *e=use[j];
+                if(early_issued && done_j[j]) continue;
+                if(e->g.cuda_eligible || e->g.fmt!=2 || e->u.fmt!=2 || e->d.fmt!=2) continue;
+                int nr=0,eid=uniq[base+j];
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==eid){
+                        group_row[(int64_t)tr_count*S+nr]=s;
+                        group_weight[(int64_t)tr_count*S+nr]=ws[(int64_t)s*K+kk];
+                        nr++; break;
+                    }
+                if(nr<g_cuda_transient_min_rows) continue;
+                if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait+=now_s()-tw; }
+                tr_j[tr_count]=j; tr_n[tr_count]=nr; tr_off[tr_count]=tr_total;
+                const float *xsrc=E8_XE(e);
+                for(int r=0;r<nr;r++) memcpy(group_x+(int64_t)(tr_total+r)*D,
+                    xsrc+(int64_t)group_row[(int64_t)tr_count*S+r]*D,D*sizeof(float));
+                tr_total+=nr; tr_count++;
+            }
+            double tr0=now_s();
+            for(int wave=0;wave<tr_count;wave+=g_cuda_ndev){
+                int nw=tr_count-wave<g_cuda_ndev?tr_count-wave:g_cuda_ndev;
+                #pragma omp parallel for num_threads(g_cuda_ndev) schedule(static)
+                for(int q=0;q<nw;q++){
+                    int ti=wave+q,j=tr_j[ti];
+                    tr_ok[ti]=cuda_transient_expert(use[j],
+                        group_y+(int64_t)tr_off[ti]*D,
+                        group_x+(int64_t)tr_off[ti]*D,tr_n[ti],q);
+                }
+            }
+            for(int q=0;q<tr_count;q++) if(tr_ok[q]){
+                transient_done[tr_j[q]]=1;
+                for(int r=0;r<tr_n[q];r++){
+                    int row=group_row[(int64_t)q*S+r];
+                    float *os=out+(int64_t)row*D;
+                    float wgt=group_weight[(int64_t)q*S+r];
+                    const float *hr=group_y+(int64_t)(tr_off[q]+r)*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                }
+            }
+            double trdt=now_s()-tr0; m->t_emm+=trdt; if(g_prof)m->t_egpu+=trdt;
+        }
+#endif
         if(!metal_done && !xexp_done && !vk_active)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
 #ifdef COLI_CUDA
+            if(transient_done[j]) continue;
             if(early_issued && done_j[j]) continue;    /* computing on the GPU right now */
 #endif
             /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
@@ -7853,6 +7966,20 @@ int main(int argc, char **argv){
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     g_cuda_router=getenv("COLI_CUDA_ROUTER")?atoi(getenv("COLI_CUDA_ROUTER")):0;
     g_cuda_resid=getenv("COLI_CUDA_RESID")?atoi(getenv("COLI_CUDA_RESID")):0;
+    g_cuda_transient_prefill=getenv("COLI_CUDA_TRANSIENT_PREFILL")?
+        atoi(getenv("COLI_CUDA_TRANSIENT_PREFILL"))!=0:0;
+    g_cuda_transient_min_rows=getenv("COLI_CUDA_TRANSIENT_MIN_ROWS")?
+        atoi(getenv("COLI_CUDA_TRANSIENT_MIN_ROWS")):1;
+    if(g_cuda_transient_min_rows<1) g_cuda_transient_min_rows=1;
+    if(g_cuda_transient_prefill && (!g_cuda_enabled || g_cuda_ndev<2)){
+        fprintf(stderr,"[CUDA] transient prefill requires COLI_CUDA=1 and at least two devices; disabled\n");
+        g_cuda_transient_prefill=0;
+    }
+    if(g_cuda_transient_prefill){
+        atexit(cuda_transient_cleanup);
+        fprintf(stderr,"[CUDA] transient prefill experts ON across %d devices (min rows %d)\n",
+                g_cuda_ndev,g_cuda_transient_min_rows);
+    }
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
