@@ -7,25 +7,32 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
-**Motore piccolo, modello immenso.** Esplora **GLM-5.2 (MoE da 744 miliardi di
-parametri)** su hardware consumer ed eterogeneo — in C puro, senza dipendenze
-del motore, trattando storage, RAM e VRAM come un'unica gerarchia di inferenza.
+**Motore piccolo, modello immenso.** Esegui **modelli MoE di frontiera — da 744
+miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogeneo,
+in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
+un'unica gerarchia di inferenza.
 
-> **Colibrì è un motore di inferenza sperimentale e una piattaforma di ricerca.**
-> Il suo obiettivo principale è migliorare le prestazioni di inferenza lungo
-> l'intero confine software/hardware — formati dei modelli, gerarchia di memoria,
-> I/O dello storage, piazzamento, scheduling, kernel, speculazione e sovrapposizione
-> CPU/GPU — affinché i grandi modelli dipendano meno da hardware raro e costino meno.
+Oggi girano quattro famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia `coli chat` /
+`coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
 
-Colibrì è intenzionalmente un luogo dove verificare idee di sistema aggressive,
-non un runtime di produzione con SLA. Gli esperimenti devono dimostrare il proprio
-valore con misure end-to-end riproducibili; la policy predefinita **non cambia mai
-silenziosamente la precisione del modello né la semantica del router**. Una memoria
-veloce insufficiente può ridurre la velocità, ma non ridefinire il modello di nascosto.
+> **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
+> ricerca aperta.** Il suo obiettivo principale è migliorare le prestazioni di
+> inferenza lungo l'intero confine software/hardware — formati dei modelli,
+> gerarchia di memoria, I/O dello storage, piazzamento, scheduling, kernel,
+> speculazione e sovrapposizione CPU/GPU — affinché i grandi modelli dipendano
+> meno da hardware raro e costino meno.
+
+Colibrì è intenzionalmente un luogo dove verificare idee di sistema aggressive —
+quindi **nessuno SLA sulla velocità, e una garanzia dura sulla semantica**: gli
+esperimenti devono dimostrare il proprio valore con misure end-to-end riproducibili;
+la policy predefinita **non cambia mai silenziosamente la precisione del modello né
+la semantica del router**. Una memoria veloce insufficiente può ridurre la velocità,
+ma non ridefinire il modello di nascosto.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.3.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
