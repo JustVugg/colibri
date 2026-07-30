@@ -21,7 +21,10 @@ struct RaggedKVEntry {
 struct ColiCudaTensor {
     void *weights;
     float *scales;
+    void *host_weights;
+    float *host_scales;
     size_t weight_bytes;
+    size_t host_weight_cap, host_scale_cap;
     int fmt, I, O, device;
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
@@ -30,6 +33,13 @@ struct ColiCudaTensor {
     RaggedKVEntry ragged[512];
     int ragged_count;
 };
+
+typedef struct {
+    void *g,*u,*d,*hg,*hu,*hd;
+    float *gs,*us,*ds,*hgs,*hus,*hds;
+    int D,I,busy,ready;
+    cudaEvent_t uploaded,done;
+} TransientSlot;
 
 typedef struct {
     int device;
@@ -42,6 +52,8 @@ typedef struct {
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
+    cudaStream_t transient_copy;
+    TransientSlot transient[2];
     cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -608,6 +620,12 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
+static int reserve_pinned_bytes(void **ptr,size_t *cap,size_t bytes){
+    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned weight staging allocation"))return 0;
+    *cap=bytes;return 1;
+}
+
 /* Publish quant.h's E8 codebook to every configured device. __constant__ memory
  * is per-device, so this walks the contexts; the engine calls it once after init
  * rather than the backend carrying a second copy of the table that could drift
@@ -684,12 +702,22 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
+        for(int s=0;s<2;s++){
+            TransientSlot *t=&ctx->transient[s];
+            if(t->g)cudaFree(t->g);if(t->u)cudaFree(t->u);if(t->d)cudaFree(t->d);
+            if(t->gs)cudaFree(t->gs);if(t->us)cudaFree(t->us);if(t->ds)cudaFree(t->ds);
+            if(t->hg)cudaFreeHost(t->hg);if(t->hu)cudaFreeHost(t->hu);if(t->hd)cudaFreeHost(t->hd);
+            if(t->hgs)cudaFreeHost(t->hgs);if(t->hus)cudaFreeHost(t->hus);if(t->hds)cudaFreeHost(t->hds);
+            if(t->uploaded)cudaEventDestroy(t->uploaded);if(t->done)cudaEventDestroy(t->done);
+        }
+        if(ctx->transient_copy)cudaStreamDestroy(ctx->transient_copy);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->host_x=ctx->host_y=ctx->host_kv=nullptr;ctx->stream=nullptr;
+        ctx->transient_copy=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
@@ -808,19 +836,23 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
     if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
-    if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
-                            cudaMemcpyHostToDevice),"tensor refresh")) return 0;
+    size_t sb=tensor->scale_count*sizeof(float);
+    if(!reserve_pinned_bytes(&tensor->host_weights,&tensor->host_weight_cap,tensor->weight_bytes)||
+       (sb&&!reserve_pinned(&tensor->host_scales,&tensor->host_scale_cap,sb))) return 0;
+    std::memcpy(tensor->host_weights,weights,tensor->weight_bytes);
+    if(sb) std::memcpy(tensor->host_scales,scales,sb);
+    if (!cuda_ok(cudaMemcpyAsync(tensor->weights,tensor->host_weights,tensor->weight_bytes,
+                                 cudaMemcpyHostToDevice,ctx->stream),"tensor refresh")) return 0;
     if(tensor->fmt==2||tensor->fmt==4){
-        offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256>>>(
+        offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256,0,ctx->stream>>>(
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
     /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
      * the fallback below would otherwise copy O floats out of a NULL host pointer. */
-    return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
-        (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
-        cudaMemcpyHostToDevice),"scale refresh");
+    if(tensor->fmt&&tensor->fmt!=6&&!cuda_ok(cudaMemcpyAsync(tensor->scales,tensor->host_scales,sb,
+        cudaMemcpyHostToDevice,ctx->stream),"scale refresh")) return 0;
+    return cuda_ok(cudaStreamSynchronize(ctx->stream),"tensor refresh synchronize");
 }
 
 /* Test hook: COLI_GPU_FAIL_AFTER=N makes every GPU COMPUTE entry point report
@@ -897,6 +929,113 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
+}
+
+static int transient_slot_prepare(TransientSlot *t,int D,int I){
+    if(t->ready && t->D==D && t->I==I) return 1;
+    if(t->ready) return 0; /* one model has one routed-expert geometry per run */
+    size_t gb=(size_t)I*row_bytes(2,D),db=(size_t)D*row_bytes(2,I);
+    size_t gsb=(size_t)I*sizeof(float),dsb=(size_t)D*sizeof(float);
+    int ok=cuda_ok(cudaMalloc(&t->g,gb),"transient gate allocation")&&
+       cuda_ok(cudaMalloc(&t->u,gb),"transient up allocation")&&
+       cuda_ok(cudaMalloc(&t->d,db),"transient down allocation")&&
+       cuda_ok(cudaMalloc(&t->gs,gsb),"transient gate scales allocation")&&
+       cuda_ok(cudaMalloc(&t->us,gsb),"transient up scales allocation")&&
+       cuda_ok(cudaMalloc(&t->ds,dsb),"transient down scales allocation")&&
+       cuda_ok(cudaMallocHost(&t->hg,gb),"transient pinned gate allocation")&&
+       cuda_ok(cudaMallocHost(&t->hu,gb),"transient pinned up allocation")&&
+       cuda_ok(cudaMallocHost(&t->hd,db),"transient pinned down allocation")&&
+       cuda_ok(cudaMallocHost(&t->hgs,gsb),"transient pinned gate scales allocation")&&
+       cuda_ok(cudaMallocHost(&t->hus,gsb),"transient pinned up scales allocation")&&
+       cuda_ok(cudaMallocHost(&t->hds,dsb),"transient pinned down scales allocation")&&
+       cuda_ok(cudaEventCreateWithFlags(&t->uploaded,cudaEventDisableTiming),"transient upload event")&&
+       cuda_ok(cudaEventCreateWithFlags(&t->done,cudaEventDisableTiming),"transient done event");
+    if(!ok){
+        if(t->g)cudaFree(t->g);if(t->u)cudaFree(t->u);if(t->d)cudaFree(t->d);
+        if(t->gs)cudaFree(t->gs);if(t->us)cudaFree(t->us);if(t->ds)cudaFree(t->ds);
+        if(t->hg)cudaFreeHost(t->hg);if(t->hu)cudaFreeHost(t->hu);if(t->hd)cudaFreeHost(t->hd);
+        if(t->hgs)cudaFreeHost(t->hgs);if(t->hus)cudaFreeHost(t->hus);if(t->hds)cudaFreeHost(t->hds);
+        if(t->uploaded)cudaEventDestroy(t->uploaded);if(t->done)cudaEventDestroy(t->done);
+        *t={};return 0;
+    }
+    t->D=D;t->I=I;t->ready=1;return 1;
+}
+
+/* Two-slot transient INT4 pipeline. The copy stream fills slot N+1 while the
+ * compute stream consumes slot N; events prevent either slot from being reused
+ * before its expert has finished. Inputs/outputs are one pointer per expert. */
+extern "C" int coli_cuda_transient_group(int device,
+        const void *const *gw,const void *const *uw,const void *const *dw,
+        const float *const *gs,const float *const *us,const float *const *ds,
+        const int *rows,int count,int D,int I,float *const *y,const float *const *x){
+    if(fault_injected()||!gw||!uw||!dw||!gs||!us||!ds||!rows||!y||!x||
+       count<1||D<1||I<1) return 0;
+    DeviceContext *ctx=find_ctx(device);
+    if(!select_ctx(ctx)) return 0;
+    if(!ctx->transient_copy&&!cuda_ok(cudaStreamCreateWithFlags(&ctx->transient_copy,
+        cudaStreamNonBlocking),"transient copy stream")) return 0;
+    if(!transient_slot_prepare(&ctx->transient[0],D,I)||
+       !transient_slot_prepare(&ctx->transient[1],D,I)) return 0;
+    int total=0,max_rows=0;
+    int *off=(int*)std::malloc((size_t)count*sizeof(int));
+    if(!off)return 0;
+    for(int k=0;k<count;k++){
+        if(rows[k]<1){std::free(off);return 0;}
+        off[k]=total;total+=rows[k];if(rows[k]>max_rows)max_rows=rows[k];
+    }
+    size_t xb=(size_t)total*D*sizeof(float),one_x=(size_t)max_rows*D*sizeof(float);
+    size_t one_i=(size_t)max_rows*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,one_x)||!reserve(&ctx->y,&ctx->y_cap,one_x)||
+       !reserve(&ctx->gate,&ctx->gate_cap,one_i)||!reserve(&ctx->up,&ctx->up_cap,one_i)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)){
+        std::free(off);return 0;
+    }
+    for(int k=0;k<count;k++)std::memcpy(ctx->host_x+(size_t)off[k]*D,x[k],
+                                        (size_t)rows[k]*D*sizeof(float));
+    size_t gb=(size_t)I*row_bytes(2,D),db=(size_t)D*row_bytes(2,I);
+    size_t gsb=(size_t)I*sizeof(float),dsb=(size_t)D*sizeof(float);
+    int ok=1;
+    for(int k=0;k<count&&ok;k++){
+        TransientSlot *t=&ctx->transient[k&1];
+        if(t->busy&&!cuda_ok(cudaEventSynchronize(t->done),"transient slot wait")){ok=0;break;}
+        std::memcpy(t->hg,gw[k],gb);std::memcpy(t->hu,uw[k],gb);std::memcpy(t->hd,dw[k],db);
+        std::memcpy(t->hgs,gs[k],gsb);std::memcpy(t->hus,us[k],gsb);std::memcpy(t->hds,ds[k],dsb);
+        ok=cuda_ok(cudaMemcpyAsync(t->g,t->hg,gb,cudaMemcpyHostToDevice,ctx->transient_copy),"transient gate upload")&&
+           cuda_ok(cudaMemcpyAsync(t->u,t->hu,gb,cudaMemcpyHostToDevice,ctx->transient_copy),"transient up upload")&&
+           cuda_ok(cudaMemcpyAsync(t->d,t->hd,db,cudaMemcpyHostToDevice,ctx->transient_copy),"transient down upload")&&
+           cuda_ok(cudaMemcpyAsync(t->gs,t->hgs,gsb,cudaMemcpyHostToDevice,ctx->transient_copy),"transient gate scales upload")&&
+           cuda_ok(cudaMemcpyAsync(t->us,t->hus,gsb,cudaMemcpyHostToDevice,ctx->transient_copy),"transient up scales upload")&&
+           cuda_ok(cudaMemcpyAsync(t->ds,t->hds,dsb,cudaMemcpyHostToDevice,ctx->transient_copy),"transient down scales upload");
+        if(!ok)break;
+        offset_to_signed_s4<<<(unsigned)((gb+255)/256),256,0,ctx->transient_copy>>>((uint8_t*)t->g,gb);
+        offset_to_signed_s4<<<(unsigned)((gb+255)/256),256,0,ctx->transient_copy>>>((uint8_t*)t->u,gb);
+        offset_to_signed_s4<<<(unsigned)((db+255)/256),256,0,ctx->transient_copy>>>((uint8_t*)t->d,db);
+        if(!cuda_ok(cudaGetLastError(),"transient int4 conversion")||
+           !cuda_ok(cudaEventRecord(t->uploaded,ctx->transient_copy),"transient upload record")||
+           !cuda_ok(cudaStreamWaitEvent(ctx->stream,t->uploaded,0),"transient upload wait")){ok=0;break;}
+        int nr=rows[k];size_t rb=(size_t)nr*D*sizeof(float);
+        if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x+(size_t)off[k]*D,rb,
+                                   cudaMemcpyHostToDevice,ctx->stream),"transient input upload")){ok=0;break;}
+        quant_matmul<<<dim3((unsigned)I,(unsigned)nr),256,0,ctx->stream>>>(
+            ctx->gate,ctx->x,t->g,t->gs,2,nr,D,I,row_bytes(2,D),0,1);
+        quant_matmul<<<dim3((unsigned)I,(unsigned)nr),256,0,ctx->stream>>>(
+            ctx->up,ctx->x,t->u,t->us,2,nr,D,I,row_bytes(2,D),0,1);
+        silu_mul<<<(unsigned)(((size_t)nr*I+255)/256),256,0,ctx->stream>>>(
+            ctx->gate,ctx->up,(size_t)nr*I);
+        quant_matmul<<<dim3((unsigned)D,(unsigned)nr),256,0,ctx->stream>>>(
+            ctx->y,ctx->gate,t->d,t->ds,2,nr,I,D,row_bytes(2,I),0,1);
+        if(!cuda_ok(cudaGetLastError(),"transient expert launch")||
+           !cuda_ok(cudaMemcpyAsync(ctx->host_y+(size_t)off[k]*D,ctx->y,rb,
+                                   cudaMemcpyDeviceToHost,ctx->stream),"transient output download")||
+           !cuda_ok(cudaEventRecord(t->done,ctx->stream),"transient done record")){ok=0;break;}
+        t->busy=1;
+    }
+    if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"transient group synchronize"))ok=0;
+    if(!ok)cudaStreamSynchronize(ctx->transient_copy);
+    if(ok)for(int k=0;k<count;k++)std::memcpy(y[k],ctx->host_y+(size_t)off[k]*D,
+                                              (size_t)rows[k]*D*sizeof(float));
+    std::free(off);return ok;
 }
 
 extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *up,
@@ -1337,6 +1476,8 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     }
     if (tensor->weights) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->host_weights) cudaFreeHost(tensor->host_weights);
+    if (tensor->host_scales) cudaFreeHost(tensor->host_scales);
     for(int i=0;i<tensor->ragged_count;i++){
         if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
         if(tensor->ragged[i].rope)cudaFree(tensor->ragged[i].rope);

@@ -295,6 +295,30 @@ int main(int argc, char **argv) {
     ColiCudaTensor *t4 = nullptr;
     if (!coli_cuda_matmul(&t4, got, x, q4, s4, 2, 1, 4, 2, d1, 0) || !close_enough(got, want4, 2)) return 1;
 
+    /* Three experts force transient slot 0 -> 1 -> 0 reuse while the copy and
+     * compute streams overlap. Compare against the ordinary resident MLP path. */
+    {
+        const uint8_t down4[4]={0x98,0xba,0xdc,0xfe};
+        const float sd4[4]={.5f,.25f,.125f,.0625f};
+        ColiCudaTensor *g=nullptr,*u=nullptr,*d=nullptr;
+        if(!coli_cuda_tensor_upload(&g,q4,s4,2,4,2,d0)||
+           !coli_cuda_tensor_upload(&u,q4,s4,2,4,2,d0)||
+           !coli_cuda_tensor_upload(&d,down4,sd4,2,2,4,d0))return 1;
+        float x0[4]={1,2,3,4},x1[8]={-1,2,-3,4,4,-3,2,-1},x2[4]={.5f,-1,.25f,2};
+        float w0[4],w1[8],w2[4],y0[4],y1[8],y2[4];
+        if(!coli_cuda_expert_mlp(g,u,d,w0,x0,1)||
+           !coli_cuda_expert_mlp(g,u,d,w1,x1,2)||
+           !coli_cuda_expert_mlp(g,u,d,w2,x2,1))return 1;
+        const void *gw[3]={q4,q4,q4},*uw[3]={q4,q4,q4},*dw[3]={down4,down4,down4};
+        const float *gs[3]={s4,s4,s4},*us[3]={s4,s4,s4},*ds[3]={sd4,sd4,sd4};
+        const float *xs[3]={x0,x1,x2};float *ys[3]={y0,y1,y2};int rs[3]={1,2,1};
+        if(!coli_cuda_transient_group(d0,gw,uw,dw,gs,us,ds,rs,3,4,2,ys,xs)||
+           !close_enough(y0,w0,4)||!close_enough(y1,w1,8)||!close_enough(y2,w2,4)){
+            std::fprintf(stderr,"transient double-buffer mismatch\n");return 1;
+        }
+        coli_cuda_tensor_free(g);coli_cuda_tensor_free(u);coli_cuda_tensor_free(d);
+    }
+
     const uint8_t q2[2] = {0xe4, 0x1b};
     const float s2[2] = {0.5f, 2.0f};
     const float want2[2] = {-2.0f, 12.0f};

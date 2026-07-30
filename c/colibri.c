@@ -362,7 +362,7 @@ typedef struct {
 static CudaTransientTensor g_cuda_transient[COLI_CUDA_MAX_DEVICES][3];
 static int g_cuda_transient_prefill, g_cuda_transient_min_rows=1;
 static uint64_t g_cuda_transient_calls, g_cuda_transient_rows;
-static double g_cuda_transient_upload_s, g_cuda_transient_compute_s;
+static double g_cuda_transient_upload_s, g_cuda_transient_compute_s, g_cuda_transient_pipeline_s;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
@@ -501,10 +501,12 @@ static void cuda_stats_print(void){
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
     if(g_cuda_transient_calls) fprintf(stderr,
-        "[CUDA] transient prefill experts: %llu call, %llu rows | upload %.1f ms | compute %.1f ms\n",
+        "[CUDA] transient prefill experts: %llu call, %llu rows | pipeline %.1f ms"
+        " | fallback upload %.1f ms | fallback compute %.1f ms\n",
         (unsigned long long)g_cuda_transient_calls,
         (unsigned long long)g_cuda_transient_rows,
-        g_cuda_transient_upload_s*1e3,g_cuda_transient_compute_s*1e3);
+        g_cuda_transient_pipeline_s*1e3,g_cuda_transient_upload_s*1e3,
+        g_cuda_transient_compute_s*1e3);
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
         "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
         g_ovl_issue,g_ovl_cpu,g_ovl_take);
@@ -4013,14 +4015,40 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 tr_total+=nr; tr_count++;
             }
             double tr0=now_s();
-            for(int wave=0;wave<tr_count;wave+=g_cuda_ndev){
-                int nw=tr_count-wave<g_cuda_ndev?tr_count-wave:g_cuda_ndev;
-                #pragma omp parallel for num_threads(g_cuda_ndev) schedule(static)
-                for(int q=0;q<nw;q++){
-                    int ti=wave+q,j=tr_j[ti];
-                    tr_ok[ti]=cuda_transient_expert(use[j],
-                        group_y+(int64_t)tr_off[ti]*D,
-                        group_x+(int64_t)tr_off[ti]*D,tr_n[ti],q);
+            /* One persistent worker per device. The old wave loop opened an OpenMP
+             * region and imposed a six-device barrier after every six experts, so a
+             * fast card waited for the slowest card roughly 1,400 times per prompt. */
+            #pragma omp parallel for num_threads(g_cuda_ndev) schedule(static)
+            for(int di=0;di<g_cuda_ndev;di++){
+                const void *tgw[64],*tuw[64],*tdw[64];
+                const float *tgs[64],*tus[64],*tds[64],*tx[64];
+                float *ty[64];int tn[64],tiq[64],nc=0;
+                for(int ti=di;ti<tr_count;ti+=g_cuda_ndev){
+                    int j=tr_j[ti];
+                    ESlot *e=use[j];tiq[nc]=ti;tn[nc]=tr_n[ti];
+                    tgw[nc]=e->g.q4;tuw[nc]=e->u.q4;tdw[nc]=e->d.q4;
+                    tgs[nc]=e->g.s;tus[nc]=e->u.s;tds[nc]=e->d.s;
+                    tx[nc]=group_x+(int64_t)tr_off[ti]*D;
+                    ty[nc]=group_y+(int64_t)tr_off[ti]*D;nc++;
+                }
+                if(!nc)continue;
+                double tp=now_s();
+                int piped=coli_cuda_transient_group(g_cuda_devices[di],
+                    tgw,tuw,tdw,tgs,tus,tds,tn,nc,D,I,ty,tx);
+                double pdt=now_s()-tp;
+                if(piped){
+                    #pragma omp atomic
+                    g_cuda_transient_pipeline_s+=pdt;
+                    for(int q=0;q<nc;q++){
+                        tr_ok[tiq[q]]=1;
+                        #pragma omp atomic
+                        g_cuda_transient_calls++;
+                        #pragma omp atomic
+                        g_cuda_transient_rows+=(uint64_t)tn[q];
+                    }
+                } else for(int q=0;q<nc;q++){
+                    int ti=tiq[q],j=tr_j[ti];
+                    tr_ok[ti]=cuda_transient_expert(use[j],ty[q],tx[q],tn[q],di);
                 }
             }
             for(int q=0;q<tr_count;q++) if(tr_ok[q]){

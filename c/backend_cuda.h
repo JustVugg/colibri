@@ -67,6 +67,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Prefill-only INT4 spill pipeline: stream a group of host-resident experts
+ * through two reusable device slots, overlapping the next H2D copy with the
+ * current expert computation. Inputs and outputs contain one pointer per expert. */
+COLI_CUDA_DLLEXPORT int coli_cuda_transient_group(int device,
+        const void *const *gw,const void *const *uw,const void *const *dw,
+        const float *const *gs,const float *const *us,const float *const *ds,
+        const int *rows,int count,int D,int I,float *const *y,const float *const *x);
+
 /* Prefill-oriented shared expert path.  INT4 weights stay packed in global
  * memory, activations are converted to FP16 per tile, and Tensor Cores
  * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the

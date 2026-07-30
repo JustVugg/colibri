@@ -39,6 +39,10 @@ typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uin
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
 typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up,
                                         ColiCudaTensor *down, float *y, const float *x, int S);
+typedef int            (*fn_transient_group)(int device,
+        const void *const *gw,const void *const *uw,const void *const *dw,
+        const float *const *gs,const float *const *us,const float *const *ds,
+        const int *rows,int count,int D,int I,float *const *y,const float *const *x);
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x);
@@ -111,6 +115,7 @@ static struct {
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
+    fn_transient_group transient_group;
     fn_expert_group    expert_group;
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_take expert_group_take;
@@ -265,6 +270,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_upload, fn_pipe_upload)
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
+    RESOLVE(transient_group, fn_transient_group)
     #undef RESOLVE
 
     g_cuda.available = 1;
@@ -537,6 +543,14 @@ int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCud
 int coli_cuda_tensor_update(ColiCudaTensor *tensor, const void *weights, const float *scales){
     if(!g_cuda.available){ return 0; }
     return g_cuda.tensor_update(tensor, weights, scales);
+}
+
+int coli_cuda_transient_group(int device,
+        const void *const *gw,const void *const *uw,const void *const *dw,
+        const float *const *gs,const float *const *us,const float *const *ds,
+        const int *rows,int count,int D,int I,float *const *y,const float *const *x){
+    if(!g_cuda.available)return 0;
+    return g_cuda.transient_group(device,gw,uw,dw,gs,us,ds,rows,count,D,I,y,x);
 }
 
 #endif /* _WIN32 */
