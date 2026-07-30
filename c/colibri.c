@@ -479,6 +479,39 @@ static int cuda_transient_expert(ESlot *e, float *y, const float *x, int rows, i
     }
     return ok;
 }
+typedef struct {
+    ESlot **use;
+    int *tr_j,*tr_n,*tr_off,*tr_ok;
+    float *group_x,*group_y;
+    int di,ndev,count,D,I,piped;
+    double elapsed;
+} CudaTransientTask;
+static void *cuda_transient_worker(void *arg){
+    CudaTransientTask *t=arg;
+    const void *gw[64],*uw[64],*dw[64];
+    const float *gs[64],*us[64],*ds[64],*x[64];
+    float *y[64];int rows[64],tiq[64],n=0;
+    for(int ti=t->di;ti<t->count;ti+=t->ndev){
+        int j=t->tr_j[ti];
+        ESlot *e=t->use[j];tiq[n]=ti;rows[n]=t->tr_n[ti];
+        gw[n]=e->g.q4;uw[n]=e->u.q4;dw[n]=e->d.q4;
+        gs[n]=e->g.s;us[n]=e->u.s;ds[n]=e->d.s;
+        x[n]=t->group_x+(int64_t)t->tr_off[ti]*t->D;
+        y[n]=t->group_y+(int64_t)t->tr_off[ti]*t->D;n++;
+    }
+    if(!n)return NULL;
+    double start=now_s();
+    t->piped=coli_cuda_transient_group(g_cuda_devices[t->di],
+        gw,uw,dw,gs,us,ds,rows,n,t->D,t->I,y,x);
+    t->elapsed=now_s()-start;
+    if(t->piped) for(int q=0;q<n;q++) t->tr_ok[tiq[q]]=1;
+    else for(int q=0;q<n;q++){
+        int ti=tiq[q],j=t->tr_j[ti];
+        t->tr_ok[ti]=cuda_transient_expert(t->use[j],y[q],x[q],
+                                            rows[q],t->di);
+    }
+    return NULL;
+}
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -4015,40 +4048,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 tr_total+=nr; tr_count++;
             }
             double tr0=now_s();
-            /* One persistent worker per device. The old wave loop opened an OpenMP
-             * region and imposed a six-device barrier after every six experts, so a
-             * fast card waited for the slowest card roughly 1,400 times per prompt. */
-            #pragma omp parallel for num_threads(g_cuda_ndev) schedule(static)
+            /* Keep GPU upload workers out of OpenMP: changing its hot team from the
+             * decode thread count to six devices cuts later CPU-expert bandwidth. */
+            pthread_t workers[COLI_CUDA_MAX_DEVICES];
+            CudaTransientTask tasks[COLI_CUDA_MAX_DEVICES];
+            int started[COLI_CUDA_MAX_DEVICES]={0};
             for(int di=0;di<g_cuda_ndev;di++){
-                const void *tgw[64],*tuw[64],*tdw[64];
-                const float *tgs[64],*tus[64],*tds[64],*tx[64];
-                float *ty[64];int tn[64],tiq[64],nc=0;
+                tasks[di]=(CudaTransientTask){use,tr_j,tr_n,tr_off,tr_ok,
+                    group_x,group_y,di,g_cuda_ndev,tr_count,D,I,0,0};
+                started[di]=pthread_create(&workers[di],NULL,cuda_transient_worker,
+                                            &tasks[di])==0;
+                if(!started[di])cuda_transient_worker(&tasks[di]);
+            }
+            for(int di=0;di<g_cuda_ndev;di++){
+                if(started[di])pthread_join(workers[di],NULL);
+                if(!tasks[di].piped)continue;
+                g_cuda_transient_pipeline_s+=tasks[di].elapsed;
                 for(int ti=di;ti<tr_count;ti+=g_cuda_ndev){
-                    int j=tr_j[ti];
-                    ESlot *e=use[j];tiq[nc]=ti;tn[nc]=tr_n[ti];
-                    tgw[nc]=e->g.q4;tuw[nc]=e->u.q4;tdw[nc]=e->d.q4;
-                    tgs[nc]=e->g.s;tus[nc]=e->u.s;tds[nc]=e->d.s;
-                    tx[nc]=group_x+(int64_t)tr_off[ti]*D;
-                    ty[nc]=group_y+(int64_t)tr_off[ti]*D;nc++;
-                }
-                if(!nc)continue;
-                double tp=now_s();
-                int piped=coli_cuda_transient_group(g_cuda_devices[di],
-                    tgw,tuw,tdw,tgs,tus,tds,tn,nc,D,I,ty,tx);
-                double pdt=now_s()-tp;
-                if(piped){
-                    #pragma omp atomic
-                    g_cuda_transient_pipeline_s+=pdt;
-                    for(int q=0;q<nc;q++){
-                        tr_ok[tiq[q]]=1;
-                        #pragma omp atomic
-                        g_cuda_transient_calls++;
-                        #pragma omp atomic
-                        g_cuda_transient_rows+=(uint64_t)tn[q];
-                    }
-                } else for(int q=0;q<nc;q++){
-                    int ti=tiq[q],j=tr_j[ti];
-                    tr_ok[ti]=cuda_transient_expert(use[j],ty[q],tx[q],tn[q],di);
+                    g_cuda_transient_calls++;
+                    g_cuda_transient_rows+=(uint64_t)tr_n[ti];
                 }
             }
             for(int q=0;q<tr_count;q++) if(tr_ok[q]){
