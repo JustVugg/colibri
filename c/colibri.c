@@ -361,8 +361,9 @@ typedef struct {
     int fmt, I, O;
 } CudaTransientTensor;
 static CudaTransientTensor g_cuda_transient[COLI_CUDA_MAX_DEVICES][3];
-static int g_cuda_transient_prefill, g_cuda_transient_min_rows=1;
+static int g_cuda_transient_prefill, g_cuda_transient_nvme, g_cuda_transient_min_rows=1;
 static uint64_t g_cuda_transient_calls, g_cuda_transient_rows;
+static uint64_t g_cuda_transient_nvme_experts, g_cuda_transient_nvme_waves;
 static double g_cuda_transient_upload_s, g_cuda_transient_compute_s, g_cuda_transient_pipeline_s;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
@@ -541,6 +542,10 @@ static void cuda_stats_print(void){
         (unsigned long long)g_cuda_transient_rows,
         g_cuda_transient_pipeline_s*1e3,g_cuda_transient_upload_s*1e3,
         g_cuda_transient_compute_s*1e3);
+    if(g_cuda_transient_nvme_waves) fprintf(stderr,
+        "[CUDA] transient NVMe overlap: %llu disk experts in %llu ready-first waves\n",
+        (unsigned long long)g_cuda_transient_nvme_experts,
+        (unsigned long long)g_cuda_transient_nvme_waves);
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
         "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
         g_ovl_issue,g_ovl_cpu,g_ovl_take);
@@ -2340,7 +2345,10 @@ static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
  * peek — report not-ready and let the wait do the work. */
 static inline int pipe_ready(int q){
 #ifdef __linux__
-    if(g_uring) return 0;
+    if(g_uring){
+        uring_reap(&g_ub_pipe);
+        return g_ub_pipe.load[q].done;
+    }
 #endif
     return atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)!=0;
 }
@@ -4028,59 +4036,96 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!metal_done && !xexp_done && !vk_active && group_enabled &&
            g_cuda_enabled && g_cuda_transient_prefill && S>1 && !g_decode_batch &&
            g_cuda_ndev>1 && !omp_in_parallel()){
-            int tr_j[64],tr_n[64],tr_off[64],tr_ok[64]={0},tr_count=0,tr_total=0;
-            for(int j=0;j<nb;j++){
-                ESlot *e=use[j];
-                if(early_issued && done_j[j]) continue;
-                if(e->g.cuda_eligible || e->g.fmt!=2 || e->u.fmt!=2 || e->d.fmt!=2) continue;
-                int nr=0,eid=uniq[base+j];
-                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                    if(idxs[(int64_t)s*K+kk]==eid){
-                        group_row[(int64_t)tr_count*S+nr]=s;
-                        group_weight[(int64_t)tr_count*S+nr]=ws[(int64_t)s*K+kk];
-                        nr++; break;
+            int tr_seen[64]={0},tr_left=nb;
+            while(tr_left>0){
+                int tr_j[64],tr_n[64],tr_off[64],tr_ok[64]={0},tr_count=0,tr_total=0;
+                int wait_j=-1;
+                /* Ready-first is the NVMe->RAM->GPU pipeline: do not drain the
+                 * whole disk batch before issuing GPU work. Loader threads (or
+                 * io_uring) keep filling the skipped slots while this wave runs.
+                 * One expert per device is the minimum useful wave: issuing fewer
+                 * strands cards and pays the parallel-region cost too often. */
+                if(g_cuda_transient_nvme && g_pipe){
+                    int ready=0;
+                    for(int j=0;j<nb;j++) if(!tr_seen[j] && !(early_issued&&done_j[j])){
+                        if(qof[j]<0 || pipe_ready(qof[j])) ready++;
+                        else if(wait_j<0) wait_j=j;
                     }
-                if(nr<g_cuda_transient_min_rows) continue;
-                if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait+=now_s()-tw; }
-                tr_j[tr_count]=j; tr_n[tr_count]=nr; tr_off[tr_count]=tr_total;
-                const float *xsrc=E8_XE(e);
-                for(int r=0;r<nr;r++) memcpy(group_x+(int64_t)(tr_total+r)*D,
-                    xsrc+(int64_t)group_row[(int64_t)tr_count*S+r]*D,D*sizeof(float));
-                tr_total+=nr; tr_count++;
-            }
-            double tr0=now_s();
-            /* Keep GPU upload workers out of OpenMP: changing its hot team from the
-             * decode thread count to six devices cuts later CPU-expert bandwidth. */
-            pthread_t workers[COLI_CUDA_MAX_DEVICES];
-            CudaTransientTask tasks[COLI_CUDA_MAX_DEVICES];
-            int started[COLI_CUDA_MAX_DEVICES]={0};
-            for(int di=0;di<g_cuda_ndev;di++){
-                tasks[di]=(CudaTransientTask){use,tr_j,tr_n,tr_off,tr_ok,
-                    group_x,group_y,di,g_cuda_ndev,tr_count,D,I,0,0};
-                started[di]=pthread_create(&workers[di],NULL,cuda_transient_worker,
-                                            &tasks[di])==0;
-                if(!started[di])cuda_transient_worker(&tasks[di]);
-            }
-            for(int di=0;di<g_cuda_ndev;di++){
-                if(started[di])pthread_join(workers[di],NULL);
-                if(!tasks[di].piped)continue;
-                g_cuda_transient_pipeline_s+=tasks[di].elapsed;
-                for(int ti=di;ti<tr_count;ti+=g_cuda_ndev){
-                    g_cuda_transient_calls++;
-                    g_cuda_transient_rows+=(uint64_t)tr_n[ti];
+                    if(ready<g_cuda_ndev && wait_j>=0){
+                        double tw=now_s(); pipe_wait(qof[wait_j]); m->t_ewait+=now_s()-tw;
+                        continue;
+                    }
+                    wait_j=-1;
                 }
-            }
-            for(int q=0;q<tr_count;q++) if(tr_ok[q]){
-                transient_done[tr_j[q]]=1;
-                for(int r=0;r<tr_n[q];r++){
-                    int row=group_row[(int64_t)q*S+r];
-                    float *os=out+(int64_t)row*D;
-                    float wgt=group_weight[(int64_t)q*S+r];
-                    const float *hr=group_y+(int64_t)(tr_off[q]+r)*D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                for(int j=0;j<nb;j++){
+                    if(tr_seen[j]) continue;
+                    if(early_issued && done_j[j]){ tr_seen[j]=1; tr_left--; continue; }
+                    if(g_cuda_transient_nvme && g_pipe && qof[j]>=0 && !pipe_ready(qof[j])){
+                        if(wait_j<0) wait_j=j;
+                        continue;
+                    }
+                    if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait+=now_s()-tw; }
+                    tr_seen[j]=1; tr_left--;
+                    ESlot *e=use[j];
+                    if(e->g.cuda_eligible || e->g.fmt!=2 || e->u.fmt!=2 || e->d.fmt!=2) continue;
+                    int nr=0,eid=uniq[base+j];
+                    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                        if(idxs[(int64_t)s*K+kk]==eid){
+                            group_row[(int64_t)tr_count*S+nr]=s;
+                            group_weight[(int64_t)tr_count*S+nr]=ws[(int64_t)s*K+kk];
+                            nr++; break;
+                        }
+                    if(nr<g_cuda_transient_min_rows) continue;
+                    tr_j[tr_count]=j; tr_n[tr_count]=nr; tr_off[tr_count]=tr_total;
+                    const float *xsrc=E8_XE(e);
+                    for(int r=0;r<nr;r++) memcpy(group_x+(int64_t)(tr_total+r)*D,
+                        xsrc+(int64_t)group_row[(int64_t)tr_count*S+r]*D,D*sizeof(float));
+                    tr_total+=nr; tr_count++;
                 }
+                if(!tr_count && wait_j>=0){
+                    double tw=now_s(); pipe_wait(qof[wait_j]); m->t_ewait+=now_s()-tw;
+                    continue;
+                }
+                if(!tr_count) continue;
+                if(g_cuda_transient_nvme){
+                    g_cuda_transient_nvme_waves++;
+                    for(int q=0;q<tr_count;q++) if(qof[tr_j[q]]>=0)
+                        g_cuda_transient_nvme_experts++;
+                }
+                double tr0=now_s();
+                /* Keep GPU upload workers out of OpenMP: changing its hot team from the
+                 * decode thread count to six devices cuts later CPU-expert bandwidth. */
+                pthread_t workers[COLI_CUDA_MAX_DEVICES];
+                CudaTransientTask tasks[COLI_CUDA_MAX_DEVICES];
+                int started[COLI_CUDA_MAX_DEVICES]={0};
+                for(int di=0;di<g_cuda_ndev;di++){
+                    tasks[di]=(CudaTransientTask){use,tr_j,tr_n,tr_off,tr_ok,
+                        group_x,group_y,di,g_cuda_ndev,tr_count,D,I,0,0};
+                    started[di]=pthread_create(&workers[di],NULL,cuda_transient_worker,
+                                                &tasks[di])==0;
+                    if(!started[di])cuda_transient_worker(&tasks[di]);
+                }
+                for(int di=0;di<g_cuda_ndev;di++){
+                    if(started[di])pthread_join(workers[di],NULL);
+                    if(!tasks[di].piped)continue;
+                    g_cuda_transient_pipeline_s+=tasks[di].elapsed;
+                    for(int ti=di;ti<tr_count;ti+=g_cuda_ndev){
+                        g_cuda_transient_calls++;
+                        g_cuda_transient_rows+=(uint64_t)tr_n[ti];
+                    }
+                }
+                for(int q=0;q<tr_count;q++) if(tr_ok[q]){
+                    transient_done[tr_j[q]]=1;
+                    for(int r=0;r<tr_n[q];r++){
+                        int row=group_row[(int64_t)q*S+r];
+                        float *os=out+(int64_t)row*D;
+                        float wgt=group_weight[(int64_t)q*S+r];
+                        const float *hr=group_y+(int64_t)(tr_off[q]+r)*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                    }
+                }
+                double trdt=now_s()-tr0; m->t_emm+=trdt; if(g_prof)m->t_egpu+=trdt;
             }
-            double trdt=now_s()-tr0; m->t_emm+=trdt; if(g_prof)m->t_egpu+=trdt;
         }
 #endif
         if(!metal_done && !xexp_done && !vk_active)
@@ -8017,6 +8062,8 @@ int main(int argc, char **argv){
     g_cuda_resid=getenv("COLI_CUDA_RESID")?atoi(getenv("COLI_CUDA_RESID")):0;
     g_cuda_transient_prefill=getenv("COLI_CUDA_TRANSIENT_PREFILL")?
         atoi(getenv("COLI_CUDA_TRANSIENT_PREFILL"))!=0:0;
+    g_cuda_transient_nvme=getenv("COLI_CUDA_TRANSIENT_NVME")?
+        atoi(getenv("COLI_CUDA_TRANSIENT_NVME"))!=0:0;
     g_cuda_transient_min_rows=getenv("COLI_CUDA_TRANSIENT_MIN_ROWS")?
         atoi(getenv("COLI_CUDA_TRANSIENT_MIN_ROWS")):1;
     if(g_cuda_transient_min_rows<1) g_cuda_transient_min_rows=1;
@@ -8024,10 +8071,16 @@ int main(int argc, char **argv){
         fprintf(stderr,"[CUDA] transient prefill requires COLI_CUDA=1 and at least two devices; disabled\n");
         g_cuda_transient_prefill=0;
     }
+    if(g_cuda_transient_nvme && (!g_cuda_transient_prefill || !g_pipe)){
+        fprintf(stderr,"[CUDA] transient NVMe overlap requires COLI_CUDA_TRANSIENT_PREFILL=1 and PIPE=1; disabled\n");
+        g_cuda_transient_nvme=0;
+    }
     if(g_cuda_transient_prefill){
         atexit(cuda_transient_cleanup);
         fprintf(stderr,"[CUDA] transient prefill experts ON across %d devices (min rows %d)\n",
                 g_cuda_ndev,g_cuda_transient_min_rows);
+        if(g_cuda_transient_nvme)
+            fprintf(stderr,"[CUDA] transient NVMe ready-first overlap ON\n");
     }
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
