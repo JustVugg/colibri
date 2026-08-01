@@ -7,6 +7,175 @@ else:
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def test_full_mode_start_refuses_wrong_usage_identity_before_seed_or_spawn(self):
+        class FakeSocket:
+            def bind(self, address):
+                pass
+
+            def close(self):
+                pass
+
+        with ModelFixture() as fixture, canonical_temporary_directory() as state:
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root, mode="full"),
+                hardware=hardware_fixture(),
+            )
+            manifest = {
+                "state": "ready",
+                "base_port": 8000,
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(plan["mounts"][0])],
+                "processes": [],
+                "ports": [],
+            }
+            with mock.patch.dict(
+                os.environ, {"XDG_STATE_HOME": state}
+            ), mock.patch.object(
+                ramdisk, "_filesystem_for_path", return_value="ext4"
+            ), mock.patch.object(
+                ramdisk, "_load_manifest", return_value=manifest
+            ), mock.patch.object(
+                ramdisk, "_assert_effective_masks_unchanged"
+            ), mock.patch.object(
+                ramdisk, "_assert_ready_mounts"
+            ), mock.patch.object(
+                ramdisk, "_save_manifest"
+            ), mock.patch.object(
+                ramdisk, "_admit_concurrent_runtimes"
+            ), mock.patch.object(
+                ramdisk.socket,
+                "socket",
+                side_effect=lambda *args, **kwargs: FakeSocket(),
+            ), mock.patch.object(
+                ramdisk, "_usage_write"
+            ) as usage_write, mock.patch.object(
+                ramdisk.subprocess, "Popen"
+            ) as popen:
+                for header, message in (
+                    ("-1 1 2\n-2 1 1\n", "engine identity"),
+                    (
+                        "-1 9 2\n-2 1 3815245270\n",
+                        "dimensions",
+                    ),
+                ):
+                    with self.subTest(message=message):
+                        (fixture.root / ".coli_usage").write_text(
+                            header + "0 1 10\n",
+                            encoding="utf-8",
+                        )
+                        with self.assertRaisesRegex(
+                            ramdisk.RamdiskError,
+                            message,
+                        ):
+                            ramdisk.start.__wrapped__(
+                                argparse.Namespace(base_port=None),
+                                cli_path=sys.executable,
+                            )
+
+        usage_write.assert_not_called()
+        popen.assert_not_called()
+        self.assertEqual(manifest["state"], "ready")
+
+    def test_start_stop_preserve_headered_usage_identity(self):
+        engine_id = 3815245270
+        usage_header = "-1 1 2\n-2 1 %d\n" % engine_id
+
+        class FakeSocket:
+            def bind(self, address):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            pid = 4300
+
+            def poll(self):
+                return None
+
+        nonce = "a" * 48
+        identity = {
+            "pid": 4300,
+            "pgid": 4300,
+            "uid": host_uid(),
+            "starttime": 14300,
+            "nonce": nonce,
+        }
+        with ModelFixture() as fixture, canonical_temporary_directory() as state:
+            canonical = fixture.root / ".coli_usage"
+            canonical.write_text(
+                usage_header + "0 1 10\n",
+                encoding="utf-8",
+            )
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
+            manifest = {
+                "state": "ready",
+                "base_port": 8000,
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(plan["mounts"][0])],
+                "processes": [],
+                "ports": [],
+            }
+            with mock.patch.dict(
+                os.environ, {"XDG_STATE_HOME": state}
+            ), mock.patch.object(
+                ramdisk, "_filesystem_for_path", return_value="ext4"
+            ), mock.patch.object(
+                ramdisk, "_load_manifest", return_value=manifest
+            ), mock.patch.object(
+                ramdisk, "_assert_effective_masks_unchanged"
+            ), mock.patch.object(
+                ramdisk, "_assert_ready_mounts"
+            ), mock.patch.object(
+                ramdisk, "_save_manifest"
+            ), mock.patch.object(
+                ramdisk, "_admit_concurrent_runtimes"
+            ), mock.patch.object(
+                ramdisk.socket,
+                "socket",
+                side_effect=lambda *args, **kwargs: FakeSocket(),
+            ), mock.patch.object(
+                ramdisk.subprocess, "Popen", return_value=FakeProcess()
+            ), mock.patch.object(
+                ramdisk, "_proc_identity", return_value=identity
+            ), mock.patch.object(
+                ramdisk, "_wait_managed_ready"
+            ), mock.patch.object(
+                ramdisk,
+                "_process_matches",
+                return_value=(False, "not-running", None),
+            ), mock.patch.object(
+                ramdisk.secrets,
+                "token_hex",
+                side_effect=lambda size: "a" * (size * 2),
+            ):
+                launched = ramdisk.start.__wrapped__(
+                    argparse.Namespace(base_port=None),
+                    cli_path=sys.executable,
+                )
+                record = launched["processes"][0]
+                state_usage = Path(record["state_dir"]) / ".coli_usage"
+                self.assertTrue(
+                    state_usage.read_text(encoding="utf-8").startswith(
+                        usage_header
+                    )
+                )
+                current = ramdisk._usage_read(str(state_usage))
+                current["0:1"] = 12
+                ramdisk._usage_write(str(state_usage), current)
+                stopped = ramdisk.stop.__wrapped__()
+
+            self.addCleanup(ramdisk._forget_managed_child, 4300)
+            merged = ramdisk._usage_read(str(canonical))
+            self.assertEqual(stopped["state"], "stopped")
+            self.assertEqual(merged["0:1"], 12)
+            self.assertEqual(merged["-1:1"], 2)
+            self.assertEqual(merged["-2:1"], engine_id)
+
     def test_per_node_launch_forces_durable_kv_and_node_local_core_counts(self):
         captures = []
         nonce = "a" * 48

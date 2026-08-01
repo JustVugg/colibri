@@ -6,7 +6,35 @@ else:
     from ramdisk_test_support import *  # noqa: F401,F403
 
 
+def quantized_expert_tensors(fmt, hidden=384, intermediate=256):
+    tensors = []
+    for projection, rows, columns in (
+        ("gate_proj", intermediate, hidden),
+        ("up_proj", intermediate, hidden),
+        ("down_proj", hidden, intermediate),
+    ):
+        name = "model.layers.0.mlp.experts.0.%s.weight" % projection
+        if fmt == 1:
+            weight_bytes, scale_bytes = rows * columns, rows * 4
+        elif fmt == 5:
+            groups = (columns + 63) // 64
+            weight_bytes, scale_bytes = rows * groups * 24, rows * groups * 4
+        elif fmt == 6:
+            weight_bytes = rows * ((columns + 255) // 256) * 98
+            scale_bytes = 4
+        elif fmt == 8:
+            weight_bytes = rows * columns
+            scale_bytes = ((rows + 127) // 128) * ((columns + 127) // 128) * 4
+        else:
+            raise AssertionError("unsupported test format")
+        tensors.append((name, "U8", weight_bytes, [weight_bytes]))
+        tensors.append((name + ".qs", "F32", scale_bytes, [scale_bytes // 4]))
+    return tensors
+
+
 class ScanAndPlanTest(unittest.TestCase):
+    GLM_USAGE_HEADER = "-1 1 2\n-2 1 3815245270\n"
+
     def test_scan_indexes_complete_six_tensor_experts_and_sorted_shards(self):
         with ModelFixture() as fixture:
             model = ramdisk.scan_model(str(fixture.root))
@@ -15,6 +43,62 @@ class ScanAndPlanTest(unittest.TestCase):
         self.assertEqual(len(model["experts"]["0:0"]["tensors"]), 6)
         self.assertEqual(model["experts"]["0:0"]["shards"], model["shard_names"])
         self.assertTrue(model["experts"]["0:1"]["direct_map_eligible"])
+
+    def test_scan_accepts_all_direct_engine_expert_formats(self):
+        for fmt in (5, 6, 8):
+            with self.subTest(fmt=fmt), ModelFixture() as fixture:
+                for shard in fixture.root.glob("*.safetensors"):
+                    shard.unlink()
+                tensors = quantized_expert_tensors(fmt)
+                write_safetensors(fixture.root / "model.safetensors", tensors)
+                config_path = fixture.root / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config.update(hidden_size=384, moe_intermediate_size=256)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                model = ramdisk.scan_model(str(fixture.root))
+
+                expert = model["experts"]["0:0"]
+                self.assertTrue(expert["direct_map_eligible"])
+                self.assertEqual(expert["tensor_bytes"], sum(item[2] for item in tensors))
+
+    def test_scan_rejects_ambiguous_or_corrupt_direct_format_geometry(self):
+        fixtures = {
+            "unstamped E8/FP8 collision": (6, 98, 64, None),
+            "wrong FP8 scale count": (8, 384, 256, 4),
+        }
+        for label, (fmt, hidden, intermediate, extra_scale_bytes) in fixtures.items():
+            with self.subTest(case=label), ModelFixture() as fixture:
+                for shard in fixture.root.glob("*.safetensors"):
+                    shard.unlink()
+                tensors = quantized_expert_tensors(fmt, hidden, intermediate)
+                if extra_scale_bytes:
+                    name, dtype, size, shape = tensors[1]
+                    tensors[1] = (name, dtype, size + extra_scale_bytes,
+                                  [shape[0] + extra_scale_bytes // 4])
+                write_safetensors(fixture.root / "model.safetensors", tensors)
+                config_path = fixture.root / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config.update(hidden_size=hidden, moe_intermediate_size=intermediate)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                model = ramdisk.scan_model(str(fixture.root))
+
+                self.assertFalse(model["experts"]["0:0"]["direct_map_eligible"])
+
+    def test_scan_preserves_unstamped_int8_fp8_collision_inversion(self):
+        with ModelFixture() as fixture:
+            for shard in fixture.root.glob("*.safetensors"):
+                shard.unlink()
+            # gate/up [2,256] have two per-row scales and two FP8 blocks. The
+            # engine's unstamped policy deliberately selects incumbent int8.
+            tensors = quantized_expert_tensors(1, hidden=256, intermediate=2)
+            write_safetensors(fixture.root / "model.safetensors", tensors)
+            config_path = fixture.root / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.update(hidden_size=256, moe_intermediate_size=2)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            model = ramdisk.scan_model(str(fixture.root))
+
+        self.assertTrue(model["experts"]["0:0"]["direct_map_eligible"])
 
     def test_fingerprint_changes_when_source_identity_changes(self):
         with ModelFixture() as fixture:
@@ -90,6 +174,31 @@ class ScanAndPlanTest(unittest.TestCase):
         self.assertGreater(
             plan["profile"]["predicted_expert_bytes_avoided_per_staged_byte"], 0
         )
+
+    def test_headered_profile_validates_model_dimensions_and_engine(self):
+        with ModelFixture() as fixture:
+            model = ramdisk.scan_model(str(fixture.root))
+            profile = fixture.root / ".coli_usage"
+            profile.write_text(
+                self.GLM_USAGE_HEADER + "0 1 10\n",
+                encoding="utf-8",
+            )
+            _, counts = ramdisk._load_profile(str(profile), model)
+            self.assertEqual(counts, {"0:1": 10})
+
+            profile.write_text(
+                "-1 9 2\n-2 1 3815245270\n0 1 10\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ramdisk.RamdiskError, "dimensions"):
+                ramdisk._load_profile(str(profile), model)
+
+            profile.write_text(
+                "-1 1 2\n-2 1 1\n0 1 10\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ramdisk.RamdiskError, "engine"):
+                ramdisk._load_profile(str(profile), model)
 
     def test_partial_mode_requires_a_profile_and_positive_budget(self):
         with ModelFixture() as fixture:

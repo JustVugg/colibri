@@ -341,6 +341,7 @@ def start(
     recover_delta,
     usage_read,
     usage_write,
+    validate_usage_for_plan,
     managed_numa_enabled,
     memory_node_list,
     engine_cpu_list,
@@ -539,6 +540,39 @@ def start(
             "COLI_RAMDISK_START_TIMEOUT must be between 1 and 86400 "
             "seconds"
         )
+    # Recover every stable replica state first, then validate one canonical
+    # seed before creating any per-engine copy or spawning the first child.
+    # A later replica's journal therefore cannot introduce an incompatible
+    # identified header after an earlier replica has already launched.
+    seed_state_dirs = []
+    for mount in manifest["mounts"]:
+        _raise_if_cancelled(cancel_event)
+        node = mount.get("node")
+        label = (
+            "interleaved"
+            if node is None
+            else "node-%d" % node
+        )
+        state_dir = os.path.join(
+            state_root(),
+            "engines",
+            fingerprint_dir,
+            label,
+        )
+        ensure_private_dir(state_dir)
+        assert_durable_state_dir(state_dir, plan=plan)
+        recover_delta(
+            state_dir,
+            canonical_usage,
+            plan=plan,
+        )
+        seed_state_dirs.append(state_dir)
+    canonical_baseline = usage_read(canonical_usage)
+    validate_usage_for_plan(
+        canonical_baseline,
+        plan,
+        source="canonical usage history %s" % canonical_usage,
+    )
     # Admit the complete replica set from one shared cgroup snapshot before
     # spawning the first child.
     admit_concurrent_runtimes(
@@ -557,25 +591,8 @@ def start(
         for index, mount in enumerate(manifest["mounts"]):
             _raise_if_cancelled(cancel_event)
             node = mount.get("node")
-            label = (
-                "interleaved"
-                if node is None
-                else "node-%d" % node
-            )
-            state_dir = os.path.join(
-                state_root(),
-                "engines",
-                fingerprint_dir,
-                label,
-            )
-            ensure_private_dir(state_dir)
-            assert_durable_state_dir(state_dir, plan=plan)
-            recover_delta(
-                state_dir,
-                canonical_usage,
-                plan=plan,
-            )
-            baseline = usage_read(canonical_usage)
+            state_dir = seed_state_dirs[index]
+            baseline = dict(canonical_baseline)
             usage_write(
                 os.path.join(state_dir, ".coli_usage"),
                 baseline,
@@ -637,7 +654,6 @@ def start(
                 "COLI_GPUS",
                 "COLI_GPU",
                 "COLI_CUDA",
-                "COLI_METAL",
                 "COLI_NO_OMP_TUNE",
                 "COLI_OMP_TUNED",
                 "DIRECT",

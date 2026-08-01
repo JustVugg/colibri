@@ -21,7 +21,10 @@ from .common import (
     _path_is_below,
     _path_without_symlinks,
     _positive_int,
+    _validated_usage_header,
     _utc_now,
+    _usage_engine_id,
+    _usage_engine_name,
 )
 from .platform_ops import current_uid, get_platform_ops
 from .accelerator import _managed_accelerator_contract
@@ -538,13 +541,138 @@ def _read_optional_text(path):
         return ""
 
 
+def _usage_header(counts, source="usage history"):
+    if not isinstance(counts, dict):
+        raise RamdiskError("%s counts must contain an object" % source)
+    records = []
+    for key, value in counts.items():
+        if not isinstance(key, str):
+            continue
+        match = re.fullmatch(r"(-?\d+):(\d+)", key)
+        if not match:
+            continue
+        layer, second = (int(item) for item in match.groups())
+        if layer in (-1, -2):
+            try:
+                records.append((layer, second, int(value)))
+            except (TypeError, ValueError):
+                raise RamdiskError("%s has a malformed usage header" % source)
+    return _validated_usage_header(records, source=source)
+
+
+def _validate_usage_for_plan(counts, plan, source="usage history"):
+    """Validate identified usage metadata against the managed model."""
+    header = _usage_header(counts, source=source)
+    if header is None:
+        return None
+    try:
+        model_path = plan["model"]["path"]
+        with open(
+            os.path.join(model_path, "config.json"),
+            "r",
+            encoding="utf-8",
+        ) as stream:
+            config = json.load(stream)
+        if not isinstance(config, dict):
+            raise ValueError("config root is not an object")
+        dimensions = (
+            int(config["num_hidden_layers"]),
+            int(config["n_routed_experts"]),
+        )
+        engine_id = _usage_engine_id(
+            _usage_engine_name(config.get("model_type"))
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise RamdiskError(
+            "cannot validate %s against the managed model config: %s"
+            % (source, exc)
+        )
+    return _validated_usage_header(
+        [
+            (-1, header["n_layers"], header["n_experts"]),
+            (
+                -2,
+                header["format_version"],
+                header["engine_id"],
+            ),
+        ],
+        source=source,
+        expected_dimensions=dimensions,
+        expected_engine_id=engine_id,
+    )
+
+
+def _usage_header_counts(header):
+    if not header:
+        return {}
+    return {
+        "-1:%d" % header["n_layers"]: header["n_experts"],
+        "-2:%d" % header["format_version"]: header["engine_id"],
+    }
+
+
+def _usage_data_counts(counts):
+    result = {}
+    for key, value in counts.items():
+        if not isinstance(key, str):
+            continue
+        match = re.fullmatch(r"(\d+):(\d+)", key)
+        if match:
+            result[key] = int(value)
+    return result
+
+
+def _compatible_usage_header(*histories):
+    reference = None
+    reference_source = None
+    for source, counts in histories:
+        header = _usage_header(counts, source=source)
+        if header is None:
+            continue
+        if reference is None:
+            reference = header
+            reference_source = source
+            continue
+        if (
+            header["n_layers"],
+            header["n_experts"],
+        ) != (
+            reference["n_layers"],
+            reference["n_experts"],
+        ):
+            raise RamdiskError(
+                "%s history dimensions do not match %s"
+                % (source, reference_source)
+            )
+        if header["format_version"] != reference["format_version"]:
+            raise RamdiskError(
+                "%s usage format version does not match %s"
+                % (source, reference_source)
+            )
+        if header["engine_id"] != reference["engine_id"]:
+            raise RamdiskError(
+                "%s engine identity does not match %s"
+                % (source, reference_source)
+            )
+    return reference
+
+
 def _usage_read(path):
     counts = {}
+    header_records = []
     for line in _read_optional_text(path).splitlines():
         match = PROFILE_LINE_RE.match(line)
-        if match:
-            layer, expert, count = (int(value) for value in match.groups())
+        if not match:
+            if re.match(r"^\s*-(?:1|2)(?:\s|$)", line):
+                raise RamdiskError("%s has a malformed usage header" % path)
+            continue
+        layer, expert, count = (int(value) for value in match.groups())
+        if layer in (-1, -2):
+            header_records.append((layer, expert, count))
+        elif layer >= 0:
             counts["%d:%d" % (layer, expert)] = count
+    header = _validated_usage_header(header_records, source=path)
+    counts.update(_usage_header_counts(header))
     return counts
 
 
@@ -588,11 +716,24 @@ def _usage_write(path, counts, merge_id=None, merge_ids=None):
     markers = set(merge_ids or ())
     if merge_id:
         markers.add(merge_id)
+    header = _usage_header(counts, source=path)
+    data_counts = _usage_data_counts(counts)
     fd, tmp = tempfile.mkstemp(prefix=".usage-", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            # route_trace.h deliberately keeps an all-zero history zero-byte,
+            # so emit identifying records only when there are data records.
+            if header and data_counts:
+                stream.write(
+                    "-1 %d %d\n"
+                    % (header["n_layers"], header["n_experts"])
+                )
+                stream.write(
+                    "-2 %d %d\n"
+                    % (header["format_version"], header["engine_id"])
+                )
             for key in sorted(
-                counts,
+                data_counts,
                 key=lambda item: tuple(
                     int(value)
                     for value in item.split(":")
@@ -600,7 +741,7 @@ def _usage_write(path, counts, merge_id=None, merge_ids=None):
             ):
                 layer, expert = key.split(":")
                 stream.write(
-                    "%s %s %d\n" % (layer, expert, counts[key])
+                    "%s %s %d\n" % (layer, expert, data_counts[key])
                 )
             for marker in sorted(markers):
                 stream.write("# coli-ramdisk-merge %s\n" % marker)
@@ -675,6 +816,12 @@ def _recover_delta(
     delta = payload.get("delta", {})
     if not isinstance(delta, dict):
         raise RamdiskError("usage delta journal has invalid counts")
+    headers = payload.get("headers", {})
+    if not isinstance(headers, dict):
+        raise RamdiskError("usage delta journal has invalid headers")
+    _compatible_usage_header(
+        ("usage delta journal", headers),
+    )
     merge_id = payload.get("id")
     if not merge_id:
         raise RamdiskError(
@@ -699,8 +846,17 @@ def _recover_delta(
             applied = _usage_merge_ids(canonical_path)
             if merge_id not in applied:
                 canonical = _usage_read(canonical_path)
+                merged_header = _compatible_usage_header(
+                    ("usage delta journal", headers),
+                    ("canonical usage history", canonical),
+                )
                 for key, value in delta.items():
+                    if not re.fullmatch(r"\d+:\d+", str(key)):
+                        raise RamdiskError(
+                            "usage delta journal has invalid counts"
+                        )
                     canonical[key] = canonical.get(key, 0) + int(value)
+                canonical.update(_usage_header_counts(merged_header))
                 applied.add(merge_id)
                 _usage_write(
                     canonical_path,
@@ -727,10 +883,16 @@ def _merge_usage(
     state_usage = os.path.join(record["state_dir"], ".coli_usage")
     current = _usage_read(state_usage)
     baseline = record.get("usage_baseline", {})
+    source_header = _compatible_usage_header(
+        ("managed usage history", current),
+        ("usage baseline", baseline),
+    )
+    current_counts = _usage_data_counts(current)
+    baseline_counts = _usage_data_counts(baseline)
     delta = {
-        key: value - baseline.get(key, 0)
-        for key, value in current.items()
-        if value > baseline.get(key, 0)
+        key: value - baseline_counts.get(key, 0)
+        for key, value in current_counts.items()
+        if value > baseline_counts.get(key, 0)
     }
     delta_path = os.path.join(
         record["state_dir"],
@@ -750,6 +912,33 @@ def _merge_usage(
     if merge_id in _usage_merge_ids(canonical_path):
         return
     if not delta:
+        # A current engine upgrades a legacy headerless seed when it saves.
+        # Preserve that newly known identity even when no counters changed.
+        if source_header is not None:
+            _assert_canonical_usage_target(
+                canonical_path,
+                plan=plan,
+                source_still_matches=source_still_matches,
+            )
+            lock_path = os.path.join(_state_root(), "usage.lock")
+            _ensure_private_dir(os.path.dirname(lock_path))
+            with open(lock_path, "a+", encoding="utf-8") as lock:
+                with _usage_lock(lock):
+                    canonical = _usage_read(canonical_path)
+                    canonical_header = _compatible_usage_header(
+                        ("managed usage history", current),
+                        ("usage baseline", baseline),
+                        ("canonical usage history", canonical),
+                    )
+                    if _usage_header(canonical) is None:
+                        canonical.update(
+                            _usage_header_counts(canonical_header)
+                        )
+                        _usage_write(
+                            canonical_path,
+                            canonical,
+                            merge_ids=_usage_merge_ids(canonical_path),
+                        )
         try:
             _durable_unlink(delta_path)
         except OSError:
@@ -761,6 +950,7 @@ def _merge_usage(
             "version": 1,
             "id": merge_id,
             "delta": delta,
+            "headers": _usage_header_counts(source_header),
             "created_at": _utc_now(),
         },
     )
@@ -776,8 +966,13 @@ def _merge_usage(
             applied = _usage_merge_ids(canonical_path)
             if merge_id not in applied:
                 canonical = _usage_read(canonical_path)
+                merged_header = _compatible_usage_header(
+                    ("usage delta journal", _usage_header_counts(source_header)),
+                    ("canonical usage history", canonical),
+                )
                 for key, value in delta.items():
                     canonical[key] = canonical.get(key, 0) + value
+                canonical.update(_usage_header_counts(merged_header))
                 applied.add(merge_id)
                 _usage_write(
                     canonical_path,

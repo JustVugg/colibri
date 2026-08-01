@@ -24,7 +24,9 @@ MIB = 1 << 20
 
 TMPFS_MAGIC = 0x01021994
 
-PROFILE_LINE_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s*$")
+PROFILE_LINE_RE = re.compile(r"^\s*(-?\d+)\s+(\d+)\s+(\d+)\s*$")
+
+USAGE_FORMAT_VERSION = 1
 
 USAGE_MERGE_RE = re.compile(r"^# coli-ramdisk-merge ([0-9a-f]{32})$")
 
@@ -36,6 +38,81 @@ class _OperationCancelled(RamdiskError):
 
 class _EngineCleanupError(RamdiskError):
     """A benchmark engine may still be live, so no later variant may launch."""
+
+
+def _usage_engine_id(name):
+    """Return route_trace.h's stable 32-bit FNV-1a engine identity."""
+    value = 2166136261
+    for byte in str(name).encode("utf-8"):
+        value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
+    return value
+
+
+def _usage_engine_name(model_type):
+    """Mirror the launcher's model-type to route_trace engine mapping."""
+    normalized = str(model_type or "").lower()
+    if "inkling" in normalized:
+        return "inkling"
+    if "kimi" in normalized:
+        return "kimi_k3"
+    return "glm_moe_dsa"
+
+
+def _validated_usage_header(
+    records,
+    source="usage history",
+    expected_dimensions=None,
+    expected_engine_id=None,
+):
+    """Validate the two route_trace.h identified-history records."""
+    dimensions = []
+    formats = []
+    for layer, second, third in records:
+        if layer == -1:
+            dimensions.append((int(second), int(third)))
+        elif layer == -2:
+            formats.append((int(second), int(third)))
+    if not dimensions and not formats:
+        return None
+    if len(dimensions) != 1 or len(formats) != 1:
+        raise RamdiskError(
+            "%s must contain both usage headers exactly once" % source
+        )
+    n_layers, n_experts = dimensions[0]
+    version, engine_id = formats[0]
+    if n_layers < 0 or n_experts < 1:
+        raise RamdiskError("%s has invalid history dimensions" % source)
+    if version > USAGE_FORMAT_VERSION:
+        raise RamdiskError(
+            "%s uses unsupported usage format version %d" % (source, version)
+        )
+    if not 0 <= engine_id <= 0xFFFFFFFF:
+        raise RamdiskError("%s has an invalid engine identity" % source)
+    if expected_dimensions is not None and (
+        n_layers,
+        n_experts,
+    ) != tuple(expected_dimensions):
+        raise RamdiskError(
+            "%s dimensions %d x %d do not match the selected model's %d x %d"
+            % (
+                source,
+                n_layers,
+                n_experts,
+                expected_dimensions[0],
+                expected_dimensions[1],
+            )
+        )
+    if expected_engine_id is not None and engine_id != expected_engine_id:
+        raise RamdiskError(
+            "%s engine identity does not match the selected model" % source
+        )
+    return {
+        "n_layers": n_layers,
+        "n_experts": n_experts,
+        "format_version": version,
+        "engine_id": engine_id,
+    }
+
 
 def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()

@@ -40,6 +40,8 @@ ACCELERATOR_ENVIRONMENT_KEYS = (
     "CUDA_DEVICE_ORDER",
     "CUDA_VISIBLE_DEVICES",
     "COLI_CUDA",
+    "COLI_METAL",
+    "COLI_VULKAN",
     "COLI_CUDA_DUAL_PROJ",
     "COLI_CUDA_MTP",
     "COLI_CUDA_PIPE",
@@ -60,6 +62,7 @@ ACCELERATOR_ENVIRONMENT_KEYS = (
     "COLI_GPU_FAIL_AFTER",
     "CUDA_EXPERT_GB",
     "CUDA_DENSE",
+    "CUDA_RAW_EXPERTS",
     "CUDA_RESERVE_GB",
     "COLI_CUDA_ATTN",
     "COLI_CUDA_ATTN_SHARD",
@@ -76,6 +79,13 @@ ACCELERATOR_ENVIRONMENT_KEYS = (
     "REPIN",
     "REPIN_VERBOSE",
     "SPEC_PIN",
+)
+
+ACCELERATOR_ENVIRONMENT_PREFIXES = (
+    "COLI_ANS_",
+    "COLI_CUDA_",
+    "COLI_METAL_",
+    "COLI_VK_",
 )
 
 
@@ -549,8 +559,12 @@ def _apply_managed_accelerator_environment(environment, plan):
             "ambient CUDA_VISIBLE_DEVICES prevents safe physical GPU "
             "selection; relaunch with it unset"
         )
-    for key in ACCELERATOR_ENVIRONMENT_KEYS:
-        environment.pop(key, None)
+    for key in tuple(environment):
+        if (
+            key in ACCELERATOR_ENVIRONMENT_KEYS
+            or key.startswith(ACCELERATOR_ENVIRONMENT_PREFIXES)
+        ):
+            environment.pop(key, None)
     applied = _managed_accelerator_environment(
         {"managed_accelerator": contract}
     )

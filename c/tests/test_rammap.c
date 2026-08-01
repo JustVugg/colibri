@@ -4,13 +4,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/vfs.h>
+#endif
 #include <unistd.h>
 
 #define main coli_glm_main_unused
 #include "../colibri.c"
 #undef main
 
+#ifdef __linux__
 static int fail(const char *what){ fprintf(stderr,"FAIL: %s\n",what); return 1; }
 
 static int expert_greedy_token(ESlot *slot,const float x[4],float out[4]){
@@ -50,10 +53,68 @@ static void add_expert(Model *m,int expert,int tfd,int mixed_fd){
     }
 }
 
+static int64_t add_quant_expert(Model *m,int fd,long fs_magic,int fmt,
+                                int hidden,int moe_inter,int64_t base){
+    static const char *proj[3]={"gate_proj","up_proj","down_proj"};
+    int OO[3]={moe_inter,moe_inter,hidden},II[3]={hidden,hidden,moe_inter};
+    memset(m,0,sizeof(*m)); m->c.hidden=hidden; m->c.moe_inter=moe_inter;
+    m->S.cap=6; m->S.t=calloc(6,sizeof(st_tensor));
+    m->S.fds[0]=fd; m->S.fs_magic[0]=fs_magic; m->S.is_tmpfs[0]=1; m->S.nfd=1;
+    int64_t off=base,total=0;
+    for(int k=0;k<3;k++){
+        int O=OO[k],I=II[k];
+        int64_t wb=fmt==6 ? (int64_t)O*e8_rowbytes(I) : (int64_t)O*I;
+        int64_t sb=fmt==6 ? 4 : fp8_nblk(O)*fp8_nblk(I)*4;
+        char name[300];
+        snprintf(name,sizeof(name),"model.layers.0.mlp.experts.0.%s.weight",proj[k]);
+        m->S.t[m->S.n++]=(st_tensor){strdup(name),fd,off,wb,3,wb}; off+=wb;
+        size_t n=strlen(name); memcpy(name+n,".qs",4);
+        m->S.t[m->S.n++]=(st_tensor){strdup(name),fd,off,sb,2,sb/4}; off+=sb;
+        total+=wb+sb;
+    }
+    return total;
+}
+
+static void free_quant_expert(Model *m){
+    for(int i=0;i<m->S.n;i++) free(m->S.t[i].name);
+    free(m->S.t);
+}
+
+static int check_direct_quant_format(int fd,long fs_magic,int fmt,int hidden,int moe_inter,
+                                     int64_t base,int64_t expected_total){
+    Model m; int64_t fixture_total=add_quant_expert(&m,fd,fs_magic,fmt,hidden,moe_inter,base);
+    ESlot slot={0}; int64_t got=rammap_bind_one(&m,0,0,&slot);
+    QT *q[3]={&slot.g,&slot.u,&slot.d};
+    int OO[3]={moe_inter,moe_inter,hidden},II[3]={hidden,hidden,moe_inter};
+    int bad=fixture_total!=expected_total || got!=expected_total ||
+            slot.eid!=0 || slot.backing!=ESLOT_BACKING_RAMMAP;
+    for(int k=0;k<3;k++){
+        int64_t want_weight=fmt==6 ? (int64_t)OO[k]*e8_rowbytes(II[k])
+                                   : (int64_t)OO[k]*II[k];
+        int64_t want_scale=fmt==6 ? 4 : fp8_nblk(OO[k])*fp8_nblk(II[k])*4;
+        if(q[k]->fmt!=fmt || q[k]->O!=OO[k] || q[k]->I!=II[k] || q[k]->gs!=0 ||
+           qt_scale_bytes(q[k])!=want_scale || qt_bytes(q[k])-want_scale!=want_weight ||
+           (fmt==6 ? q[k]->q4==NULL : q[k]->q8==NULL)) bad=1;
+    }
+    free_quant_expert(&m);
+    return bad ? fail(fmt==6 ? "direct E8 binding / geometry" :
+                               "direct FP8 binding / geometry") : 0;
+}
+#endif
+
 int main(void){
 #ifndef __linux__
     puts("test_rammap: skipped (Linux only)"); return 0;
 #else
+    uint8_t owned_byte=0;
+    ESlot no_host={0}, released_owned={.backing=ESLOT_BACKING_OWNED};
+    ESlot owned={.slab=&owned_byte,.backing=ESLOT_BACKING_OWNED};
+    ESlot rammap={.backing=ESLOT_BACKING_RAMMAP};
+    ESlot mmap_slot={.backing=ESLOT_BACKING_MMAP};
+    if(expert_host_ready(&no_host) || expert_host_ready(&released_owned) ||
+       !expert_host_ready(&owned) || !expert_host_ready(&rammap) ||
+       !expert_host_ready(&mmap_slot))
+        return fail("expert host-ready backing classification");
     QT grouped={.fmt=4,.O=2,.I=129,.gs=64};
     QT int3={.fmt=5,.O=2,.I=65};
     QT e8={.fmt=6,.O=2,.I=257};
@@ -104,6 +165,19 @@ int main(void){
        pwrite(rfd,data,sizeof(data),0)!=(ssize_t)sizeof(data)){
         close(tfd); close(rfd); unlink(tpath); unlink(rpath); return fail("fixture write");
     }
+    if(ftruncate(tfd,1<<20)) return fail("extended quantized fixture");
+    if(check_direct_quant_format(tfd,(long)tfs.f_type,6,384,256,4096,137996)) return 1;
+    if(check_direct_quant_format(tfd,(long)tfs.f_type,8,384,256,262144,294984)) return 1;
+
+    /* At I=98 the E8 weight/tag geometry collides with FP8 (and, for O=1,
+     * int8). Direct mapping must decline an unstamped ambiguous expert and
+     * leave the ordinary slab/SSD loader in charge, never guess a decoder. */
+    Model collision; add_quant_expert(&collision,tfd,(long)tfs.f_type,6,98,64,600000);
+    ESlot collision_slot={0};
+    if(rammap_bind_one(&collision,0,0,&collision_slot)!=0 ||
+       collision_slot.backing==ESLOT_BACKING_RAMMAP)
+        return fail("ambiguous E8/FP8 direct binding fails closed");
+    free_quant_expert(&collision);
 
     Model m={0}; m.c.n_layers=1; m.c.n_experts=2; m.c.hidden=4; m.c.moe_inter=3;
     m.c.first_dense=0; m.ebits=8; m.L=calloc(1,sizeof(Layer)); m.L[0].sparse=1;

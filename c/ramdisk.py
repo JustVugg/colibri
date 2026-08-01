@@ -257,6 +257,7 @@ from ramdisk_support.state import (
     _usage_merge_ids,
     _usage_read,
     _usage_write,
+    _validate_usage_for_plan,
 )
 
 
@@ -749,6 +750,7 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
         recover_delta=_recover_delta,
         usage_read=_usage_read,
         usage_write=_usage_write,
+        validate_usage_for_plan=_validate_usage_for_plan,
         managed_numa_enabled=_managed_numa_enabled,
         memory_node_list=_memory_node_list,
         engine_cpu_list=_engine_cpu_list,

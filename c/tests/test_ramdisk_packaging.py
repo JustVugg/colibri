@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,7 @@ SUPPORT_MODULES = (
     "version.py",
     "resource_plan.py",
     "doctor.py",
+    "autotune.py",
     "openai_server.py",
     "ramdisk.py",
     "ramdisk_ui.py",
@@ -162,6 +164,7 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertNotIn("cp -R ramdisk_support", result.stdout)
         self.assertIn("requirements-tui.txt", result.stdout)
         self.assertIn("version.py", result.stdout)
+        self.assertIn("autotune.py", result.stdout)
         self.assertIn("coli.libexec", result.stdout)
         self.assertIn("/usr/libexec/colibri/", result.stdout)
 
@@ -436,6 +439,7 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn("c/ramdisk.py", flake)
         self.assertIn("c/ramdisk_ui.py", flake)
         self.assertIn("c/ramdisk_textual.py", flake)
+        self.assertIn("c/autotune.py", flake)
         self.assertIn("install -d -m 755 $out/lib/colibri/ramdisk_support", flake)
         self.assertIn(
             "install -m 644 c/ramdisk_support/*.py "
@@ -447,7 +451,7 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn('make -C c colibri ARCH="$ARCH"', flake)
         self.assertIn("cp c/colibri", flake)
         self.assertIn('COLI_ENGINE "$out/lib/colibri/colibri"', flake)
-        self.assertIn('program = "${colibri}/bin/glm";', flake)
+        self.assertIn('program = "${colibri}/bin/colibri";', flake)
         self.assertIn("nativeCheckInputs = [pythonEnv];", flake)
         self.assertIn("export PYTHONDONTWRITEBYTECODE=1", flake)
         self.assertIn("make test\n", flake)
@@ -457,11 +461,13 @@ class RamdiskPackagingTest(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("make colibri ${{ matrix.make_args }}", workflow)
+        self.assertIn("for t in colibri inkling kimi_k3 olmoe; do", workflow)
+        self.assertIn("make $t ${{ matrix.make_args }}", workflow)
         self.assertIn("cp c/colibri${{ matrix.ext }}", workflow)
         self.assertIn("cp c/ramdisk.py dist/", workflow)
         self.assertIn("cp c/ramdisk_ui.py dist/", workflow)
         self.assertIn("cp c/ramdisk_textual.py dist/", workflow)
+        self.assertIn("cp c/autotune.py dist/", workflow)
         self.assertIn("mkdir -p dist/ramdisk_support", workflow)
         self.assertIn(
             "cp c/ramdisk_support/*.py dist/ramdisk_support/",
@@ -508,10 +514,29 @@ class RamdiskPackagingTest(unittest.TestCase):
             "release/install packaging intentionally requires a flat support package",
         )
 
-    def test_clean_removes_current_and_legacy_engine_names(self):
+    def test_clean_removes_makefile_outputs_and_legacy_engine_names(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            artifacts = [root / name for name in ("colibri", "colibri.exe", "glm", "glm.exe")]
+            artifacts = [
+                root / name
+                for name in (
+                    ".build-config",
+                    "colibri", "colibri.exe", "glm", "glm.exe",
+                    "olmoe", "olmoe.exe", "inkling", "inkling.exe",
+                    "kimi_k3", "kimi_k3.exe", "iobench", "iobench.exe",
+                    "backend_cuda.o", "backend_cuda_ink.o", "backend_loader.o",
+                    "backend_vulkan.o", "backend_cuda_test", "backend_cuda_test.exe",
+                    "ragged_attention_test", "ragged_attention_test.exe",
+                    "backend_cuda_bench", "backend_cuda_bench.exe", "backend_metal.o",
+                    "backend_metal_test", "backend_metal_test.exe",
+                    "gemm_largebatch_test", "gemm_largebatch_test.exe", "coli_cuda.dll",
+                    "coli_cuda.lib", "coli_cuda.exp", "tools/libiq3.so",
+                    "tools/libiq3.dylib", "tools/iq3.dll", "tools/librans_c.so",
+                    "tools/librans_c.dylib", "tools/rans_c.dll",
+                    "shaders/qmatmul_gate_up.spv", "shaders/attention_absorb.spv",
+                    "shaders/rmsnorm.spv",
+                )
+            ]
             tests_dir = root / "tests"
             tests_dir.mkdir()
             cache_dirs = [
@@ -522,11 +547,26 @@ class RamdiskPackagingTest(unittest.TestCase):
             for cache_dir in cache_dirs:
                 cache_dir.mkdir(parents=True)
                 (cache_dir / "stale.pyc").write_bytes(b"bytecode")
+            makefile = (C_DIR / "Makefile").read_text(encoding="utf-8")
+            test_basenames = re.findall(
+                r"^tests/(test_[a-z0-9_]+)\$\(EXE\):", makefile, re.MULTILINE
+            )
+            test_basenames.extend(
+                (
+                    "bench_topp",
+                    "bench_dsa_select",
+                    "bench_idot",
+                    "bench_mla_simd",
+                    "fuzz_rans",
+                )
+            )
             artifacts.extend(
-                tests_dir / name
-                for name in ("test_resource_masks", "test_e8_kernel")
+                tests_dir / f"{name}{suffix}"
+                for name in test_basenames
+                for suffix in ("", ".exe")
             )
             for artifact in artifacts:
+                artifact.parent.mkdir(parents=True, exist_ok=True)
                 artifact.write_bytes(b"binary")
 
             subprocess.run(

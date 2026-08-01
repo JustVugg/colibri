@@ -56,8 +56,16 @@ class ManagedAcceleratorTest(unittest.TestCase):
             "CUDA_DEVICE_ORDER": "FASTEST_FIRST",
             "CUDA_VISIBLE_DEVICES": "7",
             "COLI_CUDA": "1",
+            "COLI_CUDA_ATTN_PREFIX": "64",
             "COLI_CUDA_MTP": "1",
+            "COLI_ANS_SIDECAR": "/tmp/hostile-ans-sidecar",
+            "CUDA_RAW_EXPERTS": "1",
             "COLI_GPUS": "9",
+            "COLI_METAL": "1",
+            "COLI_METAL_SPIN": "1",
+            "COLI_VULKAN": "1",
+            "COLI_VK_EXPERTS": "999",
+            "COLI_VK_SHADERS": "/tmp/hostile-shaders",
             "CUDA_EXPERT_GB": "999",
             "CUDA_RESERVE_GB": "0",
             "COLI_MMAP": "1",
@@ -87,7 +95,15 @@ class ManagedAcceleratorTest(unittest.TestCase):
         self.assertNotIn("COLI_GPUS", environment)
         self.assertNotIn("CUDA_DEVICE_ORDER", environment)
         self.assertNotIn("CUDA_VISIBLE_DEVICES", environment)
+        self.assertNotIn("COLI_CUDA_ATTN_PREFIX", environment)
         self.assertNotIn("COLI_CUDA_MTP", environment)
+        self.assertNotIn("COLI_ANS_SIDECAR", environment)
+        self.assertNotIn("CUDA_RAW_EXPERTS", environment)
+        self.assertNotIn("COLI_METAL", environment)
+        self.assertNotIn("COLI_METAL_SPIN", environment)
+        self.assertNotIn("COLI_VULKAN", environment)
+        self.assertNotIn("COLI_VK_EXPERTS", environment)
+        self.assertNotIn("COLI_VK_SHADERS", environment)
         self.assertNotIn("CUDA_EXPERT_GB", environment)
         self.assertNotIn("CUDA_RESERVE_GB", environment)
         self.assertNotIn("PIN", environment)

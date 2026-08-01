@@ -29,6 +29,9 @@ from .common import (
     _parse_range_list,
     _path_is_below,
     _path_without_symlinks,
+    _usage_engine_id,
+    _usage_engine_name,
+    _validated_usage_header,
     _utc_now,
 )
 
@@ -41,6 +44,7 @@ def _load_profile(path, model):
             "partial staging requires .coli_usage or an explicit compatible --profile"
         )
     counts = {}
+    header_records = []
     fingerprint = None
     try:
         with open(path, "r", encoding="utf-8") as stream:
@@ -67,6 +71,9 @@ def _load_profile(path, model):
                 if not match:
                     raise RamdiskError("invalid profile line %d in %s" % (number, path))
                 layer, expert, count = (int(value) for value in match.groups())
+                if layer < 0:
+                    header_records.append((layer, expert, count))
+                    continue
                 counts["%d:%d" % (layer, expert)] = count
     except (OSError, ValueError, TypeError) as exc:
         if isinstance(exc, RamdiskError):
@@ -74,6 +81,18 @@ def _load_profile(path, model):
         raise RamdiskError("cannot parse profile %s: %s" % (path, exc))
     if fingerprint and fingerprint != model["fingerprint"]:
         raise RamdiskError("profile model fingerprint does not match the selected model")
+    if header_records:
+        config = model.get("config", {})
+        engine = _usage_engine_name(config.get("model_type"))
+        _validated_usage_header(
+            header_records,
+            source="profile %s" % path,
+            expected_dimensions=(
+                int(config.get("num_hidden_layers", 0)),
+                int(config.get("n_routed_experts", 0)),
+            ),
+            expected_engine_id=_usage_engine_id(engine),
+        )
     compatible = {key: count for key, count in counts.items() if key in model["experts"] and count > 0}
     if not compatible:
         raise RamdiskError("profile contains no experts compatible with this model")

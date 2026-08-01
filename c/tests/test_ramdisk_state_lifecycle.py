@@ -8,6 +8,8 @@ else:
 
 class StateAndSafetyTest(unittest.TestCase):
     FINGERPRINT = "sha256:" + ("a" * 64)
+    GLM_ENGINE_ID = 3815245270
+    USAGE_HEADER = "-1 1 2\n-2 1 %d\n" % GLM_ENGINE_ID
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -126,6 +128,143 @@ class StateAndSafetyTest(unittest.TestCase):
         self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 15)
         self.assertFalse(os.path.exists(delta_path))
         self.assertEqual(os.stat(model_dir).st_mode & 0o777, 0o750)
+
+    def test_headered_usage_copy_merge_and_recovery_preserve_metadata(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        Path(canonical).write_text(
+            self.USAGE_HEADER + "0 1 10\n",
+            encoding="utf-8",
+        )
+
+        baseline = ramdisk._usage_read(canonical)
+        self.assertEqual(baseline["-1:1"], 2)
+        self.assertEqual(baseline["-2:1"], self.GLM_ENGINE_ID)
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        ramdisk._usage_write(state_usage, baseline)
+        self.assertTrue(
+            Path(state_usage).read_text(encoding="utf-8").startswith(
+                self.USAGE_HEADER
+            )
+        )
+
+        current = dict(baseline)
+        current["0:1"] = 13
+        ramdisk._usage_write(state_usage, current)
+        record = {
+            "state_dir": state_dir,
+            "usage_baseline": baseline,
+            "usage_merge_id": "b" * 32,
+        }
+        ramdisk._merge_usage(record, canonical)
+        merged = ramdisk._usage_read(canonical)
+        self.assertEqual(merged["0:1"], 13)
+        self.assertEqual(merged["-1:1"], 2)
+        self.assertEqual(merged["-2:1"], self.GLM_ENGINE_ID)
+
+        recovery_dir = os.path.join(self.root, "recovery-state")
+        os.makedirs(recovery_dir)
+        recovery_id = "c" * 32
+        ramdisk._atomic_json(
+            os.path.join(recovery_dir, ".coli_usage.delta.json"),
+            {
+                "version": 1,
+                "id": recovery_id,
+                "delta": {"0:1": 2},
+                "headers": {
+                    "-1:1": 2,
+                    "-2:1": self.GLM_ENGINE_ID,
+                },
+            },
+        )
+        ramdisk._recover_delta(recovery_dir, canonical)
+        recovered = ramdisk._usage_read(canonical)
+        self.assertEqual(recovered["0:1"], 15)
+        self.assertEqual(recovered["-1:1"], 2)
+        self.assertEqual(recovered["-2:1"], self.GLM_ENGINE_ID)
+
+    def test_usage_metadata_must_be_complete_and_compatible(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        Path(canonical).write_text(
+            self.USAGE_HEADER + "0 1 10\n",
+            encoding="utf-8",
+        )
+        baseline = ramdisk._usage_read(canonical)
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        Path(state_usage).write_text(
+            "-1 1 2\n-2 1 1\n0 1 12\n",
+            encoding="utf-8",
+        )
+        record = {"state_dir": state_dir, "usage_baseline": baseline}
+        with self.assertRaisesRegex(ramdisk.RamdiskError, "engine"):
+            ramdisk._merge_usage(record, canonical)
+        self.assertEqual(ramdisk._usage_read(canonical), baseline)
+
+        incomplete = os.path.join(self.root, "incomplete.coli_usage")
+        Path(incomplete).write_text("-1 1 2\n0 1 3\n", encoding="utf-8")
+        with self.assertRaisesRegex(ramdisk.RamdiskError, "both"):
+            ramdisk._usage_read(incomplete)
+
+    def test_legacy_seed_upgrades_to_engine_header_and_old_journal_recovers(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        Path(canonical).write_text("0 1 10\n", encoding="utf-8")
+        baseline = ramdisk._usage_read(canonical)
+        Path(state_dir, ".coli_usage").write_text(
+            self.USAGE_HEADER + "0 1 10\n",
+            encoding="utf-8",
+        )
+        ramdisk._merge_usage(
+            {"state_dir": state_dir, "usage_baseline": baseline},
+            canonical,
+        )
+        upgraded = ramdisk._usage_read(canonical)
+        self.assertEqual(upgraded["0:1"], 10)
+        self.assertEqual(upgraded["-1:1"], 2)
+        self.assertEqual(upgraded["-2:1"], self.GLM_ENGINE_ID)
+
+        current = dict(upgraded)
+        current["0:1"] = 12
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            current,
+        )
+        ramdisk._merge_usage(
+            {
+                "state_dir": state_dir,
+                "usage_baseline": baseline,
+                "usage_merge_id": "e" * 32,
+            },
+            canonical,
+        )
+
+        # Journals created by the pre-header RAM-disk manager have no metadata.
+        # They remain valid legacy deltas, while the canonical identity wins.
+        recovery_dir = os.path.join(self.root, "old-journal")
+        os.makedirs(recovery_dir)
+        ramdisk._atomic_json(
+            os.path.join(recovery_dir, ".coli_usage.delta.json"),
+            {
+                "version": 1,
+                "id": "d" * 32,
+                "delta": {"0:1": 1},
+            },
+        )
+        ramdisk._recover_delta(recovery_dir, canonical)
+        recovered = ramdisk._usage_read(canonical)
+        self.assertEqual(recovered["0:1"], 13)
+        self.assertEqual(recovered["-1:1"], 2)
+        self.assertEqual(recovered["-2:1"], self.GLM_ENGINE_ID)
 
     def test_atomic_json_never_chmods_an_existing_override_parent(self):
         parent = os.path.join(self.root, "shared-parent")

@@ -328,6 +328,11 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  uint8_t *aslab; float *afslab;
                  unsigned char backing; } ESlot;   /* PR #377: ESLOT_BACKING_* — composes with #419 arena fields */
 
+/* A mapped expert has valid host QT views without owning an anonymous slab. */
+static int expert_host_ready(const ESlot *s){
+    return s->slab || s->backing==ESLOT_BACKING_RAMMAP || s->backing==ESLOT_BACKING_MMAP;
+}
+
 typedef struct {
     float **Lc, **Rc, **Ic;
     int *kv_start, max_t;
@@ -1757,7 +1762,8 @@ static const char *qt_name_by_fmt(int fmt){
  * (expert_load_impl and friends) always pass NULL: this branch's repack
  * tool never stamps routed experts, so there is nothing for those paths to
  * consult. */
-static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs, const char *stamped_name){
+static int qt_resolve_fmt_impl(const char *name, int O, int I, int64_t nb, int64_t ns,
+                               int *gs, const char *stamped_name, int fatal){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
@@ -1801,16 +1807,19 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
             if(sf==1 && i8_row_also){ *gs=0; return 1; }
             /* sf==8 with only fp8_blk_ue8m0_also true falls through here too --
              * see the comment above this block. */
-            fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
-                "(fmt=6, 4-byte tag)%s%s%s; refusing rather than guessing (untrusted "
-                "container, fmt=6 collision at I=98)%s\n",
-                name,O,I,(long long)nb,(long long)ns,
-                fp8_blk_f32_also   ? " AND per-128x128-block FP8 f32 scales (fmt=8, single block)" : "",
-                fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=8, 4 blocks, recognized-not-implemented)" : "",
-                i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "",
-                stamped_name ? " -- metadata stamp present but names a format/encoding that doesn't resolve the ambiguity"
-                             : "");
-            exit(1);
+            if(fatal){
+                fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
+                    "(fmt=6, 4-byte tag)%s%s%s; refusing rather than guessing (untrusted "
+                    "container, fmt=6 collision at I=98)%s\n",
+                    name,O,I,(long long)nb,(long long)ns,
+                    fp8_blk_f32_also   ? " AND per-128x128-block FP8 f32 scales (fmt=8, single block)" : "",
+                    fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=8, 4 blocks, recognized-not-implemented)" : "",
+                    i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "",
+                    stamped_name ? " -- metadata stamp present but names a format/encoding that doesn't resolve the ambiguity"
+                                 : "");
+                exit(1);
+            }
+            return -1;
         }
         *gs=0; return 6;
     }
@@ -1820,8 +1829,13 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * int3-g64 and grouped-int4-at-gs=64 carry the SAME scale cardinality O*ceil(I/64). */
     int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : (nb==exp_i3)?5 : 0;
     if(!fmt){
-        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64/fp8 layout for [%d,%d], refusing (untrusted container)\n",
-                name,(long long)nb,O,I); exit(1); }
+        if(fatal){
+            fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64/fp8 layout for [%d,%d], refusing (untrusted container)\n",
+                    name,(long long)nb,O,I);
+            exit(1);
+        }
+        return -1;
+    }
     *gs=0;
     if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
     /* fmt=1 vs fmt=8 (native FP8-e4m3 passthrough): THE DESIGN LANDMINE. Weight
@@ -1929,12 +1943,15 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
             if(sf==1 || sf==8){
                 fmt = sf;
             } else if(stamped_name){
-                fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
-                    "int8 (fmt=1) and per-128x128-block FP8 (fmt=8) scale geometry; refusing "
-                    "rather than guessing (untrusted container, THE DESIGN LANDMINE) -- metadata "
-                    "stamp present but names a format that doesn't resolve the ambiguity\n",
-                    name,O,I,(long long)ns);
-                exit(1);
+                if(fatal){
+                    fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
+                        "int8 (fmt=1) and per-128x128-block FP8 (fmt=8) scale geometry; refusing "
+                        "rather than guessing (untrusted container, THE DESIGN LANDMINE) -- metadata "
+                        "stamp present but names a format that doesn't resolve the ambiguity\n",
+                        name,O,I,(long long)ns);
+                    exit(1);
+                }
+                return -1;
             }
             /* else (no stamp at all): falls through to fmt=1, the INVERSION. */
         } else if(is_blk_ue8m0){
@@ -1942,16 +1959,19 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
                 fmt = 1;   /* stamp confirms this is genuinely plain int8, not an
                             * unimplemented-encoding fp8 tensor -- safe to resolve. */
             } else {
-                fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
-                    "implemented; only f32 block scales are supported in this build (nb=%lld "
-                    "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
-                    "1 byte/block)%s%s -- refusing rather than misreading the sidecar "
-                    "(untrusted container)\n",
-                    name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
-                    is_row ? " -- scale array ALSO matches per-row int8 (fmt=1)" : "",
-                    stamped_name ? " -- a metadata stamp cannot grant this build a decoder it doesn't have"
-                                 : "");
-                exit(1);
+                if(fatal){
+                    fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
+                        "implemented; only f32 block scales are supported in this build (nb=%lld "
+                        "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
+                        "1 byte/block)%s%s -- refusing rather than misreading the sidecar "
+                        "(untrusted container)\n",
+                        name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
+                        is_row ? " -- scale array ALSO matches per-row int8 (fmt=1)" : "",
+                        stamped_name ? " -- a metadata stamp cannot grant this build a decoder it doesn't have"
+                                     : "");
+                    exit(1);
+                }
+                return -1;
             }
         } else if(is_blk && !is_row) fmt=8;
     }
@@ -1960,9 +1980,26 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
                       : (fmt==8)? fp8_nblk(O)*fp8_nblk(I)
                       : (int64_t)O;   /* in FLOAT */
     if(ns != exp_scale*4){
-        fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
-                name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
+        if(fatal){
+            fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
+                    name,(long long)ns,(long long)(exp_scale*4),O,I,fmt);
+            exit(1);
+        }
+        return -1;
+    }
     return fmt;
+}
+
+/* Optional consumers (RAM-map eligibility) need the exact same byte geometry
+ * and collision policy without turning an ineligible optimization into a fatal
+ * model-load error.  The ordinary container path keeps its fail-loud contract. */
+static int qt_try_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns,
+                              int *gs, const char *stamped_name){
+    return qt_resolve_fmt_impl(name,O,I,nb,ns,gs,stamped_name,0);
+}
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns,
+                          int *gs, const char *stamped_name){
+    return qt_resolve_fmt_impl(name,O,I,nb,ns,gs,stamped_name,1);
 }
 
 /* TRUST-VERIFY-REFUSE: if `stamped` (the tensor's __metadata__ format-NAME
@@ -2387,11 +2424,10 @@ static ESlot *rammap_slot(Model *m, int layer, int eid){
 
 /* Bind one immutable direct expert.  Eligibility is descriptor-based: a symlink
  * in the staged namespace is direct only when its opened target is actually tmpfs.
- * Format inference reuses dev's detect_group_size() (grouped-int4, fmt=4) and the
- * int3-g64 (fmt=5) byte count, so all five dev quant formats are recognised.
- * Unlike qt_resolve_fmt() (which exits on a bad layout for trusted-container QT
- * loads), this returns 0 on any mismatch so the expert simply falls back to the
- * ordinary SSD/slab path — a tmpfs-ineligible expert is expected, not fatal. */
+ * Format inference reuses qt_resolve_fmt's authoritative geometry and collision
+ * policy through its nonfatal wrapper, including grouped-int4, int3-g64, E8 and
+ * FP8. Any mismatch returns 0 so the expert simply falls back to the ordinary
+ * SSD/slab path — a tmpfs-ineligible expert is expected, not fatal. */
 static int64_t rammap_bind_one(Model *m, int layer, int eid, ESlot *s){
 #ifndef __linux__
     (void)m;(void)layer;(void)eid;(void)s; return 0;
@@ -2413,20 +2449,9 @@ static int64_t rammap_bind_one(Model *m, int layer, int eid, ESlot *s){
     for(int k=0;k<3;k++){
         int O=OO[k], In=II[k];
         int64_t nb=tw[k]->nbytes, ns=tq[k]->nbytes;
-        int64_t exp_i8=(int64_t)O*In;
-        int64_t exp_i4=(int64_t)O*((In+1)/2);
-        int64_t exp_i2=(int64_t)O*((In+3)/4);
-        int64_t exp_i3=(int64_t)O*i3_rowbytes(In);   /* int3-g64 (fmt=5) */
-        int fmt=0,gs=0,scale_elems=O;
-        if(nb==exp_i8) fmt=1;
-        else if(nb==exp_i4){
-            gs=detect_group_size(O,In,ns);            /* dev helper: 0 => plain per-row int4 */
-            if(gs>0){ fmt=4; scale_elems=(int64_t)O*((In+gs-1)/gs); }
-            else      { fmt=2; }
-        } else if(nb==exp_i2) fmt=3;
-        else if(nb==exp_i3){ fmt=5; scale_elems=(int64_t)O*i3_groups(In); }
-        else return 0;
-        if(ns!=scale_elems*4) return 0;
+        int gs=0;
+        int fmt=qt_try_resolve_fmt(tw[k]->name,O,In,nb,ns,&gs,NULL);
+        if(fmt<0) return 0;
         bw[k]=map_of_fd(tw[k]->fd); bq[k]=map_of_fd(tq[k]->fd);
         if(!bw[k]||!bq[k]) return 0;
         memset(qt[k],0,sizeof(*qt[k]));
@@ -5053,13 +5078,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 uint8_t vcls[64];
                 for(int c2=0;c2<ncpu;c2++){
                     if(g_pipe && cqof[c2]>=0) vcls[c2] = pipe_ready(cqof[c2]) ? 0 : 2;   /* loaded : in flight */
-                    else                      vcls[c2] = ce[c2]->slab       ? 0 : 1;   /* resident : sync miss */
+                    else                      vcls[c2] = expert_host_ready(ce[c2]) ? 0 : 1;   /* resident : sync miss */
                 }
                 int vord[64], no=0;
                 for(uint8_t k2=0;k2<3;k2++) for(int c2=0;c2<ncpu;c2++) if(vcls[c2]==k2) vord[no++]=c2;
                 for(int oi=0;oi<no;oi++){ int c2=vord[oi]; ESlot *e=ce[c2]; int nr=cnr[c2];
                     if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
-                    if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
+                    if(!expert_host_ready(e)) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                     double te0=now_s();
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);

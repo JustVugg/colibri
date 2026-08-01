@@ -43,7 +43,13 @@ def _cc_flags():
     (falls back to single-threaded -- exactly like the Makefile's own
     OMPDIR probe -- if it's not, rather than failing the build). Returns
     (cc, cflags, ldflags) or (None, None, None) if no compiler is found."""
-    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    # Mirror the Makefile's compiler choice: Apple Clang on Darwin, GCC on
+    # every other supported target. A generic `cc` may be Clang without
+    # libomp even when the production GCC toolchain is installed.
+    if sys.platform == "darwin":
+        cc = shutil.which("clang") or shutil.which("cc")
+    else:
+        cc = shutil.which("gcc")
     if not cc:
         return None, None, None
     cflags = ["-O3", "-Wall", "-Wextra", "-Wno-unused-parameter",

@@ -79,6 +79,72 @@ def _shape_numel(shape):
         result *= value
     return result
 
+def _resolve_direct_format(rows, columns, weight_bytes, scale_bytes):
+    """Mirror ``qt_resolve_fmt`` for an unstamped routed-expert tensor.
+
+    Return ``(fmt, group_size)`` only when the engine can decode the exact
+    weight/scale geometry. Ambiguous E8 layouts and recognized-but-unsupported
+    FP8 UE8M0 sidecars fail closed, while the established unstamped
+    int8-versus-FP8 collision rule continues to select int8.
+    """
+    int8_bytes = rows * columns
+    int4_bytes = rows * ((columns + 1) // 2)
+    int2_bytes = rows * ((columns + 3) // 4)
+    int3_groups = (columns + 63) // 64
+    int3_bytes = rows * int3_groups * 24
+    e8_bytes = rows * ((columns + 255) // 256) * 98
+    fp8_blocks = ((rows + 127) // 128) * ((columns + 127) // 128)
+
+    # qt_resolve_fmt's SECOND DESIGN LANDMINE: an unstamped I=98 tensor can
+    # satisfy E8 and one or more raw-byte formats simultaneously.
+    if scale_bytes == 4 and weight_bytes == e8_bytes:
+        raw_bytes_also = weight_bytes == int8_bytes
+        if raw_bytes_also and (fp8_blocks in (1, 4) or rows == 1):
+            return None
+        return 6, 0
+
+    # Keep the engine's row-format precedence for small-shape byte collisions.
+    if weight_bytes == int8_bytes:
+        fmt, group_size = 1, 0
+    elif weight_bytes == int4_bytes:
+        fmt, group_size = 2, 0
+        if scale_bytes > rows * 4:
+            for candidate in (16, 32, 48, 64, 96, 128, 192, 256):
+                if candidate > columns:
+                    break
+                if scale_bytes == rows * ((columns + candidate - 1) // candidate) * 4:
+                    fmt, group_size = 4, candidate
+                    break
+    elif weight_bytes == int2_bytes:
+        fmt, group_size = 3, 0
+    elif weight_bytes == int3_bytes:
+        fmt, group_size = 5, 0
+    else:
+        return None
+
+    if fmt == 1:
+        is_row = scale_bytes == rows * 4
+        is_fp8_f32 = scale_bytes == fp8_blocks * 4
+        is_fp8_ue8m0 = scale_bytes == fp8_blocks
+        if is_row and is_fp8_f32:
+            pass  # Unstamped collision: qt_resolve_fmt selects incumbent int8.
+        elif is_fp8_ue8m0:
+            return None
+        elif is_fp8_f32 and not is_row:
+            fmt = 8
+
+    if fmt == 4:
+        expected_scales = rows * ((columns + group_size - 1) // group_size)
+    elif fmt == 5:
+        expected_scales = rows * int3_groups
+    elif fmt == 8:
+        expected_scales = fp8_blocks
+    else:
+        expected_scales = rows
+    if scale_bytes != expected_scales * 4:
+        return None
+    return fmt, group_size
+
 def _direct_tensor_set_eligible(entry, config):
     hidden = int(config["hidden_size"])
     intermediate = int(config["moe_intermediate_size"])
@@ -101,21 +167,7 @@ def _direct_tensor_set_eligible(entry, config):
         ):
             return False
         weight_bytes = weight["bytes"]
-        scale_values = scale["bytes"] // 4
-        int8_bytes = rows * columns
-        int4_bytes = rows * ((columns + 1) // 2)
-        int2_bytes = rows * ((columns + 3) // 4)
-        if weight_bytes == int8_bytes or weight_bytes == int2_bytes:
-            if scale_values != rows:
-                return False
-        elif weight_bytes == int4_bytes:
-            valid_scales = {rows}
-            for group_size in (16, 32, 48, 64, 96, 128, 192, 256):
-                if group_size <= columns:
-                    valid_scales.add(rows * ((columns + group_size - 1) // group_size))
-            if scale_values not in valid_scales:
-                return False
-        else:
+        if _resolve_direct_format(rows, columns, weight_bytes, scale["bytes"]) is None:
             return False
     return True
 

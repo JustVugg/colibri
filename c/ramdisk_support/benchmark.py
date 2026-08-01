@@ -243,7 +243,6 @@ def _benchmark_environment(
         "COLI_GPUS",
         "COLI_GPU",
         "COLI_CUDA",
-        "COLI_METAL",
         "COLI_NO_OMP_TUNE",
         "COLI_OMP_TUNED",
         "DIRECT",
@@ -315,6 +314,15 @@ def _benchmark_environment(
     ).items():
         environment[key] = str(value)
     return environment
+
+
+def _benchmark_storage_mode(environment):
+    """Name the effective expert-storage path in a launched environment."""
+    if environment.get("COLI_RAMMAP") == "1":
+        return "rammap"
+    if environment.get("COLI_MMAP") == "1":
+        return "mmap"
+    return "slab"
 
 
 def _cancellable_engine_type(
@@ -538,6 +546,8 @@ def _score_variant(
         node=node,
         knobs=knobs,
     )
+    storage_mode = _benchmark_storage_mode(environment)
+    uses_rammap = storage_mode == "rammap"
     ensure_private_dir(state_dir)
     assert_durable_state_dir(
         state_dir,
@@ -546,7 +556,7 @@ def _score_variant(
     admit_runtime(
         plan,
         target_mount,
-        benchmark=not rammap,
+        benchmark=not uses_rammap,
     )
     prompt = render_chat(
         [
@@ -690,12 +700,12 @@ def _score_variant(
     }
     expected_experts = (
         plan["staging"]["direct_mapped_expert_count"]
-        if rammap
+        if uses_rammap
         else 0
     )
     expected_bytes = (
         plan["staging"]["direct_mapped_bytes"]
-        if rammap
+        if uses_rammap
         else 0
     )
     if (
@@ -703,16 +713,17 @@ def _score_variant(
         or observed_bytes != {expected_bytes}
     ):
         raise RamdiskError(
-            "RAM-map telemetry mismatch: expected %d experts/%d "
-            "bytes, observed %s/%s"
+            "RAM-map telemetry mismatch under %s storage: expected "
+            "%d experts/%d bytes, observed %s/%s"
             % (
+                storage_mode,
                 expected_experts,
                 expected_bytes,
                 sorted(observed_experts, key=str),
                 sorted(observed_bytes, key=str),
             )
         )
-    if rammap and plan["mode"] == "full":
+    if uses_rammap and plan["mode"] == "full":
         if any(
             run.get("physical_ssd_valid") is not True
             for run in runs
@@ -763,6 +774,7 @@ def _score_variant(
         "runs": runs,
         "output_sha256": next(iter(outputs)),
         "persistent_engine": True,
+        "storage_mode": storage_mode,
         "log": log_path,
         "interactive": {
             "ttft_ms": _percentile(ttfts, 0.50),
@@ -863,6 +875,13 @@ def _aggregate_score(
 
     plan = manifest["plan"]
     runtime = plan.get("managed_runtime", {})
+    aggregate_storage_mode = (
+        "mmap"
+        if (plan.get("managed_accelerator") or {}).get("mode")
+        == "cuda"
+        else "rammap"
+    )
+    aggregate_uses_rammap = aggregate_storage_mode == "rammap"
     fingerprint_dir = manifest["model_fingerprint"].split(
         ":",
         1,
@@ -907,7 +926,7 @@ def _aggregate_score(
         admit_concurrent_runtimes(
             plan,
             mounts,
-            benchmark=False,
+            benchmark=not aggregate_uses_rammap,
         )
 
         def launch(mount):
@@ -932,6 +951,13 @@ def _aggregate_score(
                 node=node,
                 knobs=normalized_knobs,
             )
+            storage_mode = _benchmark_storage_mode(environment)
+            if storage_mode != aggregate_storage_mode:
+                raise RamdiskError(
+                    "aggregate launch storage mode %s does not match "
+                    "the managed %s contract"
+                    % (storage_mode, aggregate_storage_mode)
+                )
             log_path = os.path.join(
                 state_dir,
                 "benchmark.log",
@@ -968,6 +994,7 @@ def _aggregate_score(
                 "engine": engine,
                 "log_stream": log,
                 "log": log_path,
+                "storage_mode": storage_mode,
             }
             with launched_lock:
                 launched.append(entry)
@@ -1023,6 +1050,7 @@ def _aggregate_score(
                     else None
                 ),
                 "elapsed_seconds": elapsed,
+                "storage_mode": entry["storage_mode"],
                 "rammap_experts": profile.get(
                     "rammap_experts"
                 ),
@@ -1079,14 +1107,19 @@ def _aggregate_score(
                 "deterministic aggregate outputs differed across "
                 "replicas or runs"
             )
-        expected_experts = plan["staging"][
-            "direct_mapped_expert_count"
-        ]
-        expected_bytes = plan["staging"][
-            "direct_mapped_bytes"
-        ]
         for round_result in rounds:
             for row in round_result["rows"]:
+                uses_rammap = row["storage_mode"] == "rammap"
+                expected_experts = (
+                    plan["staging"]["direct_mapped_expert_count"]
+                    if uses_rammap
+                    else 0
+                )
+                expected_bytes = (
+                    plan["staging"]["direct_mapped_bytes"]
+                    if uses_rammap
+                    else 0
+                )
                 if (
                     row["rammap_experts"]
                     != expected_experts
@@ -1094,11 +1127,11 @@ def _aggregate_score(
                     != expected_bytes
                 ):
                     raise RamdiskError(
-                        "node %s aggregate RAM-map telemetry does "
-                        "not match the staging plan"
-                        % row["node"]
+                        "node %s aggregate %s telemetry does not "
+                        "match the managed storage contract"
+                        % (row["node"], row["storage_mode"])
                     )
-                if plan["mode"] == "full":
+                if uses_rammap and plan["mode"] == "full":
                     if (
                         row.get("physical_ssd_valid")
                         is not True
@@ -1149,6 +1182,7 @@ def _aggregate_score(
             "warmups": 1,
             "measured_rounds": 3,
             "persistent_engines": True,
+            "storage_mode": aggregate_storage_mode,
             "fixed_environment": {
                 "TEMP": 0,
                 "DRAFT": 0,
@@ -1419,6 +1453,17 @@ def run_benchmark(
     )
     model = manifest["plan"]["model"]["path"]
     mount = manifest["mounts"][0]["path"]
+    managed_cuda = (
+        (manifest["plan"].get("managed_accelerator") or {}).get(
+            "mode"
+        )
+        == "cuda"
+    )
+    staged_storage = "mmap" if managed_cuda else "direct"
+    staged_rammap = not managed_cuda
+    tmpfs_variant_name = (
+        "tmpfs_mmap" if managed_cuda else "tmpfs_pread_slabs"
+    )
     running = manifest.get("state") == "running"
     if running:
         raise RamdiskError(
@@ -1437,7 +1482,7 @@ def run_benchmark(
             },
         ),
         (
-            "tmpfs_pread_slabs",
+            tmpfs_variant_name,
             mount,
             False,
             {
@@ -1460,9 +1505,9 @@ def run_benchmark(
         specs.extend(
             [
                 (
-                    "full_direct_half_threads",
+                    "full_%s_half_threads" % staged_storage,
                     mount,
-                    True,
+                    staged_rammap,
                     {
                         "PIPE": 0,
                         "OMP_NUM_THREADS": max(
@@ -1473,9 +1518,9 @@ def run_benchmark(
                     },
                 ),
                 (
-                    "full_direct_pipe0",
+                    "full_%s_pipe0" % staged_storage,
                     mount,
-                    True,
+                    staged_rammap,
                     {
                         "PIPE": 0,
                         "OMP_NUM_THREADS": cores,
@@ -1483,9 +1528,9 @@ def run_benchmark(
                     },
                 ),
                 (
-                    "full_direct_pipe1",
+                    "full_%s_pipe1" % staged_storage,
                     mount,
-                    True,
+                    staged_rammap,
                     {
                         "PIPE": 1,
                         "OMP_NUM_THREADS": cores,
@@ -1495,7 +1540,7 @@ def run_benchmark(
             ]
         )
         skipped = {
-            "name": "partial_direct_ssd_fallback",
+            "name": "partial_%s_ssd_fallback" % staged_storage,
             "status": "not-applicable",
             "reason": "manifest is full mode",
         }
@@ -1503,9 +1548,9 @@ def run_benchmark(
         specs.extend(
             [
                 (
-                    "partial_direct_buffered",
+                    "partial_%s_buffered" % staged_storage,
                     mount,
-                    True,
+                    staged_rammap,
                     {
                         "PIPE": 1,
                         "DIRECT": 0,
@@ -1514,9 +1559,9 @@ def run_benchmark(
                     },
                 ),
                 (
-                    "partial_direct_ssd",
+                    "partial_%s_ssd" % staged_storage,
                     mount,
-                    True,
+                    staged_rammap,
                     {
                         "PIPE": 1,
                         "DIRECT": 1,
@@ -1525,9 +1570,9 @@ def run_benchmark(
                     },
                 ),
                 (
-                    "partial_direct_uring",
+                    "partial_%s_uring" % staged_storage,
                     mount,
-                    True,
+                    staged_rammap,
                     {
                         "PIPE": 1,
                         "DIRECT": 1,
@@ -1538,7 +1583,7 @@ def run_benchmark(
             ]
         )
         skipped = {
-            "name": "full_direct",
+            "name": "full_%s" % staged_storage,
             "status": "not-applicable",
             "reason": "manifest is partial mode",
         }
@@ -1629,7 +1674,8 @@ def run_benchmark(
                 is True
             )
             and variant["name"].startswith(
-                "%s_direct" % manifest["plan"]["mode"]
+                "%s_%s"
+                % (manifest["plan"]["mode"], staged_storage)
             )
         )
     ]
@@ -1700,7 +1746,7 @@ def run_benchmark(
             )
     tmpfs_ok = any(
         (
-            variant.get("name") == "tmpfs_pread_slabs"
+            variant.get("name") == tmpfs_variant_name
             and variant.get("status") == "ok"
             and (
                 variant.get("greedy_output_matches_ssd")
@@ -1726,7 +1772,10 @@ def run_benchmark(
         and aggregate_ok
     )
     full_zero_verified = None
-    if manifest["plan"]["mode"] == "full":
+    if (
+        manifest["plan"]["mode"] == "full"
+        and staged_rammap
+    ):
         full_zero_verified = bool(successful) and all(
             (
                 len(variant.get("runs", [])) == 3

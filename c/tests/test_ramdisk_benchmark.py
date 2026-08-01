@@ -6,6 +6,30 @@ else:
     from ramdisk_test_support import *  # noqa: F401,F403
 
 
+def _enable_managed_cuda(plan):
+    """Give a fixture plan the immutable managed-CUDA storage contract."""
+    plan["managed_accelerator"] = {
+        "mode": "cuda",
+        "layout": "experts-only",
+        "devices": [
+            {
+                "index": 0,
+                "cuda_ordinal": 0,
+                "name": "GPU 0",
+                "uuid": "GPU-test-0",
+                "pci_bus_id": "0000:41:00.0",
+                "numa_node": 0,
+            }
+        ],
+        "mmap": True,
+        "rammap": False,
+        "async_copy": True,
+        "vram_budget": "auto",
+        "capability": "available",
+    }
+    return plan
+
+
 class BenchmarkTest(unittest.TestCase):
     def test_cancellable_engine_startup_terminates_before_ready_timeout(self):
         cancel = threading.Event()
@@ -253,6 +277,96 @@ class BenchmarkTest(unittest.TestCase):
         self.assertNotIn("COLI_NO_OMP_TUNE", benchmark_environment)
         self.assertNotIn("COLI_OMP_TUNED", benchmark_environment)
 
+    def test_cuda_variant_scores_the_effective_mmap_launch_contract(self):
+        import openai_server
+
+        class FakeEngine:
+            environments = []
+
+            def __init__(self, *args, **kwargs):
+                type(self).environments.append(dict(kwargs["env"]))
+                self.profile_seq = 0
+                self.profile = []
+
+            def generate(
+                self,
+                prompt,
+                maximum,
+                temperature,
+                top_p,
+                on_text,
+                cache_slot=0,
+            ):
+                on_text("identical output")
+                self.profile_seq += 1
+                self.profile.append(
+                    {
+                        "physical_ssd_bytes": 4096,
+                        "physical_ssd_valid": False,
+                        "rammap_experts": 0,
+                        "rammap_bytes": 0,
+                    }
+                )
+                return {
+                    "completion_tokens": 32,
+                    "tokens_per_second": 4.0,
+                }
+
+            def close(self):
+                pass
+
+        with ModelFixture() as fixture, canonical_temporary_directory() as state:
+            plan = _enable_managed_cuda(
+                ramdisk.build_plan(
+                    plan_args(fixture.root),
+                    hardware=hardware_fixture(),
+                )
+            )
+            manifest = {
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(plan["mounts"][0])],
+            }
+            target_mount = manifest["mounts"][0]
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": state},
+                clear=True,
+            ), mock.patch.object(
+                openai_server,
+                "Engine",
+                FakeEngine,
+            ), mock.patch.object(
+                ramdisk,
+                "_filesystem_for_path",
+                return_value="ext4",
+            ), mock.patch.object(
+                ramdisk,
+                "_admit_runtime",
+            ) as admit:
+                # A stale caller request must not override the persisted CUDA
+                # contract used to launch and score this engine.
+                result = ramdisk._score_variant(
+                    "/fake/colibri",
+                    manifest,
+                    "full_mmap_pipe0",
+                    target_mount["path"],
+                    True,
+                    {"PIPE": 0},
+                )
+
+        environment = FakeEngine.environments[0]
+        self.assertEqual(environment["COLI_CUDA"], "1")
+        self.assertEqual(environment["COLI_MMAP"], "1")
+        self.assertEqual(environment["COLI_RAMMAP"], "0")
+        self.assertEqual(result["storage_mode"], "mmap")
+        self.assertEqual(result["interactive"]["ram_map_coverage"], 0.0)
+        admit.assert_called_once_with(
+            plan,
+            target_mount,
+            benchmark=True,
+        )
+
     def test_aggregate_launches_fixed_node_local_engines_and_runs_concurrently(self):
         import openai_server
 
@@ -367,6 +481,95 @@ class BenchmarkTest(unittest.TestCase):
                 ],
             )
 
+    def test_cuda_aggregate_scores_the_effective_mmap_contract(self):
+        import openai_server
+
+        class FakeEngine:
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                self.environment = dict(kwargs["env"])
+                self.profile_seq = 0
+                self.profile = []
+                type(self).instances.append(self)
+
+            def generate(
+                self,
+                prompt,
+                maximum,
+                temperature,
+                top_p,
+                on_text,
+                cache_slot=0,
+            ):
+                on_text("identical output")
+                self.profile_seq += 1
+                self.profile.append(
+                    {
+                        "physical_ssd_bytes": 4096,
+                        "physical_ssd_valid": False,
+                        "rammap_experts": 0,
+                        "rammap_bytes": 0,
+                    }
+                )
+                return {"completion_tokens": 32}
+
+            def close(self):
+                pass
+
+        with ModelFixture() as fixture, canonical_temporary_directory() as state:
+            plan = _enable_managed_cuda(
+                ramdisk.build_plan(
+                    plan_args(fixture.root, topology="per-node"),
+                    hardware=hardware_fixture(),
+                )
+            )
+            manifest = {
+                "state": "ready",
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(item) for item in plan["mounts"]],
+                "processes": [],
+            }
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": state},
+                clear=True,
+            ), mock.patch.object(
+                openai_server,
+                "Engine",
+                FakeEngine,
+            ), mock.patch.object(
+                ramdisk,
+                "_filesystem_for_path",
+                return_value="ext4",
+            ), mock.patch.object(
+                ramdisk,
+                "_fresh_user_binary",
+                return_value="/usr/bin/numactl",
+            ), mock.patch.object(
+                ramdisk,
+                "_admit_concurrent_runtimes",
+            ) as admit:
+                result = ramdisk._aggregate_score(
+                    manifest,
+                    engine_path="/fake/colibri",
+                    knobs={"PIPE": 0},
+                )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["storage_mode"], "mmap")
+        self.assertEqual(len(FakeEngine.instances), 1)
+        environment = FakeEngine.instances[0].environment
+        self.assertEqual(environment["COLI_CUDA"], "1")
+        self.assertEqual(environment["COLI_MMAP"], "1")
+        self.assertEqual(environment["COLI_RAMMAP"], "0")
+        admit.assert_called_once_with(
+            plan,
+            manifest["mounts"],
+            benchmark=True,
+        )
+
     def test_concurrent_runtime_admission_reserves_shared_cgroup_headroom(self):
         with ModelFixture() as fixture:
             plan = ramdisk.build_plan(
@@ -446,6 +649,118 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(seen_knobs["full_direct_pipe0"]["OMP_NUM_THREADS"], 3)
         self.assertEqual(seen_knobs["full_direct_pipe1"]["OMP_NUM_THREADS"], 3)
         self.assertNotIn("OMP_NUM_THREADS", aggregate.call_args.kwargs["knobs"])
+
+    def test_cuda_benchmark_generates_only_mmap_staged_variants(self):
+        with ModelFixture() as fixture:
+            plan = _enable_managed_cuda(
+                ramdisk.build_plan(
+                    plan_args(fixture.root),
+                    hardware=hardware_fixture(),
+                )
+            )
+            manifest = {
+                "state": "ready",
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(plan["mounts"][0])],
+                "processes": [],
+            }
+            requested_modes = {}
+
+            def score(
+                engine_path,
+                current_manifest,
+                name,
+                weights,
+                rammap,
+                knobs,
+            ):
+                requested_modes[name] = rammap
+                return {
+                    "name": name,
+                    "status": "ok",
+                    "storage_mode": "mmap",
+                    "knobs": dict(knobs),
+                    "runs": [
+                        {
+                            "physical_ssd_bytes": 4096,
+                            "physical_ssd_valid": False,
+                        }
+                    ] * 3,
+                    "output_sha256": "same-output",
+                    "interactive": {
+                        "p50_tokens_per_second": float(
+                            len(requested_modes)
+                        )
+                    },
+                }
+
+            with mock.patch.object(
+                ramdisk,
+                "_load_manifest",
+                return_value=manifest,
+            ), mock.patch.object(
+                ramdisk,
+                "_assert_effective_masks_unchanged",
+            ), mock.patch.object(
+                ramdisk,
+                "_assert_ready_mounts",
+            ), mock.patch.object(
+                ramdisk,
+                "_resolve_engine_path",
+                return_value="/fake/colibri",
+            ), mock.patch.object(
+                ramdisk,
+                "_score_variant",
+                side_effect=score,
+            ), mock.patch.object(
+                ramdisk,
+                "discover_hardware",
+                return_value={"swap": {"used_bytes": 0}},
+            ), mock.patch.object(
+                ramdisk,
+                "_aggregate_score",
+                return_value={"status": "not-run"},
+            ), mock.patch.object(
+                ramdisk,
+                "_system_score",
+                return_value={},
+            ), mock.patch.object(
+                ramdisk,
+                "_read_json",
+                return_value={"version": 1, "results": []},
+            ), mock.patch.object(
+                ramdisk,
+                "_atomic_json",
+            ), mock.patch.object(
+                ramdisk,
+                "_save_manifest",
+            ):
+                result = ramdisk.benchmark.__wrapped__(
+                    argparse.Namespace(),
+                    cli_path="/fake/coli",
+                )
+
+        self.assertEqual(
+            list(requested_modes),
+            [
+                "ssd_baseline",
+                "tmpfs_mmap",
+                "full_mmap_half_threads",
+                "full_mmap_pipe0",
+                "full_mmap_pipe1",
+            ],
+        )
+        self.assertFalse(any(requested_modes.values()))
+        self.assertEqual(result["best_variant"], "full_mmap_pipe1")
+        self.assertTrue(
+            result["acceptance"]["all_required_paths_succeeded"]
+        )
+        self.assertIsNone(
+            result["acceptance"][
+                "full_zero_physical_ssd_reads_verified"
+            ]
+        )
 
     def test_best_runtime_knobs_are_saved_only_for_current_topology(self):
         with ModelFixture() as fixture:
