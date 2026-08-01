@@ -149,7 +149,11 @@ jobs:
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
           # script in the archive the engine ships but cannot be driven by coli chat.
           test -f tools/k3_tokenizer.py || { echo "FAIL: k3_tokenizer.py missing from archive"; exit 1; }
-          python3 -c "import ast,sys; ast.parse(open('tools/k3_tokenizer.py').read())" \
+          # encoding='utf-8' explicitly: on Windows open() defaults to the ANSI code
+          # page (cp1252), which cannot decode this UTF-8 file, so the v1.4.0 tag build
+          # failed here with a UnicodeDecodeError while the file itself was perfectly
+          # fine. The check was wrong, not the artifact.
+          python3 -c "import ast; ast.parse(open('tools/k3_tokenizer.py', encoding='utf-8').read())" \
             || { echo "FAIL: packaged k3_tokenizer.py does not parse"; exit 1; }
           python3 - <<'PYCHK'
           import os, sys

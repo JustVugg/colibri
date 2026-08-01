@@ -98,3 +98,6 @@ c/tests/bench_topp
 c/tests/bench_topp.exe
 c/tests/bench_dsa_select
 c/tests/bench_dsa_select.exe
+
+# Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
+.claude/
