@@ -200,6 +200,23 @@ def env_for_engine(a, arch):
     env = os.environ.copy()
     if a.ngen: env["NGEN"] = str(a.ngen)
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
+    if arch == "deepseek_v4":
+        if a.gpu == "none":
+            env.pop("COLI_GPUS", None)
+        elif a.gpu and a.gpu != "auto":
+            env["COLI_GPUS"] = a.gpu
+        # The native backend's fast path is opt-in at the kernel boundary.
+        # Select it for the service too; otherwise only experts use CUDA.
+        for key in ("DSV4_CUDA_LAYER", "DSV4_CUDA_SEGMENT_GRAPH",
+                    "DSV4_CUDA_DEEPGEMM", "DSV4_CUDA_DENSE_DG",
+                    "DSV4_CUDA_MOE_MASKED", "DSV4_CUDA_VLLM_MHC",
+                    "DSV4_CUDA_ATTN_ASYNC", "DSV4_CUDA_SPARSE_MLA"):
+            env.setdefault(key, "1")
+        devices = [value for value in env.get("COLI_GPUS", "").split(",") if value]
+        if len(devices) == 6:
+            for key in ("DSV4_CUDA_EP2", "DSV4_CUDA_REPLICATED_TP2",
+                        "DSV4_CUDA_MOE_TP2"):
+                env.setdefault(key, "1")
     return env
 
 def cuda_binary():

@@ -6,6 +6,7 @@ import socket
 import tempfile
 import threading
 import unittest
+import openai_server
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -1511,6 +1512,18 @@ class KeepAliveFramingTest(unittest.TestCase):
         status, payload = self._post(conn, headers={"Authorization": "Bearer secret"})
         self.assertEqual(status, 200, "the 401's unread body desynchronised the connection")
         self.assertEqual(json.loads(payload)["object"], "chat.completion")
+
+    def test_deepseek_v4_rejects_unvalidated_tools(self):
+        server = self._server()
+        conn = self._conn(server)
+        body = dict(self.CHAT, tools=[{"type": "function", "function": {
+            "name": "weather", "parameters": {"type": "object"}}}])
+        with patch.object(openai_server, "ARCH", "deepseek_v4"):
+            status, payload = self._post(conn, body)
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 400)
+        self.assertEqual(error["param"], "tools")
+        self.assertEqual(error["code"], "unsupported_parameter")
 
     def test_unknown_model_does_not_desync_the_next_request(self):
         server = self._server()

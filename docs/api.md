@@ -52,11 +52,12 @@ server beyond the machine.
 
 `coli serve --model /path/to/DeepSeek-V4-Flash-0731` detects
 `model_type: deepseek_v4`, launches the native `deepseek_v4` engine, and uses
-the model's native `<｜User｜>` / `<｜Assistant｜>` chat format. OpenAI tools are
-rendered and parsed as native DSML, including multiple calls in one response
-and `tool` result round trips. The base backend is intentionally limited to
-2,048 prompt-plus-output tokens until the Lightning Indexer lands; requests
-above that boundary are clamped by the engine rather than treated as validated
+the model's native `<｜User｜>` / `<｜Assistant｜>` chat format. Native DSML
+rendering and parsing exist, but requests containing OpenAI tools return an
+explicit `unsupported_parameter` error until real-checkpoint tool generation
+passes the quality gate. The base backend is intentionally limited to 2,048
+prompt-plus-output tokens until the Lightning Indexer lands; requests above
+that boundary are clamped by the engine rather than treated as validated
 long-context inference. This path is greedy-only today: `temperature` and
 `top_p` are accepted by the wire protocol but do not change sampling yet.
 

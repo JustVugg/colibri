@@ -71,6 +71,28 @@ class EnvDefaultsTest(unittest.TestCase):
             self.assertNotIn(k, e)
 
 
+class DeepSeekV4EnvTest(unittest.TestCase):
+    def test_service_enables_native_cuda_path(self):
+        with mock.patch.dict(os.environ, {"COLI_GPUS": "0,1,2,3,4,5"}, clear=True):
+            env = coli.env_for_engine(args(), "deepseek_v4")
+        self.assertEqual(env["DSV4_CUDA_LAYER"], "1")
+        self.assertEqual(env["DSV4_CUDA_SEGMENT_GRAPH"], "1")
+        self.assertEqual(env["DSV4_CUDA_EP2"], "1")
+        self.assertEqual(env["DSV4_CUDA_MOE_TP2"], "1")
+
+    def test_service_preserves_explicit_kernel_override(self):
+        with mock.patch.dict(os.environ, {"COLI_GPUS": "0,1",
+                                          "DSV4_CUDA_SPARSE_MLA": "0"}, clear=True):
+            env = coli.env_for_engine(args(), "deepseek_v4")
+        self.assertEqual(env["DSV4_CUDA_SPARSE_MLA"], "0")
+        self.assertNotIn("DSV4_CUDA_EP2", env)
+
+    def test_gpu_argument_reaches_sibling_engine(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = coli.env_for_engine(args(gpu="2,3"), "deepseek_v4")
+        self.assertEqual(env["COLI_GPUS"], "2,3")
+
+
 class CudaAutoEnableTest(unittest.TestCase):
     """Windows bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS run
     CPU-only even on a CUDA build with a GPU present. env_for now auto-enables

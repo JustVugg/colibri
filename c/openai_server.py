@@ -2115,6 +2115,9 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
+        if tools and ARCH == "deepseek_v4":
+            raise APIError(400, "DeepSeek V4 tool calls are not quality-validated yet.",
+                           "tools", "unsupported_parameter")
         if grammar is not None and ARCH in ("inkling", "kimi", "deepseek_v4"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
