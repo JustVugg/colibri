@@ -21,7 +21,7 @@
 #include "backend_cuda_dsv4.h"
 #endif
 
-#define DSV4_MAX_CONTEXT 2048
+#define DSV4_MAX_CONTEXT 32768
 
 typedef struct {
     int hidden, layers, vocab;
@@ -62,13 +62,19 @@ typedef struct {
 
 static Dsv4State state_init(const Dsv4Cfg *c,int max_tokens){
     Dsv4State st={0};st.max_compressed=(max_tokens+3)/4;
-    st.kv=calloc((size_t)c->layers*c->window*c->head_dim,sizeof(float));
-    st.compressed=calloc((size_t)c->layers*st.max_compressed*c->head_dim,sizeof(float));
-    st.comp_value=calloc((size_t)c->layers*2*c->window*c->head_dim,sizeof(float));
-    st.comp_score=malloc((size_t)c->layers*2*c->window*c->head_dim*sizeof(float));
-    st.compressed_len=calloc((size_t)c->layers,sizeof(int));
-    if(!st.kv||!st.compressed||!st.comp_value||!st.comp_score||!st.compressed_len)die("out of memory allocating KV state");
-    long n=(long)c->layers*2*c->window*c->head_dim;for(long i=0;i<n;i++)st.comp_score[i]=-INFINITY;
+    int gpu_only=0;
+#ifdef COLI_CUDA
+    gpu_only=getenv("DSV4_CUDA_LAYER")&&atoi(getenv("DSV4_CUDA_LAYER"));
+#endif
+    if(!gpu_only){
+        st.kv=calloc((size_t)c->layers*c->window*c->head_dim,sizeof(float));
+        st.compressed=calloc((size_t)c->layers*st.max_compressed*c->head_dim,sizeof(float));
+        st.comp_value=calloc((size_t)c->layers*2*c->window*c->head_dim,sizeof(float));
+        st.comp_score=malloc((size_t)c->layers*2*c->window*c->head_dim*sizeof(float));
+        st.compressed_len=calloc((size_t)c->layers,sizeof(int));
+        if(!st.kv||!st.compressed||!st.comp_value||!st.comp_score||!st.compressed_len)die("out of memory allocating KV state");
+        long n=(long)c->layers*2*c->window*c->head_dim;for(long i=0;i<n;i++)st.comp_score[i]=-INFINITY;
+    }
 #ifdef COLI_CUDA
     st.gpu_kv=calloc((size_t)c->layers,sizeof(*st.gpu_kv));
     st.gpu_peer_kv=calloc((size_t)c->layers,sizeof(*st.gpu_peer_kv));
@@ -1268,8 +1274,9 @@ static int prefill_prompt(shards*s,const Dsv4Cfg*c,Dsv4State*state,const int*ids
 static void generate(shards *s,const Dsv4Cfg *c,const char *model_dir,const char *arg){
     char *end;long max=strtol(arg,&end,10);if(end==arg||*end!=':'||max<1||max>128)die("--generate expects MAX:TEXT");
     char path[4096];snprintf(path,sizeof(path),"%s/tokenizer.json",model_dir);Tok tok;tok_load(&tok,path);
-    int ids[DSV4_MAX_CONTEXT],n=tok_encode(&tok,end+1,(int)strlen(end+1),ids,DSV4_MAX_CONTEXT);if(n<1)ids[n++]=c->bos;
-    if(n+(int)max>DSV4_MAX_CONTEXT)die("generator is currently limited to 2048 total tokens");
+    int *ids=malloc((DSV4_MAX_CONTEXT+1)*sizeof(*ids));if(!ids)die("out of memory tokenizing prompt");
+    int n=tok_encode(&tok,end+1,(int)strlen(end+1),ids,DSV4_MAX_CONTEXT+1);if(n<1)ids[n++]=c->bos;
+    if(n+(int)max>DSV4_MAX_CONTEXT){free(ids);die("prompt and output exceed the 32768-token context limit");}
     Dsv4State state=state_init(c,n+(int)max);
 #ifdef COLI_CUDA
     gpu_state_prepare(c,&state);
@@ -1290,7 +1297,7 @@ static void generate(shards *s,const Dsv4Cfg *c,const char *model_dir,const char
     printf("  generation=%s\n  generation_ids=",text);for(int i=0;i<made;i++)printf("%s%d",i?",":"",out[i]);
     printf("\n  prompt_tokens=%d ttft=%.3fs output_tokens=%d decode=%.4f tok/s total=%.4f tok/s\n",n,pre,made,made>1?(made-1)/dec:0.f,made/(pre+dec));
     profile_print();
-    state_free(&state);
+    state_free(&state);free(ids);
 }
 
 static void generate_token(shards*s,const Dsv4Cfg*c,const char*arg){

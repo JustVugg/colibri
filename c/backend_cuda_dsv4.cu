@@ -588,13 +588,13 @@ __global__ void fi_position_batch(int64_t*slot,int64_t*position,int start,int to
 __global__ void fi_indices_batch(int*idx,int*length,int start,int tokens,int window,int topk){int t=blockIdx.x,p=threadIdx.x;if(t>=tokens)return;int pos=start+t,n=min(pos+1,window),first=pos+1-n;if(p<topk)idx[(long long)t*topk+p]=p<n?first+p:-1;if(!p)length[t]=n;}
 __global__ void gather_group_rows(float*out,const float*in,int tokens,int groups,int width,int group){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*width;if(p<n){int row=p/width,col=p%width;out[p]=in[((long long)row*groups+group)*width+col];}}
 __global__ void scatter_group_rows(float*out,const float*in,int tokens,int groups,int width,int group){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*width;if(p<n){int row=p/width,col=p%width;out[((long long)row*groups+group)*width+col]=in[p];}}
-__global__ void fi_indices(int*idx,int*length,const int*state,int window){int i=threadIdx.x,pos=decode_pos(state),n=min(pos+1,window),start=pos+1-n;if(i<512)idx[i]=i<n?start+i:-1;if(!i)*length=n;}
+__global__ void fi_indices(int*idx,int*length,const int*state,int window){int i=threadIdx.x,pos=decode_pos(state),n=min(pos+1,window),start=pos+1-n;if(i<512)idx[i]=i<n?(start+i)%window:-1;if(!i)*length=n;}
 /* C4A attends to the indexer's compressed candidates in addition to SWA.
  * The ranges intentionally overlap: those summaries are separate learned KV
  * entries, not duplicates for the runtime to remove.  Before the Lightning
  * Indexer is needed, every live compressed entry is therefore a candidate. */
 __global__ void fi_extra_indices(int*idx,int*out_length,const int*length,const int*state,int window,int ratio){int i=threadIdx.x,n=min(*length,512);if(i<512)idx[i]=i<n?i:-1;if(!i)*out_length=n;(void)state;(void)window;(void)ratio;}
-__global__ void fi_position(int64_t*slot,int64_t*position,const int*state){if(!threadIdx.x){*slot=decode_pos(state);*position=decode_pos(state);}}
+__global__ void fi_position(int64_t*slot,int64_t*position,const int*state,int window){if(!threadIdx.x){int pos=decode_pos(state);*slot=pos%window;*position=pos;}}
 __global__ void fi_cos_sin(float*out,const float*cs,const float*sn,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int pos=i/32,k=i%32;out[(long long)pos*64+k]=cs[i];out[(long long)pos*64+32+k]=sn[i];}}
 #endif
 __global__ void compress_store_dynamic(float*values,float*scores,const float*v,const float*g,const float*ape,const int*state,int ratio,int overlap,int O){int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<O){int phase=decode_pos(state)%ratio,slot=(overlap?ratio:0)+phase;values[(long long)slot*O+d]=v[d];scores[(long long)slot*O+d]=g[d]+ape[(long long)phase*O+d];}}
@@ -829,8 +829,8 @@ extern "C" Dsv4CudaKvCache *dsv4_cuda_kv_create(int device, int window, int dim,
         return nullptr;
     }
 #ifdef COLI_DSV4_FLASHINFER
-    size_t fib=(size_t)((max_tokens+63)/64)*64*584,fic=(size_t)((k->max_compressed+63)/64)*64*584;
-    k->fi_splits=(window+63)/64+(k->max_compressed+63)/64;
+    size_t fib=(size_t)((window+63)/64)*64*584,fic=(size_t)((k->max_compressed+63)/64)*64*584;
+    k->fi_splits=(window+63)/64+8;
     if(!ok(cudaMalloc(&k->fi_kv,fib),"FlashInfer KV allocation")||!ok(cudaMemset(k->fi_kv,0,fib),"FlashInfer KV clear")||
        !ok(cudaMalloc(&k->fi_comp,fic),"FlashInfer compressed KV allocation")||!ok(cudaMemset(k->fi_comp,0,fic),"FlashInfer compressed KV clear")||
        !ok(cudaMalloc(&k->fi_indices,512*sizeof(int)),"FlashInfer indices allocation")||!ok(cudaMalloc(&k->fi_comp_indices,512*sizeof(int)),"FlashInfer compressed indices allocation")||!ok(cudaMalloc(&k->fi_length,sizeof(int)),"FlashInfer length allocation")||!ok(cudaMalloc(&k->fi_comp_length,sizeof(int)),"FlashInfer compressed length allocation")||
@@ -1041,7 +1041,7 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
             c->p3, 1, dim, qk_rope, c->decode_state, 0, 0, 0, cache->rope_cos, cache->rope_sin);
     if(!sparse){if (K > qk_rope) fp8_sim64<<<(K - qk_rope + 63) / 64, 64, 0, c->stream>>>(c->p3, K - qk_rope);cache_store_dynamic<<<(K + 255) / 256, 256, 0, c->stream>>>(cache->kv, c->p3, c->decode_state, cache->window, K);}
 #ifdef COLI_DSV4_FLASHINFER
-    else{fi_prepare_q<<<(heads*dim+255)/256,256,0,c->stream>>>(cache->fi_mid,c->p2,heads*dim);fi_prepare_q<<<(dim+255)/256,256,0,c->stream>>>(cache->fi_out,c->p3,dim);fi_position<<<1,1,0,c->stream>>>(cache->fi_slot,cache->fi_pos,c->decode_state);
+    else{fi_prepare_q<<<(heads*dim+255)/256,256,0,c->stream>>>(cache->fi_mid,c->p2,heads*dim);fi_prepare_q<<<(dim+255)/256,256,0,c->stream>>>(cache->fi_out,c->p3,dim);fi_position<<<1,1,0,c->stream>>>(cache->fi_slot,cache->fi_pos,c->decode_state,cache->window);
         if(!dsv4_vllm_qnorm_rope_kv_insert(cache->fi_mid,cache->fi_q,cache->fi_out,cache->fi_kv,cache->fi_slot,cache->fi_pos,cache->fi_cos_sin,eps,heads,64,64*584,c->stream))return 0;}
 #endif
     if (async && !ok(cudaStreamWaitEvent(c->stream, c->join, 0), "attention join wait")) return 0;
