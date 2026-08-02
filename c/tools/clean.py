@@ -33,6 +33,7 @@ FILES = [
 # Test binaries are extensionless on Unix and `.exe` on Windows.  Keep the
 # basenames explicit so clean can never mistake a source/fixture for an output.
 TEST_BASENAMES = [
+    "test_serve_sentinel", "test_ue8m0",
     "test_json", "test_st", "test_st_pread", "test_st_mirror", "test_tier", "test_grammar",
     "test_ablate", "test_schema_gbnf", "test_decode_batch", "test_idot",
     "test_i4_grouped", "test_stops", "test_topp", "test_temp_env", "test_kv_alloc",
