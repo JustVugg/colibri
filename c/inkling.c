@@ -38,6 +38,20 @@
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
 #endif
+#ifdef COLI_METAL
+/* Apple-GPU expert MoE (opt-in, COLI_METAL=1). Reuses colibri's batched
+ * coli_metal_moe_block: inkling's container int4 (nibble-packed, -8 offset,
+ * per-row scales) is bit-identical to the Metal fmt=2 kernel, and int8 to
+ * fmt=1. Expert slots live in page-aligned per-layer slabs registered once
+ * for zero-copy resolve — unified memory, no upload. Attention and the dense
+ * path stay on the CPU (at high hit rates ~90% of decode is expert matmul). */
+#include "backend_metal.h"
+static int g_metal = 0;
+#endif
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 
 #define MAXL 256
 
@@ -52,6 +66,7 @@ typedef struct {
     int n_experts, topk, n_shared, moe_inter, dense_inter;
     int eos;
     float eps, route_scale, mup;
+    int audio_tok, mel_bins, mel_vocab;   /* DMel audio input (TMLv0 <|audio|> placeholder) */
     unsigned char local[MAXL];            /* 1 = sliding-window layer */
     unsigned char sparse[MAXL];           /* 1 = MoE layer, 0 = dense MLP */
 } Cfg;
@@ -115,6 +130,8 @@ typedef struct {
     int xq;                               /* experts on disk are a colibri container (U8 + .qs) */
     Wt embed, lm_head;
     float *embed_norm, *final_norm;
+    Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
+    float *audio_norm;                    /* audio tower RMSNorm [D]; NULL = no audio */
     Layer *L;
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
@@ -488,6 +505,12 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *eo = json_get(root,"eos_token_id");
     if (!eo || eo->t != J_NUM) eo = json_get(r,"eos_token_id");
     c->eos = (eo && eo->t == J_NUM) ? (int)eo->num : -1;
+    /* DMel audio: placeholder id at the top level (absent in the shipped
+     * config -> the TMLv0 constant), frame geometry under audio_config */
+    c->audio_tok = (int)jnum(root,"audio_token_id",200023);
+    jval *ac = json_get(root,"audio_config");
+    c->mel_bins  = ac ? (int)jnum(ac,"n_mel_bins",80)     : 80;
+    c->mel_vocab = ac ? (int)jnum(ac,"mel_vocab_size",16) : 16;
     /* real config.json: intermediate_size = MoE, dense_intermediate_size = dense.
      * HF-saved config (post_init applied): intermediate_size = dense, moe_intermediate_size = MoE. */
     jval *dis = json_get(r,"dense_intermediate_size");
@@ -717,10 +740,34 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         } else fprintf(stderr, "[cuda] init failed, running on CPU\n");
     }
 #endif
+#ifdef COLI_METAL
+    {   const char *me = getenv("COLI_METAL");
+        if (me && *me == '1' && !getenv("NOGPU")) {
+            /* Residency set ON by default for inkling: without it every MoE
+             * block pays per-buffer useResource churn — measured 0.17 vs 1.76
+             * tok/s decode on Inkling-Small. COLI_METAL_RESSET=0 opts out. */
+            setenv("COLI_METAL_RESSET", "1", 0);
+            if (coli_metal_init()) {
+                g_metal = 1;
+                fprintf(stderr, "[metal] ready — batched expert MoE on the Apple GPU\n");
+            } else fprintf(stderr, "[metal] init failed, running on CPU\n");
+        }
+    }
+#endif
     m->embed      = load_w(m, "model.embed_tokens.weight", 0);
     m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
     m->final_norm = load_t(m, "model.norm.weight");
     m->lm_head    = load_w(m, "lm_head.weight", 1);
+    /* Inkling's audio "tower" is one embedding table + one RMSNorm. The int4
+     * containers are text-only, so these usually arrive via an audio.safetensors
+     * sidecar dropped in the snapshot dir (st_init indexes every *.safetensors).
+     * Absent tensors = text-only engine, exactly as before. */
+    if (st_has(&m->S, "model.audio.encoder.weight")) {
+        m->audio_enc  = load_w(m, "model.audio.encoder.weight", 0);
+        m->audio_norm = load_t(m, "model.audio.final_norm.weight");
+        fprintf(stderr, "[audio] DMel encoder loaded (%d bins x %d levels -> D=%d)\n",
+                c->mel_bins, c->mel_vocab, D);
+    }
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[320];
     for (int i = 0; i < c->n_layers; i++) {
@@ -788,6 +835,33 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    /* container mode: slot storage is one page-aligned slab per sparse layer
+     * (weights) plus one for the row scales, with every slot's pointers carved
+     * out up front. Slots then recycle their region on eviction — no per-slot
+     * malloc, and (under Metal) each slab registers ONCE for zero-copy GPU
+     * resolve instead of churning register/unregister on every fill. */
+    if (m->xq) {
+        int64_t st13 = m->rb13*2*I, st2 = m->rb2*D;
+        size_t pg = 16384;
+        size_t wlen = ((size_t)cap*(st13+st2) + pg - 1) / pg * pg;
+        size_t slen = ((size_t)cap*(2*I+D)*4 + pg - 1) / pg * pg;
+        for (int i = 0; i < c->n_layers; i++) {
+            if (!c->sparse[i]) continue;
+            void *wsl = NULL, *ssl = NULL;
+            if (posix_memalign(&wsl, pg, wlen) || posix_memalign(&ssl, pg, slen)) {
+                fprintf(stderr, "OOM expert slab layer %d (%zu MB)\n", i, (wlen+slen)>>20); exit(1); }
+            for (int k = 0; k < cap; k++) {
+                Slot *s = &m->cache[i].slots[k];
+                s->p13 = (uint8_t*)wsl + (int64_t)k*(st13+st2);
+                s->p2  = s->p13 + st13;
+                s->s13 = (float*)ssl + (int64_t)k*(2*I+D);
+                s->s2  = s->s13 + 2*I;
+            }
+#ifdef COLI_METAL
+            if (g_metal) { coli_metal_register(wsl, wlen); coli_metal_register(ssl, slen); }
+#endif
+        }
+    }
     /* usage counters; seeded from a previous run's history when present */
     rt_init("inkling", c->n_layers, E);
     for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
@@ -804,6 +878,14 @@ static double mem_avail_bytes(void) {
     while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
     fclose(f);
     return kb * 1024.0;
+#elif defined(__APPLE__)
+    /* free + inactive + purgeable ~ Linux MemAvailable. Without this the auto
+     * cap fell back to 16 experts/layer on a 128 GB Mac. */
+    vm_size_t page = 0; host_page_size(mach_host_self(), &page);
+    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
+        return 0;
+    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
 #else
     return 0;
 #endif
@@ -826,9 +908,7 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        if (m->xq)              { s->p13 = malloc((size_t)(m->rb13*2*I)); s->p2 = malloc((size_t)(m->rb2*D));
-                                  s->s13 = falloc(2*I); s->s2 = falloc(D);
-                                  if (!s->p13 || !s->p2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
+        if (m->xq)              { /* slab-carved at model_init; nothing to allocate */ }
         else if (m->quant_bits) { s->q13 = malloc(n13); s->q2 = malloc(n2);
                                   s->s13 = falloc(2*I); s->s2 = falloc(D);
                                   if (!s->q13 || !s->q2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
@@ -1122,6 +1202,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
     int64_t npair = (int64_t)S*K;
+#ifdef COLI_METAL
+    /* per-round scratch for the batched GPU submit: pairs grouped by expert,
+     * activations packed in group order. Allocated once per moe() call. */
+    float *mxg = NULL, *mrw = NULL; const void **mgp = NULL, **mup = NULL, **mdp = NULL;
+    const float **mgs = NULL, **mus = NULL, **mds = NULL; Slot **mslot = NULL;
+    int *mxoff = NULL, *mnr = NULL, *mrows = NULL, *mgi = NULL, *mfp = NULL;
+    /* GPU for decode too, now that the residency set is on by default: with
+     * it a decode block runs in ~3ms and measures 1.76 tok/s vs 0.84 on CPU
+     * (Inkling-Small, M-series 128 GB). Without the set the same block paid
+     * ~135ms of useResource churn and CPU won — INK_METAL_MIN_S=2 restores
+     * the prefill-only gate if that regime ever returns. */
+    int metal_min_s = getenv("INK_METAL_MIN_S") ? atoi(getenv("INK_METAL_MIN_S")) : 1;
+    if (g_metal && m->xq && S >= metal_min_s) {
+        mxg = falloc((int64_t)cap*D); mrw = falloc(cap);
+        mgp = malloc(cap*sizeof(void*)); mup = malloc(cap*sizeof(void*)); mdp = malloc(cap*sizeof(void*));
+        mgs = malloc(cap*sizeof(float*)); mus = malloc(cap*sizeof(float*)); mds = malloc(cap*sizeof(float*));
+        mslot = malloc(cap*sizeof(Slot*));
+        mxoff = malloc((cap+1)*sizeof(int)); mnr = malloc(cap*sizeof(int));
+        mrows = malloc(cap*sizeof(int)); mgi = malloc(cap*sizeof(int)); mfp = malloc(cap*sizeof(int));
+    }
+#endif
     for (int64_t base = 0; base < npair; base += cap) {
         int64_t end = base + cap < npair ? base + cap : npair;
         nfill = 0;
@@ -1146,6 +1247,46 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             m->t_fill += now_s() - tf;
         }
         double te = now_s();
+#ifdef COLI_METAL
+        if (mxg) {
+            /* group this round's (token, expert) pairs by expert and submit ONE
+             * command buffer; the kernel scatter-adds rw*hh into out with the
+             * same accumulate semantics as the CPU loop below. 0 -> CPU. */
+            int nb = 0;
+            for (int64_t t = base; t < end; t++) {
+                Slot *e = use[t - base];
+                if (!e) { mgi[t - base] = -1; continue; }
+                int gi = -1;
+                for (int j = 0; j < nb; j++) if (mslot[j] == e) { gi = j; break; }
+                if (gi < 0) { gi = nb++; mslot[gi] = e; mnr[gi] = 0; }
+                mgi[t - base] = gi; mnr[gi]++;
+            }
+            if (nb) {
+                mxoff[0] = 0;
+                for (int j = 0; j < nb; j++) mxoff[j+1] = mxoff[j] + mnr[j];
+                memcpy(mfp, mxoff, nb*sizeof(int));
+                for (int64_t t = base; t < end; t++) {
+                    int gi = mgi[t - base];
+                    if (gi < 0) continue;
+                    int s = (int)(t / K), kk = (int)(t % K);
+                    int r = mfp[gi]++;
+                    memcpy(mxg + (int64_t)r*D, x + (int64_t)s*D, (size_t)D*sizeof(float));
+                    mrows[r] = s;
+                    mrw[r] = wgt[(int64_t)s*(K+ns) + kk];
+                }
+                for (int j = 0; j < nb; j++) {
+                    Slot *e = mslot[j];
+                    mgp[j] = e->p13; mup[j] = e->p13 + (int64_t)I*m->rb13; mdp[j] = e->p2;
+                    mgs[j] = e->s13; mus[j] = e->s13 + I; mds[j] = e->s2;
+                }
+                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                                         mxg, mxoff, mnr, mrows, mrw, out, S)) {
+                    m->t_expert += now_s() - te;
+                    continue;                              /* round done on the GPU */
+                }
+            } else { m->t_expert += now_s() - te; continue; }
+        }
+#endif
         for (int64_t t = base; t < end; t++) {            /* calcolo + accumulo */
             int s = (int)(t / K), kk = (int)(t % K);
             Slot *e = use[t - base];
@@ -1194,18 +1335,61 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
     free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
     free(g); free(hh);              /* u aliases g+I */
+#ifdef COLI_METAL
+    if (mxg) {
+        free(mxg); free(mrw); free(mgp); free(mup); free(mdp);
+        free(mgs); free(mus); free(mds); free(mslot);
+        free(mxoff); free(mnr); free(mrows); free(mgi); free(mfp);
+    }
+#endif
+}
+
+/* ---------- DMel audio embedding ----------
+ * One frame = mel_bins u8 levels in [0, mel_vocab). Its decoder embedding is
+ * sum_b E[b*mel_vocab + v_b], RMSNorm'd with the audio tower norm (eps is a
+ * literal 1e-6 in the HF audio tower, independent of the text rms_norm_eps).
+ * This row REPLACES the <|audio|> placeholder's text embedding — embed_norm
+ * does not apply, matching masked_scatter in modeling_inkling.py. */
+static void audio_embed_row(Model *m, const uint8_t *frame, float *out, float *tmp) {
+    Cfg *c = &m->c; int D = c->hidden;
+    memset(out, 0, (size_t)D * sizeof(float));
+    for (int b = 0; b < c->mel_bins; b++) {
+        int v = frame[b] < c->mel_vocab ? frame[b] : c->mel_vocab - 1;
+        wt_row_f32(m->audio_enc, (int64_t)(b*c->mel_vocab + v)*D, tmp, D);
+        for (int d = 0; d < D; d++) out[d] += tmp[d];
+    }
+    rmsnorm_row(out, out, m->audio_norm, D, 1e-6f);
+}
+
+/* count <|audio|> placeholders in a token sequence (0 if no audio tower) */
+static int audio_tok_count(Model *m, const int *ids, int n) {
+    if (!m->audio_norm) return 0;
+    int k = 0;
+    for (int i = 0; i < n; i++) k += (ids[i] == m->c.audio_tok);
+    return k;
 }
 
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
- * non-NULL also writes the per-position argmax (teacher-forcing check). */
-static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
+ * non-NULL also writes the per-position argmax (teacher-forcing check).
+ * dmel: u8 [naud, mel_bins] frames consumed left-to-right by the <|audio|>
+ * placeholder positions in ids (prefill only; decode steps pass NULL). */
+static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
+                      const uint8_t *dmel, int naud) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
+    float *arow = (dmel && naud > 0) ? falloc(D) : NULL;
+    int aidx = 0;
     for (int s = 0; s < S; s++) {
+        if (arow && m->audio_norm && ids[s] == c->audio_tok && aidx < naud) {
+            audio_embed_row(m, dmel + (int64_t)aidx*c->mel_bins, x + (int64_t)s*D, arow);
+            aidx++;
+            continue;
+        }
         wt_row_f32(m->embed, (int64_t)ids[s]*D, x + (int64_t)s*D, D);
         if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, x + (int64_t)s*D, m->embed_norm, D, c->eps);
     }
+    free(arow);
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
@@ -1240,6 +1424,10 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return logit;
 }
 
+static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
+    return step_mm(m, ids, S, pos0, tf_out, NULL, 0);
+}
+
 static void state_reset(Model *m) {
     Cfg *c = &m->c;
     m->kv_len = 0;
@@ -1264,9 +1452,10 @@ static void kv_alloc(Model *m, int max_t) {
 }
 
 /* greedy generation, olmoe.c-style */
-static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
+static void generate(Model *m, const int *prompt, int np, int n_new, int *out,
+                     const uint8_t *dmel, int naud) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
-    float *logit = step(m, prompt, np, 0, NULL);
+    float *logit = step_mm(m, prompt, np, 0, NULL, dmel, naud);
     int len = np;
     Cfg *c = &m->c;
     for (int s = 0; s < n_new; s++) {
@@ -1281,16 +1470,24 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
 }
 
 /* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
-static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
+static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
+                            const uint8_t *dmel, int naud) {
     Cfg *c = &m->c;
     int cap = (int)strlen(prompt) + 16;
     int *ids = malloc(cap * sizeof(int));
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return; }
+    if (audio_tok_count(m, ids, np) != naud) {
+        fprintf(stderr, "audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
+                naud, audio_tok_count(m, ids, np),
+                m->audio_norm ? "" : " — snapshot has no audio tensors (audio.safetensors)");
+        free(ids); return;
+    }
     kv_alloc(m, np + n_new + 8);
-    printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
+    printf("[%d prompt tokens%s] %s", np, naud ? " incl. audio" : "", naud ? "" : prompt);
+    fflush(stdout);
     double t0 = now_s(), t1 = 0;
-    float *logit = step(m, ids, np, 0, NULL);
+    float *logit = step_mm(m, ids, np, 0, NULL, dmel, naud);
     int len = np;
     char buf[512];
     for (int s = 0; s < n_new; s++) {
@@ -1311,6 +1508,14 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
     double wall = now_s() - t0;
+#ifdef COLI_METAL
+    if (g_metal) {
+        uint64_t mok = 0, mfb = 0, mex = 0;
+        coli_metal_moe_counts(&mok, &mfb, &mex);
+        printf("[metal] %llu MoE blocks on GPU, %llu CPU fallbacks, %llu experts\n",
+               (unsigned long long)mok, (unsigned long long)mfb, (unsigned long long)mex);
+    }
+#endif
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | other %.1fs\n",
            m->t_fill, m->t_expert, m->t_shared, m->t_attn,
            wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
@@ -1378,7 +1583,8 @@ static const char *prompt_reject(int np, int want) {
     return NULL;
 }
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+                 uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 
@@ -1397,20 +1603,29 @@ static int serve_read_cmd(const char *cur_id) {
     if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
     if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
     if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok; float temp, top_p;
-        if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 ||
-            plen < 0 || plen > (1<<22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        int slot, plen, max_tok, alen = 0; float temp, top_p;
+        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
+        /* 6th field (optional, backward compatible): DMel byte count appended
+         * verbatim after the text payload — frames x mel_bins u8 levels */
+        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26)) {
+            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
         (void)slot;
         char *pl = malloc((size_t)plen + 1);
         if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        int nl = fgetc(stdin); (void)nl;
         pl[plen] = 0;
+        uint8_t *au = NULL;
+        if (alen > 0) {
+            au = malloc((size_t)alen);
+            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
+        }
+        int nl = fgetc(stdin); (void)nl;
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", id);
             q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
             q->payload = pl; q->plen = plen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+            q->audio = au; q->alen = alen;
+        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
     }
     return 0;
 }
@@ -1423,13 +1638,21 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     const char *bad = prompt_reject(np, q->max_tok);
     if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    /* audio: every <|audio|> placeholder must have exactly one DMel frame */
+    int naud = q->alen / m->c.mel_bins;
+    if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
+        printf("ERROR %s audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
+               q->id, naud, audio_tok_count(m, ids, np),
+               m->audio_norm ? "" : " — snapshot has no audio tensors");
+        fflush(stdout); free(ids); return;
+    }
     state_reset(m);
     kv_alloc(m, np + q->max_tok + 8);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
     double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
-    float *logit = step(m, ids, np, 0, NULL);
+    float *logit = step_mm(m, ids, np, 0, NULL, q->audio, naud);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
@@ -1529,6 +1752,11 @@ static void serve_tiers_emap(Model *m) {
 }
 
 static void serve_loop(Model *m, Tok *T) {
+    /* Before the sentinel: on Windows a TEXT-mode stdout rewrites the trailing \n
+     * as \r\n, the gateway never matches it and waits forever (#748). Lives in
+     * compat.h because colibri.c has had it since #195 and this engine was
+     * written without it. */
+    coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
@@ -1546,7 +1774,7 @@ static void serve_loop(Model *m, Tok *T) {
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
         serve_one(m, T, &q);
         serve_tiers_emap(m);
-        free(q.payload);
+        free(q.payload); free(q.audio);
     }
 }
 
@@ -1567,7 +1795,11 @@ int main(int argc, char **argv) {
      * once (COLI_OMP_TUNED guards the exec; COLI_NO_OMP_TUNE=1 disables).
      * NOT under CUDA — same exception glm.c makes: a spinning 24-thread team
      * starves the CUDA driver during every stream sync. */
-#ifndef COLI_CUDA
+#if !defined(COLI_CUDA) && !defined(__APPLE__)
+    /* NOT on Apple Silicon: the active-spin team steals the shared SoC power
+     * budget (same mechanism as the M5 Max Metal report) and measured strictly
+     * worse on Inkling-Small even for pure-CPU decode — 0.50 vs 0.84 tok/s,
+     * and 2x the prefill. Opt back in with COLI_OMP_TUNED=0 unset + Linux. */
     if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
@@ -1579,7 +1811,7 @@ int main(int argc, char **argv) {
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
-#endif  /* !COLI_CUDA */
+#endif  /* !COLI_CUDA && !__APPLE__ */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
@@ -1592,15 +1824,32 @@ int main(int argc, char **argv) {
     }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
+    const char *audiopath = NULL;
     int cap = -1, bits = 0, n_new = 256, npos = 0, chat = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--chat")) chat = 1;
+        else if (!strcmp(argv[i], "--audio") && i+1 < argc) audiopath = argv[++i];
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
+    }
+    /* --audio <file>: raw u8 DMel frames, [n_frames, mel_bins] row-major —
+     * what tinkernel-audio / the gateway DSP emit. Implies --chat (the audio
+     * message needs TMLv0 framing to be in distribution). */
+    uint8_t *dmel = NULL; long dmel_bytes = 0;
+    if (audiopath) {
+        FILE *af = fopen(audiopath, "rb");
+        if (!af) { perror(audiopath); return 1; }
+        fseek(af, 0, SEEK_END); dmel_bytes = ftell(af); fseek(af, 0, SEEK_SET);
+        dmel = malloc((size_t)dmel_bytes);
+        if (fread(dmel, 1, (size_t)dmel_bytes, af) != (size_t)dmel_bytes) {
+            fprintf(stderr, "short read on %s\n", audiopath); return 1; }
+        fclose(af);
+        chat = 1;
+        if (!prompt) prompt = "";
     }
     /* --chat: avvolge il prompt nel template di Inkling (sottoinsieme testuale di
      * chat_template.jinja, lo stesso che openai_server.py rende in render_chat_inkling):
@@ -1609,7 +1858,7 @@ int main(int argc, char **argv) {
      * generazione. Senza template un modello instruct riceve testo fuori
      * distribuzione. THINK=<0..1> alza lo sforzo di ragionamento (default 0). */
     char *chat_buf = NULL;
-    if (chat && prompt) {
+    if (chat && prompt && !dmel) {
         const char *eff = getenv("THINK") ? getenv("THINK") : "0";
         size_t need = strlen(prompt) + strlen(eff) + 256;
         chat_buf = malloc(need);
@@ -1618,6 +1867,26 @@ int main(int argc, char **argv) {
                  "<|message_user|><|content_text|>%s<|end_message|>"
                  "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>"
                  "<|message_model|>", prompt, eff);
+        prompt = chat_buf;
+    } else if (chat && dmel) {
+        /* audio turn, TMLv0 framing (conformant with tml-renderers 0.1.0):
+         * effort system message, optional text user message, then the audio
+         * message — <|content_audio_input|>, one <|audio|> per frame,
+         * <|audio_end|> — and <|message_model|> to hand the turn over.
+         * Frame count is provisional here (mel_bins is read from config.json
+         * at model_init); recomputed below once the model is loaded. */
+        const char *eff = getenv("THINK") ? getenv("THINK") : "0";
+        long nf_guess = dmel_bytes / 80;           /* placeholder emission only */
+        size_t need = strlen(prompt) + strlen(eff) + (size_t)nf_guess*10 + 320;
+        chat_buf = malloc(need);
+        if (!chat_buf) { fprintf(stderr, "OOM chat template\n"); return 1; }
+        char *w = chat_buf;
+        w += sprintf(w, "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>", eff);
+        if (prompt[0])
+            w += sprintf(w, "<|message_user|><|content_text|>%s<|end_message|>", prompt);
+        w += sprintf(w, "<|message_user|><|content_audio_input|>");
+        for (long i = 0; i < nf_guess; i++) w += sprintf(w, "<|audio|>");
+        sprintf(w, "<|audio_end|><|end_message|><|message_model|>");
         prompt = chat_buf;
     }
     if (cap < 0) cap = (prompt || pfile) ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
@@ -1642,7 +1911,13 @@ int main(int argc, char **argv) {
         pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
-        if (prompt) generate_stream(&m, &T, prompt, n_new);
+        if (prompt) {
+            int naud = dmel ? (int)(dmel_bytes / m.c.mel_bins) : 0;
+            if (dmel && dmel_bytes % m.c.mel_bins != 0) {
+                fprintf(stderr, "%s: %ld bytes is not a multiple of mel_bins=%d\n",
+                        audiopath, dmel_bytes, m.c.mel_bins); return 1; }
+            generate_stream(&m, &T, prompt, n_new, dmel, naud);
+        }
         else {   /* -f: one prompt per line, model loaded once, usage accumulates */
             FILE *pf = fopen(pfile, "rb"); if (!pf) { perror(pfile); return 1; }
             char ln[8192]; int np = 0;
@@ -1651,7 +1926,7 @@ int main(int argc, char **argv) {
                 if (!n || ln[0]=='#') continue;
                 printf("\n===== prompt %d =====\n", ++np);
                 state_reset(&m);
-                generate_stream(&m, &T, ln, n_new);
+                generate_stream(&m, &T, ln, n_new, NULL, 0);
             }
             fclose(pf);
         }
@@ -1675,10 +1950,12 @@ int main(int argc, char **argv) {
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
     char *arena=NULL; jval *ref = json_parse(buf, &arena);
-    int np, nfull, ntf;
+    int np, nfull, ntf, ndm;
     int *pids  = read_int_array(ref,"prompt_ids",&np);
     int *full  = read_int_array(ref,"full_ids",&nfull);
     int *tfref = read_int_array(ref,"tf_pred",&ntf);
+    /* optional audio oracle: "dmel" = flattened [n_frames, mel_bins] levels */
+    int *dmint = read_int_array(ref,"dmel",&ndm);
     int ngen = nfull - np;
 
     Model m; model_init(&m, snap, cap, bits);
@@ -1691,10 +1968,19 @@ int main(int argc, char **argv) {
     printf("resident weights loaded in %.1fs | RSS: %.2f GB\n", m.dense_load_s, rss_gb());
     kv_alloc(&m, nfull + 8);
 
+    uint8_t *rdmel = NULL; int rnaud = 0;
+    if (dmint && ndm > 0) {
+        if (ndm % m.c.mel_bins != 0) { fprintf(stderr, "dmel len %d not a multiple of mel_bins %d\n", ndm, m.c.mel_bins); return 1; }
+        rnaud = ndm / m.c.mel_bins;
+        rdmel = malloc((size_t)ndm);
+        for (int i = 0; i < ndm; i++) rdmel[i] = (uint8_t)dmint[i];
+        printf("audio oracle: %d DMel frames x %d bins\n", rnaud, m.c.mel_bins);
+    }
+
     /* pass 1: teacher-forced argmax over the full reference sequence */
     if (tfref && ntf == nfull) {
         int *tf = malloc(nfull * sizeof(int));
-        float *lg = step(&m, full, nfull, 0, tf);
+        float *lg = step_mm(&m, full, nfull, 0, tf, rdmel, rnaud);
         free(lg);
         int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
         printf("teacher-forced argmax: %d/%d match\n", ok, nfull);
@@ -1705,13 +1991,21 @@ int main(int argc, char **argv) {
     /* pass 2: greedy generation, token-for-token vs the oracle */
     int *out = malloc(nfull * sizeof(int));
     double t = now_s();
-    generate(&m, pids, np, ngen, out);
+    generate(&m, pids, np, ngen, out, rdmel, rnaud);
     double dt = now_s() - t;
     int match = 0;
     printf("Reference: "); for (int i=np;i<nfull;i++) printf("%d ", full[i]);
     printf("\nC engine : "); for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
     printf("\nMatching tokens: %d/%d\n", match, ngen);
     double tot = m.hits + m.miss;
+#ifdef COLI_METAL
+    if (g_metal) {
+        uint64_t mok = 0, mfb = 0, mex = 0;
+        coli_metal_moe_counts(&mok, &mfb, &mex);
+        printf("[metal] %llu MoE blocks on GPU, %llu CPU fallbacks, %llu experts\n",
+               (unsigned long long)mok, (unsigned long long)mfb, (unsigned long long)mex);
+    }
+#endif
     printf("PEAK RSS: %.2f GB | expert cache hit %.1f%% | %.2f tok/s\n",
            rss_gb(), tot?100.0*m.hits/tot:0.0, ngen/dt);
     free(buf); free(arena);

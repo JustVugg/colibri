@@ -36,6 +36,7 @@
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
 #include "omp_tune.h"
+#include "route_trace.h"                    /* shared routing telemetry (#700) */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -82,7 +83,7 @@ typedef struct {
     float **K, **V; int kv_len, max_t;
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
-    uint32_t *freq;
+    uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
     int freq_token_count, hot_pinned, hot_n, warmup_tokens;
     int token_count;
     /* PREDICTION IMPROVEMENT A: per-layer EMA of gate logits across tokens.
@@ -322,7 +323,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         m->cache[i].slots = calloc(cap, sizeof(Slot));
     }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
-    m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
+    rt_init("olmoe", c->n_layers, c->n_experts);
+    rt_drop_row(c->n_layers);                     /* every olmoe layer routes; no MTP row */
+    m->freq = rt_counts_all();                    /* alias: the read sites keep their shape */
+    { const char *up = getenv("COLI_USAGE");      /* optional history to seed from */
+      if (up && *up) { int64_t h = rt_load(up);
+        if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
+                           (long long)h, up); } }
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -491,7 +498,8 @@ static void pin_hot_experts(Model *m) {
     
     int pinned_total = 0;
     for (int l = 0; l < c->n_layers; l++) {
-        uint32_t *freq_l = m->freq + (int64_t)l * c->n_experts;
+        uint32_t *freq_l = m->freq[l];
+        if (!freq_l) continue;                    /* a layer with no row cannot be ranked */
         
         uint64_t layer_total = 0;
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
@@ -654,8 +662,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
         /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
         if (!m->hot_pinned && m->freq) {
-            uint32_t *freq_l = m->freq + (int64_t)layer * E;
-            for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
+            uint32_t *freq_l = m->freq[layer];
+            if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
@@ -757,10 +765,11 @@ static void pilot_realload(Model *m, int layer, int eid) {
         }
         
         /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
-        if (g_pilot_evict_guard && m->freq && m->last_access && lc->slots[lru].eid >= 0) {
+        if (g_pilot_evict_guard && m->freq && m->freq[layer] && m->last_access &&
+            lc->slots[lru].eid >= 0) {
             int vid = lc->slots[lru].eid;
-            uint64_t vs = lfru_score(m->freq[layer * c->n_experts + vid], m->last_access[layer * c->n_experts + vid], m->clock);
-            uint64_t cs = lfru_score(m->freq[layer * c->n_experts + eid], m->last_access[layer * c->n_experts + eid], m->clock);
+            uint64_t vs = lfru_score(m->freq[layer][vid], m->last_access[layer * c->n_experts + vid], m->clock);
+            uint64_t cs = lfru_score(m->freq[layer][eid], m->last_access[layer * c->n_experts + eid], m->clock);
             if (cs <= vs + (vs >> 2) + (4u << 8)) {
                 m->is_queued[layer * c->n_experts + eid] = 0;
                 pthread_mutex_unlock(&g_pilot_mx);
@@ -1120,6 +1129,8 @@ int main(int argc, char **argv) {
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);
         run_chat(&m, &T, ctx_cap);
+        { const char *up = getenv("COLI_USAGE");
+          if (up && *up) rt_save(up, 0); }
         return 0;
     }
 
@@ -1151,7 +1162,8 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
         free(buf); free(arena);
-        return 0;
+        return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
+                        * sweep cannot fold its own tokens into the persisted ranking */
     }
 
     int *out = malloc((np + n_new) * sizeof(int));
@@ -1187,6 +1199,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    { const char *up = getenv("COLI_USAGE");
+      if (up && *up) rt_save(up, 0); }              /* same bytes as every other engine */
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     return 0;

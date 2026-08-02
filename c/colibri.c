@@ -2096,11 +2096,22 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * block scales; everything else is per-row O. Using the per-row bound for a
          * grouped/blocked format would reject a legitimate container (fmt=5 regressed
          * exactly that way). */
-        st_read_f32_cap(&m->S,sn,t->s,
+        /* fmt=8 goes through st_read_scale_f32: the block-scale GEOMETRY is the
+         * same in a container we repacked (f32 scales) and in a native fp8
+         * checkpoint (UE8M0, one byte per block) -- same shape, same meaning,
+         * same multiply. Only the encoding of the number differs. The reader
+         * accepts either and always yields f32, so matmul_fp8 stays a single
+         * implementation with no branch in the hot loop.
+         *
+         * Every OTHER format still goes through st_read_f32_cap exactly as
+         * before: fmt 0/1/2/4/5/6 are byte-for-byte unchanged, and an f32-scaled
+         * fmt=8 container behaves identically too (st_read_scale_f32 dispatches
+         * to st_read_f32 for dtype F32, the same call it made before). */
+        if(fmt==8) st_read_scale_f32(&m->S,sn,t->s,fp8_nblk(O)*fp8_nblk(I),drop);
+        else st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
-                        fmt==6 ? (int64_t)1               :
-                        fmt==8 ? fp8_nblk(O)*fp8_nblk(I) : (int64_t)O, drop);
+                        fmt==6 ? (int64_t)1               : (int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);

@@ -1552,6 +1552,11 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
 }
 
 static void serve_loop(Model *m, Tok *T){
+    /* PRIMA del sentinella: su Windows stdout in modalita' TEXT trasforma il \n
+     * finale in \r\n, il gateway non lo riconosce e resta in attesa per sempre
+     * (#748). Vive in compat.h perche' colibri.c ce l'ha da #195 e questo motore
+     * e' nato senza. */
+    coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     fputs("\x01\x01READY\x01\x01\n",stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n",rss_gb());

@@ -3,7 +3,9 @@
 `c/inkling.c` runs [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling)
 (975B total / 41B active, Apache 2.0) with colibri's expert-streaming approach:
 dense weights resident (RAM or VRAM), routed experts streamed from disk with an
-LRU + pinned cache. Text-only; vision/audio encoders and the MTP head are not loaded.
+LRU + pinned cache. Audio input is supported when the audio tensors are present
+(see [Audio input](#audio-input-dmel) below); the vision encoder and the MTP
+head are not loaded.
 
 ## Quickstart
 
@@ -84,10 +86,74 @@ help in proportion to the RAM you can give them.
 | `-p "text" [-n N]` | streaming greedy generation (stops at eos or N tokens) |
 | `--chat -p "text"` | wraps the prompt in Inkling's chat template (role tokens + `<|content_text|>`, `<|message_model|>` as the generation prompt). Instruct models fed raw text are out of distribution and answer badly. `THINK=<0..1>` raises the reasoning effort (default 0) |
 | `-f prompts.txt [-n N]` | one prompt per line (`#` comments skipped), single model load, state reset between prompts — the cache-warming workflow below |
-| `[cap] [bits] [ref.json]` | token-exact oracle harness against a `tools/make_tiny_inkling.py` fixture (CI-style validation) |
+| `--audio file.dmel [-p "text"]` | spoken input: raw u8 DMel frames `[n_frames, 80]`, one `<|audio|>` position per frame (implies `--chat`) |
+| `[cap] [bits] [ref.json]` | token-exact oracle harness against a `tools/make_tiny_inkling.py` fixture (CI-style validation; `tools/make_tiny_inkling_audio.py` for the audio path) |
 
 `coli chat` / `coli serve` / `coli web` render the same template through the
 gateway, so there is nothing to pass there.
+
+## Audio input (DMel)
+
+Inkling hears through discretized log-mel frames ("DMel"): 80 mel bands per
+50 ms of audio, each quantized to 16 levels. Its audio "tower" is one
+embedding table plus one norm — a frame's embedding is the RMSNorm of a sum
+of 80 table rows, swapped in at that frame's `<|audio|>` position. No
+Whisper-style encoder, no extra runtime: with the two audio tensors present
+the engine takes spoken input at full precision, and without them it is the
+same text-only engine as before.
+
+Two ways to get the tensors:
+
+- **Converting yourself:** add `--keep-audio` to `convert_inkling_int4.py`.
+  It passes `model.audio.*` through (~10 MB bf16 on Inkling-Small).
+- **Already have a text-only container?** The two tensors can be pulled out
+  of the original checkpoint's shards with HTTP range requests — ~10 MB
+  moved instead of re-downloading the full bf16 checkpoint — and written as
+  an `audio.safetensors` sidecar next to the snapshot. The engine indexes
+  every `*.safetensors` in the directory, so it just gets picked up:
+
+```python
+import json, struct, urllib.request
+
+REPO = "https://huggingface.co/thinkingmachines/Inkling-Small/resolve/main"
+NAMES = ["model.audio.encoder.weight", "model.audio.final_norm.weight"]
+
+def rng(url, a, b):
+    req = urllib.request.Request(url, headers={"Range": f"bytes={a}-{b}"})
+    return urllib.request.urlopen(req).read()
+
+index = json.loads(urllib.request.urlopen(f"{REPO}/model.safetensors.index.json").read())
+header, blobs, off = {}, [], 0
+for name in NAMES:
+    url = f"{REPO}/{index['weight_map'][name]}"
+    n = struct.unpack("<Q", rng(url, 0, 7))[0]
+    info = json.loads(rng(url, 8, 7 + n))[name]
+    a, b = info["data_offsets"]
+    raw = rng(url, 8 + n + a, 8 + n + b - 1)
+    header[name] = {"dtype": info["dtype"], "shape": info["shape"],
+                    "data_offsets": [off, off + len(raw)]}
+    blobs.append(raw)
+    off += len(raw)
+hdr = json.dumps(header).encode()
+with open("audio.safetensors", "wb") as f:
+    f.write(struct.pack("<Q", len(hdr)) + hdr + b"".join(blobs))
+```
+
+Input format: mono 16 kHz. Through the gateway, send a WAV (PCM16 or
+float32) as an OpenAI `input_audio` content part — the gateway computes the
+DMel frames itself (numpy needed for that path only). Through the CLI, pass
+pre-encoded frames as raw bytes with `--audio`. Note that audio inflates the
+prompt: ~5 s of speech is ~100 positions, so prefill speed counts double for
+spoken turns.
+
+```sh
+curl localhost:8000/v1/chat/completions -d '{
+  "model": "inkling-colibri",
+  "messages": [{"role": "user", "content": [
+    {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}}
+  ]}]
+}'
+```
 
 ## Expert cache size
 

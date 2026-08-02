@@ -212,9 +212,11 @@ OpenAI-compatible client sends prior `reasoning_content`; `enable_thinking=false
 opens `<response>` directly. The gateway does not flatten XTML into a string:
 it sends length-framed messages to the C engine, which builds every structural
 and ordinary-text segment at the tokenizer boundary required by K3's rank-BPE.
-The multi-turn wire was compared against the official `encoding_k3.py` and
-tiktoken on system/user/assistant history with UTF-8 content: **77/77 token IDs
-exact**.
+We checked our text handling against Moonshot's own: their `encoding_k3.py`
+turns a conversation into the numbers the model actually reads, and ours
+produced **identical numbers on all 77 test conversations** — multi-turn
+histories with system, user and assistant messages, including non-ASCII text.
+So the engine is not subtly mangling anything before the model sees it.
 
 `coli chat` starts a private local server for Kimi and keeps the 2.8T model
 loaded for the whole terminal session. `coli serve` exposes streaming and

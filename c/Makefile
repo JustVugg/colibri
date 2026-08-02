@@ -97,6 +97,40 @@ ARCH   ?= native
 CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
+else ifneq (,$(AARCH64))
+# --- Linux / *BSD aarch64 (#631) ---
+# NEON e' baseline, ma i kernel SDOT/SMMLA int8-int4 vivono dietro
+# __ARM_FEATURE_DOTPROD / __ARM_FEATURE_MATMUL_INT8. A gcc that does not know
+# this core (gcc 13 vs Cortex-X925 on GB10: #631) degrades native to plain
+# armv8-a SILENTLY: the kernels compile out, no warning, the banner says
+# "idot: neon" and int4 S=1 decode falls back to f32. So for the default
+# ARCH=native, probe the macro; if it is missing, re-add the features the
+# silicon itself reports in /proc/cpuinfo -- but keep them only if this
+# compiler accepts the modifiers (gcc < 10 has no +i8mm: composing blindly
+# would turn a slow build into a broken one).
+CC      = gcc
+ARCH   ?= native
+ifeq ($(ARCH),native)
+ARCHFLAG := -mcpu=native
+ifeq ($(shell $(CC) -mcpu=native -dM -E - </dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8),0)
+CPUFEAT  := $(shell grep -m1 '^Features' /proc/cpuinfo 2>/dev/null)
+ARCH_EXT := $(if $(filter asimddp,$(CPUFEAT)),+dotprod)$(if $(filter i8mm,$(CPUFEAT)),+i8mm)
+ifneq ($(ARCH_EXT),)
+ifneq ($(shell $(CC) -march=armv8-a$(ARCH_EXT) -dM -E - </dev/null 2>/dev/null | grep -cE '__ARM_FEATURE_DOTPROD|__ARM_FEATURE_MATMUL_INT8'),0)
+ARCHFLAG := -march=armv8-a$(ARCH_EXT)
+else
+$(warning $(CC) does not accept$(subst +, +,$(ARCH_EXT)): int8/int4 idot kernels compile out (#631))
+endif
+endif
+endif
+else ifneq (,$(filter armv%,$(ARCH)))
+ARCHFLAG := -march=$(ARCH)
+else
+ARCHFLAG := -mcpu=$(ARCH)
+endif
+CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp -pthread
+EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
 CC      = gcc
@@ -458,11 +492,11 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
 
-olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h
+olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
-	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
+inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(VK_OBJ) $(VK_SPV)
 	$(CC) $(CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
@@ -488,6 +522,12 @@ portable:
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
+
+tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

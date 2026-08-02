@@ -365,6 +365,22 @@ families. Each is a **sibling engine** — one C file, its own architecture, the
 `coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
 the model's `config.json`):
 
+> **What each one needs.** These differ a lot, and reading two of them together
+> has confused people into thinking the requirements contradict each other
+> ([#191](https://github.com/JustVugg/colibri/issues/191)). They do not — they
+> are different models. **None of them needs a GPU.**
+>
+> | Model | Disk for the weights | RAM | GPU |
+> |---|---|---|---|
+> | **OLMoE** | ~4 GB | 8 GB | not needed |
+> | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
+> | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
+> | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
+>
+> A GPU only ever makes it faster. Speed is set by your disk, because the experts
+> are streamed from it — expect a fraction of a token per second on a slow drive
+> and a few per second on a fast one with the cache warm.
+
 | Family | Total / active | Weights | Build | Docs |
 |---|---|---|---|---|
 | **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
@@ -388,8 +404,8 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mirror preflight
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
 ./coli ramdisk --model /nvme/glm52_i4     # Linux NUMA/tmpfs staging and managed engines
-./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
-./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
+./coli web  --model /nvme/glm52_i4        # API + dashboard, and opens a browser
+./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
 On Windows the portable commands work with syntax such as
@@ -421,9 +437,9 @@ COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
 COLI_MODEL=/nvme/inkling_i4    ./coli chat
 COLI_MODEL=/nvme/kimi_k3       ./coli chat
 
-./coli web --model /nvme/inkling_i4               # API + dashboard, same port
+./coli web --model /nvme/inkling_i4               # API + dashboard, opens a browser
 ./coli web --model /nvme/kimi_k3
-./coli serve --model /nvme/inkling_i4             # API only
+./coli serve --model /nvme/inkling_i4             # API + dashboard, no browser
 ```
 
 For the non-GLM engines `coli chat` starts the gateway locally and attaches the
