@@ -607,12 +607,15 @@ COLI_RAMDISK_INTEGRATION=1 \
 Run it only in a suitable privileged or private mount environment. Its cleanup
 path is part of the test.
 
-The RAM-map end-to-end test is separate and consumes an existing compatible
-tmpfs-backed model supplied by the caller:
+The RAM-map end-to-end test is separate and consumes two existing compatible
+GLM int4 namespaces supplied by the caller: a block-backed canonical namespace
+(whose safetensor shards are hidden after staging) and a tmpfs-backed staged
+namespace:
 
 ```sh
 cd c
-COLI_RAMMAP_E2E_MODEL=/dev/shm/glm_i4 \
+COLI_RAMMAP_E2E_CANONICAL=/path/on/disk/glm_i4 \
+COLI_RAMMAP_E2E_STAGED=/dev/shm/glm_i4 \
   python3 -m unittest discover -s tests -p 'test_rammap_e2e.py' -v
 ```
 

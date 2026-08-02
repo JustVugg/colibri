@@ -500,13 +500,18 @@ suitable privileged/private mount environment:
 ```bash
 cd c
 COLI_RAMDISK_INTEGRATION=1 python3 -m unittest discover -s tests -p 'test_ramdisk_integration.py' -v
-COLI_RAMMAP_E2E_MODEL=/dev/shm/glm_i4 python3 -m unittest discover -s tests -p 'test_rammap_e2e.py' -v
+COLI_RAMMAP_E2E_CANONICAL=/path/on/disk/glm_i4 \
+COLI_RAMMAP_E2E_STAGED=/dev/shm/glm_i4 \
+  python3 -m unittest discover -s tests -p 'test_rammap_e2e.py' -v
 ```
 
 The first gate exercises the real tmpfs lifecycle with a generated tiny
-fixture. The second consumes an existing compatible tmpfs-backed int4 model
-directory supplied by the caller; it never downloads one. Both tests skip when
-their environment gate is absent.
+fixture. The second consumes two existing compatible GLM int4 namespaces
+supplied by the caller; it never downloads one. The canonical namespace must be
+block-backed (its safetensor shards are hidden after staging) and the staged
+namespace must be tmpfs-backed and complete, proving the engine bound
+`COLI_WEIGHTS_DIR` rather than falling back to SNAP. Both tests skip when their
+environment gates are absent.
 
 ## What's next
 
