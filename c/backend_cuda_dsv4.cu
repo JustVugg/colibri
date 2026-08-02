@@ -895,7 +895,7 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     bf16_round<<<(Q + 255) / 256, 256, 0, c->stream>>>(c->p2, Q);
     int sparse=0;
 #ifdef COLI_DSV4_FLASHINFER
-    sparse=getenv("DSV4_CUDA_SPARSE_MLA")&&atoi(getenv("DSV4_CUDA_SPARSE_MLA"))&&(heads==8||heads==16||heads==32||heads==64)&&dim==512&&pos<512;
+    sparse=getenv("DSV4_CUDA_SPARSE_MLA")&&atoi(getenv("DSV4_CUDA_SPARSE_MLA"))&&(heads==8||heads==16||heads==32||heads==64)&&dim==512&&pos<cache->window;
 #endif
     if(!sparse)head_rmsnorm<<<heads, 256, 0, c->stream>>>(c->p2, heads, dim, eps);
     if (qk_rope&&!sparse)
