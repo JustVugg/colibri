@@ -49,6 +49,11 @@ commit's TileLang mHC decode kernels for the DeepSeek-V4-Flash configuration
 (`hc=4`, `hidden=4096`, `n_out=24`, `split_k=8`). It is kept as the pinned
 upstream source for the native ABI integration.
 
+`backend_cuda_dsv4_qkv_vllm.cu` adapts that commit's
+`fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu`. The Torch registration
+layer is replaced by a native C ABI; the CUDA Q RMSNorm, RoPE, UE8M0 FP8
+quantization, and paged KV-cache insertion algorithm remains upstream code.
+
 Copyright contributors to the vLLM project
 
 Licensed under the Apache License, Version 2.0. You may obtain a copy at

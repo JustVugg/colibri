@@ -328,7 +328,7 @@ $(error FLASHINFER_HOME must point to a FlashInfer source checkout)
 endif
 CFLAGS += -DCOLI_DSV4_FLASHINFER
 NVCCFLAGS += -DCOLI_DSV4_FLASHINFER
-DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o backend_cuda_dsv4_sparse_mla_flashinfer.o
+DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o backend_cuda_dsv4_sparse_mla_flashinfer.o backend_cuda_dsv4_qkv_vllm.o
 endif
 ifeq ($(VLLM_MHC),1)
 override NVCCFLAGS += -DCOLI_DSV4_VLLM_MHC
@@ -483,6 +483,11 @@ backend_cuda_dsv4_sparse_mla_flashinfer.o: $(FLASHINFER_HOME)/csrc/sparse_mla_sm
 	"$(NVCC)" -O3 -std=c++17 -gencode=arch=compute_120f,code=sm_120f --expt-relaxed-constexpr \
 		-I"$(FLASHINFER_HOME)/include" -I"$(FLASHINFER_HOME)/3rdparty/cutlass/include" \
 		-c "$<" -o $@
+
+backend_cuda_dsv4_qkv_vllm.o: backend_cuda_dsv4_qkv_vllm.cu backend_cuda_dsv4_qkv_vllm.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++17 -gencode=arch=compute_120f,code=sm_120f \
+		--expt-relaxed-constexpr --expt-extended-lambda -c "$<" -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
