@@ -54,6 +54,7 @@ typedef struct {
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
     int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
                           * Han excluded from the letter classes, no '/' tail in the punct rule */
+    int deepseek;        /* DeepSeek-V4: numeric/CJK isolation + its own final Split regex */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id — exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
@@ -154,11 +155,16 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     if(merges) for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
-           pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
-            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        const char *l=NULL,*r=NULL; int ll=0,rl=0;
+        if(pr&&pr->t==J_ARR&&pr->len>=2&&pr->kids[0]&&pr->kids[1]&&
+           pr->kids[0]->t==J_STR&&pr->kids[1]->t==J_STR){
+            l=pr->kids[0]->str; r=pr->kids[1]->str;
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        } else if(pr&&pr->t==J_STR){
+            const char *sep=strchr(pr->str,' ');
+            if(sep){ l=pr->str; ll=(int)(sep-l); r=sep+1; rl=(int)strlen(r); }
+        }
+        if(!l||!r||ll<1||rl<1){ fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
@@ -188,6 +194,7 @@ static void tok_load(Tok *T, const char *path){
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"[一-龥")) T->deepseek=1;
         }
     }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
@@ -497,6 +504,53 @@ static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int 
     free(cp); free(off);
 }
 
+static int ds_cjk(uint32_t c){
+    return (c>=0x4e00&&c<=0x9fa5) || (c>=0x3040&&c<=0x309f) ||
+           (c>=0x30a0&&c<=0x30ff);
+}
+static int ds_lm(uint32_t c){ return is_L(c)||is_X(c); }
+static int ds_ps(uint32_t c){ return !is_S(c)&&!ds_lm(c)&&!is_N(c); }
+
+/* Sequential DeepSeek-V4 pre-tokenizer collapsed into one deterministic scan:
+ * numbers {1,3}, CJK runs, then the repository's final Split expression. */
+static void pretok_chunk_deepseek(Tok *T, const unsigned char *p, int a, int b,
+                                  int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int k=a;k<b;){ uint32_t c; int z=u8_next(p,b,k,&c); off[n]=k; cp[n++]=c; k+=z; }
+    off[n]=b;
+    int i=0;
+    while(i<n){
+        int s=i; uint32_t c=cp[i];
+        if(is_N(c)){ int k=0; while(i<n&&is_N(cp[i])&&k++<3)i++;
+            bpe_piece(T,p,off[s],off[i],out,no,max); continue; }
+        if(ds_cjk(c)){ while(i<n&&ds_cjk(cp[i]))i++;
+            bpe_piece(T,p,off[s],off[i],out,no,max); continue; }
+        /* [P/S][A-Za-z]+ */
+        if(ds_ps(c)&&i+1<n&&((cp[i+1]>='A'&&cp[i+1]<='Z')||(cp[i+1]>='a'&&cp[i+1]<='z'))){
+            i+=2; while(i<n&&((cp[i]>='A'&&cp[i]<='Z')||(cp[i]>='a'&&cp[i]<='z')))i++;
+            bpe_piece(T,p,off[s],off[i],out,no,max); continue; }
+        /* optional non-newline/non-letter/non-punct/non-symbol prefix + [L/M]+ */
+        { int j=i;
+          if(cp[j]!='\r'&&cp[j]!='\n'&&!ds_lm(cp[j])&&!ds_ps(cp[j])&&j+1<n&&ds_lm(cp[j+1])) j++;
+          if(j<n&&ds_lm(cp[j])){ while(j<n&&ds_lm(cp[j]))j++; i=j;
+              bpe_piece(T,p,off[s],off[i],out,no,max); continue; } }
+        /* optional ASCII space + [P/S]+ + newlines */
+        { int j=i; if(cp[j]==' '&&j+1<n&&ds_ps(cp[j+1]))j++;
+          if(j<n&&ds_ps(cp[j])){ while(j<n&&ds_ps(cp[j]))j++;
+              while(j<n&&(cp[j]=='\r'||cp[j]=='\n'))j++; i=j;
+              bpe_piece(T,p,off[s],off[i],out,no,max); continue; } }
+        /* whitespace branches: through final newline; otherwise keep trailing
+         * whitespace's last codepoint for the regex lookahead branch. */
+        { int j=i; while(j<n&&is_S(cp[j]))j++;
+          if(j>i){ int nl=-1; for(int k=i;k<j;k++)if(cp[k]=='\r'||cp[k]=='\n')nl=k;
+              if(nl>=0)i=nl+1; else i=(j<n&&j-i>1)?j-1:j;
+              bpe_piece(T,p,off[s],off[i],out,no,max); continue; } }
+        i++; bpe_piece(T,p,off[s],off[i],out,no,max);
+    }
+    free(cp); free(off);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -511,7 +565,8 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
+            if(T->deepseek)   pretok_chunk_deepseek(T,p,i,chunk_end,out,&no,max);
+            else if(T->kimi)  pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
             else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
             else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }

@@ -166,6 +166,9 @@ CUDA      ?= 0
 CUDA_DLL  ?= 0
 COLI_ANS  ?= 0
 DIETGPU_ROOT ?=
+DEEPGEMM  ?= 0
+VLLM_MHC  ?= 0
+NCCL      ?= 0
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
 # GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
@@ -250,6 +253,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
+DSV4_CUDA_OBJ =
 # Gates are exactly the tests that have a build rule further down -- derived from those
 # rules, so adding a gate means adding your tests/test_*.c and its rule, and nothing else.
 # There is no shared list to conflict on.
@@ -289,7 +293,7 @@ ifeq ($(HIP),1)
 $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
-LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
 CUDA_OBJ  = backend_cuda.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
@@ -301,6 +305,38 @@ GPUFLAGS += -DCOLI_ANS -I$(DIETGPU_ROOT) -I$(DIETGPU_ROOT)/build/third_party/glo
 ANS_LIBS  = -L$(DIETGPU_ROOT)/build/lib -Wl,-rpath,$(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
 ANS_NVCC_LIBS = -L$(DIETGPU_ROOT)/build/lib -Xlinker -rpath -Xlinker $(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
 LDFLAGS  += $(ANS_LIBS)
+endif
+DSV4_CUDA_OBJ = backend_cuda_dsv4.o
+ifeq ($(VLLM_MHC),1)
+ifndef TILELANG_HOME
+$(error TILELANG_HOME must point to an installed TileLang package)
+endif
+CFLAGS += -DCOLI_DSV4_VLLM_MHC
+DSV4_CUDA_OBJ += backend_cuda_dsv4_mhc_vllm.o
+endif
+ifeq ($(DEEPGEMM),1)
+ifndef DEEPGEMM_HOME
+$(error DEEPGEMM_HOME must point to a DeepGEMM include tree)
+endif
+CFLAGS += -DCOLI_DSV4_DEEPGEMM
+override NVCCFLAGS := -O3 -std=c++20 -gencode=arch=compute_120f,code=sm_120f --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=-Wall,-Wextra -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)"
+LDFLAGS += -lcuda
+endif
+ifeq ($(FLASHINFER),1)
+ifndef FLASHINFER_HOME
+$(error FLASHINFER_HOME must point to a FlashInfer source checkout)
+endif
+CFLAGS += -DCOLI_DSV4_FLASHINFER
+NVCCFLAGS += -DCOLI_DSV4_FLASHINFER
+DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o
+endif
+ifeq ($(VLLM_MHC),1)
+override NVCCFLAGS += -DCOLI_DSV4_VLLM_MHC
+endif
+ifeq ($(NCCL),1)
+CFLAGS += -DCOLI_DSV4_NCCL
+override NVCCFLAGS += -DCOLI_DSV4_NCCL
+LDFLAGS += -lnccl
 endif
 endif
 
@@ -426,6 +462,22 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_flashinfer.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+backend_cuda_dsv4_mhc_vllm.o: backend_cuda_dsv4_mhc_vllm.cu backend_cuda_dsv4_mhc_vllm.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++20 -arch=sm_120 -DENABLE_BF16 \
+		-I"$(TILELANG_HOME)/src" -I"$(TILELANG_HOME)/3rdparty/cutlass/include" \
+		-c backend_cuda_dsv4_mhc_vllm.cu -o $@
+
+backend_cuda_dsv4_flashinfer.o: backend_cuda_dsv4_flashinfer.cu backend_cuda_dsv4_flashinfer.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++17 -arch=sm_120a --expt-relaxed-constexpr -diag-suppress=20012 -diag-suppress=20013 -diag-suppress=20015 \
+		-I"$(FLASHINFER_HOME)/include" -I"$(FLASHINFER_HOME)/3rdparty/cutlass/include" \
+		-I"$(FLASHINFER_HOME)/3rdparty/cutlass/tools/util/include" -c backend_cuda_dsv4_flashinfer.cu -o $@
+
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -516,6 +568,15 @@ ifeq ($(CUDA),1)
 	@echo "*** On NVIDIA, Kimi K3 runs on the Vulkan path — build VULKAN=1 and set COLI_VULKAN=1."
 endif
 	$(CC) $(NOCUDA_CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(NOCUDA_LDFLAGS)
+
+deepseek_v4$(EXE): deepseek_v4.c json.h st.h compat.h tok.h tok_unicode.h tok_unicode_o200k.h dsv4_mhc.h dsv4_quant.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) deepseek_v4.c $(DSV4_CUDA_OBJ) -o deepseek_v4$(EXE) $(LDFLAGS)
+
+tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c dsv4_mhc.h
+	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)
+
+tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c dsv4_quant.h
+	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
