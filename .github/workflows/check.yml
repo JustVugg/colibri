@@ -18,6 +18,50 @@ jobs:
       - name: make check
         run: make -C c check
 
+  wheel-backend:
+    name: Wheel backend (Linux, ${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: setuptools 77.0.1 minimum
+            requirement: setuptools==77.0.1
+            expected: 77.0.1
+          - label: current setuptools
+            requirement: setuptools
+            expected: current
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # This is the lane's only dependency resolution step. The packaging test
+      # itself builds and installs without package-index access, using
+      # --no-index and --no-build-isolation.
+      - name: Install selected wheel backend
+        run: python -m pip install --upgrade "${{ matrix.requirement }}"
+      - name: Verify selected backend
+        env:
+          EXPECTED_SETUPTOOLS: ${{ matrix.expected }}
+        run: |
+          python - <<'PY'
+          import os
+          import setuptools
+
+          actual = setuptools.__version__
+          expected = os.environ["EXPECTED_SETUPTOOLS"]
+          print("setuptools", actual)
+          if expected != "current" and actual != expected:
+              raise SystemExit(
+                  "expected setuptools %s, got %s" % (expected, actual)
+              )
+          PY
+      - name: Build and smoke-test wheel without index access
+        run: >-
+          python -m unittest -v
+          c.tests.test_ramdisk_packaging.RamdiskPackagingTest.test_wheel_contains_runnable_ramdisk_control_plane
+
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64
     # (MSYS2/UCRT64), the exact toolchain the README's Windows port targets.

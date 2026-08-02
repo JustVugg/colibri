@@ -38,10 +38,15 @@
 
           nativeBuildInputs = with pkgs; [makeWrapper];
 
-          buildInputs = with pkgs; [
-            gcc
-            gmp
-          ];
+          buildInputs =
+            (with pkgs; [
+              gcc
+              gmp
+            ])
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.psmisc
+              pkgs.util-linux
+            ];
 
           # `make test` runs both the C harness and Python converter tests.
           nativeCheckInputs = [pythonEnv];
@@ -87,6 +92,7 @@
             makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
               --add-flags "$out/lib/colibri/coli" \
               --set-default COLI_ENGINE "$out/lib/colibri/colibri" \
+              ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "--prefix PATH : ${pkgs.lib.makeBinPath [pkgs.psmisc pkgs.util-linux]}"} \
               --set PYTHONPATH "$out/lib/colibri:${pythonEnv}/${pkgs.python3.sitePackages}"
             runHook postInstall
           '';

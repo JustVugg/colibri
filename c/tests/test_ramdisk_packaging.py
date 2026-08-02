@@ -13,6 +13,7 @@ from pathlib import Path
 C_DIR = Path(__file__).resolve().parents[1]
 ROOT = C_DIR.parent
 MAKE = shutil.which("make")
+PIP_AVAILABLE = importlib.util.find_spec("pip") is not None
 SETUPTOOLS_AVAILABLE = importlib.util.find_spec("setuptools") is not None
 SUPPORT_MODULES = (
     "version.py",
@@ -67,9 +68,49 @@ def copy_support(destination, exclude=(), package_exclude=()):
 
 
 class RamdiskPackagingTest(unittest.TestCase):
-    @unittest.skipUnless(SETUPTOOLS_AVAILABLE, "setuptools is required to build a wheel")
+    def _run_packaging_command(self, command, *, cwd):
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                **os.environ,
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                "PIP_NO_INPUT": "1",
+            },
+        )
+        if result.returncode:
+            self.fail(
+                "packaging command failed (%s):\nstdout:\n%s\nstderr:\n%s"
+                % (
+                    " ".join(map(str, command)),
+                    result.stdout,
+                    result.stderr,
+                )
+            )
+        return result
+
+    def test_spdx_license_declares_a_compatible_setuptools_minimum(self):
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        minimum_match = re.search(
+            r'setuptools>=(\d+(?:\.\d+)+)',
+            pyproject,
+        )
+        self.assertIsNotNone(minimum_match, pyproject)
+        self.assertGreaterEqual(
+            tuple(map(int, minimum_match.group(1).split("."))),
+            (77, 0, 1),
+            "SPDX project metadata requires setuptools 77.0.1 or newer",
+        )
+
+    @unittest.skipUnless(
+        SETUPTOOLS_AVAILABLE,
+        "wheel backend unavailable; source/install packaging contracts still run",
+    )
     def test_wheel_contains_runnable_ramdisk_control_plane(self):
-        """The pip entry point must not depend on files left in a source clone."""
+        """The ambient backend must build an installable CLI without an index."""
         with tempfile.TemporaryDirectory() as stage:
             stage_root = Path(stage)
             source = stage_root / "source"
@@ -88,31 +129,65 @@ class RamdiskPackagingTest(unittest.TestCase):
             copy_support(runtime)
             shutil.copytree(C_DIR / "tools", runtime / "tools")
 
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        "import setuptools.build_meta as backend, sys; "
-                        "print(backend.build_wheel(sys.argv[1]))"
-                    ),
-                    str(wheel_dir),
-                ],
-                cwd=source,
-                text=True,
-                capture_output=True,
-                check=True,
-            )
+            if PIP_AVAILABLE:
+                self._run_packaging_command(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "wheel",
+                        "--use-pep517",
+                        "--no-build-isolation",
+                        "--no-index",
+                        "--verbose",
+                        "--no-deps",
+                        "--wheel-dir",
+                        str(wheel_dir),
+                        str(source),
+                    ],
+                    cwd=stage_root,
+                )
+            else:
+                self._run_packaging_command(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import setuptools.build_meta as backend, sys; "
+                            "print(backend.build_wheel(sys.argv[1]))"
+                        ),
+                        str(wheel_dir),
+                    ],
+                    cwd=source,
+                )
 
             wheels = tuple(wheel_dir.glob("*.whl"))
             self.assertEqual(len(wheels), 1)
+
+            if PIP_AVAILABLE:
+                self._run_packaging_command(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--no-index",
+                        "--no-deps",
+                        "--target",
+                        str(installed),
+                        str(wheels[0]),
+                    ],
+                    cwd=stage_root,
+                )
+
             with zipfile.ZipFile(wheels[0]) as wheel:
                 members = set(wheel.namelist())
                 for name in ("coli", "requirements-tui.txt", *SUPPORT_MODULES):
                     self.assertIn(f"c/{name}", members)
                 for name in REQUIRED_SUPPORT_PACKAGE_MODULES:
                     self.assertIn(f"c/{SUPPORT_PACKAGE}/{name}", members)
-                wheel.extractall(installed)
+                if not PIP_AVAILABLE:
+                    wheel.extractall(installed)
 
             smoke = subprocess.run(
                 [
@@ -453,6 +528,15 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn('COLI_ENGINE "$out/lib/colibri/colibri"', flake)
         self.assertIn('program = "${colibri}/bin/colibri";', flake)
         self.assertIn("nativeCheckInputs = [pythonEnv];", flake)
+        self.assertIn(
+            "pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux",
+            flake,
+        )
+        self.assertIn("pkgs.psmisc", flake)
+        self.assertIn(
+            "--prefix PATH : ${pkgs.lib.makeBinPath [pkgs.psmisc pkgs.util-linux]}",
+            flake,
+        )
         self.assertIn("export PYTHONDONTWRITEBYTECODE=1", flake)
         self.assertIn("make test\n", flake)
         self.assertNotIn("make test-c\n", flake)
