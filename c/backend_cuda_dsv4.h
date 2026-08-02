@@ -21,6 +21,8 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scal
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t *w,int O,int I,int device);
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float *w,int O,int I,int device);
 int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
+int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t,const Dsv4CudaActivation *input,
+                           int tokens,Dsv4CudaActivation *output);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,

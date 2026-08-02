@@ -204,6 +204,10 @@ __global__ void dg_quant_dense(const float*x,uint8_t*q,int*sfa,int K){int pack=b
     for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;mx[threadIdx.x]=fabsf(x[k]);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}
         uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,x[k]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}
     if(!threadIdx.x)sfa[pack*4]=(int)codes;}
+__global__ void dg_quant_dense_batch(const float*x,uint8_t*q,int*sfa,int rows,int aligned_rows,int K){int row=blockIdx.x/(K/512),pack=blockIdx.x%(K/512);if(row>=rows)return;__shared__ float mx[128];uint32_t codes=0;
+    for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;mx[threadIdx.x]=fabsf(x[(long long)row*K+k]);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}
+        uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*K+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,x[(long long)row*K+k]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}
+    if(!threadIdx.x)sfa[(long long)pack*aligned_rows+row]=(int)codes;}
 __global__ void dg_quant_batched8(const float*x,uint8_t*q,int*sfa,int K){int batch=blockIdx.x/(K/512),pack=blockIdx.x%(K/512);if(batch>=8)return;__shared__ float mx[128];uint32_t codes=0;
     for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;mx[threadIdx.x]=fabsf(x[(long long)batch*K+k]);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}
         uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)batch*K+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,x[(long long)batch*K+k]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}
@@ -341,6 +345,23 @@ static int dg_dense_attention(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
     gemm<<<170,384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,SPLIT>1?c->dgdensews:nullptr,O,1,I,1,O,0,a,b,sa,sb,d);
     if constexpr(SPLIT>1){auto reduce=deep_gemm::sm120_split_k_reduce_impl<DgOutput,SPLIT>;reduce<<<(O+255)/256,256,0,c->stream>>>((DgOutput*)c->dgmm1,c->dgdensews,O,1,1,O);}
     dg_bf16_to_float<<<(O+255)/256,256,0,c->stream>>>(y,c->dgmm1,O);return ok(cudaGetLastError(),"attention DeepGEMM launch");
+}
+template<int O,int I,int BM,int BN,int BK,int SW,int STAGES,int EPI>
+static int dg_dense_batch(Dev*c,Dsv4CudaTensor*t,const float*x,float*y,int tokens){
+    constexpr int SMEM=88320;int aligned_tokens=(tokens+BN-1)/BN*BN;constexpr CUtensorMapSwizzle SWIZZLE=SW==128?CU_TENSOR_MAP_SWIZZLE_128B:CU_TENSOR_MAP_SWIZZLE_64B;
+    if(!t||tokens<1||t->O!=O||t->I!=I||!t->dg_scale||!buf((void**)&c->dga1,&c->dga1cap,(size_t)tokens*I)||
+       !buf((void**)&c->dgsfa1,&c->dgsfa1cap,(size_t)aligned_tokens*(I/512)*sizeof(int))||
+       !buf((void**)&c->dgmm1,&c->dgmm1cap,(size_t)tokens*O*sizeof(__nv_bfloat16)))return 0;
+    dg_quant_dense_batch<<<tokens*(I/512),128,0,c->stream>>>(x,c->dga1,c->dgsfa1,tokens,aligned_tokens,I);CUtensorMap a,b,sa,sb,d;
+    if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_UINT8,t->w,I,O,I,BK,BM,SWIZZLE)||
+       !dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_UINT8,c->dga1,I,tokens,I,BK,BN,SWIZZLE)||
+       !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,t->dg_scale,O,I/512,(unsigned long long)O*4,BM,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
+       !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,aligned_tokens,I/512,(unsigned long long)aligned_tokens*4,BN,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
+       !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,tokens,(unsigned long long)O*2,16,BM,CU_TENSOR_MAP_SWIZZLE_NONE))return 0;
+    auto gemm=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,0,I,128,128,1,BM,BN,BK,SW,SW,0,STAGES,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,1>;
+    if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM),"batched dense DeepGEMM shared memory"))return 0;
+    gemm<<<170,384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,nullptr,O,tokens,I,1,O,0,a,b,sa,sb,d);
+    dg_bf16_to_float<<<((long long)tokens*O+255)/256,256,0,c->stream>>>(y,c->dgmm1,tokens*O);return ok(cudaGetLastError(),"batched dense DeepGEMM launch");
 }
 static int dg_attention_kv_reuse(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){(void)x;return t&&t->O==512&&t->I==4096&&dg_dense_attention<512,4096,64,128,128,9,64,4,false>(c,t,x,y);}
 static int dg_attention_projection(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
@@ -1049,6 +1070,23 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
+extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
+#ifdef COLI_DSV4_DEEPGEMM
+    Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
+       input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;
+    if(t->O==1536&&t->I==4096)return dg_dense_batch<1536,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==1024&&t->I==4096)return dg_dense_batch<1024,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==512&&t->I==4096)return dg_dense_batch<512,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==4096&&t->I==4096)return dg_dense_batch<4096,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==4096&&t->I==8192)return dg_dense_batch<4096,8192,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==4096&&t->I==1024)return dg_dense_batch<4096,1024,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==16384&&t->I==1024)return dg_dense_batch<16384,1024,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    if(t->O==32768&&t->I==1024)return dg_dense_batch<32768,1024,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
+    return 0;
+#else
+    (void)t;(void)input;(void)tokens;(void)output;return 0;
+#endif
+}
 extern "C" int dsv4_cuda_head_argmax(Dsv4CudaTensor*t,const float*x,int*id,float*value){
 #ifdef COLI_DSV4_DEEPGEMM
     constexpr int O=129280,I=4096;Dev*c=t?ctx(t->device):nullptr;if(!c||!x||!id||!value||t->fmt!=16||t->O!=O||t->I!=I||!ok(cudaSetDevice(t->device),"select output head device")||
