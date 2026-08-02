@@ -930,10 +930,12 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
 #endif
     if (async && !ok(cudaStreamWaitEvent(c->stream, c->join, 0), "attention join wait")) return 0;
 #ifdef COLI_DSV4_FLASHINFER
-    if(sparse){int main_topk=((cache->window+63)/64)*64,main_splits=main_topk/64,extra_cap=ratio?(cache->max_tokens+ratio-1)/ratio:0,extra_topk=((extra_cap+63)/64)*64,extra_splits=extra_topk/64;
-        if(ratio&&!dsv4_vllm_pack_compressed(cache->compressed,cache->fi_comp,c->decode_state,ratio,64,64*584,c->stream))return 0;
-        fi_indices<<<1,512,0,c->stream>>>(cache->fi_indices,cache->fi_length,c->decode_state,cache->window);if(ratio)fi_extra_indices<<<1,512,0,c->stream>>>(cache->fi_comp_indices,cache->fi_comp_length,cache->compressed_len,c->decode_state,cache->window,ratio);
-        if(!dsv4_flashinfer_sparse_mla(cache->fi_q,cache->fi_kv,cache->fi_indices,cache->fi_mid,cache->fi_lse,cache->fi_out,cache->fi_out_lse,cache->fi_length,(float*)sink->w,ratio?cache->fi_comp:nullptr,ratio?cache->fi_comp_indices:nullptr,ratio?cache->fi_comp_length:nullptr,extra_topk,64,64*584,heads,main_topk,1,main_splits+extra_splits,0,1.f/sqrtf((float)dim),64*584,c->stream))return 0;
+    if(sparse){int main_topk=((cache->window+63)/64)*64,main_splits=main_topk/64;
+        int use_extra=ratio&&(pos+1)>=ratio;
+        int extra_cap=use_extra?(cache->max_tokens+ratio-1)/ratio:0,extra_topk=((extra_cap+63)/64)*64,extra_splits=extra_topk/64;
+        if(use_extra&&!dsv4_vllm_pack_compressed(cache->compressed,cache->fi_comp,c->decode_state,ratio,64,64*584,c->stream))return 0;
+        fi_indices<<<1,512,0,c->stream>>>(cache->fi_indices,cache->fi_length,c->decode_state,cache->window);if(use_extra)fi_extra_indices<<<1,512,0,c->stream>>>(cache->fi_comp_indices,cache->fi_comp_length,cache->compressed_len,c->decode_state,cache->window,ratio);
+        if(!dsv4_flashinfer_sparse_mla(cache->fi_q,cache->fi_kv,cache->fi_indices,cache->fi_mid,cache->fi_lse,cache->fi_out,cache->fi_out_lse,cache->fi_length,(float*)sink->w,use_extra?cache->fi_comp:nullptr,use_extra?cache->fi_comp_indices:nullptr,use_extra?cache->fi_comp_length:nullptr,extra_topk,use_extra?64:0,use_extra?64*584:0,heads,main_topk,1,main_splits+extra_splits,0,1.f/sqrtf((float)dim),64*584,c->stream))return 0;
         mhc_bf16_to_float<<<(heads*dim+255)/256,256,0,c->stream>>>(c->p4,cache->fi_out,heads*dim);
     }else
 #endif
