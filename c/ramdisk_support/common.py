@@ -39,6 +39,9 @@ class _OperationCancelled(RamdiskError):
 class _EngineCleanupError(RamdiskError):
     """A benchmark engine may still be live, so no later variant may launch."""
 
+class _MountHelperCompletedError(RamdiskError):
+    """The privileged mount helper completed and reported a failure."""
+
 
 def _usage_engine_id(name):
     """Return route_trace.h's stable 32-bit FNV-1a engine identity."""

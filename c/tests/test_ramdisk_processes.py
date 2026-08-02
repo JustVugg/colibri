@@ -187,6 +187,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self,
         *,
         popen_effect=None,
+        popen_factory=None,
         cancel_after_pending=False,
         log_open_effect=None,
         terminate_direct_child_effect=None,
@@ -226,7 +227,11 @@ class ManagedLaunchTest(unittest.TestCase):
                     cancel.set()
 
             merge = mock.Mock(side_effect=merge_effect)
-            popen = mock.Mock(side_effect=popen_effect)
+            if popen_factory is None:
+                popen = mock.Mock(side_effect=popen_effect)
+            else:
+                self.assertIsNone(popen_effect)
+                popen = popen_factory
             terminate_direct_child = mock.Mock(
                 side_effect=terminate_direct_child_effect
             )
@@ -625,7 +630,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["pending_launches"], [])
         self.assertEqual(manifest["processes"], [])
 
-    def test_popen_oserror_retains_outcome_unknown_pending_launch(self):
+    def test_mocked_popen_oserror_retains_unknown_without_inspected_attempt(self):
         manifest, snapshots, popen, merge, _terminate, _group, caught = (
             self._exercise_prepublication_popen_outcome(
                 popen_effect=OSError("parent-side Popen failure")
@@ -643,6 +648,113 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["state"], "error")
         self.assertEqual(manifest["processes"], [])
         self.assertEqual(len(manifest["pending_launches"]), 1)
+
+    def test_inspected_prefork_popen_exception_proves_child_absence(self):
+        real_popen = subprocess.Popen
+
+        class PreForkFailurePopen(real_popen):
+            def _execute_child(self, *args, **kwargs):
+                del args, kwargs
+                raise OSError("inspected pre-fork failure")
+
+        (
+            manifest,
+            snapshots,
+            _popen,
+            merge,
+            terminate,
+            group,
+            caught,
+        ) = self._exercise_prepublication_popen_outcome(
+            popen_factory=PreForkFailurePopen
+        )
+
+        self.assertIsInstance(caught, OSError)
+        self.assertEqual(str(caught), "inspected pre-fork failure")
+        self.assertTrue(
+            any(snapshot.get("pending_launches") for snapshot in snapshots)
+        )
+        terminate.assert_not_called()
+        group.assert_not_called()
+        merge.assert_called_once()
+        self.assertEqual(manifest["state"], "error")
+        self.assertEqual(manifest["processes"], [])
+        self.assertEqual(manifest["pending_launches"], [])
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and os.name == "posix",
+        "requires Linux POSIX Popen post-fork ordering",
+    )
+    def test_postfork_popen_exception_retains_and_reaps_exact_child(self):
+        real_popen = subprocess.Popen
+        attempts = []
+        attempt_owned_devnull = []
+        child_stdin_streams = []
+
+        class PostForkFailurePopen(real_popen):
+            def __init__(self, _command, **kwargs):
+                child_stdin_streams.append(kwargs["stdin"])
+                super().__init__(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(30)",
+                    ],
+                    **kwargs,
+                )
+
+            def _close_pipe_fds(self, *args):
+                super()._close_pipe_fds(*args)
+                attempts.append(self)
+                attempt_owned_devnull.append(hasattr(self, "_devnull"))
+                raise OSError("parent-side post-fork failure")
+
+        def reap_attempt():
+            if not attempts:
+                return
+            process = attempts[-1]
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
+
+        self.addCleanup(reap_attempt)
+
+        def terminate_direct_child(process):
+            self.assertIs(process, attempts[-1])
+            process.kill()
+            return None
+
+        (
+            manifest,
+            snapshots,
+            _popen,
+            merge,
+            terminate,
+            group,
+            caught,
+        ) = self._exercise_prepublication_popen_outcome(
+            popen_factory=PostForkFailurePopen,
+            terminate_direct_child_effect=terminate_direct_child,
+        )
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempt_owned_devnull, [False])
+        self.assertEqual(len(child_stdin_streams), 1)
+        self.assertTrue(child_stdin_streams[0].closed)
+        process = attempts[0]
+        self.assertIsInstance(caught, OSError)
+        self.assertEqual(str(caught), "parent-side post-fork failure")
+        self.assertTrue(process._child_created)
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(
+            any(snapshot.get("pending_launches") for snapshot in snapshots)
+        )
+        terminate.assert_called_once_with(process)
+        group.assert_called_once_with(process.pid)
+        merge.assert_called_once()
+        self.assertEqual(manifest["state"], "error")
+        self.assertEqual(manifest["processes"], [])
+        self.assertEqual(manifest["pending_launches"], [])
 
     def test_async_popen_interruption_retains_outcome_unknown_pending_launch(self):
         manifest, snapshots, popen, merge, _terminate, _group, caught = (

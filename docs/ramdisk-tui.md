@@ -381,9 +381,12 @@ interface temporarily suspends itself for one foreground `sudo -v` prompt.
 It then verifies that the credential can be reused non-interactively. The
 background worker uses non-interactive sudo only for the exact mount, unmount,
 or trusted `fuser -mM` busy-mount check. The `fuser` invocation is read-only
-and receives the verified absolute mount path as a separate argument. A
-keepalive preserves rollback authority during a long copy. If the credential
-cannot be reused without prompting, no mount operation starts.
+and receives the verified absolute mount path as a separate argument. Before
+mounting, a read-only `fuser -mM /` probe and privileged `umount --help` probe
+exercise the trusted helpers, required options, and current non-interactive
+sudo authorization. Rollback still scopes each command to the exact managed
+path. A keepalive preserves rollback authority during a long copy. If the
+credential cannot be reused without prompting, no mount operation starts.
 
 Other safety boundaries include:
 
@@ -541,7 +544,7 @@ mount. Missing, incompatible, or untrusted helpers, denied sudo reuse, diagnosti
 output, timeouts, and incomplete scans all fail closed. Prepare checks this
 capability before confirmation or mount mutation, and an existing workspace
 remains recorded for recovery while identity is unproven. The Nix package adds
-PSmisc to the Linux runtime closure automatically.
+PSmisc and util-linux to the Linux runtime closure automatically.
 
 **Sudo authorization returns to the TUI without mounting.**
 

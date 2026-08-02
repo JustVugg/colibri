@@ -15,6 +15,9 @@ ROOT = C_DIR.parent
 MAKE = shutil.which("make")
 PIP_AVAILABLE = importlib.util.find_spec("pip") is not None
 SETUPTOOLS_AVAILABLE = importlib.util.find_spec("setuptools") is not None
+ISOLATED_PEP517_REQUESTED = (
+    os.environ.get("COLIBRI_TEST_ISOLATED_PEP517") == "1"
+)
 SUPPORT_MODULES = (
     "version.py",
     "resource_plan.py",
@@ -105,12 +108,11 @@ class RamdiskPackagingTest(unittest.TestCase):
             "SPDX project metadata requires setuptools 77.0.1 or newer",
         )
 
-    @unittest.skipUnless(
-        SETUPTOOLS_AVAILABLE,
-        "wheel backend unavailable; source/install packaging contracts still run",
-    )
-    def test_wheel_contains_runnable_ramdisk_control_plane(self):
-        """The ambient backend must build an installable CLI without an index."""
+    def _assert_wheel_contains_runnable_control_plane(
+        self,
+        *,
+        isolated_build,
+    ):
         with tempfile.TemporaryDirectory() as stage:
             stage_root = Path(stage)
             source = stage_root / "source"
@@ -124,30 +126,44 @@ class RamdiskPackagingTest(unittest.TestCase):
             for name in ("pyproject.toml", "README.md", "LICENSE"):
                 shutil.copy2(ROOT / name, source / name)
             shutil.copytree(ROOT / "colibri", source / "colibri")
-            for name in ("__init__.py", "coli", "requirements-tui.txt", "download_fp8.py"):
+            for name in (
+                "__init__.py",
+                "coli",
+                "requirements-tui.txt",
+                "download_fp8.py",
+            ):
                 shutil.copy2(C_DIR / name, runtime / name)
             copy_support(runtime)
             shutil.copytree(C_DIR / "tools", runtime / "tools")
 
             if PIP_AVAILABLE:
-                self._run_packaging_command(
+                command = [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "wheel",
+                    "--use-pep517",
+                ]
+                if not isolated_build:
+                    command.extend(
+                        ["--no-build-isolation", "--no-index"]
+                    )
+                command.extend(
                     [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "wheel",
-                        "--use-pep517",
-                        "--no-build-isolation",
-                        "--no-index",
                         "--verbose",
                         "--no-deps",
                         "--wheel-dir",
                         str(wheel_dir),
                         str(source),
-                    ],
-                    cwd=stage_root,
+                    ]
                 )
+                self._run_packaging_command(command, cwd=stage_root)
             else:
+                if isolated_build:
+                    self.fail(
+                        "default isolated PEP 517 verification requires pip"
+                    )
                 self._run_packaging_command(
                     [
                         sys.executable,
@@ -189,7 +205,7 @@ class RamdiskPackagingTest(unittest.TestCase):
                 if not PIP_AVAILABLE:
                     wheel.extractall(installed)
 
-            smoke = subprocess.run(
+            smoke = self._run_packaging_command(
                 [
                     sys.executable,
                     "-c",
@@ -203,13 +219,30 @@ class RamdiskPackagingTest(unittest.TestCase):
                     str(installed),
                 ],
                 cwd=stage_root,
-                text=True,
-                capture_output=True,
-                check=True,
             )
 
         self.assertIn("interleaved = one shared model copy", smoke.stdout)
         self.assertIn("prepare", smoke.stdout)
+
+    @unittest.skipUnless(
+        SETUPTOOLS_AVAILABLE,
+        "wheel backend unavailable; source/install packaging contracts still run",
+    )
+    def test_wheel_contains_runnable_ramdisk_control_plane(self):
+        """The selected ambient backend builds without package-index access."""
+        self._assert_wheel_contains_runnable_control_plane(
+            isolated_build=False,
+        )
+
+    @unittest.skipUnless(
+        PIP_AVAILABLE and ISOLATED_PEP517_REQUESTED,
+        "set COLIBRI_TEST_ISOLATED_PEP517=1 for the networked build gate",
+    )
+    def test_default_isolated_pep517_wheel_installs_and_runs(self):
+        """Default PEP 517 isolation resolves, builds, installs, and runs."""
+        self._assert_wheel_contains_runnable_control_plane(
+            isolated_build=True,
+        )
 
     @unittest.skipUnless(MAKE, "make is required")
     def test_staged_install_dry_run_includes_support_module(self):

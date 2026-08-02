@@ -474,7 +474,7 @@ import ramdisk
     def test_platform_skip_inventory_is_exact_and_drift_checked(self):
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_operational"]["tests"]),
-            32,
+            36,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["sigterm_handler"]["tests"]),
@@ -658,6 +658,32 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
                 "cannot parse Linux process identity /proc/731/stat",
             ):
                 linux_ops._process_group_member_pids(731)
+
+    def test_process_group_scan_accepts_non_utf8_process_name_bytes(self):
+        raw_stat = b"731 (worker-\xff) S 1 731 731 0 -1 0\n"
+
+        def open_proc(path, mode, *, encoding, errors, newline):
+            self.assertEqual(path, "/proc/731/stat")
+            self.assertEqual(mode, "r")
+            self.assertEqual(newline, "")
+            return io.TextIOWrapper(
+                io.BytesIO(raw_stat),
+                encoding=encoding,
+                errors=errors,
+                newline=newline,
+            )
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "listdir", return_value=["731"]
+        ), mock.patch(
+            "builtins.open", side_effect=open_proc
+        ):
+            self.assertEqual(
+                linux_ops._process_group_member_pids(731),
+                [731],
+            )
 
     def test_process_group_scan_preserves_pid_disappearance(self):
         with mock.patch.object(
@@ -1202,6 +1228,79 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
             ):
                 linux_ops._busy_mount_references_proc("/mnt/colibri")
 
+    def test_busy_mount_scan_preserves_non_utf8_leader_and_task_names(self):
+        leader_stat = (
+            b"731 (leader-\xff) S 1 731 731 0 -1 0 "
+            b"0 0 0 0 0 0 0 0 20 0 2 0 100\n"
+        )
+        task_stat = (
+            b"732 (task-\xfe) Z 1 731 731 0 -1 0 "
+            b"0 0 0 0 0 0 0 0 20 0 1 0 101\n"
+        )
+        stat_reads = []
+
+        def list_directory(path):
+            if path == "/proc":
+                return ["731"]
+            if path == "/proc/731/fd":
+                return []
+            if path == "/proc/731/task":
+                return ["731", "732"]
+            raise AssertionError("unexpected listdir %s" % path)
+
+        def read_link(path):
+            if path == "/proc/731/task/732/cwd":
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    "zombie task has no cwd",
+                    path,
+                )
+            return "/"
+
+        def open_proc(path, mode, *, encoding, errors, newline=None):
+            self.assertEqual(mode, "r")
+            if path == "/proc/731/maps":
+                self.assertIsNone(newline)
+                return io.StringIO("")
+            self.assertEqual(newline, "")
+            if path == "/proc/731/stat":
+                stat_reads.append((path, errors))
+                payload = leader_stat
+            elif path == "/proc/731/task/732/stat":
+                stat_reads.append((path, errors))
+                payload = task_stat
+            else:
+                raise AssertionError("unexpected open %s" % path)
+            return io.TextIOWrapper(
+                io.BytesIO(payload),
+                encoding=encoding,
+                errors=errors,
+                newline=newline,
+            )
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "listdir", side_effect=list_directory
+        ), mock.patch.object(
+            linux_ops.os, "readlink", side_effect=read_link
+        ), mock.patch(
+            "builtins.open", side_effect=open_proc
+        ):
+            self.assertEqual(
+                linux_ops._busy_mount_references_proc("/mnt/colibri"),
+                [],
+            )
+
+        self.assertEqual(
+            stat_reads,
+            [
+                ("/proc/731/stat", "surrogateescape"),
+                ("/proc/731/task/732/stat", "surrogateescape"),
+                ("/proc/731/stat", "surrogateescape"),
+            ],
+        )
+
     def test_unprivileged_busy_scan_uses_trusted_fuser_without_shell(self):
         trusted = mock.Mock(
             side_effect=lambda name: "/usr/bin/" + name
@@ -1281,6 +1380,12 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
                 "731",
                 "/mnt/colibri: m\nCannot stat file: Permission denied\n",
             ),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                "731",
+                "/mnt/colibri: m\nCannot open a network socket.\n",
+            ),
         )
         for result in failures:
             with self.subTest(
@@ -1317,15 +1422,34 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         trusted = mock.Mock(
             side_effect=lambda name: "/usr/bin/" + name
         )
+
+        def run_helper(command, **kwargs):
+            del kwargs
+            if command[-3:] == ["/usr/bin/fuser", "-mM", "/"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "731\n",
+                    "/: m\n",
+                )
+            if command[-2:] == ["/usr/bin/umount", "--help"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "  -c, --no-canonicalize\n",
+                    "",
+                )
+            raise AssertionError("unexpected command %r" % (command,))
+
         run = mock.Mock(
-            return_value=subprocess.CompletedProcess(
-                [], 0, "  -c, --no-canonicalize\n", ""
-            )
+            side_effect=run_helper
         )
         with mock.patch.object(
             linux_ops, "_require_linux"
         ), mock.patch.object(
             linux_ops, "current_euid", return_value=1000
+        ), linux_ops._noninteractive_privilege(
+            trusted_system_binary=trusted,
         ):
             linux_ops._ensure_busy_mount_scan_available(
                 "/mnt/colibri",
@@ -1335,9 +1459,131 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
 
         self.assertEqual(
             trusted.call_args_list,
-            [mock.call("fuser"), mock.call("sudo"), mock.call("umount")],
+            [
+                mock.call("fuser"),
+                mock.call("sudo"),
+                mock.call("umount"),
+                mock.call("sudo"),
+            ],
         )
-        run.assert_called_once_with(["/usr/bin/umount", "--help"], timeout=5.0)
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    [
+                        "/usr/bin/sudo",
+                        "-n",
+                        "--",
+                        "/usr/bin/fuser",
+                        "-mM",
+                        "/",
+                    ],
+                    timeout=10.0,
+                ),
+                mock.call(
+                    [
+                        "/usr/bin/sudo",
+                        "-n",
+                        "--",
+                        "/usr/bin/umount",
+                        "--help",
+                    ],
+                    timeout=5.0,
+                ),
+            ],
+        )
+
+    def test_prepare_rejects_denied_privileged_umount_probe(self):
+        trusted = mock.Mock(
+            side_effect=lambda name: "/usr/bin/" + name
+        )
+
+        def run_helper(command, **kwargs):
+            del kwargs
+            if command[-3:] == ["/usr/bin/fuser", "-mM", "/"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "731\n",
+                    "/: m\n",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "sudo: command not allowed\n",
+            )
+
+        run = mock.Mock(side_effect=run_helper)
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops, "current_euid", return_value=1000
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "umount helper is incompatible or unauthorized",
+            ):
+                linux_ops._ensure_busy_mount_scan_available(
+                    "/mnt/colibri",
+                    trusted_system_binary=trusted,
+                    run=run,
+                )
+
+        self.assertEqual(
+            run.call_args_list[-1],
+            mock.call(
+                [
+                    "/usr/bin/sudo",
+                    "--",
+                    "/usr/bin/umount",
+                    "--help",
+                ],
+                timeout=5.0,
+            ),
+        )
+
+    def test_prepare_rejects_denied_fuser_probe_before_umount_check(self):
+        trusted = mock.Mock(
+            side_effect=lambda name: "/usr/bin/" + name
+        )
+        denied = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "sudo: a password is required\n",
+        )
+        run = mock.Mock(return_value=denied)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops, "current_euid", return_value=1000
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "trusted fuser could not inspect managed mount /",
+            ):
+                linux_ops._ensure_busy_mount_scan_available(
+                    "/mnt/colibri",
+                    trusted_system_binary=trusted,
+                    run=run,
+                )
+
+        self.assertEqual(
+            trusted.call_args_list,
+            [mock.call("fuser"), mock.call("sudo")],
+        )
+        run.assert_called_once_with(
+            [
+                "/usr/bin/sudo",
+                "--",
+                "/usr/bin/fuser",
+                "-mM",
+                "/",
+            ],
+            timeout=10.0,
+        )
 
     def test_root_prepare_cleanup_capability_resolves_umount(self):
         trusted = mock.Mock(

@@ -203,6 +203,32 @@ def _json_print(value):
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+@contextlib.contextmanager
+def _interruptible_confirmation():
+    """Let terminal Ctrl-C interrupt a blocking confirmation read."""
+    sigint = getattr(signal, "SIGINT", None)
+    previous = None
+    installed = False
+    if (
+        sigint is not None
+        and threading.current_thread() is threading.main_thread()
+    ):
+        try:
+            previous = signal.getsignal(sigint)
+            signal.signal(sigint, signal.default_int_handler)
+            installed = True
+        except (OSError, ValueError):
+            pass
+    try:
+        yield
+    finally:
+        if installed:
+            try:
+                signal.signal(sigint, previous)
+            except (OSError, ValueError):
+                pass
+
+
 def _confirm(message, accepted=False):
     if accepted:
         return
@@ -211,7 +237,8 @@ def _confirm(message, accepted=False):
             message
             + "; rerun with --yes after reviewing `ramdisk plan`"
         )
-    answer = input(message + " [y/N] ").strip().lower()
+    with _interruptible_confirmation():
+        answer = input(message + " [y/N] ").strip().lower()
     if answer not in ("y", "yes"):
         raise RamdiskError("cancelled")
 

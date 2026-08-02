@@ -18,10 +18,14 @@ from .common import (
     MIB,
     STATUS_SCHEMA,
     RamdiskError,
+    _MountHelperCompletedError,
     _OperationCancelled,
     _raise_if_cancelled,
     _utc_now,
 )
+
+
+_POPEN_BASE_TYPE = subprocess.Popen
 
 
 def _managed_ports_for_plan(plan, base_port=8000):
@@ -649,7 +653,28 @@ def prepare(
             # This atomic write is the recovery boundary: no helper is invoked
             # until the intended pathname exists durably as unowned/pending.
             persist_manifest()
-            mount_tmpfs(plan, mount)
+            try:
+                mount_tmpfs(plan, mount)
+            except _MountHelperCompletedError:
+                # Only this typed failure proves the helper process completed.
+                # A generic runner exception can happen while a privileged
+                # helper is still in flight and must leave ownership pending.
+                # Even after completed failure, observation proves absence but
+                # cannot prove that an observed mount belongs to this attempt.
+                try:
+                    failed_actual = mount_at(mount["path"])
+                except Exception:
+                    pass
+                else:
+                    if failed_actual is None:
+                        manifest["mounts"] = [
+                            candidate
+                            for candidate in manifest["mounts"]
+                            if candidate.get("operation_id")
+                            != record["operation_id"]
+                        ]
+                        persist_manifest()
+                raise
             mounted_actual = mount_at(mount["path"])
             if not mounted_actual:
                 raise RamdiskError(
@@ -952,6 +977,33 @@ def _rollback_launched_children(
             context["rollback_error"] = failure
 
     return cleanup_failures, surviving_groups
+
+
+def _construct_retained_popen(popen_factory, *args, **kwargs):
+    """Construct Popen while retaining a real partially initialized attempt.
+
+    Normal callable test doubles remain opaque: if they raise, no object exists
+    whose child-creation fields can be inspected, so their outcome is unknown.
+    """
+    if not (
+        isinstance(popen_factory, type)
+        and issubclass(popen_factory, _POPEN_BASE_TYPE)
+    ):
+        try:
+            return popen_factory(*args, **kwargs), None, False
+        except BaseException as exc:
+            return None, exc, False
+
+    try:
+        attempt = popen_factory.__new__(popen_factory)
+    except BaseException as exc:
+        return None, exc, False
+
+    try:
+        popen_factory.__init__(attempt, *args, **kwargs)
+    except BaseException as exc:
+        return attempt, exc, True
+    return attempt, None, True
 
 
 def start(
@@ -1422,25 +1474,70 @@ def start(
             )
             _raise_if_cancelled(cancel_event)
             log = open(log_path, "ab", buffering=0)
+            child_stdin = None
             try:
-                # Popen can raise from parent-side work after fork, including
-                # with OSError, and asynchronous delivery can land as its CALL
-                # returns. Keep the durable classification conservative until
-                # the returned handle is registered with rollback.
+                child_stdin = open(os.devnull, "rb")
+                # Retain outcome-unknown until a successful handle or a real
+                # partially initialized Popen attempt proves what happened.
                 context["spawn_outcome"] = "outcome-unknown"
-                process = subprocess.Popen(
+                (
+                    process,
+                    construction_error,
+                    attempt_inspected,
+                ) = _construct_retained_popen(
+                    subprocess.Popen,
                     command,
                     env=environment,
-                    stdin=subprocess.DEVNULL,
+                    stdin=child_stdin,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     close_fds=True,
                 )
+                if construction_error is not None:
+                    child_created = bool(
+                        getattr(process, "_child_created", False)
+                    ) if process is not None else False
+                    child_pid = (
+                        getattr(process, "pid", None)
+                        if process is not None
+                        else None
+                    )
+                    exact_child_handle = (
+                        isinstance(child_pid, int)
+                        and not isinstance(child_pid, bool)
+                        and child_pid > 0
+                        and attempt_inspected
+                    )
+                    if exact_child_handle:
+                        # Popen writes pid immediately before _child_created;
+                        # normalize an interruption in that narrow window so
+                        # poll/wait/destruction retain the exact child handle.
+                        process._child_created = True
+                        spawned.append(process)
+                        context["spawn_outcome"] = "created"
+                    elif (
+                        isinstance(construction_error, Exception)
+                        and attempt_inspected
+                        and not child_created
+                        and child_pid is None
+                    ):
+                        # A normal exception plus the inspected attempt state
+                        # proves construction never published a child PID.
+                        context["spawn_outcome"] = "proven-absent"
+                    raise construction_error
+                if process is None:
+                    raise RamdiskError(
+                        "Popen returned no process handle"
+                    )
                 spawned.append(process)
                 context["spawn_outcome"] = "created"
             finally:
-                log.close()
+                try:
+                    if child_stdin is not None:
+                        child_stdin.close()
+                finally:
+                    log.close()
             identity = None
             identity_deadline = time.monotonic() + 1.0
             while (

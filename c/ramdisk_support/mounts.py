@@ -18,6 +18,7 @@ from .common import (
     GIB,
     MIB,
     RamdiskError,
+    _MountHelperCompletedError,
     _raise_if_cancelled,
 )
 from .discovery import _discover_cgroup_memory
@@ -154,7 +155,7 @@ def _mount_tmpfs(
             )
         ):
             break
-    raise RamdiskError(
+    raise _MountHelperCompletedError(
         "cannot mount tmpfs at %s: %s"
         % (mount["path"], "; ".join(errors))
     )

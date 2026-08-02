@@ -41,14 +41,24 @@ _fallback_usage_lock = threading.RLock()
 
 
 def _valid_usage_snapshot(value):
-    return isinstance(value, dict) and all(
-        isinstance(key, str)
-        and re.fullmatch(r"(?:-1:1|-2:1|\d+:\d+)", key)
-        and isinstance(count, int)
-        and not isinstance(count, bool)
-        and count >= 0
-        for key, count in value.items()
-    )
+    if not isinstance(value, dict):
+        return False
+    for key, count in value.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+        ):
+            return False
+        if re.fullmatch(r"-[12]:[1-9]\d*", key):
+            if count <= 0:
+                return False
+        elif re.fullmatch(r"\d+:\d+", key):
+            if count < 0:
+                return False
+        else:
+            return False
+    return True
 
 
 def _state_root():

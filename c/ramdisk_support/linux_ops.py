@@ -30,6 +30,18 @@ def _read_text(path, default=""):
         return default
 
 
+def _read_proc_stat(path):
+    """Read a task stat record without losing arbitrary ``comm`` bytes."""
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+        errors="surrogateescape",
+        newline="",
+    ) as stream:
+        return stream.read()
+
+
 def _status_allowed_list(field, fallback):
     """Read the kernel's effective task mask from ``/proc/self/status``."""
     status = _read_text("/proc/self/status")
@@ -462,7 +474,7 @@ def _process_identity(pid):
         raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
     pid = int(pid)
     try:
-        raw_stat = _read_text("/proc/%d/stat" % pid)
+        raw_stat = _read_proc_stat("/proc/%d/stat" % pid)
         close = raw_stat.rfind(")")
         fields = raw_stat[close + 2 :].split()
         starttime = int(fields[19])
@@ -512,13 +524,7 @@ def _process_group_member_pids(pgid):
         pid = int(entry)
         stat_path = "/proc/%d/stat" % pid
         try:
-            with open(
-                stat_path,
-                "r",
-                encoding="utf-8",
-                errors="strict",
-            ) as stream:
-                raw = stream.read()
+            raw = _read_proc_stat(stat_path)
         except (FileNotFoundError, ProcessLookupError):
             # Exiting between listdir() and open() is ordinary procfs churn.
             continue
@@ -596,13 +602,7 @@ def _busy_mount_references_proc(path):
         """Corroborate endpoint ENOENT without overlooking a live task."""
         stat_path = "/proc/%s/stat" % entry
         try:
-            with open(
-                stat_path,
-                "r",
-                encoding="utf-8",
-                errors="strict",
-            ) as stream:
-                process_stat = stream.read()
+            process_stat = _read_proc_stat(stat_path)
         except (FileNotFoundError, ProcessLookupError):
             # The PID itself is now absent, so it cannot retain the mount.
             return True
@@ -639,13 +639,7 @@ def _busy_mount_references_proc(path):
                 task_entries = os.listdir(task_dir)
             except (FileNotFoundError, ProcessLookupError):
                 try:
-                    with open(
-                        stat_path,
-                        "r",
-                        encoding="utf-8",
-                        errors="strict",
-                    ):
-                        pass
+                    _read_proc_stat(stat_path)
                 except (FileNotFoundError, ProcessLookupError):
                     return True
                 except (OSError, UnicodeError) as exc:
@@ -728,13 +722,7 @@ def _busy_mount_references_proc(path):
         """Return one complete task-membership snapshot for a live TGID."""
         stat_path = "/proc/%s/stat" % entry
         try:
-            with open(
-                stat_path,
-                "r",
-                encoding="utf-8",
-                errors="strict",
-            ) as stream:
-                process_stat = stream.read()
+            process_stat = _read_proc_stat(stat_path)
         except (FileNotFoundError, ProcessLookupError):
             return None
         except (OSError, UnicodeError) as exc:
@@ -763,13 +751,7 @@ def _busy_mount_references_proc(path):
             task_entries = os.listdir(task_dir)
         except (FileNotFoundError, ProcessLookupError) as exc:
             try:
-                with open(
-                    stat_path,
-                    "r",
-                    encoding="utf-8",
-                    errors="strict",
-                ):
-                    pass
+                _read_proc_stat(stat_path)
             except (FileNotFoundError, ProcessLookupError):
                 return None
             except (OSError, UnicodeError) as recheck_exc:
@@ -819,23 +801,11 @@ def _busy_mount_references_proc(path):
         """Reject a partial live-task view; tolerate only proven inert tasks."""
         task_stat_path = "/proc/%s/task/%s/stat" % (entry, task)
         try:
-            with open(
-                task_stat_path,
-                "r",
-                encoding="utf-8",
-                errors="strict",
-            ) as stream:
-                task_stat = stream.read()
+            task_stat = _read_proc_stat(task_stat_path)
         except (FileNotFoundError, ProcessLookupError):
             leader_stat_path = "/proc/%s/stat" % entry
             try:
-                with open(
-                    leader_stat_path,
-                    "r",
-                    encoding="utf-8",
-                    errors="strict",
-                ):
-                    pass
+                _read_proc_stat(leader_stat_path)
             except (FileNotFoundError, ProcessLookupError):
                 return True
             except (OSError, UnicodeError) as exc:
@@ -1107,7 +1077,6 @@ def _ensure_busy_mount_scan_available(
     run=None,
 ):
     """Prove cleanup discovery and unmount exist before mount mutation."""
-    del hardware
     _require_linux()
     trusted_system_binary = (
         _trusted_system_binary
@@ -1118,11 +1087,26 @@ def _ensure_busy_mount_scan_available(
     if current_euid() == 0:
         _busy_mount_references_proc(path)
     else:
-        _trusted_fuser_binary(trusted_system_binary)
-        trusted_system_binary("sudo")
+        # The planned path is not a mountpoint yet, so ``fuser -M`` cannot
+        # probe it. Root is always a mountpoint and exercises the exact trusted
+        # PSmisc binary, privileged command shape, option support, and current
+        # sudo authorization that cleanup will require later.
+        _busy_mount_references(
+            os.path.sep,
+            hardware=hardware,
+            run=run,
+            trusted_system_binary=trusted_system_binary,
+        )
     umount = trusted_system_binary("umount")
+    help_command = [umount, "--help"]
+    if current_euid() != 0:
+        help_command = _privileged(
+            help_command,
+            hardware,
+            trusted_system_binary=trusted_system_binary,
+        )
     try:
-        help_result = run([umount, "--help"], timeout=5.0)
+        help_result = run(help_command, timeout=5.0)
     except Exception as exc:
         raise RamdiskError(
             "trusted umount helper could not be verified: %s; install the "
@@ -1137,8 +1121,9 @@ def _ensure_busy_mount_scan_available(
         or "--no-canonicalize" not in help_output
     ):
         raise RamdiskError(
-            "trusted umount helper is incompatible: cleanup requires the "
-            "util-linux --no-canonicalize option"
+            "trusted privileged umount helper is incompatible or "
+            "unauthorized: cleanup requires the util-linux "
+            "--no-canonicalize option"
         )
 
 

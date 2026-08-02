@@ -237,6 +237,152 @@ class CliModuleTest(unittest.TestCase):
 
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
+    def test_prepare_and_destroy_confirmations_keep_ctrl_c_interruptible(self):
+        if not hasattr(signal, "SIGINT"):
+            self.skipTest("SIGINT is unavailable")
+        previous = signal.getsignal(signal.SIGINT)
+
+        def interrupt_prompt(_message):
+            handler = signal.getsignal(signal.SIGINT)
+            self.assertIs(handler, signal.default_int_handler)
+            handler(signal.SIGINT, None)
+
+        for action in ("prepare", "destroy"):
+            args = argparse.Namespace(ramdisk_action=action, json=False)
+
+            def prepare(_args, cancel_event=None):
+                cli._confirm("prepare?")
+                self.fail("prepare continued after Ctrl-C")
+
+            def destroy(_args):
+                cli._confirm("destroy?")
+                self.fail("destroy continued after Ctrl-C")
+
+            with self.subTest(action=action), mock.patch.object(
+                cli.sys,
+                "stdin",
+                mock.Mock(isatty=mock.Mock(return_value=True)),
+            ), mock.patch.object(
+                cli.sys,
+                "stdout",
+                mock.Mock(isatty=mock.Mock(return_value=True)),
+            ), mock.patch(
+                "builtins.input",
+                side_effect=interrupt_prompt,
+            ), self.assertRaises(KeyboardInterrupt):
+                cli.dispatch(
+                    args,
+                    build_plan=mock.Mock(),
+                    prepare=prepare,
+                    status=mock.Mock(),
+                    benchmark=mock.Mock(),
+                    start=mock.Mock(),
+                    stop=mock.Mock(),
+                    destroy=destroy,
+                    human_plan=mock.Mock(),
+                    human_status=mock.Mock(),
+                    human_benchmark=mock.Mock(),
+                )
+
+            self.assertIs(signal.getsignal(signal.SIGINT), previous)
+
+    def test_prepare_restores_cooperative_ctrl_c_after_confirmation(self):
+        if not hasattr(signal, "SIGINT"):
+            self.skipTest("SIGINT is unavailable")
+        args = argparse.Namespace(ramdisk_action="prepare", json=False)
+
+        def prepare(_args, cancel_event=None):
+            cli._confirm("prepare?")
+            handler = signal.getsignal(signal.SIGINT)
+            self.assertTrue(callable(handler))
+            self.assertIsNot(handler, signal.default_int_handler)
+            handler(signal.SIGINT, None)
+            self.assertTrue(cancel_event.is_set())
+            raise ramdisk._OperationCancelled("termination requested")
+
+        with mock.patch.object(
+            cli.sys,
+            "stdin",
+            mock.Mock(isatty=mock.Mock(return_value=True)),
+        ), mock.patch.object(
+            cli.sys,
+            "stdout",
+            mock.Mock(isatty=mock.Mock(return_value=True)),
+        ), mock.patch(
+            "builtins.input",
+            return_value="yes",
+        ), mock.patch("sys.stderr", new_callable=io.StringIO):
+            result = cli.dispatch(
+                args,
+                build_plan=mock.Mock(),
+                prepare=prepare,
+                status=mock.Mock(),
+                benchmark=mock.Mock(),
+                start=mock.Mock(),
+                stop=mock.Mock(),
+                destroy=mock.Mock(),
+                human_plan=mock.Mock(),
+                human_status=mock.Mock(),
+                human_benchmark=mock.Mock(),
+            )
+
+        self.assertEqual(result, 128 + int(signal.SIGINT))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "openpty"),
+        "a POSIX pseudo-terminal is required",
+    )
+    def test_real_tty_ctrl_c_interrupts_confirmation_without_input(self):
+        import select
+        import time
+
+        script = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from ramdisk_support import cli
+
+with cli._cli_termination_guard(True):
+    cli._confirm("confirm?")
+raise SystemExit(99)
+"""
+        master_fd, slave_fd = os.openpty()
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(C_DIR)],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        os.close(slave_fd)
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 5.0
+            while b"[y/N]" not in output and time.monotonic() < deadline:
+                readable, _, _ = select.select([master_fd], [], [], 0.1)
+                if readable:
+                    output.extend(os.read(master_fd, 4096))
+            self.assertIn(b"[y/N]", output, output.decode(errors="replace"))
+
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.fail(
+                    "Ctrl-C was swallowed at the confirmation prompt:\n%s"
+                    % output.decode(errors="replace")
+                )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2.0)
+            os.close(master_fd)
+
+        self.assertIn(
+            process.returncode,
+            (-int(signal.SIGINT), 128 + int(signal.SIGINT)),
+        )
+
     def test_import_does_not_load_terminal_or_linux_backends(self):
         script = r"""
 import importlib.abc

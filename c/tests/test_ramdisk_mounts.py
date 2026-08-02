@@ -180,9 +180,29 @@ class MountAndCopyTest(unittest.TestCase):
         ) as run, mock.patch.object(
             ramdisk, "_privileged", side_effect=lambda command, hardware: command
         ):
-            with self.assertRaises(ramdisk.RamdiskError):
+            with self.assertRaises(
+                mounts_support._MountHelperCompletedError
+            ):
                 ramdisk._mount_tmpfs(plan, plan["mounts"][0])
         self.assertEqual(run.call_count, 1)
+
+    def test_mount_runner_oserror_is_not_a_completed_helper_failure(self):
+        with ModelFixture() as fixture:
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
+        failure = OSError("Popen failed after helper construction began")
+        with mock.patch.object(
+            ramdisk, "_trusted_system_binary", return_value="/bin/mount"
+        ), mock.patch.object(
+            ramdisk, "_run", side_effect=failure
+        ), mock.patch.object(
+            ramdisk, "_privileged", side_effect=lambda command, hardware: command
+        ):
+            with self.assertRaises(OSError) as caught:
+                ramdisk._mount_tmpfs(plan, plan["mounts"][0])
+
+        self.assertIs(caught.exception, failure)
 
     def test_unmount_uses_trusted_noncanonicalizing_util_linux_command(self):
         run = mock.Mock(
@@ -305,7 +325,9 @@ class MountAndCopyTest(unittest.TestCase):
                 and pending[0]["requested"]["source"] == "tmpfs"
                 and "identity" not in pending[0]
             )
-            raise ramdisk.RamdiskError("mount helper failed")
+            raise mounts_support._MountHelperCompletedError(
+                "mount helper failed"
+            )
 
         with mock.patch.object(ramdisk, "_load_manifest", return_value=None), mock.patch.object(
             ramdisk, "build_plan", return_value=plan
@@ -322,11 +344,225 @@ class MountAndCopyTest(unittest.TestCase):
         self.assertEqual(helper_saw_pending, [True])
         unmount.assert_not_called()
         self.assertEqual(snapshots[-1]["state"], "error")
-        self.assertEqual(
-            snapshots[-1]["mounts"][0]["ownership"],
-            "pending",
-        )
-        self.assertNotIn("identity", snapshots[-1]["mounts"][0])
+        self.assertEqual(snapshots[-1]["mounts"], [])
+        self.assertEqual(snapshots[-1]["recovery"]["state"], "clean")
+        self.assertEqual(snapshots[-1]["recovery"]["retained_mounts"], [])
+
+    @requires_linux_operational
+    def test_failed_pending_removal_save_retains_last_durable_pending_mount(self):
+        snapshots = []
+        successful = []
+        with ModelFixture() as fixture, mock.patch.object(
+            ramdisk, "_filesystem_for_path", return_value="ext4"
+        ):
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
+        mount = plan["mounts"][0]
+
+        def save(manifest):
+            snapshot = json.loads(json.dumps(manifest))
+            snapshots.append(snapshot)
+            if len(snapshots) == 3:
+                raise OSError("pending removal write failed")
+            successful.append(snapshot)
+
+        mount_at = mock.Mock(side_effect=[None, None])
+        with mock.patch.object(
+            ramdisk, "_load_manifest", return_value=None
+        ), mock.patch.object(
+            ramdisk, "build_plan", return_value=plan
+        ), mock.patch.object(
+            ramdisk, "_save_manifest", side_effect=save
+        ), mock.patch.object(
+            ramdisk, "_mount_at", mount_at
+        ), mock.patch.object(
+            ramdisk,
+            "_mount_tmpfs",
+            side_effect=mounts_support._MountHelperCompletedError(
+                "mount helper failed"
+            ),
+        ), mock.patch.object(
+            ramdisk, "_mount_table", return_value=[]
+        ), mock.patch.object(ramdisk, "_umount_path") as unmount:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "pending removal write failed.*pathname-only rollback",
+            ) as caught:
+                ramdisk.prepare.__wrapped__(
+                    plan_args(fixture.root, yes=True), display_plan=False
+                )
+
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(mount_at.call_count, 2)
+        unmount.assert_not_called()
+        self.assertEqual(successful[1]["mounts"][0]["ownership"], "pending")
+        self.assertEqual(snapshots[2]["mounts"], [])
+        retained = successful[-1]
+        self.assertEqual(retained["recovery"]["state"], "attention-required")
+        self.assertEqual(retained["recovery"]["retained_mounts"], [mount["path"]])
+        self.assertEqual(retained["mounts"][0]["ownership"], "pending")
+        self.assertNotIn("identity", retained["mounts"][0])
+
+    @requires_linux_operational
+    def test_completed_mount_failure_retains_observed_mount_without_unmount(self):
+        snapshots = []
+        observed = {}
+        with ModelFixture() as fixture, mock.patch.object(
+            ramdisk, "_filesystem_for_path", return_value="ext4"
+        ):
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
+        mount = plan["mounts"][0]
+        actual = {
+            "mount_id": 45,
+            "device": "0:45",
+            "filesystem": "tmpfs",
+            "source": "tmpfs",
+        }
+
+        def save(manifest):
+            snapshots.append(json.loads(json.dumps(manifest)))
+
+        def mount_at(_path):
+            return observed.get("identity")
+
+        def mount_helper(_plan, _mount):
+            observed["identity"] = actual
+            raise mounts_support._MountHelperCompletedError(
+                "mount helper failed"
+            )
+
+        with mock.patch.object(
+            ramdisk, "_load_manifest", return_value=None
+        ), mock.patch.object(
+            ramdisk, "build_plan", return_value=plan
+        ), mock.patch.object(
+            ramdisk, "_save_manifest", side_effect=save
+        ), mock.patch.object(
+            ramdisk, "_mount_at", side_effect=mount_at
+        ), mock.patch.object(
+            ramdisk,
+            "_mount_tmpfs",
+            side_effect=mount_helper,
+        ), mock.patch.object(
+            ramdisk, "_validate_mount", return_value=actual
+        ) as validate, mock.patch.object(
+            ramdisk, "_mount_table", return_value=[]
+        ), mock.patch.object(
+            ramdisk, "_umount_path"
+        ) as unmount:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "pathname-only rollback",
+            ):
+                ramdisk.prepare.__wrapped__(
+                    plan_args(fixture.root, yes=True), display_plan=False
+                )
+
+        validate.assert_not_called()
+        unmount.assert_not_called()
+        retained = snapshots[-1]
+        self.assertEqual(retained["recovery"]["state"], "attention-required")
+        self.assertEqual(retained["recovery"]["retained_mounts"], [mount["path"]])
+        self.assertEqual(retained["mounts"][0]["ownership"], "pending")
+        self.assertNotIn("identity", retained["mounts"][0])
+
+    @requires_linux_operational
+    def test_failed_mount_helper_retains_pending_when_observation_is_inconclusive(self):
+        snapshots = []
+        with ModelFixture() as fixture, mock.patch.object(
+            ramdisk, "_filesystem_for_path", return_value="ext4"
+        ):
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
+        mount = plan["mounts"][0]
+
+        def save(manifest):
+            snapshots.append(json.loads(json.dumps(manifest)))
+
+        with mock.patch.object(
+            ramdisk, "_load_manifest", return_value=None
+        ), mock.patch.object(
+            ramdisk, "build_plan", return_value=plan
+        ), mock.patch.object(
+            ramdisk, "_save_manifest", side_effect=save
+        ), mock.patch.object(
+            ramdisk,
+            "_mount_at",
+            side_effect=[None, OSError("mount table unavailable")],
+        ), mock.patch.object(
+            ramdisk,
+            "_mount_tmpfs",
+            side_effect=mounts_support._MountHelperCompletedError(
+                "mount helper failed"
+            ),
+        ), mock.patch.object(
+            ramdisk, "_mount_table", return_value=[]
+        ), mock.patch.object(ramdisk, "_umount_path") as unmount:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "pathname-only rollback",
+            ):
+                ramdisk.prepare.__wrapped__(
+                    plan_args(fixture.root, yes=True), display_plan=False
+                )
+
+        unmount.assert_not_called()
+        retained = snapshots[-1]
+        self.assertEqual(retained["recovery"]["state"], "attention-required")
+        self.assertEqual(retained["recovery"]["retained_mounts"], [mount["path"]])
+        self.assertEqual(retained["mounts"][0]["ownership"], "pending")
+        self.assertNotIn("identity", retained["mounts"][0])
+
+    @requires_linux_operational
+    def test_runner_oserror_retains_pending_without_absence_reconciliation(self):
+        snapshots = []
+        with ModelFixture() as fixture, mock.patch.object(
+            ramdisk, "_filesystem_for_path", return_value="ext4"
+        ):
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root), hardware=hardware_fixture()
+            )
+        mount = plan["mounts"][0]
+        mount_at = mock.Mock(return_value=None)
+
+        def save(manifest):
+            snapshots.append(json.loads(json.dumps(manifest)))
+
+        with mock.patch.object(
+            ramdisk, "_load_manifest", return_value=None
+        ), mock.patch.object(
+            ramdisk, "build_plan", return_value=plan
+        ), mock.patch.object(
+            ramdisk, "_save_manifest", side_effect=save
+        ), mock.patch.object(
+            ramdisk, "_mount_at", mount_at
+        ), mock.patch.object(
+            ramdisk,
+            "_mount_tmpfs",
+            side_effect=OSError("mount runner outcome unknown"),
+        ), mock.patch.object(
+            ramdisk, "_mount_table", return_value=[]
+        ), mock.patch.object(ramdisk, "_umount_path") as unmount:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "pathname-only rollback",
+            ) as caught:
+                ramdisk.prepare.__wrapped__(
+                    plan_args(fixture.root, yes=True), display_plan=False
+                )
+
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(mount_at.call_count, 1)
+        unmount.assert_not_called()
+        retained = snapshots[-1]
+        self.assertEqual(retained["recovery"]["state"], "attention-required")
+        self.assertEqual(retained["recovery"]["retained_mounts"], [mount["path"]])
+        self.assertEqual(retained["mounts"][0]["ownership"], "pending")
+        self.assertNotIn("identity", retained["mounts"][0])
 
     @requires_linux_operational
     def test_prepare_never_unmounts_identityless_successful_mount_by_path(self):
@@ -457,13 +693,15 @@ class MountAndCopyTest(unittest.TestCase):
             if mount["path"] == first["path"]:
                 observed[mount["path"]] = first_actual
                 return
-            raise ramdisk.RamdiskError("second mount failed")
+            raise mounts_support._MountHelperCompletedError(
+                "second mount failed"
+            )
 
         def mount_at(path):
             return observed.get(path)
 
         def unmount(path, hardware):
-            self.assertIs(hardware, plan["hardware"])
+            self.assertEqual(hardware, plan["hardware"])
             observed.pop(path)
 
         with mock.patch.object(ramdisk, "_load_manifest", return_value=None), mock.patch.object(
@@ -480,19 +718,19 @@ class MountAndCopyTest(unittest.TestCase):
                     plan_args(fixture.root, yes=True), display_plan=False
                 )
 
-        unmount_mock.assert_not_called()
+        unmount_mock.assert_called_once_with(first["path"], plan["hardware"])
         recovery = snapshots[-1]["recovery"]
-        self.assertEqual(recovery["released_mounts"], [])
         self.assertEqual(
-            recovery["retained_mounts"],
-            sorted([first["path"], second["path"]]),
+            recovery["released_mounts"],
+            [first["path"]],
         )
+        self.assertEqual(recovery["retained_mounts"], [])
         by_path = {
             record["path"]: record
             for record in snapshots[-1]["mounts"]
         }
-        self.assertEqual(by_path[first["path"]]["cleanup"]["state"], "retained")
-        self.assertEqual(by_path[second["path"]]["ownership"], "pending")
+        self.assertEqual(by_path[first["path"]]["cleanup"]["state"], "unmounted")
+        self.assertNotIn(second["path"], by_path)
 
     @requires_linux_operational
     def test_prepare_rollback_refuses_exact_mount_with_nested_child(self):

@@ -226,6 +226,94 @@ class StateAndSafetyTest(unittest.TestCase):
         self.assertEqual(recovered["-1:1"], 2)
         self.assertEqual(recovered["-2:1"], self.GLM_ENGINE_ID)
 
+    def test_multilayer_usage_header_survives_a_second_managed_merge(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        header = state_support._usage_header_counts(
+            {
+                "n_layers": 40,
+                "n_experts": 8,
+                "format_version": 1,
+                "engine_id": self.GLM_ENGINE_ID,
+            }
+        )
+        first_baseline = dict(header)
+        first_baseline["0:1"] = 10
+        manifest = self.manifest(
+            state="running",
+            processes=[{"pid": 731}],
+        )
+        manifest["processes"][0]["usage_baseline"] = dict(first_baseline)
+        ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+        loaded = ramdisk._load_manifest(required=True)
+        self.assertEqual(
+            loaded["processes"][0]["usage_baseline"]["-1:40"],
+            8,
+        )
+
+        ramdisk._usage_write(canonical, first_baseline)
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            dict(first_baseline, **{"0:1": 12}),
+        )
+
+        ramdisk._merge_usage(
+            {
+                "state_dir": state_dir,
+                "usage_baseline": first_baseline,
+                "usage_merge_id": "1" * 32,
+            },
+            canonical,
+        )
+        second_baseline = ramdisk._usage_read(canonical)
+        self.assertEqual(second_baseline["-1:40"], 8)
+        self.assertEqual(second_baseline["0:1"], 12)
+
+        second_current = dict(second_baseline)
+        second_current["0:1"] = 15
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            second_current,
+        )
+        ramdisk._merge_usage(
+            {
+                "state_dir": state_dir,
+                "usage_baseline": second_baseline,
+                "usage_merge_id": "2" * 32,
+            },
+            canonical,
+        )
+
+        final = ramdisk._usage_read(canonical)
+        self.assertEqual(final["-1:40"], 8)
+        self.assertEqual(final["-2:1"], self.GLM_ENGINE_ID)
+        self.assertEqual(final["0:1"], 15)
+
+    def test_manifest_rejects_nonpositive_or_malformed_usage_headers(self):
+        invalid_baselines = (
+            {"-1:0": 8, "-2:1": self.GLM_ENGINE_ID, "0:1": 10},
+            {"-1:40": 8, "-2:0": self.GLM_ENGINE_ID, "0:1": 10},
+            {"-1:40": 0, "-2:1": self.GLM_ENGINE_ID, "0:1": 10},
+            {"-1:40": 8, "-2:1": 0, "0:1": 10},
+            {"-1:forty": 8, "-2:1": self.GLM_ENGINE_ID, "0:1": 10},
+        )
+        for baseline in invalid_baselines:
+            with self.subTest(baseline=baseline):
+                manifest = self.manifest(
+                    state="running",
+                    processes=[{"pid": 731}],
+                )
+                manifest["processes"][0]["usage_baseline"] = baseline
+                ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "unsafe managed process record",
+                ):
+                    ramdisk._load_manifest(required=True)
+
     def test_usage_metadata_must_be_complete_and_compatible(self):
         model_dir = os.path.join(self.root, "model")
         canonical = os.path.join(model_dir, ".coli_usage")
