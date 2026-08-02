@@ -327,7 +327,7 @@ ifndef FLASHINFER_HOME
 $(error FLASHINFER_HOME must point to a FlashInfer source checkout)
 endif
 CFLAGS += -DCOLI_DSV4_FLASHINFER
-NVCCFLAGS += -DCOLI_DSV4_FLASHINFER
+override NVCCFLAGS += -DCOLI_DSV4_FLASHINFER
 DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o backend_cuda_dsv4_sparse_mla_flashinfer.o backend_cuda_dsv4_qkv_vllm.o
 endif
 ifeq ($(VLLM_MHC),1)
