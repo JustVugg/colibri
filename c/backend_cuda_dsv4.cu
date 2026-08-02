@@ -523,7 +523,11 @@ __global__ void cache_store_dynamic(float*cache,const float*kv,const int*state,i
 #ifdef COLI_DSV4_FLASHINFER
 __global__ void fi_prepare_q(__nv_bfloat16*q,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]=__float2bfloat16(x[i]);}
 __global__ void fi_indices(int*idx,int*length,const int*state,int window){int i=threadIdx.x,pos=decode_pos(state),n=min(pos+1,window),start=pos+1-n;if(i<512)idx[i]=i<n?start+i:-1;if(!i)*length=n;}
-__global__ void fi_extra_indices(int*idx,int*out_length,const int*length,const int*state,int window,int ratio){int i=threadIdx.x,start=max(0,decode_pos(state)+1-window),n=min(min(*length,start/ratio),512);if(i<512)idx[i]=i<n?i:-1;if(!i)*out_length=n;}
+/* C4A attends to the indexer's compressed candidates in addition to SWA.
+ * The ranges intentionally overlap: those summaries are separate learned KV
+ * entries, not duplicates for the runtime to remove.  Before the Lightning
+ * Indexer is needed, every live compressed entry is therefore a candidate. */
+__global__ void fi_extra_indices(int*idx,int*out_length,const int*length,const int*state,int window,int ratio){int i=threadIdx.x,n=min(*length,512);if(i<512)idx[i]=i<n?i:-1;if(!i)*out_length=n;(void)state;(void)window;(void)ratio;}
 __global__ void fi_position(int64_t*slot,int64_t*position,const int*state){if(!threadIdx.x){*slot=decode_pos(state);*position=decode_pos(state);}}
 __global__ void fi_cos_sin(float*out,const float*cs,const float*sn,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int pos=i/32,k=i%32;out[(long long)pos*64+k]=cs[i];out[(long long)pos*64+32+k]=sn[i];}}
 #endif
