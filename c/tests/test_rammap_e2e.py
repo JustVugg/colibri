@@ -12,14 +12,16 @@ The acceptance contract being proven (docs/SETTINGS.md, "full mode"):
   * the decode window does zero block-device reads -> /proc/self/io read_bytes
     stays ~0, reported as `[PROF] physical SSD reads: 0.000 GB`.
 
-Gating: needs a real GLM-compatible int4 model on tmpfs plus the built colibri binary.
-The unit suite cannot produce that (the repo's fixture generators need a recent
-transformers with the GLM modeling code), so the live test runs only when
-COLI_RAMMAP_E2E_MODEL points at such a directory; otherwise it skips. A skip is
-honest -- this test never fabricates the engine. CI stages a fixture on /dev/shm
-and sets the variable (see the ramdisk-e2e job in .github/workflows/ci.yml).
+Gating: needs distinct canonical and staged GLM-compatible int4 namespaces plus
+the built colibri binary. The canonical namespace must be block-backed and have
+its safetensor shards deliberately hidden after copying; the staged namespace
+must be tmpfs-backed and complete. This proves the engine used
+COLI_WEIGHTS_DIR rather than silently falling back to SNAP. The live test runs
+only when both variables below are set; otherwise it skips honestly.
 
-    COLI_RAMMAP_E2E_MODEL=/dev/shm/glm_i4 python3 -m pytest tests/test_rammap_e2e.py -v
+    COLI_RAMMAP_E2E_CANONICAL=/path/on/disk/glm_i4 \
+    COLI_RAMMAP_E2E_STAGED=/dev/shm/glm_i4 \
+      python3 -m pytest tests/test_rammap_e2e.py -v
 
 The parse logic itself is covered by ProfParseTest below, which runs everywhere
 and pins the exact colibri.c PROF emission strings.
@@ -69,17 +71,99 @@ def parse_prof(output):
 
 
 @unittest.skipUnless(
-    os.environ.get("COLI_RAMMAP_E2E_MODEL"),
-    "set COLI_RAMMAP_E2E_MODEL to a tmpfs-backed int4 model dir",
+    os.environ.get("COLI_RAMMAP_E2E_CANONICAL")
+    and os.environ.get("COLI_RAMMAP_E2E_STAGED"),
+    "set distinct COLI_RAMMAP_E2E_CANONICAL and COLI_RAMMAP_E2E_STAGED dirs",
 )
 class RammapE2ETest(unittest.TestCase):
     """Live Colibri on tmpfs: asserts the zero-physical-SSD-read contract holds."""
 
     def setUp(self):
-        self.model = Path(os.environ["COLI_RAMMAP_E2E_MODEL"])
+        self.canonical = Path(
+            os.environ["COLI_RAMMAP_E2E_CANONICAL"]
+        ).resolve()
+        self.staged = Path(os.environ["COLI_RAMMAP_E2E_STAGED"]).resolve()
         self.assertTrue(ENGINE.exists(), "colibri binary not built -- run `make colibri`")
-        self.assertTrue(self.model.is_dir(), "model dir missing: %s" % self.model)
+        self.assertTrue(
+            self.canonical.is_dir(),
+            "canonical model dir missing: %s" % self.canonical,
+        )
+        self.assertTrue(
+            self.staged.is_dir(),
+            "staged model dir missing: %s" % self.staged,
+        )
         self.assertTrue(REF.exists(), "missing %s -- run from a repo checkout" % REF)
+        self.assertNotEqual(self.canonical, self.staged)
+        self.assertNotEqual(
+            self.canonical.stat().st_dev,
+            self.staged.stat().st_dev,
+            "canonical and staged fixtures share a backing device",
+        )
+        canonical_fs = self._filesystem_type(self.canonical)
+        staged_fs = self._filesystem_type(self.staged)
+        self.assertIn(
+            canonical_fs,
+            ("ext4", "xfs"),
+            "canonical fixture is not block-backed: %s" % canonical_fs,
+        )
+        self.assertEqual(staged_fs, "tmpfs")
+        self.assertFalse(
+            any(self.canonical.glob("*.safetensors")),
+            "canonical shards must be hidden after staging",
+        )
+        self.assertTrue(
+            any(self.staged.glob("*.safetensors")),
+            "staged tmpfs namespace has no safetensor shards",
+        )
+
+    def _filesystem_type(self, path):
+        result = subprocess.run(
+            ["findmnt", "-T", str(path), "-n", "-o", "FSTYPE"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            "cannot identify filesystem for %s: %s" % (path, result.stderr),
+        )
+        return result.stdout.strip()
+
+    def _engine_environment(self, *, staged):
+        env = dict(os.environ)
+        env.update(
+            SNAP=str(self.canonical),
+            COLI_RAMMAP="1",
+            PROF="1",
+            REPLAY="1",
+            REF_FORCE="1",
+            REF=str(REF),
+            COLI_NO_OMP_TUNE="1",
+        )
+        if staged:
+            env["COLI_WEIGHTS_DIR"] = str(self.staged)
+        else:
+            env.pop("COLI_WEIGHTS_DIR", None)
+            env.pop("COLI_MODEL_DIRS", None)
+            env.pop("COLI_MODEL_MIRROR", None)
+        env.pop("COLI_STATE_DIR", None)
+        return env
+
+    def test_canonical_namespace_cannot_launch_without_staged_redirect(self):
+        proc = subprocess.run(
+            [str(ENGINE)],
+            env=self._engine_environment(staged=False),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "engine unexpectedly found poisoned canonical shards; the positive "
+            "test would not prove COLI_WEIGHTS_DIR redirection",
+        )
 
     def test_zero_physical_ssd_reads_on_tmpfs_rammap(self):
         # REPLAY mode drives a real forward (MoE expert loading -> RAMMAP -> I/O)
@@ -87,20 +171,12 @@ class RammapE2ETest(unittest.TestCase):
         # works on the CI-generated bench fixture as well as on a real model. The
         # physical-read accounting is identical to the PROMPT/serve path: the same
         # prof_report emits the [PROF] lines this test parses.
-        env = dict(os.environ)
-        env.update(
-            SNAP=str(self.model),
-            COLI_WEIGHTS_DIR=str(self.model),
-            COLI_RAMMAP="1",
-            PROF="1",
-            REPLAY="1",
-            REF_FORCE="1",
-            REF=str(REF),
-            COLI_NO_OMP_TUNE="1",  # single process: no OMP re-exec, deterministic capture
-        )
-        env.pop("COLI_STATE_DIR", None)  # default to SNAP; an explicit tmpfs path is rejected
         proc = subprocess.run(
-            [str(ENGINE)], env=env, capture_output=True, text=True, timeout=180
+            [str(ENGINE)],
+            env=self._engine_environment(staged=True),
+            capture_output=True,
+            text=True,
+            timeout=180,
         )
         output = proc.stdout + proc.stderr
         self.assertEqual(

@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import io
 import json
@@ -1864,11 +1865,20 @@ class KeepAliveFramingTest(unittest.TestCase):
     def test_engine_failure_after_commit_does_not_splice_a_second_response(self):
         """Once the 200 is out, a 500 status line would land inside the event stream."""
         server = self._server(_ExplodingEngine())
-        raw = self._raw(server, self._request_bytes(dict(self.CHAT, stream=True)))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            raw = self._raw(
+                server,
+                self._request_bytes(dict(self.CHAT, stream=True)),
+            )
         self.assertEqual(raw.count("HTTP/1."), 1,
                          "a second HTTP response was spliced into the committed SSE stream")
         self.assertIn("partial", raw)            # the events sent before the failure survive
         self.assertNotIn("<STILL-OPEN>", raw)
+        self.assertIn(
+            "request failed: engine died mid-stream",
+            stderr.getvalue(),
+        )
 
     def test_non_streaming_response_still_reuses_the_connection(self):
         """The fix must not turn every response into a close: plain JSON stays persistent."""
