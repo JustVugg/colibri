@@ -374,7 +374,43 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-ARCH = "glm"   # set in main(): "glm" | "inkling" | "kimi" (auto-detected)
+DSML = "｜DSML｜"
+DSML_TOOL_START = f"<{DSML}tool_calls>"
+DSML_TOOL_END = f"</{DSML}tool_calls>"
+DSML_INVOKE_RE = re.compile(
+    rf'<{re.escape(DSML)}invoke name="([^"]+)">(.*?)</{re.escape(DSML)}invoke>', re.DOTALL)
+DSML_PARAM_RE = re.compile(
+    rf'<{re.escape(DSML)}parameter name="([^"]+)" string="(true|false)">'
+    rf'(.*?)</{re.escape(DSML)}parameter>', re.DOTALL)
+
+
+def parse_deepseek_v4_tool_calls(reply, tools=None):
+    """Parse DeepSeek V4's native DSML tool blocks into OpenAI tool_calls."""
+    calls = []
+    for name, body in DSML_INVOKE_RE.findall(reply):
+        args = {}
+        for key, is_string, value in DSML_PARAM_RE.findall(body):
+            if is_string == "true":
+                args[key] = value
+            else:
+                try:
+                    args[key] = json.loads(value)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    args[key] = value
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name,
+                                   "arguments": json.dumps(args, ensure_ascii=False)}})
+    text = re.sub(re.escape(DSML_TOOL_START) + r".*?" + re.escape(DSML_TOOL_END),
+                  "", reply, flags=re.DOTALL)
+    return text.strip(), calls
+
+
+def parse_model_tool_calls(reply, tools=None):
+    return (parse_deepseek_v4_tool_calls(reply, tools) if ARCH == "deepseek_v4"
+            else parse_tool_calls(reply, tools))
+
+
+ARCH = "glm"   # set in main(): "glm" | "inkling" | "kimi" | "deepseek_v4"
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -655,6 +691,118 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
             parts.append(f"M {role} {len(text.encode('utf-8'))}\n{text}")
     parts.append(f"G {1 if enable_thinking else 0}\n")
     return "".join(parts)
+
+
+def _deepseek_v4_tools(tools):
+    schemas = []
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        schemas.append(json.dumps(fn, ensure_ascii=False))
+    if not schemas:
+        return ""
+    return ("## Tools\n\nYou have access to a set of tools to help answer the user's question. "
+            f"You can invoke tools by writing a \"<{DSML}tool_calls>\" block like the following:\n\n"
+            f"<{DSML}tool_calls>\n<{DSML}invoke name=\"$TOOL_NAME\">\n"
+            f"<{DSML}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">"
+            f"$PARAMETER_VALUE</{DSML}parameter>\n...\n</{DSML}invoke>\n"
+            f"<{DSML}invoke name=\"$TOOL_NAME2\">\n...\n</{DSML}invoke>\n"
+            f"</{DSML}tool_calls>\n\nString parameters should be specified as is and set "
+            "`string=\"true\"`. For all other types (numbers, booleans, arrays, objects), "
+            "pass the value in JSON format and set `string=\"false\"`.\n\n"
+            "If thinking_mode is enabled (triggered by <think>), you MUST output your complete "
+            "reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+            "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+            "### Available Tool Schemas\n\n" + "\n".join(schemas) +
+            "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to "
+            "invoke tool calls.\n")
+
+
+def _deepseek_v4_call(tc):
+    fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+    args = fn.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+    params = []
+    for key, value in args.items():
+        is_string = isinstance(value, str)
+        rendered = value if is_string else json.dumps(value, ensure_ascii=False)
+        params.append(f'<{DSML}parameter name="{key}" string="'
+                      f'{str(is_string).lower()}">{rendered}</{DSML}parameter>')
+    return (f'<{DSML}invoke name="{fn.get("name") or ""}">\n' +
+            "\n".join(params) + f'\n</{DSML}invoke>')
+
+
+def render_chat_deepseek_v4(messages, enable_thinking=False, reasoning_effort=None,
+                            tools=None, tool_choice=None):
+    """DeepSeek V4 native chat/DSML format used by its reference tokenizer."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        tools = [t for t in (tools or [])
+                 if (t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced]
+    elif tool_choice == "none":
+        tools = None
+
+    prepared = []
+    for index, original in enumerate(messages):
+        if not isinstance(original, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        message = dict(original)
+        if message.get("role") == "tool":
+            result = "<tool_result>" + content_text(message.get("content"),
+                                                     f"messages.{index}.content") + "</tool_result>"
+            if prepared and prepared[-1].get("role") == "user" and prepared[-1].get("_tool_result"):
+                prepared[-1]["content"] += "\n\n" + result
+            else:
+                prepared.append({"role": "user", "content": result, "_tool_result": True})
+        else:
+            prepared.append(message)
+    if tools:
+        prepared.insert(0, {"role": "system", "content": "", "_tools": tools})
+
+    prompt = ["<｜begin▁of▁sentence｜>"]
+    for index, message in enumerate(prepared):
+        role = message.get("role")
+        raw = message.get("content")
+        content = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "system":
+            prompt.append(content)
+            declared = message.get("_tools")
+            if declared:
+                prompt.append("\n\n")
+                prompt.append(_deepseek_v4_tools(declared))
+                if forced:
+                    prompt.append(f"\n\nYou must call `{forced}` and must not answer directly.")
+                elif tool_choice == "required":
+                    prompt.append("\n\nYou must call one available tool and must not answer directly.")
+        elif role in ("user", "developer"):
+            prompt.append("<｜User｜>" + content)
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+            if not isinstance(reasoning, str):
+                raise APIError(400, "Assistant reasoning must be a string.",
+                               f"messages.{index}.reasoning_content")
+            if enable_thinking and reasoning:
+                prompt.append(reasoning + "</think>")
+            prompt.append(content)
+            calls = message.get("tool_calls") or []
+            if calls:
+                prompt.append(f"\n\n<{DSML}tool_calls>\n" +
+                              "\n".join(_deepseek_v4_call(tc) for tc in calls) +
+                              f"\n</{DSML}tool_calls>")
+            prompt.append("<｜end▁of▁sentence｜>")
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+        if role in ("user", "developer") and (index == len(prepared) - 1 or
+                prepared[index + 1].get("role") in ("assistant", "latest_reminder")):
+            prompt.append("<｜Assistant｜>" + ("<think>" if enable_thinking else "</think>"))
+    return "".join(prompt)
 
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1328,9 +1476,7 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 def model_arch(model):
-    """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
-    (including an unreadable config) is glm."""
+    """Return the engine/chat family declared by config.json; unknown stays glm."""
     try:
         with open(Path(model) / "config.json", encoding="utf-8") as fh:
             model_type = (json.load(fh).get("model_type") or "").lower()
@@ -1340,6 +1486,8 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "deepseek_v4" in model_type or "deepseek-v4" in model_type:
+        return "deepseek_v4"
     return "glm"
 
 
@@ -1375,11 +1523,16 @@ class Engine:
     # cap_for_arch above. Same convention as the --cap flags in coli and
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
+    # DeepSeek V4's sibling binary follows the conventional ENGINE MODEL_DIR
+    # interface instead, so it receives the model path and does not consume cap.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        arch = model_arch(model)
+        argv = ([str(executable), str(model)] if arch == "deepseek_v4" else
+                [str(executable), str(cap_for_arch(arch, cap))])
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(model_arch(model), cap))], env=child_env,
+            argv, env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
@@ -1962,7 +2115,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi"):
+        if grammar is not None and ARCH in ("inkling", "kimi", "deepseek_v4"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -2018,7 +2171,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    content, calls = parse_model_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -2143,14 +2296,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # <tool_call> split across engine chunks is still caught.
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                tool_start = DSML_TOOL_START if ARCH == "deepseek_v4" else BOX_START
+                hold = len(tool_start) - 1
                 raw = []
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = sp["buf"].find(tool_start)
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
@@ -2180,7 +2334,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                _content, calls = parse_model_tool_calls("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -2263,7 +2417,8 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else render_chat)
+                    render_chat_kimi if ARCH == "kimi" else
+                    render_chat_deepseek_v4 if ARCH == "deepseek_v4" else render_chat)
         audio_clips = [] if ARCH == "inkling" else None
         if audio_clips is not None:
             prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
@@ -2342,7 +2497,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_tool_calls(text, tools)
+                text, calls = parse_model_tool_calls(text, tools)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -2578,7 +2733,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2607,7 +2762,9 @@ def main():
         ARCH = model_arch(args.model)
     if args.model_id is None:
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
-                         "kimi-k3-colibri" if ARCH == "kimi" else "glm-5.2-colibri")
+                         "kimi-k3-colibri" if ARCH == "kimi" else
+                         "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
+                         "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

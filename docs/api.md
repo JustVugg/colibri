@@ -48,6 +48,18 @@ penalties return an explicit error rather than being silently ignored. The
 default bind address is localhost; set `COLI_API_KEY` before exposing the
 server beyond the machine.
 
+### Experimental DeepSeek V4 service
+
+`coli serve --model /path/to/DeepSeek-V4-Flash-0731` detects
+`model_type: deepseek_v4`, launches the native `deepseek_v4` engine, and uses
+the model's native `<｜User｜>` / `<｜Assistant｜>` chat format. OpenAI tools are
+rendered and parsed as native DSML, including multiple calls in one response
+and `tool` result round trips. The base backend is intentionally limited to
+2,048 prompt-plus-output tokens until the Lightning Indexer lands; requests
+above that boundary are clamped by the engine rather than treated as validated
+long-context inference. This path is greedy-only today: `temperature` and
+`top_p` are accepted by the wire protocol but do not change sampling yet.
+
 When a reverse proxy or MagicDNS hostname preserves a public `Host` header,
 trust that exact hostname with repeatable `--allowed-host` options. The
 comma-separated `COLI_ALLOWED_HOSTS` environment variable is equivalent:

@@ -167,13 +167,16 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "deepseek_v4" in model_type or "deepseek-v4" in model_type:
+        return "deepseek_v4"
     return "glm"
 
 def engine_for(model):
     arch = model_arch(model)
     if arch == "glm" or os.environ.get("COLI_ENGINE"):
         return GLM
-    name = "inkling" if arch == "inkling" else "kimi_k3"
+    name = ("inkling" if arch == "inkling" else
+            "kimi_k3" if arch == "kimi" else "deepseek_v4")
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
 
@@ -187,7 +190,8 @@ def need_model(model, engine=None):
     engine = engine or engine_for(model)
     if not os.path.exists(engine):
         arch = model_arch(model)
-        target = "kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else "colibri"
+        target = ("kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else
+                  "deepseek_v4" if arch == "deepseek_v4" else "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
 def env_for_engine(a, arch):
@@ -989,7 +993,9 @@ def cmd_serve(a):
     import openai_server
     openai_server.ARCH=arch
     model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
-                            "inkling-colibri" if arch=="inkling" else "glm-5.2-colibri")
+                            "inkling-colibri" if arch=="inkling" else
+                            "deepseek-v4-colibri" if arch=="deepseek_v4" else
+                            "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
               a.cap,a.ngen,engine,env_for_engine(a,arch),a.cors_origin,

@@ -21,6 +21,8 @@
 #include "backend_cuda_dsv4.h"
 #endif
 
+#define DSV4_MAX_CONTEXT 2048
+
 typedef struct {
     int hidden, layers, vocab;
     int heads, head_dim, kv_heads;
@@ -1227,8 +1229,8 @@ static void bench_decode_two(shards*s,const Dsv4Cfg*c,int first,int second){
 static void generate(shards *s,const Dsv4Cfg *c,const char *model_dir,const char *arg){
     char *end;long max=strtol(arg,&end,10);if(end==arg||*end!=':'||max<1||max>128)die("--generate expects MAX:TEXT");
     char path[4096];snprintf(path,sizeof(path),"%s/tokenizer.json",model_dir);Tok tok;tok_load(&tok,path);
-    int ids[2048],n=tok_encode(&tok,end+1,(int)strlen(end+1),ids,2048);if(n<1)ids[n++]=c->bos;
-    if(n+(int)max>2048)die("generator is currently limited to 2048 total tokens");
+    int ids[DSV4_MAX_CONTEXT],n=tok_encode(&tok,end+1,(int)strlen(end+1),ids,DSV4_MAX_CONTEXT);if(n<1)ids[n++]=c->bos;
+    if(n+(int)max>DSV4_MAX_CONTEXT)die("generator is currently limited to 2048 total tokens");
     Dsv4State state=state_init(c,n+(int)max);
 #ifdef COLI_CUDA
     gpu_state_prepare(c,&state);
@@ -1266,6 +1268,61 @@ static void generate_token(shards*s,const Dsv4Cfg*c,const char*arg){
     profile_print();state_free(&state);
 }
 
+static void serve_data(const char *id,const char *data,int n){
+    printf("DATA %s %d\n",id,n);if(n)fwrite(data,1,(size_t)n,stdout);putchar('\n');fflush(stdout);
+}
+
+static void serve_request(shards *s,const Dsv4Cfg *c,const char *model_dir,
+                          const char *id,const char *prompt,int max_tokens){
+    char path[4096];snprintf(path,sizeof(path),"%s/tokenizer.json",model_dir);Tok tok;tok_load(&tok,path);
+    int *ids=malloc((DSV4_MAX_CONTEXT+1)*sizeof(*ids));
+    int *out=malloc((DSV4_MAX_CONTEXT+1)*sizeof(*out));
+    char *text=malloc((size_t)DSV4_MAX_CONTEXT*8+1);
+    if(!ids||!out||!text)die("out of memory serving request");
+    int n=tok_encode(&tok,prompt,(int)strlen(prompt),ids,DSV4_MAX_CONTEXT+1);
+    if(n<1)ids[n++]=c->bos;
+    if(n>DSV4_MAX_CONTEXT){
+        fprintf(stderr,"[dsv4] prompt exceeds %d-token context\n",DSV4_MAX_CONTEXT);
+        printf("DONE %s STAT 0 0.000 0.0 0.00 %d 1\n",id,n);fflush(stdout);goto done;
+    }
+    int budget=DSV4_MAX_CONTEXT-n;if(max_tokens>budget)max_tokens=budget;
+    if(max_tokens<1){printf("DONE %s STAT 0 0.000 0.0 0.00 %d 1\n",id,n);fflush(stdout);goto done;}
+    Dsv4State state=state_init(c,n+max_tokens);
+#ifdef COLI_CUDA
+    gpu_state_prepare(c,&state);
+#endif
+    float logit=0;int next=0;double a=wall_time();
+    for(int p=0;p<n;p++)next=model_step(s,c,&state,ids[p],p,&logit);
+    double decode_start=wall_time();int made=0,shown=0;
+    while(made<max_tokens){
+        out[made++]=next;
+        int z=tok_decode(&tok,out,made,text,(size_t)DSV4_MAX_CONTEXT*8);
+        if(z>shown){serve_data(id,text+shown,z-shown);shown=z;}
+        if(next==c->eos)break;
+        next=model_step(s,c,&state,next,n+made-1,&logit);
+    }
+    double end=wall_time(),dec=end-decode_start;
+    printf("DONE %s STAT %d %.3f 0.0 0.00 %d %d\n",id,made,
+           dec>0?made/dec:0.0,n,made>=max_tokens&&next!=c->eos);fflush(stdout);
+    (void)a;state_free(&state);
+done:
+    free(text);free(out);free(ids);
+}
+
+static void serve_loop(shards *s,const Dsv4Cfg *c,const char *model_dir){
+    fputs("\x01\x01READY\x01\x01\nSTAT 0 0.000 0.0 0.00\n",stdout);fflush(stdout);
+    char line[4096];
+    while(fgets(line,sizeof(line),stdin)){
+        char cmd[16],id[128];int slot=0,bytes=0,max_tokens=0;float temp=0,top_p=1;
+        if(sscanf(line,"%15s %127s %d %d %d %f %f",cmd,id,&slot,&bytes,&max_tokens,&temp,&top_p)<5)continue;
+        if(strcmp(cmd,"SUBMIT")||bytes<0)continue;
+        char *prompt=malloc((size_t)bytes+1);if(!prompt)die("out of memory reading request");
+        if(fread(prompt,1,(size_t)bytes,stdin)!=(size_t)bytes){free(prompt);break;}
+        prompt[bytes]=0;int ch=fgetc(stdin);(void)ch;(void)slot;(void)temp;(void)top_p;
+        serve_request(s,c,model_dir,id,prompt,max_tokens);free(prompt);
+    }
+}
+
 int main(int argc, char **argv){
     if(argc!=2 && argc!=4){
         fprintf(stderr,"usage: %s MODEL_DIR [--tokenize TEXT | --generate MAX:TEXT | --generate-token MAX:TOKEN | --first-token TOKEN | --bench-resident TOKEN | --bench-decode2 TOKEN,TOKEN | --trace-mhc TOKEN:OUT | --trace-attn TOKEN:OUT | --trace-attn2 TOKEN,TOKEN:OUT | --trace-compressor L,TOKEN:OUT | --trace-block TOKEN:OUT]\n",argv[0]); return 2; }
@@ -1292,6 +1349,7 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
     if(argc==4&&strcmp(argv[2],"--tokenize"))gpu_preload(&tensors,&c);
 #endif
+    if(argc==2&&getenv("SERVE")&&getenv("SERVE")[0]=='1')serve_loop(&tensors,&c,argv[1]);
     if(argc==4){
         if(!strcmp(argv[2],"--tokenize")){
             char path[4096]; snprintf(path,sizeof(path),"%s/tokenizer.json",argv[1]);

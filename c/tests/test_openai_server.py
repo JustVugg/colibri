@@ -15,8 +15,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
-                           generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
+                           generation_options, parse_deepseek_v4_tool_calls, parse_tool_calls,
+                           read_engine_turn, render_chat, render_chat_deepseek_v4,
+                           render_chat_kimi, serve,
                            split_thinking_reply, stop_policy)
 
 
@@ -67,6 +68,7 @@ class TemplateTest(unittest.TestCase):
             "<|assistant|><think></think>Hello<|user|>Again"
             "<|assistant|><think></think>",
         )
+
 
     def test_rejects_non_text_content(self):
         with self.assertRaisesRegex(APIError, "text message content only"):
@@ -173,6 +175,43 @@ class TemplateTest(unittest.TestCase):
             self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
         with self.assertRaises(APIError):
             stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
+
+
+class DeepSeekV4TemplateTest(unittest.TestCase):
+    TOOLS = [{"type": "function", "function": {"name": "weather",
+              "parameters": {"type": "object", "properties": {
+                  "city": {"type": "string"}, "days": {"type": "integer"}}}}}]
+
+    def test_renders_native_chat_and_tools(self):
+        prompt = render_chat_deepseek_v4(
+            [{"role": "user", "content": "weather?"}], tools=self.TOOLS)
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>"))
+        self.assertIn("<｜User｜>weather?<｜Assistant｜></think>", prompt)
+        self.assertIn("<｜DSML｜tool_calls>", prompt)
+        self.assertIn('"name": "weather"', prompt)
+
+    def test_tool_result_round_trip_render(self):
+        prompt = render_chat_deepseek_v4([
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_x", "type": "function",
+                "function": {"name": "weather", "arguments": '{"city":"Rome"}'}}]},
+            {"role": "tool", "tool_call_id": "call_x", "content": "sunny"}],
+            tools=self.TOOLS)
+        self.assertIn('<｜DSML｜invoke name="weather">', prompt)
+        self.assertIn("<tool_result>sunny</tool_result><｜Assistant｜></think>", prompt)
+
+    def test_parses_parallel_native_calls(self):
+        reply = ('<｜DSML｜tool_calls><｜DSML｜invoke name="weather">'
+                 '<｜DSML｜parameter name="city" string="true">Rome</｜DSML｜parameter>'
+                 '</｜DSML｜invoke><｜DSML｜invoke name="weather">'
+                 '<｜DSML｜parameter name="days" string="false">2</｜DSML｜parameter>'
+                 '</｜DSML｜invoke></｜DSML｜tool_calls>')
+        content, calls = parse_deepseek_v4_tool_calls(reply, self.TOOLS)
+        self.assertEqual(content, "")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Rome"})
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"days": 2})
 
 
 class StopFilterTest(unittest.TestCase):
@@ -654,6 +693,13 @@ class CapSentinelShimTest(unittest.TestCase):
         (model / "config.json").write_text("{not json")
         self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
 
+    def test_deepseek_v4_receives_model_directory(self):
+        model = self._model("deepseek_v4")
+        self.assertEqual(self._spawn_argv("deepseek_v4", model),
+                         ["deepseek_v4", model])
+        self.assertEqual(self._spawn_argv("renamed-engine", model, cap=3),
+                         ["renamed-engine", model])
+
     def test_cap_for_arch_is_the_single_translation_point(self):
         self.assertEqual(cap_for_arch("glm", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
@@ -667,6 +713,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
+        self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch("/nonexistent"), "glm")
 
 
