@@ -1397,6 +1397,221 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(stopped["state"], "stopped")
         self.assertNotIn("stop_error", stopped["processes"][0])
 
+    def test_two_engine_start_retains_survivor_when_sibling_dies_before_readiness(
+        self,
+    ):
+        # Owner interleaving: a multi-engine start publishes engine #1, then
+        # the real _wait_managed_ready death branch fires for engine #2 (the
+        # sibling exits before readiness). Rollback then runs over the
+        # surviving, already-published engine #1 and must retain it durably:
+        # state=error, no stopped_at, no premature usage merge, and a later
+        # verified stop recovers it. The fault is injected at _process_matches
+        # (the real trigger at processes.py:_wait_managed_ready), not by
+        # mocking readiness itself.
+        nonce = "f" * 48
+
+        class FakeSocket:
+            def bind(self, address):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"status":"ok"}'
+
+        captures = []
+        processes_by_pid = {}
+
+        class FakeProcess:
+            next_pid = 7400
+
+            def __init__(self):
+                type(self).next_pid += 1
+                self.pid = type(self).next_pid
+                self._alive = True
+
+            def poll(self):
+                return None if self._alive else 0
+
+            def wait(self, timeout=None):
+                if self._alive:
+                    raise subprocess.TimeoutExpired("engine", timeout)
+
+        def popen(command, **kwargs):
+            process = FakeProcess()
+            processes_by_pid[process.pid] = process
+            captures.append(
+                {"pid": process.pid, "environment": dict(kwargs["env"])}
+            )
+            return process
+
+        def identity(pid):
+            launch = next(item for item in captures if item["pid"] == pid)
+            environment = launch["environment"]
+            return {
+                "pid": pid,
+                "pgid": pid,
+                "sid": pid,
+                "uid": host_uid(),
+                "inert": False,
+                "starttime": 1000 + pid,
+                "nonce": nonce,
+                "state_dir": environment["COLI_STATE_DIR"],
+                "weights_dir": environment["COLI_WEIGHTS_DIR"],
+            }
+
+        survivor_identity = {}
+
+        def process_matches_by_record(record):
+            # First-published engine stays running and becomes ready. The
+            # sibling is reported not-running so the un-mocked readiness loop
+            # raises "exited before readiness"; it has now exited, so mark its
+            # process dead for the rollback that follows.
+            pid = record["pid"]
+            if not captures or pid != captures[0]["pid"]:
+                sibling = processes_by_pid.get(pid)
+                if sibling is not None:
+                    sibling._alive = False
+                return (False, "not-running", None)
+            survivor_identity.clear()
+            survivor_identity.update(identity(pid))
+            return (True, "running", dict(survivor_identity))
+
+        usage_ids = iter(("a" * 32, "b" * 32))
+
+        def deterministic_token(size):
+            return nonce if size == 24 else next(usage_ids)
+
+        with ModelFixture() as fixture, canonical_temporary_directory() as state:
+            hardware = hardware_fixture(nodes=2)
+            set_asymmetric_node_cores(hardware)
+            plan = ramdisk.build_plan(
+                plan_args(fixture.root, topology="per-node"),
+                hardware=hardware,
+            )
+            manifest = {
+                "state": "ready",
+                "base_port": 8100,
+                "model_fingerprint": plan["model"]["fingerprint"],
+                "plan": plan,
+                "mounts": [dict(item) for item in plan["mounts"]],
+                "processes": [],
+                "best_runtime": {
+                    "per-node": {
+                        "variant": "partial_direct",
+                        "knobs": {
+                            "PIPE": 1,
+                            "OMP_NUM_THREADS": 3,
+                            "OMP_PROC_BIND": "spread",
+                        },
+                    }
+                },
+            }
+            with mock.patch.dict(
+                os.environ, {"XDG_STATE_HOME": state}
+            ), mock.patch.multiple(
+                ramdisk,
+                _filesystem_for_path=mock.Mock(return_value="ext4"),
+                _load_manifest=mock.Mock(return_value=manifest),
+                _assert_effective_masks_unchanged=mock.Mock(),
+                _assert_ready_mounts=mock.Mock(),
+                _save_manifest=mock.Mock(),
+                _admit_concurrent_runtimes=mock.Mock(),
+                _recover_delta=mock.Mock(),
+                _usage_read=mock.Mock(return_value={}),
+                _usage_write=mock.Mock(),
+                _fresh_user_binary=mock.Mock(return_value="/usr/bin/numactl"),
+                _proc_identity=mock.Mock(side_effect=identity),
+                _process_matches=mock.Mock(
+                    side_effect=process_matches_by_record
+                ),
+                _terminate_verified_group=mock.Mock(
+                    return_value="could not revalidate process identity"
+                ),
+                _terminate_direct_child=mock.Mock(
+                    return_value="direct child survived SIGKILL"
+                ),
+                _track_managed_child=mock.Mock(),
+                _forget_managed_child=mock.Mock(),
+                _merge_usage=mock.Mock(),
+            ), mock.patch.object(
+                ramdisk.socket, "socket", side_effect=lambda *a, **k: FakeSocket()
+            ), mock.patch.object(
+                ramdisk.subprocess, "Popen", side_effect=popen
+            ), mock.patch.object(
+                ramdisk.secrets, "token_hex", side_effect=deterministic_token
+            ), mock.patch(
+                "urllib.request.urlopen", return_value=FakeResponse()
+            ):
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError, "exited before readiness"
+                ):
+                    ramdisk.start.__wrapped__(
+                        argparse.Namespace(base_port=None),
+                        cli_path=sys.executable,
+                    )
+
+        self.assertEqual(manifest["state"], "error")
+        survivor_pid = captures[0]["pid"]
+        survivors = [
+            process
+            for process in manifest["processes"]
+            if process["pid"] == survivor_pid
+        ]
+        self.assertEqual(len(survivors), 1)
+        survivor = survivors[0]
+        self.assertNotIn("stopped_at", survivor)
+        self.assertNotIn("usage_merged_at", survivor)
+        self.assertIn("alive", survivor["stop_error"])
+        self.assertFalse(
+            manifest.get("recovery", {}).get("retained_processes", [])
+        )
+
+        # A later verified stop recovers the retained survivor exactly once.
+        reloaded = json.loads(json.dumps(manifest))
+        reloaded["processes"] = [
+            process
+            for process in reloaded["processes"]
+            if process["pid"] == survivor_pid and "stopped_at" not in process
+        ]
+        self.assertEqual(len(reloaded["processes"]), 1)
+        stop_matches = mock.Mock(
+            side_effect=[
+                (True, "running", dict(survivor_identity)),
+                (False, "not-running", None),
+            ]
+        )
+        stop_terminate = mock.Mock(return_value=None)
+        stop_merge = mock.Mock()
+        with mock.patch.multiple(
+            ramdisk,
+            _load_manifest=mock.Mock(return_value=reloaded),
+            _process_matches=stop_matches,
+            _managed_child_liveness=mock.Mock(return_value=False),
+            _save_manifest=mock.Mock(),
+            _terminate_verified_group=stop_terminate,
+            _merge_usage=stop_merge,
+            _bind_usage_transaction=mock.Mock(
+                side_effect=lambda record, plan=None, reserved_ids=None: (
+                    record["usage_merge_id"]
+                )
+            ),
+        ):
+            stopped = ramdisk.stop.__wrapped__()
+
+        stop_terminate.assert_called_once_with(reloaded["processes"][0])
+        stop_merge.assert_called_once()
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertNotIn("stop_error", stopped["processes"][0])
+
     def test_full_mode_start_refuses_wrong_usage_identity_before_seed_or_spawn(self):
         class FakeSocket:
             def bind(self, address):
