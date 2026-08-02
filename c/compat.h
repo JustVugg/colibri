@@ -438,13 +438,20 @@ static inline int coli_stdin_readable(void)
  * Sta QUI e non copiato in ogni motore: e' esattamente cosi' che era sparito.
  *
  * No-op su Linux/macOS. */
-static inline void coli_serve_binary_mode(void)
+static inline void coli_serve_binary_mode_stream(FILE *stream)
 {
 #ifdef _WIN32
-    _setmode(_fileno(stdin),  _O_BINARY);
-    _setmode(_fileno(stdout), _O_BINARY);
-    setvbuf(stdout, NULL, _IONBF, 0);
+    _setmode(_fileno(stream), _O_BINARY);
+    setvbuf(stream, NULL, _IONBF, 0);
+#else
+    (void)stream;
 #endif
+}
+
+static inline void coli_serve_binary_mode(void)
+{
+    coli_serve_binary_mode_stream(stdin);
+    coli_serve_binary_mode_stream(stdout);
 }
 
 #endif /* COMPAT_H */
