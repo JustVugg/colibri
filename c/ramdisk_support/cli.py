@@ -230,7 +230,7 @@ def _cli_termination_guard(cancelable):
     }
     previous = {}
     if threading.current_thread() is threading.main_thread():
-        for name in ("SIGHUP", "SIGTERM"):
+        for name in ("SIGINT", "SIGHUP", "SIGTERM"):
             signum = getattr(signal, name, None)
             if signum is None:
                 continue

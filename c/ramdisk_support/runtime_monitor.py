@@ -58,41 +58,95 @@ managed process group has passed the persisted UID and nonce checks.
 from __future__ import print_function
 
 import csv
+import importlib
 import io
 import json
 import math
 import os
 import subprocess
+import threading
 import time
-import urllib.request
-
-from .processes import (
-    _managed_process_metrics,
-    _process_group_members,
-    _process_matches,
-)
-
 
 MIB = 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * MIB
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Keep a loopback telemetry request on loopback."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        del req, fp, code, msg, headers, newurl
-        return None
+_LOOPBACK_OPENER = None
+_LOOPBACK_OPENER_LOCK = threading.Lock()
 
 
-_LOOPBACK_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}),
-    _NoRedirect(),
-)
+def _processes_module():
+    return importlib.import_module("ramdisk_support.processes")
+
+
+def _process_matches(*args, **kwargs):
+    return _processes_module()._process_matches(*args, **kwargs)
+
+
+def _process_group_members(*args, **kwargs):
+    return _processes_module()._process_group_members(*args, **kwargs)
+
+
+def _managed_process_metrics(*args, **kwargs):
+    return _processes_module()._managed_process_metrics(*args, **kwargs)
+
+
+def _build_loopback_opener():
+    """Build an HTTP-only client with neither proxies nor redirects."""
+    request_module = importlib.import_module("urllib.request")
+
+    class _NoRedirect(request_module.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            del req, fp, code, msg, headers, newurl
+            return None
+
+    opener = request_module.OpenerDirector()
+    for handler in (
+        request_module.UnknownHandler(),
+        request_module.HTTPHandler(),
+        request_module.HTTPDefaultErrorHandler(),
+        _NoRedirect(),
+        request_module.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+def _loopback_opener():
+    global _LOOPBACK_OPENER
+    if _LOOPBACK_OPENER is None:
+        with _LOOPBACK_OPENER_LOCK:
+            if _LOOPBACK_OPENER is None:
+                _LOOPBACK_OPENER = _build_loopback_opener()
+    return _LOOPBACK_OPENER
 
 
 def _loopback_urlopen(request, timeout):
-    return _LOOPBACK_OPENER.open(request, timeout=timeout)
+    parse_module = importlib.import_module("urllib.parse")
+    url = getattr(request, "full_url", request)
+    parsed = parse_module.urlsplit(str(url))
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("invalid loopback telemetry port") from error
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "telemetry requests require an HTTP numeric-loopback URL with a port"
+        )
+    return _loopback_opener().open(request, timeout=timeout)
+
+
+def _http_request(url, headers, method):
+    request_module = importlib.import_module("urllib.request")
+    return request_module.Request(url, headers=headers, method=method)
 
 
 def _safe_int(value):
@@ -585,7 +639,7 @@ class RuntimeMonitor:
         )
         if api_key:
             headers["Authorization"] = "Bearer " + str(api_key)
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        request = _http_request(url, headers=headers, method="GET")
         with self._urlopen(request, timeout=self._timeout) as response:
             status = getattr(response, "status", None)
             if status is None and hasattr(response, "getcode"):

@@ -44,6 +44,7 @@ class UnsupportedPlatformOps:
     """Portable facts for a host without a RAM-disk lifecycle backend."""
 
     is_linux = False
+    process_control_supported = False
 
     def __init__(self, platform_name):
         self.platform_name = platform_name

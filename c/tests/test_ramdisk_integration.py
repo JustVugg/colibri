@@ -17,8 +17,10 @@ from pathlib import Path
 
 try:
     from . import test_ramdisk
+    from .platform_test_support import requires_linux_operational
 except ImportError:  # unittest discovery imports tests as top-level modules
     import test_ramdisk
+    from platform_test_support import requires_linux_operational
 
 import ramdisk
 
@@ -28,6 +30,7 @@ import ramdisk
     "set COLI_RAMDISK_INTEGRATION=1 inside a private mount namespace",
 )
 class RealTmpfsLifecycleTest(unittest.TestCase):
+    @requires_linux_operational
     def test_prepare_status_destroy_on_real_tmpfs(self):
         with test_ramdisk.ModelFixture() as fixture, tempfile.TemporaryDirectory(
             prefix="colibri-ramdisk-state-", dir="/var/tmp"

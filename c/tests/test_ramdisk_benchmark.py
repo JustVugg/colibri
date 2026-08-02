@@ -605,6 +605,7 @@ class BenchmarkTest(unittest.TestCase):
 
         cgroup_available.assert_called_once_with()
 
+    @requires_linux_operational
     def test_full_per_node_benchmark_sizes_thread_sweep_to_target_node(self):
         with ModelFixture() as fixture:
             hardware = hardware_fixture(nodes=2)
@@ -642,6 +643,8 @@ class BenchmarkTest(unittest.TestCase):
                 ramdisk, "_aggregate_score", return_value={"status": "not-run"}
             ) as aggregate, mock.patch.object(ramdisk, "_system_score", return_value={}), mock.patch.object(
                 ramdisk, "_read_json", return_value={"version": 1, "results": []}
+            ), mock.patch.object(
+                ramdisk, "_filesystem_for_path", return_value="ext4"
             ), mock.patch.object(ramdisk, "_atomic_json"), mock.patch.object(ramdisk, "_save_manifest"):
                 ramdisk.benchmark.__wrapped__(argparse.Namespace(), cli_path="/fake/coli")
 
@@ -650,6 +653,7 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(seen_knobs["full_direct_pipe1"]["OMP_NUM_THREADS"], 3)
         self.assertNotIn("OMP_NUM_THREADS", aggregate.call_args.kwargs["knobs"])
 
+    @requires_linux_operational
     def test_cuda_benchmark_generates_only_mmap_staged_variants(self):
         with ModelFixture() as fixture:
             plan = _enable_managed_cuda(
@@ -731,6 +735,10 @@ class BenchmarkTest(unittest.TestCase):
                 return_value={"version": 1, "results": []},
             ), mock.patch.object(
                 ramdisk,
+                "_filesystem_for_path",
+                return_value="ext4",
+            ), mock.patch.object(
+                ramdisk,
                 "_atomic_json",
             ), mock.patch.object(
                 ramdisk,
@@ -762,6 +770,7 @@ class BenchmarkTest(unittest.TestCase):
             ]
         )
 
+    @requires_linux_operational
     def test_best_runtime_knobs_are_saved_only_for_current_topology(self):
         with ModelFixture() as fixture:
             plan = ramdisk.build_plan(plan_args(fixture.root), hardware=hardware_fixture())
@@ -802,6 +811,8 @@ class BenchmarkTest(unittest.TestCase):
                 ramdisk, "_aggregate_score", return_value={"status": "not-run"}
             ), mock.patch.object(ramdisk, "_system_score", return_value={}), mock.patch.object(
                 ramdisk, "_read_json", return_value={"version": 1, "results": []}
+            ), mock.patch.object(
+                ramdisk, "_filesystem_for_path", return_value="ext4"
             ), mock.patch.object(ramdisk, "_atomic_json"), mock.patch.object(ramdisk, "_save_manifest"):
                 result = ramdisk.benchmark.__wrapped__(argparse.Namespace(), cli_path="/fake/coli")
 
@@ -809,6 +820,7 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(result["best_runtime_knobs"], manifest["best_runtime"]["interleaved"]["knobs"])
         self.assertEqual(manifest["best_runtime"]["per-node"], other_topology)
 
+    @requires_linux_operational
     def test_acceptance_is_false_when_applicable_paths_fail(self):
         with ModelFixture() as fixture:
             plan = ramdisk.build_plan(plan_args(fixture.root), hardware=hardware_fixture())
@@ -846,6 +858,8 @@ class BenchmarkTest(unittest.TestCase):
                 ramdisk, "_system_score", return_value={}
             ), mock.patch.object(
                 ramdisk, "_read_json", return_value={"version": 1, "results": []}
+            ), mock.patch.object(
+                ramdisk, "_filesystem_for_path", return_value="ext4"
             ), mock.patch.object(ramdisk, "_atomic_json"), mock.patch.object(
                 ramdisk, "_save_manifest"
             ):

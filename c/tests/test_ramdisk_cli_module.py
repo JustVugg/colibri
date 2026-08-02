@@ -221,10 +221,7 @@ class CliModuleTest(unittest.TestCase):
         self.assertIn("supported only on Linux", stderr.getvalue())
         loader.assert_not_called()
 
-    @unittest.skipUnless(
-        hasattr(signal, "SIGTERM"),
-        "SIGTERM is unavailable",
-    )
+    @requires_sigterm_handler
     def test_cli_termination_guard_restores_the_previous_handler(self):
         previous = signal.getsignal(signal.SIGTERM)
 

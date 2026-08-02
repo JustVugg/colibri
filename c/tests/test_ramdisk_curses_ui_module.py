@@ -488,6 +488,10 @@ class CursesUiModuleTest(unittest.TestCase):
                 hardware=hardware,
                 model=model,
             )
+            # This is a frontend worker-publication contract. Host-specific
+            # mount-root blockers are covered by planning/lifecycle tests and
+            # must not decide whether the injected UI worker runs.
+            plan["blockers"] = []
             report = {
                 "present": False,
                 "state": "absent",
@@ -684,10 +688,7 @@ class CursesUiModuleTest(unittest.TestCase):
 
         self.assertEqual(result, 130)
 
-    @unittest.skipUnless(
-        hasattr(signal, "SIGTERM"),
-        "SIGTERM is unavailable",
-    )
+    @requires_sigterm_handler
     def test_termination_guard_restores_the_previous_handler(self):
         previous = signal.getsignal(signal.SIGTERM)
 

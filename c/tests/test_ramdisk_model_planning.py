@@ -5,6 +5,8 @@ if __package__:
 else:
     from ramdisk_test_support import *  # noqa: F401,F403
 
+from ramdisk_support import discovery as discovery_support
+
 
 def quantized_expert_tensors(fmt, hidden=384, intermediate=256):
     tensors = []
@@ -105,7 +107,12 @@ class ScanAndPlanTest(unittest.TestCase):
             before = ramdisk.scan_model(str(fixture.root))["fingerprint"]
             shard = fixture.root / "model-00002-of-00002.safetensors"
             stat = shard.stat()
-            os.utime(shard, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+            # FILETIME and several mounted filesystems round sub-second
+            # changes, so use a change every supported host can observe.
+            os.utime(
+                shard,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
             after = ramdisk.scan_model(str(fixture.root))["fingerprint"]
         self.assertNotEqual(before, after)
 
@@ -271,16 +278,24 @@ class ScanAndPlanTest(unittest.TestCase):
         self.assertTrue(info["limiting_path"].endswith("service.slice"))
 
     def test_cgroup_discovery_fails_closed_when_proc_contract_is_unreadable(self):
+        class DeniedLinuxOps:
+            is_linux = True
+
+            @staticmethod
+            def read_cgroup_contract(path):
+                raise ramdisk.RamdiskError(
+                    "cannot read cgroup contract %s: denied" % path
+                )
+
         for cgroup_text, mountinfo_text, expected_path in (
             (None, "", "/proc/self/cgroup"),
             ("0::/\n", None, "/proc/self/mountinfo"),
         ):
-            with self.subTest(path=expected_path), mock.patch(
-                "builtins.open", side_effect=PermissionError("denied")
-            ):
-                info = ramdisk._discover_cgroup_memory(
+            with self.subTest(path=expected_path):
+                info = discovery_support._discover_cgroup_memory_with_ops(
                     cgroup_text=cgroup_text,
                     mountinfo_text=mountinfo_text,
+                    ops=DeniedLinuxOps(),
                 )
 
             self.assertEqual(info["status"], "unavailable")
@@ -413,6 +428,7 @@ class ScanAndPlanTest(unittest.TestCase):
         self.assertTrue(any("noswap" in blocker for blocker in blocked["blockers"]))
         self.assertFalse(any("noswap" in blocker for blocker in accepted["blockers"]))
 
+    @requires_linux_operational
     def test_protected_or_model_overlapping_mount_roots_are_blocked(self):
         with ModelFixture() as fixture:
             broad = ramdisk.build_plan(

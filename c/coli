@@ -1198,7 +1198,7 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
-def cmd_stop(a):
+def cmd_stop(a, platform_name=None):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
     not `glm`: every `pkill -x glm` in history silently killed nothing (that is
@@ -1206,6 +1206,12 @@ def cmd_stop(a):
     real processes: the pidfile first, then /proc by cmdline/environ — only
     processes that are demonstrably ours (SERVE=1 + our SNAP, or `coli serve`
     in the command line)."""
+    selected_platform = sys.platform if platform_name is None else platform_name
+    if not str(selected_platform).startswith("linux"):
+        raise SystemExit(
+            "coli stop is supported only on Linux; use your platform process "
+            "manager to stop coli serve"
+        )
     banner("stop")
     targets={}  # pid -> immutable start-time/signature identity (+ optional pidfd)
     pf=serve_pidfile(a.port)

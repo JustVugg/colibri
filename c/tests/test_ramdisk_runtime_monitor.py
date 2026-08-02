@@ -7,7 +7,12 @@ if __package__:
 else:
     from ramdisk_test_support import *  # noqa: F401,F403
 
-from ramdisk_support.runtime_monitor import MIB, RuntimeMonitor
+from ramdisk_support.runtime_monitor import (
+    MIB,
+    RuntimeMonitor,
+    _build_loopback_opener,
+    _loopback_urlopen,
+)
 
 
 class _Response:
@@ -100,6 +105,78 @@ def _members(_pgid):
 
 
 class RuntimeMonitorTest(unittest.TestCase):
+    def test_import_and_construction_leave_http_dependencies_lazy(self):
+        script = r"""
+import importlib.abc
+import sys
+
+blocked = {
+    "ramdisk_support.processes",
+    "ssl",
+    "urllib.request",
+}
+
+class RejectHttpDependencies(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise AssertionError("eager monitor dependency: " + fullname)
+        return None
+
+sys.meta_path.insert(0, RejectHttpDependencies())
+sys.path.insert(0, sys.argv[1])
+from ramdisk_support import runtime_monitor
+
+monitor = runtime_monitor.RuntimeMonitor()
+assert monitor._urlopen is runtime_monitor._loopback_urlopen
+assert runtime_monitor._LOOPBACK_OPENER is None
+assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(C_DIR)],
+            cwd=C_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_http_client_rejects_non_loopback_and_non_http_urls(self):
+        for url in (
+            "https://127.0.0.1:8123/health",
+            "http://localhost:8123/health",
+            "http://127.0.0.2:8123/health",
+            "http://127.0.0.1/health",
+            "http://127.0.0.1:0/health",
+            "http://127.0.0.1:8123/health#fragment",
+        ):
+            with self.subTest(url=url), self.assertRaisesRegex(
+                ValueError,
+                "HTTP numeric-loopback",
+            ):
+                _loopback_urlopen(url, timeout=0.5)
+
+    def test_default_http_opener_is_direct_http_only_and_refuses_redirects(self):
+        opener = _build_loopback_opener()
+        handler_names = {type(handler).__name__ for handler in opener.handlers}
+
+        self.assertNotIn("ProxyHandler", handler_names)
+        self.assertNotIn("HTTPSHandler", handler_names)
+        redirect_handler = next(
+            handler
+            for handler in opener.handlers
+            if type(handler).__name__ == "_NoRedirect"
+        )
+        self.assertIsNone(
+            redirect_handler.redirect_request(
+                mock.sentinel.request,
+                mock.sentinel.response,
+                302,
+                "redirect",
+                mock.sentinel.headers,
+                "https://example.com/escaped",
+            )
+        )
+
     def test_latest_profile_follows_endpoint_local_sequence_changes(self):
         monitor = RuntimeMonitor()
         first = monitor._select_latest_profile(

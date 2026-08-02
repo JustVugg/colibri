@@ -20,6 +20,25 @@ C_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(C_DIR))
 import ramdisk  # noqa: E402
 
+try:
+    from .platform_test_support import (
+        PLATFORM_SKIP_INVENTORY,
+        assert_platform_skip_inventory,
+        requires_linux_operational,
+        requires_linux_pidfd,
+        requires_sigint_handler,
+        requires_sigterm_handler,
+    )
+except ImportError:
+    from platform_test_support import (
+        PLATFORM_SKIP_INVENTORY,
+        assert_platform_skip_inventory,
+        requires_linux_operational,
+        requires_linux_pidfd,
+        requires_sigint_handler,
+        requires_sigterm_handler,
+    )
+
 
 @contextlib.contextmanager
 def canonical_temporary_directory(*args, **kwargs):
@@ -190,6 +209,7 @@ __all__ = [
     "C_DIR",
     "ModelFixture",
     "Path",
+    "PLATFORM_SKIP_INVENTORY",
     "argparse",
     "canonical_temporary_directory",
     "contextlib",
@@ -202,6 +222,11 @@ __all__ = [
     "os",
     "plan_args",
     "ramdisk",
+    "assert_platform_skip_inventory",
+    "requires_linux_operational",
+    "requires_linux_pidfd",
+    "requires_sigint_handler",
+    "requires_sigterm_handler",
     "set_asymmetric_node_cores",
     "shutil",
     "signal",

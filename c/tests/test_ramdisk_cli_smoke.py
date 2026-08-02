@@ -7,7 +7,7 @@ else:
 
 
 class CliJsonSmokeTest(unittest.TestCase):
-    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "SIGTERM is unavailable")
+    @requires_sigterm_handler
     def test_curses_sigterm_uses_cleanup_exception_and_restores_handler(self):
         previous = signal.getsignal(signal.SIGTERM)
         with self.assertRaises(ramdisk._TuiTerminationSignal) as raised:
@@ -19,7 +19,7 @@ class CliJsonSmokeTest(unittest.TestCase):
         self.assertEqual(raised.exception.signum, int(signal.SIGTERM))
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
-    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "SIGTERM is unavailable")
+    @requires_sigterm_handler
     def test_curses_repeated_sigterm_is_deferred_until_cleanup_guard_exits(self):
         previous = signal.getsignal(signal.SIGTERM)
         with ramdisk._curses_termination_guard():
@@ -30,7 +30,7 @@ class CliJsonSmokeTest(unittest.TestCase):
 
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
-    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "SIGTERM is unavailable")
+    @requires_sigterm_handler
     def test_cli_sigterm_requests_cooperative_prepare_rollback(self):
         args = argparse.Namespace(ramdisk_action="prepare", json=False)
         previous = signal.getsignal(signal.SIGTERM)
@@ -54,7 +54,37 @@ class CliJsonSmokeTest(unittest.TestCase):
 
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
-    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "SIGTERM is unavailable")
+    @requires_sigint_handler
+    def test_cli_repeated_sigint_stays_cooperative_through_start_rollback(self):
+        args = argparse.Namespace(ramdisk_action="start", json=False)
+        previous = signal.getsignal(signal.SIGINT)
+
+        def interrupted_start(
+            _args,
+            cli_path=None,
+            engine_path=None,
+            cancel_event=None,
+        ):
+            handler = signal.getsignal(signal.SIGINT)
+            self.assertTrue(callable(handler))
+            handler(signal.SIGINT, None)
+            handler(signal.SIGINT, None)
+            self.assertTrue(cancel_event.is_set())
+            raise ramdisk._OperationCancelled("termination requested")
+
+        with mock.patch.object(
+            ramdisk,
+            "start",
+            side_effect=interrupted_start,
+        ), mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(
+                ramdisk.dispatch(args),
+                128 + int(signal.SIGINT),
+            )
+
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
+
+    @requires_sigterm_handler
     def test_cli_sigterm_defers_until_stop_transaction_finishes(self):
         args = argparse.Namespace(ramdisk_action="stop", json=False)
         completed = []
