@@ -562,6 +562,8 @@ __global__ void rmsnorm_rows_bf16(float*out,const float*in,const __nv_bfloat16*w
 __global__ void split_qkv_rows(float*q,float*kv,const float*in,int rows,int R,int K){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)rows*(R+K);if(p<n){int row=p/(R+K),col=p%(R+K);if(col<R)q[(long long)row*R+col]=in[p];else kv[(long long)row*K+col-R]=in[p];}}
 __global__ void fi_position_batch(int64_t*slot,int64_t*position,int start,int tokens){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<tokens)slot[i]=position[i]=start+i;}
 __global__ void fi_indices_batch(int*idx,int*length,int start,int tokens,int window,int topk){int t=blockIdx.x,p=threadIdx.x;if(t>=tokens)return;int pos=start+t,n=min(pos+1,window),first=pos+1-n;if(p<topk)idx[(long long)t*topk+p]=p<n?first+p:-1;if(!p)length[t]=n;}
+__global__ void gather_group_rows(float*out,const float*in,int tokens,int groups,int width,int group){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*width;if(p<n){int row=p/width,col=p%width;out[p]=in[((long long)row*groups+group)*width+col];}}
+__global__ void scatter_group_rows(float*out,const float*in,int tokens,int groups,int width,int group){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*width;if(p<n){int row=p/width,col=p%width;out[((long long)row*groups+group)*width+col]=in[p];}}
 __global__ void fi_indices(int*idx,int*length,const int*state,int window){int i=threadIdx.x,pos=decode_pos(state),n=min(pos+1,window),start=pos+1-n;if(i<512)idx[i]=i<n?start+i:-1;if(!i)*length=n;}
 /* C4A attends to the indexer's compressed candidates in addition to SWA.
  * The ranges intentionally overlap: those summaries are separate learned KV
@@ -1085,6 +1087,25 @@ extern "C" int dsv4_cuda_attention_sparse_batch(const Dsv4CudaActivation*input,D
     return good;}
 #else
     (void)input;(void)an;(void)qkv;(void)qn;(void)qb;(void)kvn;(void)sink;(void)heads;(void)dim;(void)start;(void)tokens;(void)eps;(void)cache;(void)context;return 0;
+#endif
+}
+
+extern "C" int dsv4_cuda_attention_output_batch(const Dsv4CudaActivation*context,Dsv4CudaTensor*wa,Dsv4CudaTensor*wb,int groups,int tokens,Dsv4CudaActivation*output){
+#ifdef COLI_DSV4_DEEPGEMM
+    Dev*c=context?ctx(context->device):nullptr;int K=wa?wa->I:0,N=wa&&groups?wa->O/groups:0,WR=wa?wa->O:0,H=wb?wb->O:0;
+    if(!c||!wa||!wb||!output||groups<1||tokens<1||wa->fmt!=9||wa->O%groups||wb->fmt!=8||wb->I!=WR||
+       wa->device!=context->device||wb->device!=context->device||output->device!=context->device||
+       context->elements<(long long)tokens*groups*K||output->elements<(long long)tokens*H||N!=1024||K!=4096)return 0;
+    size_t in=(size_t)tokens*K*sizeof(float),part=(size_t)tokens*N*sizeof(float),joined=(size_t)tokens*WR*sizeof(float);
+    if(!ok(cudaSetDevice(context->device),"select batched attention output device")||!buf((void**)&c->aux1,&c->aux1cap,in)||
+       !buf((void**)&c->aux2,&c->aux2cap,part)||!buf((void**)&c->p1,&c->p1cap,joined))return 0;
+    for(int gidx=0;gidx<groups;gidx++){gather_group_rows<<<((long long)tokens*K+255)/256,256,0,c->stream>>>(c->aux1,context->data,tokens,groups,K,gidx);
+        Dsv4CudaTensor view=*wa;view.O=N;view.w=(uint8_t*)wa->w+(long long)gidx*N*K;view.dg_scale=wa->dg_scale+(long long)gidx*(K/512)*N;
+        if(!dg_dense_batch_dispatch(c,&view,c->aux1,c->aux2,tokens))return 0;
+        scatter_group_rows<<<((long long)tokens*N+255)/256,256,0,c->stream>>>(c->p1,c->aux2,tokens,groups,N,gidx);}
+    return dg_dense_batch_dispatch(c,wb,c->p1,output->data,tokens);
+#else
+    (void)context;(void)wa;(void)wb;(void)groups;(void)tokens;(void)output;return 0;
 #endif
 }
 

@@ -108,6 +108,9 @@ int dsv4_cuda_attention_sparse_batch(const Dsv4CudaActivation *input,Dsv4CudaTen
                                      Dsv4CudaTensor *kv_norm,Dsv4CudaTensor *sink,int heads,int head_dim,
                                      int start_pos,int tokens,float eps,Dsv4CudaKvCache *cache,
                                      Dsv4CudaActivation *context);
+int dsv4_cuda_attention_output_batch(const Dsv4CudaActivation *context,Dsv4CudaTensor *wo_a,
+                                     Dsv4CudaTensor *wo_b,int groups,int tokens,
+                                     Dsv4CudaActivation *output);
 int dsv4_cuda_attention_window_tp2(const Dsv4CudaActivation *input,Dsv4CudaActivation *peer_input,
                                    const Dsv4CudaAttentionWeights *primary,const Dsv4CudaAttentionWeights *peer,
                                    int compress_ratio,int heads,int head_dim,int qk_rope,int groups,int pos,float eps,

@@ -6,9 +6,10 @@
 #include "../backend_cuda_dsv4.h"
 
 static Dsv4CudaTensor*fp8_diag(int O,int I){size_t wn=(size_t)O*I,sn=(size_t)((O+127)/128)*((I+127)/128);uint8_t*w=calloc(wn,1),*s=malloc(sn);Dsv4CudaTensor*t=NULL;if(!w||!s)return NULL;for(int o=0;o<O;o++)w[(size_t)o*I+o%I]=0x38;memset(s,127,sn);int ok=dsv4_cuda_upload_fp8(&t,w,s,O,I,0);free(s);free(w);return ok?t:NULL;}
+static Dsv4CudaTensor*fp8_bf16_diag(int O,int I){size_t wn=(size_t)O*I,sn=(size_t)((O+127)/128)*((I+127)/128);uint8_t*w=calloc(wn,1),*s=malloc(sn);Dsv4CudaTensor*t=NULL;if(!w||!s)return NULL;for(int o=0;o<O;o++)w[(size_t)o*I+o%I]=0x38;memset(s,127,sn);int ok=dsv4_cuda_upload_fp8_bf16(&t,w,s,O,I,0);free(s);free(w);return ok?t:NULL;}
 
 int main(void){
-    enum { T=17,H=4096,R=1024,K=512,HEADS=8,Q=HEADS*K,MAX=32,ROPE=32 };
+    enum { T=17,H=4096,R=1024,K=512,HEADS=64,Q=HEADS*K,MAX=32,ROPE=32 };
     int dev=0;if(!dsv4_cuda_init(&dev,1))return 1;
     float*one=malloc(H*sizeof(float)),*kvone=malloc(K*sizeof(float)),*sinkv=calloc(HEADS,sizeof(float));uint16_t*qnone=malloc(R*sizeof(uint16_t));
     float*rope_cos=malloc((size_t)MAX*ROPE*sizeof(float)),*rope_sin=calloc((size_t)MAX*ROPE,sizeof(float)),*x=malloc((size_t)T*H*sizeof(float)),*got=malloc((size_t)T*Q*sizeof(float));
@@ -30,6 +31,11 @@ int main(void){
        !dsv4_cuda_activation_download(single,single_out,Q)||!dsv4_cuda_activation_sync(single_out))return 6;
     for(int i=0;i<Q;i++)if(fabsf(single[i]-got[i])>1e-3f){fprintf(stderr,"causal mismatch at %d: single=%g batch=%g\n",i,single[i],got[i]);return 7;}
     free(single);dsv4_cuda_activation_free(single_out);dsv4_cuda_activation_free(single_in);dsv4_cuda_kv_free(single_cache);
+    Dsv4CudaTensor*wa=fp8_bf16_diag(8192,4096),*wb=fp8_diag(4096,8192);Dsv4CudaActivation*projected=dsv4_cuda_activation_create(dev,(long long)T*H);float*projected_host=malloc((size_t)T*H*sizeof(float));
+    if(!wa||!wb||!projected||!projected_host||!dsv4_cuda_attention_output_batch(out,wa,wb,8,T,projected)||
+       !dsv4_cuda_activation_download(projected_host,projected,(long long)T*H)||!dsv4_cuda_activation_sync(projected))return 8;
+    for(int i=0;i<T*H;i++)if(!isfinite(projected_host[i]))return 9;
+    free(projected_host);dsv4_cuda_activation_free(projected);dsv4_cuda_tensor_free(wb);dsv4_cuda_tensor_free(wa);
     dsv4_cuda_activation_free(out);dsv4_cuda_activation_free(in);dsv4_cuda_kv_free(cache);dsv4_cuda_tensor_free(sink);dsv4_cuda_tensor_free(kvn);dsv4_cuda_tensor_free(qb);dsv4_cuda_tensor_free(qn);dsv4_cuda_tensor_free(qkv);dsv4_cuda_tensor_free(an);dsv4_cuda_shutdown();
     free(got);free(x);free(rope_sin);free(rope_cos);free(qnone);free(sinkv);free(kvone);free(one);puts("dsv4 attention batch: OK");return 0;
 }
