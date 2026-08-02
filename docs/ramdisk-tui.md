@@ -28,7 +28,10 @@ You need:
 - a terminal of at least 72 columns by 24 rows for the Textual interface;
 - enough memory for the staged set, runtime overhead, and the planner's
   operating-system reserve;
-- `sudo` authorization, or an existing root session, for `mount` and `umount`;
+- `sudo` authorization, or an existing root session, for `mount`, `umount`,
+  and the read-only busy-mount check;
+- util-linux `mount`/`umount`, plus PSmisc `fuser` when running the Linux
+  lifecycle as an unprivileged user;
 - Linux NUMA and cgroup information visible to the invoking process.
 
 Install the supported Textual frontend from a checkout:
@@ -376,10 +379,11 @@ generated-fixture lifecycle tests.
 Planning and status are unprivileged. Before Prepare or Destroy, the Textual
 interface temporarily suspends itself for one foreground `sudo -v` prompt.
 It then verifies that the credential can be reused non-interactively. The
-background worker uses non-interactive sudo only for the exact mount or
-unmount commands, and a keepalive preserves rollback authority during a long
-copy. If the credential cannot be reused without prompting, no mount operation
-starts.
+background worker uses non-interactive sudo only for the exact mount, unmount,
+or trusted `fuser -mM` busy-mount check. The `fuser` invocation is read-only
+and receives the verified absolute mount path as a separate argument. A
+keepalive preserves rollback authority during a long copy. If the credential
+cannot be reused without prompting, no mount operation starts.
 
 Other safety boundaries include:
 
@@ -523,6 +527,21 @@ share the fixed environment with a serving process.
 
 Stop managed engines first. If process cleanup is pending, Stop remains
 available even for an incomplete workspace.
+
+**Prepare, Stop, or Destroy cannot prove the mount is idle.**
+
+When run as root, managed cleanup enumerates and reads every relevant identity
+in `/proc`. A `hidepid` mount option or security policy can therefore force a
+safe refusal; restore process-table visibility for the administrator and retry.
+When run unprivileged, Colibri instead executes a trusted, root-owned PSmisc
+`fuser -mM` through `sudo`. Install your distribution's `psmisc` package if
+`fuser` is missing. Prepare also verifies the trusted util-linux `umount`
+supports the required `--no-canonicalize` cleanup mode before it creates a
+mount. Missing, incompatible, or untrusted helpers, denied sudo reuse, diagnostic
+output, timeouts, and incomplete scans all fail closed. Prepare checks this
+capability before confirmation or mount mutation, and an existing workspace
+remains recorded for recovery while identity is unproven. The Nix package adds
+PSmisc to the Linux runtime closure automatically.
 
 **Sudo authorization returns to the TUI without mounting.**
 

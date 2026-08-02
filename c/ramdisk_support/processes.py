@@ -47,6 +47,11 @@ def _process_group_members(
             members.append(identity)
         else:
             unreadable.append(pid)
+    if not members and not unreadable and ops.process_group_alive(pgid):
+        # A complete procfs scan cannot prove absence while the kernel still
+        # reports the group alive.  Preserve the existing two-list interface
+        # and make callers treat the group identity as unverified.
+        unreadable.append(int(pgid))
     return members, unreadable
 
 
@@ -339,6 +344,24 @@ def _poll_managed_child(pid):
     return returncode
 
 
+def _managed_child_liveness(pid):
+    """Return True/False for a retained child, or None without a handle."""
+    with _managed_children_lock:
+        process = _managed_children.get(int(pid))
+    if process is None:
+        return None
+    try:
+        returncode = process.poll()
+    except (ChildProcessError, OSError):
+        returncode = getattr(process, "returncode", None)
+    if returncode is None:
+        return True
+    with _managed_children_lock:
+        if _managed_children.get(int(pid)) is process:
+            _managed_children.pop(int(pid), None)
+    return False
+
+
 def _forget_managed_child(pid):
     with _managed_children_lock:
         _managed_children.pop(int(pid), None)
@@ -415,15 +438,15 @@ def _terminate_verified_group(
     term_seconds=10.0,
     kill_seconds=3.0,
     *,
-    poll_managed_child=None,
+    managed_child_liveness=None,
     process_matches=None,
     ops=None,
 ):
     """Signal only while the persisted identity still owns its PGID."""
-    poll_managed_child = (
-        _poll_managed_child
-        if poll_managed_child is None
-        else poll_managed_child
+    managed_child_liveness = (
+        _managed_child_liveness
+        if managed_child_liveness is None
+        else managed_child_liveness
     )
     process_matches = (
         _process_matches
@@ -434,9 +457,10 @@ def _terminate_verified_group(
     expected_pgid = int(record.get("pgid", record["pid"]))
 
     def revalidate(stage):
-        # Poll retained Popen handles first so an exited group leader cannot
-        # remain a zombie that falsely appears to have survived a signal.
-        poll_managed_child(record["pid"])
+        # A retained child handle is independent evidence. It can prove
+        # liveness while process-group enumeration is inconclusive, and polling
+        # it also reaps an exited group leader before the kernel check.
+        child_alive = managed_child_liveness(record["pid"])
         matches, reason, actual = process_matches(record)
         if (
             matches
@@ -444,8 +468,15 @@ def _terminate_verified_group(
             and int(actual.get("pgid", -1)) == expected_pgid
         ):
             return True, None
-        if reason == "not-running":
+        if reason == "not-running" and child_alive is not True:
             return False, None
+        if reason == "not-running":
+            return (
+                False,
+                "PID/PGID %s retained managed child is still live %s; "
+                "refusing an unverified group signal"
+                % (expected_pgid, stage),
+            )
         return (
             False,
             "PID/PGID %s identity changed %s (%s); refusing another signal"

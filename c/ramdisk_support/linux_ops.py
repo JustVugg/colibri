@@ -7,6 +7,7 @@ import os
 import platform
 import posixpath
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -147,11 +148,22 @@ def _split_mount_options(value):
 def _mount_table(path="/proc/self/mountinfo"):
     if path == "/proc/self/mountinfo":
         _require_linux()
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as stream:
+            mountinfo = stream.read()
+    except (OSError, UnicodeError) as exc:
+        raise RamdiskError(
+            "cannot read Linux mount table %s: %s" % (path, exc)
+        ) from exc
     result = []
-    for line in _read_text(path).splitlines():
+    for line_number, line in enumerate(mountinfo.splitlines(), 1):
+        if not line.strip():
+            continue
         fields = line.split()
         try:
             separator = fields.index("-")
+            if separator < 6 or len(fields) <= separator + 3:
+                raise ValueError("incomplete mountinfo record")
             result.append(
                 {
                     "mount_id": int(fields[0]),
@@ -170,8 +182,11 @@ def _mount_table(path="/proc/self/mountinfo"):
                     ),
                 }
             )
-        except (ValueError, IndexError):
-            continue
+        except (ValueError, IndexError) as exc:
+            raise RamdiskError(
+                "cannot parse Linux mount table %s line %d: %s"
+                % (path, line_number, exc)
+            ) from exc
     return result
 
 
@@ -206,8 +221,23 @@ def _filesystem_for_path(path, *, mount_table=None):
         except ValueError:
             contained = False
         if contained:
-            matches.append((len(root), mount["filesystem"]))
-    return max(matches)[1] if matches else None
+            matches.append((len(root), root, mount))
+    if not matches:
+        return None
+    longest = max(item[0] for item in matches)
+    nearest = [item for item in matches if item[0] == longest]
+    if len(nearest) > 1:
+        raise RamdiskError(
+            "refusing ambiguous stacked mounts at %s (mount ids %s)"
+            % (
+                nearest[0][1],
+                ", ".join(
+                    str(item[2]["mount_id"])
+                    for item in nearest
+                ),
+            )
+        )
+    return nearest[0][2]["filesystem"]
 
 
 def _run(command, **kwargs):
@@ -241,9 +271,6 @@ def _trusted_system_binary(name):
     if discovered:
         candidates.append(discovered)
     system_uid = os.stat("/").st_uid
-    getgroups = getattr(os, "getgroups", None)
-    groups = set(getgroups() if getgroups is not None else ())
-    groups.add(_current_gid())
     rejected = []
     for candidate in candidates:
         path = os.path.realpath(candidate)
@@ -262,20 +289,28 @@ def _trusted_system_binary(name):
             rejected.append(path)
             continue
         parent = os.path.dirname(path)
+        child_info = info
         unsafe_parent = False
         while True:
             parent_info = os.stat(parent)
-            group_writable_by_us = bool(
-                parent_info.st_mode & stat.S_IWGRP
-                and parent_info.st_gid in groups
+            sticky_protects_child = bool(
+                parent_info.st_uid == system_uid
+                and parent_info.st_mode & stat.S_ISVTX
+                and child_info.st_uid == system_uid
+                and not child_info.st_mode & 0o022
             )
             if (
-                parent_info.st_uid != system_uid
+                not stat.S_ISDIR(parent_info.st_mode)
+                or parent_info.st_uid != system_uid
                 or parent_info.st_mode & stat.S_IWOTH
-                or group_writable_by_us
+                or (
+                    parent_info.st_mode & stat.S_IWGRP
+                    and not sticky_protects_child
+                )
                 or (
                     current_euid() != 0
                     and os.access(parent, os.W_OK)
+                    and not sticky_protects_child
                 )
             ):
                 unsafe_parent = True
@@ -283,6 +318,7 @@ def _trusted_system_binary(name):
             next_parent = os.path.dirname(parent)
             if next_parent == parent:
                 break
+            child_info = parent_info
             parent = next_parent
         if unsafe_parent:
             rejected.append(path)
@@ -465,22 +501,47 @@ def _process_group_member_pids(pgid):
     members = []
     try:
         entries = os.listdir("/proc")
-    except OSError:
-        return members
+    except OSError as exc:
+        raise RamdiskError(
+            "cannot enumerate Linux process table /proc: %s; managed "
+            "cleanup requires complete process-table visibility" % exc
+        ) from exc
     for entry in entries:
         if not entry.isdigit():
             continue
         pid = int(entry)
-        raw = _read_text("/proc/%d/stat" % pid)
+        stat_path = "/proc/%d/stat" % pid
+        try:
+            with open(
+                stat_path,
+                "r",
+                encoding="utf-8",
+                errors="strict",
+            ) as stream:
+                raw = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            # Exiting between listdir() and open() is ordinary procfs churn.
+            continue
+        except (OSError, UnicodeError) as exc:
+            raise RamdiskError(
+                "cannot read Linux process identity %s: %s"
+                "; managed cleanup requires complete process-table visibility"
+                % (stat_path, exc)
+            ) from exc
         close = raw.rfind(")")
         try:
+            if close < 0:
+                raise ValueError("missing process-name terminator")
             fields = raw[close + 2 :].split()
             member_pgid = int(fields[2])
-        except (ValueError, IndexError):
-            continue
+        except (ValueError, IndexError) as exc:
+            raise RamdiskError(
+                "cannot parse Linux process identity %s: %s"
+                % (stat_path, exc)
+            ) from exc
         if member_pgid == pgid:
             members.append(pid)
-    return members
+    return sorted(members)
 
 
 def _process_group_alive(pgid):
@@ -511,57 +572,574 @@ def _process_status(pid, *, read_text=None):
     return read_text("/proc/%d/status" % int(pid))
 
 
-def _busy_mount_references(path):
-    """Return PIDs holding cwd, root, mappings, or descriptors below ``path``."""
+def _busy_mount_references_proc(path):
+    """Strict root-only procfs scan for references below ``path``."""
     _require_linux()
     path = os.path.normpath(path) + os.sep
     found = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        for leaf in ("cwd", "root"):
+
+    def visibility_error(action, proc_path, error):
+        raise RamdiskError(
+            "cannot %s %s: %s; managed cleanup requires complete /proc "
+            "visibility (hidepid or a security policy may deny it)"
+            % (action, proc_path, error)
+        ) from error
+
+    def reference_below(target):
+        if target.endswith(" (deleted)"):
+            target = target[: -len(" (deleted)")]
+        if not os.path.isabs(target):
+            return False
+        return (os.path.normpath(target) + os.sep).startswith(path)
+
+    def missing_endpoint_is_inert(entry, endpoint, missing_error):
+        """Corroborate endpoint ENOENT without overlooking a live task."""
+        stat_path = "/proc/%s/stat" % entry
+        try:
+            with open(
+                stat_path,
+                "r",
+                encoding="utf-8",
+                errors="strict",
+            ) as stream:
+                process_stat = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            # The PID itself is now absent, so it cannot retain the mount.
+            return True
+        except (OSError, UnicodeError) as exc:
+            visibility_error("verify process identity", stat_path, exc)
+
+        close = process_stat.rfind(")")
+        fields = process_stat[close + 2 :].split() if close >= 0 else []
+        try:
+            state = fields[0]
+            flags = int(fields[6], 10)
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RamdiskError(
+                "cannot parse process identity %s after missing endpoint %s; "
+                "managed cleanup requires complete /proc visibility"
+                % (stat_path, endpoint)
+            ) from exc
+        if len(state) != 1:
+            raise RamdiskError(
+                "cannot parse process identity %s after missing endpoint %s; "
+                "managed cleanup requires complete /proc visibility"
+                % (stat_path, endpoint)
+            )
+
+        # PF_KTHREAD tasks have no userspace mm, files, or cwd.
+        if flags & 0x00200000:
+            return True
+        if state in ("Z", "X", "x"):
+            # A multithreaded process can retain a zombie group leader while
+            # live siblings still share its mm/files/fs. Only a complete task
+            # snapshot with no nonleader TID proves this dead leader inert.
+            task_dir = "/proc/%s/task" % entry
             try:
-                target = os.path.realpath(
-                    "/proc/%s/%s" % (entry, leaf)
-                ) + os.sep
-                if target.startswith(path):
-                    found.append(int(entry))
-                    break
-            except OSError:
-                pass
-        if found and found[-1] == int(entry):
-            continue
-        # A process can close the shard fd after mmap(); the mapping remains a
-        # live mount reference and appears only in /proc/<pid>/maps.
-        for line in _read_text("/proc/%s/maps" % entry).splitlines():
-            fields = line.split(None, 5)
-            if len(fields) < 6 or not fields[5].startswith("/"):
+                task_entries = os.listdir(task_dir)
+            except (FileNotFoundError, ProcessLookupError):
+                try:
+                    with open(
+                        stat_path,
+                        "r",
+                        encoding="utf-8",
+                        errors="strict",
+                    ):
+                        pass
+                except (FileNotFoundError, ProcessLookupError):
+                    return True
+                except (OSError, UnicodeError) as exc:
+                    visibility_error("recheck process identity", stat_path, exc)
+                raise RamdiskError(
+                    "cannot enumerate task group %s while PID %s remains; "
+                    "managed cleanup requires complete /proc visibility"
+                    % (task_dir, entry)
+                ) from missing_error
+            except OSError as exc:
+                visibility_error("enumerate process task group", task_dir, exc)
+            invalid_tasks = [
+                task for task in task_entries if not task.isdigit()
+            ]
+            if invalid_tasks:
+                raise RamdiskError(
+                    "cannot parse process task group %s; managed cleanup "
+                    "requires complete /proc visibility" % task_dir
+                )
+            try:
+                num_threads = int(fields[17], 10)
+            except (IndexError, TypeError, ValueError) as exc:
+                raise RamdiskError(
+                    "cannot parse process thread count %s; managed cleanup "
+                    "requires complete /proc visibility" % stat_path
+                ) from exc
+            task_ids = [int(task) for task in task_entries]
+            unique_tasks = set(task_ids)
+            if (
+                num_threads <= 0
+                or len(task_ids) != num_threads
+                or len(unique_tasks) != num_threads
+                or int(entry) not in unique_tasks
+            ):
+                raise RamdiskError(
+                    "incomplete process task snapshot %s: stat declares %d "
+                    "threads but task entries are %s; managed cleanup "
+                    "requires complete /proc visibility"
+                    % (
+                        task_dir,
+                        num_threads,
+                        ",".join(str(task) for task in sorted(unique_tasks))
+                        or "none",
+                    )
+                )
+            live_siblings = sorted(
+                task for task in unique_tasks if task != int(entry)
+            )
+            if not live_siblings:
+                return True
+            raise RamdiskError(
+                "cannot trust missing process endpoint %s: zombie/dead "
+                "leader PID %s still has sibling tasks %s; managed cleanup "
+                "requires complete /proc visibility"
+                % (
+                    endpoint,
+                    entry,
+                    ",".join(str(task) for task in live_siblings),
+                )
+            ) from missing_error
+        raise RamdiskError(
+            "cannot trust missing process endpoint %s while PID %s remains "
+            "a live userspace task; managed cleanup requires complete /proc "
+            "visibility" % (endpoint, entry)
+        ) from missing_error
+
+    try:
+        entries = os.listdir("/proc")
+    except OSError as exc:
+        visibility_error("enumerate", "/proc", exc)
+
+    maps_line = re.compile(
+        r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+\s+"
+        r"[r-][w-][x-][ps]\s+[0-9A-Fa-f]+\s+"
+        r"[0-9A-Fa-f]+:[0-9A-Fa-f]+\s+\d+"
+        r"(?:\s+(.*))?$"
+    )
+
+    def task_group_snapshot(entry):
+        """Return one complete task-membership snapshot for a live TGID."""
+        stat_path = "/proc/%s/stat" % entry
+        try:
+            with open(
+                stat_path,
+                "r",
+                encoding="utf-8",
+                errors="strict",
+            ) as stream:
+                process_stat = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except (OSError, UnicodeError) as exc:
+            visibility_error("read process identity", stat_path, exc)
+
+        close = process_stat.rfind(")")
+        fields = process_stat[close + 2 :].split() if close >= 0 else []
+        try:
+            state = fields[0]
+            flags = int(fields[6], 10)
+            num_threads = int(fields[17], 10)
+            start_time = int(fields[19], 10)
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RamdiskError(
+                "cannot parse process task identity %s; managed cleanup "
+                "requires complete /proc visibility" % stat_path
+            ) from exc
+        if len(state) != 1 or num_threads <= 0 or start_time < 0:
+            raise RamdiskError(
+                "cannot parse process task identity %s; managed cleanup "
+                "requires complete /proc visibility" % stat_path
+            )
+
+        task_dir = "/proc/%s/task" % entry
+        try:
+            task_entries = os.listdir(task_dir)
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            try:
+                with open(
+                    stat_path,
+                    "r",
+                    encoding="utf-8",
+                    errors="strict",
+                ):
+                    pass
+            except (FileNotFoundError, ProcessLookupError):
+                return None
+            except (OSError, UnicodeError) as recheck_exc:
+                visibility_error(
+                    "recheck process identity",
+                    stat_path,
+                    recheck_exc,
+                )
+            raise RamdiskError(
+                "cannot enumerate task group %s while PID %s remains; "
+                "managed cleanup requires complete /proc visibility"
+                % (task_dir, entry)
+            ) from exc
+        except OSError as exc:
+            visibility_error("enumerate process task group", task_dir, exc)
+
+        if any(not task.isdigit() for task in task_entries):
+            raise RamdiskError(
+                "cannot parse process task group %s; managed cleanup "
+                "requires complete /proc visibility" % task_dir
+            )
+        task_ids = [int(task) for task in task_entries]
+        unique_tasks = set(task_ids)
+        if (
+            len(task_ids) != num_threads
+            or len(unique_tasks) != num_threads
+            or int(entry) not in unique_tasks
+        ):
+            raise RamdiskError(
+                "incomplete process task snapshot %s: stat declares %d "
+                "threads but task entries are %s; managed cleanup requires "
+                "complete /proc visibility"
+                % (
+                    task_dir,
+                    num_threads,
+                    ",".join(str(task) for task in sorted(unique_tasks))
+                    or "none",
+                )
+            )
+        return {
+            "flags": flags,
+            "start_time": start_time,
+            "tasks": tuple(sorted(unique_tasks)),
+        }
+
+    def missing_task_endpoint_is_inert(entry, task, endpoint, missing_error):
+        """Reject a partial live-task view; tolerate only proven inert tasks."""
+        task_stat_path = "/proc/%s/task/%s/stat" % (entry, task)
+        try:
+            with open(
+                task_stat_path,
+                "r",
+                encoding="utf-8",
+                errors="strict",
+            ) as stream:
+                task_stat = stream.read()
+        except (FileNotFoundError, ProcessLookupError):
+            leader_stat_path = "/proc/%s/stat" % entry
+            try:
+                with open(
+                    leader_stat_path,
+                    "r",
+                    encoding="utf-8",
+                    errors="strict",
+                ):
+                    pass
+            except (FileNotFoundError, ProcessLookupError):
+                return True
+            except (OSError, UnicodeError) as exc:
+                visibility_error(
+                    "recheck process identity",
+                    leader_stat_path,
+                    exc,
+                )
+            raise RamdiskError(
+                "incomplete process task snapshot: task %s disappeared at %s "
+                "while PID %s remains; managed cleanup requires complete "
+                "/proc visibility" % (task, endpoint, entry)
+            ) from missing_error
+        except (OSError, UnicodeError) as exc:
+            visibility_error("verify process task identity", task_stat_path, exc)
+
+        close = task_stat.rfind(")")
+        fields = task_stat[close + 2 :].split() if close >= 0 else []
+        try:
+            state = fields[0]
+            flags = int(fields[6], 10)
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RamdiskError(
+                "cannot parse process task identity %s after missing endpoint "
+                "%s; managed cleanup requires complete /proc visibility"
+                % (task_stat_path, endpoint)
+            ) from exc
+        if flags & 0x00200000 or state in ("Z", "X", "x"):
+            return True
+        raise RamdiskError(
+            "cannot trust missing task endpoint %s while task %s in PID %s "
+            "remains live; managed cleanup requires complete /proc visibility"
+            % (endpoint, task, entry)
+        ) from missing_error
+
+    def scan_task_references(entry, pid, endpoint_root, missing_is_inert):
+        """Return ``(busy, inert)`` for one leader or nonleader task."""
+        for leaf in ("cwd", "root"):
+            proc_path = "%s/%s" % (endpoint_root, leaf)
+            try:
+                target = os.readlink(proc_path)
+                if reference_below(target):
+                    return True, False
+            except (FileNotFoundError, ProcessLookupError) as exc:
+                if missing_is_inert(proc_path, exc):
+                    return False, True
+            except OSError as exc:
+                visibility_error("read process reference", proc_path, exc)
+
+        maps_path = "%s/maps" % endpoint_root
+        try:
+            with open(
+                maps_path,
+                "r",
+                encoding="utf-8",
+                errors="surrogateescape",
+            ) as stream:
+                mappings = stream.read()
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            if missing_is_inert(maps_path, exc):
+                return False, True
+        except OSError as exc:
+            visibility_error("read process mappings", maps_path, exc)
+        for line_number, line in enumerate(mappings.splitlines(), 1):
+            match = maps_line.fullmatch(line)
+            if match is None:
+                raise RamdiskError(
+                    "cannot parse process mappings %s line %d; managed cleanup "
+                    "requires complete /proc visibility"
+                    % (maps_path, line_number)
+                )
+            mapped = match.group(1)
+            if not mapped or not mapped.startswith("/"):
                 continue
-            mapped = fields[5]
-            if mapped.endswith(" (deleted)"):
-                mapped = mapped[: -len(" (deleted)")]
-            target = os.path.realpath(mapped) + os.sep
-            if target.startswith(path):
-                found.append(int(entry))
-                break
-        if found and found[-1] == int(entry):
-            continue
-        fd_dir = "/proc/%s/fd" % entry
+            if reference_below(_unescape_mount(mapped)):
+                return True, False
+
+        fd_dir = "%s/fd" % endpoint_root
         try:
             descriptors = os.listdir(fd_dir)
-        except OSError:
-            continue
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            if missing_is_inert(fd_dir, exc):
+                return False, True
+        except OSError as exc:
+            visibility_error("enumerate process descriptors", fd_dir, exc)
         for descriptor in descriptors:
+            descriptor_path = os.path.join(fd_dir, descriptor)
             try:
-                target = os.path.realpath(
-                    os.path.join(fd_dir, descriptor)
-                ) + os.sep
-                if target.startswith(path):
-                    found.append(int(entry))
-                    break
-            except OSError:
-                pass
+                target = os.readlink(descriptor_path)
+                if reference_below(target):
+                    return True, False
+            except (FileNotFoundError, ProcessLookupError):
+                # Descriptor closure after listdir() releases that reference.
+                continue
+            except OSError as exc:
+                visibility_error(
+                    "read process descriptor",
+                    descriptor_path,
+                    exc,
+                )
+        return False, False
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        leader_root = "/proc/%s" % entry
+        busy, inert = scan_task_references(
+            entry,
+            pid,
+            leader_root,
+            lambda endpoint, error: missing_endpoint_is_inert(
+                entry,
+                endpoint,
+                error,
+            ),
+        )
+        if inert:
+            continue
+        if busy:
+            found.append(pid)
+            continue
+
+        initial = task_group_snapshot(entry)
+        if initial is None or initial["flags"] & 0x00200000:
+            continue
+
+        for task in initial["tasks"]:
+            if task == pid:
+                continue
+            task_root = "/proc/%s/task/%s" % (entry, task)
+            busy, _ = scan_task_references(
+                entry,
+                pid,
+                task_root,
+                lambda endpoint, error, task=task: (
+                    missing_task_endpoint_is_inert(
+                        entry,
+                        task,
+                        endpoint,
+                        error,
+                    )
+                ),
+            )
+            if busy:
+                found.append(pid)
+                break
+        if found and found[-1] == pid:
+            continue
+
+        final = task_group_snapshot(entry)
+        if final is None:
+            continue
+        if (
+            final["start_time"] != initial["start_time"]
+            or final["tasks"] != initial["tasks"]
+        ):
+            raise RamdiskError(
+                "incomplete process task snapshot /proc/%s/task changed while "
+                "it was inspected; managed cleanup requires complete /proc "
+                "visibility" % entry
+            )
     return sorted(set(found))
+
+
+def _fuser_failure(path, result):
+    detail = " ".join(
+        value.strip()
+        for value in (
+            getattr(result, "stdout", "") or "",
+            getattr(result, "stderr", "") or "",
+        )
+        if value.strip()
+    )
+    if len(detail) > 1000:
+        detail = detail[:997] + "..."
+    suffix = ": %s" % detail if detail else ""
+    return RamdiskError(
+        "trusted fuser could not inspect managed mount %s (exit %s)%s"
+        % (path, getattr(result, "returncode", "unknown"), suffix)
+    )
+
+
+def _parse_fuser_mount_references(path, result):
+    """Parse PSmisc fuser's intentionally split stdout/stderr contract."""
+    stdout = getattr(result, "stdout", "") or ""
+    stderr = getattr(result, "stderr", "") or ""
+    returncode = getattr(result, "returncode", None)
+    if returncode == 0:
+        tokens = stdout.split()
+        if not tokens or any(
+            re.fullmatch(r"[0-9]+", token) is None or int(token) <= 0
+            for token in tokens
+        ):
+            raise RamdiskError(
+                "trusted fuser returned an invalid PID list for %s" % path
+            )
+        # Without --verbose, PSmisc writes exactly the requested mount name
+        # followed by the per-PID access letters c/e/f/F/r/m to stderr. Match
+        # the exact path independently of its whitespace or regex syntax;
+        # arbitrary diagnostics would mean the scan may be incomplete.
+        annotation = re.fullmatch(
+            re.escape(path) + r":[ \tcefFrm]*(?:\r?\n)?",
+            stderr,
+        )
+        if stderr and annotation is None:
+            raise _fuser_failure(path, result)
+        return sorted(set(int(token) for token in tokens))
+    if returncode == 1 and not stdout.strip() and not stderr.strip():
+        return []
+    raise _fuser_failure(path, result)
+
+
+def _trusted_fuser_binary(trusted_system_binary):
+    """Resolve PSmisc fuser with install guidance for unprivileged cleanup."""
+    try:
+        return trusted_system_binary("fuser")
+    except RamdiskError as exc:
+        raise RamdiskError(
+            "unprivileged managed cleanup requires trusted PSmisc fuser: "
+            "%s; install the psmisc package and retry" % exc
+        ) from exc
+
+
+def _busy_mount_references(
+    path,
+    hardware=None,
+    *,
+    run=None,
+    trusted_system_binary=None,
+    privileged=None,
+):
+    """Return a complete busy set via root procfs or trusted privileged fuser."""
+    _require_linux()
+    path = os.path.normpath(os.path.abspath(os.fspath(path)))
+    if current_euid() == 0:
+        return _busy_mount_references_proc(path)
+    run = _run if run is None else run
+    trusted_system_binary = (
+        _trusted_system_binary
+        if trusted_system_binary is None
+        else trusted_system_binary
+    )
+    fuser = _trusted_fuser_binary(trusted_system_binary)
+    command = [fuser, "-mM", path]
+    if privileged is None:
+        command = _privileged(
+            command,
+            hardware,
+            trusted_system_binary=trusted_system_binary,
+        )
+    else:
+        command = privileged(command, hardware)
+    try:
+        result = run(command, timeout=10.0)
+    except Exception as exc:
+        raise RamdiskError(
+            "trusted fuser could not inspect managed mount %s: %s"
+            % (path, exc)
+        ) from exc
+    return _parse_fuser_mount_references(path, result)
+
+
+def _ensure_busy_mount_scan_available(
+    path,
+    hardware=None,
+    *,
+    trusted_system_binary=None,
+    run=None,
+):
+    """Prove cleanup discovery and unmount exist before mount mutation."""
+    del hardware
+    _require_linux()
+    trusted_system_binary = (
+        _trusted_system_binary
+        if trusted_system_binary is None
+        else trusted_system_binary
+    )
+    run = _run if run is None else run
+    if current_euid() == 0:
+        _busy_mount_references_proc(path)
+    else:
+        _trusted_fuser_binary(trusted_system_binary)
+        trusted_system_binary("sudo")
+    umount = trusted_system_binary("umount")
+    try:
+        help_result = run([umount, "--help"], timeout=5.0)
+    except Exception as exc:
+        raise RamdiskError(
+            "trusted umount helper could not be verified: %s; install the "
+            "util-linux package" % exc
+        ) from exc
+    help_output = "%s\n%s" % (
+        getattr(help_result, "stdout", "") or "",
+        getattr(help_result, "stderr", "") or "",
+    )
+    if (
+        getattr(help_result, "returncode", None) != 0
+        or "--no-canonicalize" not in help_output
+    ):
+        raise RamdiskError(
+            "trusted umount helper is incompatible: cleanup requires the "
+            "util-linux --no-canonicalize option"
+        )
 
 
 class LinuxPlatformOps:
@@ -571,6 +1149,16 @@ class LinuxPlatformOps:
 
     def __init__(self, platform_name="linux"):
         self.platform_name = platform_name
+
+    @property
+    def process_control_supported(self):
+        """Whether managed process groups can be identified and signalled."""
+        return (
+            callable(getattr(os, "getpgid", None))
+            and callable(getattr(os, "killpg", None))
+            and getattr(signal, "SIGTERM", None) is not None
+            and getattr(signal, "SIGKILL", None) is not None
+        )
 
     def capabilities(self):
         return {

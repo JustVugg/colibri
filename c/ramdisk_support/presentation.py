@@ -272,6 +272,51 @@ def _human_status(report):
                 process["reason"],
             )
         )
+    recovery = report.get("recovery")
+    if not isinstance(recovery, dict):
+        return
+    print(
+        "  recovery: %s / %s"
+        % (recovery.get("operation"), recovery.get("state"))
+    )
+    for path in recovery.get("retained_mounts", []):
+        print("    retained mount: %s" % path)
+    for path in recovery.get("released_mounts", []):
+        print("    released mount: %s" % path)
+    for process in recovery.get("retained_processes", []):
+        print(
+            "    retained PID %s: %s (%s)"
+            % (
+                process.get("pid"),
+                process.get("state_dir"),
+                process.get("error") or "absence unproven",
+            )
+        )
+    for pending in recovery.get("pending_launches", []):
+        print(
+            "    outcome-unknown launch node %s port %s: %s"
+            % (
+                pending.get("node"),
+                pending.get("port"),
+                pending.get("state_dir"),
+            )
+        )
+    errors = recovery.get("errors", {})
+    if isinstance(errors, dict):
+        for name, value in errors.items():
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        print(
+                            "    %s PID %s: %s"
+                            % (name, item.get("pid"), item.get("error"))
+                        )
+                    else:
+                        print("    %s: %s" % (name, item))
+            else:
+                print("    %s: %s" % (name, value))
+    if recovery.get("action"):
+        print("    action: %s" % recovery["action"])
 
 
 def _human_benchmark(result):
@@ -1383,7 +1428,7 @@ def _tui_idle_action_hint(screen, plan, report):
     if policy.start.enabled:
         return "[s] start  [d] destroy"
     if policy.stop.enabled:
-        return "[x] stop  [d] destroy"
+        return "[x] stop"
     if policy.destroy.enabled:
         return "[d] destroy"
     return "[R] refresh"

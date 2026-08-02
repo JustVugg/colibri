@@ -7,6 +7,15 @@ else:
 
 
 class TuiPlacementContractTest(unittest.TestCase):
+    def setUp(self):
+        for name, value in (
+            ("_ensure_busy_mount_scan_available", None),
+            ("_busy_mount_references", []),
+        ):
+            patcher = mock.patch.object(ramdisk, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_error_footer_advertises_the_available_recovery_actions(self):
         plan = {
             "mounts": [{"path": "/mnt/colibri-test", "node": None}],
@@ -16,14 +25,88 @@ class TuiPlacementContractTest(unittest.TestCase):
         destroy_only = ramdisk._tui_idle_action_hint(
             0, plan, {"present": True, "state": "error", "processes": []}
         )
-        stop_then_destroy = ramdisk._tui_idle_action_hint(
+        stop_only = ramdisk._tui_idle_action_hint(
             0,
             plan,
             {"present": True, "state": "error", "processes": [{"pid": 123}]},
         )
+        retained_stop_only = ramdisk._tui_idle_action_hint(
+            0,
+            plan,
+            {
+                "present": True,
+                "state": "error",
+                "processes": [],
+                "recovery": {"retained_processes": [{"pgid": 123}]},
+            },
+        )
+        outcome_unknown = ramdisk._tui_idle_action_hint(
+            0,
+            plan,
+            {
+                "present": True,
+                "state": "error",
+                "processes": [],
+                "recovery": {
+                    "pending_launches": [{"state": "outcome-unknown"}]
+                },
+            },
+        )
 
         self.assertEqual(destroy_only, "[d] destroy")
-        self.assertEqual(stop_then_destroy, "[x] stop  [d] destroy")
+        self.assertEqual(stop_only, "[x] stop")
+        self.assertEqual(retained_stop_only, "[x] stop")
+        self.assertEqual(outcome_unknown, "[R] refresh")
+
+    def test_human_status_renders_only_sanitized_recovery_fields(self):
+        secret_nonce = "a" * 48
+        secret_merge_id = "b" * 32
+        report = {
+            "present": True,
+            "state": "error",
+            "mounts": [],
+            "processes": [],
+            "recovery": {
+                "operation": "start",
+                "state": "attention-required",
+                "retained_mounts": ["/mnt/colibri-test"],
+                "released_mounts": [],
+                "retained_processes": [
+                    {
+                        "pid": 15001,
+                        "state_dir": "/state/retained",
+                        "error": "absence unproven",
+                    }
+                ],
+                "pending_launches": [
+                    {
+                        "node": None,
+                        "port": 8000,
+                        "state_dir": "/state/pending",
+                        # Unknown/private keys must never be rendered.
+                        "nonce": secret_nonce,
+                        "usage_merge_id": secret_merge_id,
+                    }
+                ],
+                "errors": {"launch_error": "readiness failed"},
+                "action": "Inspect and reconcile before retrying.",
+            },
+        }
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            ramdisk._human_status(report)
+
+        rendered = output.getvalue()
+        self.assertIn("recovery: start / attention-required", rendered)
+        self.assertIn("retained mount: /mnt/colibri-test", rendered)
+        self.assertIn("retained PID 15001", rendered)
+        self.assertIn("outcome-unknown launch node None port 8000", rendered)
+        self.assertIn("readiness failed", rendered)
+        self.assertIn("action: Inspect and reconcile", rendered)
+        self.assertNotIn(secret_nonce, rendered)
+        self.assertNotIn(secret_merge_id, rendered)
+        self.assertNotIn("usage_merge_id", rendered)
 
     def test_four_node_default_is_one_shared_model_and_one_engine(self):
         with ModelFixture() as fixture:
@@ -364,6 +447,7 @@ class TuiPlacementContractTest(unittest.TestCase):
                     )
         mount.assert_not_called()
 
+    @requires_linux_operational
     def test_cancelled_prepare_does_not_hide_rollback_failure(self):
         cancel = threading.Event()
         with ModelFixture() as fixture:
@@ -386,7 +470,9 @@ class TuiPlacementContractTest(unittest.TestCase):
         ), mock.patch.object(ramdisk, "build_plan", return_value=plan), mock.patch.object(
             ramdisk, "_save_manifest"
         ), mock.patch.object(
-            ramdisk, "_mount_at", side_effect=[None, actual, actual]
+            ramdisk,
+            "_mount_at",
+            side_effect=[None, actual, actual, actual, actual, actual],
         ), mock.patch.object(ramdisk, "_mount_tmpfs"), mock.patch.object(
             ramdisk, "_validate_mount", return_value=actual
         ), mock.patch.object(ramdisk, "_populate_mount", side_effect=cancel_copy), mock.patch.object(
@@ -403,6 +489,7 @@ class TuiPlacementContractTest(unittest.TestCase):
         self.assertIn("rollback/reporting errors", str(raised.exception))
         self.assertIn("sudo ticket expired", str(raised.exception))
 
+    @requires_linux_operational
     def test_clean_prepare_cancellation_removes_recovery_manifest(self):
         cancel = threading.Event()
         with ModelFixture() as fixture:
@@ -425,7 +512,17 @@ class TuiPlacementContractTest(unittest.TestCase):
         ), mock.patch.object(ramdisk, "build_plan", return_value=plan), mock.patch.object(
             ramdisk, "_save_manifest"
         ), mock.patch.object(
-            ramdisk, "_mount_at", side_effect=[None, actual, actual]
+            ramdisk,
+            "_mount_at",
+            side_effect=[
+                None,
+                actual,
+                actual,
+                actual,
+                actual,
+                actual,
+                None,
+            ],
         ), mock.patch.object(ramdisk, "_mount_tmpfs"), mock.patch.object(
             ramdisk, "_validate_mount", return_value=actual
         ), mock.patch.object(ramdisk, "_populate_mount", side_effect=cancel_copy), mock.patch.object(
@@ -543,19 +640,33 @@ class TuiPlacementContractTest(unittest.TestCase):
         }
         self.addCleanup(setattr, ramdisk, "_tui_worker", None)
 
+        stderr = io.StringIO()
         with mock.patch.dict(
             os.environ, {"COLI_RAMDISK_UI": "curses"}
-        ), mock.patch("curses.wrapper", side_effect=interface_error):
+        ), mock.patch(
+            "curses.wrapper", side_effect=interface_error
+        ), contextlib.redirect_stderr(stderr):
             with self.assertRaisesRegex(
                 ramdisk.RamdiskError,
                 "interface failed while active operation cleanup also failed",
             ) as caught:
-                ramdisk.launch_tui(argparse.Namespace())
+                ramdisk.launch_tui(
+                    argparse.Namespace(), system="linux"
+                )
 
         self.assertIs(caught.exception.__cause__, interface_error)
         cancel_event.set.assert_called_once_with()
         worker_thread.join.assert_called_once_with()
         self.assertIsNone(ramdisk._tui_worker)
+        diagnostics = stderr.getvalue()
+        self.assertIn(
+            "interface exited; waiting for active cleanup",
+            diagnostics,
+        )
+        self.assertIn(
+            "active operation/cleanup also failed: rollback failed",
+            diagnostics,
+        )
 
     def test_minimum_width_settings_input_uses_a_full_entry_row(self):
         import curses

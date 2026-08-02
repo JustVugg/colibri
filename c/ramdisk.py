@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import copy
 import functools
+import importlib
 import json
 import math
 import os
@@ -22,8 +23,6 @@ import socket
 import subprocess
 import sys
 import threading
-import urllib.error
-import urllib.request
 from ramdisk_support.common import (
     BENCHMARK_SCHEMA,
     DEFAULT_MOUNT_ROOT,
@@ -47,16 +46,6 @@ from ramdisk_support.common import (
     _raise_if_cancelled,
     _utc_now,
 )
-from ramdisk_support.curses_ui import (
-    _TUI_SCREENS,
-    _TuiTerminationSignal,
-    _curses_termination_guard,
-    _join_tui_worker,
-    _run_tui_frontend as _curses_run_tui_frontend,
-    _tui as _curses_tui,
-    _tui_review_scroll,
-    _tui_wrap_rows,
-)
 from ramdisk_support.cli import (
     _add_lifecycle_options as _cli_add_lifecycle_options,
     _cli_exit_after_signal,
@@ -68,19 +57,6 @@ from ramdisk_support.cli import (
     configure_parser as _cli_configure_parser,
     dispatch as _cli_dispatch,
     launch_tui as _cli_launch_tui,
-)
-from ramdisk_support.benchmark import (
-    BENCHMARK_PROMPT,
-    _aggregate_score as _benchmark_aggregate_score,
-    _benchmark_environment as _benchmark_make_environment,
-    _benchmark_generate as _benchmark_generate_turn,
-    _cancellable_engine_type as _benchmark_cancellable_engine_type,
-    _normalized_runtime_knobs as _benchmark_normalized_runtime_knobs,
-    _parse_profiler as _benchmark_parse_profiler,
-    _score_variant as _benchmark_score_variant,
-    _source_build_identity as _benchmark_source_build_identity,
-    _system_score as _benchmark_system_score,
-    run_benchmark as _run_benchmark,
 )
 from ramdisk_support.accelerator import (
     ACCELERATOR_ENVIRONMENT_KEYS,
@@ -108,6 +84,7 @@ from ramdisk_support.discovery import (
     discover_hardware as _discover_hardware,
 )
 from ramdisk_support.linux_ops import (
+    _ensure_busy_mount_scan_available as _linux_ensure_busy_mount_scan_available,
     _filesystem_for_path as _linux_filesystem_for_path,
     _fresh_user_binary,
     _kernel_at_least,
@@ -195,47 +172,11 @@ from ramdisk_support.presets import (
     mark_preset_custom,
     resolve_preset as _resolve_preset,
 )
-from ramdisk_support.presentation import (
-    _human_benchmark as _presentation_human_benchmark,
-    _human_plan as _presentation_human_plan,
-    _human_status as _presentation_human_status,
-    _manifest_confirmation_token as _presentation_manifest_confirmation_token,
-    _placement_summary as _presentation_placement_summary,
-    _plan_confirmation_token as _presentation_plan_confirmation_token,
-    _prepare_confirmation as _presentation_prepare_confirmation,
-    _prepare_confirmation_rows as _presentation_prepare_confirmation_rows,
-    _tui_activity_rows as _presentation_tui_activity_rows,
-    _tui_benchmark_rows as _presentation_tui_benchmark_rows,
-    _tui_hardware_rows as _presentation_tui_hardware_rows,
-    _tui_help_rows as _presentation_tui_help_rows,
-    _tui_idle_action_hint as _presentation_tui_idle_action_hint,
-    _tui_plan_rows as _presentation_tui_plan_rows,
-    _tui_preset_rows as _presentation_tui_preset_rows,
-    _tui_settings_rows as _presentation_tui_settings_rows,
+from ramdisk_support.platform_ops import (
+    UNSUPPORTED_PLATFORM_REASON,
+    current_euid,
+    get_platform_ops,
 )
-from ramdisk_support.processes import (
-    _admit_concurrent_runtimes as _processes_admit_concurrent_runtimes,
-    _admit_runtime as _processes_admit_runtime,
-    _assert_effective_masks_unchanged as _processes_assert_effective_masks_unchanged,
-    _forget_managed_child,
-    _group_alive,
-    _managed_children,
-    _managed_children_lock,
-    _managed_process_metrics as _processes_managed_process_metrics,
-    _poll_managed_child,
-    _proc_identity,
-    _process_group_members as _processes_process_group_members,
-    _process_matches as _processes_process_matches,
-    _process_tree_alive as _processes_process_tree_alive,
-    _resolve_engine_path,
-    _runtime_admission_requirement,
-    _terminate_direct_child,
-    _terminate_group as _processes_terminate_group,
-    _terminate_verified_group as _processes_terminate_verified_group,
-    _track_managed_child,
-    _wait_managed_ready as _processes_wait_managed_ready,
-)
-from ramdisk_support.platform_ops import current_euid, get_platform_ops
 from ramdisk_support.state import (
     _assert_canonical_usage_target as _state_assert_canonical_usage_target,
     _assert_durable_state_dir as _state_assert_durable_state_dir,
@@ -261,10 +202,120 @@ from ramdisk_support.state import (
 )
 
 
-def _exclusive_lifecycle(function):
+def _benchmark_module():
+    return importlib.import_module("ramdisk_support.benchmark")
+
+
+def _urllib_module():
+    # Importing urllib.request initializes ssl and the HTTP stack.  Keep that
+    # work behind the historical ``ramdisk.urllib.request`` compatibility seam
+    # instead of imposing it on every control-plane import.
+    importlib.import_module("urllib.request")
+    return importlib.import_module("urllib")
+
+
+def _curses_ui_module():
+    return importlib.import_module("ramdisk_support.curses_ui")
+
+
+def _presentation_module():
+    return importlib.import_module("ramdisk_support.presentation")
+
+
+def _processes_module():
+    return importlib.import_module("ramdisk_support.processes")
+
+
+_LAZY_ATTRIBUTES = {
+    "BENCHMARK_PROMPT": (_benchmark_module, "BENCHMARK_PROMPT"),
+    "urllib": (_urllib_module, None),
+    "_TUI_SCREENS": (_curses_ui_module, "_TUI_SCREENS"),
+    "_TuiTerminationSignal": (
+        _curses_ui_module,
+        "_TuiTerminationSignal",
+    ),
+    "_managed_children": (_processes_module, "_managed_children"),
+    "_managed_children_lock": (
+        _processes_module,
+        "_managed_children_lock",
+    ),
+    "_runtime_admission_requirement": (
+        _processes_module,
+        "_runtime_admission_requirement",
+    ),
+}
+
+
+def __getattr__(name):
+    try:
+        loader, attribute = _LAZY_ATTRIBUTES[name]
+    except KeyError:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    loaded = loader()
+    value = loaded if attribute is None else getattr(loaded, attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_ATTRIBUTES))
+
+
+def _proc_identity(pid, *, ops=None):
+    if ops is not None:
+        return ops.process_identity(pid)
+    return _processes_module()._proc_identity(pid)
+
+
+def _group_alive(pgid, *, ops=None):
+    if ops is not None:
+        return ops.process_group_alive(pgid)
+    return _processes_module()._group_alive(pgid)
+
+
+def _poll_managed_child(pid):
+    return _processes_module()._poll_managed_child(pid)
+
+
+def _managed_child_liveness(pid):
+    return _processes_module()._managed_child_liveness(pid)
+
+
+def _track_managed_child(process):
+    return _processes_module()._track_managed_child(process)
+
+
+def _forget_managed_child(pid):
+    return _processes_module()._forget_managed_child(pid)
+
+
+def _terminate_direct_child(*args, **kwargs):
+    return _processes_module()._terminate_direct_child(*args, **kwargs)
+
+
+def _resolve_engine_path(*args, **kwargs):
+    return _processes_module()._resolve_engine_path(*args, **kwargs)
+
+
+def _exclusive_lifecycle(function=None, *, require_process_control=False):
     """Keep decorated facade calls patchable while state owns the lock."""
+    if function is None:
+        return functools.partial(
+            _exclusive_lifecycle,
+            require_process_control=require_process_control,
+        )
+
     @functools.wraps(function)
     def wrapped(*args, **kwargs):
+        ops = get_platform_ops()
+        if not getattr(ops, "is_linux", False):
+            raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+        if require_process_control and not getattr(
+            ops,
+            "process_control_supported",
+            False,
+        ):
+            raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
         with _lifecycle_lock():
             return function(*args, **kwargs)
 
@@ -390,7 +441,7 @@ def _json_print(value):
 
 
 def _human_plan(plan):
-    return _presentation_human_plan(plan)
+    return _presentation_module()._human_plan(plan)
 
 
 def _mount_at(path):
@@ -604,20 +655,26 @@ def prepare(
         populate_mount=_populate_mount,
         validate_namespace=_validate_namespace,
         source_still_matches=_source_still_matches,
+        ensure_busy_mount_scan_available=(
+            _ensure_busy_mount_scan_available
+        ),
         durable_unlink=_durable_unlink,
         manifest_path=_manifest_path,
+        mount_table=_mount_table,
+        path_is_below=_path_is_below,
+        busy_mount_references=_busy_mount_references,
     )
 
 
 def _process_group_members(pgid):
-    return _processes_process_group_members(
+    return _processes_module()._process_group_members(
         pgid,
         proc_identity=_proc_identity,
     )
 
 
 def _process_matches(record):
-    return _processes_process_matches(
+    return _processes_module()._process_matches(
         record,
         proc_identity=_proc_identity,
         process_group_members=_process_group_members,
@@ -625,7 +682,7 @@ def _process_matches(record):
 
 
 def _process_tree_alive(record, actual):
-    return _processes_process_tree_alive(
+    return _processes_module()._process_tree_alive(
         record,
         actual,
         group_alive=_group_alive,
@@ -672,7 +729,7 @@ def _assert_ready_mounts(manifest):
 
 
 def _admit_runtime(plan, mount, benchmark=False):
-    return _processes_admit_runtime(
+    return _processes_module()._admit_runtime(
         plan,
         mount,
         benchmark=benchmark,
@@ -681,7 +738,7 @@ def _admit_runtime(plan, mount, benchmark=False):
 
 
 def _admit_concurrent_runtimes(plan, mounts, benchmark=False):
-    return _processes_admit_concurrent_runtimes(
+    return _processes_module()._admit_concurrent_runtimes(
         plan,
         mounts,
         benchmark=benchmark,
@@ -691,14 +748,14 @@ def _admit_concurrent_runtimes(plan, mounts, benchmark=False):
 
 
 def _assert_effective_masks_unchanged(plan):
-    return _processes_assert_effective_masks_unchanged(
+    return _processes_module()._assert_effective_masks_unchanged(
         plan,
         discover_hardware=discover_hardware,
     )
 
 
 def _terminate_group(pgid, term_seconds=10.0, kill_seconds=3.0):
-    return _processes_terminate_group(
+    return _processes_module()._terminate_group(
         pgid,
         term_seconds=term_seconds,
         kill_seconds=kill_seconds,
@@ -707,27 +764,36 @@ def _terminate_group(pgid, term_seconds=10.0, kill_seconds=3.0):
 
 
 def _terminate_verified_group(record, term_seconds=10.0, kill_seconds=3.0):
-    return _processes_terminate_verified_group(
+    return _processes_module()._terminate_verified_group(
         record,
         term_seconds=term_seconds,
         kill_seconds=kill_seconds,
-        poll_managed_child=_poll_managed_child,
+        managed_child_liveness=_managed_child_liveness,
         process_matches=_process_matches,
     )
 
 
-def _wait_managed_ready(record, timeout, api_key=None, cancel_event=None):
-    return _processes_wait_managed_ready(
+def _wait_managed_ready(
+    record,
+    timeout,
+    api_key=None,
+    cancel_event=None,
+    *,
+    urlopen=None,
+):
+    if urlopen is None:
+        urlopen = _urllib_module().request.urlopen
+    return _processes_module()._wait_managed_ready(
         record,
         timeout,
         api_key=api_key,
         cancel_event=cancel_event,
         process_matches=_process_matches,
-        urlopen=urllib.request.urlopen,
+        urlopen=urlopen,
     )
 
 
-@_exclusive_lifecycle
+@_exclusive_lifecycle(require_process_control=True)
 def start(args, cli_path=None, engine_path=None, cancel_event=None):
     return _lifecycle_start(
         args,
@@ -739,6 +805,8 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
         assert_effective_masks_unchanged=_assert_effective_masks_unchanged,
         assert_ready_mounts=_assert_ready_mounts,
         process_matches=_process_matches,
+        group_alive=_group_alive,
+        managed_child_liveness=_managed_child_liveness,
         save_manifest=_save_manifest,
         merge_usage=_merge_usage,
         persisted_base_port=_persisted_base_port,
@@ -768,32 +836,47 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
     )
 
 
-@_exclusive_lifecycle
+@_exclusive_lifecycle(require_process_control=True)
 def stop(args=None):
     return _lifecycle_stop(
         args,
         load_manifest=_load_manifest,
         process_matches=_process_matches,
+        group_alive=_group_alive,
+        managed_child_liveness=_managed_child_liveness,
         save_manifest=_save_manifest,
         terminate_verified_group=_terminate_verified_group,
         merge_usage=_merge_usage,
     )
 
 
-def _busy_mount_references(path):
-    return _mounts_busy_mount_references(path)
+def _busy_mount_references(path, *, ops=None, hardware=None):
+    return _mounts_busy_mount_references(
+        path,
+        ops=ops,
+        hardware=hardware,
+    )
+
+
+def _ensure_busy_mount_scan_available(path, hardware=None):
+    return _linux_ensure_busy_mount_scan_available(
+        path,
+        hardware,
+        trusted_system_binary=_trusted_system_binary,
+    )
 
 
 def _managed_path(path, mount_root):
     return _lifecycle_managed_path(path, mount_root)
 
 
-@_exclusive_lifecycle
+@_exclusive_lifecycle(require_process_control=True)
 def destroy(args, expected_manifest_token=None):
     return _lifecycle_destroy(
         args,
         expected_manifest_token=expected_manifest_token,
         load_manifest=_load_manifest,
+        save_manifest=_save_manifest,
         manifest_confirmation_token=_manifest_confirmation_token,
         confirm=_confirm,
         stop_action=stop,
@@ -826,11 +909,12 @@ def status(deep=True):
         validate_mount=_validate_mount,
         validate_namespace=_validate_namespace,
         process_matches=_process_matches,
+        managed_child_liveness=_managed_child_liveness,
     )
 
 
 def _source_build_identity():
-    return _benchmark_source_build_identity(
+    return _benchmark_module()._source_build_identity(
         __file__,
         environ=os.environ,
         which=shutil.which,
@@ -839,7 +923,7 @@ def _source_build_identity():
 
 
 def _parse_profiler(text, elapsed):
-    return _benchmark_parse_profiler(text, elapsed)
+    return _benchmark_module()._parse_profiler(text, elapsed)
 
 
 def _node_core_count(plan, node=None):
@@ -871,7 +955,7 @@ def _managed_numa_enabled(plan, node=None):
 
 
 def _normalized_runtime_knobs(plan, knobs, node=None):
-    return _benchmark_normalized_runtime_knobs(
+    return _benchmark_module()._normalized_runtime_knobs(
         plan,
         knobs,
         node=node,
@@ -880,7 +964,7 @@ def _normalized_runtime_knobs(plan, knobs, node=None):
 
 
 def _benchmark_environment(manifest, weights_dir, state_dir, rammap, node=None, knobs=None):
-    return _benchmark_make_environment(
+    return _benchmark_module()._benchmark_environment(
         manifest,
         weights_dir,
         state_dir,
@@ -905,7 +989,7 @@ def _cancellable_engine_type(
     ready_marker,
     cancel_event,
 ):
-    return _benchmark_cancellable_engine_type(
+    return _benchmark_module()._cancellable_engine_type(
         engine_type,
         read_engine_turn,
         ready_marker,
@@ -920,7 +1004,7 @@ def _benchmark_generate(
     cancel_event,
     client_cancelled_type,
 ):
-    return _benchmark_generate_turn(
+    return _benchmark_module()._benchmark_generate(
         engine,
         prompt,
         on_text,
@@ -938,7 +1022,7 @@ def _score_variant(
     knobs,
     cancel_event=None,
 ):
-    return _benchmark_score_variant(
+    return _benchmark_module()._score_variant(
         engine_path,
         manifest,
         name,
@@ -959,7 +1043,7 @@ def _score_variant(
 
 
 def _aggregate_score(manifest, engine_path=None, knobs=None, cancel_event=None):
-    return _benchmark_aggregate_score(
+    return _benchmark_module()._aggregate_score(
         manifest,
         engine_path=engine_path,
         knobs=knobs,
@@ -978,7 +1062,7 @@ def _aggregate_score(manifest, engine_path=None, knobs=None, cancel_event=None):
 
 
 def _system_score(manifest, variants, swap_before, swap_after, aggregate=None):
-    return _benchmark_system_score(
+    return _benchmark_module()._system_score(
         manifest,
         variants,
         swap_before,
@@ -989,10 +1073,10 @@ def _system_score(manifest, variants, swap_before, swap_after, aggregate=None):
     )
 
 
-@_exclusive_lifecycle
+@_exclusive_lifecycle(require_process_control=True)
 def benchmark(args, cli_path=None, engine_path=None, cancel_event=None):
     cli_path = cli_path or os.path.join(os.path.dirname(__file__), "coli")
-    return _run_benchmark(
+    return _benchmark_module().run_benchmark(
         args,
         cli_path,
         engine_path=engine_path,
@@ -1017,15 +1101,15 @@ def benchmark(args, cli_path=None, engine_path=None, cancel_event=None):
 
 
 def _human_status(report):
-    return _presentation_human_status(report)
+    return _presentation_module()._human_status(report)
 
 
 def _human_benchmark(result):
-    return _presentation_human_benchmark(result)
+    return _presentation_module()._human_benchmark(result)
 
 
 def _managed_process_metrics(record):
-    return _processes_managed_process_metrics(
+    return _processes_module()._managed_process_metrics(
         record,
         process_matches=_process_matches,
         process_group_members=_process_group_members,
@@ -1049,32 +1133,32 @@ def _persisted_base_port(manifest):
 
 
 def _placement_summary(plan, base_port=8000):
-    return _presentation_placement_summary(
+    return _presentation_module()._placement_summary(
         plan,
         base_port=base_port,
     )
 
 
 def _plan_confirmation_token(plan):
-    return _presentation_plan_confirmation_token(plan)
+    return _presentation_module()._plan_confirmation_token(plan)
 
 
 def _manifest_confirmation_token(manifest):
-    return _presentation_manifest_confirmation_token(
+    return _presentation_module()._manifest_confirmation_token(
         manifest,
         persisted_base_port=_persisted_base_port,
     )
 
 
 def _prepare_confirmation(plan, base_port=8000):
-    return _presentation_prepare_confirmation(
+    return _presentation_module()._prepare_confirmation(
         plan,
         base_port=base_port,
     )
 
 
 def _prepare_confirmation_rows(plan, base_port=8000):
-    return _presentation_prepare_confirmation_rows(
+    return _presentation_module()._prepare_confirmation_rows(
         plan,
         base_port=base_port,
     )
@@ -1106,7 +1190,7 @@ _tui_worker = None
 
 
 def _tui_plan_rows(plan, report, active=False, base_port=8000, confirmation=None):
-    return _presentation_tui_plan_rows(
+    return _presentation_module()._tui_plan_rows(
         plan,
         report,
         active=active,
@@ -1116,15 +1200,15 @@ def _tui_plan_rows(plan, report, active=False, base_port=8000, confirmation=None
 
 
 def _tui_preset_rows():
-    return _presentation_tui_preset_rows()
+    return _presentation_module()._tui_preset_rows()
 
 
 def _tui_hardware_rows(hardware):
-    return _presentation_tui_hardware_rows(hardware)
+    return _presentation_module()._tui_hardware_rows(hardware)
 
 
 def _tui_activity_rows(report, hardware, process_metrics=None):
-    return _presentation_tui_activity_rows(
+    return _presentation_module()._tui_activity_rows(
         report,
         hardware,
         process_metrics=process_metrics,
@@ -1133,11 +1217,11 @@ def _tui_activity_rows(report, hardware, process_metrics=None):
 
 
 def _tui_benchmark_rows(history):
-    return _presentation_tui_benchmark_rows(history)
+    return _presentation_module()._tui_benchmark_rows(history)
 
 
 def _tui_settings_rows(args, plan, report, base_port=8000):
-    return _presentation_tui_settings_rows(
+    return _presentation_module()._tui_settings_rows(
         args,
         plan,
         report,
@@ -1146,11 +1230,11 @@ def _tui_settings_rows(args, plan, report, base_port=8000):
 
 
 def _tui_help_rows():
-    return _presentation_tui_help_rows()
+    return _presentation_module()._tui_help_rows()
 
 
 def _tui_idle_action_hint(screen, plan, report):
-    return _presentation_tui_idle_action_hint(
+    return _presentation_module()._tui_idle_action_hint(
         screen,
         plan,
         report,
@@ -1158,7 +1242,7 @@ def _tui_idle_action_hint(screen, plan, report):
 
 
 def _tui(stdscr, initial, cli_path, engine_path):
-    return _curses_tui(
+    return _curses_ui_module()._tui(
         stdscr,
         initial,
         cli_path,
@@ -1176,10 +1260,31 @@ def _textual_dependency_missing(error):
 
 
 def _run_tui_frontend(callback):
-    return _curses_run_tui_frontend(
+    return _curses_ui_module()._run_tui_frontend(
         callback,
         bindings=sys.modules[__name__],
     )
+
+
+def _tui_review_scroll(pending_action, requested_scroll):
+    return _curses_ui_module()._tui_review_scroll(
+        pending_action,
+        requested_scroll,
+    )
+
+
+def _tui_wrap_rows(rows, width):
+    return _curses_ui_module()._tui_wrap_rows(rows, width)
+
+
+@contextlib.contextmanager
+def _curses_termination_guard():
+    with _curses_ui_module()._curses_termination_guard():
+        yield
+
+
+def _join_tui_worker(active):
+    return _curses_ui_module()._join_tui_worker(active)
 
 
 def launch_tui(args, cli_path=None, engine_path=None, system=None):
@@ -1198,7 +1303,7 @@ def launch_tui(args, cli_path=None, engine_path=None, system=None):
         args,
         cli_path=cli_path,
         engine_path=engine_path,
-        system=system,
+        target_platform=system,
         lifecycle=sys.modules[__name__],
         run_tui_frontend=_run_tui_frontend,
         legacy_tui=_tui,
@@ -1206,6 +1311,12 @@ def launch_tui(args, cli_path=None, engine_path=None, system=None):
         finish_frontend=finish_frontend,
         load_textual_frontend=_load_textual_frontend,
     )
+
+
+__all__ = sorted(
+    set(name for name in globals() if not name.startswith("_"))
+    | set(name for name in _LAZY_ATTRIBUTES if not name.startswith("_"))
+)
 
 
 if __name__ == "__main__":

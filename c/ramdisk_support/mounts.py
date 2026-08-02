@@ -38,10 +38,10 @@ from .platform_ops import (
 )
 
 
-def _busy_mount_references(path, *, ops=None):
+def _busy_mount_references(path, *, ops=None, hardware=None):
     """Return processes that keep a managed mount busy."""
     ops = get_platform_ops() if ops is None else ops
-    return ops.busy_mount_references(path)
+    return ops.busy_mount_references(path, hardware=hardware)
 
 
 def _reusable_empty_mountpoint(path):
@@ -97,11 +97,10 @@ def _mount_tmpfs(
     )
     run = _run if run is None else run
     privileged = _privileged if privileged is None else privileged
-    rollback_interrupted_mount = (
-        _rollback_interrupted_mount
-        if rollback_interrupted_mount is None
-        else rollback_interrupted_mount
-    )
+    # ``rollback_interrupted_mount`` remains in the private compatibility
+    # signature while the facade is reconstructed, but it must never run here.
+    # The lifecycle persists pending ownership before invoking this helper and
+    # is the only layer that can make a durable, exact-identity cleanup choice.
     mount_bin = trusted_system_binary("mount")
     attempts = []
     thp = plan["mount_options"]["thp"]
@@ -134,17 +133,7 @@ def _mount_tmpfs(
             "tmpfs",
             mount["path"],
         ]
-        try:
-            result = run(privileged(command, hardware))
-        except BaseException as interrupted:
-            rollback_interrupted_mount(
-                plan,
-                mount,
-                try_thp,
-                try_noswap,
-                interrupted,
-            )
-            raise
+        result = run(privileged(command, hardware))
         if result.returncode == 0:
             mount["effective_thp"] = try_thp
             mount["effective_noswap"] = try_noswap
@@ -187,7 +176,16 @@ def _umount_path(
     run = _run if run is None else run
     privileged = _privileged if privileged is None else privileged
     umount = trusted_system_binary("umount")
-    result = run(privileged([umount, "--", path], hardware))
+    # Lifecycle mutations are serialized and CAP_SYS_ADMIN is delegated only
+    # to this trusted util-linux helper. Avoid its userspace canonicalization
+    # pass so the latest identity checks and the kernel pathname lookup are as
+    # close together as the path-based API permits.
+    result = run(
+        privileged(
+            [umount, "--no-canonicalize", "--", path],
+            hardware,
+        )
+    )
     if result.returncode:
         message = (
             result.stderr.strip()
@@ -208,36 +206,14 @@ def _rollback_interrupted_mount(
     validate_mount=None,
     umount_path=None,
 ):
-    """Remove a mount that completed just as its helper was interrupted."""
-    mount_at = _mount_at if mount_at is None else mount_at
-    validate_mount = (
-        _validate_mount
-        if validate_mount is None
-        else validate_mount
-    )
-    umount_path = _umount_path if umount_path is None else umount_path
-    actual = mount_at(mount["path"])
-    if actual is None:
-        return
-    attempted = dict(mount)
-    attempted["effective_thp"] = effective_thp
-    attempted["effective_noswap"] = effective_noswap
-    try:
-        validate_mount(attempted, plan)
-    except Exception as verification_error:
-        raise RamdiskError(
-            "mount helper was interrupted and a mount now exists at %s, "
-            "but it cannot be attributed safely: %s"
-            % (mount["path"], verification_error)
-        ) from cause
-    try:
-        umount_path(mount["path"], plan["hardware"])
-    except Exception as cleanup_error:
-        raise RamdiskError(
-            "mount helper was interrupted after tmpfs appeared at %s; "
-            "immediate rollback failed: %s"
-            % (mount["path"], cleanup_error)
-        ) from cause
+    """Compatibility shim that never performs pathname-only rollback.
+
+    Interrupted mount helpers are recovered only by the durable lifecycle's
+    pending/identified ownership state machine. Propagate the original event
+    without inspecting, validating, or unmounting whatever now occupies the
+    pathname.
+    """
+    raise cause
 
 
 def _option_present(options, name):
@@ -407,11 +383,12 @@ def _available_for_mount(
 
 
 def _copy_stream(src, tmp, expected_size, cancel_event=None):
-    source_fd = os.open(src, os.O_RDONLY)
+    binary_flag = getattr(os, "O_BINARY", 0)
+    source_fd = os.open(src, os.O_RDONLY | binary_flag)
     try:
         destination_fd = os.open(
             tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary_flag,
             0o400,
         )
         try:

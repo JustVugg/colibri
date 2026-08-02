@@ -40,6 +40,17 @@ _lifecycle_local = threading.local()
 _fallback_usage_lock = threading.RLock()
 
 
+def _valid_usage_snapshot(value):
+    return isinstance(value, dict) and all(
+        isinstance(key, str)
+        and re.fullmatch(r"(?:-1:1|-2:1|\d+:\d+)", key)
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+        for key, count in value.items()
+    )
+
+
 def _state_root():
     base = os.environ.get("XDG_STATE_HOME")
     if not base:
@@ -346,6 +357,7 @@ def _load_manifest(
     if len(planned_paths) != len(plan["mounts"]):
         raise RamdiskError("RAM-disk manifest has invalid planned mount paths")
     mount_by_path = {record["path"]: record for record in plan["mounts"]}
+    mount_ownership = {}
     for record in mounts:
         if (
             not isinstance(record, dict)
@@ -364,14 +376,34 @@ def _load_manifest(
                 "RAM-disk manifest mount has the wrong NUMA node"
             )
         identity = record.get("identity")
-        if (
-            not isinstance(identity, dict)
-            or not _positive_int(identity.get("mount_id"))
-            or not isinstance(identity.get("device"), str)
-        ):
+        identity_is_exact = (
+            isinstance(identity, dict)
+            and _positive_int(identity.get("mount_id"))
+            and isinstance(identity.get("device"), str)
+            and bool(identity["device"])
+        )
+        ownership = record.get("ownership")
+        if ownership is None and identity_is_exact:
+            # Manifests written before ownership transitions were explicit
+            # contain only exact identities and are managed by definition.
+            ownership = "managed"
+        if ownership not in ("pending", "identified", "managed"):
+            raise RamdiskError(
+                "RAM-disk manifest mount has an invalid ownership state"
+            )
+        if ownership == "pending" and identity is not None:
+            raise RamdiskError(
+                "RAM-disk pending mount unexpectedly has an identity"
+            )
+        if ownership != "pending" and not identity_is_exact:
             raise RamdiskError(
                 "RAM-disk manifest mount is missing its identity"
             )
+        if record["path"] in mount_ownership:
+            raise RamdiskError(
+                "RAM-disk manifest contains duplicate mount records"
+            )
+        mount_ownership[record["path"]] = ownership
     state = manifest.get("state")
     if state not in (
         "preparing",
@@ -382,7 +414,108 @@ def _load_manifest(
         "error",
     ):
         raise RamdiskError("RAM-disk manifest has an invalid lifecycle state")
+    recovery = manifest.get("recovery")
+    if recovery is not None and not isinstance(recovery, dict):
+        raise RamdiskError("RAM-disk manifest has invalid recovery metadata")
+    retained_processes = (
+        recovery.get("retained_processes", [])
+        if isinstance(recovery, dict)
+        else []
+    )
+    if not isinstance(retained_processes, list):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid retained process recovery"
+        )
+    if retained_processes and state != "error":
+        raise RamdiskError(
+            "RAM-disk retained process recovery requires the error state"
+        )
+    pending_launches = manifest.get("pending_launches", [])
+    if not isinstance(pending_launches, list):
+        raise RamdiskError("RAM-disk manifest has invalid pending launches")
+    if pending_launches and state not in ("starting", "error"):
+        raise RamdiskError(
+            "RAM-disk pending launches require starting or error state"
+        )
+    for pending in pending_launches:
+        operation_id = (
+            pending.get("operation_id") if isinstance(pending, dict) else None
+        )
+        nonce = pending.get("nonce") if isinstance(pending, dict) else None
+        port = pending.get("port") if isinstance(pending, dict) else None
+        node = pending.get("node") if isinstance(pending, dict) else None
+        state_dir = (
+            pending.get("state_dir") if isinstance(pending, dict) else None
+        )
+        baseline = (
+            pending.get("usage_baseline")
+            if isinstance(pending, dict)
+            else None
+        )
+        merge_id = (
+            pending.get("usage_merge_id")
+            if isinstance(pending, dict)
+            else None
+        )
+        if (
+            not isinstance(operation_id, str)
+            or not re.fullmatch(r"start:[0-9a-f]{32}", operation_id)
+            or not isinstance(nonce, str)
+            or not re.fullmatch(r"[0-9a-f]{48}", nonce)
+            or not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+            or node not in {record.get("node") for record in plan["mounts"]}
+            or not isinstance(state_dir, str)
+            or not os.path.isabs(state_dir)
+            or not _valid_usage_snapshot(baseline)
+            or not isinstance(merge_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", merge_id)
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has unsafe pending launch recovery"
+            )
+    for retained in retained_processes:
+        pid = retained.get("pid") if isinstance(retained, dict) else None
+        pgid = retained.get("pgid") if isinstance(retained, dict) else None
+        node = retained.get("node") if isinstance(retained, dict) else None
+        state_dir = (
+            retained.get("state_dir") if isinstance(retained, dict) else None
+        )
+        baseline = (
+            retained.get("usage_baseline")
+            if isinstance(retained, dict)
+            else None
+        )
+        merge_id = (
+            retained.get("usage_merge_id")
+            if isinstance(retained, dict)
+            else None
+        )
+        if (
+            not _positive_int(pid)
+            or pgid != pid
+            or node not in {record.get("node") for record in plan["mounts"]}
+            or not isinstance(state_dir, str)
+            or not os.path.isabs(state_dir)
+            or not _valid_usage_snapshot(baseline)
+            or not isinstance(merge_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", merge_id)
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has unsafe retained process recovery"
+            )
     recorded_paths = {record["path"] for record in mounts}
+    non_managed = sorted(
+        path
+        for path, ownership in mount_ownership.items()
+        if ownership != "managed"
+    )
+    if state not in ("preparing", "error") and non_managed:
+        raise RamdiskError(
+            "RAM-disk manifest contains pending mount ownership outside "
+            "preparation/recovery: %s" % ", ".join(non_managed)
+        )
     if (
         state in ("ready", "starting", "running", "stopped")
         and recorded_paths != planned_paths
@@ -434,12 +567,30 @@ def _load_manifest(
         "engines",
         fingerprint_dir,
     )
+    recovery_state_dirs = set()
+    for recovery_record in pending_launches + retained_processes:
+        node = recovery_record.get("node")
+        label = "interleaved" if node is None else "node-%d" % node
+        expected_recovery_state_dir = os.path.join(
+            expected_state_root,
+            label,
+        )
+        state_dir = recovery_record["state_dir"]
+        if (
+            state_dir != expected_recovery_state_dir
+            or state_dir in recovery_state_dirs
+        ):
+            raise RamdiskError(
+                "RAM-disk recovery has an unsafe or duplicate state directory"
+            )
+        assert_durable_state_dir(state_dir, plan=plan)
+        recovery_state_dirs.add(state_dir)
     process_keys = {
         "pid": set(),
         "pgid": set(),
         "port": set(),
         "node": set(),
-        "state_dir": set(),
+        "state_dir": set(recovery_state_dirs),
         "weights_dir": set(),
     }
     invoking_uid = uid_provider()
@@ -453,6 +604,8 @@ def _load_manifest(
         nonce, port = record.get("nonce"), record.get("port")
         node, weights_dir = record.get("node"), record.get("weights_dir")
         state_dir, command = record.get("state_dir"), record.get("command")
+        usage_baseline = record.get("usage_baseline")
+        usage_merge_id = record.get("usage_merge_id")
         mount = next(
             (
                 item
@@ -500,6 +653,14 @@ def _load_manifest(
             or weights_dir != mount["path"]
             or state_dir != expected_state_dir
             or not command_matches
+            or not _valid_usage_snapshot(usage_baseline)
+            or (
+                usage_merge_id is not None
+                and (
+                    not isinstance(usage_merge_id, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", usage_merge_id)
+                )
+            )
         ):
             raise RamdiskError(
                 "RAM-disk manifest contains an unsafe managed process record"
@@ -535,10 +696,12 @@ def _save_manifest(
 
 def _read_optional_text(path):
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+        with open(path, "r", encoding="utf-8", errors="strict") as stream:
             return stream.read()
-    except OSError:
+    except FileNotFoundError:
         return ""
+    except (OSError, UnicodeError) as exc:
+        raise RamdiskError("cannot read usage state %s: %s" % (path, exc))
 
 
 def _usage_header(counts, source="usage history"):
@@ -882,7 +1045,19 @@ def _merge_usage(
     )
     state_usage = os.path.join(record["state_dir"], ".coli_usage")
     current = _usage_read(state_usage)
-    baseline = record.get("usage_baseline", {})
+    baseline = record.get("usage_baseline")
+    if not _valid_usage_snapshot(baseline):
+        raise RamdiskError(
+            "managed usage recovery is missing a valid exact baseline"
+        )
+    persisted_merge_id = record.get("usage_merge_id")
+    if persisted_merge_id is not None and (
+        not isinstance(persisted_merge_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", persisted_merge_id)
+    ):
+        raise RamdiskError(
+            "managed usage recovery has an invalid transaction id"
+        )
     source_header = _compatible_usage_header(
         ("managed usage history", current),
         ("usage baseline", baseline),

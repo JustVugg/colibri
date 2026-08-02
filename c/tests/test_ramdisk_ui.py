@@ -290,6 +290,50 @@ class ActionPolicyTest(unittest.TestCase):
         self.assertTrue(already_stopped.destroy.enabled)
         self.assertIn("Destroy", already_stopped.edit_base_port.reason)
 
+    def test_retained_process_recovery_offers_only_stop_reconciliation(self):
+        policy = ActionPolicy.from_state(
+            placement_plan(),
+            {
+                "present": True,
+                "state": "error",
+                "processes": [],
+                "recovery": {
+                    "retained_processes": [{"pid": 123, "pgid": 123}],
+                    "pending_launches": [],
+                },
+            },
+        )
+
+        self.assertTrue(policy.stop.enabled)
+        self.assertEqual(policy.stop.reason, "")
+        self.assertFalse(policy.destroy.enabled)
+        self.assertIn("reconcile", policy.destroy.reason)
+        self.assertFalse(policy.edit_base_port.enabled)
+        self.assertIn("Stop managed engines", policy.edit_base_port.reason)
+
+    def test_outcome_unknown_launch_disables_stop_and_destroy(self):
+        policy = ActionPolicy.from_state(
+            placement_plan(),
+            {
+                "present": True,
+                "state": "error",
+                "processes": [],
+                "recovery": {
+                    "retained_processes": [],
+                    "pending_launches": [
+                        {"port": 8000, "state": "outcome-unknown"}
+                    ],
+                },
+            },
+        )
+
+        self.assertFalse(policy.stop.enabled)
+        self.assertFalse(policy.destroy.enabled)
+        self.assertIn("outcome is unknown", policy.stop.reason)
+        self.assertIn("outcome is unknown", policy.destroy.reason)
+        self.assertFalse(policy.edit_base_port.enabled)
+        self.assertIn("outcome-unknown", policy.edit_base_port.reason)
+
     def test_unknown_or_blocked_state_has_actionable_reasons(self):
         unknown = ActionPolicy.from_state(None, None)
         blocked_plan = placement_plan()

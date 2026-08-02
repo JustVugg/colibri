@@ -208,10 +208,23 @@ class ActionPolicy:
         else:
             prepare = ActionPermission(True)
 
-        start_enabled = state in ("ready", "stopped")
+        recovery = report.get("recovery")
+        recovery = recovery if isinstance(recovery, Mapping) else {}
+        retained_processes = recovery.get("retained_processes") or ()
+        pending_launches = recovery.get("pending_launches") or ()
+        retained_recovery = bool(retained_processes)
+        outcome_unknown = bool(pending_launches)
+        recovery_blocks_start = retained_recovery or outcome_unknown
+        start_enabled = (
+            state in ("ready", "stopped") and not recovery_blocks_start
+        )
         start = ActionPermission(
             start_enabled,
-            "" if start_enabled else "Start requires a prepared or stopped workspace.",
+            ""
+            if start_enabled
+            else "Resolve managed-process recovery before starting."
+            if recovery_blocks_start
+            else "Start requires a prepared or stopped workspace.",
         )
         process_records = tuple(report.get("processes", ()))
         process_cleanup_pending = any(
@@ -219,11 +232,19 @@ class ActionPolicy:
             or process.get("reason") != "stopped"
             for process in process_records
         )
-        stop_enabled = state in ("running", "starting") or (
-            present and process_cleanup_pending
+        retained_cleanup_pending = present and retained_recovery
+        cleanup_pending = process_cleanup_pending or retained_cleanup_pending
+        stop_enabled = not outcome_unknown and (
+            state in ("running", "starting")
+            or (present and cleanup_pending)
         )
         if stop_enabled:
             stop_reason = ""
+        elif outcome_unknown:
+            stop_reason = (
+                "Stop is unavailable while a managed launch outcome is unknown; "
+                "inspect recovery.pending_launches and recover it explicitly."
+            )
         elif state == "error":
             stop_reason = (
                 "No managed engine cleanup is pending; use Destroy to recover "
@@ -235,9 +256,19 @@ class ActionPolicy:
             stop_enabled,
             stop_reason,
         )
-        destroy_enabled = present and not stop_enabled
+        destroy_enabled = present and not stop_enabled and not outcome_unknown
         if destroy_enabled:
             destroy_reason = ""
+        elif outcome_unknown:
+            destroy_reason = (
+                "Destroy is unavailable while a managed launch outcome is unknown; "
+                "inspect recovery.pending_launches and recover it explicitly."
+            )
+        elif retained_cleanup_pending:
+            destroy_reason = (
+                "Use Stop to reconcile the retained managed process before "
+                "destroying its RAM workspace."
+            )
         elif stop_enabled:
             destroy_reason = (
                 "Stop every managed engine before destroying its RAM workspace."
@@ -245,7 +276,9 @@ class ActionPolicy:
         else:
             destroy_reason = "There is no RAM workspace to destroy."
         destroy = ActionPermission(destroy_enabled, destroy_reason)
-        benchmark_enabled = state in ("ready", "stopped")
+        benchmark_enabled = (
+            state in ("ready", "stopped") and not recovery_blocks_start
+        )
         benchmark = ActionPermission(
             benchmark_enabled,
             ""
@@ -261,10 +294,18 @@ class ActionPolicy:
                 "The persisted weights plan is locked; Destroy it before changing it."
             )
         edit_weights = ActionPermission(not present, "" if not present else locked_reason)
-        base_port_enabled = not present or state in ("ready", "stopped")
+        base_port_enabled = (
+            (not present or state in ("ready", "stopped"))
+            and not recovery_blocks_start
+        )
         if base_port_enabled:
             base_port_reason = ""
-        elif state == "error" and not process_cleanup_pending:
+        elif outcome_unknown:
+            base_port_reason = (
+                "Recover the outcome-unknown managed launch explicitly before "
+                "changing the base port."
+            )
+        elif state == "error" and not cleanup_pending:
             base_port_reason = (
                 "Destroy the incomplete workspace before changing the base port."
             )

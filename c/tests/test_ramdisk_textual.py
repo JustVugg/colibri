@@ -286,7 +286,9 @@ class BackendSelectionTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"COLI_RAMDISK_UI": "curses"}
         ), mock.patch("curses.wrapper", return_value=17) as wrapper:
-            result = ramdisk.launch_tui(argparse.Namespace())
+            result = ramdisk.launch_tui(
+                argparse.Namespace(), system="linux"
+            )
 
         self.assertEqual(result, 17)
         wrapper.assert_called_once()
@@ -299,7 +301,10 @@ class BackendSelectionTest(unittest.TestCase):
             ramdisk, "_load_textual_frontend", return_value=frontend
         ):
             result = ramdisk.launch_tui(
-                argparse.Namespace(), cli_path="/coli", engine_path="/engine"
+                argparse.Namespace(),
+                cli_path="/coli",
+                engine_path="/engine",
+                system="linux",
             )
 
         self.assertEqual(result, 19)
@@ -319,7 +324,9 @@ class BackendSelectionTest(unittest.TestCase):
         ), mock.patch(
             "curses.wrapper", return_value=23
         ) as wrapper:
-            result = ramdisk.launch_tui(argparse.Namespace())
+            result = ramdisk.launch_tui(
+                argparse.Namespace(), system="linux"
+            )
 
         self.assertEqual(result, 23)
         wrapper.assert_called_once()
@@ -332,7 +339,9 @@ class BackendSelectionTest(unittest.TestCase):
         ), mock.patch.object(
             ramdisk, "_load_textual_frontend", side_effect=missing
         ), contextlib.redirect_stderr(stderr):
-            result = ramdisk.launch_tui(argparse.Namespace())
+            result = ramdisk.launch_tui(
+                argparse.Namespace(), system="linux"
+            )
 
         self.assertEqual(result, 2)
         self.assertIn("Textual is not installed", stderr.getvalue())
@@ -345,7 +354,9 @@ class BackendSelectionTest(unittest.TestCase):
         ), mock.patch("curses.wrapper") as wrapper, contextlib.redirect_stderr(
             stderr
         ):
-            result = ramdisk.launch_tui(argparse.Namespace())
+            result = ramdisk.launch_tui(
+                argparse.Namespace(), system="linux"
+            )
 
         self.assertEqual(result, 2)
         wrapper.assert_not_called()
@@ -1099,6 +1110,52 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(active.query_one("#memory-nodes", Input).disabled)
             self.assertTrue(active.query_one("#cpu-list", Input).disabled)
             self.assertFalse(active.query_one("#base-port", Input).disabled)
+
+    async def test_recovery_policy_distinguishes_retained_and_unknown_launches(self):
+        cases = (
+            (
+                "retained",
+                {"retained_processes": [{"pid": 123, "pgid": 123}]},
+                False,
+                True,
+                "reconcile",
+            ),
+            (
+                "outcome-unknown",
+                {
+                    "pending_launches": [
+                        {"port": 8000, "state": "outcome-unknown"}
+                    ]
+                },
+                True,
+                True,
+                "outcome is unknown",
+            ),
+        )
+        for label, recovery, stop_disabled, destroy_disabled, reason in cases:
+            with self.subTest(recovery=label):
+                snapshot = active_snapshot("error")
+                report = dict(snapshot.report)
+                report.update(processes=[], recovery=recovery)
+                app = self.make_app(
+                    dataclasses.replace(snapshot, report=report)
+                )
+                async with app.run_test(size=(100, 34)) as pilot:
+                    await pilot.click("#step-operate")
+                    await pilot.pause()
+
+                    self.assertEqual(
+                        app.query_one("#action-stop", Button).disabled,
+                        stop_disabled,
+                    )
+                    self.assertEqual(
+                        app.query_one("#action-destroy", Button).disabled,
+                        destroy_disabled,
+                    )
+                    reasons = str(
+                        app.query_one("#action-reasons", Static).content
+                    )
+                    self.assertIn(reason, reasons)
 
     async def test_below_minimum_viewport_blocks_the_wizard_truthfully(self):
         app = self.make_app(absent_snapshot())

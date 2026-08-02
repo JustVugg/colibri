@@ -85,6 +85,120 @@ assert loaded == [], loaded
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_import_keeps_optional_facade_layers_lazy(self):
+        script = r"""
+import importlib.abc
+import sys
+
+blocked = {
+    "ramdisk_textual",
+    "ramdisk_ui",
+    "ramdisk_support.benchmark",
+    "ramdisk_support.curses_ui",
+    "ramdisk_support.presentation",
+    "ramdisk_support.processes",
+    "ramdisk_support.runtime_monitor",
+}
+
+class RejectOptionalLayers(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise AssertionError("eager optional facade import: " + fullname)
+        return None
+
+sys.meta_path.insert(0, RejectOptionalLayers())
+sys.path.insert(0, sys.argv[1])
+import ramdisk
+
+assert callable(ramdisk.build_plan)
+assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(C_DIR)],
+            cwd=C_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_import_does_not_initialize_the_stdlib_http_stack(self):
+        script = r"""
+import importlib.abc
+import sys
+
+blocked = {"ssl", "urllib.request"}
+
+class RejectHttpStack(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise AssertionError("eager network import: " + fullname)
+        return None
+
+sys.meta_path.insert(0, RejectHttpStack())
+sys.path.insert(0, sys.argv[1])
+import ramdisk
+
+assert callable(ramdisk.status)
+assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(C_DIR)],
+            cwd=C_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lazy_public_exports_remain_discoverable_and_star_importable(self):
+        script = r"""
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import ramdisk
+
+assert "BENCHMARK_PROMPT" in dir(ramdisk)
+assert "urllib" in dir(ramdisk)
+assert "ramdisk_support.benchmark" not in sys.modules
+assert "urllib.request" not in sys.modules
+
+namespace = {}
+exec("from ramdisk import *", namespace)
+assert isinstance(namespace["BENCHMARK_PROMPT"], str)
+assert namespace["BENCHMARK_PROMPT"]
+assert namespace["urllib"] is sys.modules["urllib"]
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(C_DIR)],
+            cwd=C_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_historical_urllib_patch_seam_remains_lazy_and_forwarded(self):
+        process_module = mock.Mock()
+        with mock.patch(
+            "ramdisk.urllib.request.urlopen",
+            new=mock.sentinel.urlopen,
+        ), mock.patch.object(
+            ramdisk,
+            "_processes_module",
+            return_value=process_module,
+        ):
+            ramdisk._wait_managed_ready(mock.sentinel.record, 3.0)
+
+        process_module._wait_managed_ready.assert_called_once_with(
+            mock.sentinel.record,
+            3.0,
+            api_key=None,
+            cancel_event=None,
+            process_matches=ramdisk._process_matches,
+            urlopen=mock.sentinel.urlopen,
+        )
+
     def test_non_linux_tui_fails_before_loading_ui_or_probing_hardware(self):
         stderr = io.StringIO()
         with (
