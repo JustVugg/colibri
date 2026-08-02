@@ -106,27 +106,40 @@ extern "C" __global__ void mhc_pre_big_fuse_with_norm_tilelang_kernel(
     float *, const float *, const float *, const float *, const float *,
     bfloat16_t *, const bfloat16_t *, float *, const bfloat16_t *, int);
 
-extern "C" cudaError_t dsv4_vllm_mhc_post_pre_norm(
+extern "C" cudaError_t dsv4_vllm_mhc_post_pre_norm_batch(
     cudaStream_t stream, const float *comb_mix, const void *residual_in,
     const float *post_mix, const void *x_in, const float *weight_t,
     float *gemm_out_mul, float *gemm_out_sqrsum, void *residual_out,
     const float *hc_scale, const float *hc_base, void *layer_input,
-    const void *norm_weight) {
-  const int num_tokens = 1, split_k = 8;
-  mhc_fused_tilelang_kernel<<<dim3(1, 12, split_k), 256, 176, stream>>>(
+    const void *norm_weight, int num_tokens) {
+  if (num_tokens < 1) return cudaErrorInvalidValue;
+  const int split_k = 8;
+  mhc_fused_tilelang_kernel<<<dim3(num_tokens, 12, split_k), 256, 176, stream>>>(
       comb_mix, post_mix, static_cast<const bfloat16_t *>(residual_in),
       static_cast<bfloat16_t *>(residual_out), gemm_out_sqrsum, weight_t,
       static_cast<const bfloat16_t *>(x_in), gemm_out_mul, num_tokens,
       split_k);
   cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) return error;
-  mhc_pre_big_fuse_with_norm_tilelang_kernel<<<1, 96, 29040, stream>>>(
+  mhc_pre_big_fuse_with_norm_tilelang_kernel<<<num_tokens, 96, 29040, stream>>>(
       const_cast<float *>(comb_mix), gemm_out_mul, gemm_out_sqrsum, hc_base,
       hc_scale, static_cast<bfloat16_t *>(layer_input),
       static_cast<const bfloat16_t *>(norm_weight),
       const_cast<float *>(post_mix),
       static_cast<const bfloat16_t *>(residual_out), num_tokens);
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t dsv4_vllm_mhc_post_pre_norm(
+    cudaStream_t stream, const float *comb_mix, const void *residual_in,
+    const float *post_mix, const void *x_in, const float *weight_t,
+    float *gemm_out_mul, float *gemm_out_sqrsum, void *residual_out,
+    const float *hc_scale, const float *hc_base, void *layer_input,
+    const void *norm_weight) {
+  return dsv4_vllm_mhc_post_pre_norm_batch(
+      stream, comb_mix, residual_in, post_mix, x_in, weight_t, gemm_out_mul,
+      gemm_out_sqrsum, residual_out, hc_scale, hc_base, layer_input,
+      norm_weight, 1);
 }
 
 

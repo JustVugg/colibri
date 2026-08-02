@@ -682,19 +682,32 @@ void launchFusedDeepseekV4QNormRopeKVRopeQuantInsert(
 }  // namespace deepseek_v4_fused_ops
 }  // namespace vllm
 
+extern "C" int dsv4_vllm_qnorm_rope_kv_insert_batch(
+    const __nv_bfloat16 *q_in, __nv_bfloat16 *q_out,
+    const __nv_bfloat16 *kv_in, uint8_t *kv_cache,
+    const int64_t *slot_mapping, const int64_t *position_ids,
+    const float *cos_sin_cache, float eps, int tokens, int insert_tokens,
+    int heads, int padded_heads,
+    int cache_block_size, int kv_block_stride, cudaStream_t stream) {
+  if (!q_in || !q_out || !kv_in || !kv_cache || !slot_mapping ||
+      !position_ids || !cos_sin_cache || tokens < 1 || insert_tokens < 0 ||
+      insert_tokens > tokens) return 0;
+  vllm::deepseek_v4_fused_ops::launchFusedDeepseekV4QNormRopeKVRopeQuantInsert(
+      q_in, q_out, kv_in, kv_cache, slot_mapping, position_ids,
+      cos_sin_cache, eps, tokens, insert_tokens, heads, padded_heads, cache_block_size,
+      kv_block_stride, stream);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 extern "C" int dsv4_vllm_qnorm_rope_kv_insert(
     const __nv_bfloat16 *q_in, __nv_bfloat16 *q_out,
     const __nv_bfloat16 *kv_in, uint8_t *kv_cache,
     const int64_t *slot_mapping, const int64_t *position_ids,
     const float *cos_sin_cache, float eps, int heads,
     int cache_block_size, int kv_block_stride, cudaStream_t stream) {
-  if (!q_in || !q_out || !kv_in || !kv_cache || !slot_mapping ||
-      !position_ids || !cos_sin_cache) return 0;
-  vllm::deepseek_v4_fused_ops::launchFusedDeepseekV4QNormRopeKVRopeQuantInsert(
-      q_in, q_out, kv_in, kv_cache, slot_mapping, position_ids,
-      cos_sin_cache, eps, 1, 1, heads, heads, cache_block_size,
-      kv_block_stride, stream);
-  return cudaGetLastError() == cudaSuccess;
+  return dsv4_vllm_qnorm_rope_kv_insert_batch(
+      q_in, q_out, kv_in, kv_cache, slot_mapping, position_ids, cos_sin_cache,
+      eps, 1, 1, heads, heads, cache_block_size, kv_block_stride, stream);
 }
 
 __global__ void packCompressedKV(const float *kv,uint8_t *cache,const int *state,int ratio,

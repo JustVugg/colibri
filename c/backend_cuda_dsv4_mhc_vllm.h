@@ -13,6 +13,12 @@ cudaError_t dsv4_vllm_mhc_post_pre_norm(
     float *gemm_out_mul, float *gemm_out_sqrsum, void *residual_out,
     const float *hc_scale, const float *hc_base, void *layer_input,
     const void *norm_weight);
+cudaError_t dsv4_vllm_mhc_post_pre_norm_batch(
+    cudaStream_t stream, const float *comb_mix, const void *residual_in,
+    const float *post_mix, const void *x_in, const float *weight_t,
+    float *gemm_out_mul, float *gemm_out_sqrsum, void *residual_out,
+    const float *hc_scale, const float *hc_base, void *layer_input,
+    const void *norm_weight, int num_tokens);
 
 #ifdef __cplusplus
 }
