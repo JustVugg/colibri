@@ -328,7 +328,7 @@ $(error FLASHINFER_HOME must point to a FlashInfer source checkout)
 endif
 CFLAGS += -DCOLI_DSV4_FLASHINFER
 NVCCFLAGS += -DCOLI_DSV4_FLASHINFER
-DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o
+DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o backend_cuda_dsv4_sparse_mla_flashinfer.o
 endif
 ifeq ($(VLLM_MHC),1)
 override NVCCFLAGS += -DCOLI_DSV4_VLLM_MHC
@@ -477,6 +477,12 @@ backend_cuda_dsv4_flashinfer.o: backend_cuda_dsv4_flashinfer.cu backend_cuda_dsv
 	"$(NVCC)" -O3 -std=c++17 -arch=sm_120a --expt-relaxed-constexpr -diag-suppress=20012 -diag-suppress=20013 -diag-suppress=20015 \
 		-I"$(FLASHINFER_HOME)/include" -I"$(FLASHINFER_HOME)/3rdparty/cutlass/include" \
 		-I"$(FLASHINFER_HOME)/3rdparty/cutlass/tools/util/include" -c backend_cuda_dsv4_flashinfer.cu -o $@
+
+backend_cuda_dsv4_sparse_mla_flashinfer.o: $(FLASHINFER_HOME)/csrc/sparse_mla_sm120_decode_dsv4.cu .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++17 -gencode=arch=compute_120f,code=sm_120f --expt-relaxed-constexpr \
+		-I"$(FLASHINFER_HOME)/include" -I"$(FLASHINFER_HOME)/3rdparty/cutlass/include" \
+		-c "$<" -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@

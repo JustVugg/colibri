@@ -2,6 +2,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <flashinfer/gemm/group_gemm_mxfp4_groupwise_sm120.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
 #include <cstdio>
 #include <cstdlib>
 
@@ -37,6 +38,13 @@ INSTANTIATE_GROUP_GEMM_MXFP4_GROUPWISE_SM120(
 }
 using namespace flashinfer::group_gemm;
 
+namespace flashinfer::sparse_mla_sm120 {
+bool launch_sparse_mla_decode_dsv4(ModelType,int,int,int,int,int,const bf16*,const uint8_t*,
+                                   const int32_t*,bf16*,float*,bf16*,float*,const int*,
+                                   const float*,const uint8_t*,const int32_t*,const int*,int,
+                                   int,size_t,int,float,size_t,cudaStream_t);
+}
+
 struct Desc { const uint8_t *w,*scale;const float *x;float *y; };
 struct FiCtx { int device=-1;const uint8_t **wp=nullptr,**sp=nullptr;uint8_t *ws=nullptr,*a=nullptr,*as=nullptr;__nv_bfloat16 *out=nullptr;int *indptr=nullptr;void *iw=nullptr,*fw=nullptr;cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;size_t wpc=0,spc=0,wsc=0,ac=0,asc=0,oc=0,ic=0; };
 static FiCtx fc[16][2];
@@ -52,4 +60,12 @@ extern "C" int dsv4_flashinfer_grouped(const void *descriptors,int count,int O,i
     if(c.exec)return cudaGraphLaunch(c.exec,stream)==cudaSuccess;
     auto launch=[&]()->int{cudaMemsetAsync(c.as,0,asb,stream);stage_pointer<<<1,32,0,stream>>>((const Desc*)descriptors,c.wp,c.sp,count);quant_activation<<<count*(I/32),32,0,stream>>>((const Desc*)descriptors,c.a,c.as,count,I);make_indptr<<<1,32,0,stream>>>(c.indptr,count);cudaError_t e=CutlassMXFP4GroupwiseScaledGroupGEMMSM120<128,32,128,true,cutlass::float_e4m3_t,cutlass::float_e2m1_t,cutlass::float_ue8m0_t,cutlass::float_ue8m0_t,cutlass::bfloat16_t>(c.iw,8<<20,c.fw,64<<20,(cutlass::float_e4m3_t*)c.a,(cutlass::float_e2m1_t*)c.wp,(cutlass::float_ue8m0_t*)c.as,(cutlass::float_ue8m0_t*)c.sp,(cutlass::bfloat16_t*)c.out,c.indptr,O,I,count,stream,device);if(e!=cudaSuccess)return 0;extract<<<(count*O+255)/256,256,0,stream>>>((const Desc*)descriptors,c.out,count,O);return cudaGetLastError()==cudaSuccess;};
     static int graph=-1;if(graph<0){const char*p=getenv("DSV4_CUDA_FLASHINFER_GRAPH");graph=p&&atoi(p)!=0;}if(!graph)return launch();if(c.exec)return cudaGraphLaunch(c.exec,stream)==cudaSuccess;if(!launch()||cudaStreamSynchronize(stream)!=cudaSuccess||cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal)!=cudaSuccess||!launch()||cudaStreamEndCapture(stream,&c.graph)!=cudaSuccess||cudaGraphInstantiate(&c.exec,c.graph,0)!=cudaSuccess)return 0;return 1;}
+extern "C" int dsv4_flashinfer_sparse_mla(const void*q,const void*kv,const int*indices,void*mid,float*mid_lse,void*out,float*out_lse,const int*length,const float*sink,const void*extra_kv,const int*extra_indices,const int*extra_length,int extra_topk,int pbs_extra,size_t extra_stride,int heads,int topk,int tokens,int splits,int chunks,float scale,size_t stride,cudaStream_t stream){
+    using namespace flashinfer::sparse_mla_sm120;
+    if(!q||!kv||!indices||!mid||!mid_lse||!out||!length||heads<1||tokens<1||splits<1)return 0;
+    return launch_sparse_mla_decode_dsv4(ModelType::DSV4,heads,topk,64,tokens,splits,
+        (const bf16*)q,(const uint8_t*)kv,(const int32_t*)indices,(bf16*)mid,mid_lse,
+        (bf16*)out,out_lse,length,sink,(const uint8_t*)extra_kv,(const int32_t*)extra_indices,
+        extra_length,extra_topk,pbs_extra,extra_stride,chunks,scale,stride,stream);
+}
 extern "C" void dsv4_flashinfer_shutdown(void){for(auto&dev:fc)for(auto&c:dev)if(c.device>=0){cudaSetDevice(c.device);if(c.exec)cudaGraphExecDestroy(c.exec);if(c.graph)cudaGraphDestroy(c.graph);cudaFree(c.wp);cudaFree(c.sp);cudaFree(c.ws);cudaFree(c.a);cudaFree(c.as);cudaFree(c.out);cudaFree(c.indptr);cudaFree(c.iw);cudaFree(c.fw);c=FiCtx{};}}

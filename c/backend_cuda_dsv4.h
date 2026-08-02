@@ -10,7 +10,7 @@ typedef struct Dsv4CudaKvCache Dsv4CudaKvCache;
 typedef struct Dsv4CudaExpertSet Dsv4CudaExpertSet;
 typedef struct Dsv4CudaGraph Dsv4CudaGraph;
 typedef struct {
-    Dsv4CudaTensor *attn_norm,*q_a,*q_norm,*q_b,*wkv,*kv_norm,*sink,*wo_a,*wo_b;
+    Dsv4CudaTensor *attn_norm,*q_a,*qkv,*q_norm,*q_b,*wkv,*kv_norm,*sink,*wo_a,*wo_b;
     Dsv4CudaTensor *compress_wkv,*compress_wgate,*compress_ape,*compress_norm;
 } Dsv4CudaAttentionWeights;
 int dsv4_cuda_init(const int *devices,int count);

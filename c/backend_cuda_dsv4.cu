@@ -27,7 +27,7 @@
 struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale,*fi_scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; };
 struct Dsv4CudaActivation { float *data; long long elements; int device; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
-struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin;int *compressed_len;int device,window,dim,max_tokens,max_compressed,rope_pairs; };
+struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin,*fi_lse,*fi_out_lse;uint8_t *fi_kv;__nv_bfloat16 *fi_q,*fi_mid,*fi_out;int *compressed_len,*fi_indices,*fi_length;int device,window,dim,max_tokens,max_compressed,rope_pairs; };
 struct MvDesc { const uint8_t *w,*scale; const float *x; float *y; };
 struct ExpertPtr { const uint8_t *w,*scale,*fi_scale; };
 struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su,*sd;uint8_t *bank_fc1,*bank_fc1_scale,*bank_fc2,*bank_fc2_scale;int *bank_fc1_dg_scale,*bank_fc2_dg_scale;int count,device,H,I,vocab,topk; };
@@ -341,8 +341,9 @@ static int dg_dense_attention(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
 static int dg_attention_kv_reuse(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){(void)x;return t&&t->O==512&&t->I==4096&&dg_dense_attention<512,4096,64,128,128,9,64,4,false>(c,t,x,y);}
 static int dg_attention_projection(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
     int good=0;
-    if(t->I==4096&&(t->O==1024||t->O==512)){
-        good=t->O==1024?dg_dense_attention<1024,4096,64,128,128,9,64,4>(c,t,x,y):
+    if(t->I==4096&&(t->O==1536||t->O==1024||t->O==512)){
+        good=t->O==1536?dg_dense_attention<1536,4096,64,128,128,9,64,4>(c,t,x,y):
+             t->O==1024?dg_dense_attention<1024,4096,64,128,128,9,64,4>(c,t,x,y):
                          dg_dense_attention<512,4096,64,128,128,9,64,4>(c,t,x,y);
     }else if(t->O==32768&&t->I==1024)good=dg_dense_attention<32768,1024,128,64,64,10,128,1>(c,t,x,y);
     else if(t->O==16384&&t->I==1024)good=dg_dense_attention<16384,1024,128,64,64,10,128,1>(c,t,x,y);
@@ -518,6 +519,13 @@ __device__ __forceinline__ int decode_pos(const int *state){return state[1];}
 __device__ __forceinline__ int compression_ready(const int *state,int ratio){return ratio&&decode_pos(state)%ratio==ratio-1;}
 __global__ void rope_heads_dynamic(float*x,int heads,int dim,int rope,const int*state,int delta,int inverse,int predicate,const float*cs,const float*sn){if(predicate&&!compression_ready(state,predicate))return;int pos=decode_pos(state)+delta,p=blockIdx.x*blockDim.x+threadIdx.x,pairs=rope/2;if(p<heads*pairs){int h=p/pairs,k=p%pairs,off=h*dim+dim-rope+2*k;float s=inverse?-sn[(long long)pos*pairs+k]:sn[(long long)pos*pairs+k],u=x[off],v=x[off+1];x[off]=__bfloat162float(__float2bfloat16(u*cs[(long long)pos*pairs+k]-v*s));x[off+1]=__bfloat162float(__float2bfloat16(u*s+v*cs[(long long)pos*pairs+k]));}}
 __global__ void cache_store_dynamic(float*cache,const float*kv,const int*state,int window,int dim){int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<dim)cache[(long long)(decode_pos(state)%window)*dim+d]=kv[d];}
+#ifdef COLI_DSV4_FLASHINFER
+__global__ void fi_pack_kv(uint8_t*cache,const float*kv,int pos){int lane=threadIdx.x,block=pos/64,local=pos%64;uint8_t*data=cache+(size_t)block*64*584+(size_t)local*576;uint8_t*sc=cache+(size_t)block*64*584+64*576+(size_t)local*8;
+    if(lane<7){float mx=0;for(int i=0;i<64;i++)mx=fmaxf(mx,fabsf(kv[lane*64+i]));float raw=fmaxf(mx,1e-4f)/448.f;int e;frexpf(raw,&e);float scale=ldexpf(1.f,e-1);if(scale<raw)scale*=2;frexpf(scale,&e);sc[lane]=(uint8_t)(e-1+127);for(int i=0;i<64;i++)data[lane*64+i]=__nv_cvt_float_to_fp8(kv[lane*64+i]/scale,__NV_SATFINITE,__NV_E4M3);}
+    if(lane<64)((__nv_bfloat16*)(data+448))[lane]=__float2bfloat16(kv[448+lane]);if(lane==7)sc[7]=0;}
+__global__ void fi_prepare_q(__nv_bfloat16*q,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]=__float2bfloat16(x[i]);}
+__global__ void fi_indices(int*idx,int*length,int pos){int i=threadIdx.x;if(i<512)idx[i]=i<=pos?i:-1;if(!i)*length=pos+1;}
+#endif
 __global__ void compress_store_dynamic(float*values,float*scores,const float*v,const float*g,const float*ape,const int*state,int ratio,int overlap,int O){int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<O){int phase=decode_pos(state)%ratio,slot=(overlap?ratio:0)+phase;values[(long long)slot*O+d]=v[d];scores[(long long)slot*O+d]=g[d]+ape[(long long)phase*O+d];}}
 __global__ void compress_pool_dynamic(float*out,const float*values,const float*scores,const int*state,int ratio,int overlap,int dim){if(!compression_ready(state,ratio))return;int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<dim){int O=(1+overlap)*dim,items=overlap?2*ratio:ratio;float mx=-INFINITY;for(int j=0;j<items;j++){int col=overlap&&j>=ratio?dim+d:d;mx=fmaxf(mx,scores[(long long)j*O+col]);}float den=0,sum=0;for(int j=0;j<items;j++){int col=overlap&&j>=ratio?dim+d:d,aoff=j*O+col;float a=expf(scores[aoff]-mx);den+=a;sum+=a*values[aoff];}out[d]=sum/den;}}
 __global__ void rmsnorm_dynamic(float*out,const float*x,const float*w,int n,float eps,const int*state,int ratio){if(!compression_ready(state,ratio))return;__shared__ float sum[256],inv;float ss=0;for(int i=threadIdx.x;i<n;i+=blockDim.x)ss+=x[i]*x[i];sum[threadIdx.x]=ss;__syncthreads();for(int k=128;k;k>>=1){if(threadIdx.x<k)sum[threadIdx.x]+=sum[threadIdx.x+k];__syncthreads();}if(!threadIdx.x)inv=rsqrtf(sum[0]/n+eps);__syncthreads();for(int i=threadIdx.x;i<n;i+=blockDim.x)out[i]=__bfloat162float(__float2bfloat16(x[i]*inv*w[i]));}
@@ -745,6 +753,14 @@ extern "C" Dsv4CudaKvCache *dsv4_cuda_kv_create(int device, int window, int dim,
         dsv4_cuda_kv_free(k);
         return nullptr;
     }
+#ifdef COLI_DSV4_FLASHINFER
+    size_t fib=(size_t)((max_tokens+63)/64)*64*584;
+    if(!ok(cudaMalloc(&k->fi_kv,fib),"FlashInfer KV allocation")||!ok(cudaMemset(k->fi_kv,0,fib),"FlashInfer KV clear")||
+       !ok(cudaMalloc(&k->fi_indices,512*sizeof(int)),"FlashInfer indices allocation")||!ok(cudaMalloc(&k->fi_length,sizeof(int)),"FlashInfer length allocation")||
+       !ok(cudaMalloc(&k->fi_q,8*512*sizeof(__nv_bfloat16)),"FlashInfer Q allocation")||!ok(cudaMalloc(&k->fi_mid,8*8*512*sizeof(__nv_bfloat16)),"FlashInfer split output allocation")||
+       !ok(cudaMalloc(&k->fi_lse,8*8*sizeof(float)),"FlashInfer split LSE allocation")||!ok(cudaMalloc(&k->fi_out,8*512*sizeof(__nv_bfloat16)),"FlashInfer output allocation")||
+       !ok(cudaMalloc(&k->fi_out_lse,8*sizeof(float)),"FlashInfer output LSE allocation")){dsv4_cuda_kv_free(k);return nullptr;}
+#endif
     fill_value<<<(pb / 4 + 255) / 256, 256, 0, c->stream>>>(k->comp_score, pb / 4, -INFINITY);
     if (!ok(cudaGetLastError(), "compress score clear")) {
         dsv4_cuda_kv_free(k);
@@ -790,6 +806,9 @@ extern "C" void dsv4_cuda_kv_free(Dsv4CudaKvCache *k) {
     if (k->rope_sin) cudaFree(k->rope_sin);
     if (k->comp_cos) cudaFree(k->comp_cos);
     if (k->comp_sin) cudaFree(k->comp_sin);
+#ifdef COLI_DSV4_FLASHINFER
+    cudaFree(k->fi_kv);cudaFree(k->fi_indices);cudaFree(k->fi_length);cudaFree(k->fi_q);cudaFree(k->fi_mid);cudaFree(k->fi_lse);cudaFree(k->fi_out);cudaFree(k->fi_out_lse);
+#endif
     free(k);
 }
 extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4CudaTensor *an, Dsv4CudaTensor *qa,
@@ -800,14 +819,15 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
                                           int qk_rope, int groups, int pos, float eps, Dsv4CudaKvCache *cache,
                                           Dsv4CudaActivation *output) {
     Dev *c = input ? ctx(input->device) : nullptr;
-    int H = qa ? qa->I : 0, R = qa ? qa->O : 0, Q = heads * dim, K = dim, WR = wa ? wa->O : 0, overlap = ratio == 4,
+    int H = qa ? qa->I : 0, R = qb ? qb->I : 0, Q = heads * dim, K = dim, WR = wa ? wa->O : 0, overlap = ratio == 4,
         O = (1 + overlap) * dim;
+    int fused_qkv = qa && qa->O == R + K;
     if (!c || !cache || !output || !an || !qa || !qn || !qb || !kv || !kvn || !sink || !wa || !wb || pos < 0 ||
         pos >= cache->max_tokens || cache->device != input->device || cache->window < 1 || cache->dim != dim ||
         cache->rope_pairs * 2 != qk_rope || input->elements < H || output->elements < H || an->fmt != 32 ||
         qn->fmt != 16 || kvn->fmt != 32 || sink->fmt != 32 || qa->fmt != 8 || qb->fmt != 8 || kv->fmt != 8 ||
         wa->fmt != 9 || wb->fmt != 8 || an->O * an->I < H || qn->O * qn->I < R || kvn->O * kvn->I < K ||
-        sink->O * sink->I < heads || qb->I != R || qb->O != Q || kv->I != H || kv->O != K || wa->I * groups != Q ||
+        sink->O * sink->I < heads || qa->O != R + (fused_qkv ? K : 0) || qb->O != Q || kv->I != H || kv->O != K || wa->I * groups != Q ||
         wb->I != WR || wb->O != H || heads % groups)
         return 0;
     if (ratio && (!cwkv || !cwg || !ape || !cnorm || cwkv->fmt != 16 || cwg->fmt != 16 || ape->fmt != 32 ||
@@ -817,7 +837,7 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     Dsv4CudaTensor *tensors[] = {an, qa, qn, qb, kv, kvn, sink, wa, wb, cwkv, cwg, ape, cnorm};
     for (auto *t : tensors)
         if (t && t->device != input->device) return 0;
-    int P1 = R > O ? R : O;
+    int P1 = R + (fused_qkv ? K : 0); if (P1 < O) P1 = O;
     if (WR > P1) P1 = WR;
     if (output->device != input->device || !ok(cudaSetDevice(input->device), "select attention device") ||
         !buf((void **)&c->dx, &c->xcap, (size_t)H * 4) || !buf((void **)&c->p1, &c->p1cap, (size_t)P1 * 4) ||
@@ -859,7 +879,7 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     }
     int dense_dg=getenv("DSV4_CUDA_DENSE_DG")&&atoi(getenv("DSV4_CUDA_DENSE_DG"));
 #ifdef COLI_DSV4_DEEPGEMM
-    if(dense_dg){if(!dg_attention_projection(c,qa,c->dx,c->p1)||!dg_attention_kv_reuse(c,kv,c->dx,c->p3))return 0;}else
+    if(dense_dg){if(!dg_attention_projection(c,qa,c->dx,c->p1)||(!fused_qkv&&!dg_attention_kv_reuse(c,kv,c->dx,c->p3)))return 0;}else
 #endif
     {fp8_sim<<<(H + 127) / 128, 128, 0, c->stream>>>(c->dx, 1, H);
     run_mv<8>((uint8_t *)qa->w, qa->scale, c->dx, c->p1, R, H, 1, c->stream);}
@@ -879,14 +899,21 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     if(dense_dg){}else
 #endif
     run_mv<8>((uint8_t *)kv->w, kv->scale, c->dx, c->p3, K, H, 1, c->stream);
-    bf16_round<<<(K + 255) / 256, 256, 0, c->stream>>>(c->p3, K);
-    rmsnorm_f32<<<1, 256, 0, c->stream>>>(c->p3, c->p3, (float *)kvn->w, K, eps);
+    if (!fused_qkv) bf16_round<<<(K + 255) / 256, 256, 0, c->stream>>>(c->p3, K);
+    rmsnorm_f32<<<1, 256, 0, c->stream>>>(c->p3, fused_qkv ? c->p1 + R : c->p3, (float *)kvn->w, K, eps);
     if (qk_rope)
         rope_heads_dynamic<<<(qk_rope / 2 + 255) / 256, 256, 0, c->stream>>>(
             c->p3, 1, dim, qk_rope, c->decode_state, 0, 0, 0, cache->rope_cos, cache->rope_sin);
     if (K > qk_rope) fp8_sim64<<<(K - qk_rope + 63) / 64, 64, 0, c->stream>>>(c->p3, K - qk_rope);
     cache_store_dynamic<<<(K + 255) / 256, 256, 0, c->stream>>>(cache->kv, c->p3, c->decode_state, cache->window, K);
     if (async && !ok(cudaStreamWaitEvent(c->stream, c->join, 0), "attention join wait")) return 0;
+#ifdef COLI_DSV4_FLASHINFER
+    int sparse=getenv("DSV4_CUDA_SPARSE_MLA")&&atoi(getenv("DSV4_CUDA_SPARSE_MLA"));
+    if(sparse&&heads==8&&dim==512&&pos<512){fi_pack_kv<<<1,64,0,c->stream>>>(cache->fi_kv,c->p3,pos);fi_prepare_q<<<16,256,0,c->stream>>>(cache->fi_q,c->p2,heads*dim);fi_indices<<<1,512,0,c->stream>>>(cache->fi_indices,cache->fi_length,pos);
+        if(!dsv4_flashinfer_sparse_mla(cache->fi_q,cache->fi_kv,cache->fi_indices,cache->fi_mid,cache->fi_lse,cache->fi_out,cache->fi_out_lse,cache->fi_length,(float*)sink->w,nullptr,nullptr,nullptr,0,0,0,heads,512,1,8,0,1.f/sqrtf((float)dim),64*584,c->stream))return 0;
+        mhc_bf16_to_float<<<(heads*dim+255)/256,256,0,c->stream>>>(c->p4,cache->fi_out,heads*dim);
+    }else
+#endif
     attention_window_dynamic<<<heads, 256, (size_t)(cache->window + cache->max_compressed) * 4, c->stream>>>(
         c->p4, c->p2, cache->kv, cache->compressed, (float *)sink->w, heads, dim, cache->window, c->decode_state,
         cache->compressed_len);
@@ -919,12 +946,17 @@ extern "C" int dsv4_cuda_attention_window_tp2(const Dsv4CudaActivation *input,Ds
     if(!p||!q||!a||!b||!cache||!peer_cache||!output||!peer_output||!p->ep_comm||!q->ep_comm||heads%2||groups%2||
        peer_input->elements<H||output->elements<H||peer_output->elements<H)return 0;
     int replicated=getenv("DSV4_CUDA_REPLICATED_TP2")&&atoi(getenv("DSV4_CUDA_REPLICATED_TP2"));
+#ifdef COLI_DSV4_DEEPGEMM
+    const char *qkv_env=getenv("DSV4_CUDA_QKV_FUSED");int fuse_qkv=!qkv_env||atoi(qkv_env);
+#else
+    int fuse_qkv=0;
+#endif
     if(!replicated&&(!ok(cudaSetDevice(p->id),"select TP2 attention primary")||!nok(ncclGroupStart(),"TP2 attention broadcast start")||
        !nok(ncclBroadcast(input->data,input->data,H,ncclFloat,0,p->ep_comm,p->stream),"TP2 attention input root")||
        !ok(cudaSetDevice(q->id),"select TP2 attention peer")||
        !nok(ncclBroadcast(peer_input->data,peer_input->data,H,ncclFloat,0,q->ep_comm,q->stream),"TP2 attention input peer")||
        !nok(ncclGroupEnd(),"TP2 attention broadcast end")))return 0;
-#define ATTN_LOCAL(x,w,k,y) dsv4_cuda_attention_window((x),(w)->attn_norm,(w)->q_a,(w)->q_norm,(w)->q_b,(w)->wkv,\
+#define ATTN_LOCAL(x,w,k,y) dsv4_cuda_attention_window((x),(w)->attn_norm,fuse_qkv?(w)->qkv:(w)->q_a,(w)->q_norm,(w)->q_b,(w)->wkv,\
         (w)->kv_norm,(w)->sink,(w)->wo_a,(w)->wo_b,(w)->compress_wkv,(w)->compress_wgate,(w)->compress_ape,\
         (w)->compress_norm,ratio,heads/2,dim,qk_rope,groups/2,pos,eps,(k),(y))
     if(!ATTN_LOCAL(input,a,cache,output)||!ATTN_LOCAL(peer_input,b,peer_cache,peer_output))return 0;

@@ -1007,6 +1007,23 @@ static Dsv4CudaTensor *preload_fp8_copy_on(shards *s,const char *stem,int O,int 
     free(w);free(sc);if(!ok)die("CUDA replicated FP8 preload failed");return *slot;
 }
 
+static Dsv4CudaTensor *preload_fp8_pair_on(shards *s,const char *first,int first_rows,const char *second,
+                                           int second_rows,int cols,int device){
+    char aw[256],as[256],bw[256],bs[256],key[576];
+    snprintf(aw,sizeof(aw),"%s.weight",first);snprintf(as,sizeof(as),"%s.scale",first);
+    snprintf(bw,sizeof(bw),"%s.weight",second);snprintf(bs,sizeof(bs),"%s.scale",second);
+    snprintf(key,sizeof(key),"%s+%s",aw,bw);Dsv4CudaTensor **slot=gpu_slot_on(key,device);if(*slot)return *slot;
+    int rows=first_rows+second_rows,sc_cols=cols/128;
+    uint8_t *w=malloc((size_t)rows*cols),*sc=malloc((size_t)(rows/128)*sc_cols);
+    if(!w||!sc)die("out of memory fusing attention projections");
+    uint8_t *a=load_raw(s,aw,(long long)first_rows*cols),*sa=load_raw(s,as,(long long)(first_rows/128)*sc_cols);
+    uint8_t *b=load_raw(s,bw,(long long)second_rows*cols),*sb=load_raw(s,bs,(long long)(second_rows/128)*sc_cols);
+    memcpy(w,a,(size_t)first_rows*cols);memcpy(w+(long long)first_rows*cols,b,(size_t)second_rows*cols);
+    memcpy(sc,sa,(size_t)(first_rows/128)*sc_cols);memcpy(sc+(long long)(first_rows/128)*sc_cols,sb,(size_t)(second_rows/128)*sc_cols);
+    int ok=dsv4_cuda_upload_fp8(slot,w,sc,rows,cols,device);
+    free(a);free(sa);free(b);free(sb);free(w);free(sc);if(!ok)die("CUDA fused attention preload failed");return *slot;
+}
+
 static Dsv4CudaTensor *preload_raw_on(shards *s,const char *name,int O,int I,int device,int fmt){
     Dsv4CudaTensor **slot=gpu_slot_on(name,device);if(*slot)return *slot;int ok=0;
     if(fmt==32){float *w=load_f32(s,name,(long long)O*I);ok=dsv4_cuda_upload_f32(slot,w,O,I,device);free(w);}
@@ -1087,6 +1104,10 @@ static void gpu_preload(shards *s,const Dsv4Cfg *c){
                 snprintf(n,sizeof(n),"layers.%d.attn.q_norm.weight",l);tp->q_norm=rank?preload_raw_on(s,n,1,c->q_lora,d,16):*gpu_slot(n);
                 snprintf(n,sizeof(n),"layers.%d.attn.wq_b",l);tp->q_b=preload_fp8_rows_on(s,n,c->heads*c->head_dim,c->q_lora,rank*Q,Q,d,0);
                 snprintf(n,sizeof(n),"layers.%d.attn.wkv",l);if(rank)tp->wkv=preload_fp8_copy_on(s,n,c->head_dim,H,d,0);else{char wn[256];snprintf(wn,sizeof(wn),"%s.weight",n);tp->wkv=*gpu_slot(wn);}
+#ifdef COLI_DSV4_DEEPGEMM
+                {char qa[256],kv[256];snprintf(qa,sizeof(qa),"layers.%d.attn.wq_a",l);snprintf(kv,sizeof(kv),"layers.%d.attn.wkv",l);
+                 tp->qkv=preload_fp8_pair_on(s,qa,c->q_lora,kv,c->head_dim,H,d);}
+#endif
                 snprintf(n,sizeof(n),"layers.%d.attn.kv_norm.weight",l);tp->kv_norm=rank?preload_raw_on(s,n,c->head_dim,1,d,32):*gpu_slot(n);
                 snprintf(n,sizeof(n),"layers.%d.attn.attn_sink",l);tp->sink=preload_f32_rows_on(s,n,c->heads,rank*lh,lh,d);
                 snprintf(n,sizeof(n),"layers.%d.attn.wo_a",l);tp->wo_a=preload_fp8_rows_on(s,n,G*c->o_lora,(c->heads/G)*c->head_dim,rank*WR,WR,d,1);
