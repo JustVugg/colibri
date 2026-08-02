@@ -204,10 +204,10 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
  *    experts enter from freshly-read RAM slots (K3_VK_UP per step) until the
  *    VRAM budget (K3_VK_GB) is reached; resident experts then skip BOTH the
  *    disk read and the CPU matmuls at decode (C==1). */
-static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #include "vk_spv.h"
+static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
 static VkExp *g_vkexp; static int64_t g_vkexp_n;
 static int g_vk_upcap=8, g_vk_up_left=0, g_vk_full=0;

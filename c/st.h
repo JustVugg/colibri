@@ -643,14 +643,9 @@ static void st_die_missing(shards *S, const char *name) {
 /* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
  * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
  * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
- * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura). */
-static void st_prefetch(shards *S, const char *name) {
-    st_tensor *t = st_find(S, name);
-    if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
-}
-
-/* like st_prefetch, but on replica `rep`'s drive: the WILLNEED must warm the
- * page cache of the SAME fd the later demand pread will hit. */
+ * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura).
+ * On replica `rep`'s drive: the WILLNEED must warm the page cache of the SAME fd
+ * the later demand pread will hit. */
 static void st_prefetch_rep(shards *S, const char *name, int rep) {
     st_tensor *t = st_find(S, name);
     if (!t) return;

@@ -419,6 +419,37 @@ typedef struct {
 } Model;
 
 #include "quant.h"
+/* IDOT/int4 engine switches. These live here, not in quant.h: quant.h never reads
+ * them -- they gate call sites in this file alone -- so defining them in the header
+ * made every other engine that includes it (kimi_k3) build with three unused
+ * statics. */
+static int g_idot=1;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static int g_i4s=1;
+#elif defined(__VSX__)
+static int g_i4s=1;
+#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
+static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
+                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
+                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
+                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
+                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
+#else
+static int g_i4s=2;
+#endif
+static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
+                       * region across all experts of the batch-union block instead of ~2
+                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
+                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
+                       * byte-identical to that family (same dot_i4i8 per row, same silu,
+                       * same requant, same accumulation order into out). Measured on a
+                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
+                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
+                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
+                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
+                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
+                       * opt-in; measure on your host. */
+
 static int g_no_fused_pair=0;
 static int g_spec_pin=1;
 static int g_spec_live=0;
@@ -2919,9 +2950,6 @@ static float *g_pres_slots;               /* [ndev][D] partial slots on home   *
 static int g_pres_used[COLI_CUDA_MAX_DEVICES], g_pres_nused;
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
-static int cmp_fdesc(const void *a,const void *b){
-    float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
-
 /* PARTIAL SELECT (quickselect, Hoare partition, DESCending). After this call the k
  * LARGEST elements of a[0..n) are in a[0..k) in unspecified order; the (k+1)-th and
  * beyond are untouched-or-smaller. O(n) average, O(n^2) pathological (mitigated by
@@ -3663,10 +3691,6 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
     free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
     m->t_attn += now_s()-ta0;
-}
-
-static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
-    attention_rows(m,l,layer,x,S,pos_base,NULL,NULL,out);
 }
 
 /* MoE GLM su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, + shared expert).

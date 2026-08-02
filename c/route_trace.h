@@ -114,7 +114,6 @@ static uint32_t **rt_counts_all(void){ return rt_c; }
 static uint32_t  *rt_counts(int layer){
     return (rt_c && layer >= 0 && layer <= rt_nl) ? rt_c[layer] : NULL;
 }
-static int rt_tracing(void){ return rt_fp != NULL; }
 
 /* Release a layer's counter row, so rt_counts(layer) is NULL for a layer that does not
  * route. rt_init cannot know which those are — an engine learns its own sparsity while it
@@ -327,8 +326,14 @@ static int rt_save(const char *path, int quiet){
         if(!rt_c[i]) continue;
         for(int e = 0; e < rt_ne; e++) if(rt_c[i][e]){ tot += rt_c[i][e]; nz++; }
     }
+    /* Truncation here is not cosmetic: the write-then-rename below would land on a
+     * DIFFERENT path than the caller asked for, so refuse instead of silently
+     * writing the history somewhere else. */
     char tmp[2100];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if(snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)){
+        if(!quiet) fprintf(stderr, "[STATS] path too long, not saved: %s\n", path);
+        return 0;
+    }
     FILE *f = fopen(tmp, "w");
     if(!f){ if(!quiet) perror(tmp); return 0; }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header
