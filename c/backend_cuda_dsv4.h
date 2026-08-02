@@ -145,6 +145,9 @@ int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set,const int64_t *map,i
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                         int token,float routed_scale,Dsv4CudaExpertSet *experts,
                         float limit,Dsv4CudaActivation *output);
+int dsv4_cuda_route_moe_batch(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,
+                              Dsv4CudaTensor *bias,const int *tokens,int count,float routed_scale,
+                              Dsv4CudaExpertSet *experts,float limit,Dsv4CudaActivation *output);
 int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                             const Dsv4CudaActivation *peer_input,Dsv4CudaTensor *peer_gate,Dsv4CudaTensor *peer_bias,
                             int token,float routed_scale,Dsv4CudaExpertSet *local,Dsv4CudaExpertSet *peer,
