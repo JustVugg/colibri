@@ -1295,15 +1295,15 @@ static void serve_request(shards *s,const Dsv4Cfg *c,const char *model_dir,
     for(int p=0;p<n;p++)next=model_step(s,c,&state,ids[p],p,&logit);
     double decode_start=wall_time();int made=0,shown=0;
     while(made<max_tokens){
+        if(next==c->eos)break;
         out[made++]=next;
         int z=tok_decode(&tok,out,made,text,(size_t)DSV4_MAX_CONTEXT*8);
         if(z>shown){serve_data(id,text+shown,z-shown);shown=z;}
-        if(next==c->eos)break;
         next=model_step(s,c,&state,next,n+made-1,&logit);
     }
     double end=wall_time(),dec=end-decode_start;
     printf("DONE %s STAT %d %.3f 0.0 0.00 %d %d\n",id,made,
-           dec>0?made/dec:0.0,n,made>=max_tokens&&next!=c->eos);fflush(stdout);
+           dec>0?made/dec:0.0,n,made>=max_tokens);fflush(stdout);
     (void)a;state_free(&state);
 done:
     free(text);free(out);free(ids);
