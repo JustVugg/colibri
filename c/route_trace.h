@@ -298,8 +298,30 @@ static int64_t rt_load(const char *path){
 }
 
 /* atomic write of the current counters. quiet=0 prints the one-line summary. */
+/* COLI_USAGE_DECAY: the persistent history is a cumulative, never-decayed histogram,
+ * so its responsiveness falls as it grows. Measured on a host with 18.2M recorded
+ * selections: a typical turn contributes ~38k, i.e. it moves the ranking by 0.2%, and
+ * the pinned set can no longer follow a change of workload. Multiplying the counters
+ * by a factor at each save gives the history a half-life in turns (0.99 -> ~69 turns)
+ * while leaving the default (1.0) byte-identical to current behaviour.
+ * Placement only: routing math and outputs are untouched, so the token-exact oracle
+ * is unaffected. Rounding keeps a count of 1 alive -- forgetting targets the large
+ * counters that dominate the ranking, not the long tail. */
+static void rt_decay(void){
+    static double d = -1.0;
+    if(d < 0.0){ const char *e = getenv("COLI_USAGE_DECAY"); d = e ? atof(e) : 1.0;
+                 if(d <= 0.0 || d > 1.0) d = 1.0; }
+    if(d >= 1.0 || !rt_c) return;
+    for(int i = 0; i <= rt_nl; i++){
+        if(!rt_c[i]) continue;
+        for(int e = 0; e < rt_ne; e++)
+            if(rt_c[i][e]) rt_c[i][e] = (unsigned)(rt_c[i][e] * d + 0.5);
+    }
+}
+
 static int rt_save(const char *path, int quiet){
     if(!rt_c || !path || !*path) return 0;
+    rt_decay();
     int64_t tot = 0, nz = 0;
     for(int i = 0; i <= rt_nl; i++){
         if(!rt_c[i]) continue;

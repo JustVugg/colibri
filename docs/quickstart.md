@@ -86,6 +86,12 @@ One setup step: **install Python 3** from
 API gateway are Python scripts (the engine itself is pure C and needs nothing).
 No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
 
+For better understanding, from powershell prompt, a complete invocation line 
+(relying on py launcher, to be launched from the folder where colibri.exe is) is:
+
+PS1> $env:COLI_MODEL="drive:/path/to/1st_copy/model/folder/"; $env:COLI_MODEL_MIRROR="/2nd_copy/model/folder/"; & py ./coli chat
+
+
 Then continue to [step 3](#3-get-the-model). Prefer to skip the launcher? You can
 run the engine directly — `.\colibri.exe` reads the model path from the `SNAP`
 environment variable (see [docs/windows.md](windows.md)) — but `coli chat` is the

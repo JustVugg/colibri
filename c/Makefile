@@ -526,6 +526,9 @@ iobench$(EXE): iobench.c compat.h
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

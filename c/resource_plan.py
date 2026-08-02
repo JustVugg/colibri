@@ -567,6 +567,20 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
         warnings.append("VRAM tier was clamped by free VRAM or model expert size")
+    # The plan sizes the hot tier from *free* VRAM, so running it while an engine
+    # instance already holds the GPUs silently produces a tiny tier and a
+    # pessimistic hit rate that describe nothing. That is exactly when a user
+    # reaches for `coli plan` -- before changing a live deployment -- so say so
+    # rather than let the numbers be read as a capacity answer.
+    if gpus:
+        gpu_total = sum(g["total_bytes"] for g in gpus)
+        gpu_free = sum(g["free_bytes"] for g in gpus)
+        if gpu_total and gpu_free < 0.75 * gpu_total:
+            warnings.append(
+                f"{format_bytes(gpu_total - gpu_free)} of VRAM is already in use "
+                f"(only {format_bytes(gpu_free)} of {format_bytes(gpu_total)} free): "
+                "this plan plans against the remainder. Stop the running engine "
+                "for a representative plan.")
     if cold_bytes:
         warnings.append("cold expert misses may reach disk; normal decode speed depends on hit rate")
 

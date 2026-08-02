@@ -222,6 +222,11 @@ cd web && npm install && npm run build   # once
 ./coli web --model <model-dir>
 ```
 
+`coli web` differs from `coli serve` only in opening a browser — both serve the
+dashboard on the same port. On a headless host (no display, often no GPU at all)
+use `coli serve`, or `coli web --no-browser`, and point a browser at it from
+another machine. Nothing in the dashboard needs a desktop session on the host.
+
 What you get:
 
 - **Chat** with live metrics: a flashing token counter while generating, then

@@ -403,6 +403,8 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 ./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
 ./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
 ./coli chat --no-persistence --model /nvme/glm52_i4  # disable runtime persistence of KV and usage history
+./coli web  --model /nvme/glm52_i4        # API + dashboard, and opens a browser
+./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
 On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
@@ -425,9 +427,9 @@ COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
 COLI_MODEL=/nvme/inkling_i4    ./coli chat
 COLI_MODEL=/nvme/kimi_k3       ./coli chat
 
-./coli web --model /nvme/inkling_i4               # API + dashboard, same port
+./coli web --model /nvme/inkling_i4               # API + dashboard, opens a browser
 ./coli web --model /nvme/kimi_k3
-./coli serve --model /nvme/inkling_i4             # API only
+./coli serve --model /nvme/inkling_i4             # API + dashboard, no browser
 ```
 
 For the non-GLM engines `coli chat` starts the gateway locally and attaches the
