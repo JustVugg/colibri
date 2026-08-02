@@ -144,6 +144,166 @@ def _usage_authority_records(manifest):
     return records
 
 
+_RETAINED_AUTHORITY_VERSION = 1
+
+
+def _retained_process_authority(pending_entry):
+    """Persist the discovery authority needed to positively prove absence.
+
+    A retained unpublished child was created (its direct Popen handle existed)
+    but never identity-published, so its original process group can disappear
+    while a nonce-attributed descendant survives in another session (for
+    example after ``setsid()``).  Absence cannot be proven from the original
+    PGID alone; recovery must re-run the same global nonce-attribution scan used
+    for pending launches.  Carry exactly that authority on the retained record.
+    """
+    return {
+        "authority_version": _RETAINED_AUTHORITY_VERSION,
+        "nonce": pending_entry["nonce"],
+        "uid": pending_entry["uid"],
+        "weights_dir": pending_entry["weights_dir"],
+        "launch_not_before": pending_entry["launch_not_before"],
+        "launcher_pid": pending_entry["launcher_pid"],
+        "launcher_starttime": pending_entry["launcher_starttime"],
+        "launcher_cmdline": list(pending_entry["launcher_cmdline"]),
+        "expected_command": list(pending_entry["expected_command"]),
+    }
+
+
+def _retained_authority(entry):
+    """Return validated discovery authority for a retained entry, or None.
+
+    Legacy records created before discovery authority was persisted cannot be
+    safely reconciled: their absence cannot be positively established.  Return
+    None so callers fail closed instead of guessing or signalling by PID.
+    """
+    if entry.get("authority_version") != _RETAINED_AUTHORITY_VERSION:
+        return None
+    nonce = entry.get("nonce")
+    uid = entry.get("uid")
+    weights_dir = entry.get("weights_dir")
+    launch_not_before = entry.get("launch_not_before")
+    launcher_pid = entry.get("launcher_pid")
+    launcher_starttime = entry.get("launcher_starttime")
+    launcher_cmdline = entry.get("launcher_cmdline")
+    expected_command = entry.get("expected_command")
+    if not (isinstance(nonce, str) and nonce and "\0" not in nonce):
+        return None
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+        return None
+    if (
+        not isinstance(weights_dir, str)
+        or not weights_dir
+        or "\0" in weights_dir
+    ):
+        return None
+    if (
+        not isinstance(launch_not_before, int)
+        or isinstance(launch_not_before, bool)
+        or launch_not_before < 0
+    ):
+        return None
+    if (
+        not isinstance(launcher_pid, int)
+        or isinstance(launcher_pid, bool)
+        or launcher_pid <= 0
+    ):
+        return None
+    if (
+        not isinstance(launcher_starttime, int)
+        or isinstance(launcher_starttime, bool)
+        or launcher_starttime <= 0
+    ):
+        return None
+    for label, value in (
+        ("launcher command", launcher_cmdline),
+        ("expected command", expected_command),
+    ):
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(
+                not isinstance(item, str) or not item
+                for item in value
+            )
+        ):
+            return None
+    return {
+        "nonce": nonce,
+        "uid": uid,
+        "weights_dir": weights_dir,
+        "launch_not_before": launch_not_before,
+        "launcher_pid": launcher_pid,
+        "launcher_starttime": launcher_starttime,
+        "launcher_cmdline": list(launcher_cmdline),
+        "expected_command": list(expected_command),
+    }
+
+
+def _retained_absence_failure(
+    entry,
+    *,
+    group_alive,
+    discover_managed_launches,
+):
+    """Return a failure string unless process absence is positively established.
+
+    Positive absence requires BOTH the original process group to be gone AND
+    zero nonce-attributable live processes anywhere on the system.  A
+    descendant that re-sessioned (``setsid()``) evades the original-PGID check
+    but is still found by the global nonce scan, so the scan is mandatory and
+    is re-run here, immediately before any accounting merge.
+    """
+    pid = entry.get("pgid", entry.get("pid"))
+    authority = _retained_authority(entry)
+    if authority is None:
+        return (
+            "PID/PGID %s unpublished managed-child recovery lacks durable "
+            "discovery authority; absence is unproven" % pid
+        )
+    try:
+        alive = group_alive(int(pid))
+    except BaseException as exc:
+        return (
+            "PID/PGID %s absence check failed during unpublished "
+            "recovery: %s" % (pid, exc)
+        )
+    if alive is not False:
+        return (
+            "PID/PGID %s unpublished managed process group is still "
+            "live or its absence is unproven" % pid
+        )
+    try:
+        candidates = discover_managed_launches(
+            nonce=authority["nonce"],
+            uid=authority["uid"],
+            state_dir=entry.get("state_dir"),
+            weights_dir=authority["weights_dir"],
+            not_before_starttime=authority["launch_not_before"],
+            launcher_pid=authority["launcher_pid"],
+            launcher_starttime=authority["launcher_starttime"],
+            launcher_cmdline=authority["launcher_cmdline"],
+            expected_command=authority["expected_command"],
+        )
+    except BaseException as exc:
+        return (
+            "PID/PGID %s global nonce attribution failed during "
+            "unpublished recovery: %s" % (pid, exc)
+        )
+    if not isinstance(candidates, list):
+        return (
+            "PID/PGID %s global nonce attribution returned an invalid "
+            "result during unpublished recovery" % pid
+        )
+    if candidates:
+        return (
+            "PID/PGID %s unpublished managed process still has %d "
+            "nonce-attributable live process(es); absence is unproven"
+            % (pid, len(candidates))
+        )
+    return None
+
+
 def _reserved_usage_transaction_ids(manifest):
     owners = {}
     for record in _usage_authority_records(manifest):
@@ -495,32 +655,31 @@ def _preflight_pending_launches(
     return preflights, failures
 
 
-def _preflight_unpublished_processes(manifest, *, group_alive):
-    """Prove every retained direct-created PGID absent without mutation."""
+def _preflight_unpublished_processes(
+    manifest,
+    *,
+    group_alive,
+    discover_managed_launches,
+):
+    """Prove every retained direct-created process positively absent.
+
+    Absence is positive only when the original process group is gone AND the
+    global nonce scan finds zero attributable live processes.  A re-sessioned
+    descendant evades the original-PGID check and is caught only by the scan,
+    so the scan is mandatory here.  Nothing is mutated.
+    """
     failures = []
     for entry in _retained_process_recovery(manifest):
         pid = entry.get("pgid", entry.get("pid"))
-        try:
-            alive = group_alive(int(pid))
-        except BaseException as exc:
-            alive = None
-            failure = (
-                "PID/PGID %s absence check failed during unpublished "
-                "recovery: %s" % (pid, exc)
-            )
-        else:
-            failure = None
-        if alive is not False:
-            failure = failure or (
-                "PID/PGID %s unpublished managed process group is still "
-                "live or its absence is unproven" % pid
-            )
+        failure = _retained_absence_failure(
+            entry,
+            group_alive=group_alive,
+            discover_managed_launches=discover_managed_launches,
+        )
         baseline = entry.get("usage_baseline")
         merge_id = entry.get("usage_merge_id")
-        if not isinstance(baseline, dict) or not (
-            isinstance(merge_id, str)
-            and len(merge_id) == 32
-            and all(character in "0123456789abcdef" for character in merge_id)
+        if not isinstance(baseline, dict) or not _valid_usage_transaction_id(
+            merge_id
         ):
             failure = failure or (
                 "PID/PGID %s unpublished recovery is missing exact durable "
@@ -535,10 +694,17 @@ def _reconcile_unpublished_processes(
     manifest,
     *,
     group_alive,
+    discover_managed_launches,
     merge_usage,
     save_manifest,
 ):
-    """Merge an unpublished child only after its direct-created PGID is absent."""
+    """Merge an unpublished child only after its absence is positively proven.
+
+    Absence is re-proven globally immediately before each accounting merge: the
+    original process group must be gone AND the global nonce scan must find zero
+    attributable live processes.  A re-sessioned descendant that evades the
+    original-PGID check keeps the entry retained instead of being merged.
+    """
     retained = list(_retained_process_recovery(manifest))
     if not retained:
         return manifest
@@ -550,6 +716,7 @@ def _reconcile_unpublished_processes(
     preflight_failures = _preflight_unpublished_processes(
         manifest,
         group_alive=group_alive,
+        discover_managed_launches=discover_managed_launches,
     )
     if preflight_failures:
         recovery = manifest.setdefault("recovery", {})
@@ -570,6 +737,21 @@ def _reconcile_unpublished_processes(
     released = []
     for entry in retained:
         pid = entry.get("pgid", entry.get("pid"))
+        # Revalidate immediately before merging accounting.  Time has passed
+        # since preflight and other entries may have merged in between, so
+        # absence (original group gone AND zero attributable processes) must be
+        # re-proven right here.  No numeric PID is ever signalled on refusal.
+        revalidation = _retained_absence_failure(
+            entry,
+            group_alive=group_alive,
+            discover_managed_launches=discover_managed_launches,
+        )
+        if revalidation is not None:
+            retained_entry = dict(entry)
+            retained_entry["error"] = revalidation
+            remaining.append(retained_entry)
+            failures.append(revalidation)
+            continue
         try:
             merge_usage(
                 entry,
@@ -2313,15 +2495,16 @@ def start(
                 ),
             }
         retained_processes = [
-            {
-                "pid": context.get("rollback_pid"),
-                "pgid": context.get("rollback_pid"),
-                "node": context.get("node"),
-                "state_dir": context["state_dir"],
-                "usage_baseline": context["usage_baseline"],
-                "usage_merge_id": context["usage_merge_id"],
-                "error": context.get("rollback_error"),
-            }
+            dict(
+                pid=context.get("rollback_pid"),
+                pgid=context.get("rollback_pid"),
+                node=context.get("node"),
+                state_dir=context["state_dir"],
+                usage_baseline=context["usage_baseline"],
+                usage_merge_id=context["usage_merge_id"],
+                error=context.get("rollback_error"),
+                **_retained_process_authority(context["pending_entry"]),
+            )
             for context in launch_contexts
             if (
                 context.get("rollback_process_alive")
@@ -2457,6 +2640,7 @@ def stop(
     retained_refusals = _preflight_unpublished_processes(
         manifest,
         group_alive=group_alive,
+        discover_managed_launches=discover_managed_launches,
     )
     recovery_refusals = pending_refusals + retained_refusals
     if recovery_refusals:
@@ -2594,6 +2778,7 @@ def stop(
         manifest = _reconcile_unpublished_processes(
             manifest,
             group_alive=group_alive,
+            discover_managed_launches=discover_managed_launches,
             merge_usage=merge_usage,
             save_manifest=save_manifest,
         )

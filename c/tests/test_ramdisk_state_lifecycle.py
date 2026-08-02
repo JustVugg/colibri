@@ -2403,6 +2403,15 @@ class StateAndSafetyTest(unittest.TestCase):
             "usage_baseline": {"0:1": 10},
             "usage_merge_id": merge_id,
             "error": "group absence unproven",
+            "authority_version": lifecycle_support._RETAINED_AUTHORITY_VERSION,
+            "nonce": "a" * 48,
+            "uid": 1000,
+            "weights_dir": os.path.join(self.root, "accounting-weights"),
+            "launch_not_before": 1,
+            "launcher_pid": 1,
+            "launcher_starttime": 1,
+            "launcher_cmdline": ["coli"],
+            "expected_command": ["coli", "serve"],
         }
         manifest = {
             "state": "error",
@@ -2442,6 +2451,7 @@ class StateAndSafetyTest(unittest.TestCase):
             lifecycle_support._reconcile_unpublished_processes(
                 manifest,
                 group_alive=lambda ignored: False,
+                discover_managed_launches=mock.Mock(return_value=[]),
                 merge_usage=merge,
                 save_manifest=fail_first_post_merge_save,
             )
@@ -2453,6 +2463,7 @@ class StateAndSafetyTest(unittest.TestCase):
         lifecycle_support._reconcile_unpublished_processes(
             restarted,
             group_alive=lambda ignored: False,
+            discover_managed_launches=mock.Mock(return_value=[]),
             merge_usage=merge,
             save_manifest=lambda ignored: None,
         )
@@ -2462,6 +2473,446 @@ class StateAndSafetyTest(unittest.TestCase):
             restarted["recovery"]["retained_processes"],
             [],
         )
+
+    def _retained_entry_with_authority(
+        self,
+        state_dir,
+        merge_id,
+        *,
+        pid=12009,
+        nonce="a" * 48,
+    ):
+        """A retained unpublished entry carrying full discovery authority."""
+        return {
+            "pid": pid,
+            "pgid": pid,
+            "node": None,
+            "state_dir": state_dir,
+            "usage_baseline": {"0:1": 10},
+            "usage_merge_id": merge_id,
+            "error": "group absence unproven",
+            "authority_version": lifecycle_support._RETAINED_AUTHORITY_VERSION,
+            "nonce": nonce,
+            "uid": 1000,
+            "weights_dir": os.path.join(self.root, "authority-weights"),
+            "launch_not_before": 1,
+            "launcher_pid": 1,
+            "launcher_starttime": 1,
+            "launcher_cmdline": ["coli"],
+            "expected_command": ["coli", "serve"],
+        }
+
+    def _unpublished_usage_manifest(self, merge_id, baseline_delta=2):
+        model_dir = os.path.join(self.root, "unpub-model-%s" % merge_id)
+        state_dir = os.path.join(self.root, "unpub-state-%s" % merge_id)
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_support._usage_write(canonical, {"0:1": 10})
+        state_support._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 10 + baseline_delta},
+        )
+        entry = self._retained_entry_with_authority(state_dir, merge_id)
+        manifest = {
+            "state": "error",
+            "plan": {"model": {"path": model_dir}, "mounts": []},
+            "recovery": {
+                "operation": "start",
+                "state": "attention-required",
+                "retained_processes": [entry],
+            },
+        }
+        return manifest, canonical, entry
+
+    def _unpublished_merge(self, canonical):
+        def merge(record, canonical_path, plan=None):
+            return state_support._merge_usage(
+                record,
+                canonical_path,
+                plan=plan,
+                filesystem_for_path=lambda ignored: "ext4",
+                source_still_matches=lambda ignored: None,
+            )
+        return merge
+
+    def test_retained_authority_helper_preserves_discovery_metadata(self):
+        pending_entry = {
+            "nonce": "deadbeef" * 6,
+            "uid": 1000,
+            "weights_dir": "/srv/w",
+            "launch_not_before": 12345,
+            "launcher_pid": 99,
+            "launcher_starttime": 4321,
+            "launcher_cmdline": ["coli", "ramdisk"],
+            "expected_command": ["coli", "serve"],
+        }
+        authority = lifecycle_support._retained_process_authority(pending_entry)
+        self.assertEqual(
+            authority["authority_version"],
+            lifecycle_support._RETAINED_AUTHORITY_VERSION,
+        )
+        entry = dict(
+            pid=12010,
+            pgid=12010,
+            state_dir="/srv/state",
+            usage_baseline={"0:1": 1},
+            usage_merge_id="c" * 32,
+            **authority,
+        )
+        validated = lifecycle_support._retained_authority(entry)
+        self.assertEqual(validated["nonce"], pending_entry["nonce"])
+        self.assertEqual(validated["uid"], pending_entry["uid"])
+        self.assertEqual(
+            validated["weights_dir"], pending_entry["weights_dir"]
+        )
+        self.assertEqual(
+            validated["launch_not_before"],
+            pending_entry["launch_not_before"],
+        )
+        self.assertEqual(
+            validated["launcher_pid"], pending_entry["launcher_pid"]
+        )
+        # Legacy records (no persisted authority) cannot be validated, so
+        # callers fail closed instead of guessing absence.
+        legacy = {
+            "pid": 1,
+            "pgid": 1,
+            "state_dir": "/s",
+            "usage_baseline": {},
+            "usage_merge_id": "d" * 32,
+        }
+        self.assertIsNone(lifecycle_support._retained_authority(legacy))
+
+    def test_unpublished_recovery_refuses_without_discovery_authority(self):
+        # A legacy retained record (created before authority was persisted)
+        # cannot be positively proven absent even when the original group is
+        # gone: refuse to merge, keep it retained, mutate no accounting.
+        merge_id = "6" * 32
+        manifest, canonical, _entry = self._unpublished_usage_manifest(merge_id)
+        authority_keys = (
+            "authority_version",
+            "nonce",
+            "uid",
+            "weights_dir",
+            "launch_not_before",
+            "launcher_pid",
+            "launcher_starttime",
+            "launcher_cmdline",
+            "expected_command",
+        )
+        manifest["recovery"]["retained_processes"][0] = {
+            key: value
+            for key, value in (
+                manifest["recovery"]["retained_processes"][0].items()
+            )
+            if key not in authority_keys
+        }
+        merge = mock.Mock()
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "lacks durable discovery authority",
+        ):
+            lifecycle_support._reconcile_unpublished_processes(
+                manifest,
+                group_alive=lambda ignored: False,
+                discover_managed_launches=mock.Mock(return_value=[]),
+                merge_usage=merge,
+                save_manifest=lambda ignored: None,
+            )
+        merge.assert_not_called()
+        self.assertEqual(state_support._usage_read(canonical), {"0:1": 10})
+        self.assertEqual(
+            len(manifest["recovery"]["retained_processes"]), 1
+        )
+
+    def test_unpublished_recovery_refuses_when_nonce_descendant_alive(self):
+        # Original group gone BUT a nonce-attributed descendant survives in a
+        # new session: absence is unproven, so no merge and the record is kept.
+        merge_id = "7" * 32
+        manifest, canonical, entry = self._unpublished_usage_manifest(merge_id)
+        escaped = {
+            "pid": 4242,
+            "uid": entry["uid"],
+            "starttime": 999,
+            "nonce": entry["nonce"],
+            "pgid": 4242,
+            "sid": 4242,
+            "cmdline": entry["expected_command"],
+            "state_dir": entry["state_dir"],
+            "weights_dir": entry["weights_dir"],
+        }
+        merge = mock.Mock()
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "nonce-attributable live process",
+        ):
+            lifecycle_support._reconcile_unpublished_processes(
+                manifest,
+                group_alive=lambda ignored: False,
+                discover_managed_launches=mock.Mock(return_value=[escaped]),
+                merge_usage=merge,
+                save_manifest=lambda ignored: None,
+            )
+        merge.assert_not_called()
+        self.assertEqual(state_support._usage_read(canonical), {"0:1": 10})
+        self.assertEqual(
+            len(manifest["recovery"]["retained_processes"]), 1
+        )
+
+    def test_unpublished_recovery_refuses_when_global_discovery_fails(self):
+        merge_id = "8" * 32
+        manifest, canonical, _entry = self._unpublished_usage_manifest(merge_id)
+        merge = mock.Mock()
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "global nonce attribution failed",
+        ):
+            lifecycle_support._reconcile_unpublished_processes(
+                manifest,
+                group_alive=lambda ignored: False,
+                discover_managed_launches=mock.Mock(
+                    side_effect=ramdisk.RamdiskError(
+                        "process table changed during scan"
+                    )
+                ),
+                merge_usage=merge,
+                save_manifest=lambda ignored: None,
+            )
+        merge.assert_not_called()
+        self.assertEqual(state_support._usage_read(canonical), {"0:1": 10})
+
+    def test_unpublished_recovery_revalidates_immediately_before_merge(self):
+        # Preflight proves absence, but a nonce-attributed process appears
+        # between preflight and the per-entry merge: the immediate re-check
+        # must refuse and mutate no accounting.
+        merge_id = "9" * 32
+        manifest, canonical, entry = self._unpublished_usage_manifest(merge_id)
+        escaped = {
+            "pid": 5353,
+            "uid": entry["uid"],
+            "starttime": 999,
+            "nonce": entry["nonce"],
+            "pgid": 5353,
+            "sid": 5353,
+            "cmdline": entry["expected_command"],
+            "state_dir": entry["state_dir"],
+            "weights_dir": entry["weights_dir"],
+        }
+        # First call (preflight) sees nothing; the per-entry revalidation sees
+        # the escaped descendant and must block the merge.
+        discover = mock.Mock(side_effect=[[], [escaped]])
+        merge = mock.Mock()
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "nonce-attributable live process",
+        ):
+            lifecycle_support._reconcile_unpublished_processes(
+                manifest,
+                group_alive=lambda ignored: False,
+                discover_managed_launches=discover,
+                merge_usage=merge,
+                save_manifest=lambda ignored: None,
+            )
+        merge.assert_not_called()
+        self.assertEqual(state_support._usage_read(canonical), {"0:1": 10})
+        self.assertEqual(
+            len(manifest["recovery"]["retained_processes"]), 1
+        )
+
+    def test_unpublished_recovery_merges_once_when_globally_absent(self):
+        merge_id = "1" * 32
+        manifest, canonical, _entry = self._unpublished_usage_manifest(merge_id)
+        lifecycle_support._reconcile_unpublished_processes(
+            manifest,
+            group_alive=lambda ignored: False,
+            discover_managed_launches=mock.Mock(return_value=[]),
+            merge_usage=self._unpublished_merge(canonical),
+            save_manifest=lambda ignored: None,
+        )
+        self.assertEqual(state_support._usage_read(canonical), {"0:1": 12})
+        self.assertEqual(
+            manifest["recovery"]["retained_processes"], []
+        )
+
+    @requires_linux_operational
+    def test_unpublished_recovery_real_setsid_descendant_refuses(self):
+        # Real kernel reproduction: a managed leader forks a child that calls
+        # setsid() and survives in a new session while the original leader's
+        # process group disappears. Recovery must not mistake the empty
+        # original group for absence while that descendant is alive.
+        import subprocess
+        import time as _time
+
+        def stat_fields(pid):
+            with open("/proc/%d/stat" % pid) as handle:
+                raw = handle.read()
+            tail = raw[raw.rfind(")") + 2:].split()
+            return {
+                "state": tail[0],
+                "pgid": int(tail[2]),
+                "sid": int(tail[3]),
+                "starttime": int(tail[19]),
+            }
+
+        def cmdline_of(pid):
+            with open("/proc/%d/cmdline" % pid, "rb") as handle:
+                raw = handle.read()
+            return [
+                token.decode()
+                for token in raw.split(b"\0")
+                if token
+            ]
+
+        nonce = os.urandom(24).hex()
+        state_dir = os.path.join(self.root, "setsid-state")
+        weights_dir = os.path.join(self.root, "setsid-weights")
+        os.makedirs(state_dir)
+        os.makedirs(weights_dir)
+        child_pid_file = os.path.join(self.root, "escaped-child.pid")
+        leader_script = (
+            "import os, time\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.setsid()\n"
+            "    time.sleep(30)\n"
+            "    os._exit(0)\n"
+            "else:\n"
+            "    open(os.environ['CHILD_PID_FILE'], 'w').write(str(child))\n"
+            "    os._exit(0)\n"
+        )
+        expected_command = [sys.executable, "-c", leader_script]
+        env = dict(os.environ)
+        env.update(
+            COLI_MANAGED_NONCE=nonce,
+            COLI_STATE_DIR=state_dir,
+            COLI_WEIGHTS_DIR=weights_dir,
+            CHILD_PID_FILE=child_pid_file,
+        )
+        leader = subprocess.Popen(
+            expected_command,
+            env=env,
+            start_new_session=True,
+        )
+        original_pgid = leader.pid
+        leader.wait()
+        escaped_pid = None
+        for _ in range(200):
+            if os.path.exists(child_pid_file):
+                with open(child_pid_file) as handle:
+                    escaped_pid = int(handle.read().strip())
+                break
+            _time.sleep(0.05)
+        self.assertIsNotNone(escaped_pid)
+        _time.sleep(0.3)
+        try:
+            escaped_identity = stat_fields(escaped_pid)
+            self.assertNotEqual(escaped_identity["pgid"], original_pgid)
+            self.assertEqual(
+                escaped_identity["pgid"], escaped_identity["sid"]
+            )
+            # Mechanism: the original group is gone, yet the global nonce scan
+            # still finds the re-sessioned descendant.
+            self.assertFalse(
+                linux_ops._process_group_alive(original_pgid)
+            )
+            launcher_cmdline = cmdline_of(os.getpid())
+            launcher_starttime = stat_fields(os.getpid())["starttime"]
+            scan = None
+            for _ in range(20):
+                try:
+                    scan = linux_ops._managed_launch_processes(
+                        nonce,
+                        host_uid(),
+                        state_dir=state_dir,
+                        weights_dir=weights_dir,
+                        not_before_starttime=escaped_identity["starttime"],
+                        launcher_pid=os.getpid(),
+                        launcher_starttime=launcher_starttime,
+                        launcher_cmdline=launcher_cmdline,
+                        expected_command=expected_command,
+                    )
+                    break
+                except ramdisk.RamdiskError:
+                    _time.sleep(0.2)
+            self.assertIsNotNone(scan)
+            self.assertTrue(
+                any(
+                    candidate.get("pid") == escaped_pid
+                    for candidate in scan
+                )
+            )
+
+            # Reconciliation with the real scan and group check must refuse to
+            # merge accounting while the escaped descendant is alive.
+            merge_id = "b" * 32
+            model_dir = os.path.join(self.root, "setsid-model")
+            os.makedirs(model_dir)
+            canonical = os.path.join(model_dir, ".coli_usage")
+            state_support._usage_write(canonical, {"0:1": 10})
+            state_support._usage_write(
+                os.path.join(state_dir, ".coli_usage"),
+                {"0:1": 13},
+            )
+            entry = {
+                "pid": original_pgid,
+                "pgid": original_pgid,
+                "node": None,
+                "state_dir": state_dir,
+                "usage_baseline": {"0:1": 10},
+                "usage_merge_id": merge_id,
+                "error": "group absence unproven",
+                "authority_version": (
+                    lifecycle_support._RETAINED_AUTHORITY_VERSION
+                ),
+                "nonce": nonce,
+                "uid": host_uid(),
+                "weights_dir": weights_dir,
+                "launch_not_before": escaped_identity["starttime"],
+                "launcher_pid": os.getpid(),
+                "launcher_starttime": launcher_starttime,
+                "launcher_cmdline": launcher_cmdline,
+                "expected_command": expected_command,
+            }
+            manifest = {
+                "state": "error",
+                "plan": {"model": {"path": model_dir}, "mounts": []},
+                "recovery": {
+                    "operation": "start",
+                    "state": "attention-required",
+                    "retained_processes": [entry],
+                },
+            }
+            merge = mock.Mock()
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "incomplete",
+            ):
+                lifecycle_support._reconcile_unpublished_processes(
+                    manifest,
+                    group_alive=linux_ops._process_group_alive,
+                    discover_managed_launches=(
+                        linux_ops._managed_launch_processes
+                    ),
+                    merge_usage=merge,
+                    save_manifest=lambda ignored: None,
+                )
+            merge.assert_not_called()
+            self.assertEqual(
+                state_support._usage_read(canonical), {"0:1": 10}
+            )
+            self.assertEqual(
+                len(manifest["recovery"]["retained_processes"]), 1
+            )
+        finally:
+            try:
+                os.kill(escaped_pid, 9)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                os.waitpid(escaped_pid, 0)
+            except (ChildProcessError, OSError):
+                pass
 
     def test_destroy_refuses_unresolved_unpublished_process_recovery(self):
         manifest = self.manifest(state="error")

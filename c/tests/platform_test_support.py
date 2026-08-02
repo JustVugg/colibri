@@ -46,6 +46,7 @@ _LINUX_OPERATIONAL_TESTS = frozenset(
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_stop_preserves_termination_failure_until_group_absence_is_proven",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_stop_revalidates_identity_before_escalating_to_sigkill",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_stop_validates_every_pid_before_signaling_any",
+        "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_unpublished_recovery_real_setsid_descendant_refuses",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_verified_stop_reaps_a_locally_owned_zombie_before_escalation",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_verified_termination_treats_retained_live_child_as_independent_evidence",
     }

@@ -535,7 +535,7 @@ import ramdisk
     def test_platform_skip_inventory_is_exact_and_drift_checked(self):
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_operational"]["tests"]),
-            38,
+            39,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["sigterm_handler"]["tests"]),
