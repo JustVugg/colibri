@@ -875,9 +875,15 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
         if (qk_rope)
             rope_heads_dynamic<<<(qk_rope / 2 + 255) / 256, 256, 0, comp>>>(
                 comp3, 1, dim, qk_rope, c->decode_state, 1 - ratio, 0, ratio, cache->comp_cos, cache->comp_sin);
+        /* The FlashInfer cache packer performs the model's UE8M0 FP8
+         * quantization.  Quantizing and dequantizing here first would apply
+         * a second, differently-scaled FP8 round before the real cache
+         * store.  Keep the simulation only for the float-cache fallback. */
+#ifndef COLI_DSV4_FLASHINFER
         if (dim > qk_rope)
             fp8_sim64_dynamic<<<(dim - qk_rope + 63) / 64, 64, 0, comp>>>(comp3, dim - qk_rope,
                                                                           c->decode_state, ratio);
+#endif
         compressed_store_dynamic<<<(dim + 255) / 256, 256, 0, comp>>>(
             cache->compressed, comp3, cache->compressed_len, c->decode_state, ratio, cache->max_compressed, dim);
         int commit_blocks = overlap ? (ratio * O + 255) / 256 : 1;
