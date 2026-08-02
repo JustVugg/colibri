@@ -1550,7 +1550,7 @@ class ManagedLaunchTest(unittest.TestCase):
                 ramdisk.secrets, "token_hex", side_effect=deterministic_token
             ), mock.patch(
                 "urllib.request.urlopen", return_value=FakeResponse()
-            ):
+            ) as urlopen_mock:
                 with self.assertRaisesRegex(
                     ramdisk.RamdiskError, "exited before readiness"
                 ):
@@ -1568,6 +1568,17 @@ class ManagedLaunchTest(unittest.TestCase):
         ]
         self.assertEqual(len(survivors), 1)
         survivor = survivors[0]
+        # Lock the readiness ordering: the survivor must have actually become
+        # ready (real readiness loop returned) BEFORE the sibling died. A
+        # reversed-iteration mutant makes the sibling die first with no engine
+        # ready, which would leave ready_at unset and record zero health
+        # requests.
+        self.assertIn("ready_at", survivor)
+        self.assertEqual(urlopen_mock.call_count, 1)
+        self.assertEqual(
+            urlopen_mock.call_args.args[0].full_url,
+            "http://127.0.0.1:%d/health" % survivor["port"],
+        )
         self.assertNotIn("stopped_at", survivor)
         self.assertNotIn("usage_merged_at", survivor)
         self.assertIn("alive", survivor["stop_error"])
@@ -1611,6 +1622,9 @@ class ManagedLaunchTest(unittest.TestCase):
         stop_merge.assert_called_once()
         self.assertEqual(stopped["state"], "stopped")
         self.assertNotIn("stop_error", stopped["processes"][0])
+        # A verified recovery must not advertise stale launch-time errors.
+        self.assertNotIn("launch_error", stopped)
+        self.assertNotIn("cleanup_errors", stopped)
 
     def test_full_mode_start_refuses_wrong_usage_identity_before_seed_or_spawn(self):
         class FakeSocket:

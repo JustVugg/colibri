@@ -3020,7 +3020,15 @@ def stop(
         )
         else "stopped"
     )
-    if isinstance(manifest.get("cleanup_errors"), list):
+    if manifest["state"] == "stopped":
+        # A verified recovery reconciles every retained process and leaves no
+        # stale launch-time error to advertise. Clear the advertised-recovery
+        # keys so a later status does not report a false attention-required
+        # state, and so a subsequent start does not inherit stale errors.
+        manifest.pop("launch_error", None)
+        manifest.pop("cleanup_errors", None)
+        manifest.pop("recovery", None)
+    elif isinstance(manifest.get("cleanup_errors"), list):
         manifest["cleanup_errors"] = [
             error
             for error in manifest["cleanup_errors"]
