@@ -47,6 +47,9 @@
  *                        everywhere; output identical.
  *   K3_VK_GB=N           VRAM cap for the tier (default: driver budget)
  *   K3_VK_UP=N           routed-expert uploads per step (default 8)
+ *   K3_METAL=0|1         Metal tier (build with `make METAL=1 kimi_k3`; Phase 4:
+ *                        scaffolding only — dispatch hooks present, forward NOT
+ *                        IMPLEMENTED; all ops fall through to CPU).
  *   K3_DIRECT=0|1        O_DIRECT expert reads (default 1; buffered fallback)
  *   K3_IDOT=0|1          int8-activation expert matmuls (default 1; 0 = float)
  *   K3_PIPE=0|1          overlap expert loads with compute (default 1)
@@ -96,7 +99,7 @@ typedef struct {
     int hidden, n_layers, vocab, first_dense, dense_inter;
     /* MLA */
     int n_heads, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head;
-    float attn_scale;
+    float attn_scale, theta;
     /* KDA */
     int kda_heads, kda_hd, kda_proj, conv_k;
     float gate_lb;
@@ -107,12 +110,14 @@ typedef struct {
     int res_bs;
     float eps;
     int8_t is_kda[128];
+    int8_t idx_type[128];                     /* DSA: 1=full (own Ic + top-K), 0=shared (reuse) */
+    int index_hd, index_nh, index_topk;       /* DSA indexer dimensions */
     int bos, eos[8], n_eos;
 } Cfg;
 
 /* ---------- RAM-resident weight, quantized at load ---------- */
 typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
-                 void *vk; /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */ } W;
+                 void *vk;    void *metal; /* ColiVkTensor* uploaded (K3_VK) / ColiMetalTensor* registered (K3_METAL); NULL = CPU only */ } W;
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
@@ -120,11 +125,16 @@ typedef struct {                          /* KDA layer */
     float *fa, *fb;                       /* decay low-rank, f32 [hd,hidden] [proj,hd] */
     float *bp;                            /* beta proj f32 [heads,hidden] */
     float *dt, *A, *onw;                  /* dt_bias[proj], exp(A_log)[heads], o_norm[hd] */
+    void   *metal_fa, *metal_fb, *metal_bp; /* Metal tensor wrappers for f32 weights */
 } Kda;
 
 typedef struct {                          /* gated MLA layer */
     W qa, qb, kva, kvb, o, g;
     float *qa_ln, *kva_ln;
+    /* DSA indexer (full layers only, optional) */
+    W      wk, wq, wp;                    /* [index_hd x {hidden, q_lora, index_hd}] */
+    float  *knw, *knb;                    /* key layernorm [index_hd] */
+    float  *Ic;                           /* indexer cache [max_t * index_hd] */
 } Mla;
 
 typedef struct {                          /* LatentMoE */
@@ -173,6 +183,8 @@ typedef struct {
      * and only the 24 MLA layers keep Lc/Rc — so an explicit record of the
      * tokens fed is the only description of it that cannot drift. */
     kv_prefix kvp;
+    /* DSA selection: per-slot k_idx arrays (shared across layers) */
+    int    *dsa_nsel, *dsa_sel; int64_t dsa_scap; /* k_idx selection: [S] counts + [S*topk] indices */
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
@@ -233,6 +245,20 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 }
 static float *falloc(int64_t n){ float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
 static float *fcalloc(int64_t n){ float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
+/* Aligned + zeroed alloc. Metal's wrap() only takes the zero-copy (newBufferWithBytesNoCopy)
+ * path when the pointer AND size are 16384-aligned; otherwise it makes a private GPU copy
+ * that is never synced back. Buffers the GPU WRITES and must persist across tokens (KDA
+ * state, conv windows) therefore have to be 16 KB-aligned so GPU updates land in host memory.
+ * Freed with plain free(); posix_memalign memory is free()-compatible on macOS. */
+static float *afcalloc(int64_t n){
+#ifdef COLI_METAL
+    size_t sz=(size_t)n*sizeof(float); void *p=NULL;
+    if(posix_memalign(&p,16384,sz)){ fprintf(stderr,"OOM %lld floats\n",(long long)n); exit(1); }
+    memset(p,0,sz); return (float*)p;
+#else
+    return fcalloc(n);
+#endif
+}
 static inline float sigmoidf_(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf_(float x){ return x/(1.f+expf(-x)); }
 static void softmax_(float *x, int n){ float m=x[0]; for(int i=1;i<n;i++) if(x[i]>m)m=x[i];
@@ -241,6 +267,51 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
     float r=1.f/sqrtf((float)(ms/D)+eps);
     for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
+}
+
+/* ---------- DSA (Dictionary Sparse Attention) CPU helpers ---------- */
+static void dsa_rope(float *v, int pos, int qk_rope, float base_theta){
+    int half = qk_rope/2;
+    if(qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope buffer (256)\n",qk_rope); exit(1); }
+    float in[256]; memcpy(in,v,qk_rope*sizeof(float));
+    for(int j=0;j<half;j++){
+        float inv=powf(base_theta,-2.0f*j/qk_rope), ang=pos*inv;
+        float cs=cosf(ang), sn=sinf(ang);
+        float a=in[2*j], b=in[2*j+1];
+        v[j]      = a*cs - b*sn;
+        v[half+j] = b*cs + a*sn;
+    }
+}
+
+typedef struct { float sc; int idx; } DsaEntry;
+static int dsa_entry_cmp_desc(const void *a,const void *b){
+    float d=((const DsaEntry*)b)->sc-((const DsaEntry*)a)->sc;
+    return d>0?1:d<0?-1:0;
+}
+
+/* dsa_score: multi-head cosine distance + ReLU + weight + top-K select.
+ * qi: [nh * index_hd] — per-head indexer query (post-RoPE, post-projection)
+ * Ic: [nk * index_hd] — indexer cache rows
+ * w32: [nh] — weight scalars from P projection
+ * nk: number of cache rows in context
+ * sel: output buffer of maxsel ints (sorted desc by score)
+ * Returns actual count of selected indices. Caller supplies token-local DsaEntry array. */
+static int dsa_score_single(int *sel, int maxsel, const float *qi, const float *Ic, int index_hd,
+                            const float *w32, int nh, int nk, DsaEntry *entries){
+    if(nk <= 0 || maxsel <= 0) return 0;
+    for(int t=0;t<nk;t++){
+        float s = 0;
+        for(int h=0;h<nh;h++){
+            float d=0;
+            for(int i=0;i<index_hd;i++) d += qi[(int64_t)h*index_hd+i] * Ic[(int64_t)t*index_hd+i];
+            s += w32[h]*(d>0?d:0); /* ReLU per-head */
+        }
+        entries[t]=(DsaEntry){s/sqrtf((float)nh), t};
+    }
+    int K = nk < maxsel ? nk : maxsel;
+    qsort(entries, nk, sizeof(DsaEntry), dsa_entry_cmp_desc);
+    for(int k=0;k<K;k++) sel[k]=entries[k].idx;
+    return K;
 }
 
 /* ---------- W: load-time quantization + matvec ---------- */
@@ -252,7 +323,7 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
  *    experts enter from freshly-read RAM slots (K3_VK_UP per step) until the
  *    VRAM budget (K3_VK_GB) is reached; resident experts then skip BOTH the
  *    disk read and the CPU matmuls at decode (C==1). */
-static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
+static int g_k3_vk __attribute__((unused))=0;     /* backend live (K3_VK=0 disables) */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
@@ -294,7 +365,46 @@ static int w_vk_upload(W *w){
         fmt==1?(const void*)w->q8:(const void*)w->q4,w->s,fmt,w->I,w->O,w->gs);
 }
 #endif
+/* ---------- Metal tier (K3_METAL, build with `make METAL=1 kimi_k3`) ----------
+ * Phase 4: scaffolding — init, dispatch hooks, feature flags.
+ * Not implemented; w_matmul intentionally falls through to CPU. */
+static int g_k3_metal=0;  /* backend live (K3_METAL env) */
+/* Phase 9: layer-level validation — capture intermediates for one layer */
+static int   g_k3_val_layer = -1;  /* K3_VALIDATE_LAYER=N (0-indexed, -1=off) */
+static int   g_k3_val_token = 0;   /* K3_VALIDATE_TOKEN (always use 0) */
+static FILE *g_k3_val_fp    = NULL; /* output file for intermediate dumps */
+/* Phase 10: full model validation — per-step logits (stays open across prefill+decode) */
+static FILE *g_k3_val_lfp   = NULL; /* K3_VAL_LOGITS: per-step logit dump */
+
+static void val_dump(const char *name, const float *v, int n);  /* forward-declare */
+static FILE *g_k3_dfp = NULL;  /* K3_DEBUG_OUT: Metal/CPU side-by-side per-dim comparison */
+#ifdef COLI_METAL
+#include "backend_metal.h"
+
+/* Metal forward entry point — Phase 4: NOT IMPLEMENTED */
+static int kimima_forward_metal(Model *m, Layer *l, int li, const float *x, int C, float *out){
+    (void)m; (void)l; (void)li; (void)x; (void)C; (void)out;
+    return 0; /* 0 = NOT IMPLEMENTED — fall through to CPU */
+}
+#endif
 static void w_matmul(float *y, const float *x, const W *w, int S){
+#ifdef COLI_METAL
+    if(g_k3_metal && coli_metal_available()){
+        if(w->fmt==0){
+            /* fmt=0 is raw f32, no scales needed — Metal shader handles it */
+            coli_metal_matmul((ColiMetalTensor**)&((W*)w)->metal, y, x, w->f, NULL, 0, S, w->I, w->O, 0);
+            return;
+        }
+        if(w->fmt==1){
+            coli_metal_matmul((ColiMetalTensor**)&((W*)w)->metal, y, x, w->q8, w->s, 1, S, w->I, w->O, 0);
+            return;
+        }
+        if(w->fmt==4){
+            coli_metal_matmul((ColiMetalTensor**)&((W*)w)->metal, y, x, w->q4, w->s, 4, S, w->I, w->O, w->gs);
+            return;
+        }
+    }
+#endif
 #ifdef COLI_VULKAN
     if(g_k3_vk&&S==1&&w->vk&&
        coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,w->fmt,1,w->I,w->O,w->gs))
@@ -304,6 +414,16 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==4) matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs);
     else { fprintf(stderr,"w_matmul: bad fmt %d\n",w->fmt); exit(1); }
+}
+/* f32 GEMM with Metal dispatch: y[S,O] = x[S,I] @ W[O,I]^T */
+static void k3_matmul_f32(void *tens, float *y, const float *x, const float *W, int S, int I, int O){
+#ifdef COLI_METAL
+    if(g_k3_metal && coli_metal_available()){
+        coli_metal_matmul((ColiMetalTensor**)tens, y, x, W, NULL, 0, S, I, O, 0);
+        return;
+    }
+#endif
+    matmul(y,x,W,S,I,O);
 }
 /* acc[0..I) += coef * row r (MLA absorb builds q_abs from kv_b rows) */
 static void w_addrow(const W *w, int r, float coef, float *acc){
@@ -475,6 +595,9 @@ static void load_cfg(Cfg *c, const char *snap){
     c->situ_b1     =(float)req_num(tc,"activation_situ_beta");
     c->situ_b2     =(float)req_num(tc,"activation_situ_linear_beta");
     jval *ep=json_get(tc,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
+    jval *rp=json_get(tc,"rope_parameters");
+    if(rp&&rp->t==J_OBJ){ jval *th=json_get(rp,"rope_theta"); c->theta=th?(float)th->num:10000.f; }
+    else c->theta=10000.f;
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale=1.f/sqrtf((float)c->qk_head);
     jval *la=json_get(tc,"linear_attn_config");
@@ -494,6 +617,21 @@ static void load_cfg(Cfg *c, const char *snap){
     if(!kl||kl->t!=J_ARR){ fprintf(stderr,"config.json: missing kda_layers\n"); exit(1); }
     for(int i=0;i<kl->len;i++){ int v=(int)kl->kids[i]->num;      /* 1-indexed */
         if(v>=1&&v<=c->n_layers) c->is_kda[v-1]=1; }
+    /* DSA indexer (optional — if absent in config, DSA is disabled) */
+    { jval *jn=json_get(tc,"index_hd");   c->index_hd   = jn&&jn->t==J_NUM ? (int)jn->num : 0; }
+    { jval *jn=json_get(tc,"index_nh");   c->index_nh   = jn&&jn->t==J_NUM ? (int)jn->num : 0; }
+    { jval *jn=json_get(tc,"index_topk"); c->index_topk = jn&&jn->t==J_NUM ? (int)jn->num : 0; }
+    if(c->index_hd > 0){
+        /* Default: all MLA layers are "full" DSA layers (compute own Ic + top-K) */
+        for(int i=0;i<c->n_layers;i++) if(!c->is_kda[i]) c->idx_type[i]=1;
+        jval *il=json_get(tc,"index_layers");
+        if(il && il->t==J_ARR){
+            /* Override: explicit list of 1-indexed full DSA layers */
+            memset(c->idx_type, 0, sizeof(c->idx_type));
+            for(int i=0;i<il->len;i++){ int v=(int)il->kids[i]->num;
+                if(v>=1&&v<=c->n_layers) c->idx_type[v-1]=1; }
+        }
+    }
     jval *b=json_get(root,"bos_token_id"); if(!b) b=json_get(tc,"bos_token_id");
     c->bos = b&&b->t==J_NUM ? (int)b->num : -1;
     jval *e=json_get(root,"eos_token_id"); if(!e) e=json_get(tc,"eos_token_id");
@@ -614,10 +752,12 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
               a->A=falloc(c->kda_heads);
               for(int h=0;h<c->kda_heads;h++) a->A[h]=expf(al[h]);
               free(al); }
-            m->kstate[i]=fcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
-            m->cwq[i]=fcalloc((int64_t)P*c->conv_k);
-            m->cwk[i]=fcalloc((int64_t)P*c->conv_k);
-            m->cwv[i]=fcalloc((int64_t)P*c->conv_k);
+            /* afcalloc: 16 KB-aligned so Metal wraps these zero-copy and GPU state/window
+             * updates persist across tokens (see afcalloc note). CPU path is unaffected. */
+            m->kstate[i]=afcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
+            m->cwq[i]=afcalloc((int64_t)P*c->conv_k);
+            m->cwk[i]=afcalloc((int64_t)P*c->conv_k);
+            m->cwv[i]=afcalloc((int64_t)P*c->conv_k);
         } else {
             Mla *a=&l->m;
             w_load(m,&a->qa,NM("model.layers.%d.self_attn.q_a_proj.weight",i),c->q_lora,c->hidden,mbits);
@@ -628,6 +768,14 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             w_load(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),c->n_heads*c->v_head,c->hidden,mbits);
             a->qa_ln =f32_load(m,NM("model.layers.%d.self_attn.q_a_layernorm.weight",i),c->q_lora);
             a->kva_ln=f32_load(m,NM("model.layers.%d.self_attn.kv_a_layernorm.weight",i),c->kv_lora);
+            /* DSA indexer weights – only for "full" layers (idx_type=1) */
+            if(c->index_hd > 0 && c->idx_type[i]){
+                w_load(m,&a->wk,NM("model.layers.%d.self_attn.w_k.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
+                w_load(m,&a->wq,NM("model.layers.%d.self_attn.w_q.weight",i),(int64_t)c->index_hd,c->q_lora,mbits);
+                w_load(m,&a->wp,NM("model.layers.%d.self_attn.w_p.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
+                a->knw=f32_load(m,NM("model.layers.%d.self_attn.kn_w",i),(int64_t)c->index_hd);
+                a->knb=f32_load(m,NM("model.layers.%d.self_attn.kn_b",i),(int64_t)c->index_hd);
+            }
         }
         if(l->sparse){
             Moe *o=&l->moe;
@@ -684,6 +832,17 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%d/step, cap %s)\n",
                 nsh,used,budget,g_vk_upcap,g_vk_gb>0?"K3_VK_GB":"driver budget");
       }
+    }
+#endif
+#ifdef COLI_METAL
+    { const char *ev=getenv("K3_METAL");
+      if(ev&&atoi(ev)){
+        fprintf(stderr,"[K3-METAL] attempting init (K3_METAL=%s)\n", ev);
+        g_k3_metal=coli_metal_init();
+        if(!g_k3_metal) fprintf(stderr,"[K3-METAL] FAILED — CPU only\n");
+      }
+      if(g_k3_metal)
+        fprintf(stderr,"[K3-METAL] init OK (fused KDA token GPU: conv_silu×3+l2_norm+kda_state; attn state CPU)\n");
     }
 #endif
     expert_table_init(m);
@@ -793,6 +952,45 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     }
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
+    /* Phase 9: layer validation init */
+    { const char *vl=getenv("K3_VALIDATE_LAYER");
+      const char *vt=getenv("K3_VALIDATE_TOKEN");
+      if(vl){
+        g_k3_val_layer=atoi(vl);
+        g_k3_val_token=vt?atoi(vt):0;
+        if(g_k3_val_token<0) g_k3_val_token=0;
+        if(g_k3_val_layer<0||g_k3_val_layer>=c->n_layers){
+          fprintf(stderr,"[K3-VAL] layer %d out of range (0..%d) — disabled\n",g_k3_val_layer,c->n_layers-1);
+          g_k3_val_layer=-1;
+        } else {
+          const char *ofn=getenv("K3_VALIDATE_OUT");
+          if(!ofn) ofn="/tmp/k3_val";
+          g_k3_val_fp=fopen(ofn,"w");
+          if(!g_k3_val_fp){
+            fprintf(stderr,"[K3-VAL] cannot open %s (%s) — disabled\n",ofn,strerror(errno));
+            g_k3_val_layer=-1;
+          } else {
+            fprintf(stderr,"[K3-VAL] active: layer %d, token %d, output %s (%d dims)\n",
+                    g_k3_val_layer,g_k3_val_token,ofn,c->hidden);
+          }
+        }
+      }
+    }
+    /* K3_DEBUG_OUT: Metal/CPU side-by-side dim comparison */
+    { const char *dbg=getenv("K3_DEBUG_OUT");
+      if(dbg){ g_k3_dfp=fopen(dbg,"w"); if(g_k3_dfp) fprintf(stderr,"[K3-DBG] active: output %s\n",dbg); }
+    }
+    /* Phase 10: full model logits capture */
+    { const char *vl=getenv("K3_VAL_LOGITS");
+      if(vl){
+        g_k3_val_lfp=fopen(vl,"wb");
+        if(!g_k3_val_lfp){
+          fprintf(stderr,"[K3-VAL-LOGITS] cannot open %s (%s) — disabled\n",vl,strerror(errno));
+        } else {
+          fprintf(stderr,"[K3-VAL-LOGITS] active: output %s (%d dims)\n",vl,c->vocab);
+        }
+      }
+    }
     #undef NM
 }
 
@@ -811,47 +1009,126 @@ static void res_mix(float *out, const float *prefix, const float *bres, int nb, 
     for(int d=0;d<D;d++){ float a=0; for(int e=0;e<=nb;e++) a+=sc[e]*v[e][d]; out[d]=a; }
 }
 
+/* Phase 9: dump ONE token's vector to output file (.ascii lines: dim0 val0\n dim1 val1\n ...) */
+static void val_dump(const char *name, const float *v, int n){
+    if(!g_k3_val_fp) return;
+    fprintf(g_k3_val_fp, "%s %d\n",name,n);
+    for(int i=0;i<n;i++) fprintf(g_k3_val_fp,"  %d %.16g\n",i,v[i]);
+}
+
 /* ---------- KDA layer (chunk of C tokens; projections batched, recurrence
  * sequential per token, AVX2 on the state sweeps) ---------- */
 static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Kda *a=&l->a;
     int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
+    { static int once=0; if(li==0 && !once){ once=1;
+        fprintf(stderr,"[KDA] L%d metal=%d P=%d H=%d hd=%d K=%d\n", li, g_k3_metal, P, H, hd, K); } }
     float *q=falloc((int64_t)C*P), *k=falloc((int64_t)C*P), *v=falloc((int64_t)C*P);
     float *gp=falloc((int64_t)C*P), *on=falloc((int64_t)C*P);
     float *t1=falloc((int64_t)C*c->kda_hd), *graw=falloc((int64_t)C*P), *braw=falloc((int64_t)C*H);
+#ifdef COLI_METAL
+    float *meta_oh = NULL, *meta_alpha = NULL, *meta_beta = NULL;
+    if(g_k3_metal){
+        meta_oh   = falloc((int64_t)C*P);
+        meta_alpha = falloc((int64_t)C*P);
+        meta_beta  = falloc((int64_t)C*H);
+    }
+#endif
+    { static int once=0; if(li==0 && !once){ once=1;
+        fprintf(stderr,"[K3-FMT] L%d KDA: q.fmt=%d gs=%d k.fmt=%d gs=%d v.fmt=%d gs=%d g.fmt=%d gs=%d\n",
+                li, a->q.fmt, a->q.gs, a->k.fmt, a->k.gs, a->v.fmt, a->v.gs, a->g.fmt, a->g.gs);
+        fflush(stderr); } }
     w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
     w_matmul(gp,x,&a->g,C);
-    matmul(t1,x,a->fa,C,c->hidden,c->kda_hd);
-    matmul(graw,t1,a->fb,C,c->kda_hd,P);
-    matmul(braw,x,a->bp,C,c->hidden,H);
+    k3_matmul_f32((void*)&a->metal_fa, t1, x, a->fa, C, c->hidden, c->kda_hd);
+    k3_matmul_f32((void*)&a->metal_fb, graw, t1, a->fb, C, c->kda_hd, P);
+    k3_matmul_f32((void*)&a->metal_bp, braw, x, a->bp, C, c->hidden, H);
     float qscale=1.f/sqrtf((float)hd);
     for(int t=0;t<C;t++){
         float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
         float *gpt=gp+(int64_t)t*P, *ont=on+(int64_t)t*P;
         const float *rgt=graw+(int64_t)t*P, *bt=braw+(int64_t)t*H;
-        /* depthwise causal conv (window: oldest..newest) + SiLU, rolls forward */
-        float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
-        float *vecs[3]={qt,kt,tv}; float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
-        for(int w2=0;w2<3;w2++){
-            float *win=wins[w2], *vec=vecs[w2]; const float *cw=taps[w2];
-            #pragma omp parallel for schedule(static)
-            for(int d=0;d<P;d++){
-                float *wd=win+(int64_t)d*K;
-                for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
-                wd[K-1]=vec[d];
-                float acc=0; const float *cd=cw+(int64_t)d*K;
-                for(int j=0;j<K;j++) acc+=cd[j]*wd[j];
-                vec[d]=siluf_(acc);
+#ifdef COLI_METAL
+        if(g_k3_metal){
+            float *mo = meta_oh + (int64_t)t*P;
+            float *ma = meta_alpha + (int64_t)t*P;
+            float *mb = meta_beta + (int64_t)t*H;
+            for(int h=0;h<H;h++){
+                const float *rgt_h=rgt+(int64_t)h*hd; float *ma_h=ma+(int64_t)h*hd;
+                for(int i=0;i<hd;i++){
+                    float z=rgt_h[i]+a->dt[(int64_t)h*hd+i];
+                    ma_h[i]=expf(c->gate_lb*sigmoidf_(a->A[h]*z));
+                }
+                mb[h]=sigmoidf_(bt[h]);
+            }
+            memset(mo, 0, (size_t)P * sizeof(float));
+            if(!coli_metal_kda_fused_token(m->cwq[li], qt, m->cwk[li], kt, m->cwv[li], tv,
+                    a->conv_q, a->conv_k, a->conv_v, m->kstate[li], ma, mb, mo, P, K, H, hd)){
+                g_k3_metal = 0;
+                fprintf(stderr, "[K3-METAL] kda_fused_token L%d t%d failed — falling back to CPU\n", li, t);
+            } else {
+      if(g_k3_dfp && li==0 && t==0){
+          fprintf(stderr,"[META_ENTER] li=%d t=%d g_k3_metal=%d\n",li,t,g_k3_metal);
+          fprintf(g_k3_dfp,"[META_DIMS] P=%d H=%d hd=%d K=%d kda_proj=%d kda_hd=%d kda_heads=%d\n",
+              P, H, hd, K, c->kda_proj, c->kda_hd, c->kda_heads);
+          fprintf(g_k3_dfp,"[META_Q] h0 d0-%d:\n",hd-1);
+                  for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qt[i]);
+                  fprintf(g_k3_dfp,"[META_K] h0 d0-%d:\n",hd-1);
+                  for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,kt[i]);
+                  fprintf(g_k3_dfp,"[META_V] h0 d0-%d:\n",hd-1);
+                  for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,tv[i]);
+                  fprintf(g_k3_dfp,"[META_OH] h0 d0-%d:\n",hd-1);
+                  for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,mo[i]);
+                  fprintf(g_k3_dfp,"[META_ALPHA] h0 d0-%d:\n",hd-1);
+                  for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,ma[i]);
+                  fprintf(g_k3_dfp,"[META_BETA] h0 %.12g\n",mb[0]);
+                  // Compute ratio oh[i]/(tv[i]*mb[0]) for all dims
+                  fprintf(g_k3_dfp,"\n[META_DOT_RATIO] oh[i] / (tv[i] * beta):\n");
+                  for(int i=0;i<hd;i++){
+                    float r = mo[i] / (tv[i] * mb[0]);
+                    fprintf(g_k3_dfp,"  %d %.12g\n",i,r);
+                  }
+                  fflush(g_k3_dfp);
+                }
+                for(int h=0;h<H;h++){
+                    const float *oh_h=mo+(int64_t)h*hd;
+                    double ms=0;
+                    for(int i=0;i<hd;i++) ms+=(double)oh_h[i]*oh_h[i];
+                    float r=1.f/sqrtf((float)(ms/hd)+c->eps);
+                    float *dst=ont+(int64_t)h*hd;
+                    for(int i=0;i<hd;i++)
+                        dst[i]=oh_h[i]*r*a->onw[i]*sigmoidf_(gpt[(int64_t)h*hd+i]);
+                }
+                continue;
+            }
+        }
+#endif
+        {
+            float *wins_cpu[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
+            float *vecs_cpu[3]={qt,kt,tv}; float *taps_cpu[3]={a->conv_q,a->conv_k,a->conv_v};
+            for(int w2=0;w2<3;w2++){
+                float *win=wins_cpu[w2], *vec=vecs_cpu[w2]; const float *cw=taps_cpu[w2];
+                #pragma omp parallel for schedule(static)
+                for(int d=0;d<P;d++){
+                    float *wd=win+(int64_t)d*K;
+                    for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
+                    wd[K-1]=vec[d];
+                    float acc=0; const float *cd=cw+(int64_t)d*K;
+                    for(int j=0;j<K;j++) acc+=cd[j]*wd[j];
+                    vec[d]=siluf_(acc);
+                }
             }
         }
         #pragma omp parallel for schedule(static)
         for(int h=0;h<H;h++){
             const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
             float qn[512], kn[512], alpha[512], kS[512], vt[512], oh[512];
+            {
             float sq=0,sk=0;
             for(int i=0;i<hd;i++){ sq+=qh[i]*qh[i]; sk+=kh[i]*kh[i]; }
             sq=1.f/sqrtf(sq+1e-6f); sk=1.f/sqrtf(sk+1e-6f);
             for(int i=0;i<hd;i++){ qn[i]=qh[i]*sq*qscale; kn[i]=kh[i]*sk; }
+            }
             for(int i=0;i<hd;i++){
                 float z=rgt[(int64_t)h*hd+i]+a->dt[(int64_t)h*hd+i];
                 alpha[i]=expf(c->gate_lb*sigmoidf_(a->A[h]*z));
@@ -896,6 +1173,26 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
 #ifdef __AVX2__
             }
 #endif
+            if(g_k3_dfp && li==0 && t==0 && h==0){
+              fprintf(g_k3_dfp,"[CPU_DIMS] P=%d H=%d hd=%d K=%d\n",P,H,hd,K);
+              fprintf(g_k3_dfp,"[CPU_QTRAW] h0 d0-%d (conv_silu out):\n",hd-1);
+              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qh[i]);
+              fprintf(g_k3_dfp,"[CPU_VTRAW] h0 d0-%d (conv_silu out):\n",hd-1);
+              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,vh[i]);
+              fprintf(g_k3_dfp,"[CPU_QN] h0 d0-%d (l2_norm q):\n",hd-1);
+              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qn[i]);
+              fprintf(g_k3_dfp,"[CPU_KN] h0 d0-%d (l2_norm k):\n",hd-1);
+              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,kn[i]);
+              fprintf(g_k3_dfp,"[CPU_OH] h0 d0-%d (state out):\n",hd-1);
+              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,oh[i]);
+              // Compute ratio oh[i]/(vh[i]*beta)
+              fprintf(g_k3_dfp,"\n[CPU_DOT_RATIO] oh[i] / (vh[i] * beta):\n");
+              for(int i=0;i<hd;i++){
+                float r = oh[i] / (vh[i] * beta);
+                fprintf(g_k3_dfp,"  %d %.12g\n",i,r);
+              }
+              fflush(g_k3_dfp);
+            }
             /* per-head RMSNorm * sigmoid(full-rank gate) */
             double ms=0; for(int vv=0;vv<hd;vv++) ms+=(double)oh[vv]*oh[vv];
             float r=1.f/sqrtf((float)(ms/hd)+c->eps);
@@ -905,28 +1202,53 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     }
     w_matmul(out,on,&a->o,C);
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
+#ifdef COLI_METAL
+    if(g_k3_metal || meta_oh){
+        free(meta_oh); free(meta_alpha); free(meta_beta);
+    }
+#endif
 }
 
 /* ---------- gated MLA layer (chunk of C tokens, NoPE, absorb; projections
  * batched, per-token causal attention — token t attends to 0..pos0+t) ------ */
-static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, int C, float *out){
+    static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, int C, float *out){
     Cfg *c=&m->c; Mla *a=&l->m;
     int H=c->n_heads, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora, qr=c->qk_rope;
     float *qa=falloc((int64_t)C*c->q_lora), *qv=falloc((int64_t)C*H*qh);
     float *ckv=falloc((int64_t)C*(kvl+qr));
     float *gv=falloc((int64_t)C*H*vh), *ctx=falloc((int64_t)C*H*vh);
+    { static int once=0; if(!once){ once=1;
+        fprintf(stderr,"[K3-FMT] L%d MLA: qa.fmt=%d gs=%d qb.fmt=%d gs=%d kva.fmt=%d gs=%d\n",
+                li, a->qa.fmt, a->qa.gs, a->qb.fmt, a->qb.gs, a->kva.fmt, a->kva.gs);
+        fflush(stderr); } }
     w_matmul(qa,x,&a->qa,C);
     for(int t=0;t<C;t++)
         rmsnorm_(qa+(int64_t)t*c->q_lora,qa+(int64_t)t*c->q_lora,a->qa_ln,c->q_lora,c->eps);
     w_matmul(qv,qa,&a->qb,C);
     w_matmul(ckv,x,&a->kva,C);
-    for(int t=0;t<C;t++){                            /* append the whole chunk to the
-                                                      * cache first: token t's scores
-                                                      * only read rows 0..pos0+t */
-        float *Lrow=m->Lc[li]+(int64_t)(pos0+t)*kvl, *Rrow=m->Rc[li]+(int64_t)(pos0+t)*qr;
-        const float *cv=ckv+(int64_t)t*(kvl+qr);
-        rmsnorm_(Lrow,cv,a->kva_ln,kvl,c->eps);
-        memcpy(Rrow,cv+kvl,qr*sizeof(float));        /* NoPE: cached raw, no rotation */
+    /* KV cache write stays on CPU even under Metal. The MLA attention loop below reads the
+     * cache directly from host memory (m->Lc[li]/m->Rc[li]), so the write must land there.
+     * coli_metal_kv_write() wrote into an unaligned wrap() copy that was never synced back,
+     * and at row 0 instead of row pos_base — so on Metal the host cache was never populated
+     * and attention read garbage, collapsing decode after a few tokens. This write is a
+     * trivial rmsnorm+copy per row (negligible vs MoE), so CPU is the correct home for it. */
+    for (int t = 0; t < C; t++) {
+        float *Lrow = m->Lc[li] + (int64_t)(pos0 + t) * kvl,
+              *Rrow = m->Rc[li] + (int64_t)(pos0 + t) * qr;
+        const float *cv = ckv + (int64_t)t * (kvl + qr);
+        rmsnorm_(Lrow, cv, a->kva_ln, kvl, c->eps);
+        memcpy(Rrow, cv + kvl, qr * sizeof(float));
+    }
+    /* DSA indexer: prefill — write K portion for full layers */
+    if(c->index_hd > 0 && c->idx_type[li]){
+        for(int t=0;t<C;t++){
+            float *ikd = a->Ic + (int64_t)(pos0+t) * c->index_hd;
+            const float *xt = x + (int64_t)t * c->hidden;
+            w_matmul(ikd, xt, &a->wk, 1);                        /* [index_hd] from [hidden] */
+            rmsnorm_(ikd, ikd, a->knw, c->index_hd, c->eps);
+            if(c->qk_rope > 0)
+                dsa_rope(ikd, pos0+t, c->qk_rope, c->theta);   /* in-place on first qk_rope dims */
+        }
     }
     w_matmul(gv,x,&a->g,C);
     for(int tt=0;tt<C;tt++){
@@ -1490,6 +1812,7 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
             st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
         }
     }
+    if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         int snap=(i%c->res_bs==0);                    /* block boundary: same for all t */
@@ -1498,30 +1821,45 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
             memcpy(p,h,D*sizeof(float));              /* prefix_sum at entry */
             if(nb>0) res_mix(h,p,bres+(int64_t)t*nbmax*D,nb,D,l->attn_sw,c->eps);
             if(snap) memcpy(bres+(int64_t)t*nbmax*D+(int64_t)nb*D,p,D*sizeof(float));
-            rmsnorm_(nrm+(int64_t)t*D,h,l->in_ln,D,c->eps);
+             rmsnorm_(nrm+(int64_t)t*D,h,l->in_ln,D,c->eps);
+            /* Phase 9: capture attn-input nrm for target token */
+            if(g_k3_val_layer==i && t==g_k3_val_token){
+              val_dump("nrm_attn",nrm+(int64_t)t*D,D); }
         }
         int have_prefix=!snap;
         if(snap) nb++;
         double t0=now_s();
         if(l->kda) kda_forward(m,l,i,nrm,C,att);
         else       mla_forward(m,l,i,nrm,pos0,C,att);
-        m->t_attn+=now_s()-t0;
+        { static int once=0; if(i==0 && !once){ once=1;
+            fprintf(stderr,"[K3-PATH] L0 attn=%s metal=%d\n", l->kda?"KDA":"MLA", g_k3_metal); fflush(stderr); } }
+         m->t_attn+=now_s()-t0;
+         /* Phase 9: capture attn output (att) for target token */
+         if(g_k3_val_layer==i && g_k3_val_token<C) val_dump("att",att+(int64_t)g_k3_val_token*D,D);
         for(int t=0;t<C;t++){
             float *p=prefix+(int64_t)t*D, *a=att+(int64_t)t*D;
-            if(have_prefix){ for(int d=0;d<D;d++) p[d]+=a[d]; }
-            else           { memcpy(p,a,D*sizeof(float)); }
-            res_mix(mix,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
-            rmsnorm_(nrm+(int64_t)t*D,mix,l->post_ln,D,c->eps);
+             if(have_prefix){ for(int d=0;d<D;d++) p[d]+=a[d]; }
+             else           { memcpy(p,a,D*sizeof(float)); }
+             res_mix(mix,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
+             rmsnorm_(nrm+(int64_t)t*D,mix,l->post_ln,D,c->eps);
+            /* Phase 9: capture MLP-input (post-attention nrm) */
+            if(g_k3_val_layer==i && t==g_k3_val_token){
+              val_dump("nrm_mlp",nrm+(int64_t)t*D,D); }
         }
         t0=now_s();
         if(l->sparse) moe_forward(m,l,i,nrm,C,mlp);
         else          dense_forward(m,l,nrm,C,mlp);
-        m->t_moe+=now_s()-t0;
+         m->t_moe+=now_s()-t0;
+         /* Phase 9: capture mlp output for target token */
+         if(g_k3_val_layer==i && g_k3_val_token<C) val_dump("mlp",mlp+(int64_t)g_k3_val_token*D,D);
         for(int t=0;t<C;t++){
             float *p=prefix+(int64_t)t*D;
             for(int d=0;d<D;d++) p[d]+=mlp[(int64_t)t*D+d];
             memcpy(hidden+(int64_t)t*D,p,D*sizeof(float));
             if(m->trace) fwrite(hidden+(int64_t)t*D,sizeof(float),D,m->trace);
+            /* Phase 9: capture layer output (hidden) for target token */
+            if(g_k3_val_layer==i && t==g_k3_val_token){
+              val_dump("hidden",hidden+(int64_t)t*D,D); }
         }
     }
     float *logits=NULL;
@@ -1529,14 +1867,16 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         double t0=now_s();
         for(int t=0;t<C;t++){
             /* head only where needed: the chunk's last token (feeds sampling)
-             * and every position when K3_LOGITS dumps teacher-forced logits */
-            if(!g_lfp && t<C-1) continue;
+             * and every position when K3_LOGITS dumps teacher-forced logits;
+             * also all positions during Phase 10 validation */
+            if(!g_lfp && !g_k3_val_lfp && t<C-1) continue;
             res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
             rmsnorm_(mix,mix,m->final_norm,D,c->eps);
             if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
             float *lo=falloc(c->vocab);
             w_matmul(lo,mix,&m->lm_head,1);
             if(g_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_lfp);
+            if(g_k3_val_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_k3_val_lfp);
             if(t==C-1) logits=lo; else free(lo);
         }
         m->t_head+=now_s()-t0;
@@ -1586,6 +1926,13 @@ static void kv_alloc(Model *m, int max_t){
 
     /* the record describes those same positions, so it survives with them */
     if(!kv_prefix_grow(&m->kvp,max_t,keep)) kv_prefix_clear(&m->kvp);
+    /* DSA indexer cache — only for full layers (idx_type=1) */
+    for(int i=0;i<c->n_layers;i++){
+        Mla *a=&m->L[i].m;
+        if(c->index_hd > 0 && c->idx_type[i]){
+            a->Ic = falloc((int64_t)max_t * c->index_hd);
+        }
+    }
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -1753,11 +2100,34 @@ static void model_state_reset(Model *m){
             memset(m->cwk[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
             memset(m->cwv[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
         }
-        if(m->Lc&&m->Lc[i]) free(m->Lc[i]);
-        if(m->Rc&&m->Rc[i]) free(m->Rc[i]);
     }
-    free(m->Lc); free(m->Rc);
-    m->Lc=NULL; m->Rc=NULL; m->max_t=0;
+#ifdef COLI_METAL
+    if(m->Lc && m->max_t>0 && g_k3_metal){
+        /* KV cache is CPU-managed (host memory) even under Metal — clear in place and keep the
+         * buffers for reuse. coli_metal_kv_clear() wrote to an unsynced GPU copy, so the host
+         * cache stayed stale across turns; memset zeroes the memory attention actually reads. */
+        for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda){
+            if(m->Lc[i]) memset(m->Lc[i],0,(size_t)m->max_t*c->kv_lora*sizeof(float));
+            if(m->Rc[i]) memset(m->Rc[i],0,(size_t)m->max_t*c->qk_rope*sizeof(float));
+        }
+        for(int i=0;i<c->n_layers;i++){
+            Mla *a=&m->L[i].m;
+            if(c->index_hd > 0 && c->idx_type[i] && a->Ic)
+                memset(a->Ic,0,(size_t)m->max_t*c->index_hd*sizeof(float));
+        }
+    } else
+#endif
+    {
+        for(int i=0;i<c->n_layers;i++){
+            if(m->Lc && m->Lc[i]) free(m->Lc[i]);
+            if(m->Rc && m->Rc[i]) free(m->Rc[i]);
+            Mla *a=&m->L[i].m;
+            if(c->index_hd > 0 && c->idx_type[i] && a->Ic) free(a->Ic);
+        }
+        if(m->Lc) free(m->Lc);
+        if(m->Rc) free(m->Rc);
+        m->Lc=NULL; m->Rc=NULL; m->max_t=0;
+    }
 }
 
 /* Decide reuse before changing the state it describes. A miss discards the
@@ -2034,7 +2404,12 @@ int main(int argc, char **argv){
           fprintf(stderr,"[K3] tokenizer.json loaded (family=%s)\n",T.kimi?"kimi":(T.o200k?"o200k":"cl100k")); } }
     if(serving){
         if(!has_tok){ fprintf(stderr,"serve mode needs tokenizer.json\n"); return 1; }
-        serve_loop(&m,&T);
+         serve_loop(&m,&T);
+        if(g_k3_val_fp){ fflush(g_k3_val_fp); fclose(g_k3_val_fp); g_k3_val_fp=NULL; }
+        if(g_k3_val_lfp){ fflush(g_k3_val_lfp); fclose(g_k3_val_lfp); g_k3_val_lfp=NULL; }
+#ifdef COLI_METAL
+        if(g_k3_metal) coli_metal_shutdown();
+#endif
         return 0;
     }
     int sp[4]={-1,-1,-1,-1};
@@ -2084,7 +2459,12 @@ int main(int argc, char **argv){
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
     if(!m.has_head||!lo){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
-        if(m.trace) fclose(m.trace);
+    if(m.trace) fclose(m.trace);
+    if(g_k3_val_fp){ fflush(g_k3_val_fp); fclose(g_k3_val_fp); g_k3_val_fp=NULL; }
+        if(g_k3_val_lfp){ fflush(g_k3_val_lfp); fclose(g_k3_val_lfp); g_k3_val_lfp=NULL; }
+#ifdef COLI_METAL
+        if(g_k3_metal) coli_metal_shutdown();
+#endif
         return 0;
     }
     double tg=now_s(); int ntok=0;
@@ -2121,8 +2501,13 @@ int main(int argc, char **argv){
         if(np+ntok>=max_t){ fprintf(stderr,"\n[K3] context full\n"); break; }
         lo=step_chunk(&m,&t,np+ntok-1,1);
         double el=now_s()-tg;
-        fprintf(stderr,"  [tok %d: %.1fs/tok, hit %.0f%%, %.1f GB read]\n",
-                ntok,el/ntok,100.0*m.hits/(m.hits+m.miss+1e-9),m.ebytes/1e9);
+        /* Per-token stats every K3_STAT_EVERY tokens (default 32) to keep the token stream
+         * readable. The final summary below always prints. K3_STAT_EVERY=1 restores per-token. */
+        static int stat_every=-1;
+        if(stat_every<0){ const char *e=getenv("K3_STAT_EVERY"); stat_every=e?atoi(e):32; if(stat_every<1) stat_every=1; }
+        if(ntok % stat_every == 0)
+            fprintf(stderr,"  [tok %d: %.1fs/tok, hit %.0f%%, %.1f GB read]\n",
+                    ntok,el/ntok,100.0*m.hits/(m.hits+m.miss+1e-9),m.ebytes/1e9);
     }
     if(lo) free(lo);
     double dt=now_s()-tg;
@@ -2135,5 +2520,10 @@ int main(int argc, char **argv){
     { const char *sv=getenv("USAGE_SAVE");
       if(!(sv && atoi(sv)==0) && g_k3_usage[0])
           rt_save(g_k3_usage,0); }                   /* same bytes as every other engine */
+    if(g_k3_val_fp){ fflush(g_k3_val_fp); fclose(g_k3_val_fp); g_k3_val_fp=NULL; }
+    if(g_k3_val_lfp){ fflush(g_k3_val_lfp); fclose(g_k3_val_lfp); g_k3_val_lfp=NULL; }
+#ifdef COLI_METAL
+    if(g_k3_metal) coli_metal_shutdown();
+#endif
     return 0;
 }
