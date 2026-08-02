@@ -10,6 +10,10 @@ int dsv4_vllm_qnorm_rope_kv_insert(const void *q_in,void *q_out,const void *kv_i
                                     const int64_t *position_ids,const float *cos_sin_cache,
                                     float eps,int heads,int cache_block_size,
                                     int kv_block_stride,cudaStream_t stream);
+int dsv4_vllm_pack_compressed(const float *kv,uint8_t *cache,const int *decode_state,
+                              int ratio,
+                              int cache_block_size,int kv_block_stride,
+                              cudaStream_t stream);
 #ifdef __cplusplus
 }
 #endif

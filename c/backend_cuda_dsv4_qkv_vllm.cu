@@ -696,3 +696,31 @@ extern "C" int dsv4_vllm_qnorm_rope_kv_insert(
       kv_block_stride, stream);
   return cudaGetLastError() == cudaSuccess;
 }
+
+__global__ void packCompressedKV(const float *kv,uint8_t *cache,const int *state,int ratio,
+                                 int cache_block_size,int kv_block_stride) {
+  int pos=state[1];if(!ratio||(pos+1)%ratio)return;int slot=(pos+1)/ratio-1;kv+=(long long)slot*512;
+  int tile=blockIdx.x,lane=threadIdx.x,block=slot/cache_block_size,row=slot%cache_block_size;
+  uint8_t *base=cache+(long long)block*kv_block_stride;
+  if(tile<7){
+    __shared__ float mx[64];float v=__bfloat162float(__float2bfloat16(kv[tile*64+lane]));
+    mx[lane]=fabsf(v);__syncthreads();
+    for(int n=32;n;n>>=1){if(lane<n)mx[lane]=fmaxf(mx[lane],mx[lane+n]);__syncthreads();}
+    float exponent=ceilf(log2f(fmaxf(mx[0],1e-4f)/448.f)),scaled=fminf(fmaxf(v*exp2f(-exponent),-448.f),448.f);
+    base[(long long)row*576+tile*64+lane]=(uint8_t)__nv_cvt_float_to_fp8(scaled,__NV_SATFINITE,__NV_E4M3);
+    if(!lane)base[(long long)cache_block_size*576+(long long)row*8+tile]=(uint8_t)fminf(fmaxf(exponent+127.f,0.f),255.f);
+  }else{
+    __nv_bfloat16 *rope=(__nv_bfloat16*)(base+(long long)row*576+448);
+    rope[lane]=__float2bfloat16(kv[448+lane]);
+    if(!lane)base[(long long)cache_block_size*576+(long long)row*8+7]=0;
+  }
+}
+
+extern "C" int dsv4_vllm_pack_compressed(const float *kv,uint8_t *cache,const int *decode_state,
+                                           int ratio,
+                                           int cache_block_size,int kv_block_stride,
+                                           cudaStream_t stream){
+  if(!kv||!cache||!decode_state||ratio<1||cache_block_size<1)return 0;
+  packCompressedKV<<<8,64,0,stream>>>(kv,cache,decode_state,ratio,cache_block_size,kv_block_stride);
+  return cudaGetLastError()==cudaSuccess;
+}
