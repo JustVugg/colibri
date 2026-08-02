@@ -105,3 +105,10 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# compiled objects
+*.o
