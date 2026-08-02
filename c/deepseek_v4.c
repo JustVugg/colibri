@@ -1347,7 +1347,8 @@ int main(int argc, char **argv){
     printf("  tensors=%d indexed, %ld required (%.2f GiB)\n",
            indexed,required,required_bytes/(1024.0*1024.0*1024.0));
 #ifdef COLI_CUDA
-    if(argc==4&&strcmp(argv[2],"--tokenize"))gpu_preload(&tensors,&c);
+    int serving=argc==2&&getenv("SERVE")&&getenv("SERVE")[0]=='1';
+    if(serving||(argc==4&&strcmp(argv[2],"--tokenize")))gpu_preload(&tensors,&c);
 #endif
     if(argc==2&&getenv("SERVE")&&getenv("SERVE")[0]=='1')serve_loop(&tensors,&c,argv[1]);
     if(argc==4){
