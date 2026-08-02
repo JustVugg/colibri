@@ -2433,13 +2433,19 @@ static int64_t rammap_bind_one(Model *m, int layer, int eid, ESlot *s){
     (void)m;(void)layer;(void)eid;(void)s; return 0;
 #else
     Cfg *c=&m->c; int I=c->moe_inter,D=c->hidden;
-    const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    const char suf[3][16]={"gate_proj","up_proj","down_proj"};
     char nm[3][288],qn[300]; st_tensor *tw[3],*tq[3];
     int OO[3]={I,I,D},II[3]={D,D,I};
     for(int k=0;k<3;k++){
         snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
         tw[k]=st_find(&m->S,nm[k]);
-        snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        /* GCC sees an indexed nm[3][] as the whole 864-byte array when it
+         * diagnoses snprintf.  Construct the suffix with the same explicit
+         * bound used by the ordinary and io_uring expert loaders. */
+        size_t name_len=strnlen(nm[k],sizeof(nm[k]));
+        if(name_len+3>=sizeof(qn)) return 0;
+        memcpy(qn,nm[k],name_len); memcpy(qn+name_len,".qs",4);
+        tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k] || tw[k]->dtype!=3 || tq[k]->dtype!=2 ||
            !st_fd_is_tmpfs(&m->S,tw[k]->fd) || !st_fd_is_tmpfs(&m->S,tq[k]->fd) ||
            (tw[k]->off&3) || (tq[k]->off&3) || tw[k]->nbytes<=0 || tq[k]->nbytes<=0 ||
@@ -5457,7 +5463,15 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         }
         Layer *sl = &m->L[src_layer];
         int sI = c->moe_inter * c->n_shared;
-        float *snrm = falloc(D), *sg = falloc(sI), *su = falloc(sI);
+        /* falloc deliberately returns uninitialized hot-path storage. rmsnorm
+         * overwrites D values before sh_gate consumes them, but GCC 15.2
+         * cannot join that extent to the separately stored QT.I model-shape
+         * invariant and emits -Wmaybe-uninitialized below. This optional
+         * LOOKA scratch is cold and small; initializing its source state makes
+         * the invariant explicit. rmsnorm still overwrites it, so valid-model
+         * arithmetic and output bytes are unchanged. */
+        float *snrm = xzalloc((size_t)D*sizeof(*snrm), "LOOKA normalization");
+        float *sg = falloc(sI), *su = falloc(sI);
         float *sout = falloc(D), *hc = falloc(D);
         rmsnorm(snrm, h, sl->post_ln, D, c->eps);
         matmul_qt(sg, snrm, &sl->sh_gate, 1);

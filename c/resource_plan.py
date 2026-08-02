@@ -13,6 +13,12 @@ from pathlib import Path
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+_DARWIN_RECLAIMABLE_PAGE_KEYS = (
+    "Pages free",
+    "Pages inactive",
+    "Pages speculative",
+    "Pages purgeable",
+)
 
 
 def _tensor_sizes(path):
@@ -76,6 +82,78 @@ def analyze_model(model):
     }
 
 
+def _parse_vm_stat(text, fallback_page_size):
+    """Return reclaimable macOS bytes from one ``vm_stat`` response."""
+    if not isinstance(text, str):
+        return 0
+    page_match = re.search(r"page size of (\d+) bytes", text)
+    page_size = (
+        int(page_match.group(1))
+        if page_match
+        else fallback_page_size
+    )
+    if not isinstance(page_size, int) or page_size <= 0:
+        return 0
+    pages = 0
+    for key in _DARWIN_RECLAIMABLE_PAGE_KEYS:
+        match = re.search(
+            rf"^{re.escape(key)}:\s+(\d+)\.\s*$",
+            text,
+            re.MULTILINE,
+        )
+        if match:
+            pages += int(match.group(1))
+    return pages * page_size if pages else 0
+
+
+def _darwin_memory_available(*, run=None, fallback_page_size=None):
+    """Return reclaimable Darwin memory without depending on ``PATH``.
+
+    Nix build sandboxes do not expose Apple's system utilities through PATH,
+    even though the native tools remain available at their stable system
+    locations.  Injecting the command runner keeps parsing tests hermetic.
+    """
+    run = subprocess.run if run is None else run
+    if fallback_page_size is None:
+        try:
+            fallback_page_size = os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, AttributeError):
+            fallback_page_size = 0
+    try:
+        result = run(
+            ["/usr/bin/vm_stat"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            available = _parse_vm_stat(
+                result.stdout,
+                fallback_page_size,
+            )
+            if available:
+                return available
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    # Preserve the existing conservative fallback to installed RAM, but use
+    # the absolute Apple tool path so it also works inside Nix builds.
+    try:
+        result = run(
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            total = int(result.stdout.strip())
+            if total > 0:
+                return total
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return 0
+
+
 def memory_available():
     # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
     try:
@@ -116,30 +194,11 @@ def memory_available():
                 return total_kb.value * 1024
         except OSError:
             pass
-    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
-    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
-    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    # macOS: no /proc and not win32. Sum the reclaimable pages reported by
+    # vm_stat (free + inactive + speculative + purgeable) — the same
+    # "reclaimable without swapping" definition the C engine uses.
     if sys.platform == "darwin":
-        try:
-            out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
-            page_match = re.search(r"page size of (\d+) bytes", out)
-            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
-            pages = 0
-            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
-                match = re.search(rf"{key}:\s+(\d+)\.", out)
-                if match:
-                    pages += int(match.group(1))
-            if pages:
-                return pages * page
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
-        try:
-            total = subprocess.run(["sysctl", "-n", "hw.memsize"], text=True,
-                                   capture_output=True, timeout=5).stdout.strip()
-            if total:
-                return int(total)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
+        return _darwin_memory_available()
     return 0
 
 
