@@ -757,9 +757,9 @@ extern "C" Dsv4CudaKvCache *dsv4_cuda_kv_create(int device, int window, int dim,
     size_t fib=(size_t)((max_tokens+63)/64)*64*584;
     if(!ok(cudaMalloc(&k->fi_kv,fib),"FlashInfer KV allocation")||!ok(cudaMemset(k->fi_kv,0,fib),"FlashInfer KV clear")||
        !ok(cudaMalloc(&k->fi_indices,512*sizeof(int)),"FlashInfer indices allocation")||!ok(cudaMalloc(&k->fi_length,sizeof(int)),"FlashInfer length allocation")||
-       !ok(cudaMalloc(&k->fi_q,8*512*sizeof(__nv_bfloat16)),"FlashInfer Q allocation")||!ok(cudaMalloc(&k->fi_mid,8*8*512*sizeof(__nv_bfloat16)),"FlashInfer split output allocation")||
-       !ok(cudaMalloc(&k->fi_lse,8*8*sizeof(float)),"FlashInfer split LSE allocation")||!ok(cudaMalloc(&k->fi_out,8*512*sizeof(__nv_bfloat16)),"FlashInfer output allocation")||
-       !ok(cudaMalloc(&k->fi_out_lse,8*sizeof(float)),"FlashInfer output LSE allocation")){dsv4_cuda_kv_free(k);return nullptr;}
+       !ok(cudaMalloc(&k->fi_q,64*512*sizeof(__nv_bfloat16)),"FlashInfer Q allocation")||!ok(cudaMalloc(&k->fi_mid,64*8*512*sizeof(__nv_bfloat16)),"FlashInfer split output allocation")||
+       !ok(cudaMalloc(&k->fi_lse,64*8*sizeof(float)),"FlashInfer split LSE allocation")||!ok(cudaMalloc(&k->fi_out,64*512*sizeof(__nv_bfloat16)),"FlashInfer output allocation")||
+       !ok(cudaMalloc(&k->fi_out_lse,64*sizeof(float)),"FlashInfer output LSE allocation")){dsv4_cuda_kv_free(k);return nullptr;}
 #endif
     fill_value<<<(pb / 4 + 255) / 256, 256, 0, c->stream>>>(k->comp_score, pb / 4, -INFINITY);
     if (!ok(cudaGetLastError(), "compress score clear")) {
@@ -909,7 +909,7 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     if (async && !ok(cudaStreamWaitEvent(c->stream, c->join, 0), "attention join wait")) return 0;
 #ifdef COLI_DSV4_FLASHINFER
     int sparse=getenv("DSV4_CUDA_SPARSE_MLA")&&atoi(getenv("DSV4_CUDA_SPARSE_MLA"));
-    if(sparse&&heads==8&&dim==512&&pos<512){fi_pack_kv<<<1,64,0,c->stream>>>(cache->fi_kv,c->p3,pos);fi_prepare_q<<<16,256,0,c->stream>>>(cache->fi_q,c->p2,heads*dim);fi_indices<<<1,512,0,c->stream>>>(cache->fi_indices,cache->fi_length,pos);
+    if(sparse&&(heads==8||heads==16||heads==32||heads==64)&&dim==512&&pos<512){fi_pack_kv<<<1,64,0,c->stream>>>(cache->fi_kv,c->p3,pos);fi_prepare_q<<<(heads*dim+255)/256,256,0,c->stream>>>(cache->fi_q,c->p2,heads*dim);fi_indices<<<1,512,0,c->stream>>>(cache->fi_indices,cache->fi_length,pos);
         if(!dsv4_flashinfer_sparse_mla(cache->fi_q,cache->fi_kv,cache->fi_indices,cache->fi_mid,cache->fi_lse,cache->fi_out,cache->fi_out_lse,cache->fi_length,(float*)sink->w,nullptr,nullptr,nullptr,0,0,0,heads,512,1,8,0,1.f/sqrtf((float)dim),64*584,c->stream))return 0;
         mhc_bf16_to_float<<<(heads*dim+255)/256,256,0,c->stream>>>(c->p4,cache->fi_out,heads*dim);
     }else
