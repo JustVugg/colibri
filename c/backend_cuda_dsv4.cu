@@ -801,6 +801,32 @@ extern "C" int dsv4_cuda_mhc_post_pre_norm(const Dsv4CudaActivation*x,const Dsv4
 #endif
     mhc_post_fn_split<<<parts,256,0,c->stream>>>((float*)fn->w,x->data,r->data,state->data,out->data,c->dy,N,M,H,parts);mhc_fn_finish<<<1,32,0,c->stream>>>(c->p1,c->dy,(float*)scale->w,(float*)base->w,N,M,I,rms_eps,parts);mhc_coeff<<<1,32,0,c->stream>>>(state->data,c->p1,M,pre_eps,sink_eps,post_mult,sink_iters);mhc_input_norm<<<1,256,0,c->stream>>>(input->data,out->data,state->data,(float*)norm->w,M,H,norm_eps);return ok(cudaGetLastError(),"fused normalized mHC post/pre launch");
 }
+extern "C" int dsv4_cuda_mhc_post_pre_norm_batch(const Dsv4CudaActivation*x,const Dsv4CudaActivation*r,Dsv4CudaActivation*state,int tokens,int H,Dsv4CudaActivation*out,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,Dsv4CudaTensor*norm,Dsv4CudaActivation*input){
+#ifdef COLI_DSV4_VLLM_MHC
+    constexpr int M=4,N=24,parts=8;long long RH=(long long)tokens*M*H,XH=(long long)tokens*H;
+    Dev*c=x?ctx(x->device):nullptr;if(!c||!r||!state||!out||!fn||!scale||!base||!norm||!input||tokens<1||H!=4096||RH>INT_MAX||XH>INT_MAX||
+       r->device!=x->device||state->device!=x->device||out->device!=x->device||fn->device!=x->device||
+       scale->device!=x->device||base->device!=x->device||norm->device!=x->device||input->device!=x->device||
+       x->elements<XH||r->elements<RH||state->elements<(long long)tokens*(M+M*M)||out->elements<RH||input->elements<XH||
+       fn->fmt!=32||norm->fmt!=32||fn->O!=N||fn->I!=M*H||norm->O*norm->I<H||
+       !ok(cudaSetDevice(x->device),"select batched mHC device")||
+       !buf((void**)&c->mhcb1,&c->mhcb1cap,(size_t)RH*sizeof(__nv_bfloat16))||
+       !buf((void**)&c->mhcb2,&c->mhcb2cap,(size_t)XH*sizeof(__nv_bfloat16))||
+       !buf((void**)&c->mhcb3,&c->mhcb3cap,(size_t)RH*sizeof(__nv_bfloat16))||
+       !buf((void**)&c->dy,&c->ycap,(size_t)tokens*parts*(N+1)*sizeof(float)))return 0;
+    if(!norm->bf16_cache){if(!ok(cudaMalloc(&norm->bf16_cache,(size_t)H*sizeof(__nv_bfloat16)),"mHC norm BF16 cache allocation"))return 0;mhc_float_to_bf16<<<(H+255)/256,256,0,c->stream>>>((__nv_bfloat16*)norm->bf16_cache,(float*)norm->w,H);}
+    mhc_float_to_bf16<<<(RH+255)/256,256,0,c->stream>>>(c->mhcb1,r->data,(int)RH);
+    mhc_float_to_bf16<<<(XH+255)/256,256,0,c->stream>>>(c->mhcb2,x->data,(int)XH);
+    float*post=state->data,*comb=post+(long long)tokens*M,*mul=c->dy,*sq=mul+(long long)tokens*parts*N;
+    cudaError_t e=dsv4_vllm_mhc_post_pre_norm_batch(c->stream,comb,c->mhcb1,post,c->mhcb2,(float*)fn->w,mul,sq,c->mhcb3,(float*)scale->w,(float*)base->w,c->mhcb2,norm->bf16_cache,tokens);
+    if(e!=cudaSuccess)return ok(e,"vLLM batched mHC launch");
+    mhc_bf16_to_float<<<(RH+255)/256,256,0,c->stream>>>(out->data,c->mhcb3,(int)RH);
+    mhc_bf16_to_float<<<(XH+255)/256,256,0,c->stream>>>(input->data,c->mhcb2,(int)XH);
+    return ok(cudaGetLastError(),"vLLM batched mHC conversion launch");
+#else
+    (void)x;(void)r;(void)state;(void)tokens;(void)H;(void)out;(void)fn;(void)scale;(void)base;(void)norm;(void)input;return 0;
+#endif
+}
 extern "C" void dsv4_cuda_kv_free(Dsv4CudaKvCache *k) {
     if (!k) return;
     cudaSetDevice(k->device);

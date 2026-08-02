@@ -76,6 +76,11 @@ int dsv4_cuda_mhc_post_pre_norm(const Dsv4CudaActivation *x,const Dsv4CudaActiva
                                 Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,Dsv4CudaTensor *base,Dsv4CudaTensor *norm,
                                 float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,float norm_eps,
                                 Dsv4CudaActivation *input);
+/* Batched state is stored as post_mix[tokens][4], then comb_mix[tokens][4][4]. */
+int dsv4_cuda_mhc_post_pre_norm_batch(const Dsv4CudaActivation *x,const Dsv4CudaActivation *residual,
+                                      Dsv4CudaActivation *state,int tokens,int H,Dsv4CudaActivation *out,
+                                      Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,Dsv4CudaTensor *base,
+                                      Dsv4CudaTensor *norm,Dsv4CudaActivation *input);
 int dsv4_cuda_attention_first(const Dsv4CudaActivation *input,Dsv4CudaTensor *attn_norm,
                               Dsv4CudaTensor *q_a,Dsv4CudaTensor *q_norm,Dsv4CudaTensor *q_b,
                               Dsv4CudaTensor *wkv,Dsv4CudaTensor *kv_norm,Dsv4CudaTensor *sink,
