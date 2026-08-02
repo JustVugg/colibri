@@ -312,8 +312,17 @@ static int o2_contraction(const uint32_t *cp, int n, int k){
     }
     return k;
 }
-/* end (cp index) of branch A|B match at i, or -1 */
-static int o2_letters(const uint32_t *cp, int n, int i){
+static int is_han(uint32_t c);   /* defined below; only mask_han=1 reaches it */
+
+/* end (cp index) of branch A|B match at i, or -1.
+ * mask_han removes Han from both character classes and is the ONLY thing that
+ * separated Kimi's matcher from o200k's -- the backtracking below was otherwise
+ * the same 31 lines, written twice, so a fix to the regex replay had to be made
+ * in both or the two tokenizers would silently disagree. The two wrappers pass a
+ * literal, so -O3 specializes each and the flag costs nothing at run time. */
+static int o2_letters_masked(const uint32_t *cp, int n, int i, int mask_han){
+#define LS1(c) (O2_S1(c) && !(mask_han && is_han(c)))
+#define LS2(c) (O2_S2(c) && !(mask_han && is_han(c)))
     /* branch A, prefix greedy (taken first), then without prefix */
     for(int pfx=1; pfx>=0; pfx--){
         int j0=i;
@@ -322,10 +331,10 @@ static int o2_letters(const uint32_t *cp, int n, int i){
             if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
             j0=i+1;
         }
-        int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
+        int m1=j0; while(m1<n && LS1(cp[m1])) m1++;
         for(int s=m1; s>=j0; s--){
-            if(s<n && O2_S2(cp[s])){
-                int k=s+1; while(k<n && O2_S2(cp[k])) k++;
+            if(s<n && LS2(cp[s])){
+                int k=s+1; while(k<n && LS2(cp[k])) k++;
                 return o2_contraction(cp,n,k);
             }
         }
@@ -338,16 +347,23 @@ static int o2_letters(const uint32_t *cp, int n, int i){
             if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
             j0=i+1;
         }
-        int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
+        int m1=j0; while(m1<n && LS1(cp[m1])) m1++;
         if(m1>j0){
-            int k=m1; while(k<n && O2_S2(cp[k])) k++;
+            int k=m1; while(k<n && LS2(cp[k])) k++;
             return o2_contraction(cp,n,k);
         }
     }
     return -1;
+#undef LS1
+#undef LS2
 }
 
-static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+/* o200k and Kimi share this splitter; `kimi` selects the only three places the
+ * two regexes differ (rule H, the Han mask on S1/S2, and rule D's newline tail).
+ * They used to be two 40-line copies, so every fix to rules C/E/F/G had to be
+ * applied twice -- and the copies could drift apart on rules that are supposed
+ * to be identical. See the Kimi block below for what the differences mean. */
+static void pretok_chunk_o2fam(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max, int kimi){
     int nb=b-a; if(nb<=0) return;
     uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
     for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
@@ -356,20 +372,22 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
     int i=0;
     while(i<n){
         int start=i; uint32_t c=cp[i];
+        /* H: [\p{Han}]+  (Kimi only) */
+        if(kimi && is_han(c)){ int j=i; while(j<n && is_han(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* A|B: letter runs with case-aware split + optional contraction */
         {
-            int e=o2_letters(cp,n,i);
+            int e=o2_letters_masked(cp,n,i,kimi);
             if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         }
         /* C: \p{N}{1,3} */
         if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*' */
+        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*'  ('/' tail is o200k-only) */
         {
             int j=i;
             if(c==' ' && j+1<n && !is_S(cp[j+1]) && !is_L(cp[j+1]) && !is_N(cp[j+1])) j++;
             if(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])){
                 while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++;
-                while(j<n && (ISNL(cp[j]) || cp[j]=='/')) j++;
+                while(j<n && (ISNL(cp[j]) || (!kimi && cp[j]=='/'))) j++;
                 i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
             }
         }
@@ -388,6 +406,9 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
     }
     #undef ISNL
     free(cp); free(off);
+}
+static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    pretok_chunk_o2fam(T,p,a,b,out,no,max,0);
 }
 
 /* ---------- pre-tokenizer Kimi (K3 / tiktoken tokenization_kimi.py) ----------
@@ -417,84 +438,8 @@ static int is_han(uint32_t c){
         if(c<r[mid][0]) hi=mid-1; else if(c>r[mid][1]) lo=mid+1; else return 1; }
     return 0;
 }
-#define KM_S1(c) ((is_U(c)||is_X(c)) && !is_han(c))
-#define KM_S2(c) ((is_X(c)||(is_L(c)&&!is_U(c))) && !is_han(c))
-/* end (cp index) of branch A|B match at i, or -1 — o2_letters with Han-masked classes */
-static int km_letters(const uint32_t *cp, int n, int i){
-    for(int pfx=1; pfx>=0; pfx--){
-        int j0=i;
-        if(pfx){
-            uint32_t c=cp[i];
-            if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
-            j0=i+1;
-        }
-        int m1=j0; while(m1<n && KM_S1(cp[m1])) m1++;
-        for(int s=m1; s>=j0; s--){
-            if(s<n && KM_S2(cp[s])){
-                int k=s+1; while(k<n && KM_S2(cp[k])) k++;
-                return o2_contraction(cp,n,k);
-            }
-        }
-    }
-    for(int pfx=1; pfx>=0; pfx--){
-        int j0=i;
-        if(pfx){
-            uint32_t c=cp[i];
-            if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
-            j0=i+1;
-        }
-        int m1=j0; while(m1<n && KM_S1(cp[m1])) m1++;
-        if(m1>j0){
-            int k=m1; while(k<n && KM_S2(cp[k])) k++;
-            return o2_contraction(cp,n,k);
-        }
-    }
-    return -1;
-}
-
 static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
-    int nb=b-a; if(nb<=0) return;
-    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
-    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
-    off[n]=b;
-    #define ISNL(c) ((c)=='\r'||(c)=='\n')
-    int i=0;
-    while(i<n){
-        int start=i; uint32_t c=cp[i];
-        /* H: [\p{Han}]+ */
-        if(is_han(c)){ int j=i; while(j<n && is_han(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-        /* A|B: letter runs, Han excluded */
-        {
-            int e=km_letters(cp,n,i);
-            if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-        }
-        /* C: \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n]*'  (no '/' tail, unlike o200k) */
-        {
-            int j=i;
-            if(c==' ' && j+1<n && !is_S(cp[j+1]) && !is_L(cp[j+1]) && !is_N(cp[j+1])) j++;
-            if(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])){
-                while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++;
-                while(j<n && ISNL(cp[j])) j++;
-                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
-            }
-        }
-        /* E: \s*[\r\n]+  F: \s+(?!\S)  G: \s+ */
-        {
-            int r=i; while(r<n && is_S(cp[r])) r++;
-            if(r>i){ int last=-1; for(int j=i;j<r;j++) if(ISNL(cp[j])) last=j;
-                if(last>=0){ i=last+1; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-                int end = (r<n) ? r-1 : r;
-                if(end<=i) end=i+1;
-                i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
-            }
-        }
-        i++;
-        bpe_piece(T,p,off[start],off[i],out,no,max);
-    }
-    #undef ISNL
-    free(cp); free(off);
+    pretok_chunk_o2fam(T,p,a,b,out,no,max,1);
 }
 
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */

@@ -697,21 +697,6 @@ static void read_u8_slice(shards *S, const char *name, uint8_t *out, int64_t bof
     posix_fadvise(t->fd, t->off + boff, nb, POSIX_FADV_DONTNEED);
 }
 
-/* container rows -> int8: rowb==cols is int8 verbatim; rowb==cols/2 is packed
- * int4 (low nibble = even column, offset +8 — convert_inkling_int4.py / glm.c) */
-static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t cols, int64_t rowb) {
-    if (rowb == cols) { memcpy(q, raw, (size_t)(rows*cols)); return; }
-    if (rowb*2 != cols) { fprintf(stderr, "container row size %ld vs cols %ld unsupported\n", (long)rowb, (long)cols); exit(1); }
-    for (int64_t r = 0; r < rows; r++) {
-        const uint8_t *b = raw + r*rowb;
-        int8_t *qr = q + r*cols;
-        for (int64_t j = 0; j < rowb; j++) {
-            qr[2*j]   = (int8_t)((b[j] & 0xF) - 8);
-            qr[2*j+1] = (int8_t)((b[j] >> 4) - 8);
-        }
-    }
-}
-
 static double mem_avail_bytes(void);
 
 static void model_init(Model *m, const char *snap, int cap, int bits) {

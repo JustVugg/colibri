@@ -207,31 +207,12 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
 static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+#include "vk_spv.h"
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
 static VkExp *g_vkexp; static int64_t g_vkexp_n;
 static int g_vk_upcap=8, g_vk_up_left=0, g_vk_full=0;
 static long g_vk_hit=0, g_vk_res=0;
 static double g_vk_gb=0;                  /* K3_VK_GB cap (0 = driver budget) */
-static const char *k3_vk_spv(char *buf, size_t n){
-    const char *env=getenv("COLI_VK_SHADERS");
-    struct stat st;
-    if(env&&*env){
-        if(!stat(env,&st)&&S_ISDIR(st.st_mode)){ snprintf(buf,n,"%s/qmatmul.spv",env); return buf; }
-        return env;
-    }
-#ifdef __linux__
-    ssize_t k=readlink("/proc/self/exe",buf,n-1);
-    if(k>0){
-        buf[k]=0;
-        char *sl=strrchr(buf,'/');
-        if(sl&&(size_t)(sl+1-buf)+sizeof("shaders/qmatmul.spv")<=n){
-            strcpy(sl+1,"shaders/qmatmul.spv");
-            if(!stat(buf,&st)) return buf;
-        }
-    }
-#endif
-    return "shaders/qmatmul.spv";
-}
 static int vk_budget_full(void){
     double used=0,budget=0;
     if(!coli_vk_mem_budget(&used,&budget)) return 0;
@@ -599,7 +580,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
 #ifdef COLI_VULKAN
     { const char *ev=getenv("K3_VK");
       if(!ev||atoi(ev)){
-        char sbuf[512]; const char *spv=k3_vk_spv(sbuf,sizeof(sbuf));
+        char sbuf[512]; const char *spv=coli_vk_resolve_spv(sbuf,sizeof(sbuf));
         g_k3_vk=coli_vk_init(spv);
         if(!g_k3_vk) fprintf(stderr,"[K3-VK] Vulkan unavailable (tried %s) — CPU only\n",spv);
       }

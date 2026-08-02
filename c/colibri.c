@@ -75,6 +75,7 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+#include "vk_spv.h"
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
@@ -464,30 +465,6 @@ static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls
                                * projections + shared expert) on Vulkan too */
 static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
-/* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
- * OR a directory containing it; unset, look alongside the binary (<exedir>/shaders/, the
- * build layout) before the historical CWD-relative fallback, so launching from outside c/
- * works. The other shaders load as siblings of the returned path (backend derive_*). */
-static const char *vk_resolve_spv(char *buf, size_t n){
-    const char *env = getenv("COLI_VK_SHADERS");
-    struct stat st;
-    if(env && *env){
-        if(!stat(env,&st) && S_ISDIR(st.st_mode)){ snprintf(buf,n,"%s/qmatmul.spv",env); return buf; }
-        return env;
-    }
-#ifdef __linux__
-    ssize_t k = readlink("/proc/self/exe", buf, n-1);
-    if(k > 0){
-        buf[k] = 0;
-        char *sl = strrchr(buf, '/');
-        if(sl && (size_t)(sl+1-buf) + sizeof("shaders/qmatmul.spv") <= n){
-            strcpy(sl+1, "shaders/qmatmul.spv");
-            if(!stat(buf,&st)) return buf;
-        }
-    }
-#endif
-    return "shaders/qmatmul.spv";
-}
 /* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
  * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
 static double g_vkb_cls, g_vkb_issue, g_vkb_acc, g_vkb_wrk, g_vkb_join;
@@ -2583,10 +2560,6 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     }
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
-}
-static int uring_wait_all(UringBatch *b){
-    for(int i=0;i<b->nload;i++) if(uring_wait_load(b,i)<0) return -1;
-    return 0;
 }
 #endif
 
@@ -9059,7 +9032,7 @@ int main(int argc, char **argv){
 #endif
 #ifdef COLI_VULKAN
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
-        char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
+        char spvbuf[512]; const char *spv = coli_vk_resolve_spv(spvbuf, sizeof(spvbuf));
         g_vulkan = coli_vk_init(spv);
         if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (tried %s; need libvulkan + "
                                "the compiled shaders — point COLI_VK_SHADERS at the shader directory "

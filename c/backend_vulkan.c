@@ -163,15 +163,18 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
 void coli_vk_alloc_priority(float p) { G.prio = p < 0 ? 0 : p > 1 ? 1 : p; }
 
 /* Device-local heap usage/budget in GB (VK_EXT_memory_budget). Returns 0 when the
- * extension is absent — callers then keep their count-based caps unchanged. */
-int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
+ * extension is absent — callers then keep their count-based caps unchanged.
+ * Takes the physical device explicitly: G and G2 are separate anonymous structs
+ * with different field sets, so the dev2 entry point below shares this body by
+ * passing its own device instead of duplicating the query. */
+static int vk_mem_budget_of(VkPhysicalDevice phys, int has_budget, double *used_gb, double *budget_gb) {
 #ifdef VK_EXT_memory_budget
-    if (!G.has_budget || !G.phys) return 0;
+    if (!has_budget || !phys) return 0;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 mp2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
-    vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+    vkGetPhysicalDeviceMemoryProperties2(phys, &mp2);
     double u = 0, b = 0;
     for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
         if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
@@ -181,8 +184,11 @@ int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
     if (budget_gb) *budget_gb = b / 1e9;
     return b > 0;
 #else
-    (void)used_gb; (void)budget_gb; return 0;
+    (void)phys; (void)has_budget; (void)used_gb; (void)budget_gb; return 0;
 #endif
+}
+int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
+    return vk_mem_budget_of(G.phys, G.has_budget, used_gb, budget_gb);
 }
 static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr) {
     return alloc_hostvis_mt(bytes, buf, mem, ptr, G.memtype);
@@ -1037,24 +1043,7 @@ int coli_vk_dev2_available(void) { return G2.ready; }
 int coli_vk_tensor_dev(const ColiVkTensor *t) { return t ? t->dev : 0; }
 
 int coli_vk_mem_budget2(double *used_gb, double *budget_gb) {
-#ifdef VK_EXT_memory_budget
-    if (!G2.has_budget || !G2.phys) return 0;
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    VkPhysicalDeviceMemoryProperties2 mp2 = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
-    vkGetPhysicalDeviceMemoryProperties2(G2.phys, &mp2);
-    double u = 0, b = 0;
-    for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
-        if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
-        }
-    if (used_gb) *used_gb = u / 1e9;
-    if (budget_gb) *budget_gb = b / 1e9;
-    return b > 0;
-#else
-    (void)used_gb; (void)budget_gb; return 0;
-#endif
+    return vk_mem_budget_of(G2.phys, G2.has_budget, used_gb, budget_gb);
 }
 
 int coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {

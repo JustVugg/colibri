@@ -1316,8 +1316,6 @@ static inline void e8_fwht(float *a, int n, const uint8_t *signbits){
     float s=1.0f/sqrtf((float)n);
     for(int i=0;i<n;i++) a[i]*=s;
 }
-static inline int e8_pow2_ceil(int n){ int p=1; while(p<n) p<<=1; return p; }
-
 /* Rotation sign bits, regenerated — not stored. xorshift64* seeded 417+n, one
  * bit per element; tools/iq3_pack.py signs() draws the identical stream, so the
  * container carries no rotation data and the two sides cannot drift apart

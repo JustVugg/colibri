@@ -157,8 +157,6 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     if (nsp) fprintf(stderr, " (%d from the tokenizer's special set)", nsp);
     fprintf(stderr, "\n");
 }
-static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c, tok_eos, NULL); }
-
 /* ---- log-prob of a target token given the logit vector ------------------- */
 static double logprob_target(const float *lo, int V, int target, int *am){
     float mx = lo[0]; int best = 0;
