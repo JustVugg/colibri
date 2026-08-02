@@ -144,8 +144,6 @@ __device__ __forceinline__ int compression_ready(const int *state,int ratio);
 __global__ void mv_bf16(const __nv_bfloat16 *w,const float *x,float *y,int O,int I){int o=blockIdx.x;if(o>=O)return;float sum=0;
     for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=x[i]*__bfloat162float(w[(long long)o*I+i]);
     __shared__ float r[256];r[threadIdx.x]=sum;__syncthreads();for(int n=128;n;n>>=1){if(threadIdx.x<n)r[threadIdx.x]+=r[threadIdx.x+n];__syncthreads();}if(!threadIdx.x)y[o]=r[0];}
-__global__ void mv_bf16_dynamic(const __nv_bfloat16*w,const float*x,float*y,int O,int I,const int*state,int ratio){if(!compression_ready(state,ratio))return;int o=blockIdx.x;if(o>=O)return;float sum=0;
-    for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=x[i]*__bfloat162float(w[(long long)o*I+i]);__shared__ float r[256];r[threadIdx.x]=sum;__syncthreads();for(int n=128;n;n>>=1){if(threadIdx.x<n)r[threadIdx.x]+=r[threadIdx.x+n];__syncthreads();}if(!threadIdx.x)y[o]=r[0];}
 __global__ void mv_f32(const float *w,const float *x,float *y,int O,int I){int o=blockIdx.x;if(o>=O)return;float sum=0;
     for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=x[i]*w[(long long)o*I+i];
     __shared__ float r[256];r[threadIdx.x]=sum;__syncthreads();for(int n=128;n;n>>=1){if(threadIdx.x<n)r[threadIdx.x]+=r[threadIdx.x+n];__syncthreads();}if(!threadIdx.x)y[o]=r[0];}
@@ -864,8 +862,8 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     if (async && (!ok(cudaEventRecord(c->fork, c->stream), "attention fork") ||
                   !ok(cudaStreamWaitEvent(c->aux, c->fork, 0), "attention aux wait"))) return 0;
     if (ratio) {
-        mv_bf16_dynamic<<<O, 256, 0, comp>>>((__nv_bfloat16 *)cwkv->w, c->dx, comp1, O, H,c->decode_state,ratio);
-        mv_bf16_dynamic<<<O, 256, 0, comp>>>((__nv_bfloat16 *)cwg->w, c->dx, comp2, O, H,c->decode_state,ratio);
+        mv_bf16<<<O, 256, 0, comp>>>((__nv_bfloat16 *)cwkv->w, c->dx, comp1, O, H);
+        mv_bf16<<<O, 256, 0, comp>>>((__nv_bfloat16 *)cwg->w, c->dx, comp2, O, H);
         compress_store_dynamic<<<(O + 255) / 256, 256, 0, comp>>>(cache->comp_value, cache->comp_score, comp1,
                                                                   comp2, (float *)ape->w, c->decode_state,
                                                                   ratio, overlap, O);
