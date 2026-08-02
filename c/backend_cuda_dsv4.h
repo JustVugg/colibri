@@ -48,6 +48,9 @@ void dsv4_cuda_activation_free(Dsv4CudaActivation *a);
 int dsv4_cuda_activation_upload(Dsv4CudaActivation *a,const float *x,long long elements);
 int dsv4_cuda_activation_download(float *x,const Dsv4CudaActivation *a,long long elements);
 int dsv4_cuda_activation_copy(Dsv4CudaActivation *dst,const Dsv4CudaActivation *src,long long elements);
+int dsv4_cuda_activation_copy_range(Dsv4CudaActivation *dst,long long dst_offset,
+                                    const Dsv4CudaActivation *src,long long src_offset,
+                                    long long elements);
 int dsv4_cuda_activation_sync(const Dsv4CudaActivation *a);
 int dsv4_cuda_activation_device(const Dsv4CudaActivation *a);
 int dsv4_cuda_decode_state_set(int device,int token,int position);
@@ -69,6 +72,9 @@ int dsv4_cuda_mhc_pre_norm(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn
 int dsv4_cuda_mhc_pre_norm_batch(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,
                                  Dsv4CudaTensor *scale,Dsv4CudaTensor *base,Dsv4CudaTensor *norm,
                                  int tokens,int H,Dsv4CudaActivation *state,Dsv4CudaActivation *input);
+int dsv4_cuda_mhc_pre_batch(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,
+                            Dsv4CudaTensor *scale,Dsv4CudaTensor *base,int tokens,int H,
+                            Dsv4CudaActivation *state,Dsv4CudaActivation *input);
 int dsv4_cuda_mhc_post(const Dsv4CudaActivation *x,const Dsv4CudaActivation *residual,
                        const Dsv4CudaActivation *state,int M,int H,Dsv4CudaActivation *out);
 int dsv4_cuda_mhc_post_pre(const Dsv4CudaActivation *x,const Dsv4CudaActivation *residual,
@@ -86,6 +92,9 @@ int dsv4_cuda_mhc_post_pre_norm_batch(const Dsv4CudaActivation *x,const Dsv4Cuda
                                       Dsv4CudaActivation *state,int tokens,int H,Dsv4CudaActivation *out,
                                       Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,Dsv4CudaTensor *base,
                                       Dsv4CudaTensor *norm,Dsv4CudaActivation *input);
+int dsv4_cuda_mhc_post_batch(const Dsv4CudaActivation *x,const Dsv4CudaActivation *residual,
+                             const Dsv4CudaActivation *state,int tokens,int H,
+                             Dsv4CudaActivation *out);
 int dsv4_cuda_attention_first(const Dsv4CudaActivation *input,Dsv4CudaTensor *attn_norm,
                               Dsv4CudaTensor *q_a,Dsv4CudaTensor *q_norm,Dsv4CudaTensor *q_b,
                               Dsv4CudaTensor *wkv,Dsv4CudaTensor *kv_norm,Dsv4CudaTensor *sink,

@@ -110,6 +110,7 @@ static GpuWeight *gw_cache;static int gw_n,gw_cap,gpu_dev[16],gpu_ndev;
 static int gpu_layer_count;
 static Dsv4CudaExpertSet *ge_cache[256],*ge_cache_peer[256];
 static Dsv4CudaAttentionWeights tp_attention[256][2];
+static Dsv4CudaTensor *batch_qkv[256];
 static TpLayerWeights tp_layer[256];
 static CpuWeight *cw_cache;static int cw_n,cw_cap;static long long cw_bytes;
 static int gpu_ep2(void){const char*p=getenv("DSV4_CUDA_EP2");return p&&atoi(p)&&gpu_ndev==6;}
@@ -1097,6 +1098,9 @@ static void gpu_preload(shards *s,const Dsv4Cfg *c){
         snprintf(n,sizeof(n),"layers.%d.attn.q_norm.weight",l);preload_bf16(s,n,1,c->q_lora);
         snprintf(n,sizeof(n),"layers.%d.attn.wq_b",l);preload_fp8(s,n,c->heads*c->head_dim,c->q_lora,0);
         snprintf(n,sizeof(n),"layers.%d.attn.wkv",l);preload_fp8(s,n,c->head_dim,H,0);
+#ifdef COLI_DSV4_DEEPGEMM
+        if(!ep2){char qa[256],kv[256];snprintf(qa,sizeof(qa),"layers.%d.attn.wq_a",l);snprintf(kv,sizeof(kv),"layers.%d.attn.wkv",l);batch_qkv[l]=preload_fp8_pair_on(s,qa,c->q_lora,kv,c->head_dim,H,gpu_device_for(n));}
+#endif
         snprintf(n,sizeof(n),"layers.%d.attn.wo_a",l);preload_fp8(s,n,G*c->o_lora,(c->heads/G)*c->head_dim,1);
         snprintf(n,sizeof(n),"layers.%d.attn.wo_b",l);preload_fp8(s,n,H,G*c->o_lora,0);
         if(ep2){int primary=gpu_dev[gpu_stage(l)],peer=gpu_dev[gpu_stage(l)+1],lh=c->heads/2,lg=G/2,Q=lh*c->head_dim,WR=lg*c->o_lora;
@@ -1179,6 +1183,32 @@ static void gpu_preload(shards *s,const Dsv4Cfg *c){
 }
 #endif
 
+#ifdef COLI_CUDA
+typedef struct {Dsv4CudaActivation *res,*next,*mhc,*input,*block,*context;} PrefillGpu;
+static void prefill_gpu_free(PrefillGpu*p){dsv4_cuda_activation_free(p->context);dsv4_cuda_activation_free(p->block);dsv4_cuda_activation_free(p->input);dsv4_cuda_activation_free(p->mhc);dsv4_cuda_activation_free(p->next);dsv4_cuda_activation_free(p->res);memset(p,0,sizeof(*p));}
+static int prefill_batch_cuda(shards*s,const Dsv4Cfg*c,Dsv4State*state,const int*tokens,int count,int start,float*logit){
+    if(count<1||count>64||gpu_ep2()||!batch_qkv[0])return -1;
+    enum {G=8};int H=c->hidden,MH=c->hc_mult*H;long long RH=(long long)count*MH,XH=(long long)count*H,CH=(long long)count*c->heads*c->head_dim;
+    float*host=malloc((size_t)RH*sizeof(float));if(!host)die("out of memory preparing batched embeddings");
+    for(int t=0;t<count;t++){float*r=initial_residual(s,c,tokens[t]);memcpy(host+(long long)t*MH,r,(size_t)MH*sizeof(float));free(r);}
+    PrefillGpu stage[16]={0};Dsv4CudaActivation*current=NULL;int current_dev=-1;
+    for(int l=0;l<c->layers;l++){
+        char n[256];snprintf(n,sizeof(n),"layers.%d.attn_norm.weight",l);int dev=gpu_device_for(n),slot=0;while(slot<gpu_ndev&&gpu_dev[slot]!=dev)slot++;if(slot==gpu_ndev)die("batched prefill device is unavailable");PrefillGpu*p=stage+slot;
+        if(!p->res){p->res=dsv4_cuda_activation_create(dev,RH);p->next=dsv4_cuda_activation_create(dev,RH);p->mhc=dsv4_cuda_activation_create(dev,(long long)count*20);p->input=dsv4_cuda_activation_create(dev,XH);p->block=dsv4_cuda_activation_create(dev,XH);p->context=dsv4_cuda_activation_create(dev,CH);if(!p->res||!p->next||!p->mhc||!p->input||!p->block||!p->context)die("batched prefill activation allocation failed");}
+        if(!current){if(!dsv4_cuda_activation_upload(p->res,host,RH))die("batched embedding upload failed");current=p->res;current_dev=dev;}
+        else if(current_dev!=dev){if(!dsv4_cuda_activation_copy(p->res,current,RH))die("batched pipeline transfer failed");current=p->res;current_dev=dev;}
+        else if(current!=p->res){Dsv4CudaActivation*tmp=p->res;p->res=current;current=tmp;}
+#define BWT(var,suffix) snprintf(n,sizeof(n),"layers.%d.%s",l,suffix);Dsv4CudaTensor*var=*gpu_slot(n)
+        BWT(afn,"hc_attn_fn");BWT(ascale,"hc_attn_scale");BWT(abase,"hc_attn_base");BWT(an,"attn_norm.weight");BWT(qn,"attn.q_norm.weight");BWT(qb,"attn.wq_b.weight");BWT(kvn,"attn.kv_norm.weight");BWT(sink,"attn.attn_sink");BWT(wa,"attn.wo_a.weight");BWT(wb,"attn.wo_b.weight");
+        BWT(ffn_fn,"hc_ffn_fn");BWT(ffn_scale,"hc_ffn_scale");BWT(ffn_base,"hc_ffn_base");BWT(ffn_norm,"ffn_norm.weight");BWT(gate,"ffn.gate.weight");Dsv4CudaTensor*bias=NULL;if(l>=c->hash_layers){snprintf(n,sizeof(n),"layers.%d.ffn.gate.bias",l);bias=*gpu_slot(n);}
+        if(!dsv4_cuda_mhc_pre_batch(current,afn,ascale,abase,count,H,p->mhc,p->input)||!dsv4_cuda_attention_sparse_batch(p->input,an,batch_qkv[l],qn,qb,kvn,sink,c->heads,c->head_dim,start,count,c->eps,state->gpu_kv[l],p->context)||!dsv4_cuda_attention_output_batch(p->context,wa,wb,G,count,p->block)||!dsv4_cuda_mhc_post_pre_norm_batch(p->block,current,p->mhc,count,H,p->next,ffn_fn,ffn_scale,ffn_base,ffn_norm,p->input)||!dsv4_cuda_route_moe_batch(p->input,gate,bias,tokens,count,c->routed_scale,ge_cache[l],c->swiglu_limit,p->block)||!dsv4_cuda_mhc_post_batch(p->block,p->next,p->mhc,count,H,p->res))die("batched prefill layer failed");
+        current=p->res;
+#undef BWT
+    }
+    if(!dsv4_cuda_activation_copy_range(state->gpu_next[c->layers-1],0,current,(long long)(count-1)*MH,MH))die("batched prefill final hidden copy failed");int next=head_argmax_gpu(c,state->gpu_next[c->layers-1],logit);for(int d=0;d<16;d++)prefill_gpu_free(stage+d);free(host);return next;
+}
+#endif
+
 static int model_step(shards *s,const Dsv4Cfg *c,Dsv4State *state,int token,int pos,float *logit){
 #ifdef COLI_CUDA
     if(state&&getenv("DSV4_CUDA_LAYER")&&atoi(getenv("DSV4_CUDA_LAYER")))for(int d=0;d<gpu_ndev;d++)if(!dsv4_cuda_decode_state_set(gpu_dev[d],token,pos))die("CUDA decode state update failed");
@@ -1226,6 +1256,15 @@ static void bench_decode_two(shards*s,const Dsv4Cfg*c,int first,int second){
     float l0,l1;double a=wall_time();int o0=model_step(s,c,&state,first,0,&l0);double b=wall_time();int o1=model_step(s,c,&state,second,1,&l1);double z=wall_time();printf("  decode2 inputs=%d,%d outputs=%d,%d logits=%.9g,%.9g first=%.3fs second=%.3fs second_speed=%.4f tok/s\n",first,second,o0,o1,l0,l1,b-a,z-b,1.0/(z-b));state_free(&state);
 }
 
+static int prefill_prompt(shards*s,const Dsv4Cfg*c,Dsv4State*state,const int*ids,int n,float*logit){
+#ifdef COLI_CUDA
+    const char*batch=getenv("DSV4_CUDA_BATCH_PREFILL");if(batch&&atoi(batch)&&n<=c->window&&getenv("DSV4_CUDA_LAYER")&&atoi(getenv("DSV4_CUDA_LAYER"))&&!gpu_ep2()){
+        int next=0;for(int p=0;p<n;p+=64){int count=n-p<64?n-p:64;next=prefill_batch_cuda(s,c,state,ids+p,count,p,logit);if(next<0)die("batched prefill is unavailable");}return next;
+    }
+#endif
+    int next=0;for(int p=0;p<n;p++)next=model_step(s,c,state,ids[p],p,logit);return next;
+}
+
 static void generate(shards *s,const Dsv4Cfg *c,const char *model_dir,const char *arg){
     char *end;long max=strtol(arg,&end,10);if(end==arg||*end!=':'||max<1||max>128)die("--generate expects MAX:TEXT");
     char path[4096];snprintf(path,sizeof(path),"%s/tokenizer.json",model_dir);Tok tok;tok_load(&tok,path);
@@ -1236,7 +1275,7 @@ static void generate(shards *s,const Dsv4Cfg *c,const char *model_dir,const char
     gpu_state_prepare(c,&state);
 #endif
     struct timespec a,b;clock_gettime(CLOCK_MONOTONIC,&a);
-    float logit=0;int next=0;for(int p=0;p<n;p++)next=model_step(s,c,&state,ids[p],p,&logit);
+    float logit=0;int next=prefill_prompt(s,c,&state,ids,n,&logit);
     clock_gettime(CLOCK_MONOTONIC,&b);double pre=b.tv_sec-a.tv_sec+(b.tv_nsec-a.tv_nsec)*1e-9;
     int out[128],made=0;clock_gettime(CLOCK_MONOTONIC,&a);
 #ifdef COLI_CUDA
@@ -1292,7 +1331,7 @@ static void serve_request(shards *s,const Dsv4Cfg *c,const char *model_dir,
     gpu_state_prepare(c,&state);
 #endif
     float logit=0;int next=0;double a=wall_time();
-    for(int p=0;p<n;p++)next=model_step(s,c,&state,ids[p],p,&logit);
+    next=prefill_prompt(s,c,&state,ids,n,&logit);
     double decode_start=wall_time();int made=0,shown=0;
     while(made<max_tokens){
         if(next==c->eos)break;
