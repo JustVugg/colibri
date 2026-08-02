@@ -64,6 +64,9 @@ int dsv4_cuda_mhc_pre_norm(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,int M,int H,float rms_eps,float pre_eps,
                            float sink_eps,float post_mult,int sink_iters,float norm_eps,
                            Dsv4CudaActivation *state,Dsv4CudaActivation *input);
+int dsv4_cuda_mhc_pre_norm_batch(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,
+                                 Dsv4CudaTensor *scale,Dsv4CudaTensor *base,Dsv4CudaTensor *norm,
+                                 int tokens,int H,Dsv4CudaActivation *state,Dsv4CudaActivation *input);
 int dsv4_cuda_mhc_post(const Dsv4CudaActivation *x,const Dsv4CudaActivation *residual,
                        const Dsv4CudaActivation *state,int M,int H,Dsv4CudaActivation *out);
 int dsv4_cuda_mhc_post_pre(const Dsv4CudaActivation *x,const Dsv4CudaActivation *residual,
