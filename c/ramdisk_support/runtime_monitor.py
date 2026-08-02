@@ -51,8 +51,10 @@
 
 All HTTP URLs are synthesized from validated manifest ports and the numeric
 loopback address. Serialized host names or URLs are never used. Endpoint and
-compute-process attribution happen only after every readable member of the
-managed process group has passed the persisted UID and nonce checks.
+compute-process attribution happen only after every live readable member of
+the managed process group has passed the persisted UID, nonce, and path
+checks. Proven inert members must still retain the exact managed UID, process
+group, and session, and are excluded from runtime sampling.
 """
 
 from __future__ import print_function
@@ -686,24 +688,38 @@ class RuntimeMonitor:
             if expected_uid is None or not expected_nonce:
                 rejected[pid] = "managed process identity is incomplete"
                 continue
-            trusted = [
-                member
-                for member in members
-                if isinstance(member, dict)
-                and _safe_int(member.get("pgid", pgid)) == pgid
-                and member.get("uid") == expected_uid
-                and member.get("nonce") == expected_nonce
-                and _safe_int(member.get("pid")) is not None
-            ]
-            if not members or len(trusted) != len(members):
+            trusted_count = 0
+            sampled_pids = set()
+            for member in members:
+                if (
+                    not isinstance(member, dict)
+                    or _safe_int(member.get("pid")) is None
+                    or _safe_int(member.get("pgid")) != pgid
+                    or _safe_int(member.get("sid")) != pgid
+                    or member.get("uid") != expected_uid
+                ):
+                    continue
+                if member.get("inert") is True:
+                    trusted_count += 1
+                    continue
+                if member.get("nonce") != expected_nonce or any(
+                    key in record and member.get(key) != record.get(key)
+                    for key in ("state_dir", "weights_dir")
+                ):
+                    continue
+                trusted_count += 1
+                sampled_pids.add(int(member["pid"]))
+            if (
+                not members
+                or trusted_count != len(members)
+                or not sampled_pids
+            ):
                 rejected[pid] = "managed process group identity mismatch"
                 continue
             verified.append(
                 {
                     "record": record,
-                    "pids": {
-                        int(member["pid"]) for member in trusted
-                    },
+                    "pids": sampled_pids,
                 }
             )
         return verified, rejected

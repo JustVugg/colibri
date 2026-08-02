@@ -45,6 +45,7 @@ class UnsupportedPlatformOps:
 
     is_linux = False
     process_control_supported = False
+    process_control_reason = UNSUPPORTED_PLATFORM_REASON
 
     def __init__(self, platform_name):
         self.platform_name = platform_name
@@ -62,10 +63,14 @@ class UnsupportedPlatformOps:
     def kernel_release(self):
         return platform.release()
 
+    process_start_boundary = staticmethod(_unsupported_process_operation)
     process_identity = staticmethod(_unsupported_process_operation)
+    managed_launch_processes = staticmethod(_unsupported_process_operation)
     process_group_member_pids = staticmethod(_unsupported_process_operation)
     process_group_alive = staticmethod(_unsupported_process_operation)
-    signal_process_group = staticmethod(_unsupported_process_operation)
+    signal_verified_process_group = staticmethod(
+        _unsupported_process_operation
+    )
     process_status = staticmethod(_unsupported_process_operation)
     busy_mount_references = staticmethod(_unsupported_process_operation)
 

@@ -237,9 +237,8 @@ class CliModuleTest(unittest.TestCase):
 
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
+    @requires_sigint_handler
     def test_prepare_and_destroy_confirmations_keep_ctrl_c_interruptible(self):
-        if not hasattr(signal, "SIGINT"):
-            self.skipTest("SIGINT is unavailable")
         previous = signal.getsignal(signal.SIGINT)
 
         def interrupt_prompt(_message):
@@ -286,9 +285,8 @@ class CliModuleTest(unittest.TestCase):
 
             self.assertIs(signal.getsignal(signal.SIGINT), previous)
 
+    @requires_sigint_handler
     def test_prepare_restores_cooperative_ctrl_c_after_confirmation(self):
-        if not hasattr(signal, "SIGINT"):
-            self.skipTest("SIGINT is unavailable")
         args = argparse.Namespace(ramdisk_action="prepare", json=False)
 
         def prepare(_args, cancel_event=None):
@@ -328,10 +326,8 @@ class CliModuleTest(unittest.TestCase):
 
         self.assertEqual(result, 128 + int(signal.SIGINT))
 
-    @unittest.skipUnless(
-        os.name == "posix" and hasattr(os, "openpty"),
-        "a POSIX pseudo-terminal is required",
-    )
+    @requires_posix_pty
+    @requires_sigint_handler
     def test_real_tty_ctrl_c_interrupts_confirmation_without_input(self):
         import select
         import time

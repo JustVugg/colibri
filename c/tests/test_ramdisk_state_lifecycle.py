@@ -9,7 +9,36 @@ else:
 
 from ramdisk_support import lifecycle as lifecycle_support
 from ramdisk_support import linux_ops
+from ramdisk_support import processes as process_support
 from ramdisk_support import state as state_support
+
+
+_REAL_BOUND_PARENT_DESCRIPTOR = state_support._bound_parent_descriptor
+_REAL_FSYNC_DIRECTORY = state_support._fsync_directory
+
+
+@contextlib.contextmanager
+def _portable_descriptor_seam():
+    """Exercise descriptor-gated state logic without weakening production."""
+
+    def allow_portable_binding(*args, **kwargs):
+        kwargs["require_native"] = False
+        return _REAL_BOUND_PARENT_DESCRIPTOR(*args, **kwargs)
+
+    with mock.patch.object(
+        state_support,
+        "_bound_parent_descriptor",
+        new=allow_portable_binding,
+    ), mock.patch.object(
+        state_support,
+        "_fsync_bound_directory",
+        new=lambda descriptor: None,
+    ), mock.patch.object(
+        state_support,
+        "_fsync_directory",
+        new=lambda path: None,
+    ):
+        yield
 
 
 class StateAndSafetyTest(unittest.TestCase):
@@ -18,6 +47,10 @@ class StateAndSafetyTest(unittest.TestCase):
     USAGE_HEADER = "-1 1 2\n-2 1 %d\n" % GLM_ENGINE_ID
 
     def setUp(self):
+        self.descriptor_seam = contextlib.ExitStack()
+        self.addCleanup(self.descriptor_seam.close)
+        if not state_support._supports_native_dirfd():
+            self.descriptor_seam.enter_context(_portable_descriptor_seam())
         self.temp = tempfile.TemporaryDirectory()
         self.root = str(Path(self.temp.name).resolve())
         self.env = mock.patch.dict(
@@ -32,6 +65,7 @@ class StateAndSafetyTest(unittest.TestCase):
         self.filesystem.start()
 
     def tearDown(self):
+        self.descriptor_seam.close()
         self.filesystem.stop()
         self.env.stop()
         self.temp.cleanup()
@@ -145,14 +179,279 @@ class StateAndSafetyTest(unittest.TestCase):
         self.assertFalse(os.path.exists(delta_path))
         self.assertEqual(os.stat(model_dir).st_mode & 0o777, 0o750)
 
+    def test_recovery_uses_one_canonical_counts_and_markers_snapshot(self):
+        model_dir = os.path.join(self.root, "model")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        canonical = os.path.join(model_dir, ".coli_usage")
+        merge_id = "4" * 32
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        ramdisk._atomic_json(
+            os.path.join(state_dir, ".coli_usage.delta.json"),
+            {"version": 1, "id": merge_id, "delta": {"0:1": 2}},
+        )
+        real_snapshot = state_support._usage_snapshot_from_bound
+        canonical_snapshots = []
+
+        def observe_snapshot(bound, name, path, **kwargs):
+            snapshot = real_snapshot(bound, name, path, **kwargs)
+            if kwargs.get("source") == "canonical usage target":
+                canonical_snapshots.append(snapshot["text"])
+            return snapshot
+
+        with mock.patch.object(
+            state_support,
+            "_usage_snapshot_from_bound",
+            side_effect=observe_snapshot,
+        ):
+            ramdisk._recover_delta(state_dir, canonical)
+
+        self.assertEqual(len(canonical_snapshots), 1)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 12)
+        self.assertEqual(ramdisk._usage_merge_ids(canonical), {merge_id})
+
+    def test_usage_delta_recovery_rejects_nonpositive_or_coerced_counts(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+
+        invalid_deltas = (
+            {"0:1": 0},
+            {"0:1": -3},
+            {"0:1": True},
+            {"0:1": 2.5},
+            {"0:1": "3"},
+            {"invalid": 3},
+        )
+        for index, delta in enumerate(invalid_deltas, 1):
+            with self.subTest(delta=delta):
+                ramdisk._atomic_json(
+                    delta_path,
+                    {
+                        "version": 1,
+                        "id": ("%x" % index) * 32,
+                        "delta": delta,
+                    },
+                )
+                journal_before = Path(delta_path).read_bytes()
+                canonical_before = Path(canonical).read_bytes()
+
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "usage delta journal has invalid counts",
+                ):
+                    ramdisk._recover_delta(state_dir, canonical)
+
+                self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+                self.assertEqual(Path(delta_path).read_bytes(), journal_before)
+
+    def test_present_null_usage_journal_is_malformed_and_retained(self):
+        model_dir = os.path.join(self.root, "model")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        canonical = os.path.join(model_dir, ".coli_usage")
+        delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        Path(delta_path).write_text("null\n", encoding="utf-8")
+        canonical_before = Path(canonical).read_bytes()
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "must contain a JSON object",
+        ):
+            ramdisk._recover_delta(state_dir, canonical)
+
+        self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+        self.assertEqual(Path(delta_path).read_text(encoding="utf-8"), "null\n")
+
+    def test_absent_usage_journal_retry_reproves_parent_directory(self):
+        model_dir = os.path.join(self.root, "model")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        canonical = os.path.join(model_dir, ".coli_usage")
+        ramdisk._usage_write(canonical, {"0:1": 10})
+
+        with mock.patch.object(
+            state_support,
+            "_fsync_bound_directory",
+        ) as sync_directory, mock.patch.object(
+            state_support,
+            "_fsync_directory",
+            new=sync_directory,
+        ):
+            ramdisk._recover_delta(state_dir, canonical)
+
+        sync_directory.assert_called_once()
+
+    def test_record_merge_refuses_mismatched_journal_transaction(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 12},
+        )
+        delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+        ramdisk._atomic_json(
+            delta_path,
+            {
+                "version": 1,
+                "id": "b" * 32,
+                "delta": {"0:1": 7},
+            },
+        )
+        canonical_before = Path(canonical).read_bytes()
+        journal_before = Path(delta_path).read_bytes()
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "journal transaction.*managed record",
+        ):
+            ramdisk._merge_usage(
+                {
+                    "state_dir": state_dir,
+                    "usage_baseline": {"0:1": 10},
+                    "usage_merge_id": "a" * 32,
+                },
+                canonical,
+            )
+
+        self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+        self.assertEqual(Path(delta_path).read_bytes(), journal_before)
+
+    def test_recover_delta_facade_forwards_expected_transaction(self):
+        plan = {"identity": "test-plan"}
+        merge_id = "a" * 32
+        with mock.patch.object(
+            ramdisk,
+            "_state_recover_delta",
+            return_value=merge_id,
+        ) as recover:
+            result = ramdisk._recover_delta(
+                "/durable/state",
+                "/model/.coli_usage",
+                plan=plan,
+                expected_merge_id=merge_id,
+            )
+
+        self.assertEqual(result, merge_id)
+        recover.assert_called_once_with(
+            "/durable/state",
+            "/model/.coli_usage",
+            plan=plan,
+            expected_merge_id=merge_id,
+            filesystem_for_path=ramdisk._filesystem_for_path,
+            source_still_matches=ramdisk._source_still_matches,
+        )
+
+    def test_matching_record_journal_and_standalone_legacy_journal_recover(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        standalone_dir = os.path.join(self.root, "standalone-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        os.makedirs(standalone_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 12},
+        )
+        merge_id = "c" * 32
+        ramdisk._atomic_json(
+            os.path.join(state_dir, ".coli_usage.delta.json"),
+            {"version": 1, "id": merge_id, "delta": {"0:1": 2}},
+        )
+
+        ramdisk._merge_usage(
+            {
+                "state_dir": state_dir,
+                "usage_baseline": {"0:1": 10},
+                "usage_merge_id": merge_id,
+            },
+            canonical,
+        )
+
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 12)
+        standalone_id = "d" * 32
+        ramdisk._atomic_json(
+            os.path.join(standalone_dir, ".coli_usage.delta.json"),
+            {
+                "version": 1,
+                "id": standalone_id,
+                "delta": {"0:1": 1},
+            },
+        )
+        ramdisk._recover_delta(standalone_dir, canonical)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 13)
+        self.assertEqual(
+            ramdisk._usage_merge_ids(canonical),
+            {merge_id, standalone_id},
+        )
+
+    def test_legacy_record_adopts_existing_journal_transaction_idempotently(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 12},
+        )
+        merge_id = "9" * 32
+        delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+        journal = {
+            "version": 1,
+            "id": merge_id,
+            "delta": {"0:1": 2},
+        }
+        ramdisk._atomic_json(delta_path, journal)
+        record = {
+            "state_dir": state_dir,
+            "usage_baseline": {"0:1": 10},
+        }
+
+        ramdisk._merge_usage(record, canonical)
+
+        self.assertEqual(record["usage_merge_id"], merge_id)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 12)
+        self.assertFalse(os.path.exists(delta_path))
+
+        # A stale replay of the adopted legacy journal must remain idempotent.
+        ramdisk._atomic_json(delta_path, journal)
+        ramdisk._merge_usage(record, canonical)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 12)
+        self.assertFalse(os.path.exists(delta_path))
+
     def test_usage_history_read_is_optional_only_when_absent(self):
         missing = os.path.join(self.root, "missing-usage")
         self.assertEqual(state_support._usage_read(missing), {})
 
         denied = os.path.join(self.root, "denied-usage")
-        with mock.patch(
-            "builtins.open",
-            side_effect=PermissionError("permission denied"),
+        Path(denied).write_text("0 1 7\n", encoding="utf-8")
+        real_open = state_support.os.open
+
+        def deny_usage_open(path, flags, *args, **kwargs):
+            if path in (denied, os.path.basename(denied)):
+                raise PermissionError("permission denied")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            side_effect=deny_usage_open,
         ):
             with self.assertRaisesRegex(
                 ramdisk.RamdiskError,
@@ -168,6 +467,369 @@ class StateAndSafetyTest(unittest.TestCase):
             "cannot read usage state",
         ):
             state_support._usage_read(invalid)
+
+    def test_managed_usage_merge_requires_regular_nonsymlink_state_file(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        os.makedirs(model_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+
+        for kind in ("missing", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                state_dir = os.path.join(self.root, "state-" + kind)
+                os.makedirs(state_dir)
+                state_usage = os.path.join(state_dir, ".coli_usage")
+                if kind == "directory":
+                    os.mkdir(state_usage)
+                elif kind == "symlink":
+                    target = os.path.join(self.root, "usage-target")
+                    Path(target).write_text("0 1 12\n", encoding="utf-8")
+                    os.symlink(target, state_usage)
+                canonical_before = Path(canonical).read_bytes()
+
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "managed usage history.*regular non-symlink file",
+                ):
+                    ramdisk._merge_usage(
+                        {
+                            "state_dir": state_dir,
+                            "usage_baseline": {"0:1": 10},
+                            "usage_merge_id": "e" * 32,
+                        },
+                        canonical,
+                    )
+
+                self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+
+    @requires_native_dirfd
+    def test_managed_usage_merge_rejects_symlink_swap_during_verified_open(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "state-native")
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        attacker = os.path.join(self.root, "attacker-native")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        Path(state_usage).write_text("0 1 12\n", encoding="utf-8")
+        Path(attacker).write_text("0 1 99\n", encoding="utf-8")
+        real_open = state_support.os.open
+        swapped = False
+
+        def swap_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path in (state_usage, ".coli_usage") and not swapped:
+                swapped = True
+                os.unlink(state_usage)
+                os.symlink(attacker, state_usage)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            side_effect=swap_before_open,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "managed usage history.*regular non-symlink|"
+                "managed usage history changed|"
+                "cannot read managed usage history",
+            ):
+                ramdisk._merge_usage(
+                    {
+                        "state_dir": state_dir,
+                        "usage_baseline": {"0:1": 10},
+                        "usage_merge_id": "8" * 32,
+                    },
+                    canonical,
+                )
+
+        self.assertTrue(swapped)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 10)
+
+    def test_managed_usage_merge_fails_closed_without_native_dirfd(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "state-portable")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 12},
+        )
+        canonical_before = Path(canonical).read_bytes()
+
+        with mock.patch.object(
+            state_support,
+            "_bound_parent_descriptor",
+            new=_REAL_BOUND_PARENT_DESCRIPTOR,
+        ), mock.patch.object(
+            state_support,
+            "_supports_native_dirfd",
+            return_value=False,
+        ), mock.patch.object(
+            state_support.os,
+            "open",
+            wraps=state_support.os.open,
+        ) as open_file:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "managed state requires descriptor-relative filesystem operations",
+            ):
+                ramdisk._merge_usage(
+                    {
+                        "state_dir": state_dir,
+                        "usage_baseline": {"0:1": 10},
+                        "usage_merge_id": "9" * 32,
+                    },
+                    canonical,
+                )
+
+        open_file.assert_not_called()
+        self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+
+    def test_managed_usage_read_binds_parent_identity(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        original_dir = os.path.join(self.root, "original-state")
+        replacement_dir = os.path.join(self.root, "replacement-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        os.makedirs(replacement_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 12},
+        )
+        ramdisk._usage_write(
+            os.path.join(replacement_dir, ".coli_usage"),
+            {"0:1": 99},
+        )
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        real_open = state_support.os.open
+        swapped = False
+
+        def swap_parent_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path in (state_dir, state_usage) and not swapped:
+                swapped = True
+                os.rename(state_dir, original_dir)
+                os.rename(replacement_dir, state_dir)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            side_effect=swap_parent_before_open,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "managed state|parent.*changed|managed usage history",
+            ):
+                ramdisk._merge_usage(
+                    {
+                        "state_dir": state_dir,
+                        "usage_baseline": {"0:1": 10},
+                        "usage_merge_id": "7" * 32,
+                    },
+                    canonical,
+                )
+
+        self.assertTrue(swapped)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 10)
+
+    def test_managed_usage_seed_write_rejects_symlink_target(self):
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(state_dir)
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        attacker = os.path.join(self.root, "attacker-usage")
+        Path(attacker).write_text("0 1 99\n", encoding="utf-8")
+        os.symlink(attacker, state_usage)
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "managed usage history.*regular non-symlink",
+        ):
+            state_support._managed_usage_write(
+                state_usage,
+                {"0:1": 10},
+                filesystem_for_path=lambda path: "ext4",
+            )
+
+        self.assertTrue(os.path.islink(state_usage))
+        self.assertIn("0 1 99", Path(attacker).read_text(encoding="utf-8"))
+
+    @requires_native_dirfd
+    def test_managed_usage_seed_write_binds_parent_identity(self):
+        state_dir = os.path.join(self.root, "node-state")
+        original_dir = os.path.join(self.root, "original-state")
+        replacement_dir = os.path.join(self.root, "replacement-state")
+        os.makedirs(state_dir)
+        os.makedirs(replacement_dir)
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        real_open = state_support.os.open
+        swapped = False
+
+        def swap_parent_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path == state_dir and not swapped:
+                swapped = True
+                os.rename(state_dir, original_dir)
+                os.rename(replacement_dir, state_dir)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            side_effect=swap_parent_before_open,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "managed state.*parent identity changed|"
+                "managed state parent identity changed",
+            ):
+                state_support._managed_usage_write(
+                    state_usage,
+                    {"0:1": 10},
+                    filesystem_for_path=lambda path: "ext4",
+                )
+
+        self.assertTrue(swapped)
+        self.assertFalse(os.path.exists(os.path.join(state_dir, ".coli_usage")))
+        self.assertFalse(os.path.exists(os.path.join(original_dir, ".coli_usage")))
+
+    @requires_posix_fifo
+    def test_managed_usage_swap_to_fifo_uses_nonblocking_open(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        ramdisk._usage_write(state_usage, {"0:1": 12})
+        real_open = state_support.os.open
+        swapped = False
+        opened_flags = []
+
+        def swap_to_fifo_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path in (state_usage, ".coli_usage") and not swapped:
+                swapped = True
+                os.unlink(state_usage)
+                os.mkfifo(state_usage)
+                opened_flags.append(flags)
+                if not flags & getattr(os, "O_NONBLOCK", 0):
+                    raise AssertionError("FIFO open would block")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            side_effect=swap_to_fifo_before_open,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "regular non-symlink",
+            ):
+                ramdisk._merge_usage(
+                    {
+                        "state_dir": state_dir,
+                        "usage_baseline": {"0:1": 10},
+                        "usage_merge_id": "6" * 32,
+                    },
+                    canonical,
+                )
+
+        self.assertTrue(swapped)
+        self.assertTrue(opened_flags[0] & os.O_NONBLOCK)
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 10)
+
+    def test_canonical_usage_symlink_cannot_authorize_marker_shortcut(self):
+        model_dir = os.path.join(self.root, "model")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        canonical = os.path.join(model_dir, ".coli_usage")
+        attacker = os.path.join(self.root, "attacker-usage")
+        merge_id = "5" * 32
+        Path(attacker).write_text(
+            "0 1 99\n# coli-ramdisk-merge %s\n" % merge_id,
+            encoding="utf-8",
+        )
+        os.symlink(attacker, canonical)
+        ramdisk._usage_write(
+            os.path.join(state_dir, ".coli_usage"),
+            {"0:1": 12},
+        )
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "canonical usage.*regular non-symlink|canonical usage target",
+        ):
+            ramdisk._merge_usage(
+                {
+                    "state_dir": state_dir,
+                    "usage_baseline": {"0:1": 10},
+                    "usage_merge_id": merge_id,
+                },
+                canonical,
+            )
+
+        self.assertTrue(os.path.islink(canonical))
+        self.assertIn("0 1 99", Path(attacker).read_text(encoding="utf-8"))
+
+    def test_managed_usage_merge_rejects_missing_or_regressed_positive_baseline(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10, "0:2": 4})
+        state_usage = os.path.join(state_dir, ".coli_usage")
+
+        for label, current, message in (
+            ("missing", {"0:2": 4}, "missing positive baseline counter"),
+            ("regressed", {"0:1": 9, "0:2": 4}, "regressed below baseline"),
+        ):
+            with self.subTest(label=label):
+                ramdisk._usage_write(state_usage, current)
+                canonical_before = Path(canonical).read_bytes()
+                with self.assertRaisesRegex(ramdisk.RamdiskError, message):
+                    ramdisk._merge_usage(
+                        {
+                            "state_dir": state_dir,
+                            "usage_baseline": {"0:1": 10, "0:2": 4},
+                            "usage_merge_id": ("1" if label == "missing" else "2") * 32,
+                        },
+                        canonical,
+                    )
+                self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+
+    def test_zero_baseline_omission_and_zero_byte_history_remain_valid(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        Path(canonical).touch()
+        state_usage = os.path.join(state_dir, ".coli_usage")
+        Path(state_usage).touch()
+
+        ramdisk._merge_usage(
+            {
+                "state_dir": state_dir,
+                "usage_baseline": {"0:1": 0},
+                "usage_merge_id": "3" * 32,
+            },
+            canonical,
+        )
+
+        self.assertEqual(Path(canonical).read_bytes(), b"")
+        self.assertEqual(Path(state_usage).read_bytes(), b"")
 
     def test_headered_usage_copy_merge_and_recovery_preserve_metadata(self):
         model_dir = os.path.join(self.root, "model")
@@ -314,6 +976,19 @@ class StateAndSafetyTest(unittest.TestCase):
                 ):
                     ramdisk._load_manifest(required=True)
 
+    def test_usage_reader_rejects_zero_header_metadata(self):
+        invalid_headers = (
+            ("-1 0 8\n-2 1 %d\n" % self.GLM_ENGINE_ID, "dimensions"),
+            ("-1 40 8\n-2 0 %d\n" % self.GLM_ENGINE_ID, "version"),
+            ("-1 40 8\n-2 1 0\n", "engine identity"),
+        )
+        for index, (contents, message) in enumerate(invalid_headers):
+            with self.subTest(contents=contents):
+                path = os.path.join(self.root, "invalid-header-%d" % index)
+                Path(path).write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(ramdisk.RamdiskError, message):
+                    ramdisk._usage_read(path)
+
     def test_usage_metadata_must_be_complete_and_compatible(self):
         model_dir = os.path.join(self.root, "model")
         canonical = os.path.join(model_dir, ".coli_usage")
@@ -401,6 +1076,304 @@ class StateAndSafetyTest(unittest.TestCase):
         ramdisk._atomic_json(os.path.join(parent, "manifest.json"), {"ok": True})
         self.assertEqual(os.stat(parent).st_mode & 0o777, before)
 
+    def test_atomic_json_stream_close_cannot_mask_primary_error(self):
+        stream = mock.MagicMock()
+        stream.__enter__.return_value = stream
+        stream.__exit__.side_effect = OSError("secondary stream close")
+        stream.close.side_effect = OSError("secondary stream close")
+        with mock.patch.object(
+            state_support.os,
+            "fdopen",
+            return_value=stream,
+        ), mock.patch.object(
+            state_support.json,
+            "dump",
+            side_effect=ValueError("primary JSON serialization"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "primary JSON serialization",
+            ):
+                state_support._atomic_json(
+                    os.path.join(self.root, "atomic.json"),
+                    {"unsafe": object()},
+                )
+
+    @requires_native_dirfd
+    def test_atomic_temp_creation_stays_inside_bound_parent(self):
+        parent = os.path.join(self.root, "usage-parent")
+        original = os.path.join(self.root, "usage-parent-original")
+        replacement = os.path.join(self.root, "usage-parent-replacement")
+        os.makedirs(parent)
+        os.makedirs(replacement)
+        target = os.path.join(parent, ".coli_usage")
+        real_open = state_support.os.open
+        swapped = False
+
+        def swap_parent_at_temp_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if (
+                isinstance(path, str)
+                and path.startswith(".usage-")
+                and kwargs.get("dir_fd") is not None
+                and not swapped
+            ):
+                swapped = True
+                os.rename(parent, original)
+                os.rename(replacement, parent)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            side_effect=swap_parent_at_temp_open,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "parent identity changed",
+            ):
+                state_support._usage_write(
+                    target,
+                    {"0:1": 1},
+                    require_native=True,
+                )
+
+        self.assertTrue(swapped)
+        self.assertEqual(list(Path(original).glob(".usage-*")), [])
+        self.assertEqual(list(Path(parent).glob(".usage-*")), [])
+
+    def test_usage_write_stream_close_cannot_mask_primary_error(self):
+        stream = mock.MagicMock()
+        stream.__enter__.return_value = stream
+        stream.__exit__.side_effect = OSError("secondary stream close")
+        stream.close.side_effect = OSError("secondary stream close")
+        path = os.path.join(self.root, ".coli_usage")
+        with mock.patch.object(
+            state_support.os,
+            "fdopen",
+            return_value=stream,
+        ):
+            stream.write.side_effect = ValueError("primary usage write")
+            with self.assertRaisesRegex(ValueError, "primary usage write"):
+                state_support._usage_write(path, {"0:1": 1})
+
+    def test_managed_usage_close_cannot_mask_parse_error(self):
+        state_usage = os.path.join(self.root, ".coli_usage")
+        Path(state_usage).write_text("-1 malformed\n", encoding="utf-8")
+        real_close = state_support.os.close
+
+        def fail_after_close(descriptor):
+            real_close(descriptor)
+            raise OSError("secondary descriptor close")
+
+        with mock.patch.object(
+            state_support.os,
+            "close",
+            side_effect=fail_after_close,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "malformed usage header",
+            ):
+                state_support._managed_usage_read(state_usage)
+
+    def test_directory_fsync_error_propagates_and_closes_descriptor(self):
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            return_value=731,
+        ), mock.patch.object(
+            state_support.os,
+            "fsync",
+            side_effect=OSError(5, "synthetic directory EIO"),
+        ), mock.patch.object(state_support.os, "close") as close:
+            with self.assertRaisesRegex(OSError, "synthetic directory EIO"):
+                _REAL_FSYNC_DIRECTORY(self.root)
+
+        close.assert_called_once_with(731)
+
+    def test_directory_fsync_preserves_primary_error_over_close_error(self):
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            return_value=732,
+        ), mock.patch.object(
+            state_support.os,
+            "fsync",
+            side_effect=OSError(5, "primary directory EIO"),
+        ), mock.patch.object(
+            state_support.os,
+            "close",
+            side_effect=OSError(9, "secondary close failure"),
+        ) as close:
+            with self.assertRaisesRegex(OSError, "primary directory EIO"):
+                _REAL_FSYNC_DIRECTORY(self.root)
+
+        close.assert_called_once_with(732)
+
+    def test_directory_fsync_reports_close_error_after_successful_sync(self):
+        with mock.patch.object(
+            state_support.os,
+            "open",
+            return_value=733,
+        ), mock.patch.object(
+            state_support.os,
+            "fsync",
+        ), mock.patch.object(
+            state_support.os,
+            "close",
+            side_effect=OSError(9, "directory close failure"),
+        ) as close:
+            with self.assertRaisesRegex(OSError, "directory close failure"):
+                _REAL_FSYNC_DIRECTORY(self.root)
+
+        close.assert_called_once_with(733)
+
+    def test_pending_manifest_save_reports_unproven_directory_commit(self):
+        path = os.path.join(self.root, "pending-manifest.json")
+        pending = {
+            "state": "starting",
+            "pending_launches": [{"operation_id": "start:" + ("a" * 32)}],
+        }
+        durability_error = OSError(5, "synthetic directory EIO")
+        with mock.patch.object(
+            state_support,
+            "_fsync_bound_directory",
+            side_effect=durability_error,
+        ), mock.patch.object(
+            state_support,
+            "_fsync_directory",
+            side_effect=durability_error,
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic directory EIO"):
+                state_support._save_manifest(
+                    pending,
+                    manifest_path=lambda: path,
+                )
+
+        persisted = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.assertEqual(
+            persisted["pending_launches"][0]["operation_id"],
+            "start:" + ("a" * 32),
+        )
+
+    def test_uncertain_canonical_marker_keeps_journal_for_retry(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        merge_id = "f" * 32
+        delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+        ramdisk._atomic_json(
+            delta_path,
+            {"version": 1, "id": merge_id, "delta": {"0:1": 2}},
+        )
+
+        durability_error = OSError(5, "synthetic directory EIO")
+        with mock.patch.object(
+            state_support,
+            "_fsync_bound_directory",
+            side_effect=durability_error,
+        ), mock.patch.object(
+            state_support,
+            "_fsync_directory",
+            side_effect=durability_error,
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic directory EIO"):
+                ramdisk._recover_delta(state_dir, canonical)
+
+        self.assertTrue(os.path.exists(delta_path))
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 12)
+        self.assertIn(merge_id, ramdisk._usage_merge_ids(canonical))
+
+        ramdisk._recover_delta(state_dir, canonical)
+        self.assertFalse(os.path.exists(delta_path))
+        self.assertEqual(ramdisk._usage_read(canonical)["0:1"], 12)
+
+    @requires_native_dirfd
+    def test_existing_marker_reproves_canonical_parent_before_journal_unlink(self):
+        model_dir = os.path.join(self.root, "model")
+        state_dir = os.path.join(self.root, "node-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        canonical = os.path.join(model_dir, ".coli_usage")
+        merge_id = "0" * 32
+        delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+        ramdisk._usage_write(canonical, {"0:1": 12}, merge_id=merge_id)
+        ramdisk._atomic_json(
+            delta_path,
+            {"version": 1, "id": merge_id, "delta": {"0:1": 2}},
+        )
+        canonical_before = Path(canonical).read_bytes()
+        synced = []
+        real_sync = state_support._fsync_bound_directory
+        canonical_parent = state_support._stat_identity(os.stat(model_dir))
+        managed_parent = state_support._stat_identity(os.stat(state_dir))
+
+        def fail_canonical_sync(descriptor):
+            info = os.fstat(descriptor)
+            identity = (info.st_dev, info.st_ino)
+            if identity == canonical_parent:
+                raise OSError("canonical parent durability uncertain")
+            return real_sync(descriptor)
+
+        with mock.patch.object(
+            state_support,
+            "_fsync_bound_directory",
+            side_effect=fail_canonical_sync,
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "canonical parent durability uncertain",
+            ):
+                ramdisk._recover_delta(state_dir, canonical)
+
+        self.assertTrue(os.path.exists(delta_path))
+        self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+
+        def track_sync(descriptor):
+            info = os.fstat(descriptor)
+            synced.append((info.st_dev, info.st_ino))
+            return real_sync(descriptor)
+
+        with mock.patch.object(
+            state_support,
+            "_fsync_bound_directory",
+            side_effect=track_sync,
+        ):
+            ramdisk._recover_delta(state_dir, canonical)
+
+        self.assertIn(canonical_parent, synced)
+        self.assertIn(managed_parent, synced)
+        self.assertLess(
+            synced.index(canonical_parent),
+            synced.index(managed_parent),
+        )
+        self.assertFalse(os.path.exists(delta_path))
+
+    def test_durable_unlink_reports_unproven_directory_commit(self):
+        path = os.path.join(self.root, "journal.json")
+        Path(path).write_text("{}\n", encoding="utf-8")
+        with mock.patch.object(
+            state_support,
+            "_fsync_directory",
+            side_effect=(
+                OSError(5, "synthetic directory EIO"),
+                None,
+            ),
+        ) as sync_directory:
+            with self.assertRaisesRegex(OSError, "synthetic directory EIO"):
+                state_support._durable_unlink(path)
+            state_support._durable_unlink(path)
+
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(sync_directory.call_count, 2)
+        sync_directory.assert_has_calls(
+            [mock.call(self.root), mock.call(self.root)]
+        )
+
     def test_private_state_directory_rejects_existing_symlink_without_chmod(self):
         target = os.path.join(self.root, "redirect-target")
         link = os.path.join(self.root, "redirect-link")
@@ -483,6 +1456,146 @@ class StateAndSafetyTest(unittest.TestCase):
         ):
             ramdisk._load_manifest(required=True)
 
+    def test_pending_operation_id_must_bind_usage_transaction(self):
+        pending = {
+            "operation_id": "start:" + ("1" * 32),
+            "nonce": "2" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "3" * 32,
+        }
+        manifest = self.manifest(state="starting")
+        manifest["pending_launches"] = [pending]
+        ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "pending launch recovery",
+        ):
+            ramdisk._load_manifest(required=True)
+
+    def test_usage_transaction_ids_are_unique_across_all_authorities(self):
+        mounts = [
+            "/mnt/colibri-test/node0",
+            "/mnt/colibri-test/node1",
+            "/mnt/colibri-test/node2",
+        ]
+        base = self.manifest(
+            state="error",
+            mount_paths=mounts,
+            processes=[{"pid": 12020}],
+        )
+        base["processes"][0]["usage_merge_id"] = "4" * 32
+        base["pending_launches"] = [
+            {
+                "operation_id": "start:" + ("5" * 32),
+                "nonce": "6" * 48,
+                "uid": host_uid(),
+                "port": 8001,
+                "node": 1,
+                "state_dir": self.recovery_state_dir(node=1),
+                "weights_dir": mounts[1],
+                "launch_not_before": 100,
+                "launcher_pid": 700,
+                "launcher_starttime": 90,
+                "launcher_cmdline": ["coli", "ramdisk", "start"],
+                "expected_command": ["coli", "serve"],
+                "usage_baseline": {"0:1": 3},
+                "usage_merge_id": "5" * 32,
+            }
+        ]
+        base["recovery"] = {
+            "operation": "start",
+            "state": "attention-required",
+            "retained_processes": [
+                {
+                    "pid": 12022,
+                    "pgid": 12022,
+                    "node": 2,
+                    "state_dir": self.recovery_state_dir(node=2),
+                    "usage_baseline": {"0:1": 3},
+                    "usage_merge_id": "7" * 32,
+                    "error": "group absence unproven",
+                }
+            ],
+        }
+
+        ramdisk._atomic_json(ramdisk._manifest_path(), base)
+        loaded = ramdisk._load_manifest(required=True)
+        self.assertEqual(loaded["processes"][0]["usage_merge_id"], "4" * 32)
+
+        duplicate_cases = (
+            ("process-pending", ("pending_launches", 0), "4" * 32),
+            (
+                "process-retained",
+                ("recovery", "retained_processes", 0),
+                "4" * 32,
+            ),
+            (
+                "pending-retained",
+                ("recovery", "retained_processes", 0),
+                "5" * 32,
+            ),
+        )
+        for label, path, duplicate in duplicate_cases:
+            with self.subTest(label=label):
+                manifest = copy.deepcopy(base)
+                target = manifest
+                for key in path:
+                    target = target[key]
+                target["usage_merge_id"] = duplicate
+                if path[0] == "pending_launches":
+                    target["operation_id"] = "start:" + duplicate
+                ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "duplicate usage transaction",
+                ):
+                    ramdisk._load_manifest(required=True)
+
+        legacy = copy.deepcopy(base)
+        legacy["processes"][0].pop("usage_merge_id")
+        ramdisk._atomic_json(ramdisk._manifest_path(), legacy)
+        self.assertIsNone(
+            ramdisk._load_manifest(required=True)["processes"][0].get(
+                "usage_merge_id"
+            )
+        )
+
+    def test_manifest_rejects_untrusted_process_usage_merge_marker(self):
+        cases = (
+            (True, "e" * 32),
+            ("not-a-timestamp", "e" * 32),
+            ("2026-08-01T00:00:00Z", None),
+        )
+        for marker, merge_id in cases:
+            with self.subTest(marker=marker, merge_id=merge_id):
+                manifest = self.manifest(
+                    state="stopped",
+                    processes=[
+                        {
+                            "pid": 12347,
+                            "usage_merge_id": merge_id,
+                            "usage_merged_at": marker,
+                        }
+                    ],
+                )
+                ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "unsafe managed process",
+                ):
+                    ramdisk._load_manifest(required=True)
+
     def test_manifest_rejects_recovery_state_dir_outside_exact_node_path(self):
         manifest = self.manifest(state="error")
         manifest["recovery"] = {
@@ -564,13 +1677,20 @@ class StateAndSafetyTest(unittest.TestCase):
         ):
             ramdisk._load_manifest(required=True)
 
-    def test_outcome_unknown_pending_launch_blocks_all_mutating_actions(self):
+    def test_outcome_unknown_pending_launch_is_reconciled_only_by_stop(self):
         pending = {
             "operation_id": "start:" + ("6" * 32),
             "nonce": "7" * 48,
+            "uid": host_uid(),
             "port": 8000,
             "node": None,
             "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
             "usage_baseline": {"0:1": 3},
             "usage_merge_id": "6" * 32,
         }
@@ -594,32 +1714,602 @@ class StateAndSafetyTest(unittest.TestCase):
 
         write_pending()
         with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            side_effect=[[], []],
+        ) as discover, mock.patch.object(
+            ramdisk, "_terminate_verified_group"
+        ) as terminate, mock.patch.object(
+            ramdisk, "_merge_usage"
+        ) as merge:
+            stopped = ramdisk.stop()
+        terminate.assert_not_called()
+        self.assertEqual(discover.call_count, 2)
+        merge.assert_called_once()
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["pending_launches"], [])
+        persisted = ramdisk._load_manifest(required=True)
+        self.assertEqual(persisted["state"], "stopped")
+        self.assertEqual(persisted["pending_launches"], [])
+
+    def test_pending_live_group_identity_is_persisted_before_stop_signals(self):
+        pending = {
+            "operation_id": "start:" + ("8" * 32),
+            "nonce": "9" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "8" * 32,
+        }
+        manifest = self.manifest(state="starting")
+        manifest["pending_launches"] = [copy.deepcopy(pending)]
+        ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+        candidate = {
+            "pid": 12010,
+            "uid": host_uid(),
+            "starttime": 400,
+            "nonce": pending["nonce"],
+            "pgid": 12010,
+            "sid": 12010,
+            "state_dir": pending["state_dir"],
+            "weights_dir": pending["weights_dir"],
+            "cmdline": ["coli", "serve"],
+        }
+
+        def terminate(record):
+            durable = ramdisk._load_manifest(required=True)
+            observed = durable["pending_launches"][0]["observed_group"]
+            self.assertEqual(observed["pgid"], 12010)
+            self.assertEqual(observed["leader_starttime"], 400)
+            self.assertEqual(record["starttime"], 400)
+            return None
+
+        with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            side_effect=[[candidate], []],
+        ), mock.patch.object(
+            ramdisk,
+            "_process_group_members",
+            return_value=([candidate], []),
+        ), mock.patch.object(
+            ramdisk,
+            "_process_matches",
+            return_value=(True, "running", candidate),
+        ), mock.patch.object(
+            ramdisk, "_group_alive", return_value=False
+        ), mock.patch.object(
+            ramdisk, "_terminate_verified_group", side_effect=terminate
+        ) as terminate_group, mock.patch.object(
+            ramdisk, "_merge_usage"
+        ) as merge:
+            stopped = ramdisk.stop()
+
+        terminate_group.assert_called_once()
+        merge.assert_called_once()
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["pending_launches"], [])
+
+    def test_manifest_rejects_untrusted_pending_usage_merge_timestamp(self):
+        pending = {
+            "operation_id": "start:" + ("4" * 32),
+            "nonce": "5" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "4" * 32,
+        }
+        for marker in (True, "not-a-timestamp"):
+            with self.subTest(marker=marker):
+                manifest = self.manifest(state="starting")
+                manifest["pending_launches"] = [
+                    dict(pending, usage_merged_at=marker)
+                ]
+                ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "unsafe pending launch recovery",
+                ):
+                    ramdisk._load_manifest(required=True)
+
+    def test_pending_wrapper_dead_group_uses_member_verified_pgid(self):
+        pending = {
+            "operation_id": "start:" + ("a" * 32),
+            "nonce": "b" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "a" * 32,
+            "observed_group": {
+                "pgid": 12011,
+                "uid": host_uid(),
+                "leader_starttime": 401,
+            },
+        }
+        manifest = self.manifest(state="starting")
+        manifest["pending_launches"] = [copy.deepcopy(pending)]
+        ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+        child = {
+            "pid": 12012,
+            "uid": host_uid(),
+            "starttime": 402,
+            "nonce": pending["nonce"],
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": pending["state_dir"],
+            "weights_dir": pending["weights_dir"],
+            "cmdline": ["colibri"],
+        }
+
+        def terminate(record):
+            self.assertEqual(record["pid"], 12011)
+            self.assertEqual(record["pgid"], 12011)
+            self.assertIsNone(record["starttime"])
+            durable = ramdisk._load_manifest(required=True)
+            self.assertEqual(
+                durable["pending_launches"][0]["observed_group"]
+                ["leader_starttime"],
+                401,
+            )
+            return None
+
+        with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            side_effect=[[child], []],
+        ), mock.patch.object(
+            ramdisk,
+            "_process_group_members",
+            return_value=([child], []),
+        ), mock.patch.object(
+            ramdisk,
+            "_process_matches",
+            return_value=(True, "running-group", {"members": [child]}),
+        ), mock.patch.object(
+            ramdisk, "_group_alive", return_value=False
+        ), mock.patch.object(
+            ramdisk, "_terminate_verified_group", side_effect=terminate
+        ) as terminate_group, mock.patch.object(
+            ramdisk, "_merge_usage"
+        ) as merge:
+            stopped = ramdisk.stop()
+
+        terminate_group.assert_called_once()
+        merge.assert_called_once()
+        self.assertEqual(stopped["state"], "stopped")
+
+    def test_pending_preflight_accepts_the_exact_inert_zombie_leader(self):
+        pending = {
+            "operation_id": "start:" + ("a" * 32),
+            "nonce": "b" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "a" * 32,
+        }
+        zombie = {
+            "pid": 12011,
+            "uid": host_uid(),
+            "state": "Z",
+            "inert": True,
+            "starttime": 401,
+            "nonce": None,
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        child = {
+            "pid": 12012,
+            "uid": host_uid(),
+            "state": "S",
+            "inert": False,
+            "starttime": 402,
+            "nonce": pending["nonce"],
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": pending["state_dir"],
+            "weights_dir": pending["weights_dir"],
+            "cmdline": ["colibri"],
+        }
+
+        def process_matches(record):
+            self.assertEqual(record["pid"], 12011)
+            self.assertEqual(record["starttime"], 401)
+            return True, "running-group", {"members": [zombie, child]}
+
+        preflights, failures = lifecycle_support._preflight_pending_launches(
+            {"pending_launches": [pending]},
+            discover_managed_launches=mock.Mock(return_value=[child]),
+            process_matches=process_matches,
+            process_group_members=mock.Mock(return_value=([zombie, child], [])),
+            group_alive=mock.Mock(return_value=True),
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(preflights[0]["observed_group"]["leader_starttime"], 401)
+
+    def test_pending_preflight_accepts_exact_inert_nonleader(self):
+        pending = {
+            "operation_id": "start:" + ("a" * 32),
+            "nonce": "b" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "a" * 32,
+        }
+        leader = {
+            "pid": 12011,
+            "uid": host_uid(),
+            "inert": False,
+            "starttime": 401,
+            "nonce": pending["nonce"],
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": pending["state_dir"],
+            "weights_dir": pending["weights_dir"],
+            "cmdline": ["coli", "serve"],
+        }
+        zombie = {
+            "pid": 12012,
+            "uid": host_uid(),
+            "state": "Z",
+            "inert": True,
+            "starttime": 402,
+            "nonce": None,
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        process_matches = mock.Mock(
+            return_value=(True, "running", {"members": [leader, zombie]})
+        )
+
+        preflights, failures = lifecycle_support._preflight_pending_launches(
+            {"pending_launches": [pending]},
+            discover_managed_launches=mock.Mock(return_value=[leader]),
+            process_matches=process_matches,
+            process_group_members=mock.Mock(
+                return_value=([leader, zombie], [])
+            ),
+            group_alive=mock.Mock(return_value=True),
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(preflights[0]["record"]["starttime"], 401)
+        process_matches.assert_called_once()
+
+    def test_pending_preflight_rejects_mismatched_inert_nonleader(self):
+        pending = {
+            "operation_id": "start:" + ("a" * 32),
+            "nonce": "b" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "a" * 32,
+        }
+        leader = {
+            "pid": 12011,
+            "uid": host_uid(),
+            "inert": False,
+            "starttime": 401,
+            "nonce": pending["nonce"],
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": pending["state_dir"],
+            "weights_dir": pending["weights_dir"],
+            "cmdline": ["coli", "serve"],
+        }
+        zombie = {
+            "pid": 12012,
+            "uid": host_uid(),
+            "state": "Z",
+            "inert": True,
+            "starttime": 402,
+            "nonce": None,
+            "pgid": 12011,
+            "sid": 12011,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        for field, value in (
+            ("uid", host_uid() + 1),
+            ("pgid", 12099),
+            ("sid", 12099),
+        ):
+            with self.subTest(field=field):
+                process_matches = mock.Mock()
+                mismatched = dict(zombie, **{field: value})
+                preflights, failures = (
+                    lifecycle_support._preflight_pending_launches(
+                        {"pending_launches": [pending]},
+                        discover_managed_launches=mock.Mock(
+                            return_value=[leader]
+                        ),
+                        process_matches=process_matches,
+                        process_group_members=mock.Mock(
+                            return_value=([leader, mismatched], [])
+                        ),
+                        group_alive=mock.Mock(return_value=True),
+                    )
+                )
+
+                self.assertEqual(preflights, [])
+                self.assertRegex(failures[0], "foreign or mismatched member")
+                process_matches.assert_not_called()
+
+    def test_pending_launch_ambiguous_groups_refuse_without_side_effects(self):
+        pending = {
+            "operation_id": "start:" + ("c" * 32),
+            "nonce": "d" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "c" * 32,
+        }
+        manifest = self.manifest(state="starting")
+        manifest["pending_launches"] = [copy.deepcopy(pending)]
+        ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+
+        def candidate(pid, pgid):
+            return {
+                "pid": pid,
+                "uid": host_uid(),
+                "starttime": 500 + pid,
+                "nonce": pending["nonce"],
+                "pgid": pgid,
+                "sid": pgid,
+                "state_dir": pending["state_dir"],
+                "weights_dir": pending["weights_dir"],
+                "cmdline": ["colibri"],
+            }
+
+        with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            return_value=[candidate(12020, 12020), candidate(12021, 12021)],
+        ), mock.patch.object(
             ramdisk, "_terminate_verified_group"
         ) as terminate, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
             with self.assertRaisesRegex(
                 ramdisk.RamdiskError,
-                "pre-spawn managed launch has an unknown outcome",
+                "multiple process groups",
             ):
                 ramdisk.stop()
+
         terminate.assert_not_called()
         merge.assert_not_called()
-        stopped_refusal = ramdisk._load_manifest(required=True)
-        self.assertEqual(stopped_refusal["state"], "error")
-        self.assertEqual(stopped_refusal["pending_launches"], [pending])
+        persisted = ramdisk._load_manifest(required=True)
+        self.assertEqual(len(persisted["pending_launches"]), 1)
+        with mock.patch.object(ramdisk, "_mount_at", return_value=None):
+            recovery_status = ramdisk.status(deep=False)
+        self.assertNotIn(
+            pending["usage_merge_id"],
+            json.dumps(recovery_status, sort_keys=True),
+        )
 
-        write_pending()
-        with mock.patch.object(ramdisk, "_umount_path") as unmount, mock.patch.object(
-            ramdisk, "_durable_unlink"
-        ) as unlink:
+        with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            side_effect=[[], []],
+        ), mock.patch.object(ramdisk, "_merge_usage"):
+            stopped = ramdisk.stop()
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertNotIn("cleanup_errors", stopped)
+
+    def test_pending_launch_waits_for_ordinary_process_global_preflight(self):
+        pending = {
+            "operation_id": "start:" + ("e" * 32),
+            "nonce": "f" * 48,
+            "uid": host_uid(),
+            "port": 8001,
+            "node": 1,
+            "state_dir": os.path.join(self.root, "pending-state"),
+            "weights_dir": "/mnt/colibri-test/node1",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "e" * 32,
+        }
+        candidate = {
+            "pid": 12030,
+            "uid": host_uid(),
+            "starttime": 530,
+            "nonce": pending["nonce"],
+            "pgid": 12030,
+            "sid": 12030,
+            "state_dir": pending["state_dir"],
+            "weights_dir": pending["weights_dir"],
+            "cmdline": ["colibri"],
+        }
+        ordinary = {
+            "pid": 12031,
+            "pgid": 12031,
+            "uid": host_uid(),
+            "nonce": "1" * 48,
+            "state_dir": os.path.join(self.root, "ordinary-state"),
+            "usage_baseline": {},
+        }
+        manifest = {
+            "state": "starting",
+            "plan": {
+                "model": {"path": os.path.join(self.root, "model")},
+                "mounts": [
+                    {"node": 0, "path": "/mnt/colibri-test/node0"},
+                    {"node": 1, "path": pending["weights_dir"]},
+                ],
+            },
+            "mounts": [
+                {"node": 0, "path": "/mnt/colibri-test/node0"},
+                {"node": 1, "path": pending["weights_dir"]},
+            ],
+            "processes": [ordinary],
+            "pending_launches": [pending],
+        }
+        process_matches = mock.Mock(
+            side_effect=[
+                (True, "running", candidate),
+                (False, "foreign-uid", None),
+            ]
+        )
+        terminate = mock.Mock()
+        merge = mock.Mock()
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "unverified processes",
+        ):
+            lifecycle_support.stop(
+                load_manifest=mock.Mock(return_value=manifest),
+                discover_managed_launches=mock.Mock(return_value=[candidate]),
+                process_matches=process_matches,
+                process_group_members=mock.Mock(return_value=([candidate], [])),
+                group_alive=mock.Mock(),
+                managed_child_liveness=mock.Mock(return_value=None),
+                save_manifest=mock.Mock(),
+                terminate_verified_group=terminate,
+                merge_usage=merge,
+                bind_usage_transaction=mock.Mock(),
+            )
+
+        terminate.assert_not_called()
+        merge.assert_not_called()
+        self.assertNotIn("observed_group", pending)
+
+    def test_pending_launch_retry_does_not_repeat_merged_transaction(self):
+        pending = {
+            "operation_id": "start:" + ("2" * 32),
+            "nonce": "3" * 48,
+            "uid": host_uid(),
+            "port": 8000,
+            "node": None,
+            "state_dir": self.recovery_state_dir(),
+            "weights_dir": "/mnt/colibri-test",
+            "launch_not_before": 100,
+            "launcher_pid": 700,
+            "launcher_starttime": 90,
+            "launcher_cmdline": ["coli", "ramdisk", "start"],
+            "expected_command": ["coli", "serve"],
+            "usage_baseline": {"0:1": 3},
+            "usage_merge_id": "2" * 32,
+        }
+        manifest = self.manifest(state="starting")
+        manifest["pending_launches"] = [copy.deepcopy(pending)]
+        ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
+        real_save = ramdisk._save_manifest
+        save_calls = []
+
+        def fail_pending_removal(value):
+            save_calls.append(copy.deepcopy(value))
+            if len(save_calls) == 2:
+                raise OSError("pending removal save failed")
+            return real_save(value)
+
+        applied_transactions = set()
+        applications = []
+
+        def idempotent_merge(record, _canonical, plan=None):
+            del plan
+            merge_id = record["usage_merge_id"]
+            if merge_id not in applied_transactions:
+                applied_transactions.add(merge_id)
+                applications.append(merge_id)
+
+        merge = mock.Mock(side_effect=idempotent_merge)
+        with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            side_effect=[[], []],
+        ), mock.patch.object(
+            ramdisk, "_merge_usage", merge
+        ), mock.patch.object(
+            ramdisk, "_save_manifest", side_effect=fail_pending_removal
+        ):
             with self.assertRaisesRegex(
                 ramdisk.RamdiskError,
-                "pre-spawn managed launch has an unknown outcome",
+                "pending authority could not be removed",
             ):
-                ramdisk.destroy(argparse.Namespace(yes=True))
-        unmount.assert_not_called()
-        unlink.assert_not_called()
+                ramdisk.stop()
+
+        after_failure = ramdisk._load_manifest(required=True)
+        self.assertEqual(len(after_failure["pending_launches"]), 1)
+        self.assertIn("usage_merged_at", after_failure["pending_launches"][0])
+        merge.assert_called_once()
+        self.assertEqual(applications, [pending["usage_merge_id"]])
+
+        with mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            side_effect=[[], []],
+        ), mock.patch.object(ramdisk, "_merge_usage", merge):
+            stopped = ramdisk.stop()
+
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(applications, [pending["usage_merge_id"]])
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["pending_launches"], [])
 
     def test_start_refuses_unresolved_unpublished_process_recovery(self):
         manifest = self.manifest(state="error")
@@ -864,6 +2554,7 @@ class StateAndSafetyTest(unittest.TestCase):
             state="running",
             processes=[{"pid": 12341}],
         )
+        os.makedirs(manifest["processes"][0]["state_dir"], exist_ok=True)
         ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
         running = (True, "running", {"pid": 12341, "pgid": 12341})
 
@@ -936,20 +2627,19 @@ class StateAndSafetyTest(unittest.TestCase):
             "starttime": 91,
             "nonce": "a" * 48,
         }
-        running = (
-            True,
-            "running",
-            {"pid": 12345, "pgid": 12345},
-        )
-        reused = (
-            False,
-            "foreign-starttime",
-            {"pid": 12345, "pgid": 12345},
+        ops = mock.Mock()
+        ops.signal_verified_process_group.side_effect = (
+            {"status": "signaled", "members": [12345], "signaled": [12345]},
+            {
+                "status": "foreign",
+                "reason": "reused-pid",
+                "members": [12345],
+            },
         )
         with mock.patch.object(
-            ramdisk,
-            "_process_matches",
-            side_effect=(running, reused),
+            process_support,
+            "get_platform_ops",
+            return_value=ops,
         ), mock.patch.object(os, "killpg", create=True) as kill:
             failure = ramdisk._terminate_verified_group(
                 record,
@@ -957,8 +2647,12 @@ class StateAndSafetyTest(unittest.TestCase):
                 kill_seconds=0,
             )
 
-        kill.assert_called_once_with(12345, signal.SIGTERM)
-        self.assertIn("identity changed before SIGKILL", failure)
+        kill.assert_not_called()
+        self.assertEqual(
+            [call.args[1] for call in ops.signal_verified_process_group.call_args_list],
+            [signal.SIGTERM, signal.SIGKILL],
+        )
+        self.assertIn("reused-pid", failure)
 
     @requires_linux_operational
     def test_verified_stop_reaps_a_locally_owned_zombie_before_escalation(self):
@@ -970,19 +2664,18 @@ class StateAndSafetyTest(unittest.TestCase):
             "nonce": "b" * 48,
         }
         process = mock.Mock(pid=12346)
-        process.poll.side_effect = (None, 0)
-        running = (
-            True,
-            "running",
-            {"pid": 12346, "pgid": 12346},
+        process.poll.return_value = 0
+        ops = mock.Mock()
+        ops.signal_verified_process_group.side_effect = (
+            {"status": "signaled", "members": [12346], "signaled": [12346]},
+            {"status": "absent", "members": []},
         )
-        stopped = (False, "not-running", None)
         ramdisk._track_managed_child(process)
         self.addCleanup(ramdisk._forget_managed_child, process.pid)
         with mock.patch.object(
-            ramdisk,
-            "_process_matches",
-            side_effect=(running, stopped),
+            process_support,
+            "get_platform_ops",
+            return_value=ops,
         ), mock.patch.object(os, "killpg", create=True) as kill:
             failure = ramdisk._terminate_verified_group(
                 record,
@@ -991,7 +2684,7 @@ class StateAndSafetyTest(unittest.TestCase):
             )
 
         self.assertIsNone(failure)
-        kill.assert_called_once_with(12346, signal.SIGTERM)
+        kill.assert_not_called()
         self.assertNotIn(12346, ramdisk._managed_children)
 
     @requires_linux_operational
@@ -1008,10 +2701,15 @@ class StateAndSafetyTest(unittest.TestCase):
         ramdisk._track_managed_child(process)
         self.addCleanup(ramdisk._forget_managed_child, process.pid)
 
+        ops = mock.Mock()
+        ops.signal_verified_process_group.return_value = {
+            "status": "absent",
+            "members": [],
+        }
         with mock.patch.object(
-            ramdisk,
-            "_process_matches",
-            return_value=(False, "not-running", None),
+            process_support,
+            "get_platform_ops",
+            return_value=ops,
         ), mock.patch.object(os, "killpg", create=True) as kill:
             failure = ramdisk._terminate_verified_group(
                 record,
@@ -1033,10 +2731,15 @@ class StateAndSafetyTest(unittest.TestCase):
         }
         self.assertIsNone(ramdisk._managed_child_liveness(record["pid"]))
 
+        ops = mock.Mock()
+        ops.signal_verified_process_group.return_value = {
+            "status": "absent",
+            "members": [],
+        }
         with mock.patch.object(
-            ramdisk,
-            "_process_matches",
-            return_value=(False, "not-running", None),
+            process_support,
+            "get_platform_ops",
+            return_value=ops,
         ), mock.patch.object(os, "killpg", create=True) as kill:
             failure = ramdisk._terminate_verified_group(
                 record,
@@ -1050,6 +2753,7 @@ class StateAndSafetyTest(unittest.TestCase):
     @requires_linux_operational
     def test_stop_persists_error_when_usage_merge_fails(self):
         manifest = self.manifest(state="running", processes=[{"pid": 12345}])
+        os.makedirs(manifest["processes"][0]["state_dir"], exist_ok=True)
         ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
         with mock.patch.object(
             ramdisk, "_process_matches", return_value=(False, "not-running", None)
@@ -1069,7 +2773,13 @@ class StateAndSafetyTest(unittest.TestCase):
         )
         durable = {"manifest": None}
         saves = {"count": 0}
-        merge = mock.Mock()
+        merge_ids = []
+
+        def replay_merge(record, canonical_usage, *, plan):
+            del canonical_usage, plan
+            merge_ids.append(record["usage_merge_id"])
+
+        merge = mock.Mock(side_effect=replay_merge)
 
         def fail_first_completion_save(current):
             saves["count"] += 1
@@ -1087,6 +2797,12 @@ class StateAndSafetyTest(unittest.TestCase):
             "managed_child_liveness": lambda pid: False,
             "terminate_verified_group": mock.Mock(),
             "merge_usage": merge,
+            "bind_usage_transaction": (
+                lambda record, plan, reserved_ids: record.setdefault(
+                    "usage_merge_id",
+                    "e" * 32,
+                )
+            ),
         }
         with self.assertRaisesRegex(
             ramdisk.RamdiskError,
@@ -1107,10 +2823,497 @@ class StateAndSafetyTest(unittest.TestCase):
             **common,
         )
 
-        self.assertEqual(merge.call_count, 1)
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(len(set(merge_ids)), 1)
         self.assertEqual(stopped["state"], "stopped")
         self.assertIn("usage_merged_at", stopped["processes"][0])
         self.assertNotIn("usage_merge_error", stopped["processes"][0])
+
+    def test_stop_persists_legacy_journal_id_before_usage_replay(self):
+        manifest = self.manifest(
+            state="running",
+            processes=[{"pid": 12361}],
+        )
+        record = manifest["processes"][0]
+        record.pop("usage_merge_id", None)
+        state_dir = record["state_dir"]
+        os.makedirs(state_dir, exist_ok=True)
+        merge_id = "a" * 32
+        state_support._atomic_json(
+            os.path.join(state_dir, ".coli_usage.delta.json"),
+            {"version": 1, "id": merge_id, "delta": {"0:1": 2}},
+        )
+        events = []
+
+        def save(current):
+            events.append(
+                ("save", current["processes"][0].get("usage_merge_id"))
+            )
+
+        def merge(current, canonical, *, plan):
+            del canonical, plan
+            events.append(("merge", current.get("usage_merge_id")))
+
+        with mock.patch.object(
+            ramdisk,
+            "_load_manifest",
+            return_value=manifest,
+        ), mock.patch.object(
+            ramdisk,
+            "_managed_launch_processes",
+            return_value=[],
+        ), mock.patch.object(
+            ramdisk,
+            "_process_matches",
+            return_value=(False, "not-running", None),
+        ), mock.patch.object(
+            ramdisk,
+            "_managed_child_liveness",
+            return_value=False,
+        ), mock.patch.object(
+            ramdisk,
+            "_group_alive",
+            return_value=False,
+        ), mock.patch.object(
+            ramdisk,
+            "_save_manifest",
+            side_effect=save,
+        ), mock.patch.object(
+            ramdisk,
+            "_merge_usage",
+            side_effect=merge,
+        ):
+            ramdisk.stop.__wrapped__()
+
+        self.assertEqual(events[0], ("save", merge_id))
+        self.assertIn(("merge", merge_id), events)
+
+    def test_start_persists_legacy_journal_id_before_usage_replay(self):
+        manifest = self.manifest(
+            state="stopped",
+            processes=[
+                {
+                    "pid": 12362,
+                    "stopped_at": "2026-08-01T00:00:00Z",
+                }
+            ],
+        )
+        record = manifest["processes"][0]
+        record.pop("usage_merge_id", None)
+        state_dir = record["state_dir"]
+        os.makedirs(state_dir, exist_ok=True)
+        merge_id = "b" * 32
+        state_support._atomic_json(
+            os.path.join(state_dir, ".coli_usage.delta.json"),
+            {"version": 1, "id": merge_id, "delta": {"0:1": 2}},
+        )
+        events = []
+
+        def save(current):
+            events.append(
+                ("save", current["processes"][0].get("usage_merge_id"))
+            )
+
+        def merge(current, canonical, *, plan):
+            del canonical, plan
+            events.append(("merge", current.get("usage_merge_id")))
+
+        with mock.patch.object(
+            ramdisk,
+            "_load_manifest",
+            return_value=manifest,
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_effective_masks_unchanged",
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_ready_mounts",
+        ), mock.patch.object(
+            ramdisk,
+            "_process_matches",
+            return_value=(False, "not-running", None),
+        ), mock.patch.object(
+            ramdisk,
+            "_managed_child_liveness",
+            return_value=False,
+        ), mock.patch.object(
+            ramdisk,
+            "_save_manifest",
+            side_effect=save,
+        ), mock.patch.object(
+            ramdisk,
+            "_merge_usage",
+            side_effect=merge,
+        ), mock.patch.object(
+            ramdisk,
+            "_persisted_base_port",
+            side_effect=ramdisk.RamdiskError("stop after recovery"),
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "stop after recovery",
+            ):
+                ramdisk.start.__wrapped__(
+                    argparse.Namespace(base_port=None),
+                    cli_path=sys.executable,
+                )
+
+        self.assertEqual(events[0], ("save", merge_id))
+        self.assertEqual(events[1], ("merge", merge_id))
+
+    def test_stop_binds_all_transactions_before_save_or_signal(self):
+        manifest = self.manifest(
+            state="running",
+            mount_paths=[
+                "/mnt/colibri-test/node0",
+                "/mnt/colibri-test/node1",
+            ],
+            processes=[{"pid": 12371}, {"pid": 12372}],
+        )
+        events = []
+        terminate = mock.Mock()
+        merge = mock.Mock()
+
+        def bind(record, plan, reserved_ids):
+            del plan
+            merge_id = ("a" if record["pid"] == 12371 else "b") * 32
+            self.assertNotIn(merge_id, reserved_ids)
+            events.append(("bind", record["pid"], merge_id))
+            record["usage_merge_id"] = merge_id
+            return merge_id
+
+        def fail_save(current):
+            events.append(
+                (
+                    "save",
+                    tuple(
+                        record.get("usage_merge_id")
+                        for record in current["processes"]
+                    ),
+                )
+            )
+            raise OSError("transaction authority save failed")
+
+        with self.assertRaisesRegex(
+            OSError,
+            "transaction authority save failed",
+        ):
+            lifecycle_support.stop(
+                load_manifest=lambda required=True: manifest,
+                process_matches=lambda record: (True, "running", {}),
+                group_alive=lambda pgid: True,
+                managed_child_liveness=lambda pid: False,
+                save_manifest=fail_save,
+                terminate_verified_group=terminate,
+                merge_usage=merge,
+                bind_usage_transaction=bind,
+            )
+
+        self.assertEqual(
+            [event[0] for event in events],
+            ["bind", "bind", "save"],
+        )
+        terminate.assert_not_called()
+        merge.assert_not_called()
+
+    def test_duplicate_legacy_journals_fail_before_record_mutation(self):
+        manifest = self.manifest(
+            state="running",
+            mount_paths=[
+                "/mnt/colibri-test/node0",
+                "/mnt/colibri-test/node1",
+            ],
+            processes=[{"pid": 12373}, {"pid": 12374}],
+        )
+        merge_id = "c" * 32
+        for record in manifest["processes"]:
+            os.makedirs(record["state_dir"], exist_ok=True)
+            state_support._atomic_json(
+                os.path.join(record["state_dir"], ".coli_usage.delta.json"),
+                {
+                    "version": 1,
+                    "id": merge_id,
+                    "delta": {"0:1": 1},
+                },
+            )
+        save = mock.Mock()
+        terminate = mock.Mock()
+        merge = mock.Mock()
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "duplicate usage transaction",
+        ):
+            lifecycle_support.stop(
+                load_manifest=lambda required=True: manifest,
+                process_matches=lambda record: (False, "not-running", None),
+                group_alive=lambda pgid: False,
+                managed_child_liveness=lambda pid: False,
+                save_manifest=save,
+                terminate_verified_group=terminate,
+                merge_usage=merge,
+                bind_usage_transaction=ramdisk._bind_usage_transaction,
+            )
+
+        self.assertTrue(
+            all(
+                record.get("usage_merge_id") is None
+                for record in manifest["processes"]
+            )
+        )
+        save.assert_not_called()
+        terminate.assert_not_called()
+        merge.assert_not_called()
+
+    def test_start_duplicate_live_orphan_journals_fail_before_replay(self):
+        manifest = self.manifest(
+            state="stopped",
+            mount_paths=[
+                "/mnt/colibri-test/node0",
+                "/mnt/colibri-test/node1",
+            ],
+        )
+        model_dir = manifest["plan"]["model"]["path"]
+        canonical = os.path.join(model_dir, ".coli_usage")
+        os.makedirs(model_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        canonical_before = Path(canonical).read_bytes()
+        merge_id = "7" * 32
+        journals = []
+        journal_bytes = []
+        for node, delta in enumerate((2, 5)):
+            state_dir = self.recovery_state_dir(node=node)
+            os.makedirs(state_dir, mode=0o700)
+            journal = os.path.join(state_dir, ".coli_usage.delta.json")
+            state_support._atomic_json(
+                journal,
+                {"version": 1, "id": merge_id, "delta": {"0:1": delta}},
+            )
+            journals.append(journal)
+            journal_bytes.append(Path(journal).read_bytes())
+
+        with mock.patch.object(
+            ramdisk,
+            "_load_manifest",
+            return_value=manifest,
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_effective_masks_unchanged",
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_ready_mounts",
+        ), mock.patch.object(
+            ramdisk,
+            "_save_manifest",
+        ) as save, mock.patch.object(
+            ramdisk,
+            "_persisted_base_port",
+            side_effect=ramdisk.RamdiskError("continued past journal preflight"),
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "duplicate usage transaction",
+            ):
+                ramdisk.start.__wrapped__(
+                    argparse.Namespace(base_port=None),
+                    cli_path=sys.executable,
+                )
+
+        save.assert_not_called()
+        self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+        self.assertEqual(
+            [Path(path).read_bytes() for path in journals],
+            journal_bytes,
+        )
+
+    def test_start_orphan_journal_cannot_reuse_manifest_authority(self):
+        merge_id = "6" * 32
+        manifest = self.manifest(
+            state="stopped",
+            mount_paths=[
+                "/mnt/colibri-test/node0",
+                "/mnt/colibri-test/node1",
+            ],
+            processes=[
+                {
+                    "pid": 12375,
+                    "stopped_at": "2026-08-01T00:00:00Z",
+                    "usage_merge_id": merge_id,
+                }
+            ],
+        )
+        model_dir = manifest["plan"]["model"]["path"]
+        canonical = os.path.join(model_dir, ".coli_usage")
+        os.makedirs(model_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+        canonical_before = Path(canonical).read_bytes()
+        os.makedirs(self.recovery_state_dir(node=0), mode=0o700)
+        orphan_state = self.recovery_state_dir(node=1)
+        os.makedirs(orphan_state, mode=0o700)
+        journal = os.path.join(orphan_state, ".coli_usage.delta.json")
+        state_support._atomic_json(
+            journal,
+            {"version": 1, "id": merge_id, "delta": {"0:1": 5}},
+        )
+        journal_before = Path(journal).read_bytes()
+
+        with mock.patch.object(
+            ramdisk,
+            "_load_manifest",
+            return_value=manifest,
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_effective_masks_unchanged",
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_ready_mounts",
+        ), mock.patch.object(
+            ramdisk,
+            "_process_matches",
+            return_value=(False, "not-running", None),
+        ), mock.patch.object(
+            ramdisk,
+            "_managed_child_liveness",
+            return_value=False,
+        ), mock.patch.object(
+            ramdisk,
+            "_save_manifest",
+        ) as save:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "duplicate usage transaction",
+            ):
+                ramdisk.start.__wrapped__(
+                    argparse.Namespace(base_port=None),
+                    cli_path=sys.executable,
+                )
+
+        save.assert_not_called()
+        self.assertEqual(Path(canonical).read_bytes(), canonical_before)
+        self.assertEqual(Path(journal).read_bytes(), journal_before)
+
+    def test_start_mint_reserves_preflighted_orphan_journal_id(self):
+        manifest = self.manifest(state="stopped")
+        model_dir = manifest["plan"]["model"]["path"]
+        os.makedirs(model_dir)
+        ramdisk._usage_write(
+            os.path.join(model_dir, ".coli_usage"),
+            {"0:1": 10},
+        )
+        state_dir = self.recovery_state_dir()
+        os.makedirs(state_dir, mode=0o700)
+        orphan_id = "8" * 32
+        fresh_id = "9" * 32
+        state_support._atomic_json(
+            os.path.join(state_dir, ".coli_usage.delta.json"),
+            {"version": 1, "id": orphan_id, "delta": {"0:1": 2}},
+        )
+        mint_attempts = []
+
+        def token_hex(size):
+            if size == 24:
+                return "a" * 48
+            self.assertEqual(size, 16)
+            mint_attempts.append(len(mint_attempts))
+            return orphan_id if len(mint_attempts) == 1 else fresh_id
+
+        class FakeSocket:
+            def bind(self, address):
+                del address
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            ramdisk,
+            "_load_manifest",
+            return_value=manifest,
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_effective_masks_unchanged",
+        ), mock.patch.object(
+            ramdisk,
+            "_assert_ready_mounts",
+        ), mock.patch.object(
+            ramdisk,
+            "_save_manifest",
+        ), mock.patch.object(
+            ramdisk,
+            "_recover_delta",
+        ), mock.patch.object(
+            ramdisk,
+            "_usage_read",
+            return_value={"0:1": 10},
+        ), mock.patch.object(
+            ramdisk,
+            "_usage_write",
+        ), mock.patch.object(
+            ramdisk,
+            "_admit_concurrent_runtimes",
+        ), mock.patch.object(
+            ramdisk,
+            "_current_process_identity",
+            return_value={
+                "pid": 700,
+                "uid": host_uid(),
+                "starttime": 90,
+                "cmdline": ["coli", "ramdisk", "start"],
+            },
+        ), mock.patch.object(
+            ramdisk,
+            "_process_start_boundary",
+            side_effect=ramdisk.RamdiskError("stop after transaction mint"),
+        ), mock.patch.object(
+            ramdisk.socket,
+            "socket",
+            side_effect=lambda *args, **kwargs: FakeSocket(),
+        ), mock.patch.object(
+            lifecycle_support.secrets,
+            "token_hex",
+            side_effect=token_hex,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "stop after transaction mint",
+            ):
+                ramdisk.start.__wrapped__(
+                    argparse.Namespace(base_port=None),
+                    cli_path=sys.executable,
+                )
+
+        self.assertEqual(len(mint_attempts), 2)
+
+    def test_expected_orphan_journal_disappearance_fails_closed(self):
+        model_dir = os.path.join(self.root, "model")
+        canonical = os.path.join(model_dir, ".coli_usage")
+        state_dir = os.path.join(self.root, "orphan-state")
+        os.makedirs(model_dir)
+        os.makedirs(state_dir)
+        ramdisk._usage_write(canonical, {"0:1": 10})
+
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "expected usage delta journal is absent",
+        ):
+            ramdisk._recover_delta(
+                state_dir,
+                canonical,
+                expected_merge_id="a" * 32,
+            )
+
+        self.assertEqual(ramdisk._usage_read(canonical), {"0:1": 10})
+
+    def test_usage_transaction_mint_skips_reserved_collision(self):
+        reserved = {"d" * 32}
+        with mock.patch.object(
+            lifecycle_support.secrets,
+            "token_hex",
+            side_effect=("d" * 32, "e" * 32),
+        ):
+            merge_id = lifecycle_support._mint_usage_transaction_id(reserved)
+
+        self.assertEqual(merge_id, "e" * 32)
+        self.assertEqual(reserved, {"d" * 32, "e" * 32})
 
     @requires_linux_operational
     def test_stop_does_not_merge_when_retained_child_is_live(self):
@@ -1146,6 +3349,7 @@ class StateAndSafetyTest(unittest.TestCase):
     @requires_linux_operational
     def test_stop_preserves_termination_failure_until_group_absence_is_proven(self):
         manifest = self.manifest(state="running", processes=[{"pid": 12349}])
+        os.makedirs(manifest["processes"][0]["state_dir"], exist_ok=True)
         ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
         running = (True, "running", {"pid": 12349, "pgid": 12349})
         inconclusive = (
@@ -1238,6 +3442,120 @@ class StateAndSafetyTest(unittest.TestCase):
         persisted = ramdisk._read_json(ramdisk._manifest_path())
         self.assertEqual(persisted["state"], "error")
         self.assertIn(mount_path, persisted["recovery"]["retained_mounts"])
+
+    def test_prepare_save_ambiguity_preserves_strongest_exact_mount(self):
+        mount_path = os.path.join(self.root, "ramdisk-mount")
+        exact_identity = {
+            "mount_id": 41,
+            "device": "0:41",
+            "filesystem": "tmpfs",
+            "source": "tmpfs",
+        }
+        plan = {
+            "blockers": [],
+            "mount_root": mount_path,
+            "mounts": [
+                {
+                    "path": mount_path,
+                    "node": None,
+                    "size_bytes": 4096,
+                }
+            ],
+            "topology": "interleaved",
+            "model": {
+                "path": os.path.join(self.root, "model"),
+                "fingerprint": self.FINGERPRINT,
+            },
+            "hardware": {
+                "swap": {"used_bytes": 0},
+            },
+            "mount_options": {},
+        }
+        durable = {"manifest": None}
+        save_calls = {"count": 0}
+
+        def ambiguous_save(current):
+            save_calls["count"] += 1
+            durable["manifest"] = copy.deepcopy(current)
+            if save_calls["count"] in (3, 4):
+                raise OSError("post-replace directory fsync failed")
+
+        observed = iter((None, copy.deepcopy(exact_identity)))
+        unmount = mock.Mock()
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "post-replace directory fsync failed",
+        ):
+            lifecycle_support.prepare(
+                argparse.Namespace(base_port=8000, yes=True),
+                display_plan=False,
+                load_manifest=lambda required=False: None,
+                build_plan=lambda args: copy.deepcopy(plan),
+                managed_ports_for_plan=lambda current, base: [base],
+                plan_confirmation_token=lambda current: "token",
+                render_plan=mock.Mock(),
+                confirm=mock.Mock(),
+                save_manifest=ambiguous_save,
+                mount_at=lambda path: next(observed),
+                mount_tmpfs=mock.Mock(),
+                umount_path=unmount,
+                validate_mount=mock.Mock(return_value=exact_identity),
+                populate_mount=mock.Mock(),
+                validate_namespace=mock.Mock(),
+                source_still_matches=mock.Mock(),
+                ensure_busy_mount_scan_available=mock.Mock(),
+                durable_unlink=mock.Mock(),
+                manifest_path=lambda: os.path.join(self.root, "manifest.json"),
+                mount_table=mock.Mock(return_value=[]),
+                path_is_below=lambda path, parent: False,
+                busy_mount_references=mock.Mock(return_value=[]),
+            )
+
+        persisted = durable["manifest"]["mounts"][0]
+        self.assertEqual(persisted["ownership"], "identified")
+        self.assertEqual(persisted["identity"], exact_identity)
+        self.assertEqual(persisted["cleanup"]["state"], "retained")
+        unmount.assert_not_called()
+
+    def test_prepare_recovery_candidate_unions_durable_pending_records(self):
+        first_path = os.path.join(self.root, "mount-a")
+        second_path = os.path.join(self.root, "mount-b")
+        durable = {
+            "state": "preparing",
+            "mounts": [
+                {
+                    "path": first_path,
+                    "operation_id": "deploy:mount:0",
+                    "ownership": "pending",
+                },
+                {
+                    "path": second_path,
+                    "operation_id": "deploy:mount:1",
+                    "ownership": "pending",
+                },
+            ],
+        }
+        current = {
+            "state": "preparing",
+            "mounts": [
+                {
+                    "path": first_path,
+                    "operation_id": "deploy:mount:0",
+                    "ownership": "identified",
+                    "identity": {"mount_id": 42, "device": "0:42"},
+                }
+            ],
+        }
+
+        recovery = lifecycle_support._strongest_prepare_recovery_manifest(
+            current,
+            durable,
+        )
+
+        by_path = {record["path"]: record for record in recovery["mounts"]}
+        self.assertEqual(by_path[first_path]["ownership"], "identified")
+        self.assertEqual(by_path[first_path]["identity"]["mount_id"], 42)
+        self.assertEqual(by_path[second_path]["ownership"], "pending")
 
     @requires_linux_operational
     def test_destroy_retains_manifest_for_unrecorded_surviving_mount(self):
@@ -1555,10 +3873,41 @@ class StateAndSafetyTest(unittest.TestCase):
             "pgid": 101,
             "uid": host_uid(),
             "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
         }
         members = [
-            {"pid": 101, "uid": host_uid(), "nonce": "a" * 48},
-            {"pid": 102, "uid": host_uid(), "nonce": "a" * 48},
+            {
+                "pid": 101,
+                "uid": host_uid(),
+                "inert": False,
+                "nonce": "a" * 48,
+                "pgid": 101,
+                "sid": 101,
+                "state_dir": "/state/node-0",
+                "weights_dir": "/mnt/weights",
+            },
+            {
+                "pid": 102,
+                "uid": host_uid(),
+                "inert": False,
+                "nonce": "a" * 48,
+                "pgid": 101,
+                "sid": 101,
+                "state_dir": "/state/node-0",
+                "weights_dir": "/mnt/weights",
+            },
+            {
+                "pid": 103,
+                "uid": host_uid(),
+                "inert": True,
+                "starttime": 203,
+                "nonce": None,
+                "pgid": 101,
+                "sid": 101,
+                "state_dir": None,
+                "weights_dir": None,
+            },
         ]
 
         def proc_text(path, default=""):
@@ -1566,6 +3915,8 @@ class StateAndSafetyTest(unittest.TestCase):
                 return "VmRSS:\t100 kB\n"
             if path == "/proc/102/status":
                 return "VmRSS:\t900 kB\n"
+            if path == "/proc/103/status":
+                self.fail("inert zombie must be excluded from RSS metrics")
             return default
 
         with mock.patch.object(
@@ -1581,6 +3932,28 @@ class StateAndSafetyTest(unittest.TestCase):
         report = ramdisk.status()
         self.assertEqual(report["schema"], ramdisk.STATUS_SCHEMA)
         self.assertEqual(report["state"], "absent")
+
+    def test_status_distinguishes_absent_mount_from_unknown_observation(self):
+        manifest = self.manifest(state="ready")
+        with mock.patch.object(
+            ramdisk, "_load_manifest", return_value=manifest
+        ), mock.patch.object(ramdisk, "_mount_at", return_value=None):
+            absent = ramdisk.status(deep=False)["mounts"][0]
+
+        with mock.patch.object(
+            ramdisk, "_load_manifest", return_value=manifest
+        ), mock.patch.object(
+            ramdisk,
+            "_mount_at",
+            side_effect=OSError("mount table unreadable"),
+        ):
+            unknown = ramdisk.status(deep=False)["mounts"][0]
+
+        self.assertIs(absent["mounted"], False)
+        self.assertIsNone(absent["option_error"])
+        self.assertIsNone(unknown["mounted"])
+        self.assertIn("mount table unreadable", unknown["option_error"])
+        self.assertFalse(unknown["verified"])
 
     def test_status_exposes_sanitized_actionable_recovery(self):
         manifest = self.manifest(state="error")
@@ -1611,9 +3984,16 @@ class StateAndSafetyTest(unittest.TestCase):
             {
                 "operation_id": "start:" + secret_merge_id,
                 "nonce": secret_nonce,
+                "uid": host_uid(),
                 "port": 8000,
                 "node": None,
                 "state_dir": os.path.join(self.root, "pending-state"),
+                "weights_dir": "/mnt/colibri-test",
+                "launch_not_before": 100,
+                "launcher_pid": 700,
+                "launcher_starttime": 90,
+                "launcher_cmdline": ["coli", "ramdisk", "start"],
+                "expected_command": ["coli", "serve"],
                 "usage_baseline": {"0:1": 23},
                 "usage_merge_id": secret_merge_id,
             }
@@ -1643,6 +4023,12 @@ class StateAndSafetyTest(unittest.TestCase):
         self.assertNotIn(secret_merge_id, serialized)
         self.assertNotIn("usage_baseline", serialized)
         self.assertNotIn("usage_merge_id", serialized)
+        self.assertNotIn("launch_not_before", serialized)
+        self.assertNotIn("launcher_pid", serialized)
+        self.assertNotIn("launcher_starttime", serialized)
+        self.assertNotIn("launcher_cmdline", serialized)
+        self.assertNotIn("expected_command", serialized)
+        self.assertNotIn("weights_dir", serialized)
 
     def test_deep_status_preserves_recovery_when_source_scan_raises_oserror(self):
         manifest = self.manifest(state="error")
@@ -1768,6 +4154,7 @@ class StateAndSafetyTest(unittest.TestCase):
                     "pid": 14002,
                     "stopped_at": "2026-08-01T00:00:00Z",
                     "usage_merged_at": "2026-08-01T00:00:00Z",
+                    "usage_merge_id": "d" * 32,
                 }
             ],
         )

@@ -56,7 +56,7 @@ class TuiPlacementContractTest(unittest.TestCase):
         self.assertEqual(destroy_only, "[d] destroy")
         self.assertEqual(stop_only, "[x] stop")
         self.assertEqual(retained_stop_only, "[x] stop")
-        self.assertEqual(outcome_unknown, "[R] refresh")
+        self.assertEqual(outcome_unknown, "[x] stop")
 
     def test_human_status_renders_only_sanitized_recovery_fields(self):
         secret_nonce = "a" * 48

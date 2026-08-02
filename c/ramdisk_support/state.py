@@ -3,13 +3,13 @@
 from __future__ import print_function
 
 import contextlib
+import datetime
 import json
 import os
 import posixpath
 import re
 import secrets
 import stat
-import tempfile
 import threading
 
 from .common import (
@@ -38,6 +38,40 @@ except ImportError:
 
 _lifecycle_local = threading.local()
 _fallback_usage_lock = threading.RLock()
+_NATIVE_DIRFD_PRIMITIVES = (
+    os.name == "posix"
+    and os.open in getattr(os, "supports_dir_fd", set())
+    and os.stat in getattr(os, "supports_dir_fd", set())
+    and os.unlink in getattr(os, "supports_dir_fd", set())
+    and os.rename in getattr(os, "supports_dir_fd", set())
+)
+
+
+def _supports_native_dirfd():
+    """Return whether the current runtime can bind every required file step."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    return (
+        _NATIVE_DIRFD_PRIMITIVES
+        and all(
+            isinstance(getattr(os, name, None), int)
+            and getattr(os, name) != 0
+            for name in required_flags
+        )
+    )
+
+
+def _valid_utc_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return False
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() == datetime.timedelta(0)
+    )
 
 
 def _valid_usage_snapshot(value):
@@ -176,25 +210,555 @@ def _lifecycle_lock():
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def _atomic_json(path, value, mode=0o600):
-    parent = os.path.dirname(path)
-    _ensure_atomic_parent(parent)
-    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=parent)
+@contextlib.contextmanager
+def _close_preserving_primary(close):
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-        _fsync_directory(parent)
+        yield
     except BaseException:
         try:
-            os.unlink(tmp)
-        except OSError:
+            close()
+        except BaseException:
             pass
         raise
+    else:
+        close()
+
+
+@contextlib.contextmanager
+def _fdopen_preserving_primary(descriptor, *args, **kwargs):
+    try:
+        stream = os.fdopen(descriptor, *args, **kwargs)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except BaseException:
+            pass
+        raise
+    with _close_preserving_primary(stream.close):
+        yield stream
+
+
+def _stat_identity(info):
+    return (info.st_dev, info.st_ino)
+
+
+def _real_directory_info(path, source):
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise RamdiskError("%s directory is unavailable: %s" % (source, exc)) from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RamdiskError("%s parent is not a real directory: %s" % (source, path))
+    return info
+
+
+def _revalidate_bound_parent(bound):
+    final = _real_directory_info(bound["parent"], bound["source"])
+    if _stat_identity(final) != bound["identity"]:
+        raise RamdiskError(
+            "%s parent identity changed during access" % bound["source"]
+        )
+    validator = bound.get("validator")
+    if validator is not None:
+        validator()
+        final = _real_directory_info(bound["parent"], bound["source"])
+        if _stat_identity(final) != bound["identity"]:
+            raise RamdiskError(
+                "%s parent identity changed during validation" % bound["source"]
+            )
+
+
+@contextlib.contextmanager
+def _bound_parent_descriptor(
+    parent,
+    *,
+    source,
+    validator=None,
+    expected_identity=None,
+    require_native=False,
+):
+    parent = os.path.normpath(parent)
+    before = _real_directory_info(parent, source)
+    before_identity = _stat_identity(before)
+    if expected_identity is not None and before_identity != expected_identity:
+        raise RamdiskError("%s parent identity changed before open" % source)
+    if validator is not None:
+        validator()
+    if not _supports_native_dirfd():
+        if require_native:
+            raise RamdiskError(
+                "%s requires descriptor-relative filesystem operations" % source
+            )
+        bound = {
+            "descriptor": None,
+            "identity": before_identity,
+            "parent": parent,
+            "native": False,
+            "source": source,
+            "validator": validator,
+        }
+        try:
+            yield bound
+        except BaseException:
+            try:
+                _revalidate_bound_parent(bound)
+            except BaseException:
+                pass
+            raise
+        else:
+            _revalidate_bound_parent(bound)
+        return
+
+    flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_DIRECTORY"))
+        | int(getattr(os, "O_NOFOLLOW"))
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(parent, flags)
+    except OSError as exc:
+        raise RamdiskError("cannot open %s parent safely: %s" % (source, exc)) from exc
+    with _close_preserving_primary(lambda: os.close(descriptor)):
+        opened = os.fstat(descriptor)
+        after_open = _real_directory_info(parent, source)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _stat_identity(opened) != before_identity
+            or _stat_identity(after_open) != before_identity
+        ):
+            raise RamdiskError("%s parent identity changed during verified open" % source)
+        if validator is not None:
+            validator()
+        after_validation = _real_directory_info(parent, source)
+        if _stat_identity(after_validation) != before_identity:
+            raise RamdiskError("%s parent identity changed during validation" % source)
+        bound = {
+            "descriptor": descriptor,
+            "identity": before_identity,
+            "parent": parent,
+            "native": True,
+            "source": source,
+            "validator": validator,
+        }
+        try:
+            yield bound
+        except BaseException:
+            try:
+                _revalidate_bound_parent(bound)
+            except BaseException:
+                pass
+            raise
+        else:
+            _revalidate_bound_parent(bound)
+
+
+def _target_info(bound, name):
+    try:
+        if bound["native"]:
+            return os.stat(
+                name,
+                dir_fd=bound["descriptor"],
+                follow_symlinks=False,
+            )
+        return os.lstat(os.path.join(bound["parent"], name))
+    except FileNotFoundError:
+        return None
+
+
+def _require_regular_target(info, path, source, *, allow_missing):
+    if info is None:
+        if allow_missing:
+            return
+        raise RamdiskError(
+            "%s must be an existing regular non-symlink file: %s"
+            % (source, path)
+        )
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RamdiskError(
+            "%s must be a regular non-symlink file: %s" % (source, path)
+        )
+
+
+def _read_regular_text_from_bound_impl(
+    bound,
+    name,
+    *,
+    source,
+    allow_missing,
+    consumer=None,
+):
+    path = os.path.join(bound["parent"], name)
+    before = _target_info(bound, name)
+    _require_regular_target(before, path, source, allow_missing=allow_missing)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | int(getattr(os, "O_NONBLOCK", 0) or 0)
+    )
+    if isinstance(getattr(os, "O_NOFOLLOW", None), int):
+        flags |= int(getattr(os, "O_NOFOLLOW"))
+    try:
+        if bound["native"]:
+            descriptor = os.open(
+                name,
+                flags,
+                dir_fd=bound["descriptor"],
+            )
+        else:
+            descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if allow_missing and before is None:
+            return {
+                "text": "",
+                "exists": False,
+                "parent_identity": bound["identity"],
+                "target_identity": None,
+            }
+        raise RamdiskError("%s changed before open: %s" % (source, path))
+    except OSError:
+        # The public reader wrapper normalizes ordinary I/O failures while
+        # preserving RamdiskError and BaseException control flow.
+        raise
+
+    with _close_preserving_primary(lambda: os.close(descriptor)):
+        opened = os.fstat(descriptor)
+        _require_regular_target(opened, path, source, allow_missing=False)
+        opened_identity = _stat_identity(opened)
+        after_open = _target_info(bound, name)
+        if (
+            before is None
+            or after_open is None
+            or _stat_identity(before) != opened_identity
+            or _stat_identity(after_open) != opened_identity
+        ):
+            raise RamdiskError("%s changed during verified open: %s" % (source, path))
+        with _fdopen_preserving_primary(
+            descriptor,
+            "r",
+            encoding="utf-8",
+            errors="strict",
+            closefd=False,
+        ) as stream:
+            try:
+                text = stream.read()
+                consumed = consumer(text) if consumer is not None else None
+            except RamdiskError:
+                raise
+            except (OSError, UnicodeError) as exc:
+                raise RamdiskError(
+                    "cannot read %s: %s" % (source, exc)
+                ) from exc
+        final = _target_info(bound, name)
+        if final is None or _stat_identity(final) != opened_identity:
+            raise RamdiskError("%s changed during read: %s" % (source, path))
+        snapshot = {
+            "text": text,
+            "exists": True,
+            "parent_identity": bound["identity"],
+            "target_identity": opened_identity,
+        }
+        if consumer is not None:
+            snapshot["value"] = consumed
+        return snapshot
+
+
+def _read_regular_text_from_bound(
+    bound,
+    name,
+    *,
+    source,
+    allow_missing,
+    consumer=None,
+):
+    try:
+        return _read_regular_text_from_bound_impl(
+            bound,
+            name,
+            source=source,
+            allow_missing=allow_missing,
+            consumer=consumer,
+        )
+    except RamdiskError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise RamdiskError("cannot read %s: %s" % (source, exc)) from exc
+
+
+def _read_bound_regular_text(
+    path,
+    *,
+    source,
+    allow_missing,
+    validator=None,
+    expected_parent_identity=None,
+    require_native=False,
+    consumer=None,
+):
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if not name or os.path.join(parent, name) != path:
+        raise RamdiskError("%s path is not normalized: %s" % (source, path))
+    with _bound_parent_descriptor(
+        parent,
+        source=source,
+        validator=validator,
+        expected_identity=expected_parent_identity,
+        require_native=require_native,
+    ) as bound:
+        return _read_regular_text_from_bound(
+            bound,
+            name,
+            source=source,
+            allow_missing=allow_missing,
+            consumer=consumer,
+        )
+
+
+def _open_bound_temporary(bound, prefix, mode):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    if bound["native"]:
+        flags |= int(getattr(os, "O_NOFOLLOW"))
+    for _ in range(128):
+        name = prefix + secrets.token_hex(16)
+        try:
+            if bound["native"]:
+                descriptor = os.open(
+                    name,
+                    flags,
+                    mode,
+                    dir_fd=bound["descriptor"],
+                )
+            else:
+                descriptor = os.open(
+                    os.path.join(bound["parent"], name),
+                    flags,
+                    mode,
+                )
+        except FileExistsError:
+            continue
+        return descriptor, name
+    raise RamdiskError("could not allocate an atomic temporary file")
+
+
+def _fsync_bound_directory(descriptor):
+    os.fsync(descriptor)
+
+
+def _atomic_replace_stream_from_bound(
+    bound,
+    name,
+    *,
+    source,
+    prefix,
+    mode,
+    writer,
+    expected_snapshot=None,
+):
+    path = os.path.join(bound["parent"], name)
+    if (
+        not name
+        or os.path.basename(name) != name
+        or os.path.normpath(path) != path
+    ):
+        raise RamdiskError("%s path is not normalized: %s" % (source, path))
+    if isinstance(expected_snapshot, dict) and (
+        expected_snapshot.get("parent_identity") != bound["identity"]
+    ):
+        raise RamdiskError("%s parent identity changed before replacement" % source)
+
+    _revalidate_bound_parent(bound)
+    initial = _target_info(bound, name)
+    _require_regular_target(initial, path, source, allow_missing=True)
+    initial_identity = _stat_identity(initial) if initial is not None else None
+    if isinstance(expected_snapshot, dict) and (
+        initial_identity != expected_snapshot.get("target_identity")
+    ):
+        raise RamdiskError("%s changed before atomic replacement" % source)
+
+    descriptor, tmp_name = _open_bound_temporary(bound, prefix, mode)
+    tmp_path = os.path.join(bound["parent"], tmp_name)
+    try:
+        opened_temp = os.fstat(descriptor)
+        _require_regular_target(
+            opened_temp,
+            tmp_path,
+            "atomic temporary file",
+            allow_missing=False,
+        )
+        temp_identity = _stat_identity(opened_temp)
+        visible_temp = _target_info(bound, tmp_name)
+        if (
+            visible_temp is None
+            or _stat_identity(visible_temp) != temp_identity
+        ):
+            raise RamdiskError("atomic temporary file escaped its bound parent")
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except BaseException:
+            pass
+        try:
+            if bound["native"]:
+                os.unlink(tmp_name, dir_fd=bound["descriptor"])
+            else:
+                os.unlink(tmp_path)
+        except BaseException:
+            pass
+        raise
+
+    replaced = False
+    try:
+        with _fdopen_preserving_primary(
+            descriptor,
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            writer(stream)
+            stream.flush()
+            if hasattr(os, "fchmod"):
+                os.fchmod(stream.fileno(), mode)
+            else:
+                os.chmod(tmp_path, mode)
+            os.fsync(stream.fileno())
+
+        _revalidate_bound_parent(bound)
+        visible_temp = _target_info(bound, tmp_name)
+        if (
+            visible_temp is None
+            or _stat_identity(visible_temp) != temp_identity
+        ):
+            raise RamdiskError("atomic temporary file changed before replacement")
+        current = _target_info(bound, name)
+        _require_regular_target(current, path, source, allow_missing=True)
+        current_identity = _stat_identity(current) if current is not None else None
+        if current_identity != initial_identity:
+            raise RamdiskError("%s changed before atomic replacement" % source)
+
+        if bound["native"]:
+            os.replace(
+                tmp_name,
+                name,
+                src_dir_fd=bound["descriptor"],
+                dst_dir_fd=bound["descriptor"],
+            )
+        else:
+            os.replace(tmp_path, path)
+        replaced = True
+
+        committed = _target_info(bound, name)
+        _require_regular_target(committed, path, source, allow_missing=False)
+        if _stat_identity(committed) != temp_identity:
+            raise RamdiskError("%s changed during atomic replacement" % source)
+        _revalidate_bound_parent(bound)
+        if bound["native"]:
+            _fsync_bound_directory(bound["descriptor"])
+        else:
+            _fsync_directory(bound["parent"])
+        return {
+            "text": None,
+            "exists": True,
+            "parent_identity": bound["identity"],
+            "target_identity": temp_identity,
+        }
+    except BaseException:
+        if not replaced:
+            try:
+                if bound["native"]:
+                    os.unlink(tmp_name, dir_fd=bound["descriptor"])
+                else:
+                    os.unlink(tmp_path)
+            except BaseException:
+                pass
+        raise
+
+
+def _atomic_replace_stream(
+    path,
+    *,
+    prefix,
+    mode,
+    writer,
+    expected_snapshot=None,
+    validator=None,
+    require_native=False,
+    source=None,
+):
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    source = source or "atomic target %s" % path
+    expected_parent = (
+        expected_snapshot.get("parent_identity")
+        if isinstance(expected_snapshot, dict)
+        else None
+    )
+    with _bound_parent_descriptor(
+        parent,
+        source=source,
+        validator=validator,
+        expected_identity=expected_parent,
+        require_native=require_native,
+    ) as bound:
+        return _atomic_replace_stream_from_bound(
+            bound,
+            name,
+            source=source,
+            prefix=prefix,
+            mode=mode,
+            writer=writer,
+            expected_snapshot=expected_snapshot,
+        )
+
+
+def _atomic_json_from_bound(
+    bound,
+    name,
+    value,
+    *,
+    mode=0o600,
+    source="atomic JSON target",
+    expected_snapshot=None,
+):
+    def write(stream):
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+    return _atomic_replace_stream_from_bound(
+        bound,
+        name,
+        source=source,
+        prefix=".tmp-",
+        mode=mode,
+        writer=write,
+        expected_snapshot=expected_snapshot,
+    )
+
+
+def _atomic_json(
+    path,
+    value,
+    mode=0o600,
+    *,
+    expected_snapshot=None,
+    validator=None,
+    require_native=False,
+):
+    parent = os.path.dirname(path)
+    _ensure_atomic_parent(parent)
+
+    def write(stream):
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+    _atomic_replace_stream(
+        path,
+        prefix=".tmp-",
+        mode=mode,
+        writer=write,
+        expected_snapshot=expected_snapshot,
+        validator=validator,
+        require_native=require_native,
+    )
 
 
 def _read_json(path, required=False):
@@ -447,15 +1011,48 @@ def _load_manifest(
         raise RamdiskError(
             "RAM-disk pending launches require starting or error state"
         )
+    invoking_uid = uid_provider()
+    pending_operation_ids = set()
+    pending_nonces = set()
+    usage_merge_ids = set()
     for pending in pending_launches:
         operation_id = (
             pending.get("operation_id") if isinstance(pending, dict) else None
         )
         nonce = pending.get("nonce") if isinstance(pending, dict) else None
+        uid = pending.get("uid") if isinstance(pending, dict) else None
         port = pending.get("port") if isinstance(pending, dict) else None
         node = pending.get("node") if isinstance(pending, dict) else None
         state_dir = (
             pending.get("state_dir") if isinstance(pending, dict) else None
+        )
+        weights_dir = (
+            pending.get("weights_dir") if isinstance(pending, dict) else None
+        )
+        launch_not_before = (
+            pending.get("launch_not_before")
+            if isinstance(pending, dict)
+            else None
+        )
+        launcher_cmdline = (
+            pending.get("launcher_cmdline")
+            if isinstance(pending, dict)
+            else None
+        )
+        launcher_pid = (
+            pending.get("launcher_pid")
+            if isinstance(pending, dict)
+            else None
+        )
+        launcher_starttime = (
+            pending.get("launcher_starttime")
+            if isinstance(pending, dict)
+            else None
+        )
+        expected_command = (
+            pending.get("expected_command")
+            if isinstance(pending, dict)
+            else None
         )
         baseline = (
             pending.get("usage_baseline")
@@ -467,24 +1064,120 @@ def _load_manifest(
             if isinstance(pending, dict)
             else None
         )
+        observed_group = (
+            pending.get("observed_group")
+            if isinstance(pending, dict)
+            else None
+        )
+        usage_merged_at = (
+            pending.get("usage_merged_at")
+            if isinstance(pending, dict)
+            else None
+        )
+        recovery_error = (
+            pending.get("recovery_error")
+            if isinstance(pending, dict)
+            else None
+        )
+        observed_pgid = (
+            observed_group.get("pgid")
+            if isinstance(observed_group, dict)
+            else None
+        )
+        observed_uid = (
+            observed_group.get("uid")
+            if isinstance(observed_group, dict)
+            else None
+        )
+        leader_starttime = (
+            observed_group.get("leader_starttime")
+            if isinstance(observed_group, dict)
+            else None
+        )
+        planned_mount = next(
+            (
+                record
+                for record in plan["mounts"]
+                if record.get("node") == node
+            ),
+            None,
+        )
         if (
             not isinstance(operation_id, str)
             or not re.fullmatch(r"start:[0-9a-f]{32}", operation_id)
             or not isinstance(nonce, str)
             or not re.fullmatch(r"[0-9a-f]{48}", nonce)
+            or uid != invoking_uid
             or not isinstance(port, int)
             or isinstance(port, bool)
             or not 1 <= port <= 65535
             or node not in {record.get("node") for record in plan["mounts"]}
             or not isinstance(state_dir, str)
             or not os.path.isabs(state_dir)
+            or planned_mount is None
+            or weights_dir != planned_mount.get("path")
+            or not isinstance(launch_not_before, int)
+            or isinstance(launch_not_before, bool)
+            or launch_not_before < 0
+            or not _positive_int(launcher_pid)
+            or not _positive_int(launcher_starttime)
+            or not isinstance(launcher_cmdline, list)
+            or not launcher_cmdline
+            or any(
+                not isinstance(item, str) or not item
+                for item in launcher_cmdline
+            )
+            or not isinstance(expected_command, list)
+            or not expected_command
+            or any(
+                not isinstance(item, str) or not item
+                for item in expected_command
+            )
             or not _valid_usage_snapshot(baseline)
             or not isinstance(merge_id, str)
             or not re.fullmatch(r"[0-9a-f]{32}", merge_id)
+            or (
+                usage_merged_at is not None
+                and not _valid_utc_timestamp(usage_merged_at)
+            )
+            or (
+                recovery_error is not None
+                and (
+                    not isinstance(recovery_error, str)
+                    or not recovery_error
+                )
+            )
+            or (
+                observed_group is not None
+                and (
+                    not isinstance(observed_group, dict)
+                    or not _positive_int(observed_pgid)
+                    or observed_uid != uid
+                    or (
+                        leader_starttime is not None
+                        and not _positive_int(leader_starttime)
+                    )
+                )
+            )
         ):
             raise RamdiskError(
                 "RAM-disk manifest has unsafe pending launch recovery"
             )
+        if operation_id != "start:" + merge_id:
+            raise RamdiskError(
+                "RAM-disk manifest has unsafe pending launch recovery"
+            )
+        if operation_id in pending_operation_ids or nonce in pending_nonces:
+            raise RamdiskError(
+                "RAM-disk manifest has duplicate pending launch recovery"
+            )
+        if merge_id in usage_merge_ids:
+            raise RamdiskError(
+                "RAM-disk manifest has duplicate usage transaction authority"
+            )
+        pending_operation_ids.add(operation_id)
+        pending_nonces.add(nonce)
+        usage_merge_ids.add(merge_id)
     for retained in retained_processes:
         pid = retained.get("pid") if isinstance(retained, dict) else None
         pgid = retained.get("pgid") if isinstance(retained, dict) else None
@@ -515,6 +1208,11 @@ def _load_manifest(
             raise RamdiskError(
                 "RAM-disk manifest has unsafe retained process recovery"
             )
+        if merge_id in usage_merge_ids:
+            raise RamdiskError(
+                "RAM-disk manifest has duplicate usage transaction authority"
+            )
+        usage_merge_ids.add(merge_id)
     recorded_paths = {record["path"] for record in mounts}
     non_managed = sorted(
         path
@@ -603,7 +1301,6 @@ def _load_manifest(
         "state_dir": set(recovery_state_dirs),
         "weights_dir": set(),
     }
-    invoking_uid = uid_provider()
     for record in processes:
         if not isinstance(record, dict):
             raise RamdiskError(
@@ -616,6 +1313,7 @@ def _load_manifest(
         state_dir, command = record.get("state_dir"), record.get("command")
         usage_baseline = record.get("usage_baseline")
         usage_merge_id = record.get("usage_merge_id")
+        usage_merged_at = record.get("usage_merged_at")
         mount = next(
             (
                 item
@@ -671,10 +1369,23 @@ def _load_manifest(
                     or not re.fullmatch(r"[0-9a-f]{32}", usage_merge_id)
                 )
             )
+            or (
+                usage_merged_at is not None
+                and (
+                    not _valid_utc_timestamp(usage_merged_at)
+                    or usage_merge_id is None
+                )
+            )
         ):
             raise RamdiskError(
                 "RAM-disk manifest contains an unsafe managed process record"
             )
+        if usage_merge_id is not None:
+            if usage_merge_id in usage_merge_ids:
+                raise RamdiskError(
+                    "RAM-disk manifest has duplicate usage transaction authority"
+                )
+            usage_merge_ids.add(usage_merge_id)
         assert_durable_state_dir(state_dir, plan=plan)
         for key, value in (
             ("pid", pid),
@@ -830,105 +1541,273 @@ def _compatible_usage_header(*histories):
     return reference
 
 
-def _usage_read(path):
+def _usage_parse(text, source):
     counts = {}
     header_records = []
-    for line in _read_optional_text(path).splitlines():
+    for line in text.splitlines():
         match = PROFILE_LINE_RE.match(line)
         if not match:
             if re.match(r"^\s*-(?:1|2)(?:\s|$)", line):
-                raise RamdiskError("%s has a malformed usage header" % path)
+                raise RamdiskError("%s has a malformed usage header" % source)
             continue
         layer, expert, count = (int(value) for value in match.groups())
         if layer in (-1, -2):
             header_records.append((layer, expert, count))
         elif layer >= 0:
             counts["%d:%d" % (layer, expert)] = count
-    header = _validated_usage_header(header_records, source=path)
+    header = _validated_usage_header(header_records, source=source)
     counts.update(_usage_header_counts(header))
     return counts
 
 
-def _usage_merge_ids(path):
+def _usage_merge_ids_parse(text):
     result = set()
-    for line in _read_optional_text(path).splitlines():
+    for line in text.splitlines():
         match = USAGE_MERGE_RE.match(line.strip())
         if match:
             result.add(match.group(1))
     return result
 
 
-def _fsync_directory(path):
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+def _usage_snapshot_from_bound(
+    bound,
+    name,
+    path,
+    *,
+    source,
+    allow_missing,
+):
+    def consume(text):
+        return {
+            "counts": _usage_parse(text, path),
+            "merge_ids": _usage_merge_ids_parse(text),
+        }
+
+    snapshot = _read_regular_text_from_bound(
+        bound,
+        name,
+        source=source,
+        allow_missing=allow_missing,
+        consumer=consume,
+    )
+    if snapshot["exists"]:
+        snapshot.update(snapshot.pop("value"))
+    else:
+        snapshot["counts"] = {}
+        snapshot["merge_ids"] = set()
+    return snapshot
+
+
+def _usage_snapshot(
+    path,
+    *,
+    source=None,
+    allow_missing=True,
+    validator=None,
+    expected_parent_identity=None,
+    require_native=False,
+):
+    source = source or "usage state %s" % path
+    def consume(text):
+        return {
+            "counts": _usage_parse(text, path),
+            "merge_ids": _usage_merge_ids_parse(text),
+        }
+
+    snapshot = _read_bound_regular_text(
+        path,
+        source=source,
+        allow_missing=allow_missing,
+        validator=validator,
+        expected_parent_identity=expected_parent_identity,
+        require_native=require_native,
+        consumer=consume,
+    )
+    if snapshot["exists"]:
+        snapshot.update(snapshot.pop("value"))
+    else:
+        snapshot["counts"] = {}
+        snapshot["merge_ids"] = set()
+    return snapshot
+
+
+def _usage_read(path):
+    return _usage_snapshot(path)["counts"]
+
+
+def _managed_usage_read(
+    path,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+):
+    if os.path.basename(path) != ".coli_usage" or os.path.normpath(path) != path:
+        raise RamdiskError("managed usage history path is not canonical: %s" % path)
+    state_dir = os.path.dirname(path)
+    validator = None
+    if filesystem_for_path is not None:
+        validator = lambda: _assert_durable_state_dir(
+            state_dir,
+            plan=plan,
+            filesystem_for_path=filesystem_for_path,
         )
+    return _usage_snapshot(
+        path,
+        source="managed usage history",
+        allow_missing=False,
+        validator=validator,
+        require_native=True,
+    )["counts"]
+
+
+def _usage_merge_ids(path):
+    return _usage_snapshot(path)["merge_ids"]
+
+
+def _fsync_directory(path):
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    except BaseException:
         try:
-            os.fsync(descriptor)
-        finally:
             os.close(descriptor)
-    except OSError:
-        pass
+        except BaseException:
+            # The fsync failure is the authoritative durability error.
+            pass
+        raise
+    else:
+        # When fsync succeeded, a close failure remains observable.
+        os.close(descriptor)
 
 
 def _durable_unlink(path):
     try:
         os.unlink(path)
     except FileNotFoundError:
-        return
+        pass
     _fsync_directory(os.path.dirname(path))
 
 
-def _usage_write(path, counts, merge_id=None, merge_ids=None):
-    parent = os.path.dirname(path)
-    if not os.path.isdir(parent):
-        raise RamdiskError(
-            "usage-state parent directory is absent: %s" % parent
+def _durable_unlink_from_bound(
+    bound,
+    name,
+    *,
+    source,
+    expected_snapshot=None,
+):
+    path = os.path.join(bound["parent"], name)
+    _revalidate_bound_parent(bound)
+    current = _target_info(bound, name)
+    current_identity = _stat_identity(current) if current is not None else None
+    if isinstance(expected_snapshot, dict) and (
+        expected_snapshot.get("parent_identity") != bound["identity"]
+        or expected_snapshot.get("target_identity") != current_identity
+    ):
+        raise RamdiskError("%s changed before durable unlink" % source)
+    if current is not None:
+        _require_regular_target(
+            current,
+            path,
+            source,
+            allow_missing=False,
         )
+        if bound["native"]:
+            os.unlink(name, dir_fd=bound["descriptor"])
+        else:
+            os.unlink(path)
+    if bound["native"]:
+        _fsync_bound_directory(bound["descriptor"])
+    else:
+        _fsync_directory(bound["parent"])
+    _revalidate_bound_parent(bound)
+
+
+def _usage_stream_writer(path, counts, merge_id=None, merge_ids=None):
     markers = set(merge_ids or ())
     if merge_id:
         markers.add(merge_id)
     header = _usage_header(counts, source=path)
     data_counts = _usage_data_counts(counts)
-    fd, tmp = tempfile.mkstemp(prefix=".usage-", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            # route_trace.h deliberately keeps an all-zero history zero-byte,
-            # so emit identifying records only when there are data records.
-            if header and data_counts:
-                stream.write(
-                    "-1 %d %d\n"
-                    % (header["n_layers"], header["n_experts"])
-                )
-                stream.write(
-                    "-2 %d %d\n"
-                    % (header["format_version"], header["engine_id"])
-                )
-            for key in sorted(
-                data_counts,
-                key=lambda item: tuple(
-                    int(value)
-                    for value in item.split(":")
-                ),
-            ):
-                layer, expert = key.split(":")
-                stream.write(
-                    "%s %s %d\n" % (layer, expert, data_counts[key])
-                )
-            for marker in sorted(markers):
-                stream.write("# coli-ramdisk-merge %s\n" % marker)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        _fsync_directory(parent)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+
+    def write(stream):
+        # route_trace.h deliberately keeps an all-zero history zero-byte,
+        # so emit identifying records only when there are data records.
+        if header and data_counts:
+            stream.write(
+                "-1 %d %d\n"
+                % (header["n_layers"], header["n_experts"])
+            )
+            stream.write(
+                "-2 %d %d\n"
+                % (header["format_version"], header["engine_id"])
+            )
+        for key in sorted(
+            data_counts,
+            key=lambda item: tuple(
+                int(value)
+                for value in item.split(":")
+            ),
+        ):
+            layer, expert = key.split(":")
+            stream.write(
+                "%s %s %d\n" % (layer, expert, data_counts[key])
+            )
+        for marker in sorted(markers):
+            stream.write("# coli-ramdisk-merge %s\n" % marker)
+
+    return write
+
+
+def _usage_write_from_bound(
+    bound,
+    name,
+    path,
+    counts,
+    merge_id=None,
+    merge_ids=None,
+    *,
+    expected_snapshot=None,
+    source="usage state",
+):
+    return _atomic_replace_stream_from_bound(
+        bound,
+        name,
+        source=source,
+        prefix=".usage-",
+        mode=0o600,
+        writer=_usage_stream_writer(path, counts, merge_id, merge_ids),
+        expected_snapshot=expected_snapshot,
+    )
+
+
+def _usage_write(
+    path,
+    counts,
+    merge_id=None,
+    merge_ids=None,
+    *,
+    expected_snapshot=None,
+    validator=None,
+    require_native=False,
+):
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        raise RamdiskError(
+            "usage-state parent directory is absent: %s" % parent
+        )
+
+    _atomic_replace_stream(
+        path,
+        prefix=".usage-",
+        mode=0o600,
+        writer=_usage_stream_writer(path, counts, merge_id, merge_ids),
+        expected_snapshot=expected_snapshot,
+        validator=validator,
+        require_native=require_native,
+    )
 
 
 def _assert_canonical_usage_target(
@@ -937,12 +1816,24 @@ def _assert_canonical_usage_target(
     *,
     source_still_matches=None,
 ):
-    parent = os.path.dirname(canonical_path)
+    normalized = os.path.normpath(canonical_path)
+    if normalized != canonical_path or os.path.basename(canonical_path) != ".coli_usage":
+        raise RamdiskError(
+            "canonical usage target is not an exact normalized .coli_usage path"
+        )
+    parent = os.path.dirname(normalized)
     if not os.path.isdir(parent):
         raise RamdiskError(
             "canonical model directory is absent; usage delta remains journaled"
         )
     if plan is not None:
+        expected = os.path.normpath(
+            os.path.join(plan["model"]["path"], ".coli_usage")
+        )
+        if normalized != expected:
+            raise RamdiskError(
+                "canonical usage target is not the managed model history"
+            )
         if os.path.realpath(parent) != os.path.realpath(plan["model"]["path"]):
             raise RamdiskError(
                 "canonical usage target no longer matches the managed model"
@@ -952,6 +1843,266 @@ def _assert_canonical_usage_target(
                 "canonical source identity validation is unavailable"
             )
         source_still_matches(plan)
+
+
+@contextlib.contextmanager
+def _canonical_usage_descriptor(
+    canonical_path,
+    plan=None,
+    *,
+    source_still_matches=None,
+):
+    validator = lambda: _assert_canonical_usage_target(
+        canonical_path,
+        plan=plan,
+        source_still_matches=source_still_matches,
+    )
+    with _bound_parent_descriptor(
+        os.path.dirname(canonical_path),
+        source="canonical usage target",
+        validator=validator,
+        require_native=True,
+    ) as bound:
+        yield bound
+
+
+def _canonical_usage_snapshot(
+    canonical_path,
+    plan=None,
+    *,
+    source_still_matches=None,
+):
+    with _canonical_usage_descriptor(
+        canonical_path,
+        plan=plan,
+        source_still_matches=source_still_matches,
+    ) as bound:
+        return _usage_snapshot_from_bound(
+            bound,
+            ".coli_usage",
+            canonical_path,
+            source="canonical usage target",
+            allow_missing=True,
+        )
+
+
+def _canonical_usage_read(
+    canonical_path,
+    plan=None,
+    *,
+    source_still_matches=None,
+):
+    return _canonical_usage_snapshot(
+        canonical_path,
+        plan=plan,
+        source_still_matches=source_still_matches,
+    )["counts"]
+
+
+def _managed_state_validator(
+    state_dir,
+    plan,
+    filesystem_for_path,
+):
+    return lambda: _assert_durable_state_dir(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+    )
+
+
+@contextlib.contextmanager
+def _managed_state_descriptor(
+    state_dir,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+):
+    validator = _managed_state_validator(
+        state_dir,
+        plan,
+        filesystem_for_path,
+    )
+    with _bound_parent_descriptor(
+        state_dir,
+        source="managed state",
+        validator=validator,
+        require_native=True,
+    ) as bound:
+        yield bound
+
+
+def _managed_usage_write(
+    path,
+    counts,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+):
+    if os.path.basename(path) != ".coli_usage" or os.path.normpath(path) != path:
+        raise RamdiskError("managed usage history path is not canonical: %s" % path)
+    state_dir = os.path.dirname(path)
+    with _managed_state_descriptor(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+    ) as bound:
+        snapshot = _usage_snapshot_from_bound(
+            bound,
+            ".coli_usage",
+            path,
+            source="managed usage history",
+            allow_missing=True,
+        )
+        return _usage_write_from_bound(
+            bound,
+            ".coli_usage",
+            path,
+            counts,
+            expected_snapshot=snapshot,
+            source="managed usage history",
+        )
+
+
+def _journal_snapshot_from_bound(bound, state_dir):
+    path = os.path.join(state_dir, ".coli_usage.delta.json")
+
+    def consume(text):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise RamdiskError("cannot read %s: %s" % (path, exc)) from exc
+        if not isinstance(payload, dict):
+            raise RamdiskError("usage delta journal must contain a JSON object")
+        return payload
+
+    return _read_regular_text_from_bound(
+        bound,
+        ".coli_usage.delta.json",
+        source="usage delta journal",
+        allow_missing=True,
+        consumer=consume,
+    )
+
+
+def _managed_state_snapshots(
+    state_dir,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+    include_usage=False,
+    include_journal=False,
+):
+    with _managed_state_descriptor(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+    ) as bound:
+        result = {}
+        if include_usage:
+            usage_path = os.path.join(state_dir, ".coli_usage")
+            result["usage"] = _usage_snapshot_from_bound(
+                bound,
+                ".coli_usage",
+                usage_path,
+                source="managed usage history",
+                allow_missing=False,
+            )
+        if include_journal:
+            result["journal"] = _journal_snapshot_from_bound(bound, state_dir)
+        return result
+
+
+def _journal_payload(snapshot, path):
+    if not snapshot["exists"]:
+        return None
+    payload = snapshot.get("value")
+    if not isinstance(payload, dict):
+        raise RamdiskError("usage delta journal must contain a JSON object")
+    return payload
+
+
+def _read_usage_journal(
+    state_dir,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+):
+    snapshots = _managed_state_snapshots(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+        include_journal=True,
+    )
+    path = os.path.join(state_dir, ".coli_usage.delta.json")
+    return _journal_payload(snapshots["journal"], path)
+
+
+def _journal_merge_id(payload):
+    if not isinstance(payload, dict):
+        raise RamdiskError("usage delta journal must contain a JSON object")
+    merge_id = payload.get("id")
+    if not merge_id:
+        raise RamdiskError(
+            "usage delta journal is missing its transaction id"
+        )
+    if (
+        not isinstance(merge_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", merge_id)
+    ):
+        raise RamdiskError(
+            "usage delta journal has an invalid transaction id"
+        )
+    return merge_id
+
+
+def _bind_usage_transaction(
+    record,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+    reserved_ids=None,
+):
+    reserved_ids = set(reserved_ids or ())
+    persisted = record.get("usage_merge_id")
+    if persisted is not None and (
+        not isinstance(persisted, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", persisted)
+    ):
+        raise RamdiskError(
+            "managed usage recovery has an invalid transaction id"
+        )
+    payload = _read_usage_journal(
+        record["state_dir"],
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+    )
+    journal_id = _journal_merge_id(payload) if payload is not None else None
+    if persisted is not None and journal_id is not None and persisted != journal_id:
+        raise RamdiskError(
+            "usage delta journal transaction does not match managed record"
+        )
+    authoritative = persisted or journal_id
+    if authoritative is not None and authoritative in reserved_ids:
+        raise RamdiskError(
+            "duplicate usage transaction authority: %s" % authoritative
+        )
+    if authoritative is None:
+        for _ in range(128):
+            candidate = secrets.token_hex(16)
+            if candidate not in reserved_ids:
+                authoritative = candidate
+                break
+        else:
+            raise RamdiskError("could not allocate a unique usage transaction id")
+    merge_id = authoritative
+    operation_id = record.get("operation_id")
+    if operation_id is not None and operation_id != "start:" + merge_id:
+        raise RamdiskError(
+            "managed usage transaction does not match its operation authority"
+        )
+    record["usage_merge_id"] = merge_id
+    return merge_id
 
 
 @contextlib.contextmanager
@@ -967,27 +2118,19 @@ def _usage_lock(lock):
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def _recover_delta(
-    state_dir,
-    canonical_path,
-    plan=None,
-    *,
-    filesystem_for_path=None,
-    source_still_matches=None,
-):
-    _assert_durable_state_dir(
-        state_dir,
-        plan=plan,
-        filesystem_for_path=filesystem_for_path,
-    )
-    delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
-    payload = _read_json(delta_path)
-    if not payload:
-        return
-    if not isinstance(payload, dict):
-        raise RamdiskError("usage delta journal must contain a JSON object")
+def _validated_usage_delta(payload, expected_merge_id=None):
+    merge_id = _journal_merge_id(payload)
     delta = payload.get("delta", {})
     if not isinstance(delta, dict):
+        raise RamdiskError("usage delta journal has invalid counts")
+    if any(
+        not isinstance(key, str)
+        or re.fullmatch(r"\d+:\d+", key) is None
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+        for key, value in delta.items()
+    ):
         raise RamdiskError("usage delta journal has invalid counts")
     headers = payload.get("headers", {})
     if not isinstance(headers, dict):
@@ -995,48 +2138,174 @@ def _recover_delta(
     _compatible_usage_header(
         ("usage delta journal", headers),
     )
-    merge_id = payload.get("id")
-    if not merge_id:
-        raise RamdiskError(
-            "usage delta journal is missing its transaction id"
-        )
-    if (
-        not isinstance(merge_id, str)
-        or not re.fullmatch(r"[0-9a-f]{32}", merge_id)
-    ):
-        raise RamdiskError(
-            "usage delta journal has an invalid transaction id"
-        )
-    _assert_canonical_usage_target(
-        canonical_path,
+    if expected_merge_id is not None:
+        if (
+            not isinstance(expected_merge_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", expected_merge_id)
+        ):
+            raise RamdiskError(
+                "managed usage recovery has an invalid expected transaction id"
+            )
+        if merge_id != expected_merge_id:
+            raise RamdiskError(
+                "usage delta journal transaction does not match managed record"
+            )
+    return merge_id, delta, headers
+
+
+def _usage_journal_transaction_id(
+    state_dir,
+    plan=None,
+    *,
+    filesystem_for_path=None,
+):
+    """Return one validated live journal ID without applying its delta."""
+    payload = _read_usage_journal(
+        state_dir,
         plan=plan,
-        source_still_matches=source_still_matches,
+        filesystem_for_path=filesystem_for_path,
     )
+    if payload is None:
+        return None
+    merge_id, _, _ = _validated_usage_delta(payload)
+    return merge_id
+
+
+def _apply_usage_delta(
+    canonical_path,
+    merge_id,
+    delta,
+    headers,
+    plan=None,
+    *,
+    source_still_matches=None,
+):
     lock_path = os.path.join(_state_root(), "usage.lock")
     _ensure_private_dir(os.path.dirname(lock_path))
     with open(lock_path, "a+", encoding="utf-8") as lock:
         with _usage_lock(lock):
-            applied = _usage_merge_ids(canonical_path)
-            if merge_id not in applied:
-                canonical = _usage_read(canonical_path)
+            with _canonical_usage_descriptor(
+                canonical_path,
+                plan=plan,
+                source_still_matches=source_still_matches,
+            ) as canonical_bound:
+                canonical_snapshot = _usage_snapshot_from_bound(
+                    canonical_bound,
+                    ".coli_usage",
+                    canonical_path,
+                    source="canonical usage target",
+                    allow_missing=True,
+                )
+                applied = set(canonical_snapshot["merge_ids"])
+                if merge_id in applied:
+                    # A prior replace may have published this marker while its
+                    # parent-directory fsync reported an uncertain outcome.
+                    # Re-prove the canonical namespace before the caller is
+                    # allowed to delete the last durable delta journal.
+                    _revalidate_bound_parent(canonical_bound)
+                    _fsync_bound_directory(canonical_bound["descriptor"])
+                    _revalidate_bound_parent(canonical_bound)
+                    return
+                canonical = dict(canonical_snapshot["counts"])
                 merged_header = _compatible_usage_header(
                     ("usage delta journal", headers),
                     ("canonical usage history", canonical),
                 )
                 for key, value in delta.items():
-                    if not re.fullmatch(r"\d+:\d+", str(key)):
-                        raise RamdiskError(
-                            "usage delta journal has invalid counts"
-                        )
-                    canonical[key] = canonical.get(key, 0) + int(value)
+                    canonical[key] = canonical.get(key, 0) + value
                 canonical.update(_usage_header_counts(merged_header))
                 applied.add(merge_id)
-                _usage_write(
+                _usage_write_from_bound(
+                    canonical_bound,
+                    ".coli_usage",
                     canonical_path,
                     canonical,
                     merge_ids=applied,
+                    expected_snapshot=canonical_snapshot,
+                    source="canonical usage target",
                 )
-    _durable_unlink(delta_path)
+
+
+def _recover_delta_from_bound(
+    state_bound,
+    journal_snapshot,
+    state_dir,
+    canonical_path,
+    plan=None,
+    expected_merge_id=None,
+    *,
+    source_still_matches=None,
+    keep_journal=False,
+):
+    delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+    payload = _journal_payload(journal_snapshot, delta_path)
+    if payload is None:
+        if expected_merge_id is not None:
+            if (
+                not isinstance(expected_merge_id, str)
+                or re.fullmatch(r"[0-9a-f]{32}", expected_merge_id) is None
+            ):
+                raise RamdiskError(
+                    "managed usage recovery has an invalid expected transaction id"
+                )
+            raise RamdiskError(
+                "expected usage delta journal is absent: %s" % delta_path
+            )
+        _durable_unlink_from_bound(
+            state_bound,
+            ".coli_usage.delta.json",
+            source="usage delta journal",
+            expected_snapshot=journal_snapshot,
+        )
+        return None
+    merge_id, delta, headers = _validated_usage_delta(
+        payload,
+        expected_merge_id=expected_merge_id,
+    )
+    _revalidate_bound_parent(state_bound)
+    _apply_usage_delta(
+        canonical_path,
+        merge_id,
+        delta,
+        headers,
+        plan=plan,
+        source_still_matches=source_still_matches,
+    )
+    _revalidate_bound_parent(state_bound)
+    if not keep_journal:
+        _durable_unlink_from_bound(
+            state_bound,
+            ".coli_usage.delta.json",
+            source="usage delta journal",
+            expected_snapshot=journal_snapshot,
+        )
+    return merge_id
+
+
+def _recover_delta(
+    state_dir,
+    canonical_path,
+    plan=None,
+    expected_merge_id=None,
+    *,
+    filesystem_for_path=None,
+    source_still_matches=None,
+):
+    with _managed_state_descriptor(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+    ) as state_bound:
+        journal_snapshot = _journal_snapshot_from_bound(state_bound, state_dir)
+        return _recover_delta_from_bound(
+            state_bound,
+            journal_snapshot,
+            state_dir,
+            canonical_path,
+            plan=plan,
+            expected_merge_id=expected_merge_id,
+            source_still_matches=source_still_matches,
+        )
 
 
 def _merge_usage(
@@ -1048,13 +2317,6 @@ def _merge_usage(
     filesystem_for_path=None,
     source_still_matches=None,
 ):
-    _assert_durable_state_dir(
-        record["state_dir"],
-        plan=plan,
-        filesystem_for_path=filesystem_for_path,
-    )
-    state_usage = os.path.join(record["state_dir"], ".coli_usage")
-    current = _usage_read(state_usage)
     baseline = record.get("usage_baseline")
     if not _valid_usage_snapshot(baseline):
         raise RamdiskError(
@@ -1068,101 +2330,148 @@ def _merge_usage(
         raise RamdiskError(
             "managed usage recovery has an invalid transaction id"
         )
-    source_header = _compatible_usage_header(
-        ("managed usage history", current),
-        ("usage baseline", baseline),
-    )
-    current_counts = _usage_data_counts(current)
-    baseline_counts = _usage_data_counts(baseline)
-    delta = {
-        key: value - baseline_counts.get(key, 0)
-        for key, value in current_counts.items()
-        if value > baseline_counts.get(key, 0)
-    }
-    delta_path = os.path.join(
-        record["state_dir"],
-        ".coli_usage.delta.json",
-    )
-    if os.path.exists(delta_path):
-        _recover_delta(
-            record["state_dir"],
-            canonical_path,
-            plan=plan,
-            filesystem_for_path=filesystem_for_path,
-            source_still_matches=source_still_matches,
+    state_dir = record["state_dir"]
+    state_usage = os.path.join(state_dir, ".coli_usage")
+    delta_path = os.path.join(state_dir, ".coli_usage.delta.json")
+    with _managed_state_descriptor(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=filesystem_for_path,
+    ) as state_bound:
+        usage_snapshot = _usage_snapshot_from_bound(
+            state_bound,
+            ".coli_usage",
+            state_usage,
+            source="managed usage history",
+            allow_missing=False,
         )
-        return
-    merge_id = record.get("usage_merge_id") or secrets.token_hex(16)
-    record["usage_merge_id"] = merge_id
-    if merge_id in _usage_merge_ids(canonical_path):
-        return
-    if not delta:
-        # A current engine upgrades a legacy headerless seed when it saves.
-        # Preserve that newly known identity even when no counters changed.
-        if source_header is not None:
-            _assert_canonical_usage_target(
+        journal_snapshot = _journal_snapshot_from_bound(state_bound, state_dir)
+        current = usage_snapshot["counts"]
+        source_header = _compatible_usage_header(
+            ("managed usage history", current),
+            ("usage baseline", baseline),
+        )
+        current_counts = _usage_data_counts(current)
+        baseline_counts = _usage_data_counts(baseline)
+        for key, baseline_count in baseline_counts.items():
+            if baseline_count <= 0:
+                continue
+            if key not in current_counts:
+                raise RamdiskError(
+                    "managed usage history is missing positive baseline counter %s"
+                    % key
+                )
+            if current_counts[key] < baseline_count:
+                raise RamdiskError(
+                    "managed usage history counter %s regressed below baseline"
+                    % key
+                )
+        delta = {
+            key: value - baseline_counts.get(key, 0)
+            for key, value in current_counts.items()
+            if value > baseline_counts.get(key, 0)
+        }
+
+        payload = _journal_payload(journal_snapshot, delta_path)
+        if payload is not None:
+            journal_merge_id = _journal_merge_id(payload)
+            if (
+                persisted_merge_id is not None
+                and persisted_merge_id != journal_merge_id
+            ):
+                raise RamdiskError(
+                    "usage delta journal transaction does not match managed record"
+                )
+            record["usage_merge_id"] = journal_merge_id
+            _recover_delta_from_bound(
+                state_bound,
+                journal_snapshot,
+                state_dir,
                 canonical_path,
                 plan=plan,
+                expected_merge_id=journal_merge_id,
                 source_still_matches=source_still_matches,
+                keep_journal=keep_journal,
             )
-            lock_path = os.path.join(_state_root(), "usage.lock")
-            _ensure_private_dir(os.path.dirname(lock_path))
-            with open(lock_path, "a+", encoding="utf-8") as lock:
-                with _usage_lock(lock):
-                    canonical = _usage_read(canonical_path)
-                    canonical_header = _compatible_usage_header(
-                        ("managed usage history", current),
-                        ("usage baseline", baseline),
-                        ("canonical usage history", canonical),
+            return
+
+        # Prove the absent journal in the same durable directory authority that
+        # will create and later unlink this transaction's journal.
+        _durable_unlink_from_bound(
+            state_bound,
+            ".coli_usage.delta.json",
+            source="usage delta journal",
+            expected_snapshot=journal_snapshot,
+        )
+        merge_id = persisted_merge_id or secrets.token_hex(16)
+        record["usage_merge_id"] = merge_id
+
+        lock_path = os.path.join(_state_root(), "usage.lock")
+        _ensure_private_dir(os.path.dirname(lock_path))
+        with open(lock_path, "a+", encoding="utf-8") as lock:
+            with _usage_lock(lock):
+                with _canonical_usage_descriptor(
+                    canonical_path,
+                    plan=plan,
+                    source_still_matches=source_still_matches,
+                ) as canonical_bound:
+                    canonical_snapshot = _usage_snapshot_from_bound(
+                        canonical_bound,
+                        ".coli_usage",
+                        canonical_path,
+                        source="canonical usage target",
+                        allow_missing=True,
                     )
-                    if _usage_header(canonical) is None:
-                        canonical.update(
-                            _usage_header_counts(canonical_header)
+                    if merge_id in canonical_snapshot["merge_ids"]:
+                        return
+                    if not delta:
+                        canonical = dict(canonical_snapshot["counts"])
+                        canonical_header = _compatible_usage_header(
+                            ("managed usage history", current),
+                            ("usage baseline", baseline),
+                            ("canonical usage history", canonical),
                         )
-                        _usage_write(
-                            canonical_path,
-                            canonical,
-                            merge_ids=_usage_merge_ids(canonical_path),
-                        )
-        try:
-            _durable_unlink(delta_path)
-        except OSError:
-            pass
-        return
-    _atomic_json(
-        delta_path,
-        {
+                        if (
+                            source_header is not None
+                            and _usage_header(canonical) is None
+                        ):
+                            canonical.update(
+                                _usage_header_counts(canonical_header)
+                            )
+                            _usage_write_from_bound(
+                                canonical_bound,
+                                ".coli_usage",
+                                canonical_path,
+                                canonical,
+                                merge_ids=canonical_snapshot["merge_ids"],
+                                expected_snapshot=canonical_snapshot,
+                                source="canonical usage target",
+                            )
+                        return
+
+        journal_payload = {
             "version": 1,
             "id": merge_id,
             "delta": delta,
             "headers": _usage_header_counts(source_header),
             "created_at": _utc_now(),
-        },
-    )
-    _assert_canonical_usage_target(
-        canonical_path,
-        plan=plan,
-        source_still_matches=source_still_matches,
-    )
-    lock_path = os.path.join(_state_root(), "usage.lock")
-    _ensure_private_dir(os.path.dirname(lock_path))
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        with _usage_lock(lock):
-            applied = _usage_merge_ids(canonical_path)
-            if merge_id not in applied:
-                canonical = _usage_read(canonical_path)
-                merged_header = _compatible_usage_header(
-                    ("usage delta journal", _usage_header_counts(source_header)),
-                    ("canonical usage history", canonical),
-                )
-                for key, value in delta.items():
-                    canonical[key] = canonical.get(key, 0) + value
-                canonical.update(_usage_header_counts(merged_header))
-                applied.add(merge_id)
-                _usage_write(
-                    canonical_path,
-                    canonical,
-                    merge_ids=applied,
-                )
-    if not keep_journal:
-        _durable_unlink(delta_path)
+        }
+        _revalidate_bound_parent(state_bound)
+        journal_snapshot = _atomic_json_from_bound(
+            state_bound,
+            ".coli_usage.delta.json",
+            journal_payload,
+            source="usage delta journal",
+            expected_snapshot=journal_snapshot,
+        )
+        journal_snapshot["value"] = journal_payload
+        _recover_delta_from_bound(
+            state_bound,
+            journal_snapshot,
+            state_dir,
+            canonical_path,
+            plan=plan,
+            expected_merge_id=merge_id,
+            source_still_matches=source_still_matches,
+            keep_journal=keep_journal,
+        )

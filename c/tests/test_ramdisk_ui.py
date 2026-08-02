@@ -311,7 +311,7 @@ class ActionPolicyTest(unittest.TestCase):
         self.assertFalse(policy.edit_base_port.enabled)
         self.assertIn("Stop managed engines", policy.edit_base_port.reason)
 
-    def test_outcome_unknown_launch_disables_stop_and_destroy(self):
+    def test_outcome_unknown_launch_offers_only_stop_recovery(self):
         policy = ActionPolicy.from_state(
             placement_plan(),
             {
@@ -327,12 +327,12 @@ class ActionPolicyTest(unittest.TestCase):
             },
         )
 
-        self.assertFalse(policy.stop.enabled)
+        self.assertTrue(policy.stop.enabled)
         self.assertFalse(policy.destroy.enabled)
-        self.assertIn("outcome is unknown", policy.stop.reason)
-        self.assertIn("outcome is unknown", policy.destroy.reason)
+        self.assertEqual(policy.stop.reason, "")
+        self.assertIn("use Stop", policy.destroy.reason)
         self.assertFalse(policy.edit_base_port.enabled)
-        self.assertIn("outcome-unknown", policy.edit_base_port.reason)
+        self.assertIn("Use Stop", policy.edit_base_port.reason)
 
     def test_unknown_or_blocked_state_has_actionable_reasons(self):
         unknown = ActionPolicy.from_state(None, None)

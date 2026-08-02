@@ -2,10 +2,13 @@ import argparse
 import errno
 import io
 import json
+import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,12 +29,21 @@ if __package__:
     from .platform_test_support import (  # noqa: E402
         PLATFORM_SKIP_INVENTORY,
         assert_platform_skip_inventory,
+        requires_linux_pidfd,
     )
 else:
     from platform_test_support import (  # noqa: E402
         PLATFORM_SKIP_INVENTORY,
         assert_platform_skip_inventory,
+        requires_linux_pidfd,
     )
+
+
+def _proc_stat_record(pid, pgid, session, starttime, state="S"):
+    fields = [state, "1", str(pgid), str(session)] + ["0"] * 15
+    fields[17] = "1"
+    fields.append(str(starttime))
+    return "%d (managed worker) %s\n" % (pid, " ".join(fields))
 
 
 class RamdiskPlatformTest(unittest.TestCase):
@@ -408,6 +420,32 @@ import ramdisk
 
         forbidden_lock.assert_not_called()
 
+    def test_linux_process_mutator_reports_missing_pidfd_before_state(self):
+        ops = linux_ops.LinuxPlatformOps()
+        forbidden_lock = mock.Mock(
+            side_effect=AssertionError("lifecycle lock was reached")
+        )
+        with mock.patch.object(
+            linux_ops,
+            "_pidfd_process_control_supported",
+            return_value=False,
+        ), mock.patch.object(
+            ramdisk,
+            "get_platform_ops",
+            return_value=ops,
+        ), mock.patch.object(
+            ramdisk,
+            "_lifecycle_lock",
+            forbidden_lock,
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "requires Linux pidfd_open.*pidfd_send_signal",
+            ):
+                ramdisk.stop()
+
+        forbidden_lock.assert_not_called()
+
     def test_facade_discovery_does_not_probe_linux_facilities_when_unsupported(self):
         ops = UnsupportedPlatformOps("win32")
         with (
@@ -434,6 +472,29 @@ import ramdisk
         self.assertIsNone(hardware["mount"])
         open_file.assert_not_called()
         which.assert_not_called()
+
+    def test_managed_launch_discovery_is_explicitly_unsupported_off_linux(self):
+        ops = UnsupportedPlatformOps("win32")
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            UNSUPPORTED_PLATFORM_REASON,
+        ):
+            ops.process_start_boundary()
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            UNSUPPORTED_PLATFORM_REASON,
+        ):
+            ops.managed_launch_processes(
+                nonce="a" * 48,
+                uid=1000,
+                state_dir="/state/node-0",
+                weights_dir="/mnt/weights",
+                not_before_starttime=17000,
+                launcher_pid=700,
+                launcher_starttime=16000,
+                launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+            )
 
     def test_synthetic_cgroup_contracts_remain_platform_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -474,7 +535,7 @@ import ramdisk
     def test_platform_skip_inventory_is_exact_and_drift_checked(self):
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_operational"]["tests"]),
-            36,
+            38,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["sigterm_handler"]["tests"]),
@@ -482,16 +543,129 @@ import ramdisk
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["sigint_handler"]["tests"]),
+            4,
+        )
+        self.assertEqual(
+            len(PLATFORM_SKIP_INVENTORY["posix_pty"]["tests"]),
             1,
+        )
+        self.assertEqual(
+            len(PLATFORM_SKIP_INVENTORY["posix_fifo"]["tests"]),
+            1,
+        )
+        self.assertEqual(
+            len(PLATFORM_SKIP_INVENTORY["native_dirfd"]["tests"]),
+            4,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_pidfd"]["tests"]),
             1,
         )
+        self.assertEqual(
+            len(PLATFORM_SKIP_INVENTORY["linux_stdlib_pidfd"]["tests"]),
+            1,
+        )
         assert_platform_skip_inventory()
+
+    def test_pidfd_markers_distinguish_managed_libc_from_stdlib_support(self):
+        target = os.environ.get("COLIBRI_TEST_TARGET_PLATFORM", sys.platform)
+        managed_pidfd = (
+            target.startswith("linux")
+            and linux_ops._pidfd_process_control_supported()
+        )
+
+        self.assertEqual(
+            PLATFORM_SKIP_INVENTORY["linux_pidfd"]["supported"],
+            managed_pidfd,
+        )
+        self.assertEqual(
+            PLATFORM_SKIP_INVENTORY["linux_stdlib_pidfd"]["supported"],
+            target.startswith("linux")
+            and callable(getattr(os, "pidfd_open", None))
+            and callable(getattr(signal, "pidfd_send_signal", None)),
+        )
 
 
 class LinuxOperationalReadContractTest(unittest.TestCase):
+    @requires_linux_pidfd
+    def test_real_pidfd_group_signal_targets_each_exact_member(self):
+        nonce = "d" * 48
+        state_dir = "/tmp/colibri-pidfd-test-state"
+        weights_dir = "/tmp/colibri-pidfd-test-weights"
+        environment = os.environ.copy()
+        environment.update(
+            COLI_MANAGED_NONCE=nonce,
+            COLI_STATE_DIR=state_dir,
+            COLI_WEIGHTS_DIR=weights_dir,
+        )
+        program = (
+            "import os,time; child=os.fork(); "
+            "print(child,flush=True) if child else None; time.sleep(60)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", program],
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        child_pid = int(process.stdout.readline().strip())
+        open_pidfd, send_pidfd = linux_ops._pidfd_api()
+        cleanup_pidfds = []
+        for pid in (process.pid, child_pid):
+            cleanup_pidfds.append(open_pidfd(pid, 0))
+        real_killpg = linux_ops.os.killpg
+
+        try:
+            leader = linux_ops._strict_process_identity(process.pid)
+            record = {
+                "pid": process.pid,
+                "pgid": process.pid,
+                "uid": os.getuid(),
+                "starttime": leader["starttime"],
+                "nonce": nonce,
+                "state_dir": state_dir,
+                "weights_dir": weights_dir,
+            }
+            with mock.patch.object(
+                linux_ops.os,
+                "killpg",
+                side_effect=lambda pgid, signum: real_killpg(pgid, signum),
+            ) as killpg:
+                result = linux_ops._signal_verified_process_group(
+                    record,
+                    signal.SIGTERM,
+                )
+                process.wait(timeout=5.0)
+                deadline = time.monotonic() + 5.0
+                while (
+                    time.monotonic() < deadline
+                    and linux_ops._process_group_alive(process.pid)
+                ):
+                    time.sleep(0.05)
+
+            self.assertEqual(result["status"], "signaled")
+            self.assertEqual(
+                set(result["signaled"]),
+                {process.pid, child_pid},
+            )
+            self.assertEqual(process.returncode, -signal.SIGTERM)
+            self.assertFalse(linux_ops._process_group_alive(process.pid))
+            self.assertTrue(
+                all(call.args[1] == 0 for call in killpg.call_args_list)
+            )
+        finally:
+            for descriptor in cleanup_pidfds:
+                try:
+                    send_pidfd(descriptor, signal.SIGKILL, None, 0)
+                except OSError:
+                    pass
+                os.close(descriptor)
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5.0)
+            process.stdout.close()
+
     def test_trusted_helper_rejects_foreign_group_writable_parent(self):
         safe_directory = mock.Mock(
             st_mode=stat.S_IFDIR | 0o755,
@@ -600,6 +774,1027 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
                 executable,
             )
 
+    def test_process_start_boundary_floors_uptime_to_boot_ticks(self):
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "sysconf", return_value=250
+        ), mock.patch(
+            "builtins.open",
+            return_value=io.StringIO("123.456 99.0\n"),
+        ):
+            boundary = linux_ops.LinuxPlatformOps().process_start_boundary()
+
+        self.assertEqual(boundary, 30864)
+
+    def test_process_start_boundary_fails_closed(self):
+        cases = (
+            ("unreadable", 100, None, "cannot read Linux boot uptime"),
+            ("malformed", 100, "unknown 0.0\n", "cannot parse Linux boot uptime"),
+            ("invalid-hz", 0, "123.45 0.0\n", "clock tick rate is invalid"),
+        )
+        for case, ticks_per_second, uptime, message in cases:
+            def open_uptime(*args, **kwargs):
+                del args, kwargs
+                if uptime is None:
+                    raise PermissionError(
+                        errno.EACCES,
+                        "permission denied",
+                        "/proc/uptime",
+                    )
+                return io.StringIO(uptime)
+
+            with self.subTest(case=case), mock.patch.object(
+                linux_ops, "_require_linux"
+            ), mock.patch.object(
+                linux_ops.os,
+                "sysconf",
+                return_value=ticks_per_second,
+            ), mock.patch(
+                "builtins.open", side_effect=open_uptime
+            ):
+                with self.assertRaisesRegex(ramdisk.RamdiskError, message):
+                    linux_ops._process_start_boundary()
+
+    def test_managed_launch_scan_returns_every_exact_attributed_identity(self):
+        nonce = "a" * 48
+        owners = {731: 1000, 732: 1000, 900: 2000}
+        starttimes = {731: 17001, 732: 17002}
+        opened = []
+
+        def file_stat(path):
+            pid = int(path.rsplit("/", 1)[-1])
+            return mock.Mock(st_uid=owners[pid])
+
+        def open_proc(path, mode, *args, **kwargs):
+            del args, kwargs
+            opened.append(path)
+            pid = int(path.split("/")[2])
+            if path.endswith("/stat"):
+                self.assertEqual(mode, "r")
+                return io.StringIO(
+                    _proc_stat_record(pid, 731, 731, starttimes[pid])
+                )
+            if path.endswith("/cmdline"):
+                self.assertEqual(mode, "rb")
+                return io.BytesIO(
+                    ("coli\0serve\0--port\0%d\0" % (8000 + pid - 731)).encode()
+                )
+            if path.endswith("/environ"):
+                self.assertEqual(mode, "rb")
+                return io.BytesIO(
+                    (
+                        "COLI_MANAGED_NONCE=%s\0"
+                        "COLI_STATE_DIR=/state/node-0\0"
+                        "COLI_WEIGHTS_DIR=/mnt/weights\0" % nonce
+                    ).encode()
+                )
+            raise AssertionError("unexpected open %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os,
+            "listdir",
+            return_value=["732", "self", "900", "731"],
+        ), mock.patch.object(
+            linux_ops.os, "stat", side_effect=file_stat
+        ), mock.patch(
+            "builtins.open", side_effect=open_proc
+        ):
+            result = linux_ops.LinuxPlatformOps().managed_launch_processes(
+                nonce=nonce,
+                uid=1000,
+                state_dir="/state/node-0",
+                weights_dir="/mnt/weights",
+                not_before_starttime=17000,
+                launcher_pid=700,
+                launcher_starttime=16000,
+                launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+            )
+
+        self.assertEqual([item["pid"] for item in result], [731, 732])
+        self.assertEqual(result[0]["pgid"], 731)
+        self.assertEqual(result[0]["sid"], 731)
+        self.assertEqual(result[0]["starttime"], 17001)
+        self.assertEqual(result[0]["nonce"], nonce)
+        self.assertEqual(result[0]["cmdline"][:2], ["coli", "serve"])
+        self.assertEqual(result[0]["state_dir"], "/state/node-0")
+        self.assertEqual(result[0]["weights_dir"], "/mnt/weights")
+        self.assertFalse(any(path.startswith("/proc/900/") for path in opened))
+
+    def test_process_identity_exposes_group_attribution_fields(self):
+        nonce = "a" * 48
+
+        def open_proc(path, mode, *args, **kwargs):
+            del args, kwargs
+            if path == "/proc/732/stat":
+                self.assertEqual(mode, "r")
+                return io.StringIO(
+                    _proc_stat_record(732, 731, 731, 17002)
+                )
+            if path == "/proc/732/cmdline":
+                self.assertEqual(mode, "rb")
+                return io.BytesIO(b"coli\0serve\0")
+            if path == "/proc/732/environ":
+                self.assertEqual(mode, "rb")
+                return io.BytesIO(
+                    (
+                        "COLI_MANAGED_NONCE=%s\0"
+                        "COLI_STATE_DIR=/state/node-0\0"
+                        "COLI_WEIGHTS_DIR=/mnt/weights\0" % nonce
+                    ).encode()
+                )
+            raise AssertionError("unexpected open %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "getpgid", return_value=731
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch(
+            "builtins.open", side_effect=open_proc
+        ):
+            identity = linux_ops._process_identity(732)
+
+        self.assertEqual(identity["pid"], 732)
+        self.assertEqual(identity["uid"], 1000)
+        self.assertEqual(identity["starttime"], 17002)
+        self.assertEqual(identity["pgid"], 731)
+        self.assertEqual(identity["sid"], 731)
+        self.assertEqual(identity["nonce"], nonce)
+        self.assertEqual(identity["state_dir"], "/state/node-0")
+        self.assertEqual(identity["weights_dir"], "/mnt/weights")
+
+    def test_process_identity_preserves_none_for_unreadable_attribution(self):
+        def open_proc(path, mode, *args, **kwargs):
+            del mode, args, kwargs
+            if path.endswith("/stat"):
+                return io.StringIO(
+                    _proc_stat_record(732, 731, 731, 17002)
+                )
+            if path.endswith("/cmdline"):
+                return io.BytesIO(b"coli\0serve\0")
+            if path.endswith("/environ"):
+                raise PermissionError(
+                    errno.EACCES,
+                    "permission denied",
+                    path,
+                )
+            raise AssertionError("unexpected open %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "getpgid", return_value=731
+        ), mock.patch(
+            "builtins.open", side_effect=open_proc
+        ):
+            self.assertIsNone(linux_ops._process_identity(732))
+
+    def test_process_identity_rejects_a_hybrid_reused_pid_snapshot(self):
+        before = {
+            "state": "S",
+            "starttime": 17002,
+            "pgid": 731,
+            "sid": 731,
+            "num_threads": 1,
+        }
+        after = dict(before, starttime=17003)
+
+        def open_proc(path, mode, *args, **kwargs):
+            del args, kwargs
+            if path.endswith("/cmdline"):
+                self.assertEqual(mode, "rb")
+                return io.BytesIO(b"coli\0serve\0")
+            if path.endswith("/environ"):
+                self.assertEqual(mode, "rb")
+                return io.BytesIO(b"OTHER=value\0")
+            raise AssertionError("unexpected open %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops,
+            "_strict_proc_stat_identity",
+            side_effect=[before, after],
+        ), mock.patch.object(
+            linux_ops.os, "getpgid", return_value=731
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch("builtins.open", side_effect=open_proc):
+            self.assertIsNone(linux_ops._process_identity(732))
+
+    def test_process_identity_proves_a_lone_thread_zombie_inert(self):
+        opened = []
+
+        def open_proc(path, mode, *args, **kwargs):
+            del args, kwargs
+            opened.append(path)
+            if path.endswith("/stat"):
+                self.assertEqual(mode, "r")
+                return io.StringIO(
+                    _proc_stat_record(732, 731, 731, 17002, state="Z")
+                )
+            raise AssertionError("zombie endpoint must not be read: %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch.object(
+            linux_ops.os, "listdir", return_value=["732"]
+        ), mock.patch("builtins.open", side_effect=open_proc):
+            identity = linux_ops._process_identity(732)
+
+        self.assertTrue(identity["inert"])
+        self.assertEqual(identity["state"], "Z")
+        self.assertEqual(identity["starttime"], 17002)
+        self.assertNotIn("/proc/732/cmdline", opened)
+        self.assertNotIn("/proc/732/environ", opened)
+
+    def test_managed_launch_inspection_treats_a_stable_zombie_as_inert(self):
+        opened = []
+
+        def open_proc(path, mode, *args, **kwargs):
+            del args, kwargs
+            opened.append(path)
+            if path.endswith("/stat"):
+                self.assertEqual(mode, "r")
+                return io.StringIO(
+                    _proc_stat_record(731, 731, 731, 17000, state="Z")
+                )
+            raise AssertionError("zombie endpoint must not be read: %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch.object(
+            linux_ops.os, "listdir", return_value=["731"]
+        ), mock.patch("builtins.open", side_effect=open_proc):
+            observation = linux_ops._inspect_managed_launch_pid(
+                731,
+                1000,
+                17000,
+            )
+
+        self.assertEqual(observation["kind"], "inert-dead")
+        self.assertEqual(observation["state"], "Z")
+        self.assertNotIn("/proc/731/cmdline", opened)
+        self.assertNotIn("/proc/731/environ", opened)
+
+    def test_inert_identity_rejects_incomplete_or_changing_task_snapshot(self):
+        before = {
+            "state": "Z",
+            "starttime": 17000,
+            "pgid": 731,
+            "sid": 731,
+            "num_threads": 1,
+        }
+        with self.subTest(case="unexpected-sibling"), mock.patch.object(
+            linux_ops.os,
+            "listdir",
+            return_value=["731", "732"],
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "incomplete or live task group",
+            ):
+                linux_ops._stable_inert_process_identity(
+                    731,
+                    "/proc/731",
+                    1000,
+                    before,
+                )
+
+        changed = dict(before, num_threads=2)
+        with self.subTest(case="stat-turnover"), mock.patch.object(
+            linux_ops.os,
+            "listdir",
+            return_value=["731"],
+        ), mock.patch.object(
+            linux_ops,
+            "_strict_proc_stat_identity",
+            return_value=changed,
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "changed during pending-launch recovery",
+            ):
+                linux_ops._stable_inert_process_identity(
+                    731,
+                    "/proc/731",
+                    1000,
+                    before,
+                )
+
+    def test_managed_launch_scan_skips_only_old_unreadable_same_uid(self):
+        for starttime, must_refuse in ((16999, False), (17000, True)):
+            opened = []
+
+            def open_proc(path, mode, *args, **kwargs):
+                del mode, args, kwargs
+                opened.append(path)
+                if path.endswith("/stat"):
+                    return io.StringIO(
+                        _proc_stat_record(731, 731, 731, starttime)
+                    )
+                if path.endswith("/cmdline"):
+                    return io.BytesIO(b"unrelated\0")
+                if path.endswith("/environ"):
+                    raise PermissionError(
+                        errno.EACCES,
+                        "permission denied",
+                        path,
+                    )
+                raise AssertionError("unexpected open %s" % path)
+
+            with self.subTest(
+                starttime=starttime
+            ), mock.patch.object(
+                linux_ops, "_require_linux"
+            ), mock.patch.object(
+                linux_ops.os, "listdir", return_value=["731"]
+            ), mock.patch.object(
+                linux_ops.os,
+                "stat",
+                return_value=mock.Mock(st_uid=1000),
+            ), mock.patch(
+                "builtins.open", side_effect=open_proc
+            ):
+                if must_refuse:
+                    with self.assertRaisesRegex(
+                        ramdisk.RamdiskError,
+                        "cannot read Linux process identity /proc/731/environ",
+                    ):
+                        linux_ops._managed_launch_processes(
+                            "a" * 48,
+                            1000,
+                            state_dir="/state/node-0",
+                            weights_dir="/mnt/weights",
+                            not_before_starttime=17000,
+                            launcher_pid=700,
+                            launcher_starttime=16000,
+                            launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                        )
+                    self.assertIn("/proc/731/environ", opened)
+                else:
+                    self.assertEqual(
+                        linux_ops._managed_launch_processes(
+                            "a" * 48,
+                            1000,
+                            state_dir="/state/node-0",
+                            weights_dir="/mnt/weights",
+                            not_before_starttime=17000,
+                            launcher_pid=700,
+                            launcher_starttime=16000,
+                            launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                        ),
+                        [],
+                    )
+                    self.assertNotIn("/proc/731/cmdline", opened)
+                    self.assertNotIn("/proc/731/environ", opened)
+
+    def test_managed_launch_scan_rejects_recent_missing_or_wrong_nonce(self):
+        nonce = "a" * 48
+        for case, actual_nonce in (("missing", None), ("wrong", "b" * 48)):
+            def open_proc(path, mode, *args, **kwargs):
+                del mode, args, kwargs
+                if path.endswith("/stat"):
+                    return io.StringIO(
+                        _proc_stat_record(731, 731, 731, 17000)
+                    )
+                if path.endswith("/cmdline"):
+                    return io.BytesIO(b"coli\0ramdisk\0start\0")
+                if path.endswith("/environ"):
+                    nonce_field = (
+                        "COLI_MANAGED_NONCE=%s\0" % actual_nonce
+                        if actual_nonce is not None
+                        else ""
+                    )
+                    return io.BytesIO(
+                        (
+                            nonce_field
+                            + "COLI_STATE_DIR=/state/node-0\0"
+                            + "COLI_WEIGHTS_DIR=/mnt/weights\0"
+                        ).encode()
+                    )
+                raise AssertionError("unexpected open %s" % path)
+
+            with self.subTest(case=case), mock.patch.object(
+                linux_ops, "_require_linux"
+            ), mock.patch.object(
+                linux_ops.os, "listdir", return_value=["731"]
+            ), mock.patch.object(
+                linux_ops.os,
+                "stat",
+                return_value=mock.Mock(st_uid=1000),
+            ), mock.patch(
+                "builtins.open", side_effect=open_proc
+            ):
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "(ambiguous managed launch attribution|"
+                    "missing or mismatched nonce attribution)",
+                ):
+                    linux_ops._managed_launch_processes(
+                        nonce,
+                        1000,
+                        state_dir="/state/node-0",
+                        weights_dir="/mnt/weights",
+                        not_before_starttime=17000,
+                        launcher_pid=700,
+                        launcher_starttime=16000,
+                        launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                    )
+
+    def test_managed_launch_scan_ignores_stable_readable_recent_bystander(self):
+        def open_proc(path, mode, *args, **kwargs):
+            del mode, args, kwargs
+            if path.endswith("/stat"):
+                return io.StringIO(
+                    _proc_stat_record(731, 731, 731, 17000)
+                )
+            if path.endswith("/cmdline"):
+                return io.BytesIO(b"unrelated-worker\0")
+            if path.endswith("/environ"):
+                return io.BytesIO(
+                    b"BROKEN\0"
+                    b"COLI_MANAGED_NONCE=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0"
+                    b"COLI_MANAGED_NONCE\0"
+                    b"COLI_STATE_DIR=/other/a\0"
+                    b"COLI_STATE_DIR=/other/b\0"
+                    b"COLI_WEIGHTS_DIR=/other/weights\0"
+                )
+            raise AssertionError("unexpected open %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "listdir", return_value=["731"]
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch("builtins.open", side_effect=open_proc):
+            self.assertEqual(
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                ),
+                [],
+            )
+
+    def test_managed_launch_scan_rejects_path_attribution_without_target_nonce(self):
+        for case, actual_nonce in (("missing", None), ("wrong", "b" * 48)):
+            def open_proc(path, mode, *args, **kwargs):
+                del mode, args, kwargs
+                if path.endswith("/stat"):
+                    return io.StringIO(
+                        _proc_stat_record(731, 731, 731, 17000)
+                    )
+                if path.endswith("/cmdline"):
+                    return io.BytesIO(b"renamed-engine\0")
+                if path.endswith("/environ"):
+                    nonce_field = (
+                        ("COLI_MANAGED_NONCE=%s\0" % actual_nonce).encode()
+                        if actual_nonce is not None
+                        else b""
+                    )
+                    return io.BytesIO(
+                        nonce_field
+                        + b"COLI_STATE_DIR=/state/node-0\0"
+                        + b"COLI_WEIGHTS_DIR=/mnt/weights\0"
+                    )
+                raise AssertionError("unexpected open %s" % path)
+
+            with self.subTest(case=case), mock.patch.object(
+                linux_ops, "_require_linux"
+            ), mock.patch.object(
+                linux_ops.os, "listdir", return_value=["731"]
+            ), mock.patch.object(
+                linux_ops.os,
+                "stat",
+                return_value=mock.Mock(st_uid=1000),
+            ), mock.patch("builtins.open", side_effect=open_proc):
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "(ambiguous managed launch attribution|"
+                    "missing or mismatched nonce attribution)",
+                ):
+                    linux_ops._managed_launch_processes(
+                        "a" * 48,
+                        1000,
+                        state_dir="/state/node-0",
+                        weights_dir="/mnt/weights",
+                        not_before_starttime=17000,
+                        launcher_pid=700,
+                        launcher_starttime=16000,
+                        launcher_cmdline=["coli", "ramdisk", "start"],
+                        expected_command=["coli", "serve"],
+                    )
+
+    def test_managed_launch_scan_excludes_the_exact_original_launcher(self):
+        observation = {
+            "kind": "same-uid",
+            "pid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "cmdline": ["coli", "ramdisk", "start"],
+            "state_dir": None,
+            "weights_dir": None,
+            "environment_candidates": {},
+            "environment_ambiguities": (
+                "COLI_MANAGED_NONCE",
+                "COLI_STATE_DIR",
+                "COLI_WEIGHTS_DIR",
+            ),
+        }
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops,
+            "_proc_pid_snapshot",
+            return_value={731: "/proc/731"},
+        ), mock.patch.object(
+            linux_ops,
+            "_inspect_managed_launch_pid",
+            return_value=observation,
+        ):
+            self.assertEqual(
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=731,
+                    launcher_starttime=17000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                ),
+                [],
+            )
+
+    def test_managed_launch_scan_excludes_the_unattributed_recovery_process(self):
+        recovery_pid = linux_ops.os.getpid()
+        observation = {
+            "kind": "same-uid",
+            "pid": recovery_pid,
+            "uid": 1000,
+            "starttime": 18000,
+            "nonce": None,
+            "pgid": recovery_pid,
+            "sid": recovery_pid,
+            "cmdline": ["coli", "ramdisk", "start"],
+            "state_dir": None,
+            "weights_dir": None,
+            "environment_candidates": {},
+            "environment_ambiguities": (
+                "COLI_MANAGED_NONCE",
+                "COLI_STATE_DIR",
+                "COLI_WEIGHTS_DIR",
+            ),
+        }
+        snapshot = {recovery_pid: "/proc/%d" % recovery_pid}
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops, "_proc_pid_snapshot", return_value=snapshot
+        ), mock.patch.object(
+            linux_ops,
+            "_inspect_managed_launch_pid",
+            return_value=observation,
+        ):
+            self.assertEqual(
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                ),
+                [],
+            )
+
+    def test_managed_launch_scan_rejects_turnover_after_final_reads(self):
+        stable = {
+            "kind": "same-uid",
+            "pid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "cmdline": ["unrelated-worker"],
+            "state_dir": None,
+            "weights_dir": None,
+            "environment_candidates": {},
+            "environment_ambiguities": (),
+        }
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops,
+            "_proc_pid_snapshot",
+            side_effect=[
+                {731: "/proc/731"},
+                {731: "/proc/731"},
+                {731: "/proc/731"},
+                {732: "/proc/732"},
+            ],
+        ), mock.patch.object(
+            linux_ops,
+            "_inspect_managed_launch_pid",
+            side_effect=[stable, stable, None],
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "unverified PID.*732",
+            ):
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                )
+
+    def test_managed_launch_scan_rechecks_final_snapshot_identity(self):
+        stable = {
+            "kind": "same-uid",
+            "pid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "cmdline": ["unrelated-worker"],
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        reused = dict(stable, starttime=17001)
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops,
+            "_proc_pid_snapshot",
+            side_effect=[{731: "/proc/731"}] * 3,
+        ), mock.patch.object(
+            linux_ops,
+            "_inspect_managed_launch_pid",
+            side_effect=[stable, stable, reused],
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "changed during final",
+            ):
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                )
+
+    def test_managed_launch_scan_rechecks_same_pid_after_fourth_snapshot(self):
+        stable = {
+            "kind": "same-uid",
+            "pid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "cmdline": ["unrelated-worker"],
+            "state_dir": None,
+            "weights_dir": None,
+            "environment_candidates": {},
+            "environment_ambiguities": (),
+        }
+        reused = dict(stable, starttime=17001)
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops,
+            "_proc_pid_snapshot",
+            return_value={731: "/proc/731"},
+        ), mock.patch.object(
+            linux_ops,
+            "_inspect_managed_launch_pid",
+            side_effect=[stable, stable, stable, reused],
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "changed after the final",
+            ):
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                )
+
+    def test_managed_launch_scan_rechecks_same_pid_in_final_confirmation(self):
+        stable = {
+            "kind": "same-uid",
+            "pid": 731,
+            "uid": 1000,
+            "state": "S",
+            "inert": False,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "cmdline": ["unrelated-worker"],
+            "state_dir": None,
+            "weights_dir": None,
+            "environment_candidates": {},
+            "environment_ambiguities": (),
+        }
+        reused = dict(stable, starttime=17001)
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops,
+            "_proc_pid_snapshot",
+            return_value={731: "/proc/731"},
+        ), mock.patch.object(
+            linux_ops,
+            "_inspect_managed_launch_pid",
+            side_effect=[stable, stable, stable, stable, reused],
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "changed during final pending-launch identity confirmation",
+            ):
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                    expected_command=["coli", "serve"],
+                )
+
+    def test_managed_launch_scan_treats_pid_disappearance_as_benign(self):
+        owner_reads = 0
+
+        def file_stat(path):
+            nonlocal owner_reads
+            self.assertEqual(path, "/proc/731")
+            owner_reads += 1
+            if owner_reads == 1:
+                return mock.Mock(st_uid=1000)
+            raise FileNotFoundError(errno.ENOENT, "process exited", path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os,
+            "listdir",
+            side_effect=(["731"], [], [], [], []),
+        ), mock.patch.object(
+            linux_ops.os, "stat", side_effect=file_stat
+        ), mock.patch(
+            "builtins.open",
+            side_effect=FileNotFoundError(
+                errno.ENOENT,
+                "process exited",
+                "/proc/731/stat",
+            ),
+        ):
+            self.assertEqual(
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                ),
+                [],
+            )
+
+    def test_managed_launch_scan_rejects_unreadable_or_malformed_same_uid(self):
+        cases = (
+            (
+                "denied-environ",
+                PermissionError(
+                    errno.EACCES,
+                    "permission denied",
+                    "/proc/731/environ",
+                ),
+                "cannot read Linux process identity /proc/731/environ",
+            ),
+            (
+                "malformed-environ",
+                None,
+                "ambiguous managed launch attribution",
+            ),
+            (
+                "malformed-stat",
+                None,
+                "cannot parse Linux process identity /proc/731/stat",
+            ),
+        )
+        for case, environ_error, message in cases:
+            def open_proc(path, mode, *args, **kwargs):
+                del mode, args, kwargs
+                if path.endswith("/stat"):
+                    if case == "malformed-stat":
+                        return io.StringIO("731 (truncated) S 1\n")
+                    return io.StringIO(
+                        _proc_stat_record(731, 731, 731, 17001)
+                    )
+                if path.endswith("/cmdline"):
+                    return io.BytesIO(b"coli\0serve\0")
+                if path.endswith("/environ"):
+                    if environ_error is not None:
+                        raise environ_error
+                    payload = (
+                        b"not-an-environment-entry\0"
+                        if case == "malformed-environ"
+                        else b"OTHER=value\0"
+                    )
+                    return io.BytesIO(payload)
+                raise AssertionError("unexpected open %s" % path)
+
+            with self.subTest(case=case), mock.patch.object(
+                linux_ops, "_require_linux"
+            ), mock.patch.object(
+                linux_ops.os, "listdir", return_value=["731"]
+            ), mock.patch.object(
+                linux_ops.os,
+                "stat",
+                return_value=mock.Mock(st_uid=1000),
+            ), mock.patch(
+                "builtins.open", side_effect=open_proc
+            ):
+                with self.assertRaisesRegex(ramdisk.RamdiskError, message):
+                    linux_ops._managed_launch_processes(
+                        "a" * 48,
+                        1000,
+                        state_dir="/state/node-0",
+                        weights_dir="/mnt/weights",
+                        not_before_starttime=17000,
+                        launcher_pid=700,
+                        launcher_starttime=16000,
+                        launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                    )
+
+    def test_managed_launch_scan_rejects_new_uninspected_pid(self):
+        def open_proc(path, mode, *args, **kwargs):
+            del mode, args, kwargs
+            if path.endswith("/stat"):
+                return io.StringIO(
+                    _proc_stat_record(731, 731, 731, 17001)
+                )
+            if path.endswith("/cmdline"):
+                return io.BytesIO(b"unrelated\0")
+            if path.endswith("/environ"):
+                return io.BytesIO(b"OTHER=value\0")
+            raise AssertionError("unexpected open %s" % path)
+
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os,
+            "listdir",
+            side_effect=(["731"], ["731", "732"]),
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch(
+            "builtins.open", side_effect=open_proc
+        ):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "uninspected PID.*732",
+            ):
+                linux_ops._managed_launch_processes(
+                    "a" * 48,
+                    1000,
+                    state_dir="/state/node-0",
+                    weights_dir="/mnt/weights",
+                    not_before_starttime=17000,
+                    launcher_pid=700,
+                    launcher_starttime=16000,
+                    launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                )
+
+    def test_managed_launch_scan_rejects_attribution_or_session_ambiguity(self):
+        nonce = "a" * 48
+        cases = (
+            (
+                "/wrong/state",
+                731,
+                "mismatched state or weights attribution",
+            ),
+            (
+                "/state/node-0",
+                700,
+                "violates the new-session process-group identity",
+            ),
+        )
+        for actual_state, session, message in cases:
+            def open_proc(path, mode, *args, **kwargs):
+                del mode, args, kwargs
+                if path.endswith("/stat"):
+                    return io.StringIO(
+                        _proc_stat_record(731, 731, session, 17001)
+                    )
+                if path.endswith("/cmdline"):
+                    return io.BytesIO(b"coli\0serve\0")
+                if path.endswith("/environ"):
+                    return io.BytesIO(
+                        (
+                            "COLI_MANAGED_NONCE=%s\0"
+                            "COLI_STATE_DIR=%s\0"
+                            "COLI_WEIGHTS_DIR=/mnt/weights\0"
+                            % (nonce, actual_state)
+                        ).encode()
+                    )
+                raise AssertionError("unexpected open %s" % path)
+
+            with self.subTest(message=message), mock.patch.object(
+                linux_ops, "_require_linux"
+            ), mock.patch.object(
+                linux_ops.os, "listdir", return_value=["731"]
+            ), mock.patch.object(
+                linux_ops.os,
+                "stat",
+                return_value=mock.Mock(st_uid=1000),
+            ), mock.patch(
+                "builtins.open", side_effect=open_proc
+            ):
+                with self.assertRaisesRegex(ramdisk.RamdiskError, message):
+                    linux_ops._managed_launch_processes(
+                        nonce,
+                        1000,
+                        state_dir="/state/node-0",
+                        weights_dir="/mnt/weights",
+                        not_before_starttime=17000,
+                        launcher_pid=700,
+                        launcher_starttime=16000,
+                        launcher_cmdline=["coli", "ramdisk", "start"],
+                            expected_command=["coli", "serve"],
+                    )
+
     def test_process_group_scan_rejects_proc_enumeration_failures(self):
         failures = (
             PermissionError(errno.EACCES, "permission denied", "/proc"),
@@ -703,6 +1898,39 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
                 [],
             )
 
+    def test_process_group_liveness_treats_only_stable_zombies_as_inert(self):
+        zombie = {
+            "state": "Z",
+            "starttime": 17000,
+            "pgid": 731,
+            "sid": 731,
+            "num_threads": 1,
+        }
+        with mock.patch.object(
+            linux_ops, "_require_linux"
+        ), mock.patch.object(
+            linux_ops.os, "killpg"
+        ) as killpg, mock.patch.object(
+            linux_ops,
+            "_process_group_member_pids",
+            side_effect=[[731], [731]],
+        ), mock.patch.object(
+            linux_ops.os,
+            "stat",
+            return_value=mock.Mock(st_uid=1000),
+        ), mock.patch.object(
+            linux_ops,
+            "_strict_proc_stat_identity",
+            return_value=zombie,
+        ), mock.patch.object(
+            linux_ops,
+            "_stable_inert_process_identity",
+            return_value=zombie,
+        ):
+            self.assertFalse(linux_ops._process_group_alive(731))
+
+        killpg.assert_called_once_with(731, 0)
+
     def test_empty_dead_process_group_is_not_running(self):
         ops = mock.Mock()
         ops.process_group_member_pids.return_value = []
@@ -741,6 +1969,933 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         self.assertEqual(members, ([], [731]))
         self.assertFalse(result[0])
         self.assertEqual(result[1], "unverified-process-group")
+
+    def test_process_group_membership_churn_is_unverified_not_absent(self):
+        zombie = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        child = {
+            "pid": 732,
+            "uid": 1000,
+            "state": "S",
+            "inert": False,
+            "starttime": 17001,
+            "nonce": "a" * 48,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        ops = mock.Mock()
+        ops.process_group_member_pids.side_effect = (
+            [731],
+            [731],
+            [731, 732],
+            [731, 732],
+        )
+        identities = {731: zombie, 732: child}
+
+        members, unreadable = processes._process_group_members(
+            731,
+            ops=ops,
+            proc_identity=lambda pid: identities[pid],
+        )
+
+        self.assertTrue(unreadable)
+        result = processes._process_matches(
+            {
+                "pid": 731,
+                "pgid": 731,
+                "uid": 1000,
+                "starttime": 17000,
+                "nonce": "a" * 48,
+                "state_dir": "/state/node-0",
+                "weights_dir": "/mnt/weights",
+            },
+            proc_identity=lambda ignored: zombie,
+            process_group_members=lambda ignored: (members, unreadable),
+        )
+        self.assertFalse(result[0])
+        self.assertEqual(result[1], "unverified-process-group")
+
+    def test_process_group_stability_ignores_scheduler_state_transitions(self):
+        member = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "R",
+            "inert": False,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        sleeping = dict(member, state="S")
+        ops = mock.Mock()
+        ops.process_group_member_pids.return_value = [731]
+
+        members, unreadable = processes._process_group_members(
+            731,
+            ops=ops,
+            proc_identity=mock.Mock(side_effect=(member, sleeping)),
+        )
+
+        self.assertEqual(members, [sleeping])
+        self.assertEqual(unreadable, [])
+
+    def test_pidfd_group_signal_opens_all_targets_before_validation(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        identities = {
+            731: dict(
+                record,
+                inert=False,
+                state="S",
+                sid=731,
+            ),
+            732: dict(
+                record,
+                pid=732,
+                starttime=17001,
+                inert=False,
+                state="S",
+                sid=731,
+            ),
+        }
+        events = []
+
+        def pidfd_open(pid, flags):
+            events.append(("open", pid, flags))
+            return pid + 1000
+
+        def identity(pid):
+            events.append(("identity", pid))
+            return identities[pid]
+
+        def pidfd_send(pidfd, signum, siginfo, flags):
+            events.append(("signal", pidfd, signum, siginfo, flags))
+
+        close = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"), mock.patch.object(
+            linux_ops.os, "killpg", create=True
+        ) as killpg:
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(
+                    side_effect=([731, 732], [731, 732], [731, 732])
+                ),
+                process_identity=identity,
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=pidfd_open,
+                pidfd_send_signal=pidfd_send,
+                pidfd_exited=mock.Mock(return_value=False),
+                close_fd=close,
+            )
+
+        self.assertEqual(result["status"], "signaled")
+        self.assertEqual(result["signaled"], [731, 732])
+        self.assertLess(
+            max(index for index, event in enumerate(events) if event[0] == "open"),
+            min(index for index, event in enumerate(events) if event[0] == "identity"),
+        )
+        self.assertLess(
+            max(index for index, event in enumerate(events) if event[0] == "identity"),
+            min(index for index, event in enumerate(events) if event[0] == "signal"),
+        )
+        killpg.assert_not_called()
+        self.assertEqual(
+            {call.args[0] for call in close.call_args_list},
+            {1731, 1732},
+        )
+
+    def test_pidfd_group_signal_refuses_reused_leader_after_binding(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        reused = dict(
+            record,
+            starttime=17001,
+            inert=False,
+            state="S",
+            sid=731,
+        )
+        send = mock.Mock()
+        close = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(
+                    side_effect=([731], [731], [731])
+                ),
+                process_identity=mock.Mock(return_value=reused),
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=mock.Mock(return_value=17),
+                pidfd_send_signal=send,
+                pidfd_exited=mock.Mock(return_value=False),
+                close_fd=close,
+            )
+
+        self.assertEqual(result["status"], "foreign")
+        self.assertEqual(result["reason"], "reused-pid")
+        send.assert_not_called()
+        close.assert_called_once_with(17)
+
+    def test_pidfd_group_signal_treats_open_esrch_as_inconclusive(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        send = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(return_value=[731]),
+                process_identity=mock.Mock(),
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=mock.Mock(side_effect=ProcessLookupError()),
+                pidfd_send_signal=send,
+                pidfd_exited=mock.Mock(return_value=False),
+                close_fd=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "inconclusive")
+        send.assert_not_called()
+
+    def test_pidfd_group_signal_detects_same_number_reuse_by_fd_readiness(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        exact = dict(record, inert=False, state="S", sid=731)
+        send = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(return_value=[731]),
+                process_identity=mock.Mock(return_value=exact),
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=mock.Mock(return_value=17),
+                pidfd_send_signal=send,
+                pidfd_exited=mock.Mock(
+                    side_effect=(False, False, True)
+                ),
+                close_fd=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(
+            result["reason"],
+            "pinned-member-exited-before-signal",
+        )
+        send.assert_not_called()
+
+    def test_pidfd_group_signal_validates_entire_batch_before_first_signal(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        leader = dict(record, inert=False, state="S", sid=731)
+        foreign = dict(
+            leader,
+            pid=732,
+            starttime=17001,
+            nonce="b" * 48,
+        )
+        send = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(return_value=[731, 732]),
+                process_identity=mock.Mock(side_effect=(leader, foreign)),
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=mock.Mock(side_effect=(17, 18)),
+                pidfd_send_signal=send,
+                pidfd_exited=mock.Mock(return_value=False),
+                close_fd=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "foreign")
+        self.assertEqual(result["reason"], "foreign-nonce")
+        send.assert_not_called()
+
+    def test_pidfd_group_signal_reports_partial_non_esrch_failure(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        identities = (
+            dict(record, inert=False, state="S", sid=731),
+            dict(
+                record,
+                pid=732,
+                starttime=17001,
+                inert=False,
+                state="S",
+                sid=731,
+            ),
+        )
+        send = mock.Mock(
+            side_effect=(None, OSError(errno.EIO, "input/output error"))
+        )
+        with mock.patch.object(linux_ops, "_require_linux"), mock.patch.object(
+            linux_ops.os, "killpg", create=True
+        ) as killpg:
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "after signaling PID\\(s\\) 731.*numeric fallback is forbidden",
+            ):
+                linux_ops._signal_verified_process_group(
+                    record,
+                    signal.SIGTERM,
+                    process_group_member_pids=mock.Mock(
+                        return_value=[731, 732]
+                    ),
+                    process_identity=mock.Mock(side_effect=identities),
+                    process_group_alive=mock.Mock(return_value=True),
+                    pidfd_open=mock.Mock(side_effect=(17, 18)),
+                    pidfd_send_signal=send,
+                    pidfd_exited=mock.Mock(return_value=False),
+                    close_fd=mock.Mock(),
+                )
+
+        self.assertEqual(send.call_count, 2)
+        killpg.assert_not_called()
+
+    def test_pidfd_group_signal_fails_closed_when_kernel_lacks_pidfd(self):
+        record = {"pid": 731, "pgid": 731}
+        send = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            with self.assertRaisesRegex(
+                ramdisk.RamdiskError,
+                "requires Linux pidfd_open.*pidfd_open failed",
+            ):
+                linux_ops._signal_verified_process_group(
+                    record,
+                    signal.SIGTERM,
+                    process_group_member_pids=mock.Mock(return_value=[731]),
+                    process_identity=mock.Mock(),
+                    process_group_alive=mock.Mock(return_value=True),
+                    pidfd_open=mock.Mock(
+                        side_effect=OSError(
+                            errno.ENOSYS,
+                            "function not implemented",
+                        )
+                    ),
+                    pidfd_send_signal=send,
+                    pidfd_exited=mock.Mock(return_value=False),
+                    close_fd=mock.Mock(),
+                )
+
+        send.assert_not_called()
+
+    def test_pidfd_group_signal_treats_send_esrch_as_gone(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        exact = dict(record, inert=False, state="S", sid=731)
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(return_value=[731]),
+                process_identity=mock.Mock(return_value=exact),
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=mock.Mock(return_value=17),
+                pidfd_send_signal=mock.Mock(
+                    side_effect=ProcessLookupError()
+                ),
+                pidfd_exited=mock.Mock(return_value=False),
+                close_fd=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "signaled")
+        self.assertEqual(result["signaled"], [])
+        self.assertEqual(result["exited"], [731])
+
+    def test_pidfd_group_signal_skips_exact_inert_members(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        inert = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17000,
+            "pgid": 731,
+            "sid": 731,
+        }
+        live = dict(
+            record,
+            pid=732,
+            starttime=17001,
+            state="S",
+            inert=False,
+            sid=731,
+        )
+        send = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(return_value=[731, 732]),
+                process_identity=mock.Mock(side_effect=(inert, live)),
+                process_group_alive=mock.Mock(return_value=True),
+                pidfd_open=mock.Mock(side_effect=(17, 18)),
+                pidfd_send_signal=send,
+                pidfd_exited=lambda pidfd: pidfd == 17,
+                close_fd=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "signaled")
+        self.assertEqual(result["signaled"], [732])
+        send.assert_called_once_with(18, signal.SIGTERM, None, 0)
+
+    def test_pidfd_group_signal_accepts_only_stably_inert_absence(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        inert = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17000,
+            "pgid": 731,
+            "sid": 731,
+        }
+        send = mock.Mock()
+        with mock.patch.object(linux_ops, "_require_linux"):
+            result = linux_ops._signal_verified_process_group(
+                record,
+                signal.SIGTERM,
+                process_group_member_pids=mock.Mock(return_value=[731]),
+                process_identity=mock.Mock(return_value=inert),
+                process_group_alive=mock.Mock(side_effect=(False, False)),
+                pidfd_open=mock.Mock(return_value=17),
+                pidfd_send_signal=send,
+                pidfd_exited=mock.Mock(return_value=True),
+                close_fd=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "absent")
+        send.assert_not_called()
+
+    def test_verified_termination_retries_inconclusive_pidfd_scan(self):
+        record = {"pid": 731, "pgid": 731}
+        ops = mock.Mock()
+        ops.signal_verified_process_group.side_effect = (
+            {
+                "status": "inconclusive",
+                "reason": "membership-changed",
+                "members": [731],
+            },
+            {"status": "signaled", "signaled": [731], "members": [731]},
+            {"status": "absent", "members": []},
+        )
+
+        with mock.patch.object(processes.time, "sleep") as sleep:
+            failure = processes._terminate_verified_group(
+                record,
+                term_seconds=1.0,
+                kill_seconds=1.0,
+                managed_child_liveness=lambda ignored: False,
+                ops=ops,
+            )
+
+        self.assertIsNone(failure)
+        self.assertEqual(ops.signal_verified_process_group.call_count, 3)
+        self.assertTrue(
+            all(
+                call.args[1] == signal.SIGTERM
+                for call in ops.signal_verified_process_group.call_args_list
+            )
+        )
+        sleep.assert_called()
+
+    def test_verified_termination_retries_transient_strict_identity_error(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        exact = dict(record, inert=False, state="S", sid=731)
+        sends = []
+
+        class Ops:
+            calls = 0
+
+            def signal_verified_process_group(self, current, signum):
+                self.calls += 1
+                if self.calls == 3:
+                    members = mock.Mock(return_value=[])
+                    identity = mock.Mock()
+                    alive = mock.Mock(return_value=False)
+                else:
+                    members = mock.Mock(return_value=[731])
+                    if self.calls == 1:
+                        identity = mock.Mock(
+                            side_effect=ramdisk.RamdiskError(
+                                "procfs changed during TERM transition"
+                            )
+                        )
+                    else:
+                        identity = mock.Mock(return_value=exact)
+                    alive = mock.Mock(return_value=True)
+                return linux_ops._signal_verified_process_group(
+                    current,
+                    signum,
+                    process_group_member_pids=members,
+                    process_identity=identity,
+                    process_group_alive=alive,
+                    pidfd_open=mock.Mock(return_value=17),
+                    pidfd_send_signal=lambda *args: sends.append(args),
+                    pidfd_exited=mock.Mock(return_value=False),
+                    close_fd=mock.Mock(),
+                )
+
+        ops = Ops()
+        with mock.patch.object(linux_ops, "_require_linux"), mock.patch.object(
+            processes.time, "sleep"
+        ):
+            failure = processes._terminate_verified_group(
+                record,
+                term_seconds=1.0,
+                kill_seconds=1.0,
+                managed_child_liveness=lambda ignored: False,
+                ops=ops,
+            )
+
+        self.assertIsNone(failure)
+        self.assertEqual(ops.calls, 3)
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][1], signal.SIGTERM)
+
+    def test_verified_termination_resignals_new_exact_members(self):
+        record = {"pid": 731, "pgid": 731}
+        ops = mock.Mock()
+        ops.signal_verified_process_group.side_effect = (
+            {"status": "signaled", "signaled": [731], "members": [731]},
+            {
+                "status": "signaled",
+                "signaled": [731, 732],
+                "members": [731, 732],
+            },
+            {"status": "absent", "members": []},
+        )
+
+        with mock.patch.object(processes.time, "sleep"):
+            failure = processes._terminate_verified_group(
+                record,
+                term_seconds=1.0,
+                kill_seconds=1.0,
+                managed_child_liveness=lambda ignored: False,
+                ops=ops,
+            )
+
+        self.assertIsNone(failure)
+        self.assertEqual(ops.signal_verified_process_group.call_count, 3)
+
+    def test_verified_termination_fails_foreign_attribution_immediately(self):
+        record = {"pid": 731, "pgid": 731}
+        ops = mock.Mock()
+        ops.signal_verified_process_group.return_value = {
+            "status": "foreign",
+            "reason": "reused-pid",
+            "members": [731],
+        }
+
+        failure = processes._terminate_verified_group(
+            record,
+            term_seconds=1.0,
+            kill_seconds=1.0,
+            managed_child_liveness=lambda ignored: False,
+            ops=ops,
+        )
+
+        self.assertIn("reused-pid", failure)
+        ops.signal_verified_process_group.assert_called_once_with(
+            record,
+            signal.SIGTERM,
+        )
+
+    def test_process_match_revalidates_every_live_group_member_attribution(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        leader = {
+            "pid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        mismatches = (
+            dict(leader, pid=732, pgid=999),
+            dict(leader, pid=732, sid=999),
+            dict(leader, pid=732, state_dir="/wrong/state"),
+            dict(leader, pid=732, weights_dir="/wrong/weights"),
+        )
+        for member in mismatches:
+            with self.subTest(member=member):
+                result = processes._process_matches(
+                    record,
+                    proc_identity=lambda ignored: leader,
+                    process_group_members=lambda ignored: ([member], []),
+                )
+                self.assertFalse(result[0])
+                self.assertEqual(result[1], "foreign-process-group")
+
+    def test_dead_wrapper_group_requires_exact_member_paths_and_session(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        mismatched = {
+            "pid": 732,
+            "uid": 1000,
+            "starttime": 17001,
+            "nonce": nonce,
+            "pgid": 999,
+            "sid": 999,
+            "state_dir": "/wrong/state",
+            "weights_dir": "/wrong/weights",
+        }
+        result = processes._process_matches(
+            record,
+            proc_identity=lambda ignored: None,
+            process_group_members=lambda ignored: ([mismatched], []),
+        )
+        self.assertFalse(result[0])
+        self.assertEqual(result[1], "foreign-process-group")
+
+    def test_inert_zombie_leader_does_not_hide_exact_live_child(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        zombie = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        child = {
+            "pid": 732,
+            "uid": 1000,
+            "state": "S",
+            "inert": False,
+            "starttime": 17001,
+            "nonce": nonce,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        members = lambda ignored: ([zombie, child], [])
+        running = processes._process_matches(
+            record,
+            proc_identity=lambda ignored: zombie,
+            process_group_members=members,
+        )
+        self.assertTrue(running[0])
+        self.assertEqual(running[1], "running-group")
+
+        stopped = processes._process_matches(
+            record,
+            proc_identity=lambda ignored: zombie,
+            process_group_members=lambda ignored: ([zombie], []),
+        )
+        self.assertEqual(stopped, (False, "not-running", None))
+
+    def test_inert_nonleader_does_not_hide_exact_live_group_members(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        leader = {
+            "pid": 731,
+            "uid": 1000,
+            "inert": False,
+            "starttime": 17000,
+            "nonce": nonce,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        zombie = {
+            "pid": 732,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17001,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        child = dict(leader, pid=733, starttime=17002)
+
+        running = processes._process_matches(
+            record,
+            proc_identity=lambda ignored: leader,
+            process_group_members=lambda ignored: ([leader, zombie, child], []),
+        )
+
+        self.assertTrue(running[0])
+        self.assertEqual(running[1], "running")
+
+    def test_all_inert_group_is_not_running_with_or_without_leader(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        leader = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17000,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        child = dict(leader, pid=732, starttime=17001)
+
+        for case, actual, members in (
+            ("leader-present", leader, [leader, child]),
+            ("leader-absent", None, [child]),
+        ):
+            with self.subTest(case=case):
+                stopped = processes._process_matches(
+                    record,
+                    proc_identity=lambda ignored, value=actual: value,
+                    process_group_members=lambda ignored, value=members: (
+                        value,
+                        [],
+                    ),
+                )
+                self.assertEqual(stopped, (False, "not-running", None))
+
+        foreign = processes._process_matches(
+            record,
+            proc_identity=lambda ignored: None,
+            process_group_members=lambda ignored: (
+                [dict(child, uid=1001, pgid=999, sid=999)],
+                [],
+            ),
+        )
+        self.assertFalse(foreign[0])
+        self.assertEqual(foreign[1], "foreign-process-group")
+
+    def test_inert_group_member_requires_exact_uid_pgid_and_sid(self):
+        nonce = "a" * 48
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": nonce,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        leader = {
+            "pid": 731,
+            "uid": 1000,
+            "inert": False,
+            "starttime": 17000,
+            "nonce": nonce,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        zombie = {
+            "pid": 732,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17001,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        for field, value in (("uid", 1001), ("pgid", 999), ("sid", 999)):
+            with self.subTest(field=field):
+                mismatched = dict(zombie, **{field: value})
+                result = processes._process_matches(
+                    record,
+                    proc_identity=lambda ignored: leader,
+                    process_group_members=lambda ignored: (
+                        [leader, mismatched],
+                        [],
+                    ),
+                )
+                self.assertFalse(result[0])
+                self.assertEqual(result[1], "foreign-process-group")
+
+    def test_inert_leader_requires_exact_persisted_starttime(self):
+        record = {
+            "pid": 731,
+            "pgid": 731,
+            "uid": 1000,
+            "starttime": 17000,
+            "nonce": "a" * 48,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+        reused = {
+            "pid": 731,
+            "uid": 1000,
+            "state": "Z",
+            "inert": True,
+            "starttime": 17001,
+            "nonce": None,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": None,
+            "weights_dir": None,
+        }
+        child = {
+            "pid": 732,
+            "uid": 1000,
+            "state": "S",
+            "inert": False,
+            "starttime": 17002,
+            "nonce": "a" * 48,
+            "pgid": 731,
+            "sid": 731,
+            "state_dir": "/state/node-0",
+            "weights_dir": "/mnt/weights",
+        }
+
+        result = processes._process_matches(
+            record,
+            proc_identity=lambda ignored: reused,
+            process_group_members=lambda ignored: ([reused, child], []),
+        )
+
+        self.assertFalse(result[0])
+        self.assertEqual(result[1], "foreign-process-group")
 
     def test_mount_table_rejects_operational_read_failures(self):
         failures = (
@@ -1098,7 +3253,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         mount_root = "/mnt/colibri"
         mapped = "1000-2000 r--p 00000000 00:01 7 %s/model.bin\n" % mount_root
 
-        for reference in ("cwd", "root", "maps", "fd"):
+        for reference in ("cwd", "root", "exe", "maps", "fd"):
             def list_directory(path):
                 if path == "/proc":
                     return ["731"]
@@ -1114,6 +3269,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
                 if path == "/proc/731/task/732/%s" % reference and reference in (
                     "cwd",
                     "root",
+                    "exe",
                 ):
                     return mount_root + "/weights"
                 if path == "/proc/731/task/732/fd/9":

@@ -16,6 +16,7 @@ from .accelerator import _same_gpu_identity
 from .common import (
     GIB,
     RamdiskError,
+    _positive_int,
     _raise_if_cancelled,
     _utc_now,
 )
@@ -32,27 +33,134 @@ def _process_group_members(
     ops=None,
     proc_identity=None,
 ):
-    """Return readable identities and unreadable PIDs in one process group."""
+    """Return identities only from a bounded stable membership view."""
     ops = get_platform_ops() if ops is None else ops
     proc_identity = (
         _proc_identity
         if proc_identity is None
         else proc_identity
     )
-    members = []
-    unreadable = []
-    for pid in ops.process_group_member_pids(pgid):
-        identity = proc_identity(pid)
-        if identity:
-            members.append(identity)
-        else:
-            unreadable.append(pid)
-    if not members and not unreadable and ops.process_group_alive(pgid):
-        # A complete procfs scan cannot prove absence while the kernel still
-        # reports the group alive.  Preserve the existing two-list interface
-        # and make callers treat the group identity as unverified.
-        unreadable.append(int(pgid))
-    return members, unreadable
+    pgid = int(pgid)
+
+    def identity_fingerprint(identity):
+        # Scheduler state (R/S/D) is expected to change between reads. Only
+        # compare the stable identity and persisted-attribution fields.
+        return tuple(
+            identity.get(key)
+            for key in (
+                "pid",
+                "uid",
+                "inert",
+                "starttime",
+                "nonce",
+                "pgid",
+                "sid",
+                "state_dir",
+                "weights_dir",
+            )
+        )
+
+    def scan():
+        before = list(ops.process_group_member_pids(pgid))
+        if before != sorted(set(before)):
+            return [], sorted(set(before) or {pgid}), None
+        identities = []
+        unreadable = []
+        for pid in before:
+            identity = proc_identity(pid)
+            if (
+                isinstance(identity, dict)
+                and identity.get("pid") == pid
+            ):
+                identities.append(identity)
+            else:
+                unreadable.append(pid)
+        after = list(ops.process_group_member_pids(pgid))
+        if after != before:
+            unreadable.extend(set(before) | set(after))
+        if unreadable:
+            return identities, sorted(set(unreadable)), None
+        return identities, [], (
+            before,
+            [identity_fingerprint(identity) for identity in identities],
+        )
+
+    first_members, first_unreadable, first_view = scan()
+    if first_unreadable:
+        return first_members, first_unreadable
+    second_members, second_unreadable, second_view = scan()
+    if second_unreadable:
+        return second_members, second_unreadable
+    if first_view != second_view:
+        pids = {
+            member.get("pid")
+            for member in first_members + second_members
+            if isinstance(member, dict)
+            and isinstance(member.get("pid"), int)
+        }
+        return second_members, sorted(pids or {pgid})
+
+    # Empty and all-inert snapshots authorize irreversible state cleanup, so
+    # couple them to kernel liveness and one final complete identity scan.
+    if not second_members or all(
+        _proven_inert_group_member(member)
+        for member in second_members
+    ):
+        alive_before = ops.process_group_alive(pgid)
+        final_members, final_unreadable, final_view = scan()
+        alive_after = ops.process_group_alive(pgid)
+        if final_unreadable:
+            return final_members, final_unreadable
+        if final_view != second_view:
+            pids = {
+                member.get("pid")
+                for member in second_members + final_members
+                if isinstance(member, dict)
+                and isinstance(member.get("pid"), int)
+            }
+            return final_members, sorted(pids or {pgid})
+        if alive_before or alive_after:
+            return final_members, [pgid]
+        return final_members, []
+    return second_members, []
+
+
+def _proven_inert_group_member(identity):
+    """Return whether procfs proved one stable process identity inert."""
+    return (
+        isinstance(identity, dict)
+        and identity.get("inert") is True
+        and _positive_int(identity.get("pid"))
+        and _positive_int(identity.get("starttime"))
+    )
+
+
+def _inert_group_member_matches(record, identity, expected_pgid):
+    """Validate one proven-dead member within a mixed live group."""
+    if (
+        not _proven_inert_group_member(identity)
+        or identity.get("uid") != record.get("uid")
+        or identity.get("pgid") != expected_pgid
+        or identity.get("sid") != expected_pgid
+    ):
+        return False
+    if identity["pid"] == int(record["pid"]):
+        return identity["starttime"] == record.get("starttime")
+    return True
+
+
+def _live_group_member_matches(record, identity, expected_pgid):
+    """Require complete persisted attribution for every runnable member."""
+    return (
+        isinstance(identity, dict)
+        and identity.get("inert") is False
+        and identity.get("uid") == record.get("uid")
+        and identity.get("nonce") == record.get("nonce")
+        and identity.get("pgid") == expected_pgid
+        and identity.get("sid") == expected_pgid
+        and identity.get("state_dir") == record.get("state_dir")
+        and identity.get("weights_dir") == record.get("weights_dir")
+    )
 
 
 def _process_matches(
@@ -73,7 +181,24 @@ def _process_matches(
     )
     pid = int(record["pid"])
     expected_pgid = int(record.get("pgid", pid))
+
+    def attribution_matches(identity):
+        if isinstance(identity, dict) and identity.get("inert") is True:
+            # Stable lone-thread zombies cannot run, retain files, or mutate
+            # usage. Every runnable member still needs full attribution.
+            return _inert_group_member_matches(
+                record,
+                identity,
+                expected_pgid,
+            )
+        return _live_group_member_matches(record, identity, expected_pgid)
+
     actual = proc_identity(pid)
+    if (
+        _proven_inert_group_member(actual)
+        and actual.get("pid") == pid
+    ):
+        actual = None
     if not actual:
         # The Python serve wrapper can die before its engine child. A managed
         # session keeps the original PGID, so validate every surviving
@@ -87,11 +212,22 @@ def _process_matches(
                 "unverified-process-group",
                 {"pgid": expected_pgid, "members": unreadable},
             )
-        if any(
-            member["uid"] != record.get("uid")
-            or member["nonce"] != record.get("nonce")
-            for member in members
-        ):
+        if all(_proven_inert_group_member(member) for member in members):
+            if any(
+                not _inert_group_member_matches(
+                    record,
+                    member,
+                    expected_pgid,
+                )
+                for member in members
+            ):
+                return (
+                    False,
+                    "foreign-process-group",
+                    {"pgid": expected_pgid, "members": members},
+                )
+            return False, "not-running", None
+        if any(not attribution_matches(member) for member in members):
             return (
                 False,
                 "foreign-process-group",
@@ -110,7 +246,44 @@ def _process_matches(
         return False, "foreign-nonce", actual
     if actual["pgid"] != expected_pgid:
         return False, "foreign-process-group", actual
-    return True, "running", actual
+    if actual.get("sid") != expected_pgid:
+        return False, "foreign-session", actual
+    if any(
+        actual.get(key) != record.get(key)
+        for key in ("state_dir", "weights_dir")
+    ):
+        return False, "foreign-path-attribution", actual
+    members, unreadable = process_group_members(expected_pgid)
+    if unreadable or not members:
+        return (
+            False,
+            "unverified-process-group",
+            {"pgid": expected_pgid, "members": unreadable},
+        )
+    if all(_proven_inert_group_member(member) for member in members):
+        if any(
+            not _inert_group_member_matches(
+                record,
+                member,
+                expected_pgid,
+            )
+            for member in members
+        ):
+            return (
+                False,
+                "foreign-process-group",
+                {"pgid": expected_pgid, "members": members},
+            )
+        return False, "not-running", None
+    if any(not attribution_matches(member) for member in members):
+        return (
+            False,
+            "foreign-process-group",
+            {"pgid": expected_pgid, "members": members},
+        )
+    running = dict(actual)
+    running["members"] = members
+    return True, "running", running
 
 
 def _process_tree_alive(
@@ -399,40 +572,6 @@ def _terminate_direct_child(
         return "direct child PID %s survived SIGKILL" % process.pid
 
 
-def _terminate_group(
-    pgid,
-    term_seconds=10.0,
-    kill_seconds=3.0,
-    *,
-    group_alive=None,
-    ops=None,
-):
-    """Terminate one already-verified or directly-created process group."""
-    group_alive = _group_alive if group_alive is None else group_alive
-    ops = get_platform_ops() if ops is None else ops
-    try:
-        ops.signal_process_group(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + term_seconds
-    while time.monotonic() < deadline and group_alive(pgid):
-        time.sleep(0.1)
-    if not group_alive(pgid):
-        return None
-    try:
-        ops.signal_process_group(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + kill_seconds
-    while time.monotonic() < deadline and group_alive(pgid):
-        time.sleep(0.05)
-    return (
-        "process group %s survived SIGKILL" % pgid
-        if group_alive(pgid)
-        else None
-    )
-
-
 def _terminate_verified_group(
     record,
     term_seconds=10.0,
@@ -442,77 +581,104 @@ def _terminate_verified_group(
     process_matches=None,
     ops=None,
 ):
-    """Signal only while the persisted identity still owns its PGID."""
+    """Terminate persisted members only through freshly verified pidfds."""
     managed_child_liveness = (
         _managed_child_liveness
         if managed_child_liveness is None
         else managed_child_liveness
     )
-    process_matches = (
-        _process_matches
-        if process_matches is None
-        else process_matches
-    )
+    # ``process_matches`` remains an accepted injection for facade/API
+    # compatibility. Lifecycle preflight uses it before this function, but it
+    # cannot safely authorize a later signal because PID/PGID reuse may occur
+    # between those two operations.
+    del process_matches
     ops = get_platform_ops() if ops is None else ops
     expected_pgid = int(record.get("pgid", record["pid"]))
 
-    def revalidate(stage):
-        # A retained child handle is independent evidence. It can prove
-        # liveness while process-group enumeration is inconclusive, and polling
-        # it also reaps an exited group leader before the kernel check.
-        child_alive = managed_child_liveness(record["pid"])
-        matches, reason, actual = process_matches(record)
-        if (
-            matches
-            and actual
-            and int(actual.get("pgid", -1)) == expected_pgid
-        ):
-            return True, None
-        if reason == "not-running" and child_alive is not True:
-            return False, None
-        if reason == "not-running":
+    def signal_round(signum, stage):
+        result = ops.signal_verified_process_group(record, signum)
+        if not isinstance(result, dict):
             return (
-                False,
-                "PID/PGID %s retained managed child is still live %s; "
-                "refusing an unverified group signal"
+                "failed",
+                "PID/PGID %s verified cleanup returned an invalid result %s"
                 % (expected_pgid, stage),
             )
+        status = result.get("status")
+        reason = result.get("reason", "unspecified")
+        if status == "absent":
+            # Polling also reaps a retained local group leader. A live Popen
+            # handle contradicts procfs absence and must retain authority.
+            if managed_child_liveness(record["pid"]) is True:
+                return (
+                    "failed",
+                    "PID/PGID %s retained managed child is still live %s; "
+                    "refusing to accept process-group absence"
+                    % (expected_pgid, stage),
+                )
+            return "stopped", None
+        if status == "foreign":
+            return (
+                "failed",
+                "PID/PGID %s identity changed %s (%s); refusing any "
+                "further signal"
+                % (expected_pgid, stage, reason),
+            )
+        if status == "inconclusive":
+            return "inconclusive", reason
+        if status == "signaled":
+            return "running", None
         return (
-            False,
-            "PID/PGID %s identity changed %s (%s); refusing another signal"
-            % (expected_pgid, stage, reason),
+            "failed",
+            "PID/PGID %s verified cleanup returned unknown status %r %s"
+            % (expected_pgid, status, stage),
         )
 
-    alive, failure = revalidate("before SIGTERM")
-    if failure or not alive:
-        return failure
-    try:
-        ops.signal_process_group(expected_pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return None
-    deadline = time.monotonic() + term_seconds
-    while time.monotonic() < deadline:
-        alive, failure = revalidate("after SIGTERM")
-        if failure or not alive:
-            return failure
-        time.sleep(0.1)
+    def signal_window(signum, duration, interval, label):
+        deadline = time.monotonic() + max(0.0, float(duration))
+        last_inconclusive = None
+        first = True
+        while first or time.monotonic() < deadline:
+            first = False
+            state, detail = signal_round(signum, "during %s" % label)
+            if state == "stopped":
+                return "stopped", None
+            if state == "failed":
+                return "failed", detail
+            if state == "inconclusive":
+                last_inconclusive = detail
+            else:
+                last_inconclusive = None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(interval)
+        return "deadline", last_inconclusive
 
-    alive, failure = revalidate("before SIGKILL")
-    if failure or not alive:
-        return failure
-    try:
-        ops.signal_process_group(expected_pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    state, failure = signal_window(
+        signal.SIGTERM,
+        term_seconds,
+        0.1,
+        "SIGTERM grace period",
+    )
+    if state == "stopped":
         return None
-    deadline = time.monotonic() + kill_seconds
-    while time.monotonic() < deadline:
-        alive, failure = revalidate("after SIGKILL")
-        if failure or not alive:
-            return failure
-        time.sleep(0.05)
-    alive, failure = revalidate("after SIGKILL")
-    if failure or not alive:
+    if state == "failed":
         return failure
+
+    state, failure = signal_window(
+        signal.SIGKILL,
+        kill_seconds,
+        0.05,
+        "SIGKILL grace period",
+    )
+    if state == "stopped":
+        return None
+    if state == "failed":
+        return failure
+    if failure:
+        return (
+            "process group %s remained unverified after SIGKILL (%s)"
+            % (expected_pgid, failure)
+        )
     return "process group %s survived SIGKILL" % expected_pgid
 
 
@@ -632,22 +798,42 @@ def _managed_process_metrics(
     rss_processes = 0
     matches, _, _ = process_matches(record)
     if matches:
+        expected_pgid = int(record.get("pgid", record["pid"]))
         members, unreadable = process_group_members(
-            int(record.get("pgid", record["pid"]))
+            expected_pgid
         )
-        verified = [
+        inert_members = [
             member
             for member in members
-            if member.get("uid") == record.get("uid")
-            and member.get("nonce") == record.get("nonce")
+            if isinstance(member, dict)
+            and member.get("inert") is True
+        ]
+        live_members = [
+            member
+            for member in members
+            if not isinstance(member, dict)
+            or member.get("inert") is not True
+        ]
+        verified_live = [
+            member
+            for member in live_members
+            if _live_group_member_matches(record, member, expected_pgid)
         ]
         if (
             not unreadable
-            and len(verified) == len(members)
-            and verified
+            and all(
+                _inert_group_member_matches(
+                    record,
+                    member,
+                    expected_pgid,
+                )
+                for member in inert_members
+            )
+            and len(verified_live) == len(live_members)
+            and verified_live
         ):
             rss_bytes = 0
-            for member in verified:
+            for member in verified_live:
                 for line in process_status(
                     member["pid"]
                 ).splitlines():

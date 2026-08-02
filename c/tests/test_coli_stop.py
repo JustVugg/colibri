@@ -8,9 +8,9 @@ from pathlib import Path
 from unittest import mock
 
 try:
-    from .platform_test_support import requires_linux_pidfd
+    from .platform_test_support import requires_linux_stdlib_pidfd
 except ImportError:
-    from platform_test_support import requires_linux_pidfd
+    from platform_test_support import requires_linux_stdlib_pidfd
 
 
 C_DIR = Path(__file__).resolve().parents[1]
@@ -64,7 +64,7 @@ class ColiStopIdentityTest(unittest.TestCase):
 
         kill.assert_called_once_with(4242, signal.SIGTERM)
 
-    @requires_linux_pidfd
+    @requires_linux_stdlib_pidfd
     def test_pidfd_is_used_instead_of_numeric_pid_when_available(self):
         target = {
             "pid": 4242,

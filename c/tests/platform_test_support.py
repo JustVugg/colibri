@@ -29,6 +29,8 @@ _LINUX_OPERATIONAL_TESTS = frozenset(
         "test_ramdisk_mounts.MountAndCopyTest.test_runner_oserror_retains_pending_without_absence_reconciliation",
         "test_ramdisk_presentation.TuiPlacementContractTest.test_cancelled_prepare_does_not_hide_rollback_failure",
         "test_ramdisk_presentation.TuiPlacementContractTest.test_clean_prepare_cancellation_removes_recovery_manifest",
+        "test_ramdisk_processes.ManagedLaunchTest.test_exact_popen_attempt_is_reaped_across_registration_boundaries",
+        "test_ramdisk_processes.ManagedLaunchTest.test_postfork_popen_exception_retains_and_reaps_exact_child",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_busy_mount_scan_includes_the_manager_process",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_dashboard_rss_sums_verified_wrapper_and_engine_group",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_destroy_persists_recovery_state_when_kernel_unmount_fails",
@@ -62,11 +64,41 @@ _SIGTERM_HANDLER_TESTS = frozenset(
 
 _SIGINT_HANDLER_TESTS = frozenset(
     {
+        "test_ramdisk_cli_module.CliModuleTest.test_prepare_and_destroy_confirmations_keep_ctrl_c_interruptible",
+        "test_ramdisk_cli_module.CliModuleTest.test_prepare_restores_cooperative_ctrl_c_after_confirmation",
+        "test_ramdisk_cli_module.CliModuleTest.test_real_tty_ctrl_c_interrupts_confirmation_without_input",
         "test_ramdisk_cli_smoke.CliJsonSmokeTest.test_cli_repeated_sigint_stays_cooperative_through_start_rollback",
     }
 )
 
+_POSIX_PTY_TESTS = frozenset(
+    {
+        "test_ramdisk_cli_module.CliModuleTest.test_real_tty_ctrl_c_interrupts_confirmation_without_input",
+    }
+)
+
+_POSIX_FIFO_TESTS = frozenset(
+    {
+        "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_managed_usage_swap_to_fifo_uses_nonblocking_open",
+    }
+)
+
+_NATIVE_DIRFD_TESTS = frozenset(
+    {
+        "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_atomic_temp_creation_stays_inside_bound_parent",
+        "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_existing_marker_reproves_canonical_parent_before_journal_unlink",
+        "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_managed_usage_merge_rejects_symlink_swap_during_verified_open",
+        "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_managed_usage_seed_write_binds_parent_identity",
+    }
+)
+
 _LINUX_PIDFD_TESTS = frozenset(
+    {
+        "test_ramdisk_platform.LinuxOperationalReadContractTest.test_real_pidfd_group_signal_targets_each_exact_member",
+    }
+)
+
+_LINUX_STDLIB_PIDFD_TESTS = frozenset(
     {
         "test_coli_stop.ColiStopIdentityTest.test_pidfd_is_used_instead_of_numeric_pid_when_available",
     }
@@ -76,6 +108,36 @@ _TARGET_PLATFORM = os.environ.get(
     "COLIBRI_TEST_TARGET_PLATFORM",
     sys.platform,
 )
+
+
+def _linux_pidfd_supported():
+    """Match the managed runtime's stdlib-or-libc kernel capability probe."""
+    if not _TARGET_PLATFORM.startswith("linux"):
+        return False
+    try:
+        from ramdisk_support import linux_ops
+    except ImportError:
+        return False
+    return linux_ops._pidfd_process_control_supported()
+
+
+def _native_dirfd_supported():
+    """Match the descriptor primitives required by durable managed state."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    return (
+        not _TARGET_PLATFORM.startswith("win")
+        and os.name == "posix"
+        and os.open in getattr(os, "supports_dir_fd", set())
+        and os.stat in getattr(os, "supports_dir_fd", set())
+        and os.unlink in getattr(os, "supports_dir_fd", set())
+        and os.rename in getattr(os, "supports_dir_fd", set())
+        and all(
+            isinstance(getattr(os, name, None), int)
+            and getattr(os, name) != 0
+            for name in required_flags
+        )
+    )
+
 
 PLATFORM_SKIP_INVENTORY = {
     "linux_operational": {
@@ -93,13 +155,38 @@ PLATFORM_SKIP_INVENTORY = {
         "reason": "SIGINT is unavailable",
         "tests": _SIGINT_HANDLER_TESTS,
     },
-    "linux_pidfd": {
+    "posix_pty": {
+        "supported": os.name == "posix" and hasattr(os, "openpty"),
+        "reason": "a POSIX pseudo-terminal is required",
+        "tests": _POSIX_PTY_TESTS,
+    },
+    "posix_fifo": {
         "supported": (
-            _TARGET_PLATFORM.startswith("linux")
-            and hasattr(signal, "pidfd_send_signal")
+            not _TARGET_PLATFORM.startswith("win")
+            and os.name == "posix"
+            and hasattr(os, "mkfifo")
         ),
+        "reason": "a POSIX FIFO is required",
+        "tests": _POSIX_FIFO_TESTS,
+    },
+    "native_dirfd": {
+        "supported": _native_dirfd_supported(),
+        "reason": "native descriptor-relative filesystem operations are unavailable",
+        "tests": _NATIVE_DIRFD_TESTS,
+    },
+    "linux_pidfd": {
+        "supported": _linux_pidfd_supported(),
         "reason": "Linux pidfd signaling is unavailable",
         "tests": _LINUX_PIDFD_TESTS,
+    },
+    "linux_stdlib_pidfd": {
+        "supported": (
+            _TARGET_PLATFORM.startswith("linux")
+            and callable(getattr(os, "pidfd_open", None))
+            and callable(getattr(signal, "pidfd_send_signal", None))
+        ),
+        "reason": "Python stdlib pidfd signaling is unavailable",
+        "tests": _LINUX_STDLIB_PIDFD_TESTS,
     },
 }
 
@@ -129,7 +216,11 @@ def _requires(marker):
 requires_linux_operational = _requires("linux_operational")
 requires_sigterm_handler = _requires("sigterm_handler")
 requires_sigint_handler = _requires("sigint_handler")
+requires_posix_pty = _requires("posix_pty")
+requires_posix_fifo = _requires("posix_fifo")
+requires_native_dirfd = _requires("native_dirfd")
 requires_linux_pidfd = _requires("linux_pidfd")
+requires_linux_stdlib_pidfd = _requires("linux_stdlib_pidfd")
 
 
 def assert_platform_skip_inventory():
@@ -138,15 +229,58 @@ def assert_platform_skip_inventory():
         "requires_linux_operational": "linux_operational",
         "requires_sigterm_handler": "sigterm_handler",
         "requires_sigint_handler": "sigint_handler",
+        "requires_posix_pty": "posix_pty",
+        "requires_posix_fifo": "posix_fifo",
+        "requires_native_dirfd": "native_dirfd",
         "requires_linux_pidfd": "linux_pidfd",
+        "requires_linux_stdlib_pidfd": "linux_stdlib_pidfd",
     }
     discovered = {marker: set() for marker in PLATFORM_SKIP_INVENTORY}
     tests_dir = Path(__file__).resolve().parent
+
+    def raw_platform_skip(decorator):
+        if not isinstance(decorator, ast.Call):
+            return False
+        target = decorator.func
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "unittest"
+            and target.attr in ("skipIf", "skipUnless")
+            and decorator.args
+        ):
+            return False
+        condition_nodes = tuple(ast.walk(decorator.args[0]))
+        names = {
+            node.id for node in condition_nodes if isinstance(node, ast.Name)
+        }
+        attributes = {
+            node.attr
+            for node in condition_nodes
+            if isinstance(node, ast.Attribute)
+        }
+        return (
+            ("sys" in names and "platform" in attributes)
+            or (
+                "os" in names
+                and attributes.intersection({"name", "openpty", "mkfifo"})
+            )
+            or "signal" in names
+        )
+
     for source in tests_dir.glob("test_*.py"):
         tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
         for class_node in (
             node for node in tree.body if isinstance(node, ast.ClassDef)
         ):
+            if source.name.startswith("test_ramdisk_") and any(
+                raw_platform_skip(decorator)
+                for decorator in class_node.decorator_list
+            ):
+                raise AssertionError(
+                    "raw class platform skip bypasses inventory: %s.%s"
+                    % (source.stem, class_node.name)
+                )
             for function in (
                 node
                 for node in class_node.body
@@ -161,6 +295,43 @@ def assert_platform_skip_inventory():
                             "%s.%s.%s"
                             % (source.stem, class_node.name, function.name)
                         )
+
+                if source.name.startswith("test_ramdisk_"):
+                    for decorator in function.decorator_list:
+                        if raw_platform_skip(decorator):
+                            raise AssertionError(
+                                "raw platform skip bypasses inventory: %s.%s.%s"
+                                % (source.stem, class_node.name, function.name)
+                            )
+
+                    for call in (
+                        node
+                        for node in ast.walk(function)
+                        if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "skipTest"
+                    ):
+                        reason = " ".join(
+                            node.value
+                            for node in call.args
+                            if isinstance(node, ast.Constant)
+                            and isinstance(node.value, str)
+                        ).upper()
+                        if any(
+                            token in reason
+                            for token in (
+                                "SIGINT",
+                                "SIGTERM",
+                                "LINUX",
+                                "MACOS",
+                                "POSIX",
+                                "WINDOWS",
+                            )
+                        ):
+                            raise AssertionError(
+                                "dynamic platform skip bypasses inventory: %s.%s.%s"
+                                % (source.stem, class_node.name, function.name)
+                            )
 
     mismatches = []
     for marker, entry in PLATFORM_SKIP_INVENTORY.items():

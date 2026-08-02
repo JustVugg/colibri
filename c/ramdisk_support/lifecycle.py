@@ -20,12 +20,14 @@ from .common import (
     RamdiskError,
     _MountHelperCompletedError,
     _OperationCancelled,
+    _positive_int,
     _raise_if_cancelled,
     _utc_now,
 )
 
 
 _POPEN_BASE_TYPE = subprocess.Popen
+_PENDING_RECOVERY_ERROR_PREFIX = "pending managed-launch recovery: "
 
 
 def _managed_ports_for_plan(plan, base_port=8000):
@@ -109,31 +111,394 @@ def _unresolved_process_recovery_error(action):
 def _pending_launch_recovery_error(action):
     return RamdiskError(
         "refusing %s while a pre-spawn managed launch has an unknown "
-        "outcome; inspect pending_launches in status and recover the "
-        "deployment explicitly" % action
+        "outcome; run `coli ramdisk stop` to discover, stop, and reconcile "
+        "the pending launch" % action
     )
 
 
-def _reconcile_unpublished_processes(
+def _valid_usage_transaction_id(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _usage_authority_records(manifest):
+    records = []
+    records.extend(
+        record
+        for record in manifest.get("processes", [])
+        if isinstance(record, dict)
+    )
+    records.extend(
+        record
+        for record in manifest.get("pending_launches", [])
+        if isinstance(record, dict)
+    )
+    records.extend(
+        record
+        for record in _retained_process_recovery(manifest)
+        if isinstance(record, dict)
+    )
+    return records
+
+
+def _reserved_usage_transaction_ids(manifest):
+    owners = {}
+    for record in _usage_authority_records(manifest):
+        merge_id = record.get("usage_merge_id")
+        if merge_id is None:
+            continue
+        if not _valid_usage_transaction_id(merge_id):
+            raise RamdiskError("managed recovery has an invalid usage transaction")
+        if merge_id in owners and owners[merge_id] is not record:
+            raise RamdiskError(
+                "duplicate usage transaction authority: %s" % merge_id
+            )
+        owners[merge_id] = record
+    return set(owners)
+
+
+def _mint_usage_transaction_id(reserved_ids):
+    for _ in range(128):
+        merge_id = secrets.token_hex(16)
+        if merge_id not in reserved_ids:
+            reserved_ids.add(merge_id)
+            return merge_id
+    raise RamdiskError("could not allocate a unique usage transaction id")
+
+
+def _bind_recovery_usage_transactions(
+    manifest,
+    records,
+    *,
+    plan,
+    bind_usage_transaction,
+    reserved_ids=None,
+):
+    """Resolve every candidate before mutating any durable manifest record."""
+    reserved = _reserved_usage_transaction_ids(manifest)
+    reserved.update(reserved_ids or ())
+    resolved = []
+    for record in records:
+        persisted = record.get("usage_merge_id")
+        local_reserved = set(reserved)
+        if persisted is not None:
+            local_reserved.discard(persisted)
+        candidate_record = copy.deepcopy(record)
+        merge_id = bind_usage_transaction(
+            candidate_record,
+            plan=plan,
+            reserved_ids=local_reserved,
+        )
+        if not _valid_usage_transaction_id(merge_id):
+            raise RamdiskError("managed recovery has an invalid usage transaction")
+        if merge_id in local_reserved:
+            raise RamdiskError(
+                "duplicate usage transaction authority: %s" % merge_id
+            )
+        if persisted is not None:
+            reserved.discard(persisted)
+        reserved.add(merge_id)
+        resolved.append((record, merge_id))
+    for record, merge_id in resolved:
+        record["usage_merge_id"] = merge_id
+    return reserved
+
+
+def _state_dir_authority_key(path):
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _preflight_seed_usage_journals(
+    manifest,
+    state_dirs,
+    *,
+    plan,
+    usage_journal_transaction_id,
+):
+    """Resolve every current seed journal before the first canonical replay."""
+    reserved = _reserved_usage_transaction_ids(manifest)
+    manifest_ids_by_state = {}
+    for record in _usage_authority_records(manifest):
+        state_dir = record.get("state_dir")
+        if not isinstance(state_dir, str) or not state_dir:
+            continue
+        merge_id = record.get("usage_merge_id")
+        if merge_id is None:
+            continue
+        manifest_ids_by_state.setdefault(
+            _state_dir_authority_key(state_dir),
+            set(),
+        ).add(merge_id)
+
+    expected_by_state = {}
+    journal_owner_by_id = {}
+    for state_dir in state_dirs:
+        state_key = _state_dir_authority_key(state_dir)
+        if state_key in expected_by_state:
+            continue
+        merge_id = usage_journal_transaction_id(state_dir, plan=plan)
+        if merge_id is None:
+            expected_by_state[state_key] = None
+            continue
+        if not _valid_usage_transaction_id(merge_id):
+            raise RamdiskError("managed recovery has an invalid usage transaction")
+        prior_owner = journal_owner_by_id.get(merge_id)
+        if prior_owner is not None and prior_owner != state_key:
+            raise RamdiskError(
+                "duplicate usage transaction authority: %s" % merge_id
+            )
+        same_state_manifest_ids = manifest_ids_by_state.get(state_key, set())
+        if same_state_manifest_ids and merge_id not in same_state_manifest_ids:
+            raise RamdiskError(
+                "usage delta journal transaction does not match managed record"
+            )
+        if merge_id in reserved and merge_id not in same_state_manifest_ids:
+            raise RamdiskError(
+                "duplicate usage transaction authority: %s" % merge_id
+            )
+        journal_owner_by_id[merge_id] = state_key
+        expected_by_state[state_key] = merge_id
+        reserved.add(merge_id)
+
+    # Canonical markers are intentionally not included. They are historical,
+    # not live authorities; the 128-bit transaction space is the explicit
+    # collision assumption that permits an old marked journal to replay as a
+    # harmless idempotent retry.
+    return expected_by_state, reserved
+
+
+def _preflight_pending_launches(
     manifest,
     *,
+    discover_managed_launches,
+    process_matches,
+    process_group_members,
     group_alive,
-    merge_usage,
-    save_manifest,
 ):
-    """Merge an unpublished child only after its direct-created PGID is absent."""
-    retained = list(_retained_process_recovery(manifest))
-    if not retained:
-        return manifest
-    plan = manifest["plan"]
-    canonical_usage = os.path.join(
-        plan["model"]["path"],
-        ".coli_usage",
-    )
+    """Resolve pending nonces without authorizing a signal or usage merge."""
+    preflights = []
     failures = []
-    remaining = []
-    released = []
-    for entry in retained:
+    for entry in _pending_launch_recovery(manifest):
+        label = "pending launch on port %s (node %s)" % (
+            entry.get("port", "unknown"),
+            entry.get("node") if entry.get("node") is not None else "shared",
+        )
+        try:
+            candidates = discover_managed_launches(
+                nonce=entry["nonce"],
+                uid=entry["uid"],
+                state_dir=entry["state_dir"],
+                weights_dir=entry["weights_dir"],
+                not_before_starttime=entry["launch_not_before"],
+                launcher_pid=entry["launcher_pid"],
+                launcher_starttime=entry["launcher_starttime"],
+                launcher_cmdline=entry["launcher_cmdline"],
+                expected_command=entry["expected_command"],
+            )
+        except Exception as exc:
+            failures.append("%s discovery failed: %s" % (label, exc))
+            continue
+        if not isinstance(candidates, list):
+            failures.append("%s discovery returned an invalid result" % label)
+            continue
+
+        observed = entry.get("observed_group")
+        if not candidates:
+            if observed is not None:
+                try:
+                    still_alive = group_alive(observed["pgid"])
+                except Exception as exc:
+                    failures.append(
+                        "%s observed group absence check failed: %s"
+                        % (label, exc)
+                    )
+                    continue
+                if still_alive is not False:
+                    failures.append(
+                        "%s observed process group %s remains live or its "
+                        "absence is unproven"
+                        % (label, observed["pgid"])
+                    )
+                    continue
+            preflights.append(
+                {
+                    "entry": entry,
+                    "record": None,
+                    "live": False,
+                    "observed_group": observed,
+                }
+            )
+            continue
+
+        malformed = [
+            candidate
+            for candidate in candidates
+            if (
+                not isinstance(candidate, dict)
+                or not _positive_int(candidate.get("pid"))
+                or candidate.get("uid") != entry["uid"]
+                or candidate.get("nonce") != entry["nonce"]
+                or candidate.get("state_dir") != entry["state_dir"]
+                or candidate.get("weights_dir") != entry["weights_dir"]
+                or not _positive_int(candidate.get("starttime"))
+                or not _positive_int(candidate.get("pgid"))
+                or candidate.get("sid") != candidate.get("pgid")
+            )
+        ]
+        if malformed:
+            failures.append(
+                "%s discovery returned malformed or mismatched identities"
+                % label
+            )
+            continue
+        pgids = {candidate["pgid"] for candidate in candidates}
+        if len(pgids) != 1:
+            failures.append(
+                "%s nonce is attributable to multiple process groups: %s"
+                % (label, ", ".join(str(value) for value in sorted(pgids)))
+            )
+            continue
+        pgid = next(iter(pgids))
+        try:
+            members, unreadable = process_group_members(pgid)
+        except Exception as exc:
+            failures.append(
+                "%s process-group discovery failed: %s" % (label, exc)
+            )
+            continue
+        if unreadable or not members:
+            failures.append(
+                "%s process group %s has unreadable or absent members"
+                % (label, pgid)
+            )
+            continue
+
+        leader = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate["pid"] == pgid
+            ),
+            None,
+        )
+        inert_leader = next(
+            (
+                member
+                for member in members
+                if isinstance(member, dict)
+                and member.get("pid") == pgid
+                and member.get("inert") is True
+            ),
+            None,
+        )
+        leader_identity = leader or inert_leader
+        leader_starttime = (
+            leader_identity.get("starttime")
+            if leader_identity is not None
+            else None
+        )
+        persisted_leader_starttime = (
+            observed.get("leader_starttime")
+            if observed is not None
+            else leader_starttime
+        )
+        next_observed = {
+            "pgid": pgid,
+            "uid": entry["uid"],
+            "leader_starttime": persisted_leader_starttime,
+        }
+        if observed is not None and (
+            observed.get("pgid") != pgid
+            or observed.get("uid") != entry["uid"]
+            or (
+                leader_identity is not None
+                and (
+                    observed.get("leader_starttime") is None
+                    or observed.get("leader_starttime") != leader_starttime
+                )
+            )
+        ):
+            failures.append(
+                "%s observed process-group identity changed" % label
+            )
+            continue
+
+        def member_matches(member):
+            if (
+                not isinstance(member, dict)
+                or not _positive_int(member.get("pid"))
+                or not _positive_int(member.get("starttime"))
+            ):
+                return False
+            if member.get("inert") is True:
+                if (
+                    member.get("uid") != entry["uid"]
+                    or member.get("pgid") != pgid
+                    or member.get("sid") != pgid
+                ):
+                    return False
+                if member["pid"] == pgid:
+                    return (
+                        member is inert_leader
+                        and member["starttime"]
+                        == persisted_leader_starttime
+                    )
+                return True
+            return (
+                member.get("uid") == entry["uid"]
+                and member.get("nonce") == entry["nonce"]
+                and member.get("pgid") == pgid
+                and member.get("sid") == pgid
+                and member.get("state_dir") == entry["state_dir"]
+                and member.get("weights_dir") == entry["weights_dir"]
+            )
+
+        if any(
+            not member_matches(member)
+            for member in members
+        ):
+            failures.append(
+                "%s process group %s contains a foreign or mismatched member"
+                % (label, pgid)
+            )
+            continue
+
+        record = dict(entry)
+        record.update(
+            {
+                "pid": pgid,
+                "pgid": pgid,
+                "starttime": leader_starttime,
+            }
+        )
+        try:
+            matches, reason, _ = process_matches(record)
+        except Exception as exc:
+            matches, reason = False, "identity-check-failed: %s" % exc
+        if not matches:
+            failures.append(
+                "%s process group %s is not safely attributable (%s)"
+                % (label, pgid, reason)
+            )
+            continue
+        preflights.append(
+            {
+                "entry": entry,
+                "record": record,
+                "live": True,
+                "observed_group": next_observed,
+            }
+        )
+    return preflights, failures
+
+
+def _preflight_unpublished_processes(manifest, *, group_alive):
+    """Prove every retained direct-created PGID absent without mutation."""
+    failures = []
+    for entry in _retained_process_recovery(manifest):
         pid = entry.get("pgid", entry.get("pid"))
         try:
             alive = group_alive(int(pid))
@@ -162,11 +527,49 @@ def _reconcile_unpublished_processes(
                 "usage accounting metadata" % pid
             )
         if failure:
-            retained_entry = dict(entry)
-            retained_entry["error"] = failure
-            remaining.append(retained_entry)
             failures.append(failure)
-            continue
+    return failures
+
+
+def _reconcile_unpublished_processes(
+    manifest,
+    *,
+    group_alive,
+    merge_usage,
+    save_manifest,
+):
+    """Merge an unpublished child only after its direct-created PGID is absent."""
+    retained = list(_retained_process_recovery(manifest))
+    if not retained:
+        return manifest
+    plan = manifest["plan"]
+    canonical_usage = os.path.join(
+        plan["model"]["path"],
+        ".coli_usage",
+    )
+    preflight_failures = _preflight_unpublished_processes(
+        manifest,
+        group_alive=group_alive,
+    )
+    if preflight_failures:
+        recovery = manifest.setdefault("recovery", {})
+        for entry in retained:
+            entry["error"] = (
+                "retained process recovery did not pass global preflight"
+            )
+        recovery["retained_processes"] = retained
+        recovery["state"] = "attention-required"
+        manifest["state"] = "error"
+        save_manifest(manifest)
+        raise RamdiskError(
+            "unpublished managed-child recovery is incomplete: "
+            + "; ".join(preflight_failures)
+        )
+    failures = []
+    remaining = []
+    released = []
+    for entry in retained:
+        pid = entry.get("pgid", entry.get("pid"))
         try:
             merge_usage(
                 entry,
@@ -514,6 +917,39 @@ def _rollback_preparation_mounts(
     return cleanup_errors, retained, released
 
 
+def _strongest_prepare_recovery_manifest(current, durable):
+    """Union recovery records without downgrading exact mount authority."""
+    recovery = copy.deepcopy(current)
+    ownership_rank = {"pending": 0, "identified": 1, "managed": 2}
+    selected = {}
+    order = []
+    for source_index, source in enumerate((durable or {}, current or {})):
+        for record in source.get("mounts", []):
+            key = (
+                record.get("operation_id"),
+                record.get("path"),
+            )
+            if key not in selected:
+                if (
+                    source_index == 1
+                    and record.get("ownership") == "pending"
+                ):
+                    # A pending record that never reached a successful save is
+                    # current-only evidence from before helper invocation and
+                    # therefore is not a recovery authority.
+                    continue
+                order.append(key)
+                selected[key] = copy.deepcopy(record)
+                continue
+            existing = selected[key]
+            if ownership_rank.get(record.get("ownership"), -1) >= (
+                ownership_rank.get(existing.get("ownership"), -1)
+            ):
+                selected[key] = copy.deepcopy(record)
+    recovery["mounts"] = [selected[key] for key in order]
+    return recovery
+
+
 def prepare(
     args,
     progress=None,
@@ -728,33 +1164,54 @@ def prepare(
         persist_manifest()
         return manifest
     except BaseException as exc:
-        # Rollback authority comes only from a manifest write that returned
-        # successfully. An in-memory identity promotion whose write failed
-        # must never authorize a pathname unmount during error handling.
-        recovery_manifest = copy.deepcopy(durable_manifest)
+        # Keep the strongest exact observation even when its directory fsync
+        # failed, while retaining any durable-only pending operation that an
+        # ambiguous removal may still leave recoverable.
+        recovery_manifest = _strongest_prepare_recovery_manifest(
+            manifest,
+            durable_manifest,
+        )
         recovery_manifest["state"] = "error"
         recovery_manifest["error"] = str(exc)
         cleanup_errors = []
+        rollback_authority_persisted = False
         try:
             save_manifest(recovery_manifest)
+            rollback_authority_persisted = True
         except BaseException as save_exc:
             cleanup_errors.append(
                 "could not persist preparation error: %s" % save_exc
             )
-        (
-            mount_cleanup_errors,
-            retained_mounts,
-            released_mounts,
-        ) = _rollback_preparation_mounts(
-            recovery_manifest,
-            mount_at=mount_at,
-            mount_table=mount_table,
-            path_is_below=path_is_below,
-            busy_mount_references=busy_mount_references,
-            umount_path=umount_path,
-            validate_mount=validate_mount,
-        )
-        cleanup_errors.extend(mount_cleanup_errors)
+        if rollback_authority_persisted:
+            (
+                mount_cleanup_errors,
+                retained_mounts,
+                released_mounts,
+            ) = _rollback_preparation_mounts(
+                recovery_manifest,
+                mount_at=mount_at,
+                mount_table=mount_table,
+                path_is_below=path_is_below,
+                busy_mount_references=busy_mount_references,
+                umount_path=umount_path,
+                validate_mount=validate_mount,
+            )
+            cleanup_errors.extend(mount_cleanup_errors)
+        else:
+            retained_mounts = {
+                record["path"]
+                for record in recovery_manifest.get("mounts", [])
+                if isinstance(record.get("path"), str)
+            }
+            released_mounts = set()
+            for record in recovery_manifest.get("mounts", []):
+                record["cleanup"] = {
+                    "state": "retained",
+                    "error": (
+                        "rollback withheld because exact recovery authority "
+                        "was not proven durable"
+                    ),
+                }
         recovery_manifest["recovery"] = {
             "operation": "prepare",
             "state": (
@@ -979,11 +1436,18 @@ def _rollback_launched_children(
     return cleanup_failures, surviving_groups
 
 
-def _construct_retained_popen(popen_factory, *args, **kwargs):
+def _construct_retained_popen(
+    popen_factory,
+    attempt_context,
+    *args,
+    **kwargs,
+):
     """Construct Popen while retaining a real partially initialized attempt.
 
     Normal callable test doubles remain opaque: if they raise, no object exists
     whose child-creation fields can be inspected, so their outcome is unknown.
+    A real attempt is registered before ``__init__`` can create a child, making
+    its exact handle available to rollback even if construction is interrupted.
     """
     if not (
         isinstance(popen_factory, type)
@@ -999,11 +1463,36 @@ def _construct_retained_popen(popen_factory, *args, **kwargs):
     except BaseException as exc:
         return None, exc, False
 
+    attempt_context["popen_attempt"] = attempt
     try:
         popen_factory.__init__(attempt, *args, **kwargs)
     except BaseException as exc:
         return attempt, exc, True
     return attempt, None, True
+
+
+def _launch_identity_matches(
+    identity,
+    *,
+    pid,
+    uid,
+    nonce,
+    state_dir,
+    weights_dir,
+):
+    """Require complete observed provenance before publishing a launch."""
+    return (
+        isinstance(identity, dict)
+        and identity.get("pid") == pid
+        and identity.get("uid") == uid
+        and identity.get("inert") is False
+        and _positive_int(identity.get("starttime"))
+        and identity.get("nonce") == nonce
+        and identity.get("pgid") == pid
+        and identity.get("sid") == pid
+        and identity.get("state_dir") == state_dir
+        and identity.get("weights_dir") == weights_dir
+    )
 
 
 def start(
@@ -1021,12 +1510,14 @@ def start(
     managed_child_liveness,
     save_manifest,
     merge_usage,
+    bind_usage_transaction,
     persisted_base_port,
     fresh_user_binary,
     admit_concurrent_runtimes,
     state_root,
     ensure_private_dir,
     assert_durable_state_dir,
+    usage_journal_transaction_id,
     recover_delta,
     usage_read,
     usage_write,
@@ -1037,6 +1528,9 @@ def start(
     node_core_count,
     normalized_runtime_knobs,
     apply_managed_accelerator_environment=None,
+    invoking_uid,
+    process_start_boundary,
+    current_process_identity,
     proc_identity,
     wait_managed_ready,
     track_managed_child,
@@ -1050,6 +1544,13 @@ def start(
         apply_managed_accelerator_environment = (
             _apply_managed_accelerator_environment
         )
+    launch_uid = invoking_uid()
+    if (
+        not isinstance(launch_uid, int)
+        or isinstance(launch_uid, bool)
+        or launch_uid < 0
+    ):
+        raise RamdiskError("managed launch has an invalid invoking UID")
     manifest = load_manifest(required=True)
     if _pending_launch_recovery(manifest):
         raise _pending_launch_recovery_error("start")
@@ -1082,6 +1583,7 @@ def start(
     canonical_usage = os.path.join(model, ".coli_usage")
     foreign = []
     recovered = False
+    recovery_records = []
     for record in manifest.get("processes", []):
         _raise_if_cancelled(cancel_event)
         try:
@@ -1119,21 +1621,7 @@ def start(
                     )
                 )
                 continue
-            if not record.get("usage_merged_at"):
-                record.setdefault(
-                    "usage_merge_id",
-                    secrets.token_hex(16),
-                )
-                save_manifest(manifest)
-                merge_usage(
-                    record,
-                    canonical_usage,
-                    plan=plan,
-                )
-                record["usage_merged_at"] = _utc_now()
-                record.pop("usage_merge_error", None)
-                recovered = True
-                save_manifest(manifest)
+            recovery_records.append((record, "stopped"))
             continue
         if matches:
             raise RamdiskError(
@@ -1141,24 +1629,7 @@ def start(
                 % record.get("port")
             )
         if reason == "not-running" and child_alive is not True:
-            # Crash recovery must merge post-baseline counts before the stable
-            # state directory is seeded for a replacement process.
-            record.setdefault(
-                "usage_merge_id",
-                secrets.token_hex(16),
-            )
-            save_manifest(manifest)
-            merge_usage(
-                record,
-                canonical_usage,
-                plan=plan,
-            )
-            record["usage_merged_at"] = _utc_now()
-            record["stopped_at"] = _utc_now()
-            record["crash_recovered_at"] = _utc_now()
-            record.pop("usage_merge_error", None)
-            recovered = True
-            save_manifest(manifest)
+            recovery_records.append((record, "crashed"))
         else:
             foreign.append(
                 "PID %s (%s)"
@@ -1188,6 +1659,67 @@ def start(
                 % (refusal, save_exc)
             ) from refusal
         raise refusal
+
+    fingerprint_dir = manifest["model_fingerprint"].split(
+        ":",
+        1,
+    )[-1]
+    seed_state_dirs = []
+    for mount in manifest["mounts"]:
+        _raise_if_cancelled(cancel_event)
+        node = mount.get("node")
+        label = "interleaved" if node is None else "node-%d" % node
+        state_dir = os.path.join(
+            state_root(),
+            "engines",
+            fingerprint_dir,
+            label,
+        )
+        ensure_private_dir(state_dir)
+        assert_durable_state_dir(state_dir, plan=plan)
+        seed_state_dirs.append(state_dir)
+    expected_seed_journals, reserved_usage_ids = (
+        _preflight_seed_usage_journals(
+            manifest,
+            seed_state_dirs,
+            plan=plan,
+            usage_journal_transaction_id=usage_journal_transaction_id,
+        )
+    )
+    recovery_state_keys = {
+        _state_dir_authority_key(record["state_dir"])
+        for record, _ in recovery_records
+    }
+    orphan_reserved_ids = {
+        merge_id
+        for state_key, merge_id in expected_seed_journals.items()
+        if merge_id is not None and state_key not in recovery_state_keys
+    }
+    if recovery_records:
+        reserved_usage_ids = _bind_recovery_usage_transactions(
+            manifest,
+            [record for record, _ in recovery_records],
+            plan=plan,
+            bind_usage_transaction=bind_usage_transaction,
+            reserved_ids=orphan_reserved_ids,
+        )
+        # Every adopted or minted authority becomes durable before the first
+        # canonical replay, so a crash cannot later mint a second transaction.
+        save_manifest(manifest)
+    for record, recovery_kind in recovery_records:
+        merge_usage(
+            record,
+            canonical_usage,
+            plan=plan,
+        )
+        if not record.get("usage_merged_at"):
+            record["usage_merged_at"] = _utc_now()
+        if recovery_kind == "crashed":
+            record["stopped_at"] = _utc_now()
+            record["crash_recovered_at"] = _utc_now()
+        record.pop("usage_merge_error", None)
+        recovered = True
+        save_manifest(manifest)
     if recovered:
         save_manifest(manifest)
 
@@ -1261,10 +1793,6 @@ def start(
     managed_ctx = int(runtime.get("ctx", 4096))
     managed_slots = int(runtime.get("kv_slots", 1))
     managed_cap = int(runtime.get("cache_cap", 8))
-    fingerprint_dir = manifest["model_fingerprint"].split(
-        ":",
-        1,
-    )[-1]
     try:
         startup_timeout = float(
             os.environ.get(
@@ -1288,35 +1816,55 @@ def start(
     # seed before creating any per-engine copy or spawning the first child.
     # A later replica's journal therefore cannot introduce an incompatible
     # identified header after an earlier replica has already launched.
-    seed_state_dirs = []
-    for mount in manifest["mounts"]:
+    for state_dir in seed_state_dirs:
         _raise_if_cancelled(cancel_event)
-        node = mount.get("node")
-        label = (
-            "interleaved"
-            if node is None
-            else "node-%d" % node
-        )
-        state_dir = os.path.join(
-            state_root(),
-            "engines",
-            fingerprint_dir,
-            label,
-        )
-        ensure_private_dir(state_dir)
-        assert_durable_state_dir(state_dir, plan=plan)
+        state_key = _state_dir_authority_key(state_dir)
+        if state_key in recovery_state_keys:
+            continue
         recover_delta(
             state_dir,
             canonical_usage,
             plan=plan,
+            expected_merge_id=expected_seed_journals[state_key],
         )
-        seed_state_dirs.append(state_dir)
-    canonical_baseline = usage_read(canonical_usage)
+    canonical_baseline = usage_read(canonical_usage, plan=plan)
     validate_usage_for_plan(
         canonical_baseline,
         plan,
         source="canonical usage history %s" % canonical_usage,
     )
+    launcher_identity = current_process_identity()
+    launcher_pid = (
+        launcher_identity.get("pid")
+        if isinstance(launcher_identity, dict)
+        else None
+    )
+    launcher_starttime = (
+        launcher_identity.get("starttime")
+        if isinstance(launcher_identity, dict)
+        else None
+    )
+    launcher_identity_uid = (
+        launcher_identity.get("uid")
+        if isinstance(launcher_identity, dict)
+        else None
+    )
+    launcher_cmdline = (
+        launcher_identity.get("cmdline")
+        if isinstance(launcher_identity, dict)
+        else None
+    )
+    if (
+        not _positive_int(launcher_pid)
+        or launcher_identity_uid != launch_uid
+        or not _positive_int(launcher_starttime)
+        or not isinstance(launcher_cmdline, list)
+        or not launcher_cmdline
+        or any(not isinstance(item, str) or not item for item in launcher_cmdline)
+    ):
+        raise RamdiskError(
+            "managed launch cannot establish its exact launcher identity"
+        )
     # Admit the complete replica set from one shared cgroup snapshot before
     # spawning the first child.
     admit_concurrent_runtimes(
@@ -1341,18 +1889,58 @@ def start(
             usage_write(
                 os.path.join(state_dir, ".coli_usage"),
                 baseline,
+                plan=plan,
             )
             port = base_port + (
                 0 if node is None else int(node)
             )
+            command = [
+                cli_path,
+                "serve",
+                "--model",
+                model,
+                "--port",
+                str(port),
+                "--cap",
+                str(managed_cap),
+                "--ctx",
+                str(managed_ctx),
+                "--kv-slots",
+                str(managed_slots),
+            ]
+            if not os.access(cli_path, os.X_OK):
+                command.insert(0, sys.executable)
+            if node is not None:
+                command = [
+                    managed_numactl,
+                    "--physcpubind=%s"
+                    % engine_cpu_list(plan, node=node),
+                    "--membind=%d" % node,
+                ] + command
             launch_nonce = secrets.token_hex(24)
-            usage_merge_id = secrets.token_hex(16)
+            usage_merge_id = _mint_usage_transaction_id(reserved_usage_ids)
+            launch_not_before = process_start_boundary()
+            if (
+                not isinstance(launch_not_before, int)
+                or isinstance(launch_not_before, bool)
+                or launch_not_before < 0
+            ):
+                raise RamdiskError(
+                    "managed launch has an invalid process-start boundary"
+                )
             pending_entry = {
                 "operation_id": "start:%s" % usage_merge_id,
                 "nonce": launch_nonce,
+                "uid": launch_uid,
                 "port": port,
                 "node": node,
                 "state_dir": state_dir,
+                "weights_dir": mount["path"],
+                "launch_not_before": launch_not_before,
+                "launcher_pid": launcher_pid,
+                "launcher_starttime": launcher_starttime,
+                "launcher_cmdline": list(launcher_cmdline),
+                "expected_command": list(command),
                 "usage_baseline": baseline,
                 "usage_merge_id": usage_merge_id,
             }
@@ -1368,8 +1956,9 @@ def start(
             launch_contexts.append(context)
             manifest["pending_launches"].append(pending_entry)
             # A hard manager crash after this durable write but before exact
-            # process publication leaves an outcome-unknown launch that every
-            # mutating action must retain and surface, never silently ignore.
+            # process publication leaves an outcome-unknown launch. Stop is
+            # the sole supported reconciler; every other mutation must retain
+            # and surface it, never silently ignore it.
             save_manifest(manifest)
             environment = os.environ.copy()
             environment.update(
@@ -1421,6 +2010,7 @@ def start(
                 "COLI_CUDA",
                 "COLI_NO_OMP_TUNE",
                 "COLI_OMP_TUNED",
+                "COLI_USAGE_DECAY",
                 "DIRECT",
                 "PIPE",
                 "PIPE_WORKERS",
@@ -1436,6 +2026,9 @@ def start(
             )
             for key, value in applied_runtime_knobs.items():
                 environment[key] = str(value)
+            # Managed accounting is reconciled against an exact launch
+            # baseline, so ambient decay may not lower cumulative counters.
+            environment["COLI_USAGE_DECAY"] = "1.0"
             applied_accelerator = apply_managed_accelerator_environment(
                 environment,
                 plan,
@@ -1445,29 +2038,6 @@ def start(
                 if applied_accelerator.get("COLI_RAMMAP") == "1"
                 else 0
             )
-            command = [
-                cli_path,
-                "serve",
-                "--model",
-                model,
-                "--port",
-                str(port),
-                "--cap",
-                str(managed_cap),
-                "--ctx",
-                str(managed_ctx),
-                "--kv-slots",
-                str(managed_slots),
-            ]
-            if not os.access(cli_path, os.X_OK):
-                command.insert(0, sys.executable)
-            if node is not None:
-                command = [
-                    managed_numactl,
-                    "--physcpubind=%s"
-                    % engine_cpu_list(plan, node=node),
-                    "--membind=%d" % node,
-                ] + command
             log_path = os.path.join(
                 state_dir,
                 "engine.log",
@@ -1486,6 +2056,7 @@ def start(
                     attempt_inspected,
                 ) = _construct_retained_popen(
                     subprocess.Popen,
+                    context,
                     command,
                     env=environment,
                     stdin=child_stdin,
@@ -1547,33 +2118,51 @@ def start(
                 _raise_if_cancelled(cancel_event)
                 identity = proc_identity(process.pid)
                 if (
-                    identity
-                    and identity.get("pgid") == process.pid
-                    and identity.get("nonce") == launch_nonce
+                    isinstance(identity, dict)
+                    and identity.get("pid") == process.pid
+                    and _positive_int(identity.get("starttime"))
+                ):
+                    context["observed_leader_starttime"] = identity[
+                        "starttime"
+                    ]
+                if _launch_identity_matches(
+                    identity,
+                    pid=process.pid,
+                    uid=launch_uid,
+                    nonce=launch_nonce,
+                    state_dir=state_dir,
+                    weights_dir=mount["path"],
                 ):
                     break
                 time.sleep(0.01)
             if (
                 process.poll() is not None
-                or not identity
-                or identity.get("pgid") != process.pid
-                or identity.get("nonce") != launch_nonce
+                or not _launch_identity_matches(
+                    identity,
+                    pid=process.pid,
+                    uid=launch_uid,
+                    nonce=launch_nonce,
+                    state_dir=state_dir,
+                    weights_dir=mount["path"],
+                )
             ):
+                context["promotion_identity_failed"] = True
                 raise RamdiskError(
-                    "managed engine exited during launch; see %s"
+                    "managed engine exited or failed exact identity "
+                    "attribution during launch; see %s"
                     % log_path
                 )
             record = {
-                "pid": process.pid,
+                "pid": identity["pid"],
                 "pgid": identity["pgid"],
                 "uid": identity["uid"],
                 "starttime": identity["starttime"],
-                "nonce": launch_nonce,
+                "nonce": identity["nonce"],
                 "port": port,
                 "node": node,
                 "command": command,
-                "state_dir": state_dir,
-                "weights_dir": mount["path"],
+                "state_dir": identity["state_dir"],
+                "weights_dir": identity["weights_dir"],
                 "usage_baseline": baseline,
                 "usage_merge_id": usage_merge_id,
                 "started_at": _utc_now(),
@@ -1594,16 +2183,10 @@ def start(
                 != pending_entry["operation_id"]
             ]
             manifest["state"] = "starting"
-            try:
-                save_manifest(manifest)
-            except BaseException:
-                manifest["processes"] = list(records)
-                manifest["ports"] = [
-                    item["port"]
-                    for item in records
-                ]
-                manifest["pending_launches"].append(pending_entry)
-                raise
+            # A raised save has an ambiguous commit outcome: os.replace may
+            # already have published this exact record. Keep the candidate in
+            # memory so rollback never downgrades it to PID-only authority.
+            save_manifest(manifest)
             records.append(record)
             context["record"] = record
 
@@ -1627,14 +2210,30 @@ def start(
         cleanup_failures = []
         surviving_groups = set()
 
-        # Close the two line-level publication windows before rollback. A
-        # handle present in ``spawned`` proves Popen returned even if control
-        # flow landed before ``spawn_outcome`` was updated. Likewise, an exact
-        # record still present in the candidate manifest is the published
-        # authority even if interruption landed before the local records list
-        # and context were updated. Normalizing both views prevents one
-        # state_dir from being serialized as pending+retained or
-        # published+retained.
+        # Close the line-level publication windows before rollback. A real
+        # Popen attempt is registered in its context before __init__ can create
+        # a child, so recover its exact handle even if control never returned
+        # far enough to append it to ``spawned``. A handle already present in
+        # ``spawned`` proves Popen returned even if control landed before
+        # ``spawn_outcome`` was updated. Likewise, an exact record still in the
+        # candidate manifest is the published authority even if interruption
+        # landed before the local records list and context were updated.
+        spawned_ids = {id(process) for process in spawned}
+        for context in launch_contexts:
+            attempt = context.get("popen_attempt")
+            attempt_pid = getattr(attempt, "pid", None)
+            exact_attempt = (
+                isinstance(attempt_pid, int)
+                and not isinstance(attempt_pid, bool)
+                and attempt_pid > 0
+            )
+            if exact_attempt and id(attempt) not in spawned_ids:
+                # Popen assigns pid immediately before _child_created. Restore
+                # that invariant when an asynchronous exception landed between
+                # the two assignments or anywhere before caller registration.
+                attempt._child_created = True
+                spawned.append(attempt)
+                spawned_ids.add(id(attempt))
         for context in launch_contexts[:len(spawned)]:
             context["spawn_outcome"] = "created"
         published_by_launch = {
@@ -1692,6 +2291,27 @@ def start(
                 "creation outcome is unknown and pending recovery was retained"
                 % context["state_dir"]
             )
+        mismatched_live_contexts = [
+            context
+            for context in launch_contexts
+            if (
+                context.get("promotion_identity_failed")
+                and context.get("rollback_process_alive")
+                and context.get("record") is None
+            )
+        ]
+        for context in mismatched_live_contexts:
+            pending = context["pending_entry"]
+            leader_starttime = context.get("observed_leader_starttime")
+            pending["observed_group"] = {
+                "pgid": context["rollback_pid"],
+                "uid": pending["uid"],
+                "leader_starttime": (
+                    leader_starttime
+                    if _positive_int(leader_starttime)
+                    else None
+                ),
+            }
         retained_processes = [
             {
                 "pid": context.get("rollback_pid"),
@@ -1706,14 +2326,16 @@ def start(
             if (
                 context.get("rollback_process_alive")
                 and context.get("record") is None
+                and not context.get("promotion_identity_failed")
             )
         ]
         # Cooperative rollback has now classified every pending launch as
-        # never-created, proven absent, or retained with an exact direct PGID.
+        # never-created, proven absent, still discoverable under its pending
+        # nonce plus observed PGID, or retained with an exact direct PGID.
         # Publish that transition before any usage transaction can be saved.
         manifest["pending_launches"] = [
             context["pending_entry"]
-            for context in outcome_unknown_contexts
+            for context in outcome_unknown_contexts + mismatched_live_contexts
         ]
         if retained_processes:
             manifest["recovery"] = {
@@ -1742,10 +2364,10 @@ def start(
                 and record["pgid"] in surviving_groups
             ):
                 continue
-            record.setdefault(
-                "usage_merge_id",
-                secrets.token_hex(16),
-            )
+            if record.get("usage_merge_id") is None:
+                record["usage_merge_id"] = _mint_usage_transaction_id(
+                    reserved_usage_ids
+                )
             transaction_persisted = bool(
                 context.get("record")
             ) and rollback_save(
@@ -1814,33 +2436,52 @@ def stop(
     args=None,
     *,
     load_manifest,
+    discover_managed_launches=None,
     process_matches,
+    process_group_members=None,
     group_alive,
     managed_child_liveness,
     save_manifest,
     terminate_verified_group,
     merge_usage,
+    bind_usage_transaction,
 ):
     manifest = load_manifest(required=True)
-    if _pending_launch_recovery(manifest):
-        refusal = _pending_launch_recovery_error("stop")
+    pending_preflights, pending_refusals = _preflight_pending_launches(
+        manifest,
+        discover_managed_launches=discover_managed_launches,
+        process_matches=process_matches,
+        process_group_members=process_group_members,
+        group_alive=group_alive,
+    )
+    retained_refusals = _preflight_unpublished_processes(
+        manifest,
+        group_alive=group_alive,
+    )
+    recovery_refusals = pending_refusals + retained_refusals
+    if recovery_refusals:
+        refusal = RamdiskError(
+            "refusing unresolved managed-process recovery: "
+            + "; ".join(recovery_refusals)
+        )
         manifest["state"] = "error"
-        manifest.setdefault("cleanup_errors", []).append(str(refusal))
+        cleanup_errors = manifest.setdefault("cleanup_errors", [])
+        cleanup_errors[:] = [
+            error
+            for error in cleanup_errors
+            if not str(error).startswith(_PENDING_RECOVERY_ERROR_PREFIX)
+        ]
+        cleanup_errors.append(
+            _PENDING_RECOVERY_ERROR_PREFIX + "; ".join(recovery_refusals)
+        )
         try:
             save_manifest(manifest)
         except BaseException as save_exc:
             raise RamdiskError(
-                "%s; could not persist pending-launch recovery: %s"
+                "%s; could not persist managed-process recovery refusal: %s"
                 % (refusal, save_exc)
             ) from refusal
         raise refusal
-    if _retained_process_recovery(manifest):
-        manifest = _reconcile_unpublished_processes(
-            manifest,
-            group_alive=group_alive,
-            merge_usage=merge_usage,
-            save_manifest=save_manifest,
-        )
     non_managed_mounts = [
         record
         for record in manifest.get("mounts", [])
@@ -1939,16 +2580,161 @@ def stop(
                 % (refusal, save_exc)
             ) from refusal
         raise refusal
-    for record, _, _, _ in identities:
-        if not record.get("usage_merged_at"):
-            record.setdefault(
-                "usage_merge_id",
-                secrets.token_hex(16),
-            )
-    # Persist transaction ids before signaling. Recovery can then recognize a
-    # marker if the manager dies between usage replacement and manifest save.
-    save_manifest(manifest)
+    if identities:
+        _bind_recovery_usage_transactions(
+            manifest,
+            [record for record, _, _, _ in identities],
+            plan=plan,
+            bind_usage_transaction=bind_usage_transaction,
+        )
+        # Resolve every ordinary process authority together and make the whole
+        # set durable before retained recovery, replay, or the first signal.
+        save_manifest(manifest)
+    if _retained_process_recovery(manifest):
+        manifest = _reconcile_unpublished_processes(
+            manifest,
+            group_alive=group_alive,
+            merge_usage=merge_usage,
+            save_manifest=save_manifest,
+        )
+    observed_changed = False
+    for preflight in pending_preflights:
+        observed_group = preflight.get("observed_group")
+        entry = preflight["entry"]
+        if preflight.get("live") and entry.get("observed_group") != observed_group:
+            entry["observed_group"] = observed_group
+            observed_changed = True
+    if observed_changed:
+        try:
+            # The only signalable group identity must be durable before the
+            # first signal. A crash after this point can therefore prove that
+            # exact group's absence before accounting is merged.
+            save_manifest(manifest)
+        except BaseException as save_exc:
+            raise RamdiskError(
+                "could not persist pending launch process-group identity: %s"
+                % save_exc
+            ) from save_exc
     failures = []
+    for preflight in pending_preflights:
+        entry = preflight["entry"]
+        label = "pending launch on port %s (node %s)" % (
+            entry.get("port", "unknown"),
+            entry.get("node") if entry.get("node") is not None else "shared",
+        )
+        observed_group = entry.get("observed_group")
+        termination_failure = None
+        if preflight.get("live"):
+            try:
+                termination_failure = terminate_verified_group(
+                    preflight["record"]
+                )
+            except Exception as termination_exc:
+                termination_failure = (
+                    "pending process-group termination revalidation failed: %s"
+                    % termination_exc
+                )
+
+        try:
+            remaining_candidates = discover_managed_launches(
+                nonce=entry["nonce"],
+                uid=entry["uid"],
+                state_dir=entry["state_dir"],
+                weights_dir=entry["weights_dir"],
+                not_before_starttime=entry["launch_not_before"],
+                launcher_pid=entry["launcher_pid"],
+                launcher_starttime=entry["launcher_starttime"],
+                launcher_cmdline=entry["launcher_cmdline"],
+                expected_command=entry["expected_command"],
+            )
+        except Exception as discovery_exc:
+            remaining_candidates = None
+            recovery_failure = (
+                "%s post-termination discovery failed: %s"
+                % (label, discovery_exc)
+            )
+        else:
+            recovery_failure = None
+        if remaining_candidates is not None and not isinstance(
+            remaining_candidates,
+            list,
+        ):
+            recovery_failure = (
+                "%s post-termination discovery returned an invalid result"
+                % label
+            )
+        elif remaining_candidates:
+            recovery_failure = (
+                "%s still has nonce-attributable processes after recovery"
+                % label
+            )
+        if observed_group is not None:
+            try:
+                observed_group_alive = group_alive(observed_group["pgid"])
+            except Exception as group_exc:
+                observed_group_alive = None
+                recovery_failure = (
+                    "%s observed group absence check failed: %s"
+                    % (label, group_exc)
+                )
+            if observed_group_alive is not False:
+                recovery_failure = recovery_failure or (
+                    "%s observed process group %s remains live or its "
+                    "absence is unproven"
+                    % (label, observed_group["pgid"])
+                )
+        if recovery_failure:
+            if termination_failure:
+                recovery_failure = "%s; %s" % (
+                    termination_failure,
+                    recovery_failure,
+                )
+            entry["recovery_error"] = recovery_failure
+            failures.append(recovery_failure)
+            continue
+
+        # Positive absence supersedes a benign termination race. The strict
+        # second process-table scan plus any persisted PGID absence is the
+        # authority for whether accounting may now be merged.
+        entry.pop("recovery_error", None)
+        try:
+            # Always replay the stable transaction. The canonical merge marker
+            # is authoritative; a timestamp alone must never suppress a
+            # missing accounting write after a corrupt or partial snapshot.
+            merge_usage(
+                entry,
+                canonical_usage,
+                plan=plan,
+            )
+            if not entry.get("usage_merged_at"):
+                entry["usage_merged_at"] = _utc_now()
+            save_manifest(manifest)
+        except Exception as merge_exc:
+            recovery_failure = (
+                "%s usage delta was not durably reconciled: %s"
+                % (label, merge_exc)
+            )
+            entry["recovery_error"] = recovery_failure
+            failures.append(recovery_failure)
+            continue
+
+        previous_pending = list(manifest.get("pending_launches", []))
+        manifest["pending_launches"] = [
+            pending
+            for pending in previous_pending
+            if pending.get("operation_id") != entry.get("operation_id")
+        ]
+        try:
+            save_manifest(manifest)
+        except Exception as remove_exc:
+            manifest["pending_launches"] = previous_pending
+            recovery_failure = (
+                "%s was reconciled but pending authority could not be "
+                "removed: %s" % (label, remove_exc)
+            )
+            entry["recovery_error"] = recovery_failure
+            failures.append(recovery_failure)
+
     for record, matches, reason, actual in identities:
         if matches:
             pgid = int(record.get("pgid", record["pid"]))
@@ -1994,40 +2780,37 @@ def stop(
                 failures.append(retained_failure)
                 continue
             record.pop("stop_error", None)
-        if record.get("usage_merged_at"):
-            # The applied transaction marker is authoritative. Older/error
-            # snapshots could retain a save failure in usage_merge_error after
-            # the exact merge had already completed; do not let that stale
-            # diagnostic make every later stop permanently fail.
+        try:
+            # Always replay the stable transaction.  The canonical merge-id
+            # marker is authoritative and makes this idempotent; a timestamp
+            # alone must never suppress a missing accounting write.
+            merge_usage(
+                record,
+                canonical_usage,
+                plan=plan,
+            )
+            if not record.get("usage_merged_at"):
+                record["usage_merged_at"] = _utc_now()
             record.pop("usage_merge_error", None)
+        except Exception as exc:
+            record["usage_merge_error"] = str(exc)
+            failures.append(
+                "PID %s usage delta was not merged: %s"
+                % (record.get("pid"), exc)
+            )
         else:
             try:
-                merge_usage(
-                    record,
-                    canonical_usage,
-                    plan=plan,
-                )
-                record["usage_merged_at"] = _utc_now()
-                record.pop("usage_merge_error", None)
+                # Every node is its own committed transaction. If this
+                # intermediate write fails, the final recovery write (or a
+                # fresh retry using the same stable transaction id) can
+                # publish the already-applied marker without reapplying it.
+                save_manifest(manifest)
             except Exception as exc:
-                record["usage_merge_error"] = str(exc)
                 failures.append(
-                    "PID %s usage delta was not merged: %s"
+                    "PID %s usage merge completed but its manifest marker "
+                    "could not be persisted: %s"
                     % (record.get("pid"), exc)
                 )
-            else:
-                try:
-                    # Every node is its own committed transaction. If this
-                    # intermediate write fails, the final recovery write (or a
-                    # fresh retry using the same stable transaction id) can
-                    # publish the already-applied marker without reapplying it.
-                    save_manifest(manifest)
-                except Exception as exc:
-                    failures.append(
-                        "PID %s usage merge completed but its manifest marker "
-                        "could not be persisted: %s"
-                        % (record.get("pid"), exc)
-                    )
         record.setdefault("stopped_at", _utc_now())
         record.pop("stop_error", None)
     planned_paths = {
@@ -2052,10 +2835,18 @@ def stop(
         )
         else "stopped"
     )
+    if isinstance(manifest.get("cleanup_errors"), list):
+        manifest["cleanup_errors"] = [
+            error
+            for error in manifest["cleanup_errors"]
+            if not str(error).startswith(_PENDING_RECOVERY_ERROR_PREFIX)
+        ]
+        if not manifest["cleanup_errors"]:
+            manifest.pop("cleanup_errors", None)
     save_manifest(manifest)
     if failures:
         raise RamdiskError(
-            "engines were signaled but cleanup is incomplete: "
+            "managed engine cleanup is incomplete: "
             + "; ".join(failures)
         )
     return manifest
@@ -2562,8 +3353,8 @@ def status(
             ],
             "errors": error_summary,
             "action": (
-                "Do not start or destroy this deployment; inspect the "
-                "outcome-unknown pending launch and reconcile it explicitly."
+                "Run `coli ramdisk stop` to discover, stop, and reconcile "
+                "the outcome-unknown pending launch."
                 if pending_launches
                 else "Run `coli ramdisk stop` after the retained process "
                 "group exits to reconcile its exact usage transaction."
@@ -2626,7 +3417,7 @@ def status(
                 "path": record["path"],
                 "node": record.get("node"),
                 "ownership": record.get("ownership", "managed"),
-                "mounted": bool(actual),
+                "mounted": None if mount_read_error is not None else bool(actual),
                 "verified": (
                     identity_verified
                     and options_verified

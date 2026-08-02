@@ -233,18 +233,17 @@ class ActionPolicy:
             for process in process_records
         )
         retained_cleanup_pending = present and retained_recovery
-        cleanup_pending = process_cleanup_pending or retained_cleanup_pending
-        stop_enabled = not outcome_unknown and (
+        cleanup_pending = (
+            process_cleanup_pending
+            or retained_cleanup_pending
+            or (present and outcome_unknown)
+        )
+        stop_enabled = (present and outcome_unknown) or (
             state in ("running", "starting")
             or (present and cleanup_pending)
         )
         if stop_enabled:
             stop_reason = ""
-        elif outcome_unknown:
-            stop_reason = (
-                "Stop is unavailable while a managed launch outcome is unknown; "
-                "inspect recovery.pending_launches and recover it explicitly."
-            )
         elif state == "error":
             stop_reason = (
                 "No managed engine cleanup is pending; use Destroy to recover "
@@ -262,7 +261,7 @@ class ActionPolicy:
         elif outcome_unknown:
             destroy_reason = (
                 "Destroy is unavailable while a managed launch outcome is unknown; "
-                "inspect recovery.pending_launches and recover it explicitly."
+                "use Stop to discover, terminate, and reconcile it first."
             )
         elif retained_cleanup_pending:
             destroy_reason = (
@@ -302,8 +301,8 @@ class ActionPolicy:
             base_port_reason = ""
         elif outcome_unknown:
             base_port_reason = (
-                "Recover the outcome-unknown managed launch explicitly before "
-                "changing the base port."
+                "Use Stop to reconcile the outcome-unknown managed launch "
+                "before changing the base port."
             )
         elif state == "error" and not cleanup_pending:
             base_port_reason = (

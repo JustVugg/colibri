@@ -90,12 +90,14 @@ def _members(_pgid):
             {
                 "pid": 4100,
                 "pgid": 4100,
+                "sid": 4100,
                 "uid": 1000,
                 "nonce": "managed-nonce",
             },
             {
                 "pid": 4101,
                 "pgid": 4100,
+                "sid": 4100,
                 "uid": 1000,
                 "nonce": "managed-nonce",
             },
@@ -105,6 +107,196 @@ def _members(_pgid):
 
 
 class RuntimeMonitorTest(unittest.TestCase):
+    def test_verify_records_samples_live_child_of_inert_leader(self):
+        record, manifest, _report, _plan, _hardware = _fixture()
+        record.update(
+            {
+                "state_dir": "/run/colibri/state",
+                "weights_dir": "/run/colibri/weights",
+            }
+        )
+        members = [
+            {
+                "pid": 4100,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "starttime": 12345,
+                "inert": True,
+                "nonce": None,
+                "state_dir": None,
+                "weights_dir": None,
+            },
+            {
+                "pid": 4101,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "inert": False,
+                "nonce": "managed-nonce",
+                "state_dir": "/run/colibri/state",
+                "weights_dir": "/run/colibri/weights",
+            },
+        ]
+        monitor = RuntimeMonitor(
+            process_matches=lambda _record: (
+                True,
+                "running-group",
+                {"members": members},
+            ),
+            process_group_members=lambda _pgid: (members, []),
+        )
+
+        verified, rejected = monitor._verify_records(manifest)
+
+        self.assertEqual(rejected, {})
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(verified[0]["pids"], {4101})
+
+    def test_verify_records_samples_live_members_beside_inert_nonleader(self):
+        record, manifest, _report, _plan, _hardware = _fixture()
+        record.update(
+            {
+                "state_dir": "/run/colibri/state",
+                "weights_dir": "/run/colibri/weights",
+            }
+        )
+        members = [
+            {
+                "pid": 4100,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "inert": False,
+                "nonce": "managed-nonce",
+                "state_dir": "/run/colibri/state",
+                "weights_dir": "/run/colibri/weights",
+            },
+            {
+                "pid": 4101,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "inert": True,
+                "nonce": None,
+                "state_dir": None,
+                "weights_dir": None,
+            },
+            {
+                "pid": 4102,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "inert": False,
+                "nonce": "managed-nonce",
+                "state_dir": "/run/colibri/state",
+                "weights_dir": "/run/colibri/weights",
+            },
+        ]
+        monitor = RuntimeMonitor(
+            process_matches=lambda _record: (
+                True,
+                "running",
+                {"members": members},
+            ),
+            process_group_members=lambda _pgid: (members, []),
+        )
+
+        verified, rejected = monitor._verify_records(manifest)
+
+        self.assertEqual(rejected, {})
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(verified[0]["pids"], {4100, 4102})
+
+    def test_verify_records_rejects_inert_member_outside_exact_group(self):
+        _record, manifest, _report, _plan, _hardware = _fixture()
+        exact_live = {
+            "pid": 4100,
+            "pgid": 4100,
+            "sid": 4100,
+            "uid": 1000,
+            "inert": False,
+            "nonce": "managed-nonce",
+        }
+        exact_inert = {
+            "pid": 4101,
+            "pgid": 4100,
+            "sid": 4100,
+            "uid": 1000,
+            "inert": True,
+            "nonce": None,
+        }
+        for field, foreign in (
+            ("pgid", 4200),
+            ("sid", 4200),
+            ("uid", 1001),
+        ):
+            with self.subTest(field=field):
+                inert = dict(exact_inert)
+                inert[field] = foreign
+                members = [exact_live, inert]
+                monitor = RuntimeMonitor(
+                    process_matches=lambda _record: (
+                        True,
+                        "running",
+                        {"members": members},
+                    ),
+                    process_group_members=lambda _pgid: (members, []),
+                )
+
+                verified, rejected = monitor._verify_records(manifest)
+
+                self.assertEqual(verified, [])
+                self.assertEqual(
+                    rejected,
+                    {4100: "managed process group identity mismatch"},
+                )
+
+    def test_verify_records_rejects_foreign_live_member_path(self):
+        record, manifest, _report, _plan, _hardware = _fixture()
+        record.update(
+            {
+                "state_dir": "/run/colibri/state",
+                "weights_dir": "/run/colibri/weights",
+            }
+        )
+        members = [
+            {
+                "pid": 4100,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "inert": False,
+                "nonce": "managed-nonce",
+                "state_dir": "/run/colibri/foreign",
+                "weights_dir": "/run/colibri/weights",
+            },
+            {
+                "pid": 4101,
+                "pgid": 4100,
+                "sid": 4100,
+                "uid": 1000,
+                "inert": True,
+                "nonce": None,
+            },
+        ]
+        monitor = RuntimeMonitor(
+            process_matches=lambda _record: (
+                True,
+                "running",
+                {"members": members},
+            ),
+            process_group_members=lambda _pgid: (members, []),
+        )
+
+        verified, rejected = monitor._verify_records(manifest)
+
+        self.assertEqual(verified, [])
+        self.assertEqual(
+            rejected,
+            {4100: "managed process group identity mismatch"},
+        )
+
     def test_import_and_construction_leave_http_dependencies_lazy(self):
         script = r"""
 import importlib.abc
@@ -1190,6 +1382,7 @@ assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
                     {
                         "pid": record["pid"],
                         "pgid": record["pgid"],
+                        "sid": record["pgid"],
                         "uid": record["uid"],
                         "nonce": record["nonce"],
                     }

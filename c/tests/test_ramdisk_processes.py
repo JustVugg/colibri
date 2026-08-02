@@ -12,7 +12,12 @@ from ramdisk_support import state as state_support
 
 
 class ManagedLaunchTest(unittest.TestCase):
-    def _exercise_launch_line_interrupt(self, source_fragment):
+    def _exercise_launch_line_interrupt(
+        self,
+        source_fragment,
+        *,
+        identity_mutation=None,
+    ):
         class FakeSocket:
             def bind(self, address):
                 pass
@@ -41,6 +46,7 @@ class ManagedLaunchTest(unittest.TestCase):
         }
         snapshots = []
         trace_hits = []
+        verified_records = []
 
         def trace_interrupt(frame, event, arg):
             if (
@@ -87,6 +93,21 @@ class ManagedLaunchTest(unittest.TestCase):
                 "processes": [],
                 "ports": [],
             }
+            identity.update(
+                {
+                    "inert": False,
+                    "sid": process.pid,
+                    "state_dir": os.path.join(
+                        expected_state_root,
+                        "engines",
+                        plan["model"]["fingerprint"].split(":", 1)[-1],
+                        "interleaved",
+                    ),
+                    "weights_dir": mount["path"],
+                }
+            )
+            if identity_mutation is not None:
+                identity = identity_mutation(dict(identity))
 
             def save(current):
                 snapshot = json.loads(json.dumps(current))
@@ -97,6 +118,22 @@ class ManagedLaunchTest(unittest.TestCase):
             saved_manifest_path = None
             saved_state_root = None
             saved_benchmarks_path = None
+            def terminate_verified(record):
+                verified_records.append(
+                    json.loads(json.dumps(record))
+                )
+                return "process group survived SIGKILL"
+
+            clock = iter((0.0, 0.0, 2.0))
+            monotonic_patch = (
+                mock.patch.object(
+                    lifecycle_support.time,
+                    "monotonic",
+                    side_effect=lambda: next(clock, 2.0),
+                )
+                if identity_mutation is not None
+                else contextlib.nullcontext()
+            )
             with mock.patch.dict(
                 os.environ, {"XDG_STATE_HOME": state}
             ), mock.patch.multiple(
@@ -116,7 +153,7 @@ class ManagedLaunchTest(unittest.TestCase):
                     return_value=(True, "running", identity)
                 ),
                 _terminate_verified_group=mock.Mock(
-                    return_value="process group survived SIGKILL"
+                    side_effect=terminate_verified
                 ),
                 _terminate_direct_child=mock.Mock(
                     return_value="direct child survived SIGKILL"
@@ -135,7 +172,7 @@ class ManagedLaunchTest(unittest.TestCase):
                 ramdisk.secrets,
                 "token_hex",
                 side_effect=lambda size: nonce if size == 24 else merge_id,
-            ):
+            ), monotonic_patch:
                 try:
                     sys.settrace(trace_interrupt)
                     ramdisk.start.__wrapped__(
@@ -165,7 +202,14 @@ class ManagedLaunchTest(unittest.TestCase):
             except ramdisk.RamdiskError as exc:
                 load_error = exc
 
-        return manifest, snapshots, trace_hits, caught, load_error
+        return (
+            manifest,
+            snapshots,
+            trace_hits,
+            caught,
+            load_error,
+            verified_records,
+        )
 
     def _launch_authorities(self, manifest):
         return [
@@ -182,6 +226,26 @@ class ManagedLaunchTest(unittest.TestCase):
             )
             for entry in entries
         ]
+
+    def _exact_launch_identity(self, identity, plan, node=None):
+        mount = next(
+            record
+            for record in plan["mounts"]
+            if record.get("node") == node
+        )
+        label = "interleaved" if node is None else "node-%d" % node
+        return dict(
+            identity,
+            inert=False,
+            sid=identity["pid"],
+            state_dir=os.path.join(
+                ramdisk._state_root(),
+                "engines",
+                plan["model"]["fingerprint"].split(":", 1)[-1],
+                label,
+            ),
+            weights_dir=mount["path"],
+        )
 
     def _exercise_prepublication_popen_outcome(
         self,
@@ -300,6 +364,72 @@ class ManagedLaunchTest(unittest.TestCase):
             group_alive,
             caught,
         )
+
+    def _exercise_exact_popen_line_interrupt(
+        self,
+        *,
+        target_code,
+        source_fragment,
+        constructor_error=False,
+    ):
+        real_popen = subprocess.Popen
+        attempts = []
+        trace_hits = []
+
+        class ProbePopen(real_popen):
+            def __init__(self, _command, **kwargs):
+                super().__init__(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(30)",
+                    ],
+                    **kwargs,
+                )
+                attempts.append(self)
+                if constructor_error:
+                    raise OSError("post-init constructor failure")
+
+        def reap_attempts():
+            for process in attempts:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=2)
+
+        self.addCleanup(reap_attempts)
+
+        def terminate_direct_child(process):
+            self.assertIs(process, attempts[-1])
+            process.kill()
+            return None
+
+        def group_alive(pgid):
+            self.assertEqual(pgid, attempts[-1].pid)
+            self.assertIsNotNone(attempts[-1].poll())
+            return False
+
+        def trace_interrupt(frame, event, arg):
+            if (
+                event == "line"
+                and frame.f_code is target_code
+                and source_fragment
+                in linecache.getline(frame.f_code.co_filename, frame.f_lineno)
+            ):
+                trace_hits.append(frame.f_lineno)
+                sys.settrace(None)
+                raise KeyboardInterrupt("exact Popen handle boundary")
+            return trace_interrupt
+
+        try:
+            sys.settrace(trace_interrupt)
+            result = self._exercise_prepublication_popen_outcome(
+                popen_factory=ProbePopen,
+                terminate_direct_child_effect=terminate_direct_child,
+                group_alive_effect=group_alive,
+            )
+        finally:
+            sys.settrace(None)
+        return result, attempts, trace_hits
 
     def test_launch_rollback_keeps_live_direct_child_when_proc_identity_is_inconclusive(self):
         class LiveProcess:
@@ -529,7 +659,15 @@ class ManagedLaunchTest(unittest.TestCase):
                 successful[-1]["pending_launches"][0]["state_dir"],
                 snapshots[-1]["pending_launches"][0]["state_dir"],
             )
-            return identity
+            return dict(
+                identity,
+                inert=False,
+                sid=process.pid,
+                state_dir=snapshots[-1]["pending_launches"][0]["state_dir"],
+                weights_dir=snapshots[-1]["pending_launches"][0][
+                    "weights_dir"
+                ],
+            )
 
         with ModelFixture() as fixture, canonical_temporary_directory() as state:
             plan = ramdisk.build_plan(
@@ -591,12 +729,18 @@ class ManagedLaunchTest(unittest.TestCase):
 
         merge.assert_not_called()
         self.assertEqual(manifest["state"], "error")
-        self.assertEqual(manifest["processes"], [])
+        self.assertEqual(len(manifest["processes"]), 1)
         self.assertEqual(manifest["pending_launches"], [])
-        retained = manifest["recovery"]["retained_processes"][0]
-        self.assertEqual(retained["pid"], process.pid)
-        self.assertEqual(retained["usage_baseline"], {})
-        self.assertEqual(retained["usage_merge_id"], merge_id)
+        self.assertFalse(
+            manifest.get("recovery", {}).get("retained_processes")
+        )
+        published = manifest["processes"][0]
+        self.assertEqual(published["pid"], process.pid)
+        self.assertEqual(published["uid"], host_uid())
+        self.assertEqual(published["starttime"], 17290)
+        self.assertEqual(published["nonce"], nonce)
+        self.assertEqual(published["usage_baseline"], {})
+        self.assertEqual(published["usage_merge_id"], merge_id)
 
     def test_cancel_after_pending_save_is_rechecked_before_popen(self):
         manifest, snapshots, popen, _merge, _terminate, _group, caught = (
@@ -681,10 +825,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["processes"], [])
         self.assertEqual(manifest["pending_launches"], [])
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux") and os.name == "posix",
-        "requires Linux POSIX Popen post-fork ordering",
-    )
+    @requires_linux_operational
     def test_postfork_popen_exception_retains_and_reaps_exact_child(self):
         real_popen = subprocess.Popen
         attempts = []
@@ -755,6 +896,73 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["state"], "error")
         self.assertEqual(manifest["processes"], [])
         self.assertEqual(manifest["pending_launches"], [])
+
+    @requires_linux_operational
+    def test_exact_popen_attempt_is_reaped_across_registration_boundaries(self):
+        cases = (
+            (
+                "helper-success-return",
+                lifecycle_support._construct_retained_popen.__code__,
+                "return attempt, None, True",
+                False,
+            ),
+            (
+                "helper-error-return",
+                lifecycle_support._construct_retained_popen.__code__,
+                "return attempt, exc, True",
+                True,
+            ),
+            (
+                "caller-success-registration",
+                lifecycle_support.start.__code__,
+                "spawned.append(process)",
+                False,
+            ),
+            (
+                "caller-error-registration",
+                lifecycle_support.start.__code__,
+                "spawned.append(process)",
+                True,
+            ),
+        )
+        for name, target_code, source_fragment, constructor_error in cases:
+            with self.subTest(boundary=name):
+                (
+                    result,
+                    attempts,
+                    trace_hits,
+                ) = self._exercise_exact_popen_line_interrupt(
+                    target_code=target_code,
+                    source_fragment=source_fragment,
+                    constructor_error=constructor_error,
+                )
+                (
+                    manifest,
+                    snapshots,
+                    _popen,
+                    merge,
+                    terminate,
+                    group,
+                    caught,
+                ) = result
+
+                self.assertEqual(len(trace_hits), 1)
+                self.assertEqual(len(attempts), 1)
+                process = attempts[0]
+                self.assertIsInstance(caught, KeyboardInterrupt)
+                self.assertIsNotNone(process.returncode)
+                self.assertTrue(
+                    any(snapshot.get("pending_launches") for snapshot in snapshots)
+                )
+                terminate.assert_called_once_with(process)
+                group.assert_called_once_with(process.pid)
+                merge.assert_called_once()
+                self.assertEqual(manifest["state"], "error")
+                self.assertEqual(manifest["processes"], [])
+                self.assertEqual(manifest["pending_launches"], [])
+                self.assertFalse(
+                    manifest.get("recovery", {}).get("retained_processes")
+                )
 
     def test_async_popen_interruption_retains_outcome_unknown_pending_launch(self):
         manifest, snapshots, popen, merge, _terminate, _group, caught = (
@@ -843,7 +1051,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["processes"], [])
 
     def test_interrupt_after_handle_registration_keeps_one_loadable_authority(self):
-        manifest, _snapshots, hits, caught, load_error = (
+        manifest, _snapshots, hits, caught, load_error, _verified = (
             self._exercise_launch_line_interrupt(
                 'context["spawn_outcome"] = "created"'
             )
@@ -857,7 +1065,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(authorities[0][0], "retained")
 
     def test_interrupt_after_process_publication_keeps_published_authority_only(self):
-        manifest, _snapshots, hits, caught, load_error = (
+        manifest, _snapshots, hits, caught, load_error, _verified = (
             self._exercise_launch_line_interrupt("records.append(record)")
         )
 
@@ -867,6 +1075,179 @@ class ManagedLaunchTest(unittest.TestCase):
         authorities = self._launch_authorities(manifest)
         self.assertEqual(len(authorities), 1)
         self.assertEqual(authorities[0][0], "published")
+
+    def test_post_replace_interrupt_does_not_downgrade_exact_authority(self):
+        real_fsync_directory = state_support._fsync_bound_directory
+        interrupted = []
+
+        def interrupt_after_promotion_replace(descriptor):
+            real_fsync_directory(descriptor)
+            if interrupted:
+                return
+            durable = ramdisk._read_json(ramdisk._manifest_path())
+            if durable and durable.get("processes") and not durable.get(
+                "pending_launches"
+            ):
+                interrupted.append(ramdisk._manifest_path())
+                raise KeyboardInterrupt(
+                    "after exact process authority replacement"
+                )
+
+        with mock.patch.object(
+            state_support,
+            "_fsync_bound_directory",
+            side_effect=interrupt_after_promotion_replace,
+        ):
+            (
+                manifest,
+                _snapshots,
+                hits,
+                caught,
+                load_error,
+                verified_records,
+            ) = self._exercise_launch_line_interrupt(
+                "fragment-that-does-not-exist"
+            )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(hits, [])
+        self.assertIsInstance(caught, ramdisk.RamdiskError)
+        self.assertIsNone(load_error)
+        self.assertEqual(
+            [kind for kind, _ in self._launch_authorities(manifest)],
+            ["published"],
+        )
+        self.assertEqual(len(verified_records), 1)
+        published = manifest["processes"][0]
+        self.assertEqual(
+            {
+                key: verified_records[0][key]
+                for key in (
+                    "pid",
+                    "pgid",
+                    "uid",
+                    "starttime",
+                    "nonce",
+                    "state_dir",
+                    "weights_dir",
+                    "usage_merge_id",
+                )
+            },
+            {
+                key: published[key]
+                for key in (
+                    "pid",
+                    "pgid",
+                    "uid",
+                    "starttime",
+                    "nonce",
+                    "state_dir",
+                    "weights_dir",
+                    "usage_merge_id",
+                )
+            },
+        )
+        self.assertEqual(published["uid"], host_uid())
+        self.assertEqual(published["starttime"], 17298)
+        self.assertEqual(published["nonce"], "6" * 48)
+
+    def test_launch_promotion_requires_complete_observed_identity(self):
+        valid = {
+            "pid": 7298,
+            "uid": host_uid(),
+            "inert": False,
+            "starttime": 17298,
+            "nonce": "6" * 48,
+            "pgid": 7298,
+            "sid": 7298,
+            "state_dir": "/state/exact",
+            "weights_dir": "/weights/exact",
+        }
+        contract = {
+            "pid": 7298,
+            "uid": host_uid(),
+            "nonce": "6" * 48,
+            "state_dir": "/state/exact",
+            "weights_dir": "/weights/exact",
+        }
+        self.assertTrue(
+            lifecycle_support._launch_identity_matches(valid, **contract)
+        )
+        cases = {
+            "not-a-dict": None,
+            "pid": dict(valid, pid=7299),
+            "uid": dict(valid, uid=host_uid() + 1),
+            "starttime-zero": dict(valid, starttime=0),
+            "starttime-bool": dict(valid, starttime=True),
+            "inert": dict(valid, inert=True),
+            "inert-missing": {
+                key: value for key, value in valid.items() if key != "inert"
+            },
+            "nonce": dict(valid, nonce="7" * 48),
+            "pgid": dict(valid, pgid=7299),
+            "sid": dict(valid, sid=7299),
+            "state-dir": dict(valid, state_dir="/state/foreign"),
+            "weights-dir": dict(valid, weights_dir="/weights/foreign"),
+        }
+        for case, identity in cases.items():
+            with self.subTest(case=case):
+                self.assertFalse(
+                    lifecycle_support._launch_identity_matches(
+                        identity,
+                        **contract,
+                    )
+                )
+
+    def test_mismatched_launch_identity_retains_pending_group_authority(self):
+        cases = {
+            "pid": lambda value: dict(value, pid=value["pid"] + 1),
+            "uid": lambda value: dict(value, uid=value["uid"] + 1),
+            "starttime": lambda value: dict(value, starttime=0),
+            "inert": lambda value: dict(value, inert=True),
+            "nonce": lambda value: dict(value, nonce="8" * 48),
+            "pgid": lambda value: dict(value, pgid=value["pgid"] + 1),
+            "sid": lambda value: dict(value, sid=value["sid"] + 1),
+            "state-dir": lambda value: dict(
+                value,
+                state_dir=value["state_dir"] + "-foreign",
+            ),
+            "weights-dir": lambda value: dict(
+                value,
+                weights_dir=value["weights_dir"] + "-foreign",
+            ),
+        }
+        for case, mutation in cases.items():
+            with self.subTest(case=case):
+                (
+                    manifest,
+                    _snapshots,
+                    hits,
+                    caught,
+                    load_error,
+                    verified_records,
+                ) = self._exercise_launch_line_interrupt(
+                    "fragment-that-does-not-exist",
+                    identity_mutation=mutation,
+                )
+                self.assertEqual(hits, [])
+                self.assertIsInstance(caught, ramdisk.RamdiskError)
+                self.assertIsNone(load_error)
+                self.assertEqual(manifest["processes"], [])
+                self.assertEqual(len(manifest["pending_launches"]), 1)
+                pending = manifest["pending_launches"][0]
+                self.assertEqual(
+                    pending["observed_group"]["pgid"],
+                    7298,
+                )
+                self.assertEqual(
+                    pending["observed_group"]["uid"],
+                    host_uid(),
+                )
+                self.assertFalse(
+                    manifest.get("recovery", {}).get("retained_processes")
+                )
+                self.assertEqual(verified_records, [])
+                self.assertNotIn("usage_merged_at", pending)
 
     def test_failed_launch_never_merges_usage_while_direct_child_is_alive(self):
         nonce = "e" * 48
@@ -890,13 +1271,28 @@ class ManagedLaunchTest(unittest.TestCase):
         identity = {
             "pid": 7300,
             "pgid": 7300,
+            "sid": 7300,
             "uid": host_uid(),
+            "inert": False,
             "starttime": 17300,
             "nonce": nonce,
         }
         with ModelFixture() as fixture, canonical_temporary_directory() as state:
             plan = ramdisk.build_plan(
                 plan_args(fixture.root), hardware=hardware_fixture()
+            )
+            identity.update(
+                {
+                    "state_dir": os.path.join(
+                        state,
+                        "colibri",
+                        "ramdisk",
+                        "engines",
+                        plan["model"]["fingerprint"].split(":", 1)[-1],
+                        "interleaved",
+                    ),
+                    "weights_dir": plan["mounts"][0]["path"],
+                }
             )
             manifest = {
                 "state": "ready",
@@ -945,7 +1341,9 @@ class ManagedLaunchTest(unittest.TestCase):
             ), mock.patch.object(
                 ramdisk.subprocess, "Popen", return_value=LiveProcess()
             ), mock.patch.object(
-                ramdisk.secrets, "token_hex", return_value=nonce
+                ramdisk.secrets,
+                "token_hex",
+                side_effect=lambda size: nonce if size == 24 else "a" * 32,
             ):
                 with self.assertRaisesRegex(
                     ramdisk.RamdiskError,
@@ -986,6 +1384,11 @@ class ManagedLaunchTest(unittest.TestCase):
             _save_manifest=mock.Mock(),
             _terminate_verified_group=terminate,
             _merge_usage=merge_after_stop,
+            _bind_usage_transaction=mock.Mock(
+                side_effect=lambda record, plan=None, reserved_ids=None: (
+                    record["usage_merge_id"]
+                )
+            ),
         ):
             stopped = ramdisk.stop.__wrapped__()
 
@@ -1088,7 +1491,9 @@ class ManagedLaunchTest(unittest.TestCase):
         identity = {
             "pid": 4300,
             "pgid": 4300,
+            "sid": 4300,
             "uid": host_uid(),
+            "inert": False,
             "starttime": 14300,
             "nonce": nonce,
         }
@@ -1101,6 +1506,19 @@ class ManagedLaunchTest(unittest.TestCase):
             )
             plan = ramdisk.build_plan(
                 plan_args(fixture.root), hardware=hardware_fixture()
+            )
+            identity.update(
+                {
+                    "state_dir": os.path.join(
+                        state,
+                        "colibri",
+                        "ramdisk",
+                        "engines",
+                        plan["model"]["fingerprint"].split(":", 1)[-1],
+                        "interleaved",
+                    ),
+                    "weights_dir": plan["mounts"][0]["path"],
+                }
             )
             manifest = {
                 "state": "ready",
@@ -1201,13 +1619,26 @@ class ManagedLaunchTest(unittest.TestCase):
             return process
 
         def identity(pid):
+            launch = next(
+                item for item in captures if item["pid"] == pid
+            )
+            environment = launch["environment"]
             return {
                 "pid": pid,
                 "pgid": pid,
+                "sid": pid,
                 "uid": host_uid(),
+                "inert": False,
                 "starttime": 1000 + pid,
                 "nonce": nonce,
+                "state_dir": environment["COLI_STATE_DIR"],
+                "weights_dir": environment["COLI_WEIGHTS_DIR"],
             }
+
+        usage_ids = iter(("a" * 32, "b" * 32))
+
+        def deterministic_token(size):
+            return nonce if size == 24 else next(usage_ids)
 
         with ModelFixture() as fixture, canonical_temporary_directory() as state:
             hardware = hardware_fixture(nodes=2)
@@ -1240,6 +1671,7 @@ class ManagedLaunchTest(unittest.TestCase):
                     "KVSAVE": "0",
                     "COLI_NO_OMP_TUNE": "1",
                     "COLI_OMP_TUNED": "1",
+                    "COLI_USAGE_DECAY": "0.5",
                 },
             ), mock.patch.object(
                 ramdisk, "_filesystem_for_path", return_value="ext4"
@@ -1249,14 +1681,18 @@ class ManagedLaunchTest(unittest.TestCase):
                 ramdisk, "_admit_concurrent_runtimes"
             ) as admit, mock.patch.object(ramdisk, "_recover_delta"), mock.patch.object(
                 ramdisk, "_usage_read", return_value={}
-            ), mock.patch.object(ramdisk, "_usage_write"), mock.patch.object(
+            ) as usage_read, mock.patch.object(
+                ramdisk, "_usage_write"
+            ) as usage_write, mock.patch.object(
                 ramdisk, "_fresh_user_binary", return_value="/usr/bin/numactl"
             ), mock.patch.object(
                 ramdisk.socket, "socket", side_effect=lambda *args, **kwargs: FakeSocket()
             ), mock.patch.object(ramdisk.subprocess, "Popen", side_effect=popen), mock.patch.object(
                 ramdisk, "_proc_identity", side_effect=identity
             ), mock.patch.object(ramdisk, "_wait_managed_ready"), mock.patch.object(
-                ramdisk.secrets, "token_hex", return_value=nonce
+                ramdisk.secrets,
+                "token_hex",
+                side_effect=deterministic_token,
             ):
                 result = ramdisk.start.__wrapped__(
                     argparse.Namespace(base_port=None), cli_path=sys.executable
@@ -1266,6 +1702,17 @@ class ManagedLaunchTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "running")
         admit.assert_called_once_with(plan, manifest["mounts"], benchmark=False)
+        usage_read.assert_called_once_with(
+            os.path.join(plan["model"]["path"], ".coli_usage"),
+            plan=plan,
+        )
+        self.assertEqual(usage_write.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs.get("plan") is plan
+                for call in usage_write.call_args_list
+            )
+        )
         self.assertEqual(len(captures), 2)
         for index, (expected_cores, expected_cpus) in enumerate(
             ((3, "0-2"), (5, "3-7"))
@@ -1278,6 +1725,7 @@ class ManagedLaunchTest(unittest.TestCase):
             self.assertEqual(environment["OMP_NUM_THREADS"], str(expected_cores))
             self.assertEqual(environment["OMP_PROC_BIND"], "spread")
             self.assertEqual(environment["COLI_NUMA"], "0")
+            self.assertEqual(environment["COLI_USAGE_DECAY"], "1.0")
             self.assertNotIn("COLI_NO_OMP_TUNE", environment)
             self.assertNotIn("COLI_OMP_TUNED", environment)
             self.assertEqual(environment["COLI_NUMA_NODES"], str(index))
@@ -1318,7 +1766,9 @@ class ManagedLaunchTest(unittest.TestCase):
         identity = {
             "pid": 4200,
             "pgid": 4200,
+            "sid": 4200,
             "uid": host_uid(),
+            "inert": False,
             "starttime": 14200,
             "nonce": nonce,
         }
@@ -1347,6 +1797,19 @@ class ManagedLaunchTest(unittest.TestCase):
                 cuda_capable=True,
             )
             plan = result["plan"]
+            identity.update(
+                {
+                    "state_dir": os.path.join(
+                        state,
+                        "colibri",
+                        "ramdisk",
+                        "engines",
+                        plan["model"]["fingerprint"].split(":", 1)[-1],
+                        "interleaved",
+                    ),
+                    "weights_dir": plan["mounts"][0]["path"],
+                }
+            )
             manifest = {
                 "state": "ready",
                 "base_port": 8000,
@@ -1461,7 +1924,9 @@ class ManagedLaunchTest(unittest.TestCase):
         identity = {
             "pid": 6100,
             "pgid": 6100,
+            "sid": 6100,
             "uid": host_uid(),
+            "inert": False,
             "starttime": 16100,
             "nonce": nonce,
         }
@@ -1469,6 +1934,19 @@ class ManagedLaunchTest(unittest.TestCase):
         with ModelFixture() as fixture, canonical_temporary_directory() as state:
             plan = ramdisk.build_plan(
                 plan_args(fixture.root), hardware=hardware_fixture()
+            )
+            identity.update(
+                {
+                    "state_dir": os.path.join(
+                        state,
+                        "colibri",
+                        "ramdisk",
+                        "engines",
+                        plan["model"]["fingerprint"].split(":", 1)[-1],
+                        "interleaved",
+                    ),
+                    "weights_dir": plan["mounts"][0]["path"],
+                }
             )
             manifest = {
                 "state": "ready",

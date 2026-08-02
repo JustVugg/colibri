@@ -1127,9 +1127,9 @@ class RamdiskTextualPilotTest(unittest.IsolatedAsyncioTestCase):
                         {"port": 8000, "state": "outcome-unknown"}
                     ]
                 },
+                False,
                 True,
-                True,
-                "outcome is unknown",
+                "use Stop",
             ),
         )
         for label, recovery, stop_disabled, destroy_disabled, reason in cases:

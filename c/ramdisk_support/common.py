@@ -83,13 +83,13 @@ def _validated_usage_header(
         )
     n_layers, n_experts = dimensions[0]
     version, engine_id = formats[0]
-    if n_layers < 0 or n_experts < 1:
+    if n_layers < 1 or n_experts < 1:
         raise RamdiskError("%s has invalid history dimensions" % source)
-    if version > USAGE_FORMAT_VERSION:
+    if not 1 <= version <= USAGE_FORMAT_VERSION:
         raise RamdiskError(
             "%s uses unsupported usage format version %d" % (source, version)
         )
-    if not 0 <= engine_id <= 0xFFFFFFFF:
+    if not 1 <= engine_id <= 0xFFFFFFFF:
         raise RamdiskError("%s has an invalid engine identity" % source)
     if expected_dimensions is not None and (
         n_layers,

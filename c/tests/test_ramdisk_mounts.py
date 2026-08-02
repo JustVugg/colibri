@@ -864,8 +864,12 @@ class MountAndCopyTest(unittest.TestCase):
 
         validate.assert_not_called()
         unmount.assert_not_called()
-        self.assertEqual(snapshots[-1]["mounts"][0]["ownership"], "pending")
-        self.assertNotIn("identity", snapshots[-1]["mounts"][0])
+        self.assertEqual(snapshots[-1]["mounts"][0]["ownership"], "identified")
+        self.assertEqual(snapshots[-1]["mounts"][0]["identity"], actual)
+        self.assertEqual(
+            snapshots[-1]["mounts"][0]["cleanup"]["state"],
+            "retained",
+        )
 
     def test_preparation_rollback_revalidates_identity_before_unmount(self):
         path = "/mnt/colibri-test"

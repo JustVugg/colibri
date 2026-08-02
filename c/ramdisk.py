@@ -175,6 +175,7 @@ from ramdisk_support.presets import (
 from ramdisk_support.platform_ops import (
     UNSUPPORTED_PLATFORM_REASON,
     current_euid,
+    current_uid,
     get_platform_ops,
 )
 from ramdisk_support.state import (
@@ -182,6 +183,8 @@ from ramdisk_support.state import (
     _assert_durable_state_dir as _state_assert_durable_state_dir,
     _atomic_json,
     _benchmarks_path,
+    _bind_usage_transaction as _state_bind_usage_transaction,
+    _canonical_usage_read as _state_canonical_usage_read,
     _durable_unlink,
     _ensure_atomic_parent,
     _ensure_private_dir,
@@ -190,14 +193,16 @@ from ramdisk_support.state import (
     _load_manifest as _state_load_manifest,
     _manifest_mount_layout,
     _manifest_path,
+    _managed_usage_write as _state_managed_usage_write,
     _merge_usage as _state_merge_usage,
     _read_json,
     _recover_delta as _state_recover_delta,
     _save_manifest as _state_save_manifest,
     _state_root,
     _usage_merge_ids,
-    _usage_read,
-    _usage_write,
+    _usage_journal_transaction_id as _state_usage_journal_transaction_id,
+    _usage_read as _state_usage_read,
+    _usage_write as _state_usage_write,
     _validate_usage_for_plan,
 )
 
@@ -273,6 +278,39 @@ def _group_alive(pgid, *, ops=None):
     return _processes_module()._group_alive(pgid)
 
 
+def _managed_launch_processes(
+    nonce,
+    uid,
+    *,
+    state_dir=None,
+    weights_dir=None,
+    not_before_starttime=None,
+    launcher_pid=None,
+    launcher_starttime=None,
+    launcher_cmdline=None,
+    expected_command=None,
+):
+    return get_platform_ops().managed_launch_processes(
+        nonce,
+        uid,
+        state_dir=state_dir,
+        weights_dir=weights_dir,
+        not_before_starttime=not_before_starttime,
+        launcher_pid=launcher_pid,
+        launcher_starttime=launcher_starttime,
+        launcher_cmdline=launcher_cmdline,
+        expected_command=expected_command,
+    )
+
+
+def _process_start_boundary():
+    return get_platform_ops().process_start_boundary()
+
+
+def _current_process_identity():
+    return get_platform_ops().process_identity(os.getpid())
+
+
 def _poll_managed_child(pid):
     return _processes_module()._poll_managed_child(pid)
 
@@ -315,7 +353,14 @@ def _exclusive_lifecycle(function=None, *, require_process_control=False):
             "process_control_supported",
             False,
         ):
-            raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+            reason = getattr(
+                ops,
+                "process_control_reason",
+                UNSUPPORTED_PLATFORM_REASON,
+            )
+            if not isinstance(reason, str) or not reason:
+                reason = UNSUPPORTED_PLATFORM_REASON
+            raise RamdiskError(reason)
         with _lifecycle_lock():
             return function(*args, **kwargs)
 
@@ -709,11 +754,83 @@ def _merge_usage(record, canonical_path, plan=None, keep_journal=False):
     )
 
 
-def _recover_delta(state_dir, canonical_path, plan=None):
+def _usage_read(path, plan=None):
+    if plan is None:
+        return _state_usage_read(path)
+    return _state_canonical_usage_read(
+        path,
+        plan=plan,
+        source_still_matches=_source_still_matches,
+    )
+
+
+def _usage_write(
+    path,
+    counts,
+    merge_id=None,
+    merge_ids=None,
+    *,
+    plan=None,
+    expected_snapshot=None,
+    validator=None,
+    require_native=False,
+):
+    if plan is not None:
+        if (
+            merge_id is not None
+            or merge_ids is not None
+            or expected_snapshot is not None
+            or validator is not None
+            or require_native
+        ):
+            raise RamdiskError(
+                "managed usage seed does not accept generic write authority"
+            )
+        return _state_managed_usage_write(
+            path,
+            counts,
+            plan=plan,
+            filesystem_for_path=_filesystem_for_path,
+        )
+    return _state_usage_write(
+        path,
+        counts,
+        merge_id=merge_id,
+        merge_ids=merge_ids,
+        expected_snapshot=expected_snapshot,
+        validator=validator,
+        require_native=require_native,
+    )
+
+
+def _bind_usage_transaction(record, plan=None, *, reserved_ids=None):
+    return _state_bind_usage_transaction(
+        record,
+        plan=plan,
+        filesystem_for_path=_filesystem_for_path,
+        reserved_ids=reserved_ids,
+    )
+
+
+def _usage_journal_transaction_id(state_dir, plan=None):
+    return _state_usage_journal_transaction_id(
+        state_dir,
+        plan=plan,
+        filesystem_for_path=_filesystem_for_path,
+    )
+
+
+def _recover_delta(
+    state_dir,
+    canonical_path,
+    plan=None,
+    expected_merge_id=None,
+):
     return _state_recover_delta(
         state_dir,
         canonical_path,
         plan=plan,
+        expected_merge_id=expected_merge_id,
         filesystem_for_path=_filesystem_for_path,
         source_still_matches=_source_still_matches,
     )
@@ -751,15 +868,6 @@ def _assert_effective_masks_unchanged(plan):
     return _processes_module()._assert_effective_masks_unchanged(
         plan,
         discover_hardware=discover_hardware,
-    )
-
-
-def _terminate_group(pgid, term_seconds=10.0, kill_seconds=3.0):
-    return _processes_module()._terminate_group(
-        pgid,
-        term_seconds=term_seconds,
-        kill_seconds=kill_seconds,
-        group_alive=_group_alive,
     )
 
 
@@ -809,12 +917,14 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
         managed_child_liveness=_managed_child_liveness,
         save_manifest=_save_manifest,
         merge_usage=_merge_usage,
+        bind_usage_transaction=_bind_usage_transaction,
         persisted_base_port=_persisted_base_port,
         fresh_user_binary=_fresh_user_binary,
         admit_concurrent_runtimes=_admit_concurrent_runtimes,
         state_root=_state_root,
         ensure_private_dir=_ensure_private_dir,
         assert_durable_state_dir=_assert_durable_state_dir,
+        usage_journal_transaction_id=_usage_journal_transaction_id,
         recover_delta=_recover_delta,
         usage_read=_usage_read,
         usage_write=_usage_write,
@@ -827,6 +937,9 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
         apply_managed_accelerator_environment=(
             _apply_managed_accelerator_environment
         ),
+        invoking_uid=current_uid,
+        process_start_boundary=_process_start_boundary,
+        current_process_identity=_current_process_identity,
         proc_identity=_proc_identity,
         wait_managed_ready=_wait_managed_ready,
         track_managed_child=_track_managed_child,
@@ -841,12 +954,15 @@ def stop(args=None):
     return _lifecycle_stop(
         args,
         load_manifest=_load_manifest,
+        discover_managed_launches=_managed_launch_processes,
         process_matches=_process_matches,
+        process_group_members=_process_group_members,
         group_alive=_group_alive,
         managed_child_liveness=_managed_child_liveness,
         save_manifest=_save_manifest,
         terminate_verified_group=_terminate_verified_group,
         merge_usage=_merge_usage,
+        bind_usage_transaction=_bind_usage_transaction,
     )
 
 
