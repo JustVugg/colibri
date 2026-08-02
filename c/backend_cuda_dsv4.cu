@@ -28,7 +28,7 @@
 struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale,*fi_scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; };
 struct Dsv4CudaActivation { float *data; long long elements; int device; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
-struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin,*fi_lse,*fi_out_lse,*fi_cos_sin;uint8_t *fi_kv,*fi_comp;__nv_bfloat16 *fi_q,*fi_mid,*fi_out;int *compressed_len,*fi_indices,*fi_comp_indices,*fi_length,*fi_comp_length;int64_t *fi_slot,*fi_pos;int device,window,dim,max_tokens,max_compressed,rope_pairs,fi_splits; };
+struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin,*fi_lse,*fi_out_lse,*fi_cos_sin;uint8_t *fi_kv,*fi_comp;__nv_bfloat16 *fi_q,*fi_mid,*fi_out;int *compressed_len,*fi_indices,*fi_comp_indices,*fi_length,*fi_comp_length;int64_t *fi_slot,*fi_pos;size_t fi_qcap,fi_midcap,fi_outcap,fi_lsecap,fi_out_lsecap,fi_indicescap,fi_lengthcap,fi_slotcap,fi_poscap;int device,window,dim,max_tokens,max_compressed,rope_pairs,fi_splits; };
 struct MvDesc { const uint8_t *w,*scale; const float *x; float *y; };
 struct ExpertPtr { const uint8_t *w,*scale,*fi_scale; };
 struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su,*sd;uint8_t *bank_fc1,*bank_fc1_scale,*bank_fc2,*bank_fc2_scale;int *bank_fc1_dg_scale,*bank_fc2_dg_scale;int count,device,H,I,vocab,topk; };
@@ -363,6 +363,17 @@ static int dg_dense_batch(Dev*c,Dsv4CudaTensor*t,const float*x,float*y,int token
     gemm<<<170,384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,nullptr,O,tokens,I,1,O,0,a,b,sa,sb,d);
     dg_bf16_to_float<<<((long long)tokens*O+255)/256,256,0,c->stream>>>(y,c->dgmm1,tokens*O);return ok(cudaGetLastError(),"batched dense DeepGEMM launch");
 }
+static int dg_dense_batch_dispatch(Dev*c,Dsv4CudaTensor*t,const float*x,float*y,int tokens){
+    if(t->O==1536&&t->I==4096)return dg_dense_batch<1536,4096,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==1024&&t->I==4096)return dg_dense_batch<1024,4096,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==512&&t->I==4096)return dg_dense_batch<512,4096,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==4096&&t->I==4096)return dg_dense_batch<4096,4096,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==4096&&t->I==8192)return dg_dense_batch<4096,8192,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==4096&&t->I==1024)return dg_dense_batch<4096,1024,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==16384&&t->I==1024)return dg_dense_batch<16384,1024,64,16,64,64,16,64>(c,t,x,y,tokens);
+    if(t->O==32768&&t->I==1024)return dg_dense_batch<32768,1024,64,16,64,64,16,64>(c,t,x,y,tokens);
+    return 0;
+}
 static int dg_attention_kv_reuse(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){(void)x;return t&&t->O==512&&t->I==4096&&dg_dense_attention<512,4096,64,128,128,9,64,4,false>(c,t,x,y);}
 static int dg_attention_projection(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
     int good=0;
@@ -546,6 +557,11 @@ __global__ void rope_heads_dynamic(float*x,int heads,int dim,int rope,const int*
 __global__ void cache_store_dynamic(float*cache,const float*kv,const int*state,int window,int dim){int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<dim)cache[(long long)(decode_pos(state)%window)*dim+d]=kv[d];}
 #ifdef COLI_DSV4_FLASHINFER
 __global__ void fi_prepare_q(__nv_bfloat16*q,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]=__float2bfloat16(x[i]);}
+__global__ void rmsnorm_rows(float*out,const float*in,const float*w,int rows,int H,float eps){int row=blockIdx.x;const float*x=in+(long long)row*H;float*y=out+(long long)row*H;__shared__ float ws[8],inv;int lane=threadIdx.x&31,warp=threadIdx.x>>5;float ss=0;for(int h=threadIdx.x;h<H;h+=blockDim.x){float v=x[h];ss+=v*v;}for(int d=16;d;d>>=1)ss+=__shfl_down_sync(0xffffffff,ss,d);if(!lane)ws[warp]=ss;__syncthreads();if(!warp){float v=lane<8?ws[lane]:0;for(int d=16;d;d>>=1)v+=__shfl_down_sync(0xffffffff,v,d);if(!lane)inv=rsqrtf(v/H+eps);}__syncthreads();for(int h=threadIdx.x;h<H;h+=blockDim.x)y[h]=__bfloat162float(__float2bfloat16(x[h]*inv*w[h]));(void)rows;}
+__global__ void rmsnorm_rows_bf16(float*out,const float*in,const __nv_bfloat16*w,int rows,int H,float eps){int row=blockIdx.x;const float*x=in+(long long)row*H;float*y=out+(long long)row*H;__shared__ float ws[8],inv;int lane=threadIdx.x&31,warp=threadIdx.x>>5;float ss=0;for(int h=threadIdx.x;h<H;h+=blockDim.x){float v=x[h];ss+=v*v;}for(int d=16;d;d>>=1)ss+=__shfl_down_sync(0xffffffff,ss,d);if(!lane)ws[warp]=ss;__syncthreads();if(!warp){float v=lane<8?ws[lane]:0;for(int d=16;d;d>>=1)v+=__shfl_down_sync(0xffffffff,v,d);if(!lane)inv=rsqrtf(v/H+eps);}__syncthreads();for(int h=threadIdx.x;h<H;h+=blockDim.x)y[h]=__bfloat162float(__float2bfloat16(x[h]*inv*__bfloat162float(w[h])));(void)rows;}
+__global__ void split_qkv_rows(float*q,float*kv,const float*in,int rows,int R,int K){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)rows*(R+K);if(p<n){int row=p/(R+K),col=p%(R+K);if(col<R)q[(long long)row*R+col]=in[p];else kv[(long long)row*K+col-R]=in[p];}}
+__global__ void fi_position_batch(int64_t*slot,int64_t*position,int start,int tokens){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<tokens)slot[i]=position[i]=start+i;}
+__global__ void fi_indices_batch(int*idx,int*length,int start,int tokens,int window,int topk){int t=blockIdx.x,p=threadIdx.x;if(t>=tokens)return;int pos=start+t,n=min(pos+1,window),first=pos+1-n;if(p<topk)idx[(long long)t*topk+p]=p<n?first+p:-1;if(!p)length[t]=n;}
 __global__ void fi_indices(int*idx,int*length,const int*state,int window){int i=threadIdx.x,pos=decode_pos(state),n=min(pos+1,window),start=pos+1-n;if(i<512)idx[i]=i<n?start+i:-1;if(!i)*length=n;}
 /* C4A attends to the indexer's compressed candidates in addition to SWA.
  * The ranges intentionally overlap: those summaries are separate learned KV
@@ -1021,6 +1037,57 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     return ok(cudaGetLastError(), "attention window launch");
 }
 
+static int fi_reserve_batch(Dsv4CudaKvCache*k,int tokens,int heads,int topk,int splits){
+#ifdef COLI_DSV4_FLASHINFER
+    size_t q=(size_t)tokens*heads*512*sizeof(__nv_bfloat16),mid=(size_t)tokens*heads*splits*512*sizeof(__nv_bfloat16),
+           lse=(size_t)tokens*heads*splits*sizeof(float),out_lse=(size_t)tokens*heads*sizeof(float),
+           indices=(size_t)tokens*topk*sizeof(int),length=(size_t)tokens*sizeof(int),pos=(size_t)tokens*sizeof(int64_t);
+    return buf((void**)&k->fi_q,&k->fi_qcap,q)&&buf((void**)&k->fi_mid,&k->fi_midcap,mid)&&
+           buf((void**)&k->fi_out,&k->fi_outcap,q)&&buf((void**)&k->fi_lse,&k->fi_lsecap,lse)&&
+           buf((void**)&k->fi_out_lse,&k->fi_out_lsecap,out_lse)&&buf((void**)&k->fi_indices,&k->fi_indicescap,indices)&&
+           buf((void**)&k->fi_length,&k->fi_lengthcap,length)&&buf((void**)&k->fi_slot,&k->fi_slotcap,pos)&&
+           buf((void**)&k->fi_pos,&k->fi_poscap,pos);
+#else
+    (void)k;(void)tokens;(void)heads;(void)topk;(void)splits;return 0;
+#endif
+}
+
+extern "C" int dsv4_cuda_attention_sparse_batch(const Dsv4CudaActivation*input,Dsv4CudaTensor*an,Dsv4CudaTensor*qkv,Dsv4CudaTensor*qn,Dsv4CudaTensor*qb,Dsv4CudaTensor*kvn,Dsv4CudaTensor*sink,int heads,int dim,int start,int tokens,float eps,Dsv4CudaKvCache*cache,Dsv4CudaActivation*context){
+#if defined(COLI_DSV4_FLASHINFER) && defined(COLI_DSV4_DEEPGEMM)
+#define BATCH_ATTN_REQUIRE(expr,stage) do{if(!(expr)){fprintf(stderr,"[DSV4 batch attention] %s failed\n",stage);return 0;}}while(0)
+    Dev*c=input?ctx(input->device):nullptr;int H=qkv?qkv->I:0,K=dim,R=qkv?qkv->O-K:0,Q=heads*dim,topk=cache?max(128,((cache->window+63)/64)*64):0,splits=topk/64;
+    if(!c||!cache||!context||!an||!qkv||!qn||!qb||!kvn||!sink||tokens<1||start<0||start+tokens>cache->max_tokens||dim!=512||topk<64||topk>512||
+       cache->device!=input->device||context->device!=input->device||input->elements<(long long)tokens*H||context->elements<(long long)tokens*Q||
+       an->fmt!=32||qkv->fmt!=8||qn->fmt!=16||qb->fmt!=8||kvn->fmt!=32||sink->fmt!=32||qkv->O!=R+K||qb->I!=R||qb->O!=Q||
+       an->O*an->I<H||qn->O*qn->I<R||kvn->O*kvn->I<K||sink->O*sink->I<heads){fprintf(stderr,"[DSV4 batch attention] validation failed\n");return 0;}
+    Dsv4CudaTensor*tensors[]={an,qkv,qn,qb,kvn,sink};for(auto*t:tensors)if(t->device!=input->device){fprintf(stderr,"[DSV4 batch attention] device mismatch\n");return 0;}
+    size_t nh=(size_t)tokens*H,nr=(size_t)tokens*R,nk=(size_t)tokens*K,nq=(size_t)tokens*Q;
+    if(!ok(cudaSetDevice(input->device),"select batched sparse attention device")||!buf((void**)&c->dx,&c->xcap,nh*sizeof(float))||
+       !buf((void**)&c->p1,&c->p1cap,(size_t)tokens*(R+K)*sizeof(float))||!buf((void**)&c->p2,&c->p2cap,nr*sizeof(float))||
+       !buf((void**)&c->p3,&c->p3cap,nk*sizeof(float))||!buf((void**)&c->p4,&c->p4cap,nq*sizeof(float))||
+       !buf((void**)&c->mhcb1,&c->mhcb1cap,nq*sizeof(__nv_bfloat16))||!buf((void**)&c->mhcb2,&c->mhcb2cap,nk*sizeof(__nv_bfloat16))||
+       !fi_reserve_batch(cache,tokens,heads,topk,splits)){fprintf(stderr,"[DSV4 batch attention] workspace allocation failed\n");return 0;}
+    rmsnorm_rows<<<tokens,256,0,c->stream>>>(c->dx,input->data,(float*)an->w,tokens,H,eps);
+    BATCH_ATTN_REQUIRE(dg_dense_batch_dispatch(c,qkv,c->dx,c->p1,tokens),"QKV projection");
+    split_qkv_rows<<<((long long)tokens*(R+K)+255)/256,256,0,c->stream>>>(c->p2,c->p3,c->p1,tokens,R,K);
+    rmsnorm_rows_bf16<<<tokens,256,0,c->stream>>>(c->p2,c->p2,(__nv_bfloat16*)qn->w,tokens,R,eps);
+    BATCH_ATTN_REQUIRE(dg_dense_batch_dispatch(c,qb,c->p2,c->p4,tokens),"Q projection");
+    rmsnorm_rows<<<tokens,256,0,c->stream>>>(c->p3,c->p3,(float*)kvn->w,tokens,K,eps);
+    mhc_float_to_bf16<<<(nq+255)/256,256,0,c->stream>>>(c->mhcb1,c->p4,(int)nq);
+    mhc_float_to_bf16<<<(nk+255)/256,256,0,c->stream>>>(c->mhcb2,c->p3,(int)nk);
+    fi_position_batch<<<(tokens+255)/256,256,0,c->stream>>>(cache->fi_slot,cache->fi_pos,start,tokens);
+    BATCH_ATTN_REQUIRE(dsv4_vllm_qnorm_rope_kv_insert_batch(c->mhcb1,cache->fi_q,c->mhcb2,cache->fi_kv,cache->fi_slot,cache->fi_pos,cache->fi_cos_sin,eps,tokens,tokens,heads,heads,64,64*584,c->stream),"QNorm/RoPE/cache insert");
+    fi_indices_batch<<<tokens,topk,0,c->stream>>>(cache->fi_indices,cache->fi_length,start,tokens,cache->window,topk);
+    BATCH_ATTN_REQUIRE(dsv4_flashinfer_sparse_mla(cache->fi_q,cache->fi_kv,cache->fi_indices,cache->fi_mid,cache->fi_lse,cache->fi_out,cache->fi_out_lse,cache->fi_length,(float*)sink->w,nullptr,nullptr,nullptr,0,0,0,heads,topk,tokens,splits,0,1.f/sqrtf((float)dim),64*584,c->stream),"FlashInfer sparse MLA");
+    mhc_bf16_to_float<<<(nq+255)/256,256,0,c->stream>>>(context->data,cache->fi_out,(int)nq);
+    {int good=ok(cudaGetLastError(),"batched sparse attention launch");
+#undef BATCH_ATTN_REQUIRE
+    return good;}
+#else
+    (void)input;(void)an;(void)qkv;(void)qn;(void)qb;(void)kvn;(void)sink;(void)heads;(void)dim;(void)start;(void)tokens;(void)eps;(void)cache;(void)context;return 0;
+#endif
+}
+
 extern "C" int dsv4_cuda_attention_window_tp2(const Dsv4CudaActivation *input,Dsv4CudaActivation *peer_input,
         const Dsv4CudaAttentionWeights *a,const Dsv4CudaAttentionWeights *b,int ratio,int heads,int dim,int qk_rope,
         int groups,int pos,float eps,Dsv4CudaKvCache *cache,Dsv4CudaKvCache *peer_cache,
@@ -1074,15 +1141,7 @@ extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*
 #ifdef COLI_DSV4_DEEPGEMM
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
        input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;
-    if(t->O==1536&&t->I==4096)return dg_dense_batch<1536,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==1024&&t->I==4096)return dg_dense_batch<1024,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==512&&t->I==4096)return dg_dense_batch<512,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==4096&&t->I==4096)return dg_dense_batch<4096,4096,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==4096&&t->I==8192)return dg_dense_batch<4096,8192,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==4096&&t->I==1024)return dg_dense_batch<4096,1024,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==16384&&t->I==1024)return dg_dense_batch<16384,1024,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    if(t->O==32768&&t->I==1024)return dg_dense_batch<32768,1024,64,16,64,64,16,64>(c,t,input->data,output->data,tokens);
-    return 0;
+    return dg_dense_batch_dispatch(c,t,input->data,output->data,tokens);
 #else
     (void)t;(void)input;(void)tokens;(void)output;return 0;
 #endif
