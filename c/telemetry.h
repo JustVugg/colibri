@@ -117,9 +117,7 @@ static void tiers_emit(Model *m){
     int pinned=0,lru=0;
     for(int i=0;i<=c->n_layers;i++){ pinned+=m->npin?m->npin[i]:0; lru+=m->ecn?m->ecn[i]:0; }
     int vram=0; double vram_gb=0;
-#ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
-#endif
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
     double eb=(double)expert_bytes_probe(m,m->ebits);

@@ -2152,6 +2152,14 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
      * expert re-uploads instead of computing with the old expert's tensors. */
     if(s->eid!=eid){
         if(s->g.vk_eligible) g_vk_resident--;
+        if(s->g.vk || s->u.vk || s->d.vk) {
+            int64_t b = 0;
+            if(s->g.vk) b += coli_vk_tensor_bytes(s->g.vk);
+            if(s->u.vk) b += coli_vk_tensor_bytes(s->u.vk);
+            if(s->d.vk) b += coli_vk_tensor_bytes(s->d.vk);
+            m->gpu_expert_count--;
+            m->gpu_expert_bytes -= b;
+        }
         qt_vk_reset(&s->g); qt_vk_reset(&s->u); qt_vk_reset(&s->d);
     }
 #endif
@@ -7654,7 +7662,10 @@ static void vk_registry_fill(Model *m){
             fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
             break;
         }
-        bytes+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+        int64_t actual = coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+        bytes+=actual;
+        m->gpu_expert_bytes+=actual;
+        m->gpu_expert_count++;
         g_vk_reg_n++;
     }
     coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
@@ -7692,7 +7703,10 @@ static void vk_registry_fill(Model *m){
                 fprintf(stderr,"[VK] dev2 tier: VRAM full after %d experts\n",g_vk_reg_n2);
                 break;
             }
-            bytes2+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+            int64_t actual = coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+            bytes2+=actual;
+            m->gpu_expert_bytes+=actual;
+            m->gpu_expert_count++;
             g_vk_reg_n2++;
         }
         fprintf(stderr,"[VK] dev2 tier: %d experts resident (%.2f GB VRAM, %.1fs, next-%d of history)\n",
