@@ -112,6 +112,10 @@ RX = {
     "cuda_mode":     (re.compile(r"\[CUDA\] mode: (.+)"),                 lambda m: m.group(1)),
     "cuda_tier":     (re.compile(r"CUDA expert tier: (\d+) resident experts \(([\d.]+) GB\)"),
                       lambda m: {"resident":int(m.group(1)),"vram_gb":float(m.group(2))}),
+    "vk_tier":       (re.compile(r"\[VK\] (?:dev2 |expert )tier: (\d+) (?:hot )?experts resident \(([\d.]+) GB VRAM\)"),
+                      lambda m: {"resident": int(m.group(1)), "vram_gb": float(m.group(2))}),
+    "vk_dense":      (re.compile(r"\[VK\] dense preloaded: (\d+) tensors, ([\d.]+) GB VRAM"),
+                      lambda m: {"tensors": int(m.group(1)), "vram_gb": float(m.group(2))}),
     # stderr: TOKENS dump (line 4010-4012)
     "tokens_dump":   (re.compile(r"^\[TOKENS\] (\d+) generated:(.*)$", re.MULTILINE),
                       lambda m: [int(x) for x in m.group(2).split()]),
@@ -148,6 +152,12 @@ def extract_metrics(stdout: str, stderr: str) -> dict:
         cuda_devs.append({"id":int(m.group(1)),"name":m.group(2).strip(),
                           "vram_gb":float(m.group(3)),"sm":f"{m.group(4)}.{m.group(5)}"})
     if cuda_devs: metrics["cuda_devices"] = cuda_devs
+    # Multiple Vulkan devices
+    vk_devs = []
+    for m in re.finditer(r"\[VK\] (?:dev(\d+) )?ready: ([^,\n]+)", text_err):
+        dev_id = int(m.group(1)) if m.group(1) else 0
+        vk_devs.append({"id": dev_id, "name": m.group(2).strip()})
+    if vk_devs: metrics["vk_devices"] = vk_devs
     # Multiple progress checkpoints — collect the full curve
     progress = []
     for m in RX["progress_tps"][0].finditer(text_err):
@@ -333,6 +343,7 @@ class DiagnosticHarness:
             "cap_final": metrics.get("cap_ok"),
             "cuda_devices": metrics.get("cuda_devices", []),
             "cuda_mode": metrics.get("cuda_mode"),
+            "vk_devices": metrics.get("vk_devices", []),
         }
         # Print summary
         print(f"  load time:    {result['load_secs']:.2f}s" if result['load_secs'] else "  load time:    FAILED")
@@ -349,6 +360,8 @@ class DiagnosticHarness:
             print(f"  cache cap:    {result['cache_cap_requested']}")
         for d in result['cuda_devices']:
             print(f"  GPU {d['id']}:       {d['name']}, {d['vram_gb']:.1f} GB, sm_{d['sm']}")
+        for d in result.get('vk_devices', []):
+            print(f"  VK GPU {d['id']}:    {d['name']}")
         if rc != 0 and rc != -1:
             print(f"  WARNING: engine returned rc={rc}")
         self.results["phases"]["system"] = result
@@ -435,6 +448,7 @@ class DiagnosticHarness:
             "mtp_counts": metrics.get("mtp_acc_cnt"),
             "spec_tok_per_fw": metrics.get("spec_tok_per_fw"),
             "cuda_tier": metrics.get("cuda_tier"),
+            "vk_tier": metrics.get("vk_tier"),
             "progress_curve": metrics.get("progress_curve", []),
         }
         # Print the PROFILE breakdown
@@ -455,6 +469,9 @@ class DiagnosticHarness:
         if result.get('cuda_tier'):
             ct = result['cuda_tier']
             print(f"    CUDA tier: {ct['resident']} experts, {ct['vram_gb']:.1f} GB VRAM")
+        if result.get('vk_tier'):
+            vt = result['vk_tier']
+            print(f"    VK tier:   {vt['resident']} experts, {vt['vram_gb']:.1f} GB VRAM")
         # Show generated text preview
         if text:
             print(f"\n  GENERATED TEXT (first 200 chars):")
@@ -588,6 +605,8 @@ class DiagnosticHarness:
                 lines += [f"- Cache cap: {s['cap_final']}"]
             for d in s.get("cuda_devices", []):
                 lines += [f"- GPU {d['id']}: {d['name']}, {d['vram_gb']:.1f} GB, sm_{d['sm']}"]
+            for d in s.get("vk_devices", []):
+                lines += [f"- VK GPU {d['id']}: {d['name']}"]
             lines.append("")
         # Smoke
         if "smoke" in phases:

@@ -84,6 +84,10 @@ CUDA_RESIDENT_RE = re.compile(
     r"\[CUDA\] resident set:\s+(\d+)\s+tensors,\s+([0-9.]+)\s+GB\s+VRAM"
 )
 
+VK_DEVICE_RE = re.compile(r"\[VK\] (?:dev\d+\s+)?ready:\s+([^,\n]+)")
+VK_TIER_RE = re.compile(r"\[VK\] (?:dev2\s+|expert\s+)tier:\s+(\d+)\s+(?:hot\s+)?experts resident\s+\(([0-9.]+)\s+GB\s+VRAM")
+VK_DENSE_RE = re.compile(r"\[VK\] dense preloaded:\s+(\d+)\s+tensors,\s+([0-9.]+)\s+GB\s+VRAM")
+
 # "PREFILL (teacher-forcing) C vs oracle: 11/32 positions | 1700.4 pos/s"  (TF=1 mode, stdout)
 TF_MATCH_RE = re.compile(r"PREFILL \(teacher-forcing\).*:\s+(\d+)/(\d+)\s+positions")
 
@@ -204,7 +208,7 @@ def parse_run(stdout: str, stderr: str = "") -> dict:
 
     Raises RuntimeError only if the core throughput line is missing — everything
     else is optional and absent on some run modes (e.g. [PROF] needs PROF=1,
-    CUDA tier needs gpu_expert_count>0).
+    CUDA/VK tier needs gpu_expert_count>0).
     """
     out = dict(
         tok_s=None, hit_pct=None, profile=None, profile_sum=None,
@@ -361,6 +365,20 @@ def parse_run(stdout: str, stderr: str = "") -> dict:
             ("h2d_ms", "kernel_ms", "d2h_ms"),
             (float(m.group(1)), float(m.group(2)), float(m.group(3)))))
     out["cuda"] = cuda
+
+    vk = dict(enabled=False, expert_count=None, expert_gb=None,
+              resident_tensors=None, resident_gb=None)
+    if VK_DEVICE_RE.search(blob):
+        vk["enabled"] = True
+    m = VK_TIER_RE.search(blob)
+    if m:
+        vk["expert_count"] = int(m.group(1))
+        vk["expert_gb"] = float(m.group(2))
+    m = VK_DENSE_RE.search(blob)
+    if m:
+        vk["resident_tensors"] = int(m.group(1))
+        vk["resident_gb"] = float(m.group(2))
+    out["vk"] = vk
 
     m = TF_MATCH_RE.search(stdout)
     if m:
