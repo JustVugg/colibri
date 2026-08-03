@@ -34,6 +34,24 @@ jobs:
       - name: ruff
         run: make -C c lint-py
 
+  # Separate from `lint` because it is a full compile plus analysis of each of
+  # the four engines -- minutes, not seconds. Keeping it apart means the fast
+  # formatting feedback is not held up behind it.
+  clang-tidy:
+    name: clang-tidy (bugprone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-tidy 18
+        # Same major-version pin as the format check: the check set and its
+        # diagnostics move between releases.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-18 libomp-dev
+          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
+      - name: clang-tidy
+        run: make -C c lint-tidy
+
   engine:
     name: Engine (Linux, CPU)
     runs-on: ubuntu-latest

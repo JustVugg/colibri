@@ -445,9 +445,20 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
             exit(1);
         }
         if (S->fmt_n == S->fmt_cap) {
-            S->fmt_cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
-            S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char *));
-            S->fmt_val = realloc(S->fmt_val, S->fmt_cap * sizeof(char *));
+            /* Checked, unlike before: on failure realloc returns NULL, the array
+             * pointer became NULL with it, and the two stores below dereferenced
+             * it. Every other allocation on this path exits with a message; this
+             * one crashed instead. */
+            int cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
+            char **nn = realloc(S->fmt_name, (size_t)cap * sizeof(char *));
+            char **nv = realloc(S->fmt_val, (size_t)cap * sizeof(char *));
+            if (!nn || !nv) {
+                fprintf(stderr, "%s: OOM growing the format-stamp table to %d entries\n", shard_path, cap);
+                exit(1);
+            }
+            S->fmt_name = nn;
+            S->fmt_val = nv;
+            S->fmt_cap = cap;
         }
         S->fmt_name[S->fmt_n] = strdup(inner->keys[i]);
         S->fmt_val[S->fmt_n] = strdup(v->str);

@@ -772,6 +772,21 @@ lint-py:
 	@cd .. && ruff check .
 	@cd .. && ruff format --check --diff . >/dev/null 2>&1 || true
 
+# clang-tidy over the four engines. Slower than the other two (it is a full
+# compile plus analysis per engine), so it is a separate target and a separate
+# CI job -- `make lint` stays fast enough to run before every commit.
+# Configuration and the rationale for every disabled check: ../.clang-tidy
+CLANG_TIDY ?= clang-tidy
+LINT_TIDY_SRC = colibri.c inkling.c kimi_k3.c olmoe.c
+
+lint-tidy:
+	@command -v $(CLANG_TIDY) >/dev/null 2>&1 || { echo "clang-tidy not found (apt install clang-tidy-$(CLANG_FORMAT_MAJOR))" >&2; exit 1; }
+	@rc=0; log=`mktemp`; for f in $(LINT_TIDY_SRC); do \
+	   printf '  clang-tidy %-12s' "$$f"; \
+	   if $(CLANG_TIDY) --quiet "$$f" -- -O1 -I. -std=gnu11 >"$$log" 2>&1; then echo "ok"; else echo "FAIL"; rc=1; fi; \
+	   grep -v '^[0-9][0-9]* warnings* generated\.$$' "$$log" || true; \
+	 done; rm -f "$$log"; exit $$rc
+
 lint: lint-c lint-py
 
 # Local validation: one portable CPU build and dependency-free tests.
@@ -808,7 +823,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: lint lint-c lint-py all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: lint lint-c lint-py lint-tidy all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

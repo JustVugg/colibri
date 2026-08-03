@@ -71,11 +71,12 @@ static char *j_parse_str_raw(jparser *p) {
     do {                                                                                                               \
         if (n + 1 >= cap) {                                                                                            \
             cap *= 2;                                                                                                  \
-            tmp = (char *)realloc(tmp, cap);                                                                           \
-            if (!tmp) {                                                                                                \
+            char *nt_ = (char *)realloc(tmp, cap);                                                                     \
+            if (!nt_) {                                                                                                \
                 fprintf(stderr, "OOM parsing JSON string\n");                                                          \
                 exit(1);                                                                                               \
             }                                                                                                          \
+            tmp = nt_;                                                                                                 \
         }                                                                                                              \
         tmp[n++] = (char)(ch);                                                                                         \
     } while (0)
@@ -186,8 +187,14 @@ static jval *j_parse_val(jparser *p) {
             jval *val = j_parse_val(p);
             if (v->len == cap) {
                 cap *= 2;
-                v->keys = realloc(v->keys, cap * sizeof(char *));
-                v->kids = realloc(v->kids, cap * sizeof(jval *));
+                char **nk = realloc(v->keys, cap * sizeof(char *));
+                jval **nv = realloc(v->kids, cap * sizeof(jval *));
+                if (!nk || !nv) {
+                    fprintf(stderr, "OOM parsing JSON object\n");
+                    exit(1);
+                }
+                v->keys = nk;
+                v->kids = nv;
             }
             v->keys[v->len] = key;
             v->kids[v->len] = val;
@@ -225,7 +232,12 @@ static jval *j_parse_val(jparser *p) {
             jval *val = j_parse_val(p);
             if (v->len == cap) {
                 cap *= 2;
-                v->kids = realloc(v->kids, cap * sizeof(jval *));
+                jval **nv = realloc(v->kids, cap * sizeof(jval *));
+                if (!nv) {
+                    fprintf(stderr, "OOM parsing JSON array\n");
+                    exit(1);
+                }
+                v->kids = nv;
             }
             v->kids[v->len++] = val;
             j_ws(p);
