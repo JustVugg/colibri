@@ -17,6 +17,18 @@ DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
+# Warnings deliberately left off, and why. Everything else in -Wall -Wextra is
+# on and the build is expected to be warning-free (see CONTRIBUTING).
+#
+# -Wunused-function: the engines are single translation units that include a
+# set of header-only libraries (st.h, quant.h, route_trace.h, tok.h, sample.h).
+# A header function that only one engine calls is "unused" in the other three,
+# which is 62 warnings that say nothing -- there is no separate .o for the
+# compiler to see the other caller in. Genuinely dead functions still get
+# found: they are the ones unused in EVERY engine, which is a set intersection
+# over the four builds, not something a single -W flag can express.
+WARN_OFF = -Wno-unused-function
+
 # Fallbacks for the rare toolchain that does not answer -dumpmachine: keep the
 # #129 signal (OS=Windows_NT, set in every Windows shell) for Windows, then
 # `uname` for everything else, so no host regresses.
@@ -42,6 +54,7 @@ ifneq (,$(DARWIN))
 # Apple clang non include il runtime OpenMP: se c'e' libomp di Homebrew lo usa
 # (brew install libomp), altrimenti compila single-thread (i pragma omp sono ignorati).
 # Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
+
 CC      = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
 # `brew --prefix libomp` can print the formula's prospective path even when it
@@ -54,7 +67,7 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 $(OMPC) -Wall -Wextra $(WARN_OFF)
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
@@ -79,7 +92,7 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra $(WARN_OFF)
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
@@ -94,7 +107,7 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra $(WARN_OFF)
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else ifneq (,$(AARCH64))
@@ -128,7 +141,7 @@ ARCHFLAG := -march=$(ARCH)
 else
 ARCHFLAG := -mcpu=$(ARCH)
 endif
-CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra $(WARN_OFF)
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else
@@ -139,7 +152,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra $(WARN_OFF)
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 endif
@@ -727,6 +740,40 @@ efficiency-cuda:
 efficiency-report:
 	$(PYTHON) tests/test_efficiency_report.py
 
+
+# --- lint ---------------------------------------------------------------
+# Formatting and Python static checks. Both are advisory locally and enforced
+# in CI; neither needs a model, a GPU or any build.
+#
+#   make lint        both of the below
+#   make lint-c      clang-format, check only -- prints a diff, changes nothing
+#   make lint-py     ruff (configuration lives in ../pyproject.toml)
+#
+# LINT_C_SRC is what the repo can verify a reformat of: *.cu needs nvcc and
+# *.mm has no CI coverage at all, so neither is reformatted or checked yet.
+LINT_C_SRC := $(wildcard *.c *.h tests/*.c tools/*.c)
+
+# CLANG_FORMAT_MAJOR: clang-format's output changes between major versions, so a
+# tree formatted with 17 does not pass a check run by 19. CI pins 18; warn (do not
+# fail) on anything else, so a contributor on another distro gets an explanation
+# instead of a diff they did not cause.
+CLANG_FORMAT ?= clang-format
+CLANG_FORMAT_MAJOR = 18
+
+lint-c:
+	@command -v $(CLANG_FORMAT) >/dev/null 2>&1 || { echo "clang-format not found (apt install clang-format-$(CLANG_FORMAT_MAJOR))" >&2; exit 1; }
+	@v=`$(CLANG_FORMAT) --version | sed -n 's/.*version \([0-9]*\).*/\1/p'`; \
+	 [ "$$v" = "$(CLANG_FORMAT_MAJOR)" ] || echo "warning: clang-format $$v, CI uses $(CLANG_FORMAT_MAJOR) — output differs between major versions" >&2
+	@$(CLANG_FORMAT) --dry-run --Werror $(LINT_C_SRC)
+	@echo "clang-format: $(words $(LINT_C_SRC)) files clean"
+
+lint-py:
+	@command -v ruff >/dev/null 2>&1 || { echo "ruff not found (pip install ruff)" >&2; exit 1; }
+	@cd .. && ruff check .
+	@cd .. && ruff format --check --diff . >/dev/null 2>&1 || true
+
+lint: lint-c lint-py
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
@@ -761,7 +808,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: lint lint-c lint-py all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

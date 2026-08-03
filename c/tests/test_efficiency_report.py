@@ -99,7 +99,7 @@ def main() -> int:
     wall = time.time() - t0
     flags = []  # collected FLAG lines for the summary
 
-    print(f"\n[0] RUN")
+    print("\n[0] RUN")
     _line("wall clock", f"{wall:.0f}s")
     _line("exit code", proc.returncode,
           None if proc.returncode == 0 else "FLAG",
@@ -111,7 +111,7 @@ def main() -> int:
         return 0
 
     # ---------------------------------------------------------------- [1] WHO ----
-    print(f"\n[1] PROVENANCE  — what is running, on what, with what config")
+    print("\n[1] PROVENANCE  — what is running, on what, with what config")
     if t.get("machine"):
         m = t["machine"]
         _line("CPU", m["cpu"])
@@ -128,7 +128,7 @@ def main() -> int:
         print("    (this is the EFFECTIVE config after auto-budgeting — not your env verbatim)")
 
     # ---------------------------------------------------------------- [2] SPEED --
-    print(f"\n[2] THROUGHPUT  — is it fast, is the tail healthy")
+    print("\n[2] THROUGHPUT  — is it fast, is the tail healthy")
     if t.get("tok_s") is not None:
         _line("tok/s", f"{t['tok_s']:.3f}")
     else:
@@ -147,7 +147,7 @@ def main() -> int:
                          "(look for REPIN swaps or disk stalls)")
 
     # ---------------------------------------------------------------- [3] TIME ---
-    print(f"\n[3] WHERE TIME GOES  — what is doing it, when (share of decode)")
+    print("\n[3] WHERE TIME GOES  — what is doing it, when (share of decode)")
     ts = t.get("time_shares")
     prof = t.get("profile")
     if ts:
@@ -175,7 +175,7 @@ def main() -> int:
     # attention sub-breakdown: how is attention being read
     ab = t.get("attn_breakdown")
     if ab:
-        print(f"\n[3a] ATTENTION BREAKDOWN  — how the attention phase is spent")
+        print("\n[3a] ATTENTION BREAKDOWN  — how the attention phase is spent")
         atot = sum(ab.values()) or 1.0
         for k, label in (("proj_rope", "projection + RoPE"),
                          ("score_sm_value", "score-softmax-value"),
@@ -183,7 +183,7 @@ def main() -> int:
             _line(label, f"{ab[k]:.3f}s  ({ab[k]/atot:.0%} of attn)")
 
     # ---------------------------------------------------------------- [4] CACHE --
-    print(f"\n[4] EXPERT CACHE  — is the cache efficient")
+    print("\n[4] EXPERT CACHE  — is the cache efficient")
     hit = t.get("hit_pct")
     if hit is not None:
         ok = hit >= LOW_HIT_RATE * 100
@@ -203,7 +203,7 @@ def main() -> int:
                          "-> redundant I/O; cache is re-fetching evicted experts")
 
     # ---------------------------------------------------------------- [5] DISK ---
-    print(f"\n[5] DISK I/O  — is I/O the bottleneck, and where")
+    print("\n[5] DISK I/O  — is I/O the bottleneck, and where")
     eio = t.get("expert_io")
     if eio:
         _line("total fetched", f"{eio['gb_fetched']:.3f} GB")
@@ -216,7 +216,7 @@ def main() -> int:
                          "overlapping fully, or DIRECT=1 on NVMe")
     ds = t.get("disk_split")
     if ds:
-        print(f"\n[5a] DISK-LOAD SPLIT  — which decode phase reads the bytes")
+        print("\n[5a] DISK-LOAD SPLIT  — which decode phase reads the bytes")
         _line("draft phase", f"{ds['draft']} loads")
         _line("absorb phase", f"{ds['absorb']} loads")
         _line("verify/main", f"{ds['verify_main']} loads")
@@ -231,7 +231,7 @@ def main() -> int:
               "" if ok else "I/O-bound (see levers in [3])")
 
     # ---------------------------------------------------------------- [6] ROUTE --
-    print(f"\n[6] ROUTING QUALITY  — is the router / prefetch accurate")
+    print("\n[6] ROUTING QUALITY  — is the router / prefetch accurate")
     ra = t.get("route_agree")
     if ra:
         ok = ra["agree_pct"] >= LOW_ROUTE_AGREE * 100
@@ -248,13 +248,13 @@ def main() -> int:
               None, "high swap = churn between turns")
     la = t.get("lookahead")
     if la:
-        print(f"\n[6a] ROUTING PREDICTABILITY  — recall of true experts in predicted top-8")
+        print("\n[6a] ROUTING PREDICTABILITY  — recall of true experts in predicted top-8")
         print("    (which predictor should drive prefetch? highest recall wins)")
         for row in la:
             _line(row["predictor"][:34], f"{row['pct']:5.1f}%  ({row['hit']}/{row['tot']})")
 
     # ---------------------------------------------------------------- [7] SPEC ---
-    print(f"\n[7] SPECULATION  — is the draft decoder pulling weight")
+    print("\n[7] SPECULATION  — is the draft decoder pulling weight")
     sp = t.get("speculation")
     if sp:
         _line("tokens/forward", f"{sp['tok_per_fw']:.2f}  (>1.0 means speculation helps)")
@@ -269,7 +269,7 @@ def main() -> int:
                          "drafts cost more I/O than they save; try DRAFT=0")
 
     # ---------------------------------------------------------------- [8] GPU ----
-    print(f"\n[8] GPU TIERS  — is the GPU actually used")
+    print("\n[8] GPU TIERS  — is the GPU actually used")
     cuda = t.get("cuda") or {}
     if not cuda.get("enabled"):
         print("  (CUDA not enabled — CPU-only run)")

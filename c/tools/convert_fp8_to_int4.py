@@ -504,7 +504,7 @@ def main():
     if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
     if bits_map:
-        print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+        print("[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
 
     # Il PIANO risolto, PRIMA di toccare qualunque cosa (#383): --mtp/--indexer cambiano il
     # default di ebits a 8 (testa int4 = acceptance ~0%, issue #8) e il ramo grouped e'
@@ -525,25 +525,17 @@ def main():
         print("[nvfp4] LUT e2m1: 16/16 codici OK")
         # 2) round-trip: costruisco un tensore ai SOLI valori rappresentabili (scala nota per
         #    blocco+globale), impacchetto come modelopt, poi dequant deve tornare ESATTO.
-        import numpy as np, io
-        from safetensors.torch import save as st_save
-        from safetensors import safe_open
+        import numpy as np
         rng = np.random.default_rng(0); O, I, GS = 8, 64, 16
         codes = rng.integers(0, 16, size=(O, I)).astype(np.uint8)   # nibble e2m1 casuali
         w4 = np.array(_E2M1, np.float32)[codes]                      # [O,I]
         # scale per-blocco (rappresentabili in f8e4m3) + globale piccola (stile modelopt)
         blk = rng.choice([0.5,1.0,2.0,4.0,8.0], size=(O, I//GS)).astype(np.float32)
         gscale = np.float32(3.9e-5)
-        W = w4 * np.repeat(blk, GS, axis=1) * gscale                 # riferimento esatto
         # impacchetto: pari->nibble basso, dispari->alto
         packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
         import ml_dtypes  # solo per il test: encode f8e4m3 delle scale di blocco
-        tens = {name: torch.from_numpy(arr) for name, arr in {
-            "w.weight": packed,
-            "w.weight_scale": blk.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),  # placeholder
-        }.items()}
-        # torch non ha un costruttore da bytes f8: passo via file safetensors scritto a mano.
-        # piu' semplice: uso direttamente dequant_nvfp4 su un finto 'f' in-memory.
+        # torch non ha un costruttore da bytes f8: uso dequant_nvfp4 su un finto 'f' in-memory.
         class _F:
             def __init__(s, d): s.d = d
             def get_tensor(s, n): return s.d[n]

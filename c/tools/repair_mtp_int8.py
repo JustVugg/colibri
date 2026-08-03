@@ -32,7 +32,7 @@ USAGE
   int4 containers were converted from). Requires numpy and network access;
   no torch, no HF token (public repo, anonymous range reads).
 """
-import argparse, glob, json, os, ssl, struct, sys, urllib.request
+import argparse, glob, json, os, ssl, struct, urllib.request
 import numpy as np
 
 # macOS python.org builds ship no CA bundle: use certifi when available (Linux

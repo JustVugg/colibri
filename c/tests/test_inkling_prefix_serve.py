@@ -179,7 +179,7 @@ class InklingPrefixServeTest(unittest.TestCase):
         eng = Engine()
         eng.ask("1", b"The capital of France is")
         diverged = eng.ask("2", b"Completely different opening text here")
-        log = eng.close()
+        eng.close()
 
         cold = Engine(log_prefix=False)
         fresh = cold.ask("1", b"Completely different opening text here")

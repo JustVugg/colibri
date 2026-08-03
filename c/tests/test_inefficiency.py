@@ -15,12 +15,11 @@ The signals under test, and the inefficiency each catches:
   - CPU vs CUDA TF-match : identical weights+inputs → identical argmax (kernel bug guard)
 """
 import os
-import shutil
 import unittest
 from pathlib import Path
 
 from tools.efficiency import (
-    parse_run, run_engine, disk_wait_share, tf_agreement,
+    run_engine, disk_wait_share, tf_agreement,
     TINY_TOK_S_FLOOR, MAX_DISK_WAIT_SHARE, MIN_CPU_CUDA_AGREEMENT,
 )
 

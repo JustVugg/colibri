@@ -493,7 +493,6 @@ class PhysicalCpuCountTest(unittest.TestCase):
         # The bug: lscpu absent -> os.cpu_count() or 1. On a constrained box
         # os.cpu_count() can be 1. We still must never silently pick 1 without
         # a warning, and when logical cores exist they must be used.
-        import os
         with mock.patch("resource_plan.subprocess.run", side_effect=FileNotFoundError), \
              mock.patch.object(sys, "platform", "linux"), \
              mock.patch("resource_plan.os.cpu_count", return_value=16), \

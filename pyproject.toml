@@ -51,3 +51,34 @@ version = {attr = "colibri._version.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["colibri*"]
+
+# ---------------------------------------------------------------------------
+# ruff: the Python side of the same "clean build" rule CONTRIBUTING states for
+# the C side. Run it with `ruff check .` (or `make -C c lint-py`).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+extend-exclude = ["c/tools/expert_atlas/static"]
+
+[tool.ruff.lint]
+# pyflakes (F) is the part that finds real defects -- unused imports, unused
+# locals, f-strings with no placeholders, names that do not exist. E4/E7/E9 are
+# ruff's default pycodestyle subset; the rules disabled below are the ones that
+# only disagree with how this codebase is written.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # The Python here follows the same compact style as the C: several short
+    # statements per line. That is a deliberate house style, not an accident,
+    # and reflowing ~315 sites would be a large diff that changes no behaviour.
+    "E701",  # multiple statements on one line (colon)
+    "E702",  # multiple statements on one line (semicolon)
+    "E401",  # multiple imports on one line
+    # `l` is the layer index and `I`/`O` are the matmul dimensions throughout
+    # the engine, the converters and the tools -- matching the C sources and
+    # the papers. Renaming them for the linter would make the two sides diverge.
+    "E741",  # ambiguous variable name
+    # Import-after-code is used on purpose: heavy optional deps (torch,
+    # safetensors) are imported inside the branch that needs them, so a tool
+    # that does not use them still starts without them installed.
+    "E402",  # module level import not at top of file
+]

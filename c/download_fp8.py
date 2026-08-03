@@ -4,7 +4,7 @@ Usage: python download_fp8.py
        python download_fp8.py --parallel 4
        python download_fp8.py --source hf  (force HuggingFace)
 """
-import os, sys, time, threading, argparse, subprocess
+import os, time, threading, argparse, subprocess
 
 REPO_MS = "ZhipuAI/GLM-5.2-FP8"        # ModelScope
 REPO_HF = "zai-org/GLM-5.2-FP8"        # HuggingFace
@@ -223,7 +223,7 @@ def main():
         print(f"  ✓ All {total} shards downloaded!{C.r}\n")
     else:
         print(f"{C.yel}  {final}/{total} complete, {total-final} remaining{C.r}")
-        print(f"  Re-run to resume.\n")
+        print("  Re-run to resume.\n")
 
 if __name__ == "__main__":
     try: main()

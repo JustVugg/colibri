@@ -1,0 +1,10 @@
+# Commits that only reformat code. `git blame` should look straight through
+# them to the commit that actually wrote the line.
+#
+# Enable locally (git 2.23+):
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically in its blame view.
+
+# Apply clang-format to every C source the repo can verify
+003a0b9

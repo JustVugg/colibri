@@ -133,7 +133,6 @@ def dequant_gs4(packed, scale, I):
     q[:, 0::2] = (packed & 15).astype(np.float32) - 8.0
     q[:, 1::2] = (packed >> 4).astype(np.float32) - 8.0
     q = q[:, :I]
-    ng = scale.shape[1]
     s = np.repeat(scale, GS, axis=1)[:, :I]
     return q * s
 
@@ -212,7 +211,7 @@ def main():
         sys.exit(f"[ERR] spazio insufficiente: servono ~{tot_out*1.15/1e9:.0f} GB")
 
     # ---- header di output: shape/offset noti in anticipo ----
-    print(f"[2/3] costruisco l'header di output…", flush=True)
+    print("[2/3] costruisco l'header di output…", flush=True)
     hdr, off, meta = {}, 0, {}
     for name, kind, p, base, o0, o1, dt, shape, _ob in plan:
         if kind == "gs4":
@@ -282,7 +281,7 @@ def main():
     os.replace(tmp, a.out)
     sz = os.path.getsize(a.out)
     print(f"\n✅ scritto {a.out}  {sz/1e9:.2f} GB  in {time.time()-t0:.0f}s")
-    print(f"\n=== errore di quantizzazione (L2 relativo, sui pesi VERI) ===")
+    print("\n=== errore di quantizzazione (L2 relativo, sui pesi VERI) ===")
     for k, v in sorted(err_by_kind.items()):
         print(f"  {k:12} {100*float(np.mean(v)):.3f}%   (su {len(v)} tensori)")
 

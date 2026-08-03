@@ -17,7 +17,7 @@ Usage:
   python tools/convert_olmoe.py --model ./OLMoE-1B-7B-0125-Instruct --out ./olmoe_i4
 """
 
-import argparse, json, math, os, struct, sys
+import argparse, sys
 from pathlib import Path
 
 sys.exit(
@@ -132,7 +132,7 @@ def main():
         out_shard = out / shard.name
         save_file(out_tensors, str(out_shard))
         ratio = total_expert_q / max(total_expert_f32, 1) * 100
-        print(f"ok")
+        print("ok")
 
     print(f"\nDone. {expert_count} expert tensors quantized to int{args.ebits}.")
     print(f"Expert storage: {total_expert_f32/1e9:.1f} GB -> {total_expert_q/1e9:.1f} GB ({ratio:.0f}%)")

@@ -6,7 +6,7 @@ pre-tokenizer cl100k (regex del tokenizer GLM-5.2):
 Ogni classe diventa un array ordinato di range [lo,hi] inclusivi; il C fa ricerca
 binaria. Eseguire una volta: python3 tools/gen_unicode.py > tok_unicode.h
 """
-import sys, unicodedata
+import unicodedata
 
 WHITE_SPACE = {0x09,0x0A,0x0B,0x0C,0x0D,0x20,0x85,0xA0,0x1680,
     0x2000,0x2001,0x2002,0x2003,0x2004,0x2005,0x2006,0x2007,0x2008,0x2009,0x200A,

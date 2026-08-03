@@ -6411,7 +6411,8 @@ shared_done:
 #endif
 }
 
-static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out) {
+/* D is not a parameter: every operand's shape comes from the QT descriptors. */
+static void dense_mlp(Layer *l, float *x, int S, int I, float *out) {
     float *g = falloc((int64_t)S * I), *u = falloc((int64_t)S * I);
     matmul_qt(g, x, &l->gate_proj, S);
     matmul_qt(u, x, &l->up_proj, S);
@@ -7307,7 +7308,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     }
     for (int s = 0; s < S; s++) rmsnorm(nrm + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps);
     if (l->sparse) moe(m, l, li, nrm, S, tmp, 1);
-    else dense_mlp(l, nrm, S, D, c->dense_inter, tmp);
+    else dense_mlp(l, nrm, S, c->dense_inter, tmp);
     for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp) {

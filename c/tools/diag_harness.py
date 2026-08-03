@@ -27,7 +27,7 @@ Design notes:
   - Subprocess calls have a hard timeout (default 600s) and are killed cleanly on expiry.
   - A single phase can be run standalone; results accumulate in the output dir.
 """
-import os, sys, re, json, time, argparse, subprocess, signal, traceback
+import os, sys, re, json, time, argparse, subprocess, traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -141,7 +141,7 @@ def extract_metrics(stdout: str, stderr: str) -> dict:
     m = RX["tokens_dump"][0].search(text_err)
     if m:
         try: metrics["tokens_dump"] = RX["tokens_dump"][1](m)
-        except: pass
+        except Exception: pass
     # Multiple CUDA devices — collect all
     cuda_devs = []
     for m in re.finditer(r"\[CUDA\] device (\d+): (.*?), ([\d.]+) GB VRAM, sm_(\d)(\d)", text_err):
@@ -153,7 +153,7 @@ def extract_metrics(stdout: str, stderr: str) -> dict:
     for m in RX["progress_tps"][0].finditer(text_err):
         try:
             progress.append(RX["progress_tps"][1](m))
-        except: pass
+        except Exception: pass
     if progress: metrics["progress_curve"] = progress
     # Multiple PROFILE lines — there are two (prefill + decode).  Keep both.
     prof_lines = [(i, line) for i, line in enumerate(text_out.splitlines()) if line.startswith("PROFILE:")]
@@ -165,7 +165,7 @@ def extract_metrics(stdout: str, stderr: str) -> dict:
             mm = rx.search(line)
             if mm:
                 try: p[pname] = fn(mm)
-                except: pass
+                except Exception: pass
         if p: metrics[label] = p
     return metrics
 
@@ -439,13 +439,13 @@ class DiagnosticHarness:
         }
         # Print the PROFILE breakdown
         dp = result["decode_profile"]
-        print(f"\n  DECODE TIMING BREAKDOWN (per-bucket, seconds):")
+        print("\n  DECODE TIMING BREAKDOWN (per-bucket, seconds):")
         print(f"    expert-disk:    {dp.get('prof_expert_disk', '?'):>8}")
         print(f"    expert-matmul:  {dp.get('prof_expert_mm', '?'):>8}")
         print(f"    attention:      {dp.get('prof_attention', '?'):>8}")
         print(f"    lm_head:        {dp.get('prof_lm_head', '?'):>8}")
         print(f"    other:          {dp.get('prof_other', '?'):>8}")
-        print(f"\n  PERFORMANCE:")
+        print("\n  PERFORMANCE:")
         print(f"    prefill:   {result['prefill_secs']:.2f}s" if result['prefill_secs'] else "    prefill:   ?")
         print(f"    decode:    {result['decode_tps']:.3f} tok/s" if result['decode_tps'] else "    decode:    ?")
         print(f"    hit rate:  {result['hit_rate']:.1f}%" if result.get('hit_rate') is not None else "    hit rate:  ?")
@@ -457,10 +457,10 @@ class DiagnosticHarness:
             print(f"    CUDA tier: {ct['resident']} experts, {ct['vram_gb']:.1f} GB VRAM")
         # Show generated text preview
         if text:
-            print(f"\n  GENERATED TEXT (first 200 chars):")
+            print("\n  GENERATED TEXT (first 200 chars):")
             print(f"    {text[:200].replace(chr(10), ' ')}")
         else:
-            print(f"\n  GENERATED TEXT: [none recovered]")
+            print("\n  GENERATED TEXT: [none recovered]")
         self.results["phases"]["diagnostic"] = result
         return result
 
@@ -529,7 +529,7 @@ class DiagnosticHarness:
         ngen = self.args.ngen
         results = {}
         # Run 1: with MTP (default)
-        print(f"  [1/2] MTP ON  (draft=3)...")
+        print("  [1/2] MTP ON  (draft=3)...")
         stdout, stderr, rc, t = self.runner.run_prompt(
             prompt, ngen=ngen, log_name="throughput_mtp_on.log")
         m_on = extract_metrics(stdout, stderr)
@@ -538,7 +538,7 @@ class DiagnosticHarness:
         print(f"       {m_on.get('decode_tps',0):.3f} tok/s | hit {m_on.get('hit_rate',0):.1f}% | "
               f"MTP {m_on.get('mtp_accept',0):.0f}%")
         # Run 2: MTP off
-        print(f"  [2/2] MTP OFF (MTP=0)...")
+        print("  [2/2] MTP OFF (MTP=0)...")
         stdout, stderr, rc, t = self.runner.run_prompt(
             prompt, ngen=ngen, env_extra={"MTP": "0"}, log_name="throughput_mtp_off.log")
         m_off = extract_metrics(stdout, stderr)
@@ -551,7 +551,7 @@ class DiagnosticHarness:
             results["mtp_speedup"] = sp
             print(f"\n  MTP speedup: {sp:.2f}x ({'MTP helps' if sp > 1.05 else 'MTP hurts' if sp < 0.95 else 'no effect'})")
         else:
-            print(f"\n  MTP speedup: (insufficient data)")
+            print("\n  MTP speedup: (insufficient data)")
         self.results["phases"]["throughput"] = results
         return results
 
@@ -566,11 +566,11 @@ class DiagnosticHarness:
         # Markdown
         lines = [
             f"# Diagnostic Report — {ts}",
-            f"",
+            "",
             f"**Model:** `{self.snap}`",
             f"**Engine:** `{self.glm}`",
             f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"",
+            "",
         ]
         phases = self.results["phases"]
         # System
@@ -592,7 +592,7 @@ class DiagnosticHarness:
         # Smoke
         if "smoke" in phases:
             sm = phases["smoke"]
-            lines += [f"## Phase 1: Correctness Smoke", "",
+            lines += ["## Phase 1: Correctness Smoke", "",
                       f"**{sm['pass']}/{sm['total']} prompts passed ({sm['pass_rate']:.0f}%)**", "",
                       "| ID | Category | Pass | Expect | Repetition | tok/s | Generated (first 80 chars) |",
                       "|---|---|---|---|---|---|---|"]
@@ -615,14 +615,14 @@ class DiagnosticHarness:
                              ("prof_other","other")]:
                 v = dp.get(k, "?")
                 lines.append(f"| {label} | {v} |")
-            lines += [f"", f"### Performance", f"- Decode: **{d.get('decode_tps','?')} tok/s**",
+            lines += ["", "### Performance", f"- Decode: **{d.get('decode_tps','?')} tok/s**",
                       f"- Prefill: {d.get('prefill_secs','?')}s",
                       f"- Expert hit rate: {d.get('hit_rate','?')}%",
                       f"- RSS: {d.get('rss_gb','?')} GB",
                       f"- Experts/token: {d.get('experts_per_tok','?')}",
                       f"- MTP acceptance: {d.get('mtp_accept','?')}%", ""]
             if d.get("generated_text"):
-                lines += [f"### Generated Text", f"```\n{d['generated_text'][:300]}\n```", ""]
+                lines += ["### Generated Text", f"```\n{d['generated_text'][:300]}\n```", ""]
         # Quality
         if "quality" in phases:
             q = phases["quality"]
@@ -649,7 +649,7 @@ class DiagnosticHarness:
         with open(md_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         print(f"\n{'='*60}")
-        print(f"Report written:")
+        print("Report written:")
         print(f"  JSON: {json_path}")
         print(f"  MD:   {md_path}")
         print(f"  Logs: {self.out_dir}/*.log")

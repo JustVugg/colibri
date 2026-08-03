@@ -14,7 +14,7 @@ Protocol, for every category c and every held-out prompt h of c:
 If specialisation were an artifact of prompt wording, the held-out prompt would not prefer
 its own category's set. Chance is 1/C.
 """
-import glob, json, os, sys
+import glob, os, sys
 from collections import defaultdict
 
 STATS = sys.argv[1] if len(sys.argv) > 1 else "stats"

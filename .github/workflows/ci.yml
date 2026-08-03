@@ -7,6 +7,33 @@ on:
     branches: [dev, main]
 
 jobs:
+  # Formatting and Python static analysis. Cheap (no build, no model, no GPU),
+  # so it runs first and gives the fastest possible signal on a PR.
+  lint:
+    name: Lint (clang-format, ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: pip install ruff==0.15.6
+      - name: Install clang-format 18
+        # Pinned major version. clang-format's output is NOT stable across major
+        # versions, so letting the runner pick whatever it ships would reformat
+        # the tree from under us and fail every PR at once on code nobody
+        # touched. 18 is what ubuntu-24.04 provides, which is also what
+        # contributors get from `apt install clang-format` on that release.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+      - name: clang-format
+        run: make -C c lint-c
+      - name: ruff
+        run: make -C c lint-py
+
   engine:
     name: Engine (Linux, CPU)
     runs-on: ubuntu-latest
