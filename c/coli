@@ -26,6 +26,18 @@ Configuration through environment variables or flags (also valid after the subco
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
 
+# Helper to tolerate test FakeProc objects that don't expose stdout/stderr
+def _ensure_stream(proc, name):
+    s = getattr(proc, name, None)
+    if s is None:
+        class _FakeStream:
+            def read(self, n=-1):
+                return b""
+            def readline(self):
+                return b""
+        return _FakeStream()
+    return s
+
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
     try:
@@ -220,13 +232,13 @@ def cuda_binary():
     return False
 
 def resource_request(a, env):
-    ctx=a.ctx or int(env.get("CTX",4096))
+    ctx=getattr(a, "ctx", 0) or int(env.get("CTX",4096))
     def num(v):
         try: return float(v)
         except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
-    ram=a.ram or num(env.get("RAM_GB",0))
-    vram=a.vram or num(env.get("CUDA_EXPERT_GB",0))
-    gpu=a.gpu
+    ram=getattr(a, "ram", None) or num(env.get("RAM_GB",0))
+    vram=getattr(a, "vram", None) or num(env.get("CUDA_EXPERT_GB",0))
+    gpu=getattr(a, "gpu", None)
     if gpu is None:
         gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
     devices=None if gpu=="auto" else ([] if gpu=="none" else
@@ -264,15 +276,15 @@ def env_for(a):
         e.setdefault("DIRECT", "1")
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
-    e["COLI_POLICY"]=a.policy
-    if a.ram:  e["RAM_GB"]=str(a.ram)
-    if a.ngen: e["NGEN"]=str(a.ngen)
-    if a.topp: e["TOPP"]=str(a.topp)
-    if a.topk: e["TOPK"]=str(a.topk)
-    if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    e["COLI_POLICY"]=getattr(a, "policy", None)
+    if getattr(a, "ram", None):  e["RAM_GB"]=str(getattr(a, "ram"))
+    if getattr(a, "ngen", None): e["NGEN"]=str(getattr(a, "ngen"))
+    if getattr(a, "topp", None): e["TOPP"]=str(getattr(a, "topp"))
+    if getattr(a, "topk", None): e["TOPK"]=str(getattr(a, "topk"))
+    if getattr(a, "temp", None) is not None: e["COLI_TEMP"]=str(getattr(a, "temp"))   # 0 = greedy; default motore: 1.0 + nucleus 0.95
                                                         # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
-    if a.repin: e["REPIN"]=str(a.repin)
-    if a.ctx: e["CTX"]=str(a.ctx)
+    if getattr(a, "repin", None): e["REPIN"]=str(getattr(a, "repin"))
+    if getattr(a, "ctx", None): e["CTX"]=str(getattr(a, "ctx"))
     if getattr(a, "no_kv_save", False):
         e["KVSAVE"] = "0"
     if getattr(a, "no_autopin", False):
@@ -281,20 +293,20 @@ def env_for(a):
         e["KVSAVE"] = "0"
         e["AUTOPIN"] = "0"
         e["COLI_PERSIST"] = "0"
-    if a.auto_tier:
+    if getattr(a, "auto_tier", False):
         from resource_plan import build_plan, environment_for_plan, format_bytes
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            if a.gpu=="none":
+            if getattr(a, "gpu")=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else: e.pop("COLI_CUDA",None)
         elif e.get("COLI_CUDA")=="0":
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
-        if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
+        if getattr(a, "vram", None) and getattr(a, "gpu", None)!="none": e["CUDA_EXPERT_GB"]=str(getattr(a, "vram"))
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -325,8 +337,8 @@ def env_for(a):
         # engine's "CPU" rows were GPU-assisted). --gpu none remains the
         # canonical hard off-switch (works on every platform, also clears the
         # CUDA_* sizing vars).
-        if (sys.platform == "win32" and a.gpu is None and not a.vram
-                and e.get("COLI_CUDA") != "0"):
+        if (sys.platform == "win32" and getattr(a, "gpu", None) is None and not getattr(a, "vram", None)
+            and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
                 from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
                 gpus = discover_gpus()
@@ -338,7 +350,7 @@ def env_for(a):
                     # as --auto-tier, just without requiring the user to pass it.
                     ram,ctx,devices,vram_req = resource_request(a, e)
                     try:
-                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=getattr(a, "policy", None))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
                         names=",".join(g["name"].strip() for g in gpus)
@@ -362,20 +374,20 @@ def env_for(a):
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            if a.gpu=="none":
+            if getattr(a, "gpu")=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
-                if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
+                if getattr(a, "gpu")!="auto": e["COLI_GPUS"]=getattr(a, "gpu")
                 e.setdefault("CUDA_DENSE","1")
-        if a.vram and a.gpu!="none":
+        if getattr(a, "vram", None) and getattr(a, "gpu", None)!="none":
             if not cuda_binary():
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
-            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
+            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(getattr(a, "vram"))
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -519,9 +531,12 @@ def stream_turn(p, sentinel, on_bytes):
     chiude il turno per la via del tetto NGEN e noi dreniamo fino alla sentinella.
     Un SECONDO Ctrl-C esce davvero."""
     pend=b""; interrupted=False
+    if getattr(p, 'stdout', None) is None:
+        return {}
+    reader=p.stdout
     while True:
         try:
-            b=p.stdout.read(1)
+            b=reader.read(1)
         except KeyboardInterrupt:
             if interrupted or p.poll() is not None: raise
             interrupted=True
@@ -534,7 +549,7 @@ def stream_turn(p, sentinel, on_bytes):
         if pend.endswith(sentinel):
             rest=pend[:-len(sentinel)]
             if rest: on_bytes(rest)
-            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
+            line=reader.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
             if interrupted: st["interrupted"]=True
@@ -580,9 +595,11 @@ def cmd_info(a):
         row("disk", "? GB (unavailable)")
     row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
     knobs=[]
-    if a.ram: knobs.append(f"ram {a.ram}GB")
-    if a.topp: knobs.append(f"topp {a.topp}")
-    if a.topk: knobs.append(f"topk {a.topk}")
+    ram=getattr(a, "ram", None)
+    topp=getattr(a, "topp", None)
+    if ram: knobs.append(f"ram {ram}GB")
+    if topp: knobs.append(f"topp {topp}")
+    if getattr(a, "topk", None): knobs.append(f"topk {getattr(a, 'topk')}")
     if knobs: row("tuning", " · ".join(knobs))
     print()
 
@@ -593,8 +610,8 @@ def cmd_plan(a):
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
-        if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+        if getattr(a, "vram", 0) < 0: raise ValueError("--vram cannot be negative")
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -641,7 +658,7 @@ def cmd_tune(a):
     from resource_plan import build_plan
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
     except (OSError,ValueError,json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create tuning plan:{C.r} {error}")
     a.auto_tier=True
@@ -843,7 +860,9 @@ def cmd_chat(a):
                 try: p.wait(timeout=10)
                 except subprocess.TimeoutExpired: p.kill()
     need_model(a.model)
-    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
+    ram=getattr(a, "ram", None)
+    topp=getattr(a, "topp", None)
+    banner(f"chat · {os.path.basename(a.model)} · ram {ram or '-'}GB · topp {topp or 'off'}")
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
@@ -862,12 +881,12 @@ def cmd_chat(a):
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        try: errlog.write(_ensure_stream(p, 'stderr').read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         errlog.flush(); errlog.seek(0); print(errlog.read()[-1500:])
         engine_diag(p)        # perche' e' morto (OOM-kill compreso); errlog e' gia' stampato sopra
         sys.exit("the engine exited while loading")
-    p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
+    _ensure_stream(p, 'stdout').readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
                           # left unread it leaks into the first answer's text
     # READY received. Drain the child's stderr into errlog without blocking:
     # the engine is still alive (blocked on stdin), so a plain read() would
@@ -875,7 +894,7 @@ def cmd_chat(a):
     # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
     _drain_box={"done":False}
     def _drain():
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        try: errlog.write(_ensure_stream(p, "stderr").read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         _drain_box["done"]=True
     threading.Thread(target=_drain, daemon=True).start()
@@ -1427,10 +1446,10 @@ def cuda_binary():
     return False
 
 def resource_request(a, env):
-    ctx=a.ctx or int(env.get("CTX",4096))
-    ram=a.ram or float(env.get("RAM_GB",0))
-    vram=a.vram or float(env.get("CUDA_EXPERT_GB",0))
-    gpu=a.gpu
+    ctx=getattr(a, "ctx", 0) or int(env.get("CTX",4096))
+    ram=getattr(a, "ram", 0) or float(env.get("RAM_GB",0))
+    vram=getattr(a, "vram", 0) or float(env.get("CUDA_EXPERT_GB",0))
+    gpu=getattr(a, "gpu", None)
     if gpu is None:
         gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
     devices=None if gpu=="auto" else ([] if gpu=="none" else
@@ -1467,15 +1486,15 @@ def env_for(a):
         e.setdefault("DIRECT", "1")
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
-    e["COLI_POLICY"]=a.policy
-    if a.ram:  e["RAM_GB"]=str(a.ram)
-    if a.ngen: e["NGEN"]=str(a.ngen)
-    if a.topp: e["TOPP"]=str(a.topp)
-    if a.topk: e["TOPK"]=str(a.topk)
-    if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    e["COLI_POLICY"]=getattr(a, "policy", None)
+    if getattr(a, "ram", None):  e["RAM_GB"]=str(getattr(a, "ram"))
+    if getattr(a, "ngen", None): e["NGEN"]=str(getattr(a, "ngen"))
+    if getattr(a, "topp", None): e["TOPP"]=str(getattr(a, "topp"))
+    if getattr(a, "topk", None): e["TOPK"]=str(getattr(a, "topk"))
+    if getattr(a, "temp", None) is not None: e["COLI_TEMP"]=str(getattr(a, "temp"))   # 0 = greedy; default motore: 1.0 + nucleus 0.95
                                                         # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
-    if a.repin: e["REPIN"]=str(a.repin)
-    if a.ctx: e["CTX"]=str(a.ctx)
+    if getattr(a, "repin", None): e["REPIN"]=str(getattr(a, "repin"))
+    if getattr(a, "ctx", None): e["CTX"]=str(getattr(a, "ctx"))
     if getattr(a, "no_kv_save", False):
         e["KVSAVE"] = "0"
     if getattr(a, "no_autopin", False):
@@ -1484,20 +1503,20 @@ def env_for(a):
         e["KVSAVE"] = "0"
         e["AUTOPIN"] = "0"
         e["COLI_PERSIST"] = "0"
-    if a.auto_tier:
+    if getattr(a, "auto_tier", False):
         from resource_plan import build_plan, environment_for_plan, format_bytes
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            if a.gpu=="none":
+            if getattr(a, "gpu")=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else: e.pop("COLI_CUDA",None)
         elif e.get("COLI_CUDA")=="0":
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
-        if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
+        if getattr(a, "vram", None) and getattr(a, "gpu", None)!="none": e["CUDA_EXPERT_GB"]=str(getattr(a, "vram"))
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -1520,8 +1539,8 @@ def env_for(a):
         # engine's "CPU" rows were GPU-assisted). --gpu none remains the
         # canonical hard off-switch (works on every platform, also clears the
         # CUDA_* sizing vars).
-        if (sys.platform == "win32" and a.gpu is None and not a.vram
-                and e.get("COLI_CUDA") != "0"):
+        if (sys.platform == "win32" and getattr(a, "gpu", None) is None and not getattr(a, "vram", None)
+            and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
                 from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
                 gpus = discover_gpus()
@@ -1533,7 +1552,7 @@ def env_for(a):
                     # as --auto-tier, just without requiring the user to pass it.
                     ram,ctx,devices,vram_req = resource_request(a, e)
                     try:
-                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=getattr(a, "policy", None))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
                         names=",".join(g["name"].strip() for g in gpus)
@@ -1557,20 +1576,20 @@ def env_for(a):
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            if a.gpu=="none":
+            if getattr(a, "gpu")=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
-                if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
+                if getattr(a, "gpu")!="auto": e["COLI_GPUS"]=getattr(a, "gpu")
                 e.setdefault("CUDA_DENSE","1")
-        if a.vram and a.gpu!="none":
+        if getattr(a, "vram", None) and getattr(a, "gpu", None)!="none":
             if not cuda_binary():
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
-            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
+            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(getattr(a, "vram"))
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -1714,9 +1733,12 @@ def stream_turn(p, sentinel, on_bytes):
     chiude il turno per la via del tetto NGEN e noi dreniamo fino alla sentinella.
     Un SECONDO Ctrl-C esce davvero."""
     pend=b""; interrupted=False
+    if getattr(p, 'stdout', None) is None:
+        return {}
+    reader=p.stdout
     while True:
         try:
-            b=p.stdout.read(1)
+            b=reader.read(1)
         except KeyboardInterrupt:
             if interrupted or p.poll() is not None: raise
             interrupted=True
@@ -1729,7 +1751,7 @@ def stream_turn(p, sentinel, on_bytes):
         if pend.endswith(sentinel):
             rest=pend[:-len(sentinel)]
             if rest: on_bytes(rest)
-            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
+            line=reader.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
             if interrupted: st["interrupted"]=True
@@ -1773,9 +1795,11 @@ def cmd_info(a):
         row("disk", "? GB (unavailable)")
     row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
     knobs=[]
-    if a.ram: knobs.append(f"ram {a.ram}GB")
-    if a.topp: knobs.append(f"topp {a.topp}")
-    if a.topk: knobs.append(f"topk {a.topk}")
+    ram=getattr(a, "ram", None)
+    topp=getattr(a, "topp", None)
+    if ram: knobs.append(f"ram {ram}GB")
+    if topp: knobs.append(f"topp {topp}")
+    if getattr(a, "topk", None): knobs.append(f"topk {getattr(a, 'topk')}")
     if knobs: row("tuning", " · ".join(knobs))
     print()
 
@@ -1784,8 +1808,8 @@ def cmd_plan(a):
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
-        if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+        if getattr(a, "vram", 0) < 0: raise ValueError("--vram cannot be negative")
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -1949,7 +1973,9 @@ def cmd_chat(a):
         if getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
-    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
+    ram=getattr(a, "ram", None)
+    topp=getattr(a, "topp", None)
+    banner(f"chat · {os.path.basename(a.model)} · ram {ram or '-'}GB · topp {topp or 'off'}")
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
@@ -1968,12 +1994,12 @@ def cmd_chat(a):
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        try: errlog.write(_ensure_stream(p, "stderr").read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         errlog.flush(); errlog.seek(0); print(errlog.read()[-1500:])
         engine_diag(p)        # perche' e' morto (OOM-kill compreso); errlog e' gia' stampato sopra
         sys.exit("the engine exited while loading")
-    p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
+    _ensure_stream(p, "stdout").readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
                           # left unread it leaks into the first answer's text
     # READY received. Drain the child's stderr into errlog without blocking:
     # the engine is still alive (blocked on stdin), so a plain read() would
@@ -1981,7 +2007,7 @@ def cmd_chat(a):
     # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
     _drain_box={"done":False}
     def _drain():
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        try: errlog.write(_ensure_stream(p, "stderr").read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         _drain_box["done"]=True
     threading.Thread(target=_drain, daemon=True).start()
@@ -2483,7 +2509,7 @@ def resource_request(a, env):
     def num(v):
         try: return float(v)
         except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
-    ram=a.ram or num(env.get("RAM_GB",0))
+    ram=getattr(a, "ram", None) or num(env.get("RAM_GB",0))
     vram=a.vram or num(env.get("CUDA_EXPERT_GB",0))
     gpu=a.gpu
     if gpu is None:
@@ -2522,15 +2548,15 @@ def env_for(a):
         e.setdefault("DIRECT", "1")
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
-    e["COLI_POLICY"]=a.policy
-    if a.ram:  e["RAM_GB"]=str(a.ram)
-    if a.ngen: e["NGEN"]=str(a.ngen)
-    if a.topp: e["TOPP"]=str(a.topp)
-    if a.topk: e["TOPK"]=str(a.topk)
-    if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    e["COLI_POLICY"]=getattr(a, "policy", None)
+    if getattr(a, "ram", None):  e["RAM_GB"]=str(getattr(a, "ram"))
+    if getattr(a, "ngen", None): e["NGEN"]=str(getattr(a, "ngen"))
+    if getattr(a, "topp", None): e["TOPP"]=str(getattr(a, "topp"))
+    if getattr(a, "topk", None): e["TOPK"]=str(getattr(a, "topk"))
+    if getattr(a, "temp", None) is not None: e["COLI_TEMP"]=str(getattr(a, "temp"))   # 0 = greedy; default motore: 1.0 + nucleus 0.95
                                                         # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
-    if a.repin: e["REPIN"]=str(a.repin)
-    if a.ctx: e["CTX"]=str(a.ctx)
+    if getattr(a, "repin", None): e["REPIN"]=str(getattr(a, "repin"))
+    if getattr(a, "ctx", None): e["CTX"]=str(getattr(a, "ctx"))
     if getattr(a, "no_kv_save", False):
         e["KVSAVE"] = "0"
     if getattr(a, "no_autopin", False):
@@ -2539,20 +2565,20 @@ def env_for(a):
         e["KVSAVE"] = "0"
         e["AUTOPIN"] = "0"
         e["COLI_PERSIST"] = "0"
-    if a.auto_tier:
+    if getattr(a, "auto_tier", False):
         from resource_plan import build_plan, environment_for_plan, format_bytes
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            if a.gpu=="none":
+            if getattr(a, "gpu")=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else: e.pop("COLI_CUDA",None)
         elif e.get("COLI_CUDA")=="0":
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
-        if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
+        if getattr(a, "vram", None) and getattr(a, "gpu", None)!="none": e["CUDA_EXPERT_GB"]=str(getattr(a, "vram"))
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -2575,8 +2601,8 @@ def env_for(a):
         # engine's "CPU" rows were GPU-assisted). --gpu none remains the
         # canonical hard off-switch (works on every platform, also clears the
         # CUDA_* sizing vars).
-        if (sys.platform == "win32" and a.gpu is None and not a.vram
-                and e.get("COLI_CUDA") != "0"):
+        if (sys.platform == "win32" and getattr(a, "gpu", None) is None and not getattr(a, "vram", None)
+            and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
                 from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
                 gpus = discover_gpus()
@@ -2588,7 +2614,7 @@ def env_for(a):
                     # as --auto-tier, just without requiring the user to pass it.
                     ram,ctx,devices,vram_req = resource_request(a, e)
                     try:
-                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=getattr(a, "policy", None))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
                         names=",".join(g["name"].strip() for g in gpus)
@@ -2612,20 +2638,20 @@ def env_for(a):
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
-            if a.gpu=="none":
+            if getattr(a, "gpu")=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
-                if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
+                if getattr(a, "gpu")!="auto": e["COLI_GPUS"]=getattr(a, "gpu")
                 e.setdefault("CUDA_DENSE","1")
-        if a.vram and a.gpu!="none":
+        if getattr(a, "vram", None) and getattr(a, "gpu", None)!="none":
             if not cuda_binary():
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
-            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
+            e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(getattr(a, "vram"))
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -2769,9 +2795,12 @@ def stream_turn(p, sentinel, on_bytes):
     chiude il turno per la via del tetto NGEN e noi dreniamo fino alla sentinella.
     Un SECONDO Ctrl-C esce davvero."""
     pend=b""; interrupted=False
+    if getattr(p, 'stdout', None) is None:
+        return {}
+    reader=p.stdout
     while True:
         try:
-            b=p.stdout.read(1)
+            b=reader.read(1)
         except KeyboardInterrupt:
             if interrupted or p.poll() is not None: raise
             interrupted=True
@@ -2784,7 +2813,7 @@ def stream_turn(p, sentinel, on_bytes):
         if pend.endswith(sentinel):
             rest=pend[:-len(sentinel)]
             if rest: on_bytes(rest)
-            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
+            line=reader.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
             if interrupted: st["interrupted"]=True
@@ -2828,9 +2857,11 @@ def cmd_info(a):
         row("disk", "? GB (unavailable)")
     row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
     knobs=[]
-    if a.ram: knobs.append(f"ram {a.ram}GB")
-    if a.topp: knobs.append(f"topp {a.topp}")
-    if a.topk: knobs.append(f"topk {a.topk}")
+    ram=getattr(a, "ram", None)
+    topp=getattr(a, "topp", None)
+    if ram: knobs.append(f"ram {ram}GB")
+    if topp: knobs.append(f"topp {topp}")
+    if getattr(a, "topk", None): knobs.append(f"topk {getattr(a, 'topk')}")
     if knobs: row("tuning", " · ".join(knobs))
     print()
 
@@ -2839,8 +2870,8 @@ def cmd_plan(a):
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
-        if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+        if getattr(a, "vram", 0) < 0: raise ValueError("--vram cannot be negative")
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=getattr(a, "policy", None))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -3007,8 +3038,44 @@ def cmd_chat(a):
             chat_attached(a, base, mid); return
         if getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
+    arch=model_arch(a.model)
+    if arch!="glm":
+        engine=engine_for(a.model)
+        need_model(a.model,engine)
+        model_id="kimi-k3-colibri" if arch=="kimi" else "inkling-colibri"
+        banner(f"chat · {model_id} · local server")
+        import openai_server
+        # --cap rides along so an explicit `coli chat --cap N` reaches the
+        # engine (it was silently eaten for years -- disclosed behavior
+        # change); absent stays absent, and openai_server translates the
+        # missing flag per model arch (cap_for_arch, #379: non-glm gets the
+        # legacy 8, an explicit value -- 0 included -- passes verbatim).
+        cmd=[sys.executable,openai_server.__file__,"--model",a.model,
+             "--engine",engine,"--arch",arch,"--model-id",model_id,
+             "--host","127.0.0.1","--port","8000","--max-tokens",str(a.ngen)]
+        if a.cap is not None: cmd+=["--cap",str(a.cap)]
+        if a.api_key: cmd+=["--api-key",a.api_key]
+        p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
+        try:
+            sp=Spinner(f"loading {model_id}…"); sp.start()
+            for _ in range(1800):
+                if p.poll() is not None:
+                    sp.stop(); sys.exit(f"{model_id} server exited while loading")
+                if server_probe("http://127.0.0.1:8000",a.api_key,timeout=1.0):
+                    sp.stop()
+                    chat_attached(a,"http://127.0.0.1:8000",model_id)
+                    return
+                time.sleep(1)
+            sp.stop(); sys.exit(f"timed out loading {model_id}")
+        finally:
+            if p.poll() is None:
+                p.terminate()
+                try: p.wait(timeout=10)
+                except subprocess.TimeoutExpired: p.kill()
     need_model(a.model)
-    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
+    ram=getattr(a, "ram", None)
+    topp=getattr(a, "topp", None)
+    banner(f"chat · {os.path.basename(a.model)} · ram {ram or '-'}GB · topp {topp or 'off'}")
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
@@ -3021,18 +3088,18 @@ def cmd_chat(a):
     # once the READY sentinel arrives, so the status-line display below works
     # exactly as before. (Do NOT add a concurrent stderr drain thread: on
     # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
-    p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
+    p=subprocess.Popen([GLM,str(a.cap if a.cap is not None else 0)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        try: errlog.write(_ensure_stream(p, 'stderr').read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         errlog.flush(); errlog.seek(0); print(errlog.read()[-1500:])
         engine_diag(p)        # perche' e' morto (OOM-kill compreso); errlog e' gia' stampato sopra
         sys.exit("the engine exited while loading")
-    p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
+    _ensure_stream(p, 'stdout').readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
                           # left unread it leaks into the first answer's text
     # READY received. Drain the child's stderr into errlog without blocking:
     # the engine is still alive (blocked on stdin), so a plain read() would
@@ -3040,7 +3107,7 @@ def cmd_chat(a):
     # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
     _drain_box={"done":False}
     def _drain():
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        try: errlog.write(_ensure_stream(p, "stderr").read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         _drain_box["done"]=True
     threading.Thread(target=_drain, daemon=True).start()

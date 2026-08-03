@@ -1,0 +1,13 @@
+
+[bench]
+tokenizers
+datasets
+
+[convert]
+numpy
+huggingface_hub
+
+[oracle]
+torch>=2.0
+transformers>=4.40
+safetensors
