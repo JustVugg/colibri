@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: make check
         run: make -C c check
+      - name: Build hy3 engine
+        run: make -C c hy3
 
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64
@@ -37,6 +39,9 @@ jobs:
       - name: make check
         run: make -C c check
 
+      - name: Build hy3 engine
+        run: make -C c hy3
+
       # The Windows engine as this branch builds it. Small, and it makes an
       # antivirus false-positive report (#527) verifiable on a PR instead of
       # only after a release is tagged and published.
@@ -55,3 +60,5 @@ jobs:
         run: brew install libomp
       - name: make check
         run: make -C c check
+      - name: Build hy3 engine
+        run: make -C c hy3

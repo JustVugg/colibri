@@ -418,4 +418,34 @@ static inline int coli_stdin_readable(void)
 }
 #endif
 
+/* --- coli_serve_binary_mode: stdin/stdout in BINARY per il protocollo di serve ---
+ *
+ * I motori parlano un protocollo a BYTE con `coli`:
+ *   stdout  \x01\x01READY\x01\x01\n, righe STAT, \x01\x01END\x01\x01\n
+ *   stdin   righe di testo piu' i byte di controllo \x02RESET / \x02MORE
+ * Il gateway confronta i sentinella con endswith() e una regex "^STAT ...", quindi
+ * devono arrivare ESATTI (LF, senza CR).
+ *
+ * Su Windows il CRT apre entrambi gli handle in modalita' TEXT: stdout traduce
+ * '\n' -> '\r\n' (il sentinella READY non combacia MAI e la chat si blocca senza
+ * errore), e stdin traduce '\r\n' -> '\n' e rifiuta la scrittura di byte grezzi con
+ * EINVAL, rompendo il protocollo di controllo. (#195)
+ *
+ * colibri.c lo fa da sempre; inkling.c e kimi_k3.c sono nati senza, e nessuno se n'e'
+ * accorto finche' le release binarie non hanno iniziato a contenere quei motori
+ * (#720 -> #748: Kimi K3 su Windows caricava 93 layer in 42 minuti e poi restava
+ * fermo per sempre, perche' il gateway aspettava un byte gia' storpiato).
+ * Sta QUI e non copiato in ogni motore: e' esattamente cosi' che era sparito.
+ * hy3.c is the fourth engine — call this before emitting READY (#748).
+ *
+ * No-op su Linux/macOS. */
+static inline void coli_serve_binary_mode(void)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+}
+
 #endif /* COMPAT_H */

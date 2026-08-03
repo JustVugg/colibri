@@ -51,9 +51,13 @@ class DoctorTest(unittest.TestCase):
             ("model.layers.1.mlp.experts.1.gate_proj.weight", 30),
             ("model.layers.1.mlp.experts.1.up_proj.weight", 30),
         ])
-        self.engine = self.root / "glm"
-        self.engine.write_text("#!/bin/sh\nexit 0\n")
-        self.engine.chmod(0o755)
+        if sys.platform == "win32":
+            self.engine = self.root / "glm.exe"
+            self.engine.write_bytes(b"MZ\x90\x00fixture")
+        else:
+            self.engine = self.root / "glm"
+            self.engine.write_text("#!/bin/sh\nexit 0\n")
+            self.engine.chmod(0o755)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -105,8 +109,13 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(exit_code(report), 1)
 
     def test_non_executable_engine_and_excessive_ram_budget_fail(self):
-        self.engine.chmod(0o644)
-        report = self.report(ram_gb=40)
+        if sys.platform == "win32":
+            engine = self.root / "not-an-engine.bin"
+            engine.write_bytes(b"not a PE binary")
+        else:
+            self.engine.chmod(0o644)
+            engine = self.engine
+        report = self.report(ram_gb=40, engine_path=engine)
         checks = self.checks_by_id(report)
 
         # On Windows chmod(0o644) does not remove executability (NTFS has no

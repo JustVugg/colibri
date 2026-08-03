@@ -1529,6 +1529,7 @@ static void serve_tiers_emap(Model *m) {
 }
 
 static void serve_loop(Model *m, Tok *T) {
+    coli_serve_binary_mode();   /* #748: TEXT-mode stdout mangles the READY sentinel */
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);

@@ -6,6 +6,16 @@
 #include <cstdlib>
 #include <vector>
 
+#ifdef _WIN32
+static int coli_test_setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name, value);
+}
+static int coli_test_unsetenv(const char *name) { return _putenv_s(name, ""); }
+#define setenv coli_test_setenv
+#define unsetenv coli_test_unsetenv
+#endif
+
 static double run(ColiCudaTensor *g,ColiCudaTensor *u,ColiCudaTensor *d,
                   const float *x,float *y,int rows,int iterations,int mode){
     ColiCudaTensor *gs[1]={g},*us[1]={u},*ds[1]={d}; int rs[1]={rows};

@@ -20,7 +20,8 @@ hierarchy.
 
 Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 (2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
-`coli serve` / `coli web` front end. [Full roster ↓](#other-supported-models)
+`coli serve` / `coli web` front end. **Hy3** (Tencent, 295B) is also supported
+as a sibling engine. [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
 > platform.** Its primary goal is to pursue inference-side performance across
@@ -368,6 +369,7 @@ the model's `config.json`):
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
+| **Hy3** (Tencent) | 295B / 21B | [UnderstandLing/Hy3-colibri-int4](https://huggingface.co/UnderstandLing/Hy3-colibri-int4) (~142 GB) | `make -C c hy3` | [hy3.md](docs/hy3.md) |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
@@ -403,10 +405,12 @@ changes between models**. Build the engine you want once, then just point
 make -C c glm                                     # GLM-5.2
 make -C c inkling                                 # Inkling
 make -C c kimi_k3                                 # Kimi K3
+make -C c hy3                                     # Hy3
 
 COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
 COLI_MODEL=/nvme/inkling_i4    ./coli chat
 COLI_MODEL=/nvme/kimi_k3       ./coli chat
+COLI_MODEL=/nvme/hy3_i4        ./coli chat
 
 ./coli web --model /nvme/inkling_i4               # API + dashboard, same port
 ./coli web --model /nvme/kimi_k3

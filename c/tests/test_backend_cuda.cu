@@ -7,11 +7,13 @@
 #include <cstring>
 
 #ifdef _WIN32
-/* MSVC has no POSIX setenv/unsetenv */
-static int setenv(const char *name, const char *value, int overwrite) {
-    (void)overwrite; return _putenv_s(name, value);
+static int coli_test_setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name, value);
 }
-static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+static int coli_test_unsetenv(const char *name) { return _putenv_s(name, ""); }
+#define setenv coli_test_setenv
+#define unsetenv coli_test_unsetenv
 #endif
 
 static int close_enough(const float *got, const float *want, int n) {

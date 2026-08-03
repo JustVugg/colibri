@@ -137,12 +137,21 @@ def sprite_lines():
         out.append(row+"\033[0m")
     return out
 
-def banner(sub=""):
+def banner(sub="", model=None):
     sp=sprite_lines()
+    tag = f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}"
+    if model and os.path.isdir(model):
+        arch = model_arch(model)
+        if arch == "hy3":
+            tag = f"{C.gray}Hy3 · 295B MoE · int4 · streaming CPU{C.r}"
+        elif arch == "inkling":
+            tag = f"{C.gray}Inkling · 975B MoE · int4 · streaming CPU{C.r}"
+        elif arch == "kimi":
+            tag = f"{C.gray}Kimi K3 · 2.8T MoE · MXFP4 · streaming CPU{C.r}"
     txt=[
         f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
-        f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
+        tag,
         f"{C.dgray}{sub}{C.r}" if sub else "",
         "",
     ]
@@ -163,19 +172,46 @@ def model_arch(model):
             model_type = (json.load(f).get("model_type") or "").lower()
     except (OSError, ValueError, TypeError):
         return "glm"
+    if model_type == "hy_v3" or "hy_v3" in model_type:
+        return "hy3"
     if "inkling" in model_type:
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
     return "glm"
 
+_ENGINE_NAMES = {"inkling": "inkling", "kimi": "kimi_k3", "hy3": "hy3"}
+
 def engine_for(model):
     arch = model_arch(model)
     if arch == "glm" or os.environ.get("COLI_ENGINE"):
         return GLM
-    name = "inkling" if arch == "inkling" else "kimi_k3"
+    name = _ENGINE_NAMES[arch]
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
+
+def argv_for_arch(arch, cap):
+    """Engine argv tail after the executable path."""
+    cap = cap_for_arch(arch, cap)
+    if arch == "hy3":
+        return [str(cap), "4", "8"]
+    return [str(cap)]
+
+def model_config(model):
+    path = os.path.join(model, "config.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def is_hy3_repo(repo):
+    if os.path.isdir(repo):
+        return model_config(repo).get("model_type") == "hy_v3"
+    r = repo.lower()
+    return "hy3" in r or repo.startswith("tencent/Hy")
 
 def need_model(model, engine=None):
     if not model:
@@ -187,15 +223,25 @@ def need_model(model, engine=None):
     engine = engine or engine_for(model)
     if not os.path.exists(engine):
         arch = model_arch(model)
-        target = "kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else "colibri"
+        target = _ENGINE_NAMES.get(arch, "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
+
+def cap_for_arch(arch, cap):
+    """Cap-sentinel shim shared with openai_server.py."""
+    if cap is not None:
+        return cap
+    return 0 if arch == "glm" else 8
 
 def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
     env = os.environ.copy()
-    if a.ngen: env["NGEN"] = str(a.ngen)
-    if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
+    if arch == "hy3" and "IDOT" not in env:
+        env["IDOT"] = "0"
+    if a.ngen:
+        env["NGEN"] = str(a.ngen)
+    if a.temp is not None:
+        env["COLI_TEMP"] = str(a.temp)
     return env
 
 def cuda_binary():
@@ -265,6 +311,8 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    if model_arch(a.model) == "hy3" and "IDOT" not in e:
+        e["IDOT"] = "0"
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -541,10 +589,10 @@ def cmd_build(a):
     if not os.path.exists(os.path.join(HERE, "Makefile")):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
-    sys.exit(subprocess.call(["make","-C",HERE,"colibri"]))
+    sys.exit(subprocess.call(["make","-C",HERE,"colibri","hy3"]))
 
 def cmd_info(a):
-    banner("info")
+    banner("info", a.model)
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     cfgp=os.path.join(a.model,"config.json")
@@ -570,7 +618,7 @@ def cmd_info(a):
         row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
         row("disk", "? GB (unavailable)")
-    row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
+    row("engine", "ready ✓" if os.path.exists(engine_for(a.model)) else f"not built (make -C c {_ENGINE_NAMES.get(model_arch(a.model), 'colibri')})")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -614,7 +662,7 @@ def cmd_doctor(a):
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
     report=run_doctor(
-        a.model, ram, ctx, devices, vram, engine_path=GLM, deep=a.deep,
+        a.model, ram, ctx, devices, vram, engine_path=engine_for(a.model), deep=a.deep,
         mirror_dir=os.environ.get("COLI_MODEL_MIRROR"),
     )
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
@@ -804,8 +852,9 @@ def cmd_chat(a):
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id="kimi-k3-colibri" if arch=="kimi" else "inkling-colibri"
-        banner(f"chat · {model_id} · local server")
+        model_id = {"kimi": "kimi-k3-colibri", "inkling": "inkling-colibri",
+                    "hy3": "hy3-colibri"}.get(arch, "glm-5.2-colibri")
+        banner(f"chat · {model_id} · local server", a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
         # engine (it was silently eaten for years -- disclosed behavior
@@ -984,8 +1033,8 @@ def cmd_serve(a):
     except OSError: pass
     import openai_server
     openai_server.ARCH=arch
-    model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
-                            "inkling-colibri" if arch=="inkling" else "glm-5.2-colibri")
+    model_id=a.model_id or {"kimi": "kimi-k3-colibri", "inkling": "inkling-colibri",
+                            "hy3": "hy3-colibri"}.get(arch, "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
               a.cap,a.ngen,engine,env_for_engine(a,arch),a.cors_origin,
@@ -1017,7 +1066,7 @@ def cmd_stop(a):
             if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3"):
+            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","hy3"):
                 env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
                 if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue
@@ -1094,25 +1143,27 @@ def cmd_bench(a):
 
 def cmd_convert(a):
     banner("convert")
-    # here --model is the DESTINATION the converted weights are written to, not an
-    # existing snapshot, so it needs its own wording rather than need_model's.
     if not a.model:
         sys.exit(f"{C.yel}no output directory given.{C.r}\n"
                  f"  --model <dir> is where the converted model is written")
-    # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
-    base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
+    is_hy3 = is_hy3_repo(a.repo)
+    script = "convert_hy3.py" if is_hy3 else "convert_fp8_to_int4.py"
+    base=[py, os.path.join(TOOLS, script),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
           "--group-size", str(a.group_size)]
-    if a.xbits: base+=["--xbits",str(a.xbits)]
-    # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
+    if a.xbits:
+        base += ["--xbits", str(a.xbits)]
+    if is_hy3:
+        n_layers = str(model_config(a.repo).get("num_hidden_layers", 80)) if os.path.isdir(a.repo) else "80"
+        base += ["--n-layers", n_layers]
+        print(f"  {C.dim}Hy3 convert: {' '.join(base)}{C.r}")
+        sys.exit(subprocess.call(base))
     print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
     rc=subprocess.call(base)
     if rc!=0: sys.exit(rc)
     if a.no_mtp: sys.exit(0)
-    # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
-    # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
     mtp_cmd=list(base); i=mtp_cmd.index("--ebits"); mtp_cmd[i+1]=str(max(8,a.ebits))
     print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))

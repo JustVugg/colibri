@@ -1552,6 +1552,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
 }
 
 static void serve_loop(Model *m, Tok *T){
+    coli_serve_binary_mode();   /* #748: TEXT-mode stdout mangles the READY sentinel */
     setvbuf(stdin,NULL,_IONBF,0);
     fputs("\x01\x01READY\x01\x01\n",stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n",rss_gb());

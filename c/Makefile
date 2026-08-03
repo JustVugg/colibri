@@ -111,6 +111,25 @@ EXE     =
 endif
 endif
 
+# Optional io_uring async expert reads (PIPE=2). Set IOURING_PREFIX to a liburing
+# install prefix, or IOURING=1 to auto-probe /usr and /tmp/liburing-install.
+IOURING       ?= 0
+IOURING_PREFIX ?=
+IOURING_CFLAGS  =
+IOURING_LDFLAGS =
+ifeq ($(IOURING),1)
+ifneq ($(IOURING_PREFIX),)
+IOURING_CFLAGS  = -DCOLI_IOURING -I$(IOURING_PREFIX)/include
+IOURING_LDFLAGS = -L$(IOURING_PREFIX)/lib -luring
+else ifneq ($(wildcard /tmp/liburing-install/include/liburing.h),)
+IOURING_CFLAGS  = -DCOLI_IOURING -I/tmp/liburing-install/include
+IOURING_LDFLAGS = -L/tmp/liburing-install/lib -Wl,-rpath,/tmp/liburing-install/lib -luring
+else ifneq ($(wildcard /usr/include/liburing.h),)
+IOURING_CFLAGS  = -DCOLI_IOURING
+IOURING_LDFLAGS = -luring
+endif
+endif
+
 # --- install ---
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -182,6 +201,10 @@ endif
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
 # machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
 HIP       ?= 0
+ROCM      ?= 0
+ifeq ($(ROCM),1)
+HIP := 1
+endif
 ROCM_HOME ?= /opt/rocm
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
 HIP_ARCH  ?= native
@@ -332,11 +355,16 @@ VK_OBJ    = backend_vulkan.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
 endif
 
+HY3_INPUT = hy3.c
+
 all: colibri$(EXE)
 
 # phony targets — 'glm' kept for backward compatibility
 colibri: colibri$(EXE)
 glm: colibri$(EXE)
+ifneq ($(EXE),)
+hy3: hy3$(EXE)
+endif
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
 # `make colibri.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date"
@@ -345,7 +373,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|IOURING=$(IOURING)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -367,6 +395,9 @@ backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+
+hy3$(EXE): $(HY3_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) .build-config
+	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(HY3_INPUT) $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -488,6 +519,9 @@ portable:
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
+
+tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -674,12 +708,13 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE)
+install: colibri$(EXE) hy3$(EXE) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
+	$(INSTALL) -m 755 hy3$(EXE) $(DESTDIR)$(LIBEXECDIR)/hy3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
@@ -699,7 +734,8 @@ uninstall:
 
 clean:
 	$(PYTHON) tools/clean.py
+	rm -f hy3$(EXE)
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm hy3 iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

@@ -1,7 +1,6 @@
-# Deps for the Inkling tiny-model oracle (tools/make_tiny_inkling.py) — the
-# ci.yml `inkling-oracle` job installs exactly this file, and setup-python
-# hashes it for the pip cache key. CPU torch: the oracle is a tiny random-init
-# model, no GPU wanted.
+# Deps for tiny-model oracles (Inkling: make_tiny_inkling.py; Hy3: make_hy3_oracle.py).
+# ci.yml `inkling-oracle` and `hy3-oracle` install exactly this file; setup-python
+# hashes it for the pip cache key. CPU torch: random-init fixtures, no GPU wanted.
 --index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://pypi.org/simple
 torch

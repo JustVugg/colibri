@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build colibri + inkling
-        run: cd c && make colibri inkling
+      - name: Build engines
+        run: cd c && make colibri hy3 inkling
       - name: C test suite
         run: cd c && make test-c
 
@@ -59,7 +59,7 @@ jobs:
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3 olmoe; do
+          for t in colibri inkling kimi_k3 olmoe hy3; do
             echo "::group::$t"
             make $t || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
@@ -121,6 +121,29 @@ jobs:
           # gate fails the moment a shared-code change regresses the engine.
           python3 tools/make_tiny_inkling.py tiny_inkling
           SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_inkling.json
+
+  hy3-oracle:
+    name: Hy3 oracle (teacher-forcing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build hy3
+        run: cd c && make hy3
+      - name: Tiny-model fixture + teacher-forcing oracle (fp32, 32/32 positions)
+        run: |
+          cd c
+          # Random-init HYV3ForCausalLM via HF transformers (see make_hy3_oracle.py).
+          # Weights are not committed (*.safetensors is gitignored); regenerate here
+          # like inkling-oracle does for tiny_inkling/.
+          python3 tools/make_hy3_oracle.py
+          SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
 
   engine-hip-syntax:
     name: HIP syntax check

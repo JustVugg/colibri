@@ -22,6 +22,9 @@ concurrency:
 
 jobs:
   deploy:
+    # GitHub Pages is configured on the upstream repo only; forks lack a Pages site
+    # and configure-pages fails with HTTP 404 until one is set up manually.
+    if: github.repository == 'JustVugg/colibri'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

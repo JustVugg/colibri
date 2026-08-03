@@ -35,6 +35,27 @@ def _check(identifier, status, summary, **details):
     return item
 
 
+def is_executable_file(path):
+    """Return whether *path* can be launched on the current platform."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    if os.name != "nt":
+        return os.access(path, os.X_OK)
+
+    # Windows ignores POSIX mode bits, so os.access(..., X_OK) reports true for
+    # ordinary readable files.  colibri's native build emits .exe; retain the
+    # script extensions accepted by CreateProcess and allow extensionless PE
+    # binaries as a useful cross-toolchain fallback.
+    if path.suffix.lower() in {".exe", ".com", ".bat", ".cmd"}:
+        return True
+    try:
+        with path.open("rb") as stream:
+            return stream.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
 def _json_object(pairs):
     result = {}
     for key, value in pairs:
@@ -347,38 +368,34 @@ def deep_container_report(model, mirror_dir=None):
 
 
 def cuda_linkage(engine_path):
-    """Return CUDA linkage state without loading the executable or CUDA runtime."""
+    """Return CUDA/ROCm linkage state without loading the runtime."""
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
-    if os.name == "posix":
+    if os.name == "nt":
         try:
-            result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
-                                    timeout=3, check=False)
-        except (OSError, subprocess.SubprocessError):
-            return {"linked": False, "missing": False}
-        # A HIP/ROCm build links libamdhip64 (never libcudart), so match both
-        # vendors here or a working AMD engine is reported CPU-only (#663). Mirrors
-        # the vendor-aware probe cuda_binary() already uses in c/coli.
-        lines = [line for line in result.stdout.splitlines()
-                 if "libcudart" in line or "libamdhip64" in line]
-        return {"linked": any("not found" not in line for line in lines),
-                "missing": any("not found" in line for line in lines)}
-    if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
-        try:
-            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+            data = engine.read_bytes()
         except OSError:
             return {"linked": False, "missing": False}
+        if b"amdhip64.dll" in data.lower():
+            return {"linked": True, "missing": False}
+        built = (b"[CUDA] mode: routed experts" in data or
+                 b"[ROCm] mode: routed experts" in data)
         if not built:
             return {"linked": False, "missing": False}
         dll_present = (engine.parent / "coli_cuda.dll").is_file()
         return {"linked": dll_present, "missing": not dll_present}
-    return {"linked": False, "missing": False}
+    if os.name != "posix":
+        return {"linked": False, "missing": False}
+    try:
+        result = subprocess.run(["ldd", str(engine_path)], capture_output=True, text=True,
+                                timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {"linked": False, "missing": False}
+    lines = [line for line in result.stdout.splitlines()
+             if "libcudart" in line or "libamdhip64" in line]
+    return {"linked": any("not found" not in line for line in lines),
+            "missing": any("not found" in line for line in lines)}
 
 
 def missing_shared_libraries(engine_path):

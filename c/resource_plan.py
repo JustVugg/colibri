@@ -242,34 +242,87 @@ def _discover_nvidia_gpus():
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return []
-    devices = []
-    import csv
-    for fields in csv.reader(result.stdout.splitlines()):
-        fields = [f.strip() for f in fields]
-        if len(fields) != 4:
-            continue
-        try:
-            index = int(fields[0])
-        except ValueError:
-            continue
-        # Unified-memory chips (e.g. NVIDIA GB10 Grace Blackwell) have no
-        # discrete VRAM pool, so nvidia-smi reports memory.total/memory.free
-        # as "[N/A]" rather than a number. Fall back to system RAM figures
-        # in that case instead of silently dropping the GPU from discovery.
-        try:
-            total, free = int(fields[2]), int(fields[3])
-        except ValueError:
+        result = None
+    if result is not None:
+        devices = []
+        import csv
+        for fields in csv.reader(result.stdout.splitlines()):
+            fields = [f.strip() for f in fields]
+            if len(fields) != 4:
+                continue
             try:
-                meminfo = Path("/proc/meminfo").read_text()
-                total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
-                free = memory_available() // (1024 * 1024)
-            except (OSError, AttributeError):
-                total = free = 0
-        devices.append({"index": index, "name": fields[1],
-                        "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024})
-    return devices
+                index = int(fields[0])
+            except ValueError:
+                continue
+            # Unified-memory chips (e.g. NVIDIA GB10 Grace Blackwell) have no
+            # discrete VRAM pool, so nvidia-smi reports memory.total/memory.free
+            # as "[N/A]" rather than a number. Fall back to system RAM figures
+            # in that case instead of silently dropping the GPU from discovery.
+            try:
+                total, free = int(fields[2]), int(fields[3])
+            except ValueError:
+                try:
+                    meminfo = Path("/proc/meminfo").read_text()
+                    total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
+                    free = memory_available() // (1024 * 1024)
+                except (OSError, AttributeError):
+                    total = free = 0
+            devices.append({"index": index, "name": fields[1],
+                            "total_bytes": total * 1024 * 1024,
+                            "free_bytes": free * 1024 * 1024})
+        if devices:
+            return devices
+
+    # ROCm fallback. rocm-smi's text format is stable across the supported
+    # releases, but its optional product-name fields are not; keep the name
+    # generic and only trust explicitly reported VRAM totals/usage.
+    try:
+        result = subprocess.run(["rocm-smi", "--showmeminfo", "vram"],
+                                text=True, capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is None:
+        # HIP SDK for Windows ships hipInfo instead of rocm-smi. It reports
+        # totalGlobalMem but not a reliable process-wide free value, so use the
+        # total as an upper bound; the engine still clamps uploads at runtime.
+        try:
+            result = subprocess.run(["hipInfo"], text=True, capture_output=True,
+                                    check=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        devices = []
+        blocks = re.split(r"(?=^\s*Name:\s*)", result.stdout, flags=re.MULTILINE)
+        for block in blocks:
+            name = re.search(r"^\s*Name:\s*(.+)$", block, flags=re.MULTILINE)
+            memory = re.search(r"totalGlobalMem:\s*([0-9.]+)\s*GB", block)
+            if not memory:
+                continue
+            total = int(float(memory.group(1)) * GB)
+            devices.append({"index": len(devices),
+                            "name": name.group(1).strip() if name else "AMD GPU",
+                            "total_bytes": total, "free_bytes": total})
+        return devices
+    devices = {}
+    current = None
+    for line in result.stdout.splitlines():
+        match = re.search(r"GPU\[(\d+)\]", line)
+        if match:
+            current = int(match.group(1))
+            devices.setdefault(current, {})
+        if current is None:
+            continue
+        number = re.search(r"(\d+)\s*$", line)
+        if not number:
+            continue
+        value = int(number.group(1))
+        if "VRAM Total Memory" in line:
+            devices[current]["total_bytes"] = value
+        elif "VRAM Total Used Memory" in line:
+            devices[current]["used_bytes"] = value
+    return [{"index": index, "name": f"AMD GPU {index}",
+             "total_bytes": item["total_bytes"],
+             "free_bytes": max(0, item["total_bytes"] - item.get("used_bytes", 0))}
+            for index, item in sorted(devices.items()) if "total_bytes" in item]
 
 
 def _discover_amd_gpus():
@@ -531,15 +584,22 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if ram_budget < 4 * GB:
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
-    layers = int(cfg.get("num_hidden_layers") or 0) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
-                                   int(cfg.get("qk_rope_head_dim") or 0)) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
-        int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
+    layers = int(cfg.get("num_hidden_layers", 0)) + 1
+    if cfg.get("model_type") == "hy_v3" or cfg.get("kv_lora_rank") is None:
+        hd = int(cfg.get("head_dim") or cfg.get("hidden_size", 0) // max(1, int(cfg.get("num_attention_heads", 1))))
+        n_kv = int(cfg.get("num_key_value_heads") or cfg.get("num_attention_heads", 0))
+        n_heads = int(cfg.get("num_attention_heads", 0))
+        kv_bytes = layers * context * n_kv * hd * 2 * 4
+        kv_buffer = context * n_heads * hd * 4
+    else:
+        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
+                                       int(cfg.get("qk_rope_head_dim", 0))) * 4
+        kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
+            int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts") or 0)
+    configured_experts = int(cfg.get("n_routed_experts") or cfg.get("num_experts") or 0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)

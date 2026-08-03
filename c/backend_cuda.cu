@@ -62,6 +62,7 @@ typedef struct {
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
+    float *gq,*gk,*gv,*gctx,*gsc; size_t gq_cap,gk_cap,gv_cap,gctx_cap,gsc_cap;
     cudaStream_t stream;
     cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
     void *group_desc; size_t group_desc_cap;
@@ -105,7 +106,7 @@ static double ans_now_s(){
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
-    std::fprintf(stderr, "[CUDA] %s: %s\n", what, cudaGetErrorString(err));
+    std::fprintf(stderr, COLI_ACCEL_TAG " %s: %s\n", what, cudaGetErrorString(err));
     (void)cudaGetLastError();   /* consume the sticky error: a failed call must
                                    not poison the next launch's error check */
     return 0;
@@ -597,6 +598,40 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k)*absorb_scale(wscale,fmt,gs,ng,row,k);ctx[(size_t)h*V+v]=a;}
 }
 
+#define GQA_MAX_NT 8192
+
+__global__ static void gqa_attn_kernel(float *ctx,const float *q,const float *k_cache,const float *v_cache,
+                                       float *scores,int S,int H,int Hkv,int hd,int st0,int pos_base,
+                                       int max_t,float scale,int nrep){
+    int h=blockIdx.x,s=blockIdx.y;
+    if(s>=S)return;
+    int kvh=h/nrep,pos=pos_base+s,nt=pos+1-st0;
+    if(nt<1||nt>GQA_MAX_NT)return;
+    float *sc=scores+((size_t)s*H+h)*GQA_MAX_NT;
+    const float *qv=q+((size_t)s*H+h)*hd;
+    for(int jj=threadIdx.x;jj<nt;jj+=blockDim.x){
+        int t=st0+jj; const float *kv=k_cache+((size_t)kvh*max_t+t)*hd;
+        float dot=0; for(int d=0;d<hd;d++) dot+=qv[d]*kv[d];
+        sc[jj]=dot*scale;
+    }
+    __syncthreads();
+    if(!threadIdx.x){
+        float mx=sc[0]; for(int i=1;i<nt;i++) mx=fmaxf(mx,sc[i]);
+        float sum=0; for(int i=0;i<nt;i++){ sc[i]=expf(sc[i]-mx); sum+=sc[i]; }
+        float inv=sum>0?1.f/sum:0.f; for(int i=0;i<nt;i++) sc[i]*=inv;
+    }
+    __syncthreads();
+    float *cx=ctx+((size_t)s*H+h)*hd;
+    for(int d=threadIdx.x;d<hd;d+=blockDim.x){
+        float acc=0;
+        for(int jj=0;jj<nt;jj++){
+            int t=st0+jj; const float *vv=v_cache+((size_t)kvh*max_t+t)*hd;
+            acc+=sc[jj]*vv[d];
+        }
+        cx[d]=acc;
+    }
+}
+
 __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         const float *latent,const float *rope,const void *weights,const float *wscale,
         int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale,
@@ -791,12 +826,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     for (int i = 0; i < count; i++) {
         int device = devices[i];
         if (device < 0 || device >= available) {
-            std::fprintf(stderr, "[CUDA] invalid device %d (available: 0..%d)\n", device, available - 1);
+            std::fprintf(stderr, COLI_ACCEL_TAG " invalid device %d (available: 0..%d)\n", device, available - 1);
             g_nctx = 0;
             return 0;
         }
         if (find_ctx(device)) {
-            std::fprintf(stderr, "[CUDA] duplicate device %d\n", device);
+            std::fprintf(stderr, COLI_ACCEL_TAG " duplicate device %d\n", device);
             g_nctx = 0;
             return 0;
         }
@@ -817,7 +852,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         }
 #endif
         g_nctx++;
-        std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
+        std::fprintf(stderr, COLI_ACCEL_TAG " device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                      device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     }
     return 1;
@@ -1679,6 +1714,29 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
     return cuda_ok(cudaGetLastError(),"ragged attention launch")&&
            cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"ragged output download")&&
            cuda_ok(cudaStreamSynchronize(dc->stream),"ragged attention synchronize");
+}
+
+extern "C" int coli_cuda_gqa_attention(float *ctx,const float *q,const float *k_cache,const float *v_cache,
+                                       int S,int H,int Hkv,int hd,int st0,int pos_base,int max_t,int device){
+    if(!ctx||!q||!k_cache||!v_cache||S<1||H<1||Hkv<1||hd<1||max_t<1||H%Hkv)return 0;
+    int nrep=H/Hkv,max_pos=pos_base+S-1,nt=max_pos+1-st0;
+    if(nt<1||nt>GQA_MAX_NT)return 0;
+    DeviceContext *dc=find_ctx(device); if(!select_ctx(dc)) return 0;
+    float scale=1.f/sqrtf((float)hd);
+    size_t qb=(size_t)S*H*hd*sizeof(float),kb=(size_t)Hkv*max_t*hd*sizeof(float);
+    size_t cb=qb,sb=(size_t)S*H*GQA_MAX_NT*sizeof(float);
+    if(!reserve(&dc->gq,&dc->gq_cap,qb)||!reserve(&dc->gk,&dc->gk_cap,kb)||
+       !reserve(&dc->gv,&dc->gv_cap,kb)||!reserve(&dc->gctx,&dc->gctx_cap,cb)||
+       !reserve(&dc->gsc,&dc->gsc_cap,sb)) return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->gq,q,qb,cudaMemcpyHostToDevice,dc->stream),"gqa q upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->gk,k_cache,kb,cudaMemcpyHostToDevice,dc->stream),"gqa k upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->gv,v_cache,kb,cudaMemcpyHostToDevice,dc->stream),"gqa v upload")) return 0;
+    dim3 grid(H,S);
+    gqa_attn_kernel<<<grid,256,0,dc->stream>>>(dc->gctx,dc->gq,dc->gk,dc->gv,dc->gsc,S,H,Hkv,hd,st0,pos_base,max_t,scale,nrep);
+    if(!cuda_ok(cudaGetLastError(),"gqa attention launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx,dc->gctx,cb,cudaMemcpyDeviceToHost,dc->stream),"gqa ctx download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"gqa attention synchronize")) return 0;
+    return 1;
 }
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
