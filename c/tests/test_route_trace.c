@@ -14,32 +14,41 @@
 #include "../route_trace.h"
 
 static int g_nfails = 0;
-static void check(int cond, const char *what){
-    if(!cond){ printf("FAIL: %s\n", what); g_nfails++; }
+static void check(int cond, const char *what) {
+    if (!cond) {
+        printf("FAIL: %s\n", what);
+        g_nfails++;
+    }
 }
 
 #define TMP "test_route_trace.tmp"
 
-static long fsize(const char *p){
+static long fsize(const char *p) {
     FILE *f = fopen(p, "rb");
-    if(!f) return -1;
+    if (!f) return -1;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fclose(f);
     return n;
 }
-static void zero_counts(void){
-    for(int l = 0; l <= rt_nl; l++)
-        if(rt_counts(l)) memset(rt_counts(l), 0, (size_t)rt_ne * sizeof(uint32_t));
+static void zero_counts(void) {
+    for (int l = 0; l <= rt_nl; l++)
+        if (rt_counts(l)) memset(rt_counts(l), 0, (size_t)rt_ne * sizeof(uint32_t));
 }
-static int64_t g_sum; static int g_recs;
+static int64_t g_sum;
+static int g_recs;
 /* accepts everything, to observe what the reader hands out before any admission rule */
-static int sum_cb(int l, int e, uint32_t c, void *ud){
-    (void)l; (void)e; (void)ud; g_sum += c; g_recs++; return 1;
+static int sum_cb(int l, int e, uint32_t c, void *ud) {
+    (void)l;
+    (void)e;
+    (void)ud;
+    g_sum += c;
+    g_recs++;
+    return 1;
 }
 
-int main(void){
-    rt_init("glm_moe_dsa", 5, 8);                /* 5 layers + the MTP row, 8 experts */
+int main(void) {
+    rt_init("glm_moe_dsa", 5, 8); /* 5 layers + the MTP row, 8 experts */
     check(rt_counts(0) != NULL, "rt_init allocates row 0");
     check(rt_counts(5) != NULL, "rt_init allocates the inclusive last row");
     check(rt_counts(6) == NULL, "rt_init does not allocate past n_layers");
@@ -55,7 +64,7 @@ int main(void){
     /* 2. with counts, the header appears and the data section is the sparse triples */
     int ids[3] = {2, 5, 7};
     rt_count(3, ids, 3);
-    rt_count(3, ids, 1);                          /* expert 2 twice */
+    rt_count(3, ids, 1); /* expert 2 twice */
     check(rt_save(TMP, 1) == 1, "history with counts writes");
     {
         char buf[512] = {0};
@@ -65,7 +74,7 @@ int main(void){
          * about the RECORDS rather than about the platform's line terminator. */
         FILE *f = fopen(TMP, "r");
         size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
-        if(f) fclose(f);
+        if (f) fclose(f);
         check(n > 0, "history is non-empty");
         check(strstr(buf, "-1 5 8\n") == buf, "first record is the dimensions");
         check(strstr(buf, "\n-2 1 ") != NULL, "second record is version then engine id");
@@ -110,7 +119,8 @@ int main(void){
         FILE *f = fopen(TMP, "w");
         fprintf(f, "-1 99 512\n3 2 2\n");
         fclose(f);
-        g_sum = 0; g_recs = 0;
+        g_sum = 0;
+        g_recs = 0;
         check(rt_read(TMP, sum_cb, NULL) == -1, "wrong dimensions are refused");
         check(g_recs == 0, "a refused file yields no records");
     }
@@ -129,7 +139,7 @@ int main(void){
     /* 7. inkling's IKU1 layout is refused by any engine that is not inkling */
     {
         FILE *f = fopen(TMP, "wb");
-        uint32_t hdr[3] = { RT_IKU1_MAGIC, 5, 8 };
+        uint32_t hdr[3] = {RT_IKU1_MAGIC, 5, 8};
         uint32_t body[5 * 8];
         memset(body, 0, sizeof(body));
         fwrite(hdr, 4, 3, f);
@@ -144,14 +154,15 @@ int main(void){
     {
         const char *save_engine = rt_engine;
         uint32_t save_id = rt_id;
-        rt_engine = "inkling"; rt_id = rt_hash("inkling");
+        rt_engine = "inkling";
+        rt_id = rt_hash("inkling");
 
         FILE *f = fopen(TMP, "wb");
-        uint32_t hdr[3] = { RT_IKU1_MAGIC, 5, 8 };      /* must match rt_nl / rt_ne */
+        uint32_t hdr[3] = {RT_IKU1_MAGIC, 5, 8}; /* must match rt_nl / rt_ne */
         uint32_t body[5 * 8];
         memset(body, 0, sizeof(body));
-        body[3 * 8 + 2] = 7;                            /* layer 3, expert 2 -> 7 */
-        body[1 * 8 + 5] = 4;                            /* layer 1, expert 5 -> 4 */
+        body[3 * 8 + 2] = 7; /* layer 3, expert 2 -> 7 */
+        body[1 * 8 + 5] = 4; /* layer 1, expert 5 -> 4 */
         fwrite(hdr, 4, 3, f);
         fwrite(body, 4, 5 * 8, f);
         fclose(f);
@@ -162,7 +173,8 @@ int main(void){
         check(rt_counts(1)[5] == 4, "IKU1 decode places layer 1 / expert 5");
         check(rt_counts(0)[0] == 0, "IKU1 decode leaves the zeros alone");
 
-        rt_engine = save_engine; rt_id = save_id;
+        rt_engine = save_engine;
+        rt_id = save_id;
     }
 
     /* 8. THE CONTRACT: a reader written against the old format must recover exactly the
@@ -175,18 +187,24 @@ int main(void){
         rt_count(5, ids, 2);
         check(rt_save(TMP, 1) == 1, "contract fixture writes");
 
-        int64_t legacy_tot = 0; int legacy_recs = 0;
-        FILE *f = fopen(TMP, "r");                /* exactly as the old readers open it */
-        int l, e; uint32_t cnt;
-        while(f && fscanf(f, "%d %d %u", &l, &e, &cnt) == 3)
-            if(l >= 0 && l <= 5 && e >= 0 && e < 8){ legacy_tot += cnt; legacy_recs++; }
-        if(f) fclose(f);
+        int64_t legacy_tot = 0;
+        int legacy_recs = 0;
+        FILE *f = fopen(TMP, "r"); /* exactly as the old readers open it */
+        int l, e;
+        uint32_t cnt;
+        while (f && fscanf(f, "%d %d %u", &l, &e, &cnt) == 3)
+            if (l >= 0 && l <= 5 && e >= 0 && e < 8) {
+                legacy_tot += cnt;
+                legacy_recs++;
+            }
+        if (f) fclose(f);
 
-        g_sum = 0; g_recs = 0;
+        g_sum = 0;
+        g_recs = 0;
         rt_read(TMP, sum_cb, NULL);
-        check(legacy_tot == g_sum,   "an old reader recovers the same total");
+        check(legacy_tot == g_sum, "an old reader recovers the same total");
         check(legacy_recs == g_recs, "an old reader recovers the same record count");
-        check(legacy_tot == 6,       "and that total is the one that was written");
+        check(legacy_tot == 6, "and that total is the one that was written");
     }
 
     /* 9. the total counts ACCEPTED records only. Both readers this replaces added to their
@@ -196,7 +214,7 @@ int main(void){
      * refused by — so getting this wrong inflates the count the user is shown. */
     {
         FILE *f = fopen(TMP, "w");
-        fprintf(f, "3 2 5\n9 1 100\n1 99 200\n");   /* valid, layer OOR, expert OOR */
+        fprintf(f, "3 2 5\n9 1 100\n1 99 200\n"); /* valid, layer OOR, expert OOR */
         fclose(f);
         zero_counts();
         check(rt_load(TMP) == 5, "out-of-range records are not counted in the total");
@@ -213,12 +231,14 @@ int main(void){
         fprintf(f, "-1 5 8\n-2 1 %u\n3 2 6\n", rt_hash("kimi_k3"));
         fclose(f);
         check(rt_read(TMP, sum_cb, NULL) == -1, "an untrusted read refuses another engine");
-        g_sum = 0; g_recs = 0;
+        g_sum = 0;
+        g_recs = 0;
         check(rt_read_ex(TMP, sum_cb, NULL, 1) == 6, "a trusted read takes it anyway");
         check(g_recs == 1, "trusted: the data record reached the callback");
         /* the override announces itself once per process (#700), which must not turn a
          * repeated trusted read into a different answer — the guard is on the message only */
-        g_sum = 0; g_recs = 0;
+        g_sum = 0;
+        g_recs = 0;
         check(rt_read_ex(TMP, sum_cb, NULL, 1) == 6, "a second trusted read still honours it");
         check(g_recs == 1, "the once-only notice does not gate the read");
 
@@ -227,7 +247,8 @@ int main(void){
         f = fopen(TMP, "w");
         fprintf(f, "-1 99 512\n-2 1 %u\n3 2 6\n", rt_hash("glm_moe_dsa"));
         fclose(f);
-        g_sum = 0; g_recs = 0;
+        g_sum = 0;
+        g_recs = 0;
         check(rt_read_ex(TMP, sum_cb, NULL, 1) == -1, "trust does not excuse wrong dimensions");
         check(g_recs == 0, "no record from a wrong-dimension file reached the callback");
     }
@@ -240,7 +261,8 @@ int main(void){
         FILE *f = fopen(TMP, "w");
         fprintf(f, "-1 5 8\n-2 %d %u\n3 2 9\n", RT_FORMAT_VERSION + 1, rt_hash("glm_moe_dsa"));
         fclose(f);
-        g_sum = 0; g_recs = 0;
+        g_sum = 0;
+        g_recs = 0;
         check(rt_read(TMP, sum_cb, NULL) == -1, "a future format version is refused");
         check(rt_read_ex(TMP, sum_cb, NULL, 1) == -1, "and a trusted read cannot override it");
         check(g_recs == 0, "no record from a future version reached the callback");
@@ -258,18 +280,23 @@ int main(void){
         rt_count(1, ids, 2);
         check(rt_save(TMP, 1) == 1, "three-field fixture writes");
         FILE *f = fopen(TMP, "r");
-        char line[256]; int bad = 0, lines = 0;
-        while(f && fgets(line, sizeof(line), f)){
-            int n = 0; const char *p = line;
-            for(;;){
-                while(*p == ' ' || *p == '\t') p++;
-                if(*p == '\0' || *p == '\n' || *p == '\r') break;
+        char line[256];
+        int bad = 0, lines = 0;
+        while (f && fgets(line, sizeof(line), f)) {
+            int n = 0;
+            const char *p = line;
+            for (;;) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '\0' || *p == '\n' || *p == '\r') break;
                 n++;
-                while(*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
             }
-            if(n){ lines++; if(n != 3) bad++; }
+            if (n) {
+                lines++;
+                if (n != 3) bad++;
+            }
         }
-        if(f) fclose(f);
+        if (f) fclose(f);
         check(lines > 0, "the fixture produced records");
         check(bad == 0, "every record the writer emits has exactly three fields");
     }
@@ -291,14 +318,17 @@ int main(void){
             char buf[512] = {0};
             FILE *g = fopen(TMP, "r");
             size_t n = g ? fread(buf, 1, sizeof(buf) - 1, g) : 0;
-            if(g) fclose(g);
+            if (g) fclose(g);
             check(n > 0, "post-drop history is non-empty");
             check(strstr(buf, "\n2 3 ") == NULL, "the dropped layer is not written back");
         }
     }
 
     remove(TMP);
-    if(g_nfails){ printf("route_trace: %d FAILED\n", g_nfails); return 1; }
+    if (g_nfails) {
+        printf("route_trace: %d FAILED\n", g_nfails);
+        return 1;
+    }
     printf("route_trace: empty-history size, round trip, legacy read, refusals, "
            "admitted-only totals, trusted read, dropped rows, old-reader contract ok\n");
     return 0;

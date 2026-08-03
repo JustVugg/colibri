@@ -7,16 +7,21 @@
 #include "../colibri.c"
 #undef main
 
-int main(void){
+int main(void) {
     static Model m;
-    m.c.n_layers=2; m.c.kv_lora=8; m.c.qk_rope=4;
-    m.kv=calloc(1,sizeof(KVState));
-    kv_alloc(&m,16);
-    for(int i=0;i<m.c.n_layers+1;i++){ m.Lc[i][0]=1.0f; m.Rc[i][0]=1.0f; }
-    kv_alloc(&m,32);                       /* the re-allocation path under test */
-    for(int i=0;i<m.c.n_layers+1;i++){
-        m.Lc[i][(int64_t)32*m.c.kv_lora-1]=2.0f;
-        m.Rc[i][(int64_t)32*m.c.qk_rope-1]=2.0f;
+    m.c.n_layers = 2;
+    m.c.kv_lora = 8;
+    m.c.qk_rope = 4;
+    m.kv = calloc(1, sizeof(KVState));
+    kv_alloc(&m, 16);
+    for (int i = 0; i < m.c.n_layers + 1; i++) {
+        m.Lc[i][0] = 1.0f;
+        m.Rc[i][0] = 1.0f;
+    }
+    kv_alloc(&m, 32); /* the re-allocation path under test */
+    for (int i = 0; i < m.c.n_layers + 1; i++) {
+        m.Lc[i][(int64_t)32 * m.c.kv_lora - 1] = 2.0f;
+        m.Rc[i][(int64_t)32 * m.c.qk_rope - 1] = 2.0f;
     }
     printf("OK kv_alloc re-allocation\n");
     return 0;

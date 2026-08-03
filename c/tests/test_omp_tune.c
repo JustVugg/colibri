@@ -14,11 +14,9 @@
 #include "../omp_tune.h"
 
 #ifdef _WIN32
-static int test_windows_variable_records(void)
-{
-    const size_t record_size =
-        offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor) +
-        offsetof(PROCESSOR_RELATIONSHIP, GroupMask) + sizeof(GROUP_AFFINITY);
+static int test_windows_variable_records(void) {
+    const size_t record_size = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor) +
+                               offsetof(PROCESSOR_RELATIONSHIP, GroupMask) + sizeof(GROUP_AFFINITY);
     unsigned char records[2 * record_size];
     memset(records, 0, sizeof(records));
 
@@ -26,10 +24,9 @@ static int test_windows_variable_records(void)
         unsigned char *record = records + i * record_size;
         LOGICAL_PROCESSOR_RELATIONSHIP relationship = RelationProcessorCore;
         DWORD size = (DWORD)record_size;
-        memcpy(record + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship),
-               &relationship, sizeof(relationship));
-        memcpy(record + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size),
-               &size, sizeof(size));
+        memcpy(record + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship), &relationship,
+               sizeof(relationship));
+        memcpy(record + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size), &size, sizeof(size));
     }
     if (coli_count_windows_physical_cores(records, sizeof(records)) != 2) {
         fprintf(stderr, "Windows variable-sized topology records lost a core\n");
@@ -39,8 +36,7 @@ static int test_windows_variable_records(void)
 }
 #endif
 
-static void env_set(const char *name, const char *value)
-{
+static void env_set(const char *name, const char *value) {
 #ifdef _WIN32
     _putenv_s(name, value);
 #else
@@ -48,8 +44,7 @@ static void env_set(const char *name, const char *value)
 #endif
 }
 
-static void env_unset(const char *name)
-{
+static void env_unset(const char *name) {
 #ifdef _WIN32
     _putenv_s(name, "");
 #else
@@ -57,8 +52,7 @@ static void env_unset(const char *name)
 #endif
 }
 
-int main(void)
-{
+int main(void) {
 #ifndef _OPENMP
     puts("test_omp_tune: ok (OpenMP unavailable; helper is a no-op)");
     return 0;
@@ -78,8 +72,8 @@ int main(void)
     int got = omp_get_max_threads();
     int want = physical > 0 && physical < logical ? physical : logical;
     if (got != want) {
-        fprintf(stderr, "default sizing: got %d threads, want %d (physical=%d logical=%d)\n",
-                got, want, physical, logical);
+        fprintf(stderr, "default sizing: got %d threads, want %d (physical=%d logical=%d)\n", got, want, physical,
+                logical);
         fail = 1;
     }
 

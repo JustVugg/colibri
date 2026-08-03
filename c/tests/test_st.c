@@ -4,12 +4,13 @@
 
 #include "../st.h"
 
-#define CHECK(condition) do { \
-    if (!(condition)) { \
-        fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition); \
-        return 1; \
-    } \
-} while (0)
+#define CHECK(condition)                                                                                               \
+    do {                                                                                                               \
+        if (!(condition)) {                                                                                            \
+            fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition);                              \
+            return 1;                                                                                                  \
+        }                                                                                                              \
+    } while (0)
 
 int main(void) {
     CHECK(bf16_to_f32(0x3f80) == 1.0f);

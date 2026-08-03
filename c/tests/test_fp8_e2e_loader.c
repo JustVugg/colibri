@@ -31,56 +31,71 @@
 #include <math.h>
 #include <stdlib.h>
 
-int main(int argc, char **argv){
-    if(argc < 2){ fprintf(stderr,"usage: %s <dir> [name O I]...\n", argv[0]); return 2; }
-    if((argc-2) % 3 != 0){
-        fprintf(stderr,"args after <dir> must come in (name,O,I) triples (got %d)\n", argc-2);
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <dir> [name O I]...\n", argv[0]);
+        return 2;
+    }
+    if ((argc - 2) % 3 != 0) {
+        fprintf(stderr, "args after <dir> must come in (name,O,I) triples (got %d)\n", argc - 2);
         return 2;
     }
     const char *dir = argv[1];
-    int ntensors = (argc-2)/3;
-    if(ntensors == 0){ fprintf(stderr,"no (name,O,I) triples given -- nothing to check\n"); return 2; }
+    int ntensors = (argc - 2) / 3;
+    if (ntensors == 0) {
+        fprintf(stderr, "no (name,O,I) triples given -- nothing to check\n");
+        return 2;
+    }
 
-    static Model gm; memset(&gm,0,sizeof gm);
+    static Model gm;
+    memset(&gm, 0, sizeof gm);
     st_init(&gm.S, dir);
 
     int fails = 0;
-    for(int i=0;i<ntensors;i++){
-        const char *name = argv[2+i*3];
-        int O = atoi(argv[3+i*3]);
-        int I = atoi(argv[4+i*3]);
+    for (int i = 0; i < ntensors; i++) {
+        const char *name = argv[2 + i * 3];
+        int O = atoi(argv[3 + i * 3]);
+        int I = atoi(argv[4 + i * 3]);
 
-        QT t; memset(&t,0,sizeof t);
-        qt_from_disk(&gm, name, O, I, 8, 0, &t);   /* THE REAL LOADER PATH -- not mocked */
+        QT t;
+        memset(&t, 0, sizeof t);
+        qt_from_disk(&gm, name, O, I, 8, 0, &t); /* THE REAL LOADER PATH -- not mocked */
 
-        if(t.fmt != 8){
+        if (t.fmt != 8) {
             printf("FAIL %s: fmt=%d, expected 8 (native fp8-e4m3 passthrough)\n", name, t.fmt);
-            fails++; continue;
+            fails++;
+            continue;
         }
-        if(!t.q8 || !t.s){
-            printf("FAIL %s: fmt=8 but q8=%p s=%p (expected both non-NULL)\n",
-                   name, (void*)t.q8, (void*)t.s);
-            fails++; continue;
+        if (!t.q8 || !t.s) {
+            printf("FAIL %s: fmt=8 but q8=%p s=%p (expected both non-NULL)\n", name, (void *)t.q8, (void *)t.s);
+            fails++;
+            continue;
         }
         int64_t nblkI = fp8_nblk(I);
         int64_t bad = -1;
-        for(int64_t o=0; o<O && bad<0; o++){
-            int64_t blkO = o/FP8_BLOCK;
-            const float *scl = t.s + blkO*nblkI;
-            for(int64_t ii=0; ii<I; ii++){
-                int64_t bi = ii/FP8_BLOCK;
-                float v = e4m3_decode(t.q8[o*(int64_t)I+ii]) * scl[bi];
-                if(!isfinite(v)){ bad = o*(int64_t)I+ii; break; }
+        for (int64_t o = 0; o < O && bad < 0; o++) {
+            int64_t blkO = o / FP8_BLOCK;
+            const float *scl = t.s + blkO * nblkI;
+            for (int64_t ii = 0; ii < I; ii++) {
+                int64_t bi = ii / FP8_BLOCK;
+                float v = e4m3_decode(t.q8[o * (int64_t)I + ii]) * scl[bi];
+                if (!isfinite(v)) {
+                    bad = o * (int64_t)I + ii;
+                    break;
+                }
             }
         }
-        if(bad >= 0){
+        if (bad >= 0) {
             printf("FAIL %s: non-finite dequantized value at flat index %lld\n", name, (long long)bad);
-            fails++; continue;
+            fails++;
+            continue;
         }
-        printf("ok %s: fmt=8 O=%d I=%d, weights+scale loaded through the real loader, all-finite\n",
-               name, O, I);
+        printf("ok %s: fmt=8 O=%d I=%d, weights+scale loaded through the real loader, all-finite\n", name, O, I);
     }
-    if(fails){ printf("fp8 e2e repack->load: %d/%d tensor(s) FAILED\n", fails, ntensors); return 1; }
+    if (fails) {
+        printf("fp8 e2e repack->load: %d/%d tensor(s) FAILED\n", fails, ntensors);
+        return 1;
+    }
     printf("fp8 e2e repack->load: ok (%d tensor(s))\n", ntensors);
     return 0;
 }

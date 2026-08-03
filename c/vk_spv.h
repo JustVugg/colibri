@@ -25,7 +25,10 @@ static const char *coli_vk_resolve_spv(char *buf, size_t n) {
     const char *env = getenv("COLI_VK_SHADERS");
     struct stat st;
     if (env && *env) {
-        if (!stat(env, &st) && S_ISDIR(st.st_mode)) { snprintf(buf, n, "%s/qmatmul.spv", env); return buf; }
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) {
+            snprintf(buf, n, "%s/qmatmul.spv", env);
+            return buf;
+        }
         return env;
     }
 #ifdef __linux__

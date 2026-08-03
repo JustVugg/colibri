@@ -55,23 +55,18 @@
 
 /* Numero di core FISICI, o 0 se non determinabile. Mai un valore inventato. */
 #if defined(_WIN32)
-static int coli_count_windows_physical_cores(const void *buf, DWORD bytes)
-{
+static int coli_count_windows_physical_cores(const void *buf, DWORD bytes) {
     const char *p = (const char *)buf;
     const char *end = p + bytes;
-    const size_t header_size = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-                                        Processor);
+    const size_t header_size = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor);
     int cores = 0;
 
     while ((size_t)(end - p) >= header_size) {
         LOGICAL_PROCESSOR_RELATIONSHIP relationship;
         DWORD record_size;
-        memcpy(&relationship,
-               p + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship),
+        memcpy(&relationship, p + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship),
                sizeof(relationship));
-        memcpy(&record_size,
-               p + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size),
-               sizeof(record_size));
+        memcpy(&record_size, p + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size), sizeof(record_size));
         if (record_size < header_size || (size_t)(end - p) < record_size)
             break; /* Reject a zero, truncated, or otherwise malformed record. */
         if (relationship == RelationProcessorCore) cores++;
@@ -81,8 +76,7 @@ static int coli_count_windows_physical_cores(const void *buf, DWORD bytes)
 }
 #endif
 
-static int coli_physical_cores(void)
-{
+static int coli_physical_cores(void) {
 #if defined(_WIN32)
     DWORD need = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &need);
@@ -101,9 +95,11 @@ static int coli_physical_cores(void)
      * una barriera per matmul e' il thread piu' lento a dettare il passo: gli
      * E-core rallentano la squadra invece di aiutarla (#707, -4.2% decode).
      * Su Intel Mac perflevel* non esiste: li' hw.physicalcpu e' corretto. */
-    int v = 0; size_t sz = sizeof(v);
+    int v = 0;
+    size_t sz = sizeof(v);
     if (sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, NULL, 0) == 0 && v > 0) return v;
-    v = 0; sz = sizeof(v);
+    v = 0;
+    sz = sizeof(v);
     if (sysctlbyname("hw.physicalcpu", &v, &sz, NULL, 0) == 0 && v > 0) return v;
     return 0;
 
@@ -116,21 +112,26 @@ static int coli_physical_cores(void)
     int n = 0;
     struct dirent *e;
     while ((e = readdir(d)) && n < 1024) {
-        if (strncmp(e->d_name, "cpu", 3) != 0 || e->d_name[3] < '0' || e->d_name[3] > '9')
-            continue;
+        if (strncmp(e->d_name, "cpu", 3) != 0 || e->d_name[3] < '0' || e->d_name[3] > '9') continue;
         /* d_name can be up to 255 bytes; leave enough room for the fixed
          * sysfs prefix/suffix so -Wformat-truncation stays honest when this
          * shared helper is compiled into the GLM engine too. */
         char path[512], line[64];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/%s/topology/thread_siblings_list", e->d_name);
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/%s/topology/thread_siblings_list", e->d_name);
         FILE *f = fopen(path, "r");
         if (!f) continue;
         if (fgets(line, sizeof(line), f)) {
             line[strcspn(line, "\n")] = 0;
             int dup = 0;
-            for (int i = 0; i < n; i++) if (strcmp(seen[i], line) == 0) { dup = 1; break; }
-            if (!dup) { snprintf(seen[n], sizeof(seen[0]), "%s", line); n++; }
+            for (int i = 0; i < n; i++)
+                if (strcmp(seen[i], line) == 0) {
+                    dup = 1;
+                    break;
+                }
+            if (!dup) {
+                snprintf(seen[n], sizeof(seen[0]), "%s", line);
+                n++;
+            }
         }
         fclose(f);
     }
@@ -142,22 +143,22 @@ static int coli_physical_cores(void)
 /* Dimensiona la squadra OpenMP sui core fisici. Rispetta OMP_NUM_THREADS se
  * l'utente l'ha impostata, e non fa nulla se il conteggio non e' affidabile.
  * `engine` finisce solo nella riga di log. */
-static void coli_omp_tune_threads(const char *engine)
-{
+static void coli_omp_tune_threads(const char *engine) {
 #ifdef _OPENMP
     const char *off = getenv("COLI_NO_OMP_TUNE");
     if (off) return;                       /* stesso kill-switch degli altri motori */
     if (getenv("OMP_NUM_THREADS")) return; /* l'utente comanda */
 
     int phys = coli_physical_cores();
-    if (phys <= 0) return;                 /* sconosciuto -> default di OpenMP */
+    if (phys <= 0) return; /* sconosciuto -> default di OpenMP */
     int logical = omp_get_max_threads();
-    if (phys >= logical) return;           /* niente SMT da evitare: silenzio */
+    if (phys >= logical) return; /* niente SMT da evitare: silenzio */
 
     omp_set_num_threads(phys);
-    fprintf(stderr, "[OMP] %s: %d physical-core threads instead of %d logical CPUs; "
-                    "SMT can halve decode throughput on some CPUs (#718); "
-                    "set OMP_NUM_THREADS=<n> to override\n",
+    fprintf(stderr,
+            "[OMP] %s: %d physical-core threads instead of %d logical CPUs; "
+            "SMT can halve decode throughput on some CPUs (#718); "
+            "set OMP_NUM_THREADS=<n> to override\n",
             engine, phys, logical);
 #else
     (void)engine;

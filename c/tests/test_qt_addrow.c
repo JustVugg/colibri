@@ -42,91 +42,158 @@
 #endif
 
 static int fails = 0;
-#define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
+#define CHECK(c)                                                                                                       \
+    do {                                                                                                               \
+        if (!(c)) {                                                                                                    \
+            printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);                                                        \
+            fails++;                                                                                                   \
+        }                                                                                                              \
+    } while (0)
 
 static uint64_t rng = 0xA11CE5EEDF00Dull;
-static uint8_t rndbyte(void){ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (uint8_t)(rng & 0xFF); }
-static float rndsmallf(void){ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-    return ((int64_t)(rng & 0xFFF) - 0x800) / (float)0x800; }   /* [-1,1)-ish, small magnitude */
+static uint8_t rndbyte(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return (uint8_t)(rng & 0xFF);
+}
+static float rndsmallf(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return ((int64_t)(rng & 0xFFF) - 0x800) / (float)0x800;
+} /* [-1,1)-ish, small magnitude */
 
 /* ---- independent reference dequantizer: W[row,:] as floats, one element per loop
  * iteration -- deliberately NOT the same code shape as qt_addrow/qt_matvec_rows (those
  * unroll pairs for fmt=2/3, split low/high planes for fmt=5) so this genuinely
  * cross-checks the production math, not just the production code running twice. ---- */
-static void qt_dequant_row_ref(const QT *t, int row, float *out){
-    int I=t->I;
-    if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) out[i]=w[i]; return; }
-    if(t->fmt==4){
-        const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); int gs=t->gs, ng=(I+gs-1)/gs;
-        const float *scl=t->s+(int64_t)row*ng;
-        for(int i=0;i<I;i++){ uint8_t b=w[i>>1]; int nib=(i&1)?(b>>4):(b&0xF);
-            out[i]=((int)nib-8)*scl[i/gs]; }
-        return; }
-    if(t->fmt==5){
-        const uint8_t *w=t->q4+(int64_t)row*i3_rowbytes(I);
-        const float *sr=t->s+(int64_t)row*i3_groups(I);
-        for(int i=0;i<I;i++){ int64_t g=i/I3_GROUP; const uint8_t *lo=w+g*I3_GBYTES, *hi=lo+16;
-            int k=i-(int)(g*I3_GROUP);
-            unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
-            out[i]=((int)u-4)*sr[g]; }
-        return; }
-    float s=t->s[row];
-    if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) out[i]=(float)w[i]*s; return; }
-    if(t->fmt==2){
-        const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
-        for(int i=0;i<I;i++){ uint8_t b=w[i>>1]; int nib=(i&1)?(b>>4):(b&0xF); out[i]=((int)nib-8)*s; }
-        return; }
+static void qt_dequant_row_ref(const QT *t, int row, float *out) {
+    int I = t->I;
+    if (t->fmt == 0) {
+        const float *w = t->qf + (int64_t)row * I;
+        for (int i = 0; i < I; i++) out[i] = w[i];
+        return;
+    }
+    if (t->fmt == 4) {
+        const uint8_t *w = t->q4 + (int64_t)row * ((I + 1) / 2);
+        int gs = t->gs, ng = (I + gs - 1) / gs;
+        const float *scl = t->s + (int64_t)row * ng;
+        for (int i = 0; i < I; i++) {
+            uint8_t b = w[i >> 1];
+            int nib = (i & 1) ? (b >> 4) : (b & 0xF);
+            out[i] = ((int)nib - 8) * scl[i / gs];
+        }
+        return;
+    }
+    if (t->fmt == 5) {
+        const uint8_t *w = t->q4 + (int64_t)row * i3_rowbytes(I);
+        const float *sr = t->s + (int64_t)row * i3_groups(I);
+        for (int i = 0; i < I; i++) {
+            int64_t g = i / I3_GROUP;
+            const uint8_t *lo = w + g * I3_GBYTES, *hi = lo + 16;
+            int k = i - (int)(g * I3_GROUP);
+            unsigned u = ((lo[k >> 2] >> ((k & 3) * 2)) & 3) | (((hi[k >> 3] >> (k & 7)) & 1) << 2);
+            out[i] = ((int)u - 4) * sr[g];
+        }
+        return;
+    }
+    float s = t->s[row];
+    if (t->fmt == 1) {
+        const int8_t *w = t->q8 + (int64_t)row * I;
+        for (int i = 0; i < I; i++) out[i] = (float)w[i] * s;
+        return;
+    }
+    if (t->fmt == 2) {
+        const uint8_t *w = t->q4 + (int64_t)row * ((I + 1) / 2);
+        for (int i = 0; i < I; i++) {
+            uint8_t b = w[i >> 1];
+            int nib = (i & 1) ? (b >> 4) : (b & 0xF);
+            out[i] = ((int)nib - 8) * s;
+        }
+        return;
+    }
     /* fmt==3 */
-    { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
-      for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; int v=(b>>((i&3)*2))&3; out[i]=((int)v-2)*s; } }
+    {
+        const uint8_t *w = t->q4 + (int64_t)row * ((I + 3) / 4);
+        for (int i = 0; i < I; i++) {
+            uint8_t b = w[i >> 2];
+            int v = (b >> ((i & 3) * 2)) & 3;
+            out[i] = ((int)v - 2) * s;
+        }
+    }
 }
 
 /* ---- fixture builders: one per format, deterministic pseudo-random payload ---- */
-static void fill_fmt0(QT *t, int O, int I){
-    t->fmt=0; t->O=O; t->I=I; t->gs=0;
-    t->qf=(float*)malloc((size_t)O*I*sizeof(float));
-    for(int i=0;i<O*I;i++) t->qf[i]=rndsmallf();
+static void fill_fmt0(QT *t, int O, int I) {
+    t->fmt = 0;
+    t->O = O;
+    t->I = I;
+    t->gs = 0;
+    t->qf = (float *)malloc((size_t)O * I * sizeof(float));
+    for (int i = 0; i < O * I; i++) t->qf[i] = rndsmallf();
 }
-static void fill_fmt1(QT *t, int O, int I){
-    t->fmt=1; t->O=O; t->I=I; t->gs=0;
-    t->q8=(int8_t*)malloc((size_t)O*I);
-    t->s=(float*)malloc((size_t)O*sizeof(float));
-    for(int i=0;i<O*I;i++) t->q8[i]=(int8_t)(rndbyte()-128);
-    for(int i=0;i<O;i++) t->s[i]=0.01f+0.001f*(float)i;
+static void fill_fmt1(QT *t, int O, int I) {
+    t->fmt = 1;
+    t->O = O;
+    t->I = I;
+    t->gs = 0;
+    t->q8 = (int8_t *)malloc((size_t)O * I);
+    t->s = (float *)malloc((size_t)O * sizeof(float));
+    for (int i = 0; i < O * I; i++) t->q8[i] = (int8_t)(rndbyte() - 128);
+    for (int i = 0; i < O; i++) t->s[i] = 0.01f + 0.001f * (float)i;
 }
-static void fill_fmt2(QT *t, int O, int I){
-    t->fmt=2; t->O=O; t->I=I; t->gs=0;
-    int rb=(I+1)/2;
-    t->q4=(uint8_t*)malloc((size_t)O*rb);
-    t->s=(float*)malloc((size_t)O*sizeof(float));
-    for(int i=0;i<O*rb;i++) t->q4[i]=rndbyte();
-    for(int i=0;i<O;i++) t->s[i]=0.02f+0.001f*(float)i;
+static void fill_fmt2(QT *t, int O, int I) {
+    t->fmt = 2;
+    t->O = O;
+    t->I = I;
+    t->gs = 0;
+    int rb = (I + 1) / 2;
+    t->q4 = (uint8_t *)malloc((size_t)O * rb);
+    t->s = (float *)malloc((size_t)O * sizeof(float));
+    for (int i = 0; i < O * rb; i++) t->q4[i] = rndbyte();
+    for (int i = 0; i < O; i++) t->s[i] = 0.02f + 0.001f * (float)i;
 }
-static void fill_fmt3(QT *t, int O, int I){
-    t->fmt=3; t->O=O; t->I=I; t->gs=0;
-    int rb=(I+3)/4;
-    t->q4=(uint8_t*)malloc((size_t)O*rb);
-    t->s=(float*)malloc((size_t)O*sizeof(float));
-    for(int i=0;i<O*rb;i++) t->q4[i]=rndbyte();
-    for(int i=0;i<O;i++) t->s[i]=0.03f+0.001f*(float)i;
+static void fill_fmt3(QT *t, int O, int I) {
+    t->fmt = 3;
+    t->O = O;
+    t->I = I;
+    t->gs = 0;
+    int rb = (I + 3) / 4;
+    t->q4 = (uint8_t *)malloc((size_t)O * rb);
+    t->s = (float *)malloc((size_t)O * sizeof(float));
+    for (int i = 0; i < O * rb; i++) t->q4[i] = rndbyte();
+    for (int i = 0; i < O; i++) t->s[i] = 0.03f + 0.001f * (float)i;
 }
-static void fill_fmt4(QT *t, int O, int I, int gs){
-    t->fmt=4; t->O=O; t->I=I; t->gs=gs;
-    int rb=(I+1)/2, ng=(I+gs-1)/gs;
-    t->q4=(uint8_t*)malloc((size_t)O*rb);
-    t->s=(float*)malloc((size_t)O*ng*sizeof(float));
-    for(int i=0;i<O*rb;i++) t->q4[i]=rndbyte();
-    for(int i=0;i<O*ng;i++) t->s[i]=0.015f+0.0007f*(float)i;
+static void fill_fmt4(QT *t, int O, int I, int gs) {
+    t->fmt = 4;
+    t->O = O;
+    t->I = I;
+    t->gs = gs;
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    t->q4 = (uint8_t *)malloc((size_t)O * rb);
+    t->s = (float *)malloc((size_t)O * ng * sizeof(float));
+    for (int i = 0; i < O * rb; i++) t->q4[i] = rndbyte();
+    for (int i = 0; i < O * ng; i++) t->s[i] = 0.015f + 0.0007f * (float)i;
 }
-static void fill_fmt5(QT *t, int O, int I){
-    t->fmt=5; t->O=O; t->I=I; t->gs=0;
-    int64_t ng=i3_groups(I), rb=i3_rowbytes(I);
-    t->q4=(uint8_t*)malloc((size_t)O*rb);
-    t->s=(float*)malloc((size_t)(O*ng)*sizeof(float));
-    for(int i=0;i<O*rb;i++) t->q4[i]=rndbyte();
-    for(int i=0;i<O*ng;i++) t->s[i]=0.025f+0.0003f*(float)i;
+static void fill_fmt5(QT *t, int O, int I) {
+    t->fmt = 5;
+    t->O = O;
+    t->I = I;
+    t->gs = 0;
+    int64_t ng = i3_groups(I), rb = i3_rowbytes(I);
+    t->q4 = (uint8_t *)malloc((size_t)O * rb);
+    t->s = (float *)malloc((size_t)(O * ng) * sizeof(float));
+    for (int i = 0; i < O * rb; i++) t->q4[i] = rndbyte();
+    for (int i = 0; i < O * ng; i++) t->s[i] = 0.025f + 0.0003f * (float)i;
 }
-static void free_qt(QT *t){ free(t->qf); free(t->q8); free(t->q4); free(t->s); memset(t,0,sizeof *t); }
+static void free_qt(QT *t) {
+    free(t->qf);
+    free(t->q8);
+    free(t->q4);
+    free(t->s);
+    memset(t, 0, sizeof *t);
+}
 
 /* ---- byte-identity: qt_addrow / qt_matvec_rows vs the independent reference, every
  * format both functions still legitimately handle ---- */
@@ -139,126 +206,198 @@ static void free_qt(QT *t){ free(t->qf); free(t->q8); free(t->q4); free(t->s); m
  * mantissa only, no shape/format-decode errors) before relaxing to epsilon,
  * matching this suite's own established practice for reduction-order-
  * sensitive checks (e.g. the metal-test suite's worst_rel comparisons). */
-static void check_addrow_identity(QT *t, const char *tag){
-    int I=t->I; float *ref=(float*)malloc((size_t)I*sizeof(float));
-    float *acc=(float*)malloc((size_t)I*sizeof(float));
-    float coef=1.7f;   /* != 1, so a coef-scaling bug can't hide */
-    for(int row=0; row<t->O; row++){
-        qt_dequant_row_ref(t,row,ref);
-        memset(acc,0,(size_t)I*sizeof(float));
-        qt_addrow(t,row,coef,acc);
-        for(int i=0;i<I;i++){
-            float want=coef*ref[i];
-            float ae=fabsf(acc[i]-want);
-            float rel = fabsf(want)>1e-6f ? ae/fabsf(want) : ae;
-            if(rel > 1e-5f){
-                printf("FAIL %s: qt_addrow row=%d i=%d got=%.9g want=%.9g rel=%.3g\n",tag,row,i,(double)acc[i],(double)want,(double)rel);
+static void check_addrow_identity(QT *t, const char *tag) {
+    int I = t->I;
+    float *ref = (float *)malloc((size_t)I * sizeof(float));
+    float *acc = (float *)malloc((size_t)I * sizeof(float));
+    float coef = 1.7f; /* != 1, so a coef-scaling bug can't hide */
+    for (int row = 0; row < t->O; row++) {
+        qt_dequant_row_ref(t, row, ref);
+        memset(acc, 0, (size_t)I * sizeof(float));
+        qt_addrow(t, row, coef, acc);
+        for (int i = 0; i < I; i++) {
+            float want = coef * ref[i];
+            float ae = fabsf(acc[i] - want);
+            float rel = fabsf(want) > 1e-6f ? ae / fabsf(want) : ae;
+            if (rel > 1e-5f) {
+                printf("FAIL %s: qt_addrow row=%d i=%d got=%.9g want=%.9g rel=%.3g\n", tag, row, i, (double)acc[i],
+                       (double)want, (double)rel);
                 fails++;
             }
         }
     }
-    free(ref); free(acc);
+    free(ref);
+    free(acc);
 }
-static void check_matvec_identity(QT *t, const char *tag){
-    int I=t->I; float *ref=(float*)malloc((size_t)I*sizeof(float));
-    float *x=(float*)malloc((size_t)I*sizeof(float));
-    for(int i=0;i<I;i++) x[i]=rndsmallf();
-    for(int row=0; row<t->O; row++){
-        qt_dequant_row_ref(t,row,ref);
-        double want=0; for(int i=0;i<I;i++) want+=(double)ref[i]*x[i];
-        float y=0.f;
-        qt_matvec_rows(t,row,1,x,&y);
-        double relerr = fabs(want)>1e-6 ? fabs((double)y-want)/fabs(want) : fabs((double)y-want);
-        if(relerr > 1e-4){
-            printf("FAIL %s: qt_matvec_rows row=%d got=%.9g want=%.9g relerr=%.3g\n",tag,row,(double)y,want,relerr);
+static void check_matvec_identity(QT *t, const char *tag) {
+    int I = t->I;
+    float *ref = (float *)malloc((size_t)I * sizeof(float));
+    float *x = (float *)malloc((size_t)I * sizeof(float));
+    for (int i = 0; i < I; i++) x[i] = rndsmallf();
+    for (int row = 0; row < t->O; row++) {
+        qt_dequant_row_ref(t, row, ref);
+        double want = 0;
+        for (int i = 0; i < I; i++) want += (double)ref[i] * x[i];
+        float y = 0.f;
+        qt_matvec_rows(t, row, 1, x, &y);
+        double relerr = fabs(want) > 1e-6 ? fabs((double)y - want) / fabs(want) : fabs((double)y - want);
+        if (relerr > 1e-4) {
+            printf("FAIL %s: qt_matvec_rows row=%d got=%.9g want=%.9g relerr=%.3g\n", tag, row, (double)y, want,
+                   relerr);
             fails++;
         }
     }
-    free(ref); free(x);
+    free(ref);
+    free(x);
 }
 
-static void test_byte_identity_all_formats(void){
+static void test_byte_identity_all_formats(void) {
     QT t;
-    memset(&t,0,sizeof t); fill_fmt0(&t,4,17);   check_addrow_identity(&t,"fmt=0"); check_matvec_identity(&t,"fmt=0"); free_qt(&t);
-    memset(&t,0,sizeof t); fill_fmt1(&t,4,17);   check_addrow_identity(&t,"fmt=1"); check_matvec_identity(&t,"fmt=1"); free_qt(&t);
-    memset(&t,0,sizeof t); fill_fmt2(&t,4,17);   check_addrow_identity(&t,"fmt=2"); check_matvec_identity(&t,"fmt=2"); free_qt(&t);
-    memset(&t,0,sizeof t); fill_fmt3(&t,4,17);   check_addrow_identity(&t,"fmt=3"); check_matvec_identity(&t,"fmt=3"); free_qt(&t);
-    memset(&t,0,sizeof t); fill_fmt4(&t,4,40,16);check_addrow_identity(&t,"fmt=4"); check_matvec_identity(&t,"fmt=4"); free_qt(&t);
-    memset(&t,0,sizeof t); fill_fmt5(&t,4,130);  check_addrow_identity(&t,"fmt=5"); check_matvec_identity(&t,"fmt=5"); free_qt(&t);
+    memset(&t, 0, sizeof t);
+    fill_fmt0(&t, 4, 17);
+    check_addrow_identity(&t, "fmt=0");
+    check_matvec_identity(&t, "fmt=0");
+    free_qt(&t);
+    memset(&t, 0, sizeof t);
+    fill_fmt1(&t, 4, 17);
+    check_addrow_identity(&t, "fmt=1");
+    check_matvec_identity(&t, "fmt=1");
+    free_qt(&t);
+    memset(&t, 0, sizeof t);
+    fill_fmt2(&t, 4, 17);
+    check_addrow_identity(&t, "fmt=2");
+    check_matvec_identity(&t, "fmt=2");
+    free_qt(&t);
+    memset(&t, 0, sizeof t);
+    fill_fmt3(&t, 4, 17);
+    check_addrow_identity(&t, "fmt=3");
+    check_matvec_identity(&t, "fmt=3");
+    free_qt(&t);
+    memset(&t, 0, sizeof t);
+    fill_fmt4(&t, 4, 40, 16);
+    check_addrow_identity(&t, "fmt=4");
+    check_matvec_identity(&t, "fmt=4");
+    free_qt(&t);
+    memset(&t, 0, sizeof t);
+    fill_fmt5(&t, 4, 130);
+    check_addrow_identity(&t, "fmt=5");
+    check_matvec_identity(&t, "fmt=5");
+    free_qt(&t);
 }
 
 /* ---- refusal: fork+pipe+waitpid, this suite's house pattern (see test_fp8_load.c's
  * expect_refuse/expect_stamp_refuse) -- must exit(1) with a "refus"-containing message,
  * never reach the caller's continuation, never crash with a signal. ---- */
 typedef void (*absorb_fn)(void);
-static void call_addrow_fmt8(void){
-    QT t; memset(&t,0,sizeof t);
-    enum { O=130, I=130 };   /* the coordinator's own repro shape: nblkO=nblkI=2, nblk=4 */
-    static uint8_t q8[O*I]; static float s[4];
-    for(int i=0;i<O*I;i++) q8[i]=rndbyte();
-    for(int i=0;i<4;i++) s[i]=0.01f;
-    t.fmt=8; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q8; t.s=s;
-    float acc[I]; memset(acc,0,sizeof acc);
-    qt_addrow(&t,0,1.f,acc);   /* must exit(1) inside; must NOT return */
+static void call_addrow_fmt8(void) {
+    QT t;
+    memset(&t, 0, sizeof t);
+    enum { O = 130, I = 130 }; /* the coordinator's own repro shape: nblkO=nblkI=2, nblk=4 */
+    static uint8_t q8[O * I];
+    static float s[4];
+    for (int i = 0; i < O * I; i++) q8[i] = rndbyte();
+    for (int i = 0; i < 4; i++) s[i] = 0.01f;
+    t.fmt = 8;
+    t.O = O;
+    t.I = I;
+    t.gs = 0;
+    t.q8 = (int8_t *)q8;
+    t.s = s;
+    float acc[I];
+    memset(acc, 0, sizeof acc);
+    qt_addrow(&t, 0, 1.f, acc); /* must exit(1) inside; must NOT return */
 }
-static void call_addrow_fmt6(void){
-    QT t; memset(&t,0,sizeof t);
-    enum { O=4, I=98 };
-    static uint8_t q4[O*98]; static float s[1];
-    for(int i=0;i<O*98;i++) q4[i]=rndbyte();
-    s[0]=0.01f;
-    t.fmt=6; t.O=O; t.I=I; t.gs=0; t.q4=q4; t.s=s;
-    float acc[I]; memset(acc,0,sizeof acc);
-    qt_addrow(&t,0,1.f,acc);
+static void call_addrow_fmt6(void) {
+    QT t;
+    memset(&t, 0, sizeof t);
+    enum { O = 4, I = 98 };
+    static uint8_t q4[O * 98];
+    static float s[1];
+    for (int i = 0; i < O * 98; i++) q4[i] = rndbyte();
+    s[0] = 0.01f;
+    t.fmt = 6;
+    t.O = O;
+    t.I = I;
+    t.gs = 0;
+    t.q4 = q4;
+    t.s = s;
+    float acc[I];
+    memset(acc, 0, sizeof acc);
+    qt_addrow(&t, 0, 1.f, acc);
 }
-static void call_matvec_fmt8(void){
-    QT t; memset(&t,0,sizeof t);
-    enum { O=130, I=130 };
-    static uint8_t q8[O*I]; static float s[4];
-    for(int i=0;i<O*I;i++) q8[i]=rndbyte();
-    for(int i=0;i<4;i++) s[i]=0.01f;
-    t.fmt=8; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q8; t.s=s;
-    static float x[I]; for(int i=0;i<I;i++) x[i]=rndsmallf();
-    float y=0.f;
-    qt_matvec_rows(&t,0,1,x,&y);
+static void call_matvec_fmt8(void) {
+    QT t;
+    memset(&t, 0, sizeof t);
+    enum { O = 130, I = 130 };
+    static uint8_t q8[O * I];
+    static float s[4];
+    for (int i = 0; i < O * I; i++) q8[i] = rndbyte();
+    for (int i = 0; i < 4; i++) s[i] = 0.01f;
+    t.fmt = 8;
+    t.O = O;
+    t.I = I;
+    t.gs = 0;
+    t.q8 = (int8_t *)q8;
+    t.s = s;
+    static float x[I];
+    for (int i = 0; i < I; i++) x[i] = rndsmallf();
+    float y = 0.f;
+    qt_matvec_rows(&t, 0, 1, x, &y);
 }
-static void call_matvec_fmt6(void){
-    QT t; memset(&t,0,sizeof t);
-    enum { O=4, I=98 };
-    static uint8_t q4[O*98]; static float s[1];
-    for(int i=0;i<O*98;i++) q4[i]=rndbyte();
-    s[0]=0.01f;
-    t.fmt=6; t.O=O; t.I=I; t.gs=0; t.q4=q4; t.s=s;
-    static float x[I]; for(int i=0;i<I;i++) x[i]=rndsmallf();
-    float y=0.f;
-    qt_matvec_rows(&t,0,1,x,&y);
+static void call_matvec_fmt6(void) {
+    QT t;
+    memset(&t, 0, sizeof t);
+    enum { O = 4, I = 98 };
+    static uint8_t q4[O * 98];
+    static float s[1];
+    for (int i = 0; i < O * 98; i++) q4[i] = rndbyte();
+    s[0] = 0.01f;
+    t.fmt = 6;
+    t.O = O;
+    t.I = I;
+    t.gs = 0;
+    t.q4 = q4;
+    t.s = s;
+    static float x[I];
+    for (int i = 0; i < I; i++) x[i] = rndsmallf();
+    float y = 0.f;
+    qt_matvec_rows(&t, 0, 1, x, &y);
 }
 
-static int expect_refuse_call(absorb_fn fn, const char *tag){
+static int expect_refuse_call(absorb_fn fn, const char *tag) {
 #ifndef _WIN32
-    int pipefd[2]; if(pipe(pipefd)!=0) return 0;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return 0;
     pid_t pid = fork();
-    if(pid < 0) return 0;
-    if(pid == 0){
-        dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        dup2(pipefd[1], 2);
+        close(pipefd[0]);
+        close(pipefd[1]);
         fn();
-        _exit(42);   /* reaching here (surviving the call without exit(1)) is the bug */
+        _exit(42); /* reaching here (surviving the call without exit(1)) is the bug */
     }
     close(pipefd[1]);
-    char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF: a single read() can return SHORT on Linux pipes (glibc unbuffered stderr arrives in chunks) -- truncated the refusal message past the marker, CI-caught */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
+    char err[1024] = {0};
+    size_t eoff = 0;
+    ssize_t n; /* drain to EOF: a single read() can return SHORT on Linux pipes (glibc unbuffered stderr arrives in
+                  chunks) -- truncated the refusal message past the marker, CI-caught */
+    while (eoff < sizeof(err) - 1 && (n = read(pipefd[0], err + eoff, sizeof(err) - 1 - eoff)) > 0) eoff += (size_t)n;
     close(pipefd[0]);
-    int status=0; waitpid(pid,&status,0);
-    if(WIFSIGNALED(status)){
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
         printf("FAIL %s: crashed with signal %d instead of refusing (exit(1)) -- this IS the "
-               "engine defect this test exists to catch\n", tag, WTERMSIG(status));
+               "engine defect this test exists to catch\n",
+               tag, WTERMSIG(status));
         return 0;
     }
-    int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
-    if(!ok){
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 1;
+    if (!ok) {
         printf("FAIL %s: expected exit(1) refusal, got status=%d, stderr=%.200s\n", tag, status, err);
         return 0;
     }
-    if(!strstr(err,"refus")){
+    if (!strstr(err, "refus")) {
         printf("FAIL %s: exited(1) but message lacked a refusal explanation: %.200s\n", tag, err);
         return 0;
     }
@@ -270,17 +409,20 @@ static int expect_refuse_call(absorb_fn fn, const char *tag){
 #endif
 }
 
-static void test_refusals(void){
-    CHECK(expect_refuse_call(call_addrow_fmt8,  "qt_addrow refuses fmt=8 (was SIGSEGV)"));
-    CHECK(expect_refuse_call(call_addrow_fmt6,  "qt_addrow refuses fmt=6"));
-    CHECK(expect_refuse_call(call_matvec_fmt8,  "qt_matvec_rows refuses fmt=8"));
-    CHECK(expect_refuse_call(call_matvec_fmt6,  "qt_matvec_rows refuses fmt=6"));
+static void test_refusals(void) {
+    CHECK(expect_refuse_call(call_addrow_fmt8, "qt_addrow refuses fmt=8 (was SIGSEGV)"));
+    CHECK(expect_refuse_call(call_addrow_fmt6, "qt_addrow refuses fmt=6"));
+    CHECK(expect_refuse_call(call_matvec_fmt8, "qt_matvec_rows refuses fmt=8"));
+    CHECK(expect_refuse_call(call_matvec_fmt6, "qt_matvec_rows refuses fmt=6"));
 }
 
-int main(void){
+int main(void) {
     test_byte_identity_all_formats();
     test_refusals();
-    if(fails){ printf("qt_addrow/qt_matvec_rows tests: %d FAILED\n", fails); return 1; }
+    if (fails) {
+        printf("qt_addrow/qt_matvec_rows tests: %d FAILED\n", fails);
+        return 1;
+    }
     printf("qt_addrow/qt_matvec_rows tests: ok\n");
     return 0;
 }

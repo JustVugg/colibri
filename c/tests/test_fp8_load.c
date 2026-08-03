@@ -118,7 +118,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/wait.h>
-#include <fcntl.h>      /* open(/dev/null) in Part G's sweep probe */
+#include <fcntl.h> /* open(/dev/null) in Part G's sweep probe */
 #endif
 
 /* Shadow definitions for the seam above -- must come after the #include so
@@ -139,67 +139,100 @@
  * declaration"). g_seam_wire_* observes mem_wire's (hence qt_wire_mmap's)
  * calls; g_seam_unwire_* observes qt_unwire_mmap's direct calls. */
 #ifndef _WIN32
-static void *g_seam_wire_addr[4]; static size_t g_seam_wire_len[4]; static int g_seam_wire_n;
-int test_mlock_seam(const void *addr, size_t len){
-    if(g_seam_wire_n < 4){ g_seam_wire_addr[g_seam_wire_n]=(void*)addr; g_seam_wire_len[g_seam_wire_n]=len; }
+static void *g_seam_wire_addr[4];
+static size_t g_seam_wire_len[4];
+static int g_seam_wire_n;
+int test_mlock_seam(const void *addr, size_t len) {
+    if (g_seam_wire_n < 4) {
+        g_seam_wire_addr[g_seam_wire_n] = (void *)addr;
+        g_seam_wire_len[g_seam_wire_n] = len;
+    }
     g_seam_wire_n++;
     return 0;
 }
-static void *g_seam_unwire_addr[4]; static size_t g_seam_unwire_len[4]; static int g_seam_unwire_n;
-int test_munlock_seam(const void *addr, size_t len){
-    if(g_seam_unwire_n < 4){ g_seam_unwire_addr[g_seam_unwire_n]=(void*)addr; g_seam_unwire_len[g_seam_unwire_n]=len; }
+static void *g_seam_unwire_addr[4];
+static size_t g_seam_unwire_len[4];
+static int g_seam_unwire_n;
+int test_munlock_seam(const void *addr, size_t len) {
+    if (g_seam_unwire_n < 4) {
+        g_seam_unwire_addr[g_seam_unwire_n] = (void *)addr;
+        g_seam_unwire_len[g_seam_unwire_n] = len;
+    }
     g_seam_unwire_n++;
     return 0;
 }
 #endif
 
 static int fails = 0;
-#define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
+#define CHECK(c)                                                                                                       \
+    do {                                                                                                               \
+        if (!(c)) {                                                                                                    \
+            printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);                                                        \
+            fails++;                                                                                                   \
+        }                                                                                                              \
+    } while (0)
 
 static uint64_t rng = 0xFEEDFACE0DDBA11ull;
-static float rndf(void){ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-    return ((int64_t)(rng & 0xFFFFF) - 0x80000) / (float)0x80000; }
-static uint8_t rndbyte_nonan(void){
-    for(;;){ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+static float rndf(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return ((int64_t)(rng & 0xFFFFF) - 0x80000) / (float)0x80000;
+}
+static uint8_t rndbyte_nonan(void) {
+    for (;;) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
         uint8_t b = (uint8_t)(rng & 0xFF);
-        if(b != 0x7F && b != 0xFF) return b; }
+        if (b != 0x7F && b != 0xFF) return b;
+    }
 }
 
 /* ---- Part A: qt_resolve_fmt disambiguation (in-process for non-refusing
  * cases, fork+waitpid for refusing ones -- qt_resolve_fmt exit(1)s in place,
  * it does not return an error code). ---- */
 
-static int expect_fmt_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, int expect_fmt_val, const char *tag){
-    int gs=0;
+static int expect_fmt_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, int expect_fmt_val,
+                              const char *tag) {
+    int gs = 0;
     int fmt = qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name);
-    if(fmt != expect_fmt_val){
-        printf("FAIL %s: got fmt=%d, expected fmt=%d (O=%d I=%d nb=%lld ns=%lld)\n",
-               tag, fmt, expect_fmt_val, O, I, (long long)nb, (long long)ns);
+    if (fmt != expect_fmt_val) {
+        printf("FAIL %s: got fmt=%d, expected fmt=%d (O=%d I=%d nb=%lld ns=%lld)\n", tag, fmt, expect_fmt_val, O, I,
+               (long long)nb, (long long)ns);
         return 0;
     }
     return 1;
 }
-static int expect_fmt(int O, int I, int64_t nb, int64_t ns, int expect_fmt_val, const char *tag){
+static int expect_fmt(int O, int I, int64_t nb, int64_t ns, int expect_fmt_val, const char *tag) {
     return expect_fmt_stamped(O, I, nb, ns, NULL, expect_fmt_val, tag);
 }
 
-static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, const char *tag){
+static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, const char *tag) {
 #ifndef _WIN32
-    int pipefd[2]; if(pipe(pipefd)!=0) return 0;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return 0;
     pid_t pid = fork();
-    if(pid < 0) return 0;
-    if(pid == 0){
-        dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
-        int gs=0;
-        qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name);   /* must exit(1) inside; must NOT return */
-        _exit(42);                                  /* reaching here is the bug */
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        dup2(pipefd[1], 2);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        int gs = 0;
+        qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name); /* must exit(1) inside; must NOT return */
+        _exit(42);                                            /* reaching here is the bug */
     }
     close(pipefd[1]);
-    char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF: a single read() can return SHORT on Linux pipes (glibc unbuffered stderr arrives in chunks) -- truncated the refusal message past the marker, CI-caught */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
+    char err[1024] = {0};
+    size_t eoff = 0;
+    ssize_t n; /* drain to EOF: a single read() can return SHORT on Linux pipes (glibc unbuffered stderr arrives in
+                  chunks) -- truncated the refusal message past the marker, CI-caught */
+    while (eoff < sizeof(err) - 1 && (n = read(pipefd[0], err + eoff, sizeof(err) - 1 - eoff)) > 0) eoff += (size_t)n;
     close(pipefd[0]);
-    int status=0; waitpid(pid,&status,0);
-    int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
-    if(!ok){
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 1;
+    if (!ok) {
         printf("FAIL %s: expected exit(1) refusal, got status=%d, stderr=%.200s\n", tag, status, err);
         return 0;
     }
@@ -210,9 +243,10 @@ static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const cha
      * while pinning the ue8m0 family: the ue8m0 refusal message itself
      * lacked any "refus" wording and the check never noticed). Skip the
      * echoed tag prefix before searching. */
-    const char *msg = err; size_t tl = strlen(tag);
-    if(!strncmp(err, tag, tl)) msg = err + tl;
-    if(!strstr(msg,"refus")){
+    const char *msg = err;
+    size_t tl = strlen(tag);
+    if (!strncmp(err, tag, tl)) msg = err + tl;
+    if (!strstr(msg, "refus")) {
         printf("FAIL %s: exited(1) but message lacked a refusal explanation: %.200s\n", tag, err);
         return 0;
     }
@@ -224,20 +258,24 @@ static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const cha
      * failing. Every non-refusing case in this file (expect_fmt and its
      * callers) still runs and asserts for real on Windows. */
     printf("skipped on Windows (no fork): %s\n", tag);
-    (void)O; (void)I; (void)nb; (void)ns; (void)stamped_name;
+    (void)O;
+    (void)I;
+    (void)nb;
+    (void)ns;
+    (void)stamped_name;
     return 1;
 #endif
 }
-static int expect_refuse(int O, int I, int64_t nb, int64_t ns, const char *tag){
+static int expect_refuse(int O, int I, int64_t nb, int64_t ns, const char *tag) {
     return expect_refuse_stamped(O, I, nb, ns, NULL, tag);
 }
 
-static void test_disambiguation(void){
+static void test_disambiguation(void) {
     /* --- non-degenerate golden paths (unambiguous either way) --- */
-    CHECK(expect_fmt(4096,4096,(int64_t)4096*4096,4096*4,1,"plain int8 4096x4096"));
+    CHECK(expect_fmt(4096, 4096, (int64_t)4096 * 4096, 4096 * 4, 1, "plain int8 4096x4096"));
     /* spec's own worked example: [2048,6144] expert -> block scale [16,48] */
-    CHECK(expect_fmt(2048,6144,(int64_t)2048*6144,16LL*48*4,8,"fp8 2048x6144 (spec example)"));
-    CHECK(expect_fmt(384,6144,(int64_t)384*6144,3LL*48*4,8,"fp8 384x6144 non-square block grid"));
+    CHECK(expect_fmt(2048, 6144, (int64_t)2048 * 6144, 16LL * 48 * 4, 8, "fp8 2048x6144 (spec example)"));
+    CHECK(expect_fmt(384, 6144, (int64_t)384 * 6144, 3LL * 48 * 4, 8, "fp8 384x6144 non-square block grid"));
 
     /* --- REGRESSION (maintainer review, #528): GLM-5.2's own
      * self_attn.o_proj.weight, [D,H*v_head]=[6144,16384]. nblkO=ceil(6144/128)=48,
@@ -251,7 +289,8 @@ static void test_disambiguation(void){
      * earlier revision of qt_resolve_fmt refused this shape unconditionally
      * (exit(1) at load time on an ordinary model); the INVERSION resolves it
      * to fmt=1 instead -- this is that non-refusal, asserted directly. */
-    CHECK(expect_fmt(6144,16384,(int64_t)6144*16384,6144LL*4,1,
+    CHECK(expect_fmt(
+        6144, 16384, (int64_t)6144 * 16384, 6144LL * 4, 1,
         "GLM-5.2 o_proj shape [6144,16384]: valid int8-row, ambiguous-by-byte-count, resolves fmt=1 (NOT a refusal)"));
 
     /* --- degenerate shapes: O<=128 makes nblkO==1, so ns_blk==nblkI*4 can
@@ -265,32 +304,35 @@ static void test_disambiguation(void){
      * review named explicitly ([128,16384],[256,16384],[384,16384] below) --
      * every case in this sweep hits the exact same is_row&&is_blk branch and
      * is flipped here for the same reason. --- */
-    CHECK(expect_fmt(1,1,      1,        4,  1, "degenerate O=1 I=1 (nblkI=1=O) -> fmt=1, was refuse"));
-    CHECK(expect_fmt(1,128,    128,      4,  1, "degenerate O=1 I=128 (nblkI=1=O, I at block edge) -> fmt=1, was refuse"));
-    CHECK(expect_fmt(2,256,    2LL*256,  8,  1, "degenerate O=2 I=256 (nblkI=2=O) -> fmt=1, was refuse"));
-    CHECK(expect_fmt(6,768,    6LL*768,  24, 1, "degenerate O=6 I=768 (nblkI=6=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(1, 1, 1, 4, 1, "degenerate O=1 I=1 (nblkI=1=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(1, 128, 128, 4, 1, "degenerate O=1 I=128 (nblkI=1=O, I at block edge) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(2, 256, 2LL * 256, 8, 1, "degenerate O=2 I=256 (nblkI=2=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(6, 768, 6LL * 768, 24, 1, "degenerate O=6 I=768 (nblkI=6=O) -> fmt=1, was refuse"));
     /* the three shapes the maintainer's review named explicitly (his exact expect_refuse
      * calls, O=128/256/384 at I=16384) -- FLIPPED to assert fmt=1. */
-    CHECK(expect_fmt(128,16384,128LL*16384, 512, 1, "degenerate O=128 I=16384 (nblkO=1,nblkI=128=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(128, 16384, 128LL * 16384, 512, 1,
+                     "degenerate O=128 I=16384 (nblkO=1,nblkI=128=O) -> fmt=1, was refuse"));
     /* O>128 degenerate case: nblkO=2, need nblkI=O/2 -- O=256,I=16384 -> nblkI=128, 2*128=256=O */
-    CHECK(expect_fmt(256,16384,256LL*16384, 1024, 1, "degenerate O=256 I=16384 (nblkO=2,nblkI=128, product=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(256, 16384, 256LL * 16384, 1024, 1,
+                     "degenerate O=256 I=16384 (nblkO=2,nblkI=128, product=O) -> fmt=1, was refuse"));
     /* k=3: the ambiguity isn't a one-off O=256 coincidence -- it's structural for ANY
      * O that's a multiple of 128 (nblkO=k), since nblkI==128 (I in (16256,16384]) always
      * makes nblkO*nblkI == k*128 == O. One more multiple (O=384=3*128) confirms the
      * condition generalizes past the k=2 worked example, not just a re-derivation. */
-    CHECK(expect_fmt(384,16384,384LL*16384, 1536, 1, "degenerate O=384 I=16384 (nblkO=3,nblkI=128, k=3, product=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(384, 16384, 384LL * 16384, 1536, 1,
+                     "degenerate O=384 I=16384 (nblkO=3,nblkI=128, k=3, product=O) -> fmt=1, was refuse"));
 
     /* --- boundary-ADJACENT non-degenerate cases: one step past each
      * degenerate case above, both interpretations now legitimately resolve. --- */
-    CHECK(expect_fmt(1,129, 129,   4, 1, "adjacent O=1 I=129 as fmt=1 (ns=row)"));
-    CHECK(expect_fmt(1,129, 129,   8, 8, "adjacent O=1 I=129 as fmt=8 (ns=block, nblkI=2)"));
-    CHECK(expect_fmt(2,257, 2LL*257, 8,  1, "adjacent O=2 I=257 as fmt=1 (ns=row)"));
-    CHECK(expect_fmt(2,257, 2LL*257, 12, 8, "adjacent O=2 I=257 as fmt=8 (ns=block, nblkI=3)"));
+    CHECK(expect_fmt(1, 129, 129, 4, 1, "adjacent O=1 I=129 as fmt=1 (ns=row)"));
+    CHECK(expect_fmt(1, 129, 129, 8, 8, "adjacent O=1 I=129 as fmt=8 (ns=block, nblkI=2)"));
+    CHECK(expect_fmt(2, 257, 2LL * 257, 8, 1, "adjacent O=2 I=257 as fmt=1 (ns=row)"));
+    CHECK(expect_fmt(2, 257, 2LL * 257, 12, 8, "adjacent O=2 I=257 as fmt=8 (ns=block, nblkI=3)"));
 
     /* --- neither interpretation matches: garbage .qs size, must still refuse
      * (the pre-existing generic-mismatch path, exercised through the fmt=8-aware
      * function to confirm the new code didn't disturb it). --- */
-    CHECK(expect_refuse(10,10, 100, 999, "garbage ns matches neither row nor block layout"));
+    CHECK(expect_refuse(10, 10, 100, 999, "garbage ns matches neither row nor block layout"));
 }
 
 /* ---- Part A2: fmt=6 (E8/IQ3, upstream #465, merged into dev) vs fmt=8
@@ -310,44 +352,45 @@ static void test_disambiguation(void){
  * it -- EXCEPT the ue8m0-scaled fp8 candidate, which stays refused even when
  * correctly stamped "fp8-e4m3-b128" (a stamp cannot grant a decoder this
  * build doesn't have). */
-static void test_fmt6_fp8_collision(void){
+static void test_fmt6_fp8_collision(void) {
     /* O=64, I=98: nblkO=nblkI=1 (fmt=8, single block, f32 scales) -> ns=4;
      * e8_blocks(98)=1 -> nb=O*98=6272 for BOTH interpretations, and fmt=6's
      * .qs tag is always exactly one f32 -> ns=4 too. Unstamped: must refuse. */
-    int64_t nb64=(int64_t)64*98;
-    CHECK(expect_refuse(64,98, nb64, 4, "fmt=6/fmt=8(f32) collision O=64 I=98 (unstamped)"));
+    int64_t nb64 = (int64_t)64 * 98;
+    CHECK(expect_refuse(64, 98, nb64, 4, "fmt=6/fmt=8(f32) collision O=64 I=98 (unstamped)"));
     /* boundary O=128 variant: still nblkO=1 for fmt=8 (128<=128), same collision. */
-    int64_t nb128=(int64_t)128*98;
-    CHECK(expect_refuse(128,98, nb128, 4, "fmt=6/fmt=8(f32) collision O=128 I=98 (unstamped)"));
+    int64_t nb128 = (int64_t)128 * 98;
+    CHECK(expect_refuse(128, 98, nb128, 4, "fmt=6/fmt=8(f32) collision O=128 I=98 (unstamped)"));
 
     /* stamped: the ONLY way to break this collision. Both directions must resolve
      * to the STAMPED format, not whichever the byte-arithmetic-only check would
      * have unconditionally picked (fmt=6, since it runs first in the function). */
-    CHECK(expect_fmt_stamped(64,98, nb64, 4, "fp8-e4m3-b128", 8,
-        "fmt=6/fmt=8(f32) collision O=64 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=8"));
-    CHECK(expect_fmt_stamped(64,98, nb64, 4, "e8-iq3-lattice", 6,
-        "fmt=6/fmt=8(f32) collision O=64 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
-    CHECK(expect_fmt_stamped(128,98, nb128, 4, "fp8-e4m3-b128", 8,
-        "fmt=6/fmt=8(f32) collision O=128 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=8"));
-    CHECK(expect_fmt_stamped(128,98, nb128, 4, "e8-iq3-lattice", 6,
-        "fmt=6/fmt=8(f32) collision O=128 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+    CHECK(expect_fmt_stamped(64, 98, nb64, 4, "fp8-e4m3-b128", 8,
+                             "fmt=6/fmt=8(f32) collision O=64 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=8"));
+    CHECK(expect_fmt_stamped(64, 98, nb64, 4, "e8-iq3-lattice", 6,
+                             "fmt=6/fmt=8(f32) collision O=64 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+    CHECK(expect_fmt_stamped(128, 98, nb128, 4, "fp8-e4m3-b128", 8,
+                             "fmt=6/fmt=8(f32) collision O=128 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=8"));
+    CHECK(expect_fmt_stamped(128, 98, nb128, 4, "e8-iq3-lattice", 6,
+                             "fmt=6/fmt=8(f32) collision O=128 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
 
     /* a stamp naming something else entirely does NOT resolve the ambiguity --
      * same "refuse rather than guess" posture as an absent stamp. */
-    CHECK(expect_refuse_stamped(64,98, nb64, 4, "int4-row",
+    CHECK(expect_refuse_stamped(
+        64, 98, nb64, 4, "int4-row",
         "fmt=6/fmt=8(f32) collision O=64 I=98, stamped with an UNRELATED format -> still refuses"));
 
     /* O=1, I=98: a THIRD candidate stacks on (fmt=1 plain int8 per-row, ns==O*4==4
      * too) -- a genuine three-way ambiguity. Unstamped refuses; stamped resolves
      * to whichever of the three the stamp names. */
-    int64_t nb1=(int64_t)1*98;
-    CHECK(expect_refuse(1,98, nb1, 4, "fmt=1/fmt=6/fmt=8(f32) THREE-way collision O=1 I=98 (unstamped)"));
-    CHECK(expect_fmt_stamped(1,98, nb1, 4, "int8-row", 1,
-        "three-way collision O=1 I=98, stamped int8-row -> resolves to fmt=1"));
-    CHECK(expect_fmt_stamped(1,98, nb1, 4, "fp8-e4m3-b128", 8,
-        "three-way collision O=1 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=8"));
-    CHECK(expect_fmt_stamped(1,98, nb1, 4, "e8-iq3-lattice", 6,
-        "three-way collision O=1 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+    int64_t nb1 = (int64_t)1 * 98;
+    CHECK(expect_refuse(1, 98, nb1, 4, "fmt=1/fmt=6/fmt=8(f32) THREE-way collision O=1 I=98 (unstamped)"));
+    CHECK(expect_fmt_stamped(1, 98, nb1, 4, "int8-row", 1,
+                             "three-way collision O=1 I=98, stamped int8-row -> resolves to fmt=1"));
+    CHECK(expect_fmt_stamped(1, 98, nb1, 4, "fp8-e4m3-b128", 8,
+                             "three-way collision O=1 I=98, stamped fp8-e4m3-b128 -> resolves to fmt=8"));
+    CHECK(expect_fmt_stamped(1, 98, nb1, 4, "e8-iq3-lattice", 6,
+                             "three-way collision O=1 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
 
     /* O in (384,512], I=98: nblkO=4, nblkI=1, product=4 -- a fmt=8 tensor with
      * UE8M0 (1 byte/block) scales also lands at ns==4*1==4 here, the SAME tag
@@ -357,11 +400,12 @@ static void test_fmt6_fp8_collision(void){
      * decoder, so it cannot grant a resolution the byte layout itself can't
      * support (contrast the [64,98]/[128,98] cases above, where the SAME stamp
      * name resolves cleanly because those are the f32-scaled candidate). */
-    int64_t nb400=(int64_t)400*98;
-    CHECK(expect_refuse(400,98, nb400, 4, "fmt=6/fmt=8(ue8m0, 4-block) collision O=400 I=98 (unstamped)"));
-    CHECK(expect_fmt_stamped(400,98, nb400, 4, "e8-iq3-lattice", 6,
-        "fmt=6/fmt=8(ue8m0) collision O=400 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
-    CHECK(expect_refuse_stamped(400,98, nb400, 4, "fp8-e4m3-b128",
+    int64_t nb400 = (int64_t)400 * 98;
+    CHECK(expect_refuse(400, 98, nb400, 4, "fmt=6/fmt=8(ue8m0, 4-block) collision O=400 I=98 (unstamped)"));
+    CHECK(expect_fmt_stamped(400, 98, nb400, 4, "e8-iq3-lattice", 6,
+                             "fmt=6/fmt=8(ue8m0) collision O=400 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
+    CHECK(expect_refuse_stamped(
+        400, 98, nb400, 4, "fp8-e4m3-b128",
         "fmt=6/fmt=8(ue8m0) collision O=400 I=98, stamped fp8-e4m3-b128 -> STILL refuses (no ue8m0 decoder)"));
 
     /* regression guard: a GENUINE (non-colliding) fmt=6 fixture -- I!=98, so
@@ -369,10 +413,10 @@ static void test_fmt6_fp8_collision(void){
      * NO stamp at all. Mirrors test_e8_kernel.c's own O=24,I=512 shape and a
      * small single-super-block shape (I=256, inside the (0,256] range where
      * e8_rowbytes(I)==98 but I!=98, so still non-colliding). */
-    CHECK(expect_fmt(24,512, (int64_t)24*e8_rowbytes(512), 4, 6,
-        "genuine fmt=6 (non-colliding) O=24 I=512, unstamped -> still resolves to fmt=6"));
-    CHECK(expect_fmt(64,256, (int64_t)64*e8_rowbytes(256), 4, 6,
-        "genuine fmt=6 (non-colliding) O=64 I=256 (I!=98, no collision), unstamped -> fmt=6"));
+    CHECK(expect_fmt(24, 512, (int64_t)24 * e8_rowbytes(512), 4, 6,
+                     "genuine fmt=6 (non-colliding) O=24 I=512, unstamped -> still resolves to fmt=6"));
+    CHECK(expect_fmt(64, 256, (int64_t)64 * e8_rowbytes(256), 4, 6,
+                     "genuine fmt=6 (non-colliding) O=64 I=256 (I!=98, no collision), unstamped -> fmt=6"));
 }
 
 /* ---- Part A3: fmt=8's scale ENCODING is a declared property -- UE8M0
@@ -383,18 +427,20 @@ static void test_fmt6_fp8_collision(void){
  * the small-O collision, where a DIFFERENT stamp ("int8-row", naming the
  * OTHER live candidate) legitimately resolves it, because that candidate
  * really is decodable. ---- */
-static void test_ue8m0_scale_refusal(void){
+static void test_ue8m0_scale_refusal(void) {
     /* [2048,6144] (spec example shape, same as Part A's fmt=8/f32 golden
      * path): nblkO=16, nblkI=48, product=768 blocks. A UE8M0 sidecar is
      * exactly 1 byte/block -> ns=768, distinct from BOTH fmt=1's per-row
      * count (O*4=8192) and this build's f32 block-scale count (768*4=3072).
      * Clean, unambiguous UE8M0 signature -- must name-refuse, not silently
      * treat it as a truncated/corrupt f32 array or match it to fmt=1. */
-    int64_t nb=(int64_t)2048*6144;
-    CHECK(expect_refuse(2048,6144, nb, 768,
+    int64_t nb = (int64_t)2048 * 6144;
+    CHECK(expect_refuse(
+        2048, 6144, nb, 768,
         "fp8-e4m3-b128 with ue8m0 scales (spec-shaped, non-degenerate), unstamped -> recognized, refused by name"));
-    CHECK(expect_refuse_stamped(2048,6144, nb, 768, "fp8-e4m3-b128",
-        "fp8-e4m3-b128 with ue8m0 scales, stamped fp8-e4m3-b128 -> STILL refuses (stamp names the weight format, not a decoder)"));
+    CHECK(expect_refuse_stamped(2048, 6144, nb, 768, "fp8-e4m3-b128",
+                                "fp8-e4m3-b128 with ue8m0 scales, stamped fp8-e4m3-b128 -> STILL refuses (stamp names "
+                                "the weight format, not a decoder)"));
 
     /* O=1, I=400: nblkO=1, nblkI=ceil(400/128)=4, product=4 -- a UE8M0 sidecar
      * here is ns=4*1=4, which ALSO equals fmt=1's per-row count (O*4=4): the
@@ -404,12 +450,15 @@ static void test_ue8m0_scale_refusal(void){
      * resolve it -- that candidate is real, decodable plain int8, and the
      * stamp confirms it's the one on disk. Stamped "fp8-e4m3-b128" does NOT
      * resolve it -- same "no decoder" refusal as the clean case above. */
-    int64_t nb1=(int64_t)1*400;
-    CHECK(expect_refuse(1,400, nb1, 4,
+    int64_t nb1 = (int64_t)1 * 400;
+    CHECK(expect_refuse(
+        1, 400, nb1, 4,
         "fp8-e4m3-b128 with ue8m0 scales, ALSO colliding with fmt=1 per-row (O=1), unstamped -> refused"));
-    CHECK(expect_fmt_stamped(1,400, nb1, 4, "int8-row", 1,
+    CHECK(expect_fmt_stamped(
+        1, 400, nb1, 4, "int8-row", 1,
         "ue8m0/fmt=1 collision O=1 I=400, stamped int8-row -> resolves to fmt=1 (real, decodable candidate)"));
-    CHECK(expect_refuse_stamped(1,400, nb1, 4, "fp8-e4m3-b128",
+    CHECK(expect_refuse_stamped(
+        1, 400, nb1, 4, "fp8-e4m3-b128",
         "ue8m0/fmt=1 collision O=1 I=400, stamped fp8-e4m3-b128 -> STILL refuses (no ue8m0 decoder)"));
 }
 
@@ -429,107 +478,128 @@ static void test_ue8m0_scale_refusal(void){
  * No GLM-5.2 resident tensor is a member: at I<=16384 (nblkI<=128),
  * membership forces O<=32, and every repack-eligible GLM-5.2 role has
  * O>=576 (tools/fp8_collision_census.py enumerates the roles). */
-static void test_ue8m0_family_sweep(void){
+static void test_ue8m0_family_sweep(void) {
     /* [2,1024]: nblkO=1, nblkI=8 -> nblk=8 == 4*O. ns = O*4 = nblk = 8. */
-    CHECK(expect_refuse(2,1024, (int64_t)2*1024, 8,
-        "ue8m0 family [2,1024] (nblk=8==4*O), unstamped int8-shaped -> refuses (current polarity)"));
-    CHECK(expect_fmt_stamped(2,1024, (int64_t)2*1024, 8, "int8-row", 1,
-        "ue8m0 family [2,1024], stamped int8-row -> resolves to fmt=1 (the escape hatch)"));
+    CHECK(expect_refuse(2, 1024, (int64_t)2 * 1024, 8,
+                        "ue8m0 family [2,1024] (nblk=8==4*O), unstamped int8-shaped -> refuses (current polarity)"));
+    CHECK(expect_fmt_stamped(2, 1024, (int64_t)2 * 1024, 8, "int8-row", 1,
+                             "ue8m0 family [2,1024], stamped int8-row -> resolves to fmt=1 (the escape hatch)"));
     /* [129,33000]: nblkO=2, nblkI=258 -> nblk=516 == 4*129. ns = 516. */
-    CHECK(expect_refuse(129,33000, (int64_t)129*33000, 516,
+    CHECK(expect_refuse(
+        129, 33000, (int64_t)129 * 33000, 516,
         "ue8m0 family [129,33000] (nblk=516==4*O, nblkO=2), unstamped int8-shaped -> refuses (current polarity)"));
-    CHECK(expect_fmt_stamped(129,33000, (int64_t)129*33000, 516, "int8-row", 1,
-        "ue8m0 family [129,33000], stamped int8-row -> resolves to fmt=1"));
+    CHECK(expect_fmt_stamped(129, 33000, (int64_t)129 * 33000, 516, "int8-row", 1,
+                             "ue8m0 family [129,33000], stamped int8-row -> resolves to fmt=1"));
 }
 
 /* ---- Part B: qt_from_disk loader-seam (real safetensors file) ---- */
 
-static void deq_fmt8(const QT *t, float *dq){
+static void deq_fmt8(const QT *t, float *dq) {
     int64_t nblkI = fp8_nblk(t->I);
-    for(int o=0;o<t->O;o++){
-        int64_t blkO = o/FP8_BLOCK; const float *scl = t->s + blkO*nblkI;
-        for(int i=0;i<t->I;i++){
-            int64_t bi = i/FP8_BLOCK;
-            dq[(int64_t)o*t->I+i] = e4m3_decode(t->q8[(int64_t)o*t->I+i]) * scl[bi];
+    for (int o = 0; o < t->O; o++) {
+        int64_t blkO = o / FP8_BLOCK;
+        const float *scl = t->s + blkO * nblkI;
+        for (int i = 0; i < t->I; i++) {
+            int64_t bi = i / FP8_BLOCK;
+            dq[(int64_t)o * t->I + i] = e4m3_decode(t->q8[(int64_t)o * t->I + i]) * scl[bi];
         }
     }
 }
-static void deq_fmt1(const QT *t, float *dq){
-    for(int o=0;o<t->O;o++){ float s=t->s[o];
-        for(int i=0;i<t->I;i++) dq[(int64_t)o*t->I+i]=(float)t->q8[(int64_t)o*t->I+i]*s; }
+static void deq_fmt1(const QT *t, float *dq) {
+    for (int o = 0; o < t->O; o++) {
+        float s = t->s[o];
+        for (int i = 0; i < t->I; i++) dq[(int64_t)o * t->I + i] = (float)t->q8[(int64_t)o * t->I + i] * s;
+    }
 }
 
-#define CDIV(n,d) (((n)+(d)-1)/(d))
+#define CDIV(n, d) (((n) + (d) - 1) / (d))
 
-static void test_loader_seam(void){
-    enum { O7=8, I7=256 };                        /* nblkO=1, nblkI=2 -> 2 block scales total */
-    enum { O1=5, I1=64 };                        /* DIFFERENT shape from the fp8 tensor: O1*I1=320
-                                                   * bytes, ns=O1*4=20 -- neither collides with the
-                                                   * fp8 tensor's own byte counts (kept deliberately
-                                                   * distinct so this is a plain, non-degenerate
-                                                   * negative control, not another landmine case). */
-    enum { NBLK7 = CDIV(O7,128) * CDIV(I7,128) };  /* must be a compile-time constant expression for
-                                                     * the static array below -- fp8_nblk() is a real
-                                                     * function (runtime, not constexpr), so it can't
-                                                     * size a `static` array even with literal inputs. */
-    static uint8_t q7[O7*I7]; static float s7[NBLK7];
-    for(int i=0;i<O7*I7;i++) q7[i]=rndbyte_nonan();
-    for(int i=0;i<(int)(sizeof s7/sizeof *s7);i++) s7[i]=0.01f+0.001f*(float)i;
+static void test_loader_seam(void) {
+    enum { O7 = 8, I7 = 256 }; /* nblkO=1, nblkI=2 -> 2 block scales total */
+    enum {
+        O1 = 5,
+        I1 = 64
+    }; /* DIFFERENT shape from the fp8 tensor: O1*I1=320
+        * bytes, ns=O1*4=20 -- neither collides with the
+        * fp8 tensor's own byte counts (kept deliberately
+        * distinct so this is a plain, non-degenerate
+        * negative control, not another landmine case). */
+    enum {
+        NBLK7 = CDIV(O7, 128) * CDIV(I7, 128)
+    }; /* must be a compile-time constant expression for
+        * the static array below -- fp8_nblk() is a real
+        * function (runtime, not constexpr), so it can't
+        * size a `static` array even with literal inputs. */
+    static uint8_t q7[O7 * I7];
+    static float s7[NBLK7];
+    for (int i = 0; i < O7 * I7; i++) q7[i] = rndbyte_nonan();
+    for (int i = 0; i < (int)(sizeof s7 / sizeof *s7); i++) s7[i] = 0.01f + 0.001f * (float)i;
 
-    static int8_t q1[O1*I1]; static float s1[O1];
-    for(int i=0;i<O1*I1;i++) q1[i]=(int8_t)(rndbyte_nonan()-128);
-    for(int i=0;i<O1;i++) s1[i]=0.02f+0.001f*(float)i;
+    static int8_t q1[O1 * I1];
+    static float s1[O1];
+    for (int i = 0; i < O1 * I1; i++) q1[i] = (int8_t)(rndbyte_nonan() - 128);
+    for (int i = 0; i < O1; i++) s1[i] = 0.02f + 0.001f * (float)i;
 
-    const char *dir="tests/tmp_fp8_snap";
+    const char *dir = "tests/tmp_fp8_snap";
 #ifdef _WIN32
     mkdir(dir);
 #else
-    mkdir(dir,0755);
+    mkdir(dir, 0755);
 #endif
-    char path[300]; snprintf(path,sizeof path,"%s/model.safetensors",dir);
-    int64_t nb7=(int64_t)O7*I7, ns7=(int64_t)(sizeof s7);
-    int64_t nb1=(int64_t)O1*I1, ns1=(int64_t)O1*4;
+    char path[300];
+    snprintf(path, sizeof path, "%s/model.safetensors", dir);
+    int64_t nb7 = (int64_t)O7 * I7, ns7 = (int64_t)(sizeof s7);
+    int64_t nb1 = (int64_t)O1 * I1, ns1 = (int64_t)O1 * 4;
     char hdr[1024];
-    int hl=snprintf(hdr,sizeof hdr,
-        "{\"w7\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
-        "\"w7.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]},"
-        "\"w1\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]},"
-        "\"w1.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
-        (long long)nb7,(long long)nb7,
-        (long long)(ns7/4),(long long)nb7,(long long)(nb7+ns7),
-        (long long)nb1,(long long)(nb7+ns7),(long long)(nb7+ns7+nb1),
-        (long long)O1,(long long)(nb7+ns7+nb1),(long long)(nb7+ns7+nb1+ns1));
-    FILE *f=fopen(path,"wb");
-    if(!f){ printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path); fails++; return; }
-    uint64_t hlen=(uint64_t)hl;
-    fwrite(&hlen,8,1,f); fwrite(hdr,1,hl,f);
-    fwrite(q7,1,(size_t)nb7,f); fwrite(s7,1,(size_t)ns7,f);
-    fwrite(q1,1,(size_t)nb1,f); fwrite(s1,1,(size_t)ns1,f);
+    int hl = snprintf(hdr, sizeof hdr,
+                      "{\"w7\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+                      "\"w7.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]},"
+                      "\"w1\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]},"
+                      "\"w1.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+                      (long long)nb7, (long long)nb7, (long long)(ns7 / 4), (long long)nb7, (long long)(nb7 + ns7),
+                      (long long)nb1, (long long)(nb7 + ns7), (long long)(nb7 + ns7 + nb1), (long long)O1,
+                      (long long)(nb7 + ns7 + nb1), (long long)(nb7 + ns7 + nb1 + ns1));
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path);
+        fails++;
+        return;
+    }
+    uint64_t hlen = (uint64_t)hl;
+    fwrite(&hlen, 8, 1, f);
+    fwrite(hdr, 1, hl, f);
+    fwrite(q7, 1, (size_t)nb7, f);
+    fwrite(s7, 1, (size_t)ns7, f);
+    fwrite(q1, 1, (size_t)nb1, f);
+    fwrite(s1, 1, (size_t)ns1, f);
     fclose(f);
 
-    static Model gm;                             /* only gm.S is used by qt_from_disk */
+    static Model gm; /* only gm.S is used by qt_from_disk */
     st_init(&gm.S, dir);
 
-    QT t7; memset(&t7,0,sizeof t7);
-    qt_from_disk(&gm,"w7",O7,I7,8,0,&t7);
-    CHECK(t7.fmt==8);
-    CHECK(t7.q8!=NULL && t7.s!=NULL);            /* both weight and scale allocated (qalloc, not falloc) */
-    static float dq_load[O7*I7], dq_ref[O7*I7];
-    deq_fmt8(&t7,dq_load);
-    QT tr7={.fmt=8,.q8=(int8_t*)q7,.s=s7,.O=O7,.I=I7};
-    deq_fmt8(&tr7,dq_ref);
-    CHECK(memcmp(dq_load,dq_ref,sizeof dq_ref)==0);
+    QT t7;
+    memset(&t7, 0, sizeof t7);
+    qt_from_disk(&gm, "w7", O7, I7, 8, 0, &t7);
+    CHECK(t7.fmt == 8);
+    CHECK(t7.q8 != NULL && t7.s != NULL); /* both weight and scale allocated (qalloc, not falloc) */
+    static float dq_load[O7 * I7], dq_ref[O7 * I7];
+    deq_fmt8(&t7, dq_load);
+    QT tr7 = {.fmt = 8, .q8 = (int8_t *)q7, .s = s7, .O = O7, .I = I7};
+    deq_fmt8(&tr7, dq_ref);
+    CHECK(memcmp(dq_load, dq_ref, sizeof dq_ref) == 0);
 
-    QT t1; memset(&t1,0,sizeof t1);
-    qt_from_disk(&gm,"w1",O1,I1,8,0,&t1);
-    CHECK(t1.fmt==1);                            /* negative control: plain int8 still resolves as fmt=1 */
-    static float dq_load1[O1*I1], dq_ref1[O1*I1];
-    deq_fmt1(&t1,dq_load1);
-    QT tr1={.fmt=1,.q8=q1,.s=s1,.O=O1,.I=I1};
-    deq_fmt1(&tr1,dq_ref1);
-    CHECK(memcmp(dq_load1,dq_ref1,sizeof dq_ref1)==0);
+    QT t1;
+    memset(&t1, 0, sizeof t1);
+    qt_from_disk(&gm, "w1", O1, I1, 8, 0, &t1);
+    CHECK(t1.fmt == 1); /* negative control: plain int8 still resolves as fmt=1 */
+    static float dq_load1[O1 * I1], dq_ref1[O1 * I1];
+    deq_fmt1(&t1, dq_load1);
+    QT tr1 = {.fmt = 1, .q8 = q1, .s = s1, .O = O1, .I = I1};
+    deq_fmt1(&tr1, dq_ref1);
+    CHECK(memcmp(dq_load1, dq_ref1, sizeof dq_ref1) == 0);
 
-    unlink(path); rmdir(dir);
+    unlink(path);
+    rmdir(dir);
 }
 
 /* ---- Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=8 ----
@@ -546,31 +616,36 @@ static void test_loader_seam(void){
  * (RLIMIT_MEMLOCK) and not what changed; the byte-count formula is) across
  * the shapes already used elsewhere in this file plus a block-edge
  * (non-128-multiple) case. */
-static void check_fp8_bytes(int O, int I, const char *tag){
-    QT t; memset(&t,0,sizeof t); t.fmt=8; t.O=O; t.I=I; t.gs=0;
-    int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I), nblk=nblkO*nblkI;
-    int64_t want_total = (int64_t)O*I + nblk*4;
-    int64_t want_scale = nblk*4;
+static void check_fp8_bytes(int O, int I, const char *tag) {
+    QT t;
+    memset(&t, 0, sizeof t);
+    t.fmt = 8;
+    t.O = O;
+    t.I = I;
+    t.gs = 0;
+    int64_t nblkO = fp8_nblk(O), nblkI = fp8_nblk(I), nblk = nblkO * nblkI;
+    int64_t want_total = (int64_t)O * I + nblk * 4;
+    int64_t want_scale = nblk * 4;
     int64_t got_total = qt_bytes(&t);
     int64_t got_scale = qt_scale_bytes(&t);
-    if(got_total != want_total)
+    if (got_total != want_total)
         printf("FAIL %s: qt_bytes=%lld want=%lld\n", tag, (long long)got_total, (long long)want_total);
     CHECK(got_total == want_total);
-    if(got_scale != want_scale)
+    if (got_scale != want_scale)
         printf("FAIL %s: qt_scale_bytes=%lld want=%lld\n", tag, (long long)got_scale, (long long)want_scale);
     CHECK(got_scale == want_scale);
     /* weight_b, as qt_wire_mmap/qt_unwire_mmap now compute it, must land on the exact
      * O*I raw-byte weight region -- not short (partial mlock) or long (mlock past the
      * allocation, undefined behavior) by even one byte. */
-    CHECK(got_total - got_scale == (int64_t)O*I);
+    CHECK(got_total - got_scale == (int64_t)O * I);
     /* regression guard: the fmt=2 (packed-nibble) formula must NOT be what fmt=8
      * returns -- confirm the value has actually MOVED off it (catches a silent
      * revert of the fmt==8 branch order/placement, not just a formula typo). For
      * O=1,I=1 the two formulas coincide by coincidence (both give 1+4=5), so that
      * shape is skipped for this particular guard -- the other three shapes below are
      * chosen to avoid the coincidence. */
-    int64_t old_wrong = (int64_t)O*((I+1)/2) + (int64_t)O*4;
-    if(!(O==1 && I==1)) CHECK(got_total != old_wrong);
+    int64_t old_wrong = (int64_t)O * ((I + 1) / 2) + (int64_t)O * 4;
+    if (!(O == 1 && I == 1)) CHECK(got_total != old_wrong);
 }
 
 /* qt_wire_mmap()/qt_unwire_mmap() (colibri.c) both compute weight_b/scale_b via
@@ -587,26 +662,32 @@ static void check_fp8_bytes(int O, int I, const char *tag){
  * audit finding: a FIXED 4-byte tag, not O*4 -- see qt_scale_bytes' own
  * comment for why this is reachable, not dead code); fmt=8 nblk>O, the
  * shape this review round is about). */
-static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
+static void check_wire_split(int fmt, int O, int I, int gs, const char *tag) {
     /* self-guard (fix round 1, reviewer finding): the fmt ARGUMENT is the
      * load-bearing input here, and a label that says fmt=8 with the argument
      * left at a stale ordinal turns every assertion below into a tautology
      * (want and got both fall to the same per-row default together). Pin the
      * argument to the supported set so label/argument drift dies loudly at
      * the call site instead. */
-    if(fmt!=1 && fmt!=4 && fmt!=5 && fmt!=6 && fmt!=8){
+    if (fmt != 1 && fmt != 4 && fmt != 5 && fmt != 6 && fmt != 8) {
         printf("FAIL %s: check_wire_split fmt=%d not in supported set {1,4,5,6,8} -- stale call site?\n", tag, fmt);
-        CHECK(0); return;
+        CHECK(0);
+        return;
     }
-    QT t; memset(&t,0,sizeof t); t.fmt=fmt; t.O=O; t.I=I; t.gs=gs;
+    QT t;
+    memset(&t, 0, sizeof t);
+    t.fmt = fmt;
+    t.O = O;
+    t.I = I;
+    t.gs = gs;
     int64_t want_scale = qt_scale_bytes(&t);
     int64_t want_weight = qt_bytes(&t) - want_scale;
-    int64_t got_weight=-1, got_scale=-1;
-    qt_wire_split(&t,&got_weight,&got_scale);
-    if(got_scale != want_scale)
+    int64_t got_weight = -1, got_scale = -1;
+    qt_wire_split(&t, &got_weight, &got_scale);
+    if (got_scale != want_scale)
         printf("FAIL %s: qt_wire_split scale_b=%lld want=%lld\n", tag, (long long)got_scale, (long long)want_scale);
     CHECK(got_scale == want_scale);
-    if(got_weight != want_weight)
+    if (got_weight != want_weight)
         printf("FAIL %s: qt_wire_split weight_b=%lld want=%lld\n", tag, (long long)got_weight, (long long)want_weight);
     CHECK(got_weight == want_weight);
     /* the regression this test exists to catch: a per-row-only scale_b==O*4
@@ -614,14 +695,14 @@ static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
      * cardinality differs from O (fmt=4/5/6/8 here) -- confirm the value has
      * actually moved off that old constant, not just matched qt_scale_bytes()
      * by coincidence at a degenerate shape. */
-    int64_t old_wrong_scale = (int64_t)O*4;
-    if((fmt==4 || fmt==5 || fmt==6 || fmt==8) && want_scale != old_wrong_scale)
+    int64_t old_wrong_scale = (int64_t)O * 4;
+    if ((fmt == 4 || fmt == 5 || fmt == 6 || fmt == 8) && want_scale != old_wrong_scale)
         CHECK(got_scale != old_wrong_scale);
     /* fmt=6's scale is a FIXED 4 bytes regardless of [O,I] -- assert the
      * literal value directly too, not just "moved off O*4", since a future
      * regression that made it O-dependent in some OTHER wrong way would
      * still pass the generic check above. */
-    if(fmt==6) CHECK(want_scale == 4);
+    if (fmt == 6) CHECK(want_scale == 4);
     /* fmt=8: same independent-pin discipline as the fmt==6 literal above.
      * want and got BOTH flow through the engine's qt_scale_bytes() (the test
      * computes want from it, and qt_wire_split() calls it), so a reverted or
@@ -631,9 +712,9 @@ static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
      * block-grid value here, independently of the engine, is what makes a
      * regression of that branch actually FAIL this test (mutation-proven,
      * fix round 1). */
-    if(fmt==8){
-        int64_t nblk = (((int64_t)O+127)/128) * (((int64_t)I+127)/128);
-        CHECK(want_scale == nblk*4);
+    if (fmt == 8) {
+        int64_t nblk = (((int64_t)O + 127) / 128) * (((int64_t)I + 127) / 128);
+        CHECK(want_scale == nblk * 4);
     }
 }
 
@@ -659,62 +740,73 @@ static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
  * arm both qt_wire_mmap (via mem_wire) and qt_unwire_mmap take -- Windows
  * takes a different call (compat_mlock/compat_munlock) not intercepted
  * here. */
-static void test_wire_site_regression(void){
+static void test_wire_site_regression(void) {
 #ifndef _WIN32
-    g_seam_wire_n = 0; g_seam_unwire_n = 0;
-    enum { O=2, I=16384 };
-    enum { NBLKO = CDIV(O,128), NBLKI = CDIV(I,128), NBLK = NBLKO*NBLKI };
-    static uint8_t q7[O*I]; static float s7[NBLK];
-    for(int i=0;i<O*I;i++) q7[i]=rndbyte_nonan();
-    for(int i=0;i<NBLK;i++) s7[i]=0.01f+0.001f*(float)i;
+    g_seam_wire_n = 0;
+    g_seam_unwire_n = 0;
+    enum { O = 2, I = 16384 };
+    enum { NBLKO = CDIV(O, 128), NBLKI = CDIV(I, 128), NBLK = NBLKO * NBLKI };
+    static uint8_t q7[O * I];
+    static float s7[NBLK];
+    for (int i = 0; i < O * I; i++) q7[i] = rndbyte_nonan();
+    for (int i = 0; i < NBLK; i++) s7[i] = 0.01f + 0.001f * (float)i;
 
-    QT t; memset(&t,0,sizeof t);
-    t.fmt=8; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q7; t.s=s7;
+    QT t;
+    memset(&t, 0, sizeof t);
+    t.fmt = 8;
+    t.O = O;
+    t.I = I;
+    t.gs = 0;
+    t.q8 = (int8_t *)q7;
+    t.s = s7;
 
     int64_t want_scale = qt_scale_bytes(&t);
     int64_t want_weight = qt_bytes(&t) - want_scale;
     /* sanity: this shape must actually distinguish the fix from the old bug,
      * or the test below would pass either way and prove nothing. */
-    CHECK(want_scale != (int64_t)O*4);
+    CHECK(want_scale != (int64_t)O * 4);
 
     /* qt_wire_mmap doesn't itself gate on g_mmap/mem_should_wire (its
      * caller, pin_wire, does) -- calling it directly always attempts to
      * wire, which is exactly what this test wants. */
-    int64_t wired=0; long failed=0;
+    int64_t wired = 0;
+    long failed = 0;
     qt_wire_mmap(&t, &wired, &failed);
-    if(g_seam_wire_n != 2)
+    if (g_seam_wire_n != 2)
         printf("FAIL wire-site regression: qt_wire_mmap called mlock() %d times, expected 2\n", g_seam_wire_n);
     CHECK(g_seam_wire_n == 2);
-    if(g_seam_wire_n >= 1 && (int64_t)g_seam_wire_len[0] != want_weight)
+    if (g_seam_wire_n >= 1 && (int64_t)g_seam_wire_len[0] != want_weight)
         printf("FAIL wire-site regression: qt_wire_mmap's WEIGHT mlock() call got len=%lld want=%lld\n",
                (long long)g_seam_wire_len[0], (long long)want_weight);
-    CHECK(g_seam_wire_n>=1 && (int64_t)g_seam_wire_len[0]==want_weight);
-    if(g_seam_wire_n >= 2 && (int64_t)g_seam_wire_len[1] != want_scale)
+    CHECK(g_seam_wire_n >= 1 && (int64_t)g_seam_wire_len[0] == want_weight);
+    if (g_seam_wire_n >= 2 && (int64_t)g_seam_wire_len[1] != want_scale)
         printf("FAIL wire-site regression: qt_wire_mmap's SCALE mlock() call got len=%lld want=%lld "
                "(this is exactly what a reverted scale_b=O*4 hardcode breaks)\n",
                (long long)g_seam_wire_len[1], (long long)want_scale);
-    CHECK(g_seam_wire_n>=2 && (int64_t)g_seam_wire_len[1]==want_scale);
+    CHECK(g_seam_wire_n >= 2 && (int64_t)g_seam_wire_len[1] == want_scale);
 
     /* qt_unwire_mmap early-returns unless g_mmap && mem_should_wire() are
      * both true -- force both on for this call, then restore, so this test
      * doesn't change global state for any test that runs after it. */
     int saved_g_mmap = g_mmap, saved_g_mlock = g_mlock;
-    g_mmap = 1; g_mlock = 1;
+    g_mmap = 1;
+    g_mlock = 1;
     qt_unwire_mmap(&t);
-    g_mmap = saved_g_mmap; g_mlock = saved_g_mlock;
+    g_mmap = saved_g_mmap;
+    g_mlock = saved_g_mlock;
 
-    if(g_seam_unwire_n != 2)
+    if (g_seam_unwire_n != 2)
         printf("FAIL wire-site regression: qt_unwire_mmap called munlock() %d times, expected 2\n", g_seam_unwire_n);
     CHECK(g_seam_unwire_n == 2);
-    if(g_seam_unwire_n >= 1 && (int64_t)g_seam_unwire_len[0] != want_weight)
+    if (g_seam_unwire_n >= 1 && (int64_t)g_seam_unwire_len[0] != want_weight)
         printf("FAIL wire-site regression: qt_unwire_mmap's WEIGHT munlock() call got len=%lld want=%lld\n",
                (long long)g_seam_unwire_len[0], (long long)want_weight);
-    CHECK(g_seam_unwire_n>=1 && (int64_t)g_seam_unwire_len[0]==want_weight);
-    if(g_seam_unwire_n >= 2 && (int64_t)g_seam_unwire_len[1] != want_scale)
+    CHECK(g_seam_unwire_n >= 1 && (int64_t)g_seam_unwire_len[0] == want_weight);
+    if (g_seam_unwire_n >= 2 && (int64_t)g_seam_unwire_len[1] != want_scale)
         printf("FAIL wire-site regression: qt_unwire_mmap's SCALE munlock() call got len=%lld want=%lld "
                "(this is exactly what a reverted scale_b=O*4 hardcode breaks)\n",
                (long long)g_seam_unwire_len[1], (long long)want_scale);
-    CHECK(g_seam_unwire_n>=2 && (int64_t)g_seam_unwire_len[1]==want_scale);
+    CHECK(g_seam_unwire_n >= 2 && (int64_t)g_seam_unwire_len[1] == want_scale);
 #else
     printf("skipped on Windows (no mlock/munlock observer seam): wire-site regression\n");
 #endif
@@ -730,36 +822,46 @@ static void test_wire_site_regression(void){
  * tensor and that the old fail-open `l-><t>.fmt!=8` idiom is gone. The pin
  * is a source-text assertion, disclosed as such: it proves wiring, not
  * runtime routing; the truth table proves the routing decision itself. */
-static void test_metal_fused_allowlist(void){
+static void test_metal_fused_allowlist(void) {
     /* (1) truth table: admits EXACTLY the shader's explicit integer-format
      * set {1,2,3,4} (fmt=3 was legal-and-correct on the fused path before
      * the allowlist existed; fmt=0 never actually fused -- WP_ hands the
      * shader a NULL q4 for it). A negative-guard regression (e.g.
      * `return fmt!=8;`) admits 5/6 -- the silent-f32-misread hazard -- and
      * fails here. */
-    for(int fmt=-1; fmt<=9; fmt++){
-        int want = (fmt==1 || fmt==2 || fmt==3 || fmt==4);
-        if(metal_fused_fmt_ok(fmt) != want)
+    for (int fmt = -1; fmt <= 9; fmt++) {
+        int want = (fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4);
+        if (metal_fused_fmt_ok(fmt) != want)
             printf("FAIL metal_fused_fmt_ok(%d)=%d, want %d\n", fmt, metal_fused_fmt_ok(fmt), want);
         CHECK(metal_fused_fmt_ok(fmt) == want);
     }
-    CHECK(!metal_fused_fmt_ok(100));   /* private-block ordinals stay out too */
+    CHECK(!metal_fused_fmt_ok(100)); /* private-block ordinals stay out too */
     /* (2) grep-pin: run_tests.py runs us with cwd=c/ (Part B's fixtures rely
      * on the same fact). 11 per-tensor call sites = 4 (attention_rows:
      * q_a/q_b/kv_a/o) + 7 (layer_forward_rows: those + sh_gate/sh_up/sh_down). */
     FILE *f = fopen("colibri.c", "r");
-    if(!f){ printf("FAIL Part F grep-pin: cannot open colibri.c (cwd not c/?)\n"); CHECK(0); return; }
-    static char src[16*1024*1024];
-    size_t n = fread(src, 1, sizeof(src)-1, f); src[n]=0; fclose(f);
-    CHECK(n > 100000);                      /* sanity: we read the real file */
-    int calls=0; const char *p=src;
-    while((p=strstr(p,"metal_fused_fmt_ok(l->"))!=NULL){ calls++; p++; }
-    if(calls!=11) printf("FAIL Part F grep-pin: %d metal_fused_fmt_ok(l->...) call sites, want 11\n", calls);
-    CHECK(calls==11);
+    if (!f) {
+        printf("FAIL Part F grep-pin: cannot open colibri.c (cwd not c/?)\n");
+        CHECK(0);
+        return;
+    }
+    static char src[16 * 1024 * 1024];
+    size_t n = fread(src, 1, sizeof(src) - 1, f);
+    src[n] = 0;
+    fclose(f);
+    CHECK(n > 100000); /* sanity: we read the real file */
+    int calls = 0;
+    const char *p = src;
+    while ((p = strstr(p, "metal_fused_fmt_ok(l->")) != NULL) {
+        calls++;
+        p++;
+    }
+    if (calls != 11) printf("FAIL Part F grep-pin: %d metal_fused_fmt_ok(l->...) call sites, want 11\n", calls);
+    CHECK(calls == 11);
     /* the old fail-open idiom must be gone from the gate sites (the CUDA
      * eligibility guard's `w->fmt!=8` is a different site and untouched). */
-    CHECK(strstr(src,"l->q_a.fmt!=8")==NULL);
-    CHECK(strstr(src,"l->sh_gate.fmt!=8")==NULL);
+    CHECK(strstr(src, "l->q_a.fmt!=8") == NULL);
+    CHECK(strstr(src, "l->sh_gate.fmt!=8") == NULL);
 }
 
 /* ---- Part G (micro-round 2): fmt=7 is unreachable as a qt_resolve_fmt
@@ -773,80 +875,94 @@ static void test_metal_fused_allowlist(void){
  * (row formats, grouped, int3-g64, E8/IQ3, fp8 f32/ue8m0, collision-family
  * members, degenerate dims) and assert every non-refusing resolution is in
  * {1,2,3,4,5,6,8} -- never 7, never anything else. */
-static int resolved_fmt_probe(int O, int I, int64_t nb, int64_t ns, const char *stamped){
+static int resolved_fmt_probe(int O, int I, int64_t nb, int64_t ns, const char *stamped) {
 #ifndef _WIN32
-    fflush(stdout);   /* a refusing child exits via exit(1), which flushes
-                       * inherited stdio -- don't let it replay our buffer */
-    int pipefd[2]; if(pipe(pipefd)!=0) return -2;
+    fflush(stdout); /* a refusing child exits via exit(1), which flushes
+                     * inherited stdio -- don't let it replay our buffer */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -2;
     pid_t pid = fork();
-    if(pid < 0) return -2;
-    if(pid == 0){
+    if (pid < 0) return -2;
+    if (pid == 0) {
         int devnull = open("/dev/null", O_WRONLY);
-        if(devnull>=0) dup2(devnull,2);                 /* silence refusal chatter */
+        if (devnull >= 0) dup2(devnull, 2); /* silence refusal chatter */
         close(pipefd[0]);
-        int gs=0;
+        int gs = 0;
         int fmt = qt_resolve_fmt("sweep", O, I, nb, ns, &gs, stamped);
         unsigned char b = (unsigned char)fmt;
-        ssize_t wr = write(pipefd[1], &b, 1); (void)wr;
+        ssize_t wr = write(pipefd[1], &b, 1);
+        (void)wr;
         _exit(0);
     }
     close(pipefd[1]);
-    unsigned char b=0; ssize_t got = read(pipefd[0], &b, 1);
+    unsigned char b = 0;
+    ssize_t got = read(pipefd[0], &b, 1);
     close(pipefd[0]);
-    int status=0; waitpid(pid,&status,0);
-    if(WIFEXITED(status) && WEXITSTATUS(status)==0 && got==1) return (int)b;
-    if(WIFEXITED(status) && WEXITSTATUS(status)==1) return -1;   /* refused */
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && got == 1) return (int)b;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 1) return -1; /* refused */
     return -2;                                                    /* crash/protocol: always a failure */
 #else
-    (void)O;(void)I;(void)nb;(void)ns;
-    return -3;                                                    /* sweep skipped on Windows */
+    (void)O;
+    (void)I;
+    (void)nb;
+    (void)ns;
+    return -3; /* sweep skipped on Windows */
 #endif
 }
-static void test_fmt7_unreachable_sweep(void){
+static void test_fmt7_unreachable_sweep(void) {
 #ifndef _WIN32
-    static const int Os[] = {1,2,3,24,32,33,64,98,127,128,129,130,384,400,576,2048};
-    static const int Is[] = {1,64,98,128,129,200,256,257,384,400,512,1024,6144,16384,33000};
-    int probes=0, resolved=0, refused=0;
-    for(size_t oi=0; oi<sizeof(Os)/sizeof(Os[0]); oi++){
-        for(size_t ii=0; ii<sizeof(Is)/sizeof(Is[0]); ii++){
-            int O=Os[oi], I=Is[ii];
-            int64_t nblk = fp8_nblk(O)*fp8_nblk(I);
+    static const int Os[] = {1, 2, 3, 24, 32, 33, 64, 98, 127, 128, 129, 130, 384, 400, 576, 2048};
+    static const int Is[] = {1, 64, 98, 128, 129, 200, 256, 257, 384, 400, 512, 1024, 6144, 16384, 33000};
+    int probes = 0, resolved = 0, refused = 0;
+    for (size_t oi = 0; oi < sizeof(Os) / sizeof(Os[0]); oi++) {
+        for (size_t ii = 0; ii < sizeof(Is) / sizeof(Is[0]); ii++) {
+            int O = Os[oi], I = Is[ii];
+            int64_t nblk = fp8_nblk(O) * fp8_nblk(I);
             /* every (nb, ns) class the resolver's ladder can see, incl. the
              * adversarial cross-wired ones (row-shaped ns on block-shaped nb
              * and vice versa): */
             const int64_t cand[][2] = {
-                { (int64_t)O*I,              (int64_t)O*4 },        /* int8-row shaped   */
-                { (int64_t)O*I,              nblk*4       },        /* fp8 f32 block     */
-                { (int64_t)O*I,              nblk         },        /* fp8 ue8m0 block   */
-                { (int64_t)O*((I+1)/2),      (int64_t)O*4 },        /* int4-row          */
-                { (int64_t)O*((I+3)/4),      (int64_t)O*4 },        /* int2-row          */
-                { (int64_t)O*((I+1)/2),      (int64_t)O*((I+63)/64)*4 }, /* int4-grouped g64 */
-                { (int64_t)O*i3_rowbytes(I), (int64_t)O*i3_groups(I)*4 },/* int3-g64      */
-                { (int64_t)O*e8_rowbytes(I), 4 },                   /* E8/IQ3 tag        */
-                { (int64_t)O*I,              4 },                   /* cross-wired tag   */
-                { (int64_t)O*I,              0 },                   /* degenerate ns     */
-                { 0,                          (int64_t)O*4 },       /* degenerate nb     */
+                {(int64_t)O * I, (int64_t)O * 4},                               /* int8-row shaped   */
+                {(int64_t)O * I, nblk * 4},                                     /* fp8 f32 block     */
+                {(int64_t)O * I, nblk},                                         /* fp8 ue8m0 block   */
+                {(int64_t)O * ((I + 1) / 2), (int64_t)O * 4},                   /* int4-row          */
+                {(int64_t)O * ((I + 3) / 4), (int64_t)O * 4},                   /* int2-row          */
+                {(int64_t)O * ((I + 1) / 2), (int64_t)O * ((I + 63) / 64) * 4}, /* int4-grouped g64 */
+                {(int64_t)O * i3_rowbytes(I), (int64_t)O * i3_groups(I) * 4},   /* int3-g64      */
+                {(int64_t)O * e8_rowbytes(I), 4},                               /* E8/IQ3 tag        */
+                {(int64_t)O * I, 4},                                            /* cross-wired tag   */
+                {(int64_t)O * I, 0},                                            /* degenerate ns     */
+                {0, (int64_t)O * 4},                                            /* degenerate nb     */
             };
             /* STAMPED arm (this commit threads stamped_name into
              * qt_resolve_fmt): the same grid under every stamp class --
              * agreeing/disagreeing recognized names, and an unrecognized
              * one. A stamp can steer WHICH member of {1,2,3,4,5,6,8} wins
              * (or force a refusal); it must never mint 7 or anything else. */
-            static const char *stamps[] = { NULL, "int8-row", "fp8-e4m3-b128",
-                                            "e8-iq3-lattice", "quantum-format-9000" };
-            for(size_t st=0; st<sizeof(stamps)/sizeof(stamps[0]); st++){
-                for(size_t c=0; c<sizeof(cand)/sizeof(cand[0]); c++){
+            static const char *stamps[] = {NULL, "int8-row", "fp8-e4m3-b128", "e8-iq3-lattice", "quantum-format-9000"};
+            for (size_t st = 0; st < sizeof(stamps) / sizeof(stamps[0]); st++) {
+                for (size_t c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
                     int f = resolved_fmt_probe(O, I, cand[c][0], cand[c][1], stamps[st]);
                     probes++;
-                    if(f==-2){ printf("FAIL sweep O=%d I=%d nb=%lld ns=%lld stamp=%s: crash/protocol error\n",
-                                      O,I,(long long)cand[c][0],(long long)cand[c][1],
-                                      stamps[st]?stamps[st]:"(none)"); CHECK(0); continue; }
-                    if(f==-1){ refused++; continue; }
+                    if (f == -2) {
+                        printf("FAIL sweep O=%d I=%d nb=%lld ns=%lld stamp=%s: crash/protocol error\n", O, I,
+                               (long long)cand[c][0], (long long)cand[c][1], stamps[st] ? stamps[st] : "(none)");
+                        CHECK(0);
+                        continue;
+                    }
+                    if (f == -1) {
+                        refused++;
+                        continue;
+                    }
                     resolved++;
-                    int ok = (f==1||f==2||f==3||f==4||f==5||f==6||f==8);
-                    if(!ok) printf("FAIL sweep O=%d I=%d nb=%lld ns=%lld stamp=%s: resolved to fmt=%d (outside {1,2,3,4,5,6,8})\n",
-                                   O,I,(long long)cand[c][0],(long long)cand[c][1],
-                                   stamps[st]?stamps[st]:"(none)",f);
+                    int ok = (f == 1 || f == 2 || f == 3 || f == 4 || f == 5 || f == 6 || f == 8);
+                    if (!ok)
+                        printf("FAIL sweep O=%d I=%d nb=%lld ns=%lld stamp=%s: resolved to fmt=%d (outside "
+                               "{1,2,3,4,5,6,8})\n",
+                               O, I, (long long)cand[c][0], (long long)cand[c][1], stamps[st] ? stamps[st] : "(none)",
+                               f);
                     CHECK(ok);
                     CHECK(f != 7);
                 }
@@ -882,68 +998,84 @@ static void test_fmt7_unreachable_sweep(void){
  * {"w":"fp8-e4m3-b128"} (double-JSON-encoded: a JSON string whose CONTENT is
  * itself JSON -- exactly what safetensors.save_file(metadata=...) produces,
  * since __metadata__ values must be plain strings). */
-static void write_stamp_fixture(const char *dir, const char *meta_json_string_literal){
+static void write_stamp_fixture(const char *dir, const char *meta_json_string_literal) {
 #ifdef _WIN32
     mkdir(dir);
 #else
-    mkdir(dir,0755);
+    mkdir(dir, 0755);
 #endif
-    enum { O=8, I=256 };
-    enum { NBLK = CDIV(O,128) * CDIV(I,128) };
-    static uint8_t q[O*I]; static float s[NBLK];
-    for(int i=0;i<O*I;i++) q[i]=rndbyte_nonan();
-    for(int i=0;i<NBLK;i++) s[i]=0.01f+0.001f*(float)i;
-    char path[300]; snprintf(path,sizeof path,"%s/model.safetensors",dir);
-    int64_t nb=(int64_t)O*I, ns=(int64_t)sizeof(s);
-    char hdr[2048]; int hl;
-    if(meta_json_string_literal)
-        hl=snprintf(hdr,sizeof hdr,
-            "{\"__metadata__\":{\"colibri.fmt\":%s},"
-            "\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
-            "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
-            meta_json_string_literal,
-            (long long)nb,(long long)nb,
-            (long long)(ns/4),(long long)nb,(long long)(nb+ns));
+    enum { O = 8, I = 256 };
+    enum { NBLK = CDIV(O, 128) * CDIV(I, 128) };
+    static uint8_t q[O * I];
+    static float s[NBLK];
+    for (int i = 0; i < O * I; i++) q[i] = rndbyte_nonan();
+    for (int i = 0; i < NBLK; i++) s[i] = 0.01f + 0.001f * (float)i;
+    char path[300];
+    snprintf(path, sizeof path, "%s/model.safetensors", dir);
+    int64_t nb = (int64_t)O * I, ns = (int64_t)sizeof(s);
+    char hdr[2048];
+    int hl;
+    if (meta_json_string_literal)
+        hl = snprintf(hdr, sizeof hdr,
+                      "{\"__metadata__\":{\"colibri.fmt\":%s},"
+                      "\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+                      "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+                      meta_json_string_literal, (long long)nb, (long long)nb, (long long)(ns / 4), (long long)nb,
+                      (long long)(nb + ns));
     else
-        hl=snprintf(hdr,sizeof hdr,
-            "{\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
-            "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
-            (long long)nb,(long long)nb,
-            (long long)(ns/4),(long long)nb,(long long)(nb+ns));
-    FILE *f=fopen(path,"wb");
-    if(!f){ printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path); fails++; return; }
-    uint64_t hlen=(uint64_t)hl;
-    fwrite(&hlen,8,1,f); fwrite(hdr,1,hl,f);
-    fwrite(q,1,(size_t)nb,f); fwrite(s,1,(size_t)ns,f);
+        hl = snprintf(hdr, sizeof hdr,
+                      "{\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+                      "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+                      (long long)nb, (long long)nb, (long long)(ns / 4), (long long)nb, (long long)(nb + ns));
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path);
+        fails++;
+        return;
+    }
+    uint64_t hlen = (uint64_t)hl;
+    fwrite(&hlen, 8, 1, f);
+    fwrite(hdr, 1, hl, f);
+    fwrite(q, 1, (size_t)nb, f);
+    fwrite(s, 1, (size_t)ns, f);
     fclose(f);
 }
 
 /* Fork+waitpid, mirroring expect_refuse above: st_init+qt_from_disk run in the
  * child (isolating a parsed-and-possibly-poisoned `shards` struct from the
  * rest of the suite) and must exit(1) with a "refus"-containing stderr message. */
-static int expect_stamp_refuse(const char *dir, const char *tag){
+static int expect_stamp_refuse(const char *dir, const char *tag) {
 #ifndef _WIN32
-    int pipefd[2]; if(pipe(pipefd)!=0) return 0;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return 0;
     pid_t pid = fork();
-    if(pid < 0) return 0;
-    if(pid == 0){
-        dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
-        static Model gm; memset(&gm,0,sizeof gm);
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        dup2(pipefd[1], 2);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        static Model gm;
+        memset(&gm, 0, sizeof gm);
         st_init(&gm.S, dir);
-        QT t; memset(&t,0,sizeof t);
-        qt_from_disk(&gm,"w",8,256,8,0,&t);   /* must exit(1) inside qt_verify_fmt_stamp */
-        _exit(42);                             /* reaching here is the bug */
+        QT t;
+        memset(&t, 0, sizeof t);
+        qt_from_disk(&gm, "w", 8, 256, 8, 0, &t); /* must exit(1) inside qt_verify_fmt_stamp */
+        _exit(42);                                /* reaching here is the bug */
     }
     close(pipefd[1]);
-    char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
+    char err[1024] = {0};
+    size_t eoff = 0;
+    ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */
+    while (eoff < sizeof(err) - 1 && (n = read(pipefd[0], err + eoff, sizeof(err) - 1 - eoff)) > 0) eoff += (size_t)n;
     close(pipefd[0]);
-    int status=0; waitpid(pid,&status,0);
-    int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
-    if(!ok){
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 1;
+    if (!ok) {
         printf("FAIL %s: expected exit(1) refusal, got status=%d, stderr=%.200s\n", tag, status, err);
         return 0;
     }
-    if(!strstr(err,"refus")){
+    if (!strstr(err, "refus")) {
         printf("FAIL %s: exited(1) but message lacked a refusal explanation: %.200s\n", tag, err);
         return 0;
     }
@@ -956,45 +1088,61 @@ static int expect_stamp_refuse(const char *dir, const char *tag){
 #endif
 }
 
-static void test_stamp_agreeing(void){
-    const char *dir="tests/tmp_fp8_stamp_agree";
+static void test_stamp_agreeing(void) {
+    const char *dir = "tests/tmp_fp8_stamp_agree";
     write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
-    static Model gm; memset(&gm,0,sizeof gm);
+    static Model gm;
+    memset(&gm, 0, sizeof gm);
     st_init(&gm.S, dir);
-    QT t; memset(&t,0,sizeof t);
-    qt_from_disk(&gm,"w",8,256,8,0,&t);
-    CHECK(t.fmt==8);                   /* stamp agreed -- loads exactly as unstamped would */
-    CHECK(t.q8!=NULL && t.s!=NULL);
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    QT t;
+    memset(&t, 0, sizeof t);
+    qt_from_disk(&gm, "w", 8, 256, 8, 0, &t);
+    CHECK(t.fmt == 8); /* stamp agreed -- loads exactly as unstamped would */
+    CHECK(t.q8 != NULL && t.s != NULL);
+    char p[300];
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    rmdir(dir);
 }
 
-static void test_stamp_mismatching(void){
-    const char *dir="tests/tmp_fp8_stamp_mismatch";
+static void test_stamp_mismatching(void) {
+    const char *dir = "tests/tmp_fp8_stamp_mismatch";
     /* byte-arithmetic says fmt=8 (fp8); the stamp names a REAL, recognized,
      * but DIFFERENT format -- exercises "found but disagrees", not just "name
      * not found at all" (see test_stamp_unrecognized_name below for that case). */
     write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"int8-row\\\"}\"");
     CHECK(expect_stamp_refuse(dir, "stamped-mismatching: stamp says int8-row, bytes say fp8-e4m3-b128"));
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    char p[300];
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    rmdir(dir);
 }
 
-static void test_stamp_unrecognized_name(void){
-    const char *dir="tests/tmp_fp8_stamp_unknown";
+static void test_stamp_unrecognized_name(void) {
+    const char *dir = "tests/tmp_fp8_stamp_unknown";
     write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"quantum-format-9000\\\"}\"");
     CHECK(expect_stamp_refuse(dir, "stamped with a format name this build doesn't recognize"));
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    char p[300];
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    rmdir(dir);
 }
 
-static void test_stamp_absent(void){
-    const char *dir="tests/tmp_fp8_stamp_absent";
-    write_stamp_fixture(dir, NULL);       /* no __metadata__ block at all */
-    static Model gm; memset(&gm,0,sizeof gm);
+static void test_stamp_absent(void) {
+    const char *dir = "tests/tmp_fp8_stamp_absent";
+    write_stamp_fixture(dir, NULL); /* no __metadata__ block at all */
+    static Model gm;
+    memset(&gm, 0, sizeof gm);
     st_init(&gm.S, dir);
-    QT t; memset(&t,0,sizeof t);
-    qt_from_disk(&gm,"w",8,256,8,0,&t);
-    CHECK(t.fmt==8);                   /* unstamped: byte-arithmetic inference alone decides */
-    CHECK(t.q8!=NULL && t.s!=NULL);
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    QT t;
+    memset(&t, 0, sizeof t);
+    qt_from_disk(&gm, "w", 8, 256, 8, 0, &t);
+    CHECK(t.fmt == 8); /* unstamped: byte-arithmetic inference alone decides */
+    CHECK(t.q8 != NULL && t.s != NULL);
+    char p[300];
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    rmdir(dir);
 }
 
 /* ---- Duplicate stamp claims (micro-round 2, user-ratified design D8) ----
@@ -1008,73 +1156,98 @@ static void test_stamp_absent(void){
 /* Shard 1 = write_stamp_fixture's single-tensor fp8 shard ("w" + "w.qs"),
  * renamed into a two-shard layout; shard 2 = one tiny aux f32 tensor of its
  * own plus a colibri.fmt map stamping "w". */
-static void write_second_stamp_shard(const char *dir, const char *meta_json_string_literal){
-    char path[300]; snprintf(path,sizeof path,"%s/model-extra.safetensors",dir);
-    static float aux[4] = {1.f,2.f,3.f,4.f};
-    char hdr[1024]; int hl;
-    hl=snprintf(hdr,sizeof hdr,
-        "{\"__metadata__\":{\"colibri.fmt\":%s},"
-        "\"aux\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]}}",
-        meta_json_string_literal);
-    FILE *f=fopen(path,"wb");
-    if(!f){ printf("FAIL: cannot create %s\n", path); fails++; return; }
-    uint64_t hlen=(uint64_t)hl;
-    fwrite(&hlen,8,1,f); fwrite(hdr,1,hl,f); fwrite(aux,1,sizeof aux,f);
+static void write_second_stamp_shard(const char *dir, const char *meta_json_string_literal) {
+    char path[300];
+    snprintf(path, sizeof path, "%s/model-extra.safetensors", dir);
+    static float aux[4] = {1.f, 2.f, 3.f, 4.f};
+    char hdr[1024];
+    int hl;
+    hl = snprintf(hdr, sizeof hdr,
+                  "{\"__metadata__\":{\"colibri.fmt\":%s},"
+                  "\"aux\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]}}",
+                  meta_json_string_literal);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        printf("FAIL: cannot create %s\n", path);
+        fails++;
+        return;
+    }
+    uint64_t hlen = (uint64_t)hl;
+    fwrite(&hlen, 8, 1, f);
+    fwrite(hdr, 1, hl, f);
+    fwrite(aux, 1, sizeof aux, f);
     fclose(f);
 }
-static void rm_two_shard_fixture(const char *dir){
+static void rm_two_shard_fixture(const char *dir) {
     char p[300];
-    snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p);
-    snprintf(p,sizeof p,"%s/model-extra.safetensors",dir); unlink(p);
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    snprintf(p, sizeof p, "%s/model-extra.safetensors", dir);
+    unlink(p);
     rmdir(dir);
 }
-static void test_stamp_conflicting_duplicate(void){
+static void test_stamp_conflicting_duplicate(void) {
 #ifndef _WIN32
-    const char *dir="tests/tmp_fp8_stamp_conflict";
+    const char *dir = "tests/tmp_fp8_stamp_conflict";
     write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
     write_second_stamp_shard(dir, "\"{\\\"w\\\":\\\"int8-row\\\"}\"");
     /* refusal fires at DISCOVERY time (st_init's header-parse loop), before
      * any tensor is resolved -- fork st_init alone and capture stderr. */
     fflush(stdout);
-    int pipefd[2]; if(pipe(pipefd)!=0){ CHECK(0); return; }
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        CHECK(0);
+        return;
+    }
     pid_t pid = fork();
-    if(pid < 0){ CHECK(0); return; }
-    if(pid == 0){
-        dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
-        static Model gm; memset(&gm,0,sizeof gm);
-        st_init(&gm.S, dir);                   /* must exit(1) inside the ingest */
-        _exit(42);                              /* surviving discovery is the bug */
+    if (pid < 0) {
+        CHECK(0);
+        return;
+    }
+    if (pid == 0) {
+        dup2(pipefd[1], 2);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        static Model gm;
+        memset(&gm, 0, sizeof gm);
+        st_init(&gm.S, dir); /* must exit(1) inside the ingest */
+        _exit(42);           /* surviving discovery is the bug */
     }
     close(pipefd[1]);
-    char err[2048]={0}; size_t eoff=0; ssize_t n;
-    while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
+    char err[2048] = {0};
+    size_t eoff = 0;
+    ssize_t n;
+    while (eoff < sizeof(err) - 1 && (n = read(pipefd[0], err + eoff, sizeof(err) - 1 - eoff)) > 0) eoff += (size_t)n;
     close(pipefd[0]);
-    int status=0; waitpid(pid,&status,0);
-    int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
-    if(!ok) printf("FAIL stamp-conflict: expected exit(1) at discovery, got status=%d, stderr=%.300s\n", status, err);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 1;
+    if (!ok) printf("FAIL stamp-conflict: expected exit(1) at discovery, got status=%d, stderr=%.300s\n", status, err);
     CHECK(ok);
     /* the refusal must NAME the tensor and BOTH claims (either shard may be
      * enumerated first -- readdir order -- so assert both names, not roles). */
-    CHECK(strstr(err,"conflicting format claims")!=NULL);
-    CHECK(strstr(err,"'w'")!=NULL);
-    CHECK(strstr(err,"fp8-e4m3-b128")!=NULL && strstr(err,"int8-row")!=NULL);
-    CHECK(strstr(err,"refus")!=NULL);
+    CHECK(strstr(err, "conflicting format claims") != NULL);
+    CHECK(strstr(err, "'w'") != NULL);
+    CHECK(strstr(err, "fp8-e4m3-b128") != NULL && strstr(err, "int8-row") != NULL);
+    CHECK(strstr(err, "refus") != NULL);
     rm_two_shard_fixture(dir);
 #else
     printf("skipped on Windows (no fork): stamp-conflict refusal\n");
 #endif
 }
-static void test_stamp_agreeing_duplicate(void){
-    const char *dir="tests/tmp_fp8_stamp_dupok";
+static void test_stamp_agreeing_duplicate(void) {
+    const char *dir = "tests/tmp_fp8_stamp_dupok";
     write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
     write_second_stamp_shard(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
-    static Model gm; memset(&gm,0,sizeof gm);
-    st_init(&gm.S, dir);                        /* agreeing duplicate: no refusal */
-    CHECK(gm.S.fmt_n == 1);                     /* collapsed to ONE entry, not two */
-    QT t; memset(&t,0,sizeof t);
-    qt_from_disk(&gm,"w",8,256,8,0,&t);
-    CHECK(t.fmt==8);                            /* loads exactly as single-stamped */
-    CHECK(t.q8!=NULL && t.s!=NULL);
+    static Model gm;
+    memset(&gm, 0, sizeof gm);
+    st_init(&gm.S, dir);    /* agreeing duplicate: no refusal */
+    CHECK(gm.S.fmt_n == 1); /* collapsed to ONE entry, not two */
+    QT t;
+    memset(&t, 0, sizeof t);
+    qt_from_disk(&gm, "w", 8, 256, 8, 0, &t);
+    CHECK(t.fmt == 8); /* loads exactly as single-stamped */
+    CHECK(t.q8 != NULL && t.s != NULL);
     rm_two_shard_fixture(dir);
 }
 
@@ -1095,87 +1268,113 @@ static void test_stamp_agreeing_duplicate(void){
  * anything real for the cap to trigger. Tests BOTH sides of the boundary:
  * exactly ST_FMT_STAMP_MAX entries must still load fine (no off-by-one
  * false refusal), one more must refuse. */
-static void write_stamp_cap_fixture(const char *dir, int n_entries){
+static void write_stamp_cap_fixture(const char *dir, int n_entries) {
 #ifdef _WIN32
     mkdir(dir);
 #else
-    mkdir(dir,0755);
+    mkdir(dir, 0755);
 #endif
-    size_t inner_cap = (size_t)n_entries*40 + 64;
+    size_t inner_cap = (size_t)n_entries * 40 + 64;
     char *inner = malloc(inner_cap);
-    size_t p = 0; inner[p++]='{';
-    for(int i=0;i<n_entries;i++)
-        p += (size_t)snprintf(inner+p, inner_cap-p, "%s\"stamp_%d\":\"int8-row\"", i?",":"", i);
-    inner[p++]='}'; inner[p]=0;
+    size_t p = 0;
+    inner[p++] = '{';
+    for (int i = 0; i < n_entries; i++)
+        p += (size_t)snprintf(inner + p, inner_cap - p, "%s\"stamp_%d\":\"int8-row\"", i ? "," : "", i);
+    inner[p++] = '}';
+    inner[p] = 0;
 
     /* JSON-escape `inner` into a quoted string literal for the OUTER header's
      * colibri.fmt VALUE (double-JSON-encoding, same shape write_stamp_fixture's
      * callers hand-escape for small fixtures -- built programmatically here
      * since n_entries is too many to hand-escape). */
-    char *esc = malloc(p*2 + 4);
-    size_t q = 0; esc[q++]='"';
-    for(size_t i=0;i<p;i++){
+    char *esc = malloc(p * 2 + 4);
+    size_t q = 0;
+    esc[q++] = '"';
+    for (size_t i = 0; i < p; i++) {
         char c = inner[i];
-        if(c=='"' || c=='\\') esc[q++]='\\';
-        esc[q++]=c;
+        if (c == '"' || c == '\\') esc[q++] = '\\';
+        esc[q++] = c;
     }
-    esc[q++]='"'; esc[q]=0;
+    esc[q++] = '"';
+    esc[q] = 0;
     free(inner);
 
-    enum { O=1, I=1 };
-    static uint8_t q1[O*I]; static float s1[O];
-    q1[0]=1; s1[0]=0.01f;
-    char path[300]; snprintf(path,sizeof path,"%s/model.safetensors",dir);
-    int64_t nb=(int64_t)O*I, ns=(int64_t)O*4;
+    enum { O = 1, I = 1 };
+    static uint8_t q1[O * I];
+    static float s1[O];
+    q1[0] = 1;
+    s1[0] = 0.01f;
+    char path[300];
+    snprintf(path, sizeof path, "%s/model.safetensors", dir);
+    int64_t nb = (int64_t)O * I, ns = (int64_t)O * 4;
     char *hdr = malloc(q + 512);
-    int hl = snprintf(hdr, q+512,
-        "{\"__metadata__\":{\"colibri.fmt\":%s},"
-        "\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
-        "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
-        esc,
-        (long long)nb,(long long)nb,
-        (long long)(ns/4),(long long)nb,(long long)(nb+ns));
+    int hl = snprintf(hdr, q + 512,
+                      "{\"__metadata__\":{\"colibri.fmt\":%s},"
+                      "\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+                      "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+                      esc, (long long)nb, (long long)nb, (long long)(ns / 4), (long long)nb, (long long)(nb + ns));
     free(esc);
-    FILE *f=fopen(path,"wb");
-    if(!f){ printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path); fails++; free(hdr); return; }
-    uint64_t hlen=(uint64_t)hl;
-    fwrite(&hlen,8,1,f); fwrite(hdr,1,(size_t)hl,f);
-    fwrite(q1,1,(size_t)nb,f); fwrite(s1,1,(size_t)ns,f);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path);
+        fails++;
+        free(hdr);
+        return;
+    }
+    uint64_t hlen = (uint64_t)hl;
+    fwrite(&hlen, 8, 1, f);
+    fwrite(hdr, 1, (size_t)hl, f);
+    fwrite(q1, 1, (size_t)nb, f);
+    fwrite(s1, 1, (size_t)ns, f);
     fclose(f);
     free(hdr);
 }
 
-static void test_stamp_map_cap_boundary_ok(void){
-    const char *dir="tests/tmp_fp8_stamp_cap_ok";
-    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX);   /* exactly at the cap: must NOT refuse */
-    static Model gm; memset(&gm,0,sizeof gm);
+static void test_stamp_map_cap_boundary_ok(void) {
+    const char *dir = "tests/tmp_fp8_stamp_cap_ok";
+    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX); /* exactly at the cap: must NOT refuse */
+    static Model gm;
+    memset(&gm, 0, sizeof gm);
     st_init(&gm.S, dir);
     CHECK(gm.S.fmt_n == ST_FMT_STAMP_MAX);
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    char p[300];
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    rmdir(dir);
 }
 
-static void test_stamp_map_cap_exceeded(void){
-    const char *dir="tests/tmp_fp8_stamp_cap_over";
-    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX+1);  /* one past the cap: must refuse */
+static void test_stamp_map_cap_exceeded(void) {
+    const char *dir = "tests/tmp_fp8_stamp_cap_over";
+    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX + 1); /* one past the cap: must refuse */
 #ifndef _WIN32
     int pipefd[2];
-    if(pipe(pipefd)==0){
+    if (pipe(pipefd) == 0) {
         pid_t pid = fork();
-        if(pid == 0){
-            dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
-            static Model gm; memset(&gm,0,sizeof gm);
-            st_init(&gm.S, dir);   /* must exit(1) inside st_fmt_stamp_ingest's cap check */
-            _exit(42);              /* reaching here is the bug */
-        } else if(pid > 0){
-            close(pipefd[1]);
-            char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
+        if (pid == 0) {
+            dup2(pipefd[1], 2);
             close(pipefd[0]);
-            int status=0; waitpid(pid,&status,0);
-            int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
-            if(!ok) printf("FAIL stamp-map cap exceeded: expected exit(1), got status=%d, stderr=%.200s\n", status, err);
+            close(pipefd[1]);
+            static Model gm;
+            memset(&gm, 0, sizeof gm);
+            st_init(&gm.S, dir); /* must exit(1) inside st_fmt_stamp_ingest's cap check */
+            _exit(42);           /* reaching here is the bug */
+        } else if (pid > 0) {
+            close(pipefd[1]);
+            char err[1024] = {0};
+            size_t eoff = 0;
+            ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */
+            while (eoff < sizeof(err) - 1 && (n = read(pipefd[0], err + eoff, sizeof(err) - 1 - eoff)) > 0)
+                eoff += (size_t)n;
+            close(pipefd[0]);
+            int status = 0;
+            waitpid(pid, &status, 0);
+            int ok = WIFEXITED(status) && WEXITSTATUS(status) == 1;
+            if (!ok)
+                printf("FAIL stamp-map cap exceeded: expected exit(1), got status=%d, stderr=%.200s\n", status, err);
             CHECK(ok);
-            if(ok && !strstr(err,"refus")){
-                printf("FAIL stamp-map cap exceeded: exited(1) but message lacked a refusal explanation: %.200s\n", err);
+            if (ok && !strstr(err, "refus")) {
+                printf("FAIL stamp-map cap exceeded: exited(1) but message lacked a refusal explanation: %.200s\n",
+                       err);
                 fails++;
             }
         } else fails++;
@@ -1183,26 +1382,31 @@ static void test_stamp_map_cap_exceeded(void){
 #else
     printf("skipped on Windows (no fork): stamp-map cap exceeded\n");
 #endif
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    char p[300];
+    snprintf(p, sizeof p, "%s/model.safetensors", dir);
+    unlink(p);
+    rmdir(dir);
 }
 
-int main(void){
+int main(void) {
     test_disambiguation();
     test_fmt6_fp8_collision();
     test_ue8m0_scale_refusal();
     test_ue8m0_family_sweep();
     test_loader_seam();
-    check_fp8_bytes(2048,6144, "qt_bytes fmt=8 gate/up-shaped O=2048 I=6144 (spec example)");
-    check_fp8_bytes(6144,2048, "qt_bytes fmt=8 down-shaped O=6144 I=2048");
-    check_fp8_bytes(130,200,   "qt_bytes fmt=8 block edges O,I both non-mult-128");
-    check_fp8_bytes(1,1,       "qt_bytes fmt=8 degenerate 1x1");
-    check_wire_split(1, 4096,4096, 0,  "qt_wire_split fmt=1 plain int8 (per-row scale, unaffected by the fix)");
-    check_wire_split(4, 2048,6144, 64, "qt_wire_split fmt=4 grouped int4 (O*ceil(I/gs) scale, not O*4)");
-    check_wire_split(5, 2048,6144, 0,  "qt_wire_split fmt=5 int3-g64 (O*ceil(I/64) scale, not O*4)");
-    check_wire_split(6, 2048,6144, 0,  "qt_wire_split fmt=6 E8/IQ3 (FIXED 4-byte tag, not O*4=8192B)");
-    check_wire_split(6, 1,1,       0,  "qt_wire_split fmt=6 E8/IQ3 degenerate O=1 (O*4 would coincidentally also be 4 -- exercises the literal-4 assert, not just the moved-off-O*4 one)");
-    check_wire_split(8, 2,16384, 0,    "qt_wire_split fmt=8 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
-    check_wire_split(8, 2048,6144, 0,  "qt_wire_split fmt=8 spec example: scale=3072B, NOT O*4=8192B");
+    check_fp8_bytes(2048, 6144, "qt_bytes fmt=8 gate/up-shaped O=2048 I=6144 (spec example)");
+    check_fp8_bytes(6144, 2048, "qt_bytes fmt=8 down-shaped O=6144 I=2048");
+    check_fp8_bytes(130, 200, "qt_bytes fmt=8 block edges O,I both non-mult-128");
+    check_fp8_bytes(1, 1, "qt_bytes fmt=8 degenerate 1x1");
+    check_wire_split(1, 4096, 4096, 0, "qt_wire_split fmt=1 plain int8 (per-row scale, unaffected by the fix)");
+    check_wire_split(4, 2048, 6144, 64, "qt_wire_split fmt=4 grouped int4 (O*ceil(I/gs) scale, not O*4)");
+    check_wire_split(5, 2048, 6144, 0, "qt_wire_split fmt=5 int3-g64 (O*ceil(I/64) scale, not O*4)");
+    check_wire_split(6, 2048, 6144, 0, "qt_wire_split fmt=6 E8/IQ3 (FIXED 4-byte tag, not O*4=8192B)");
+    check_wire_split(6, 1, 1, 0,
+                     "qt_wire_split fmt=6 E8/IQ3 degenerate O=1 (O*4 would coincidentally also be 4 -- exercises the "
+                     "literal-4 assert, not just the moved-off-O*4 one)");
+    check_wire_split(8, 2, 16384, 0, "qt_wire_split fmt=8 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
+    check_wire_split(8, 2048, 6144, 0, "qt_wire_split fmt=8 spec example: scale=3072B, NOT O*4=8192B");
     test_wire_site_regression();
     test_metal_fused_allowlist();
     test_fmt7_unreachable_sweep();
@@ -1214,7 +1418,10 @@ int main(void){
     test_stamp_agreeing_duplicate();
     test_stamp_map_cap_boundary_ok();
     test_stamp_map_cap_exceeded();
-    if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
+    if (fails) {
+        printf("fp8 loader-seam tests: %d FAILED\n", fails);
+        return 1;
+    }
     printf("fp8 loader-seam tests: ok\n");
     return 0;
 }

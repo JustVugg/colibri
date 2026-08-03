@@ -3,8 +3,7 @@
 
 #include "../decode_batch.h"
 
-static void test_rows_use_their_own_sequence_storage(void)
-{
+static void test_rows_use_their_own_sequence_storage(void) {
     float sequence_a[4 * 3] = {0};
     float sequence_b[4 * 3] = {0};
 
@@ -21,16 +20,14 @@ static void test_rows_use_their_own_sequence_storage(void)
     assert(sequence_b[6] == 0.0f);
 }
 
-static void test_const_reader_selects_the_same_row(void)
-{
+static void test_const_reader_selects_the_same_row(void) {
     float storage[5 * 7] = {0};
     const float *row = coli_kv_row(storage, 4, 7);
 
     assert(row == &storage[28]);
 }
 
-static void test_submit_header(void)
-{
+static void test_submit_header(void) {
     ColiSubmit sub;
     assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95", &sub));
     assert(sub.id == 42 && sub.slot == 3 && sub.bytes == 17);
@@ -52,8 +49,7 @@ static void test_submit_header(void)
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512 extra", &sub));
 }
 
-int main(void)
-{
+int main(void) {
     test_rows_use_their_own_sequence_storage();
     test_const_reader_selects_the_same_row();
     test_submit_header();

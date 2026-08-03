@@ -19,12 +19,12 @@ extern "C" {
 typedef struct ColiMetalTensor ColiMetalTensor;
 
 /* Returns 1 if a Metal device is available and pipelines compiled, else 0. */
-int  coli_metal_init(void);
+int coli_metal_init(void);
 void coli_metal_shutdown(void);
-int  coli_metal_available(void);
+int coli_metal_available(void);
 /* Bytes of unified memory in use by wrapped tensors, and their count. */
 void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
-int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
+int coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
 
 /*
  * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
@@ -42,12 +42,10 @@ int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
  * fmt+gs); later calls reuse them (weights are assumed stable at the same address).
  * Returns 1 on success, 0 if Metal is unavailable or fmt is invalid.
  */
-int coli_metal_matmul(ColiMetalTensor **tensor,
-                      float *y, const float *x,
-                      const void *weights, const float *scales,
+int coli_metal_matmul(ColiMetalTensor **tensor, float *y, const float *x, const void *weights, const float *scales,
                       int fmt, int S, int I, int O, int gs);
 
-void   coli_metal_tensor_free(ColiMetalTensor *tensor);
+void coli_metal_tensor_free(ColiMetalTensor *tensor);
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 
 /*
@@ -57,7 +55,7 @@ size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
  * address. Call after (re)allocating a slab; call unregister before freeing it.
  * base must be aligned to 16384 (Apple page) and len a multiple of it.
  */
-void coli_metal_spin_start(void);   /* COLI_METAL_SPIN=1 keep-alive experiment */
+void coli_metal_spin_start(void); /* COLI_METAL_SPIN=1 keep-alive experiment */
 void coli_metal_spin_stop(void);
 void coli_metal_register(void *base, size_t len);
 void coli_metal_unregister(void *base);
@@ -75,24 +73,19 @@ void coli_metal_unregister(void *base);
  * is the expert input; sh_out the shared-expert output; idx/w/keff the routing.
  * Returns 0 -> caller runs the whole layer on the CPU path.
  */
-int coli_metal_layer_decode(float *x,
-    const float *in_ln, const float *post_ln,
-    const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
-    const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
-    const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
-    const void *o_w, const float *o_s, int o_fmt, int o_gs,
-    const void *shg_w, const float *shg_s, int shg_fmt, int shg_gs,
-    const void *shu_w, const float *shu_s, int shu_fmt, int shu_gs,
-    const void *shd_w, const float *shd_s, int shd_fmt, int shd_gs,
-    const float *router_w, const float *router_bias,
-    int E, int K, int Ksel, float topp, int normk, float rscale,
-    float *Lc, float *Rc, int S, int pos_base, int st0,
-    float eps, float theta, float ascale,
-    float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out);
+int coli_metal_layer_decode(float *x, const float *in_ln, const float *post_ln, const void *qa_w, const float *qa_s,
+                            int qa_fmt, int qa_gs, const float *qa_ln, const void *qb_w, const float *qb_s, int qb_fmt,
+                            int qb_gs, const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs,
+                            const float *kva_ln, const void *kvb_w, const float *kvb_s, int kvb_fmt, const void *o_w,
+                            const float *o_s, int o_fmt, int o_gs, const void *shg_w, const float *shg_s, int shg_fmt,
+                            int shg_gs, const void *shu_w, const float *shu_s, int shu_fmt, int shu_gs,
+                            const void *shd_w, const float *shd_s, int shd_fmt, int shd_gs, const float *router_w,
+                            const float *router_bias, int E, int K, int Ksel, float topp, int normk, float rscale,
+                            float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale,
+                            float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out);
 
-int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales,
-                    int fmt, int S, int I, int O, int gs);   /* large-batch sync GEMM; 0 -> CPU. gs: fmt=4 group size (0 otherwise) */
+int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O,
+                    int gs); /* large-batch sync GEMM; 0 -> CPU. gs: fmt=4 group size (0 otherwise) */
 /* Parallel top-8 expert selection (r_top8_par): run ONE top-8 selection kernel standalone
  * on host arrays — par=0 the serial r_top8, par=1 the parallel exact-match replica gated
  * in the engine by COLI_RTOP8 (default ON; COLI_RTOP8=0 opts out to the serial kernel).
@@ -107,18 +100,16 @@ int coli_metal_gemm(float *y, const float *x, const void *weights, const float *
  * same automatic fallback is wired into the engine dispatch site — "par" is a request,
  * never a guarantee, so no caller can reach the unguarded parallel path out of contract.
  * Returns 1 on success, 0 if Metal is unavailable. */
-int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
-                     int Ksel, float topp, int normk, float rscale,
-                     int *idx, float *w, int *keff);
+int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K, int Ksel, float topp, int normk,
+                     float rscale, int *idx, float *w, int *keff);
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 void coli_metal_attn_lat(double *ksched, double *gsched);
-int coli_metal_attn_decode(const float *x,
-    const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
-    const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
-    const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
-    const void *o_w, const float *o_s, int o_fmt, int o_gs,
-    float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
+int coli_metal_attn_decode(const float *x, const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs,
+                           const float *qa_ln, const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
+                           const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
+                           const void *kvb_w, const float *kvb_s, int kvb_fmt, const void *o_w, const float *o_s,
+                           int o_fmt, int o_gs, float *Lc, float *Rc, int S, int pos_base, int st0, float eps,
+                           float theta, float ascale, float *out);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
@@ -148,12 +139,10 @@ int coli_metal_resset_stats(double *flush_s);
  *  out         = [S, D] accumulate target
  * Returns 1 on success, 0 to signal the caller to fall back to the CPU path.
  */
-int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
-                         const void *const *g, const void *const *u, const void *const *d,
-                         const float *const *gs, const float *const *us, const float *const *ds,
-                         const float *xg, const int *xoff, const int *nr,
-                         const int *rows, const float *rw,
-                         float *out, int S);
+int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, const void *const *g, const void *const *u,
+                         const void *const *d, const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr, const int *rows, const float *rw, float *out,
+                         int S);
 
 /*
  * Async two-phase variant: begin encodes+commits the block (own scratch, no wait) and
@@ -163,11 +152,10 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
-ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
-                         const void *const *g, const void *const *u, const void *const *d,
-                         const float *const *gs, const float *const *us, const float *const *ds,
-                         const float *xg, const int *xoff, const int *nr,
-                         const int *rows, const float *rw);
+ColiMetalMoeHandle *coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, const void *const *g,
+                                               const void *const *u, const void *const *d, const float *const *gs,
+                                               const float *const *us, const float *const *ds, const float *xg,
+                                               const int *xoff, const int *nr, const int *rows, const float *rw);
 int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out);
 
 #ifdef __cplusplus

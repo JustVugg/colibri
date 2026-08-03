@@ -54,32 +54,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include "compat.h"                    /* rename() -> MoveFileEx on Windows; see above */
+#include "compat.h" /* rename() -> MoveFileEx on Windows; see above */
 
 #define RT_FORMAT_VERSION 1
-#define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
+#define RT_IKU1_MAGIC 0x31554B49u /* "IKU1" — inkling.c's usage_save/pins_load */
 
 /* engines that write this format; the table exists so a mismatch names both sides */
-static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", NULL };
+static const char *rt_engine_names[] = {"glm_moe_dsa", "inkling", "olmoe", "kimi_k3", NULL};
 
-static uint32_t rt_hash(const char *s){        /* FNV-1a 32, stable across builds */
+static uint32_t rt_hash(const char *s) { /* FNV-1a 32, stable across builds */
     uint32_t h = 2166136261u;
-    for(; s && *s; s++){ h ^= (unsigned char)*s; h *= 16777619u; }
+    for (; s && *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 16777619u;
+    }
     return h;
 }
-static const char *rt_engine_of(uint32_t id){
-    for(int i = 0; rt_engine_names[i]; i++)
-        if(rt_hash(rt_engine_names[i]) == id) return rt_engine_names[i];
-    return NULL;                                /* unknown writer: report the id */
+static const char *rt_engine_of(uint32_t id) {
+    for (int i = 0; rt_engine_names[i]; i++)
+        if (rt_hash(rt_engine_names[i]) == id) return rt_engine_names[i];
+    return NULL; /* unknown writer: report the id */
 }
 
 /* ---- state: owned here so a new engine defines no storage and no format ---- */
-static uint32_t **rt_c;                         /* [n_layers+1][n_experts] counters */
-static int rt_nl = -1, rt_ne;                   /* rows 0..rt_nl inclusive */
-static uint32_t rt_id;                          /* this engine's id */
+static uint32_t **rt_c;       /* [n_layers+1][n_experts] counters */
+static int rt_nl = -1, rt_ne; /* rows 0..rt_nl inclusive */
+static uint32_t rt_id;        /* this engine's id */
 static const char *rt_engine = "";
-static FILE *rt_fp;                             /* ROUTE_TRACE stream, NULL = off */
-static int rt_call;                             /* moe-call counter, first trace field */
+static FILE *rt_fp; /* ROUTE_TRACE stream, NULL = off */
+static int rt_call; /* moe-call counter, first trace field */
 
 /* n_layers is inclusive: rows 0..n_layers exist, matching the extra MTP row GLM keeps at
  * index n_layers. Engines without one simply never touch it. A failed row allocation
@@ -87,33 +90,31 @@ static int rt_call;                             /* moe-call counter, first trace
 /* Open the trace stream. Separate from rt_init because it needs no dimensions, so an
  * engine that reads ROUTE_TRACE before it has parsed its config (colibri.c does) keeps
  * the message exactly where it was. Idempotent; a failed open is not retried. */
-static void rt_trace_open(void){
+static void rt_trace_open(void) {
     static int tried;
-    if(tried) return;
+    if (tried) return;
     tried = 1;
     const char *p = getenv("ROUTE_TRACE");
-    if(!p || !*p) return;
+    if (!p || !*p) return;
     rt_fp = fopen(p, "w");
-    if(!rt_fp) fprintf(stderr, "[ROUTE_TRACE] cannot open %s\n", p);
-    else       fprintf(stderr, "[ROUTE_TRACE] logging routing to %s\n", p);
+    if (!rt_fp) fprintf(stderr, "[ROUTE_TRACE] cannot open %s\n", p);
+    else fprintf(stderr, "[ROUTE_TRACE] logging routing to %s\n", p);
 }
 
-static void rt_init(const char *engine, int n_layers, int n_experts){
-    if(n_layers < 0 || n_experts < 1) return;
+static void rt_init(const char *engine, int n_layers, int n_experts) {
+    if (n_layers < 0 || n_experts < 1) return;
     rt_engine = engine ? engine : "";
     rt_id = rt_hash(rt_engine);
-    rt_c = (uint32_t**)calloc((size_t)n_layers + 1, sizeof(uint32_t*));
-    if(!rt_c) return;
-    rt_nl = n_layers; rt_ne = n_experts;
-    for(int i = 0; i <= n_layers; i++)
-        rt_c[i] = (uint32_t*)calloc((size_t)n_experts, sizeof(uint32_t));
-    rt_trace_open();                            /* no-op if the engine opened it already */
+    rt_c = (uint32_t **)calloc((size_t)n_layers + 1, sizeof(uint32_t *));
+    if (!rt_c) return;
+    rt_nl = n_layers;
+    rt_ne = n_experts;
+    for (int i = 0; i <= n_layers; i++) rt_c[i] = (uint32_t *)calloc((size_t)n_experts, sizeof(uint32_t));
+    rt_trace_open(); /* no-op if the engine opened it already */
 }
 
-static uint32_t **rt_counts_all(void){ return rt_c; }
-static uint32_t  *rt_counts(int layer){
-    return (rt_c && layer >= 0 && layer <= rt_nl) ? rt_c[layer] : NULL;
-}
+static uint32_t **rt_counts_all(void) { return rt_c; }
+static uint32_t *rt_counts(int layer) { return (rt_c && layer >= 0 && layer <= rt_nl) ? rt_c[layer] : NULL; }
 
 /* Release a layer's counter row, so rt_counts(layer) is NULL for a layer that does not
  * route. rt_init cannot know which those are — an engine learns its own sparsity while it
@@ -123,30 +124,35 @@ static uint32_t  *rt_counts(int layer){
  * NULL row as "this layer has no experts to attribute a count to", which is precisely what
  * the code being replaced expressed by leaving eusage[i] NULL on dense layers. Skip the
  * drop and a history record naming a dense layer is silently absorbed and written back. */
-static void rt_drop_row(int layer){
-    if(rt_c && layer >= 0 && layer <= rt_nl){ free(rt_c[layer]); rt_c[layer] = NULL; }
+static void rt_drop_row(int layer) {
+    if (rt_c && layer >= 0 && layer <= rt_nl) {
+        free(rt_c[layer]);
+        rt_c[layer] = NULL;
+    }
 }
 
 /* count only — for a router that bumps its other per-expert state in the same loop */
-static void rt_count(int layer, const int *ids, int k){
+static void rt_count(int layer, const int *ids, int k) {
     uint32_t *row = rt_counts(layer);
-    if(!row || !ids) return;
-    for(int i = 0; i < k; i++)
-        if(ids[i] >= 0 && ids[i] < rt_ne) row[ids[i]]++;
+    if (!row || !ids) return;
+    for (int i = 0; i < k; i++)
+        if (ids[i] >= 0 && ids[i] < rt_ne) row[ids[i]]++;
 }
 
 /* trace only — once per (row), with the gates the layer will actually apply */
-static void rt_trace(int layer, int row, const int *ids, const float *gates, int k){
-    if(!rt_fp || !ids || !gates) return;
+static void rt_trace(int layer, int row, const int *ids, const float *gates, int k) {
+    if (!rt_fp || !ids || !gates) return;
     fprintf(rt_fp, "%d %d %d", rt_call, row, layer);
-    for(int i = 0; i < k; i++) fprintf(rt_fp, " %d:%.4f", ids[i], gates[i]);
+    for (int i = 0; i < k; i++) fprintf(rt_fp, " %d:%.4f", ids[i], gates[i]);
     fputc('\n', rt_fp);
 }
 /* advance the call counter: once per moe() invocation, after its rows are traced */
-static void rt_trace_end(void){ if(rt_fp) rt_call++; }
+static void rt_trace_end(void) {
+    if (rt_fp) rt_call++;
+}
 
 /* both, for an engine that does not need them at separate points in its router */
-static void rt_route(int layer, int row, const int *ids, const float *gates, int k){
+static void rt_route(int layer, int row, const int *ids, const float *gates, int k) {
     rt_count(layer, ids, k);
     rt_trace(layer, row, ids, gates, k);
 }
@@ -160,14 +166,15 @@ static void rt_route(int layer, int row, const int *ids, const float *gates, int
  * Only placement is at stake, which is why an override exists here at all and does not for a
  * mismatched weight container (#529): pins decide which bytes are resident, never what the
  * model computes. The worst case is slower, self-inflicted, and visible in the hit rate. */
-static void rt_say_override(const char *path, const char *writer){
+static void rt_say_override(const char *path, const char *writer) {
     static int said = 0;
-    if(said) return;                            /* once per process, not once per read */
+    if (said) return; /* once per process, not once per read */
     said = 1;
-    fprintf(stderr, "[USAGE] %s: written by %s, this engine is %s\n"
-        "        — honouring it because you named it explicitly\n"
-        "          (placement only; expert ids do not transfer between engines)\n",
-        path, writer, rt_engine);
+    fprintf(stderr,
+            "[USAGE] %s: written by %s, this engine is %s\n"
+            "        — honouring it because you named it explicitly\n"
+            "          (placement only; expert ids do not transfer between engines)\n",
+            path, writer, rt_engine);
 }
 
 /* ---- one reader, three layouts. cb() receives every (layer, expert, count) record.
@@ -195,105 +202,124 @@ typedef int (*rt_cb)(int layer, int expert, uint32_t count, void *ud);
  * typed by a person; PIN=auto and the AUTOPIN seed are paths the engine found by itself and
  * nobody vouched for, so they take the full check. The caller has to tell us which, because
  * one function reads both kinds of path and the file cannot say which it was. */
-static int64_t rt_read_ex(const char *path, rt_cb cb, void *ud, int trusted){
-    FILE *f = fopen(path, "rb");                /* binary: the magic sniff needs raw bytes,
-                                                 * and %d/%u skip \r, so text parses fine */
-    if(!f) return -1;
+static int64_t rt_read_ex(const char *path, rt_cb cb, void *ud, int trusted) {
+    FILE *f = fopen(path, "rb"); /* binary: the magic sniff needs raw bytes,
+                                  * and %d/%u skip \r, so text parses fine */
+    if (!f) return -1;
     int64_t tot = 0;
     uint32_t magic = 0;
-    if(fread(&magic, 4, 1, f) == 1 && magic == RT_IKU1_MAGIC){
+    if (fread(&magic, 4, 1, f) == 1 && magic == RT_IKU1_MAGIC) {
         /* no false positive is possible from our own text: it starts with "-1 " */
-        if(strcmp(rt_engine, "inkling") != 0){
-            if(!trusted){
-                fprintf(stderr, "[USAGE] %s: written by inkling, this engine is %s — refusing "
-                    "(pass PIN=<path> to use it anyway)\n", path, rt_engine);
-                fclose(f); return -1;
+        if (strcmp(rt_engine, "inkling") != 0) {
+            if (!trusted) {
+                fprintf(stderr,
+                        "[USAGE] %s: written by inkling, this engine is %s — refusing "
+                        "(pass PIN=<path> to use it anyway)\n",
+                        path, rt_engine);
+                fclose(f);
+                return -1;
             }
             rt_say_override(path, "inkling");
         }
         uint32_t dim[2];
-        if(fread(dim, 4, 2, f) != 2){ fclose(f); return -1; }
+        if (fread(dim, 4, 2, f) != 2) {
+            fclose(f);
+            return -1;
+        }
         /* Not bypassed by trust: here the dimensions ARE the parse geometry, because a
          * record's layer and expert come from its position in the file rather than from the
          * record itself. Wrong dimensions mean the bytes are being cut up wrongly, which is
          * misreading rather than misattributing, and this refusal never promised PIN=. */
-        if((int)dim[0] != rt_nl || (int)dim[1] != rt_ne){
-            fprintf(stderr, "[USAGE] %s: history is %u layers x %u experts, this engine is "
-                "%d x %d — refusing rather than misreading it\n",
-                path, dim[0], dim[1], rt_nl, rt_ne);
-            fclose(f); return -1;
+        if ((int)dim[0] != rt_nl || (int)dim[1] != rt_ne) {
+            fprintf(stderr,
+                    "[USAGE] %s: history is %u layers x %u experts, this engine is "
+                    "%d x %d — refusing rather than misreading it\n",
+                    path, dim[0], dim[1], rt_nl, rt_ne);
+            fclose(f);
+            return -1;
         }
-        uint32_t *rowbuf = (uint32_t*)malloc((size_t)dim[1] * 4);
-        if(!rowbuf){ fclose(f); return -1; }
-        for(uint32_t l = 0; l < dim[0]; l++){
-            if(fread(rowbuf, 4, dim[1], f) != dim[1]) break;
-            for(uint32_t e = 0; e < dim[1]; e++)
-                if(rowbuf[e] && cb((int)l, (int)e, rowbuf[e], ud)) tot += rowbuf[e];
+        uint32_t *rowbuf = (uint32_t *)malloc((size_t)dim[1] * 4);
+        if (!rowbuf) {
+            fclose(f);
+            return -1;
         }
-        free(rowbuf); fclose(f); return tot;
+        for (uint32_t l = 0; l < dim[0]; l++) {
+            if (fread(rowbuf, 4, dim[1], f) != dim[1]) break;
+            for (uint32_t e = 0; e < dim[1]; e++)
+                if (rowbuf[e] && cb((int)l, (int)e, rowbuf[e], ud)) tot += rowbuf[e];
+        }
+        free(rowbuf);
+        fclose(f);
+        return tot;
     }
     rewind(f);
-    int l, ver; uint32_t v3;
-    while(fscanf(f, "%d %d %u", &l, &ver, &v3) == 3){
-        if(l == -1){                                        /* -1 <n_layers> <n_experts> */
+    int l, ver;
+    uint32_t v3;
+    while (fscanf(f, "%d %d %u", &l, &ver, &v3) == 3) {
+        if (l == -1) { /* -1 <n_layers> <n_experts> */
             /* Unconditional, like the version check: a file that declares dimensions this
              * model does not have is a mistake, not a preference, and this refusal never
              * offered PIN= as a way past it. Nor is there prior behaviour to keep — the old
              * format carried no dimensions, so no file could previously declare wrong ones.
              * Only identity, below, bends to trust, because only identity promises PIN=. */
-            if(ver != rt_nl || (int)v3 != rt_ne){
-                fprintf(stderr, "[USAGE] %s: history is %d layers x %u experts, this engine "
-                    "is %d x %d — refusing rather than misreading it\n",
-                    path, ver, v3, rt_nl, rt_ne);
-                fclose(f); return -1;
+            if (ver != rt_nl || (int)v3 != rt_ne) {
+                fprintf(stderr,
+                        "[USAGE] %s: history is %d layers x %u experts, this engine "
+                        "is %d x %d — refusing rather than misreading it\n",
+                        path, ver, v3, rt_nl, rt_ne);
+                fclose(f);
+                return -1;
             }
             continue;
         }
-        if(l == -2){                                        /* -2 <version> <engine_id> */
+        if (l == -2) { /* -2 <version> <engine_id> */
             /* Not bypassed by trust, unlike the identity check below. Trust says whose
              * history the user accepts, not that this build can parse the bytes: a future
              * layout read as v1 is misread, which is the failure this format exists to
              * avoid. There is also no prior behaviour to preserve — no v2 file exists. */
-            if(ver > RT_FORMAT_VERSION){
-                fprintf(stderr, "[USAGE] %s: format version %d, this build reads %d — "
-                    "refusing rather than misreading it\n", path, ver, RT_FORMAT_VERSION);
-                fclose(f); return -1;
+            if (ver > RT_FORMAT_VERSION) {
+                fprintf(stderr,
+                        "[USAGE] %s: format version %d, this build reads %d — "
+                        "refusing rather than misreading it\n",
+                        path, ver, RT_FORMAT_VERSION);
+                fclose(f);
+                return -1;
             }
-            if(v3 != rt_id){
+            if (v3 != rt_id) {
                 const char *w = rt_engine_of(v3);
-                if(!trusted){
-                    fprintf(stderr, "[USAGE] %s: written by %s, this engine is %s — refusing "
-                        "(pass PIN=<path> to use it anyway)\n",
-                        path, w ? w : "an unknown engine", rt_engine);
-                    fclose(f); return -1;
+                if (!trusted) {
+                    fprintf(stderr,
+                            "[USAGE] %s: written by %s, this engine is %s — refusing "
+                            "(pass PIN=<path> to use it anyway)\n",
+                            path, w ? w : "an unknown engine", rt_engine);
+                    fclose(f);
+                    return -1;
                 }
                 rt_say_override(path, w ? w : "an unknown engine");
             }
             continue;
         }
-        if(l < 0) continue;                     /* room for future header records */
-        if(cb(l, ver, v3, ud)) tot += v3;       /* data row: ver=expert, v3=count */
+        if (l < 0) continue;               /* room for future header records */
+        if (cb(l, ver, v3, ud)) tot += v3; /* data row: ver=expert, v3=count */
     }
     fclose(f);
     return tot;
 }
-static int64_t rt_read(const char *path, rt_cb cb, void *ud){
-    return rt_read_ex(path, cb, ud, 0);
-}
+static int64_t rt_read(const char *path, rt_cb cb, void *ud) { return rt_read_ex(path, cb, ud, 0); }
 
 /* accumulate a history file into the counters owned here. The admission test is the one
  * usage_load used: in range, and the layer has a counter row — which for an engine that
  * dropped its dense rows (see rt_drop_row) means the layer actually routes. */
-static int rt_acc_cb(int l, int e, uint32_t c, void *ud){
+static int rt_acc_cb(int l, int e, uint32_t c, void *ud) {
     (void)ud;
     uint32_t *row = rt_counts(l);
-    if(!row || e < 0 || e >= rt_ne) return 0;
+    if (!row || e < 0 || e >= rt_ne) return 0;
     row[e] += c;
     return 1;
 }
-static int64_t rt_load(const char *path){
+static int64_t rt_load(const char *path) {
     int64_t t = rt_read(path, rt_acc_cb, NULL);
-    return t < 0 ? 0 : t;                       /* callers already treat 0 as "no history" */
+    return t < 0 ? 0 : t; /* callers already treat 0 as "no history" */
 }
 
 /* atomic write of the current counters. quiet=0 prints the one-line summary. */
@@ -306,53 +332,64 @@ static int64_t rt_load(const char *path){
  * Placement only: routing math and outputs are untouched, so the token-exact oracle
  * is unaffected. Rounding keeps a count of 1 alive -- forgetting targets the large
  * counters that dominate the ranking, not the long tail. */
-static void rt_decay(void){
+static void rt_decay(void) {
     static double d = -1.0;
-    if(d < 0.0){ const char *e = getenv("COLI_USAGE_DECAY"); d = e ? atof(e) : 1.0;
-                 if(d <= 0.0 || d > 1.0) d = 1.0; }
-    if(d >= 1.0 || !rt_c) return;
-    for(int i = 0; i <= rt_nl; i++){
-        if(!rt_c[i]) continue;
-        for(int e = 0; e < rt_ne; e++)
-            if(rt_c[i][e]) rt_c[i][e] = (unsigned)(rt_c[i][e] * d + 0.5);
+    if (d < 0.0) {
+        const char *e = getenv("COLI_USAGE_DECAY");
+        d = e ? atof(e) : 1.0;
+        if (d <= 0.0 || d > 1.0) d = 1.0;
+    }
+    if (d >= 1.0 || !rt_c) return;
+    for (int i = 0; i <= rt_nl; i++) {
+        if (!rt_c[i]) continue;
+        for (int e = 0; e < rt_ne; e++)
+            if (rt_c[i][e]) rt_c[i][e] = (unsigned)(rt_c[i][e] * d + 0.5);
     }
 }
 
-static int rt_save(const char *path, int quiet){
-    if(!rt_c || !path || !*path) return 0;
+static int rt_save(const char *path, int quiet) {
+    if (!rt_c || !path || !*path) return 0;
     rt_decay();
     int64_t tot = 0, nz = 0;
-    for(int i = 0; i <= rt_nl; i++){
-        if(!rt_c[i]) continue;
-        for(int e = 0; e < rt_ne; e++) if(rt_c[i][e]){ tot += rt_c[i][e]; nz++; }
+    for (int i = 0; i <= rt_nl; i++) {
+        if (!rt_c[i]) continue;
+        for (int e = 0; e < rt_ne; e++)
+            if (rt_c[i][e]) {
+                tot += rt_c[i][e];
+                nz++;
+            }
     }
     /* Truncation here is not cosmetic: the write-then-rename below would land on a
      * DIFFERENT path than the caller asked for, so refuse instead of silently
      * writing the history somewhere else. */
     char tmp[2100];
-    if(snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)){
-        if(!quiet) fprintf(stderr, "[STATS] path too long, not saved: %s\n", path);
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
+        if (!quiet) fprintf(stderr, "[STATS] path too long, not saved: %s\n", path);
         return 0;
     }
     FILE *f = fopen(tmp, "w");
-    if(!f){ if(!quiet) perror(tmp); return 0; }
+    if (!f) {
+        if (!quiet) perror(tmp);
+        return 0;
+    }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header
      * existed. PIN=auto decides whether a history is usable by testing the file SIZE and
      * falls back to stats.txt when it is empty, so writing two header lines into an empty
      * history would silently cost that fallback. */
-    if(nz){
+    if (nz) {
         fprintf(f, "-1 %d %d\n", rt_nl, rt_ne);
         fprintf(f, "-2 %d %u\n", RT_FORMAT_VERSION, rt_id);
-        for(int i = 0; i <= rt_nl; i++){
-            if(!rt_c[i]) continue;
-            for(int e = 0; e < rt_ne; e++)
-                if(rt_c[i][e]) fprintf(f, "%d %d %u\n", i, e, rt_c[i][e]);
+        for (int i = 0; i <= rt_nl; i++) {
+            if (!rt_c[i]) continue;
+            for (int e = 0; e < rt_ne; e++)
+                if (rt_c[i][e]) fprintf(f, "%d %d %u\n", i, e, rt_c[i][e]);
         }
     }
     fclose(f);
-    if(rename(tmp, path) != 0) return 0;
-    if(!quiet) fprintf(stderr, "[STATS] %lld selections across %lld distinct experts -> %s\n",
-                       (long long)tot, (long long)nz, path);
+    if (rename(tmp, path) != 0) return 0;
+    if (!quiet)
+        fprintf(stderr, "[STATS] %lld selections across %lld distinct experts -> %s\n", (long long)tot, (long long)nz,
+                path);
     return 1;
 }
 

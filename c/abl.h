@@ -45,56 +45,64 @@
  * source the engine links (tests/test_ablate.c).
  * ==========================================================================*/
 
-#define ABL_MAX_CELLS 16   /* per item: 1 for single-expert tests, a few for cohort screens */
+#define ABL_MAX_CELLS 16 /* per item: 1 for single-expert tests, a few for cohort screens */
 
 typedef struct Abl {
-    int mode;                     /* 0 off, 1 contribution, 2 route-around, 3 module-swap */
-    int n;                        /* # ablated cells for THIS item                         */
-    int layer[ABL_MAX_CELLS];     /* absolute layer index                                  */
-    int expert[ABL_MAX_CELLS];    /* expert id within the layer                            */
-    int swap_to[ABL_MAX_CELLS];   /* mode-3 substitute expert id; -1 for modes 0/1/2       */
+    int mode;                   /* 0 off, 1 contribution, 2 route-around, 3 module-swap */
+    int n;                      /* # ablated cells for THIS item                         */
+    int layer[ABL_MAX_CELLS];   /* absolute layer index                                  */
+    int expert[ABL_MAX_CELLS];  /* expert id within the layer                            */
+    int swap_to[ABL_MAX_CELLS]; /* mode-3 substitute expert id; -1 for modes 0/1/2       */
 } Abl;
 
 /* PER-ITEM RESET: clear to the OFF state.  After this every abl_*() is inert. */
-static inline void abl_reset(Abl *a){
-    a->mode = 0; a->n = 0;
-    for(int i=0;i<ABL_MAX_CELLS;i++){ a->layer[i]=-1; a->expert[i]=-1; a->swap_to[i]=-1; }
+static inline void abl_reset(Abl *a) {
+    a->mode = 0;
+    a->n = 0;
+    for (int i = 0; i < ABL_MAX_CELLS; i++) {
+        a->layer[i] = -1;
+        a->expert[i] = -1;
+        a->swap_to[i] = -1;
+    }
 }
 
 /* Configure the ablation for the current item.  n is clamped to ABL_MAX_CELLS
  * (fail-safe: never overrun).  T may be NULL for modes 0/1/2 (no swap targets).
  * Returns the number of cells actually installed. */
-static inline int abl_set_item(Abl *a, int mode, const int *L, const int *E,
-                               const int *T, int n){
-    if(n < 0) n = 0;
-    if(n > ABL_MAX_CELLS) n = ABL_MAX_CELLS;
-    a->mode = mode; a->n = n;
-    for(int i=0;i<n;i++){
-        a->layer[i]  = L[i];
+static inline int abl_set_item(Abl *a, int mode, const int *L, const int *E, const int *T, int n) {
+    if (n < 0) n = 0;
+    if (n > ABL_MAX_CELLS) n = ABL_MAX_CELLS;
+    a->mode = mode;
+    a->n = n;
+    for (int i = 0; i < n; i++) {
+        a->layer[i] = L[i];
         a->expert[i] = E[i];
-        a->swap_to[i]= (T ? T[i] : -1);
+        a->swap_to[i] = (T ? T[i] : -1);
     }
     return n;
 }
 
 /* mode 2: is (layer,e) to be dropped from this token's selected set? */
-static inline int abl_route_around(const Abl *a, int layer, int e){
-    if(a->mode != 2) return 0;
-    for(int i=0;i<a->n;i++) if(a->layer[i]==layer && a->expert[i]==e) return 1;
+static inline int abl_route_around(const Abl *a, int layer, int e) {
+    if (a->mode != 2) return 0;
+    for (int i = 0; i < a->n; i++)
+        if (a->layer[i] == layer && a->expert[i] == e) return 1;
     return 0;
 }
 
 /* mode 1: is (layer,e)'s weighted contribution to be zeroed (routing kept)? */
-static inline int abl_zero_contrib(const Abl *a, int layer, int e){
-    if(a->mode != 1) return 0;
-    for(int i=0;i<a->n;i++) if(a->layer[i]==layer && a->expert[i]==e) return 1;
+static inline int abl_zero_contrib(const Abl *a, int layer, int e) {
+    if (a->mode != 1) return 0;
+    for (int i = 0; i < a->n; i++)
+        if (a->layer[i] == layer && a->expert[i] == e) return 1;
     return 0;
 }
 
 /* mode 3: substitute expert id for (layer,e), or -1 if this cell is not swapped. */
-static inline int abl_swap_target(const Abl *a, int layer, int e){
-    if(a->mode != 3) return -1;
-    for(int i=0;i<a->n;i++) if(a->layer[i]==layer && a->expert[i]==e) return a->swap_to[i];
+static inline int abl_swap_target(const Abl *a, int layer, int e) {
+    if (a->mode != 3) return -1;
+    for (int i = 0; i < a->n; i++)
+        if (a->layer[i] == layer && a->expert[i] == e) return a->swap_to[i];
     return -1;
 }
 

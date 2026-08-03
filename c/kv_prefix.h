@@ -38,10 +38,10 @@
 #include <string.h>
 
 typedef struct {
-    int *fed;      /* token ids at positions 0..len-1 */
-    int  len;      /* positions the state currently covers */
-    int  cap;      /* allocated positions */
-    int  tainted;  /* state consumed something token ids cannot describe */
+    int *fed;    /* token ids at positions 0..len-1 */
+    int len;     /* positions the state currently covers */
+    int cap;     /* allocated positions */
+    int tainted; /* state consumed something token ids cannot describe */
 } kv_prefix;
 
 /* Size the record to the KV it describes. Call it wherever the KV buffers are
@@ -86,9 +86,12 @@ static inline void kv_prefix_free(kv_prefix *p) {
 static inline int kv_prefix_grow(kv_prefix *p, int cap, int keep) {
     if (!p || cap <= 0) return 0;
     int *grown = (int *)calloc((size_t)cap, sizeof(int));
-    if (!grown) { kv_prefix_free(p); return 0; }
+    if (!grown) {
+        kv_prefix_free(p);
+        return 0;
+    }
     if (keep > p->len) keep = p->len;
-    if (keep > cap)    keep = cap;
+    if (keep > cap) keep = cap;
     if (keep > 0 && p->fed) memcpy(grown, p->fed, (size_t)keep * sizeof(int));
     free(p->fed);
     p->fed = grown;
@@ -100,10 +103,12 @@ static inline int kv_prefix_grow(kv_prefix *p, int cap, int keep) {
 /* Record n tokens fed at absolute positions pos0..pos0+n-1. Out-of-range
  * writes drop the record rather than truncating it: a partial record would
  * claim coverage the state does not have. */
-static inline void kv_prefix_record(kv_prefix *p, const int *ids,
-                                    int pos0, int n) {
+static inline void kv_prefix_record(kv_prefix *p, const int *ids, int pos0, int n) {
     if (!p || !p->fed || !ids || n <= 0 || pos0 < 0) return;
-    if (pos0 + n > p->cap) { p->len = 0; return; }
+    if (pos0 + n > p->cap) {
+        p->len = 0;
+        return;
+    }
     memcpy(p->fed + pos0, ids, (size_t)n * sizeof(int));
     if (pos0 + n > p->len) p->len = pos0 + n;
 }

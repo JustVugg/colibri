@@ -15,12 +15,13 @@
 
 #include "../st.h"
 
-#define CHECK(condition) do { \
-    if (!(condition)) { \
-        fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition); \
-        return 1; \
-    } \
-} while (0)
+#define CHECK(condition)                                                                                               \
+    do {                                                                                                               \
+        if (!(condition)) {                                                                                            \
+            fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition);                              \
+            return 1;                                                                                                  \
+        }                                                                                                              \
+    } while (0)
 
 static void write_snap(const char *dir, int truncate_bytes) {
     char path[512];
@@ -40,11 +41,15 @@ int main(void) {
     /* relative to the CWD, per test_stops: MinGW .exe files resolve Windows
      * paths and "/tmp" is not one */
     char dir[] = "test_st_pread_XXXXXX";
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    if (!mkdtemp(dir)) {
+        perror("mkdtemp");
+        return 1;
+    }
 
     /* 1) chunk loop: 96-byte tensor read 7 bytes at a time, content exact */
     write_snap(dir, 0);
-    shards S; st_init(&S, dir);
+    shards S;
+    st_init(&S, dir);
     unsigned char out[96] = {0};
     st_read_raw(&S, "t", out, 0);
     for (int i = 0; i < 96; i++) CHECK(out[i] == (unsigned char)(i * 7 + 3));
@@ -60,41 +65,55 @@ int main(void) {
      * so the bound has to be the caller's -- st_read_raw_cap makes it one. Runs on
      * the intact shard: the cap is checked before any pread, so truncation below
      * would only obscure which refusal fired. */
-    int cap_pipe[2]; CHECK(pipe(cap_pipe) == 0);
-    pid_t cap_pid = fork(); CHECK(cap_pid >= 0);
+    int cap_pipe[2];
+    CHECK(pipe(cap_pipe) == 0);
+    pid_t cap_pid = fork();
+    CHECK(cap_pid >= 0);
     if (cap_pid == 0) {
-        dup2(cap_pipe[1], 2); close(cap_pipe[0]); close(cap_pipe[1]);
+        dup2(cap_pipe[1], 2);
+        close(cap_pipe[0]);
+        close(cap_pipe[1]);
         unsigned char small[64];
-        st_read_raw_cap(&S, "t", small, sizeof(small), 0);   /* 96 > 64: must exit(1) */
-        _exit(42);                                            /* reaching here = bug */
+        st_read_raw_cap(&S, "t", small, sizeof(small), 0); /* 96 > 64: must exit(1) */
+        _exit(42);                                         /* reaching here = bug */
     }
     close(cap_pipe[1]);
     char cap_err[512] = {0};
-    ssize_t cn = read(cap_pipe[0], cap_err, sizeof(cap_err)-1); (void)cn;
+    ssize_t cn = read(cap_pipe[0], cap_err, sizeof(cap_err) - 1);
+    (void)cn;
     close(cap_pipe[0]);
-    int cap_status = 0; waitpid(cap_pid, &cap_status, 0);
+    int cap_status = 0;
+    waitpid(cap_pid, &cap_status, 0);
     CHECK(WIFEXITED(cap_status) && WEXITSTATUS(cap_status) == 1);
     CHECK(strstr(cap_err, "destination holds") != NULL);
 
     /* 2) shard truncated AFTER st_init (init validates static bounds, so the
      * pread path only fires when the file shrinks underneath a live handle):
      * child must exit(1) with an honest message, not perror's "Success" */
-    char shard[512]; snprintf(shard, sizeof(shard), "%s/model.safetensors", dir);
-    struct stat sb; CHECK(stat(shard, &sb) == 0);
+    char shard[512];
+    snprintf(shard, sizeof(shard), "%s/model.safetensors", dir);
+    struct stat sb;
+    CHECK(stat(shard, &sb) == 0);
     CHECK(truncate(shard, sb.st_size - 40) == 0);
-    int pipefd[2]; CHECK(pipe(pipefd) == 0);
-    pid_t pid = fork(); CHECK(pid >= 0);
+    int pipefd[2];
+    CHECK(pipe(pipefd) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
     if (pid == 0) {
-        dup2(pipefd[1], 2); close(pipefd[0]); close(pipefd[1]);
+        dup2(pipefd[1], 2);
+        close(pipefd[0]);
+        close(pipefd[1]);
         unsigned char buf[96];
-        st_read_raw(&S, "t", buf, 0);    /* inherited handles; must exit(1) inside */
-        _exit(42);                        /* reaching here = bug */
+        st_read_raw(&S, "t", buf, 0); /* inherited handles; must exit(1) inside */
+        _exit(42);                    /* reaching here = bug */
     }
     close(pipefd[1]);
     char err[512] = {0};
-    ssize_t n = read(pipefd[0], err, sizeof(err)-1); (void)n;
+    ssize_t n = read(pipefd[0], err, sizeof(err) - 1);
+    (void)n;
     close(pipefd[0]);
-    int status = 0; waitpid(pid, &status, 0);
+    int status = 0;
+    waitpid(pid, &status, 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);
     CHECK(strstr(err, "short read") != NULL);
     CHECK(strstr(err, "Success") == NULL);
@@ -109,7 +128,8 @@ int main(void) {
 #else
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
 #endif
-    if (system(cmd)) {}
+    if (system(cmd)) {
+    }
     printf("test_st_pread: chunk loop + honest truncation error: ok\n");
     return 0;
 }

@@ -23,11 +23,21 @@
 
 static void *slurp(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s — run tools/make_e8_fixture.py\n", path); exit(77); }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (!f) {
+        fprintf(stderr, "cannot open %s — run tools/make_e8_fixture.py\n", path);
+        exit(77);
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
     void *p = malloc((size_t)sz);
-    if (fread(p, 1, (size_t)sz, f) != (size_t)sz) { fprintf(stderr, "short read\n"); exit(1); }
-    fclose(f); *n = (size_t)sz; return p;
+    if (fread(p, 1, (size_t)sz, f) != (size_t)sz) {
+        fprintf(stderr, "short read\n");
+        exit(1);
+    }
+    fclose(f);
+    *n = (size_t)sz;
+    return p;
 }
 
 int main(void) {
@@ -35,11 +45,12 @@ int main(void) {
     uint8_t *raw = slurp("tests/fixtures/e8_case.bin", &nbytes);
     /* header: int32 O, I, then packed[O*rowbytes], deq[O*I], x[I], yref[O] */
     int32_t O, I;
-    memcpy(&O, raw, 4); memcpy(&I, raw + 4, 4);
+    memcpy(&O, raw, 4);
+    memcpy(&I, raw + 4, 4);
     size_t rb = (size_t)e8_rowbytes(I);
     const uint8_t *packed = raw + 8;
-    const float *deq  = (const float *)(packed + (size_t)O * rb);
-    const float *x    = deq + (size_t)O * I;
+    const float *deq = (const float *)(packed + (size_t)O * rb);
+    const float *x = deq + (size_t)O * I;
     const float *yref = x + I;
 
     /* 1. dequant agreement, sub-block by sub-block */
@@ -49,7 +60,8 @@ int main(void) {
         const uint8_t *row = packed + (size_t)o * rb;
         for (int64_t b = 0; b < e8_blocks(I); b++) {
             const uint8_t *blk = row + b * E8_BBYTES;
-            uint16_t dh; memcpy(&dh, blk + 96, 2);
+            uint16_t dh;
+            memcpy(&dh, blk + 96, 2);
             float d = e8_fp16_to_f32(dh);
             for (int ib = 0; ib < E8_QK / E8_SUB; ib++) {
                 int off = (int)(b * E8_QK) + ib * E8_SUB;
@@ -60,15 +72,17 @@ int main(void) {
                     float got = w[k], want = deq[(size_t)o * I + off + k];
                     if (fabsf(got - want) > 1e-6f * (fabsf(want) + 1e-6f)) {
                         if (mism < 5)
-                            fprintf(stderr, "dequant mismatch o=%d i=%d: got %.9g want %.9g\n",
-                                    o, off + k, got, want);
+                            fprintf(stderr, "dequant mismatch o=%d i=%d: got %.9g want %.9g\n", o, off + k, got, want);
                         mism++;
                     }
                 }
             }
         }
     }
-    if (mism) { printf("FAIL: %d dequant mismatches\n", mism); return 1; }
+    if (mism) {
+        printf("FAIL: %d dequant mismatches\n", mism);
+        return 1;
+    }
 
     /* 2. matmul agreement */
     float *y = malloc((size_t)O * sizeof(float));
@@ -80,7 +94,10 @@ int main(void) {
         if (rel > worst) worst = rel;
     }
     printf("e8 kernel oracle: O=%d I=%d, dequant exact, matmul worst rel %.2e\n", O, I, worst);
-    if (worst > 1e-5) { printf("FAIL\n"); return 1; }
+    if (worst > 1e-5) {
+        printf("FAIL\n");
+        return 1;
+    }
 
     /* 3. rotation agreement (converter step, #452): the fixture carries a
      * rotated-weights section — packed W@Q from the Python side, the raw
@@ -90,10 +107,11 @@ int main(void) {
     const uint8_t *sec = (const uint8_t *)(yref + O);
     if ((size_t)(sec - raw) < nbytes) {
         int32_t O2, I2;
-        memcpy(&O2, sec, 4); memcpy(&I2, sec + 4, 4);
+        memcpy(&O2, sec, 4);
+        memcpy(&I2, sec + 4, 4);
         size_t rb2 = (size_t)e8_rowbytes(I2);
         const uint8_t *packed2 = sec + 8;
-        const float *x2    = (const float *)(packed2 + (size_t)O2 * rb2);
+        const float *x2 = (const float *)(packed2 + (size_t)O2 * rb2);
         const float *xrot2 = x2 + I2;
         const float *y2ref = xrot2 + I2;
         float *xr = malloc((size_t)I2 * sizeof(float));
@@ -113,15 +131,19 @@ int main(void) {
             double rel = d / (fabs((double)y2ref[o]) + 1e-6);
             if (rel > wmm) wmm = rel;
         }
-        printf("e8 rotation oracle: O2=%d I2=%d, rot worst rel %.2e, matmul worst rel %.2e\n",
-               O2, I2, wrot, wmm);
-        if (wrot > 1e-5 || wmm > 1e-5) { printf("FAIL\n"); return 1; }
-        free(xr); free(y2);
+        printf("e8 rotation oracle: O2=%d I2=%d, rot worst rel %.2e, matmul worst rel %.2e\n", O2, I2, wrot, wmm);
+        if (wrot > 1e-5 || wmm > 1e-5) {
+            printf("FAIL\n");
+            return 1;
+        }
+        free(xr);
+        free(y2);
     } else {
         fprintf(stderr, "fixture has no rotated section — regenerate with tools/make_e8_fixture.py\n");
         return 1;
     }
     printf("OK\n");
-    free(y); free(raw);
+    free(y);
+    free(raw);
     return 0;
 }

@@ -35,64 +35,67 @@
 #ifndef COLI_HIP_NO_WMMA
 #if __has_include(<rocwmma/rocwmma.hpp>)
 #include <rocwmma/rocwmma.hpp>
-#define COLI_GPU_HAS_WMMA        1
-#define __CUDA_ARCH__            700
-#define __half                  rocwmma::float16_t
-namespace nvcuda { namespace wmma = ::rocwmma; }
-#define __syncwarp()            __syncthreads()
+#define COLI_GPU_HAS_WMMA 1
+#define __CUDA_ARCH__ 700
+#define __half rocwmma::float16_t
+namespace nvcuda {
+namespace wmma = ::rocwmma;
+}
+#define __syncwarp() __syncthreads()
 #else
 /* WMMA-capable arch but no headers: stop loudly rather than silently build
  * a binary with the tensor-core kernels disabled. */
-#error "rocWMMA headers not found. Install rocwmma-dev (or rocm-hip-runtime-dev), or build for a non-WMMA arch (see NO_WMMA_ARCHS in the Makefile)."
+#error                                                                                                                 \
+    "rocWMMA headers not found. Install rocwmma-dev (or rocm-hip-runtime-dev), or build for a non-WMMA arch (see NO_WMMA_ARCHS in the Makefile)."
 #endif
 #else
 /* Arch has no matrix cores: rocWMMA is not needed and not included. */
-#define COLI_GPU_HAS_WMMA        0
-#define __syncwarp()            __syncthreads()
+#define COLI_GPU_HAS_WMMA 0
+#define __syncwarp() __syncthreads()
 #endif
-#define cudaError_t              hipError_t
-#define cudaSuccess              hipSuccess
-#define cudaGetErrorString       hipGetErrorString
-#define cudaGetLastError         hipGetLastError
-#define cudaSetDevice            hipSetDevice
-#define cudaGetDeviceCount       hipGetDeviceCount
-#define cudaDeviceProp           hipDeviceProp_t
-#define cudaGetDeviceProperties  hipGetDeviceProperties
-#define cudaMalloc               hipMalloc
-#define cudaFree                 hipFree
-#define cudaMemcpy               hipMemcpy
-#define cudaMemcpy2D             hipMemcpy2D
-#define cudaMemcpyAsync          hipMemcpyAsync
-#define cudaMemcpyToSymbol       hipMemcpyToSymbol   /* fmt=6 E8 codebook upload */
-#define cudaMemcpyHostToDevice   hipMemcpyHostToDevice
-#define cudaMemcpyDeviceToHost   hipMemcpyDeviceToHost
-#define cudaMemGetInfo           hipMemGetInfo
-#define cudaStream_t             hipStream_t
-#define cudaStreamCreate         hipStreamCreate
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#define cudaGetLastError hipGetLastError
+#define cudaSetDevice hipSetDevice
+#define cudaGetDeviceCount hipGetDeviceCount
+#define cudaDeviceProp hipDeviceProp_t
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpy2D hipMemcpy2D
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyToSymbol hipMemcpyToSymbol /* fmt=6 E8 codebook upload */
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemGetInfo hipMemGetInfo
+#define cudaStream_t hipStream_t
+#define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
-#define cudaStreamNonBlocking    hipStreamNonBlocking
-#define cudaStreamDestroy        hipStreamDestroy
-#define cudaStreamSynchronize    hipStreamSynchronize
-#define cudaStreamWaitEvent      hipStreamWaitEvent
-#define cudaDeviceSynchronize    hipDeviceSynchronize
-#define cudaEvent_t              hipEvent_t
-#define cudaEventCreate          hipEventCreate
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamSynchronize hipStreamSynchronize
+#define cudaStreamWaitEvent hipStreamWaitEvent
+#define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaEvent_t hipEvent_t
+#define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
-#define cudaEventDisableTiming   hipEventDisableTiming
-#define cudaEventDestroy         hipEventDestroy
-#define cudaEventRecord          hipEventRecord
-#define cudaEventSynchronize     hipEventSynchronize
-#define cudaEventElapsedTime     hipEventElapsedTime
-#define cudaMallocHost           hipHostMalloc
-#define cudaFreeHost             hipHostFree
+#define cudaEventDisableTiming hipEventDisableTiming
+#define cudaEventDestroy hipEventDestroy
+#define cudaEventRecord hipEventRecord
+#define cudaEventSynchronize hipEventSynchronize
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaMallocHost hipHostMalloc
+#define cudaFreeHost hipHostFree
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
-#define cudaMemcpyPeer           hipMemcpyPeer
-#define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
-#define cudaMemsetAsync          hipMemsetAsync
+#define cudaMemcpyPeer hipMemcpyPeer
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemsetAsync hipMemsetAsync
 #else
 #include <cuda_runtime.h>
 #include <mma.h>
-#define COLI_GPU_HAS_WMMA        1
+#define COLI_GPU_HAS_WMMA 1
 #endif
 
 #endif /* COLIBRI_BACKEND_GPU_COMPAT_H */

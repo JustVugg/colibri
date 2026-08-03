@@ -4,19 +4,18 @@
 
 #include "../json.h"
 
-#define CHECK(condition) do { \
-    if (!(condition)) { \
-        fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition); \
-        return 1; \
-    } \
-} while (0)
+#define CHECK(condition)                                                                                               \
+    do {                                                                                                               \
+        if (!(condition)) {                                                                                            \
+            fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition);                              \
+            return 1;                                                                                                  \
+        }                                                                                                              \
+    } while (0)
 
 int main(void) {
-    jval *root = json_parse(
-        "{\"name\":\"Colibri\\nCPU\",\"enabled\":true,\"empty\":null,"
-        "\"values\":[1,-2.5,3e2],\"unicode\":\"\\u03bb \\uD83D\\uDE80\"}",
-        NULL
-    );
+    jval *root = json_parse("{\"name\":\"Colibri\\nCPU\",\"enabled\":true,\"empty\":null,"
+                            "\"values\":[1,-2.5,3e2],\"unicode\":\"\\u03bb \\uD83D\\uDE80\"}",
+                            NULL);
 
     CHECK(root && root->t == J_OBJ);
     CHECK(strcmp(json_get(root, "name")->str, "Colibri\nCPU") == 0);

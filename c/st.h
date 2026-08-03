@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>   /* ldexpf per ue8m0_to_f32 */
+#include <math.h> /* ldexpf per ue8m0_to_f32 */
 #include <stdint.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -26,30 +26,30 @@
 #define ST_MAX_HEADER (512ll << 20)
 
 typedef struct {
-    char   *name;
-    int     fd;
-    int64_t off;       /* offset assoluto del dato dentro al file */
+    char *name;
+    int fd;
+    int64_t off; /* offset assoluto del dato dentro al file */
     int64_t nbytes;
-    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 */
+    int dtype; /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 */
     int64_t numel;
 } st_tensor;
 
 typedef struct {
     st_tensor *t;
-    int        n, cap;
-    int        fds[512];
-    int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
-    char      *paths[512];
-    int        nfd;
-#define ST_MAX_MIR 4       /* extra read replicas beyond the primary (multi-SSD) */
-    int        mfds[ST_MAX_MIR][512];  /* MIRROR: fds of replica copy r+1 (multi-SSD), -1 = absent */
-    int        mdfds[ST_MAX_MIR][512]; /* O_DIRECT twins of the replica copies, -1 = absent */
-    int        nmirror[ST_MAX_MIR];    /* files accepted into replica r+1 */
-    int        nrep;       /* registered replica copies (0 = mirror inactive) */
-    int       *hidx;      /* hash map nome->indice (open addressing): con ~120k tensori
-                           * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
-                           * costava decine di secondi/token (misurato sul primo run reale) */
-    int        hcap;
+    int n, cap;
+    int fds[512];
+    int dfds[512]; /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
+    char *paths[512];
+    int nfd;
+#define ST_MAX_MIR 4            /* extra read replicas beyond the primary (multi-SSD) */
+    int mfds[ST_MAX_MIR][512];  /* MIRROR: fds of replica copy r+1 (multi-SSD), -1 = absent */
+    int mdfds[ST_MAX_MIR][512]; /* O_DIRECT twins of the replica copies, -1 = absent */
+    int nmirror[ST_MAX_MIR];    /* files accepted into replica r+1 */
+    int nrep;                   /* registered replica copies (0 = mirror inactive) */
+    int *hidx;                  /* hash map nome->indice (open addressing): con ~120k tensori
+                                 * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
+                                 * costava decine di secondi/token (misurato sul primo run reale) */
+    int hcap;
     /* FORMAT METADATA STAMP (reference impl, see colibri.c's qt_verify_fmt_stamp):
      * per-tensor {name -> format NAME string} pairs collected from every shard's
      * __metadata__["colibri.fmt"] JSON blob (safetensors __metadata__ values are
@@ -61,35 +61,38 @@ typedef struct {
      * Both arrays own strdup'd strings, intentionally leaked like the rest of
      * st_init_multi's one-time startup parsing (see the json_parse callers
      * below). */
-    char     **fmt_name;   /* stamped tensor name */
-    char     **fmt_val;    /* stamped format NAME string */
-    int        fmt_n, fmt_cap;
+    char **fmt_name; /* stamped tensor name */
+    char **fmt_val;  /* stamped format NAME string */
+    int fmt_n, fmt_cap;
 } shards;
 #define ST_MAX_SHARDS 512
 
-static uint64_t st_hash(const char *s){
-    uint64_t h=1469598103934665603ULL;
-    while(*s){ h^=(unsigned char)*s++; h*=1099511628211ULL; }
+static uint64_t st_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
     return h;
 }
 
 static int st_dtype_code(const char *s) {
     if (!strcmp(s, "BF16")) return 0;
-    if (!strcmp(s, "F16"))  return 1;
-    if (!strcmp(s, "F32"))  return 2;
-    if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
-    if (!strcmp(s, "I8"))   return 3;
+    if (!strcmp(s, "F16")) return 1;
+    if (!strcmp(s, "F32")) return 2;
+    if (!strcmp(s, "U8")) return 3; /* dati quantizzati (int4 packed / int8) */
+    if (!strcmp(s, "I8")) return 3;
     /* --- tipi dei checkpoint nativi fp8 (DeepSeek-V4, GLM-5.2-FP8 non ripacchettati) ---
      * PRIMA di questi, st_init faceva exit(1) su un checkpoint DeepSeek-V4 al primo
      * tensore I64, senza arrivare ai pesi. Sono INDICIZZATI qui e letti dal percorso
      * dei byte grezzi (st_read_raw); i lettori float li RIFIUTANO PER NOME invece di
      * caderci dentro -- vedi il commento in st_read_f32. Il loro codice numerico e'
      * nuovo e nessun codice esistente cambia: 0/1/2/3 restano quelli di prima. */
-    if (!strcmp(s, "F8_E4M3") || !strcmp(s, "F8_E4M3FN") ||
-        !strcmp(s, "float8_e4m3fn")) return 4;
+    if (!strcmp(s, "F8_E4M3") || !strcmp(s, "F8_E4M3FN") || !strcmp(s, "float8_e4m3fn")) return 4;
     if (!strcmp(s, "F8_E8M0") || !strcmp(s, "F8_E8M0FNU")) return 5;
     if (!strcmp(s, "I64") || !strcmp(s, "U64")) return 6;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    fprintf(stderr, "unsupported dtype: %s\n", s);
+    exit(1);
 }
 
 /* Byte per elemento. UNICO posto che lo sa: prima la formula era ripetuta in tre
@@ -97,52 +100,89 @@ static int st_dtype_code(const char *s) {
  * nuovi avrebbe silenziosamente detto "2 byte" per un I64 da 8. */
 static inline int st_dtype_esz(int dtype) {
     switch (dtype) {
-        case 2: return 4;                 /* F32 */
-        case 3: case 4: case 5: return 1; /* U8/I8, F8_E4M3, F8_E8M0 */
-        case 6: return 8;                 /* I64/U64 */
-        default: return 2;                /* BF16, F16 */
+    case 2:
+        return 4; /* F32 */
+    case 3:
+    case 4:
+    case 5:
+        return 1; /* U8/I8, F8_E4M3, F8_E8M0 */
+    case 6:
+        return 8; /* I64/U64 */
+    default:
+        return 2; /* BF16, F16 */
     }
 }
 
 /* Nome leggibile, per i messaggi di rifiuto. */
 static inline const char *st_dtype_name(int dtype) {
     switch (dtype) {
-        case 0: return "BF16"; case 1: return "F16"; case 2: return "F32";
-        case 3: return "U8/I8"; case 4: return "F8_E4M3"; case 5: return "F8_E8M0";
-        case 6: return "I64"; default: return "?";
+    case 0:
+        return "BF16";
+    case 1:
+        return "F16";
+    case 2:
+        return "F32";
+    case 3:
+        return "U8/I8";
+    case 4:
+        return "F8_E4M3";
+    case 5:
+        return "F8_E8M0";
+    case 6:
+        return "I64";
+    default:
+        return "?";
     }
 }
 
 static inline float bf16_to_f32(uint16_t h) {
-    uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f;
+    uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
 }
 static inline float f16_to_f32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t man  = h & 0x3FF;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t man = h & 0x3FF;
     uint32_t u;
-    if (exp == 0) {            /* subnormale o zero */
+    if (exp == 0) { /* subnormale o zero */
         if (man == 0) u = sign;
-        else { exp = 127 - 15 + 1; while (!(man & 0x400)) { man <<= 1; exp--; } man &= 0x3FF; u = sign | (exp << 23) | (man << 13); }
-    } else if (exp == 0x1F) {  /* inf/nan */
+        else {
+            exp = 127 - 15 + 1;
+            while (!(man & 0x400)) {
+                man <<= 1;
+                exp--;
+            }
+            man &= 0x3FF;
+            u = sign | (exp << 23) | (man << 13);
+        }
+    } else if (exp == 0x1F) { /* inf/nan */
         u = sign | 0x7F800000 | (man << 13);
     } else {
         u = sign | ((exp - 15 + 127) << 23) | (man << 13);
     }
-    float f; memcpy(&f, &u, 4); return f;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
 }
 
 static int st_open_fd(shards *S, const char *path) {
-    for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
+    for (int i = 0; i < S->nfd; i++)
+        if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0) { perror(path); exit(1); }
-    S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
+    if (fd < 0) {
+        perror(path);
+        exit(1);
+    }
+    S->paths[S->nfd] = strdup(path);
+    S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
-    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
+    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT); /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
-    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
+    S->dfds[S->nfd] = compat_open_direct(path); /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
 #else
-    S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
+    S->dfds[S->nfd] = -1; /* niente equivalente: solo buffered */
 #endif
     S->nfd++;
     return fd;
@@ -151,11 +191,13 @@ static int st_open_fd(shards *S, const char *path) {
 /* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
  * ext4-in-VHDX si strozza a ~0.8 GB/s, O_DIRECT arriva a 2.3+; misurato). -1 se non disponibile. */
 static int st_fidx(shards *S, int fd) {
-    for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return i;
+    for (int i = 0; i < S->nfd; i++)
+        if (S->fds[i] == fd) return i;
     return -1;
 }
 static int st_direct_fd(shards *S, int fd) {
-    int i = st_fidx(S, fd); return i < 0 ? -1 : S->dfds[i];
+    int i = st_fidx(S, fd);
+    return i < 0 ? -1 : S->dfds[i];
 }
 
 /* ---- MIRROR (multi-SSD): read-only copies of the model on other drives ----
@@ -164,12 +206,14 @@ static int st_direct_fd(shards *S, int fd) {
 static int st_fd_rep(shards *S, int fd, int rep) {
     if (!rep) return fd;
     if (rep > S->nrep) return -1;
-    int i = st_fidx(S, fd); return i < 0 ? -1 : S->mfds[rep-1][i];
+    int i = st_fidx(S, fd);
+    return i < 0 ? -1 : S->mfds[rep - 1][i];
 }
 static int st_direct_fd_rep(shards *S, int fd, int rep) {
     if (!rep) return st_direct_fd(S, fd);
     if (rep > S->nrep) return -1;
-    int i = st_fidx(S, fd); return i < 0 ? -1 : S->mdfds[rep-1][i];
+    int i = st_fidx(S, fd);
+    return i < 0 ? -1 : S->mdfds[rep - 1][i];
 }
 
 /* Registers <dir>/<basename> as read replica S->nrep+1 of every already-indexed
@@ -180,18 +224,22 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
  * expert shards). Returns the number of accepted files; a dir contributing 0
  * files claims no replica slot. Mirrors are NEVER written to: .coli_usage /
  * .coli_kv keep deriving from the primary alone. */
-static void st_mirror_reset(shards *S) {           /* re-init: drop every replica */
-    for (int r = 0; r < S->nrep; r++) for (int i = 0; i < S->nfd; i++) {
-        if (S->mfds[r][i] >= 0) close(S->mfds[r][i]);
-        if (S->mdfds[r][i] >= 0) close(S->mdfds[r][i]);
-    }
+static void st_mirror_reset(shards *S) { /* re-init: drop every replica */
+    for (int r = 0; r < S->nrep; r++)
+        for (int i = 0; i < S->nfd; i++) {
+            if (S->mfds[r][i] >= 0) close(S->mfds[r][i]);
+            if (S->mdfds[r][i] >= 0) close(S->mdfds[r][i]);
+        }
     memset(S->nmirror, 0, sizeof(S->nmirror));
     S->nrep = 0;
 }
 static int st_mirror_add(shards *S, const char *dir) {
     if (S->nrep >= ST_MAX_MIR) return 0;
     int r = S->nrep;
-    for (int i = 0; i < ST_MAX_SHARDS; i++) { S->mfds[r][i] = -1; S->mdfds[r][i] = -1; }
+    for (int i = 0; i < ST_MAX_SHARDS; i++) {
+        S->mfds[r][i] = -1;
+        S->mdfds[r][i] = -1;
+    }
     S->nmirror[r] = 0;
     for (int i = 0; i < S->nfd; i++) {
         const char *base = strrchr(S->paths[i], '/');
@@ -200,26 +248,33 @@ static int st_mirror_add(shards *S, const char *dir) {
         if (b2 && (!base || b2 > base)) base = b2;
 #endif
         base = base ? base + 1 : S->paths[i];
-        char mp[2048]; snprintf(mp, sizeof(mp), "%s/%s", dir, base);
+        char mp[2048];
+        snprintf(mp, sizeof(mp), "%s/%s", dir, base);
         int mfd = open(mp, COMPAT_O_RDONLY);
-        if (mfd < 0) continue;               /* partial mirror: this shard stays on the primary */
+        if (mfd < 0) continue; /* partial mirror: this shard stays on the primary */
         int64_t sza = lseek(S->fds[i], 0, SEEK_END), szb = lseek(mfd, 0, SEEK_END);
         if (sza != szb) {
             fprintf(stderr, "[MIRROR] %s: size differs from the primary copy — file skipped\n", mp);
-            close(mfd); continue;
+            close(mfd);
+            continue;
         }
-        uint64_t ha = 0, hb = 0; int ok = 1;   /* identical header => identical data_offsets */
-        if (pread(S->fds[i], &ha, 8, 0) != 8 || pread(mfd, &hb, 8, 0) != 8 ||
-            ha != hb || ha == 0 || ha > (uint64_t)256 << 20 || (int64_t)(8 + ha) > sza) ok = 0;
+        uint64_t ha = 0, hb = 0;
+        int ok = 1; /* identical header => identical data_offsets */
+        if (pread(S->fds[i], &ha, 8, 0) != 8 || pread(mfd, &hb, 8, 0) != 8 || ha != hb || ha == 0 ||
+            ha > (uint64_t)256 << 20 || (int64_t)(8 + ha) > sza)
+            ok = 0;
         if (ok) {
             char *ba = malloc(ha), *bb = malloc(ha);
-            if (!ba || !bb || pread(S->fds[i], ba, ha, 8) != (ssize_t)ha ||
-                pread(mfd, bb, ha, 8) != (ssize_t)ha || memcmp(ba, bb, ha)) ok = 0;
-            free(ba); free(bb);
+            if (!ba || !bb || pread(S->fds[i], ba, ha, 8) != (ssize_t)ha || pread(mfd, bb, ha, 8) != (ssize_t)ha ||
+                memcmp(ba, bb, ha))
+                ok = 0;
+            free(ba);
+            free(bb);
         }
         if (!ok) {
             fprintf(stderr, "[MIRROR] %s: header differs from the primary copy — file skipped\n", mp);
-            close(mfd); continue;
+            close(mfd);
+            continue;
         }
         S->mfds[r][i] = mfd;
 #ifdef O_DIRECT
@@ -229,7 +284,10 @@ static int st_mirror_add(shards *S, const char *dir) {
 #endif
         S->nmirror[r]++;
     }
-    if (S->nmirror[r] > 0) { S->nrep++; return S->nmirror[r]; }
+    if (S->nmirror[r] > 0) {
+        S->nrep++;
+        return S->nmirror[r];
+    }
     return 0;
 }
 /* backward-compatible single-mirror entry point */
@@ -258,13 +316,13 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
         ssize_t r = pread(fd, p + got, (size_t)want, off + got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno),
-                    (long long)off, (long long)got, (long long)n);
+            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno), (long long)off,
+                    (long long)got, (long long)n);
             exit(1);
         }
         if (r == 0) {
-            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n",
-                    tag, (long long)off, (long long)got, (long long)n);
+            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n", tag,
+                    (long long)off, (long long)got, (long long)n);
             exit(1);
         }
         got += r;
@@ -316,22 +374,33 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
  * this. */
 static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
     jval *meta = json_get(root, "__metadata__");
-    if (!meta || meta->t != J_OBJ) return;                /* no metadata object: unstamped, fine */
+    if (!meta || meta->t != J_OBJ) return; /* no metadata object: unstamped, fine */
     jval *stamp = json_get(meta, "colibri.fmt");
-    if (!stamp) return;                                    /* no stamp key: unstamped, fine */
+    if (!stamp) return; /* no stamp key: unstamped, fine */
     if (stamp->t != J_STR) {
-        fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
-                shard_path); exit(1); }
+        fprintf(stderr,
+                "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted "
+                "container)\n",
+                shard_path);
+        exit(1);
+    }
     char *arena2 = NULL;
     jval *inner = json_parse(stamp->str, &arena2);
     if (!inner || inner->t != J_OBJ) {
-        fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
-                shard_path); exit(1); }
+        fprintf(stderr,
+                "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing "
+                "(untrusted container)\n",
+                shard_path);
+        exit(1);
+    }
     for (int i = 0; i < inner->len; i++) {
         jval *v = inner->kids[i];
         if (v->t != J_STR) {
-            fprintf(stderr, "%s: colibri.fmt entry '%s' is not a string -- malformed stamp, refusing (untrusted container)\n",
-                    shard_path, inner->keys[i]); exit(1); }
+            fprintf(stderr,
+                    "%s: colibri.fmt entry '%s' is not a string -- malformed stamp, refusing (untrusted container)\n",
+                    shard_path, inner->keys[i]);
+            exit(1);
+        }
         /* DUPLICATE CLAIMS (user-ratified design, register D8): at most one
          * DISTINCT format claim per tensor name, container-wide. An entry
          * that repeats an already-ingested claim verbatim is tolerated and
@@ -353,31 +422,40 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
          * case, bounded by ST_FMT_STAMP_MAX at one-time startup. */
         int dup = -1;
         for (int k = 0; k < S->fmt_n; k++)
-            if (!strcmp(S->fmt_name[k], inner->keys[i])) { dup = k; break; }
+            if (!strcmp(S->fmt_name[k], inner->keys[i])) {
+                dup = k;
+                break;
+            }
         if (dup >= 0) {
-            if (!strcmp(S->fmt_val[dup], v->str)) continue;   /* agreeing duplicate: keep one */
-            fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps tensor '%s' as '%s', but an "
+            if (!strcmp(S->fmt_val[dup], v->str)) continue; /* agreeing duplicate: keep one */
+            fprintf(stderr,
+                    "%s: __metadata__[\"colibri.fmt\"] stamps tensor '%s' as '%s', but an "
                     "earlier shard's map already stamped it '%s' -- conflicting format claims, "
                     "refusing (untrusted container)\n",
-                    shard_path, inner->keys[i], v->str, S->fmt_val[dup]); exit(1); }
+                    shard_path, inner->keys[i], v->str, S->fmt_val[dup]);
+            exit(1);
+        }
         if (S->fmt_n >= ST_FMT_STAMP_MAX) {
-            fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps more than %d tensor names across "
+            fprintf(stderr,
+                    "%s: __metadata__[\"colibri.fmt\"] stamps more than %d tensor names across "
                     "this container's shards -- stamps are a resident-tensor convention (docs/FORMATS.md), "
                     "not a bulk migration path; a container stamping this many names is malformed, "
                     "refusing (untrusted container)\n",
-                    shard_path, ST_FMT_STAMP_MAX); exit(1); }
+                    shard_path, ST_FMT_STAMP_MAX);
+            exit(1);
+        }
         if (S->fmt_n == S->fmt_cap) {
             S->fmt_cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
-            S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
-            S->fmt_val  = realloc(S->fmt_val,  S->fmt_cap * sizeof(char*));
+            S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char *));
+            S->fmt_val = realloc(S->fmt_val, S->fmt_cap * sizeof(char *));
         }
         S->fmt_name[S->fmt_n] = strdup(inner->keys[i]);
-        S->fmt_val[S->fmt_n]  = strdup(v->str);
+        S->fmt_val[S->fmt_n] = strdup(v->str);
         S->fmt_n++;
     }
-    free(arena2);  /* always NULL (json_parse never populates it -- see j_dup); the jval
-                    * tree itself is intentionally leaked, same one-time-startup convention
-                    * as st_init_multi's own root parse a few lines below. */
+    free(arena2); /* always NULL (json_parse never populates it -- see j_dup); the jval
+                   * tree itself is intentionally leaked, same one-time-startup convention
+                   * as st_init_multi's own root parse a few lines below. */
 }
 
 /* Stamped format NAME for `name`, or NULL if this tensor carries no stamp
@@ -407,23 +485,34 @@ static const char *st_fmt_stamp(shards *S, const char *name) {
  * present on two drives is taken from the first-listed one only). *added
  * returns how many shards this dir contributed. */
 static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
-    DIR *d = opendir(dir); struct dirent *e;
-    if (!d) { perror(dir); exit(1); }
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    if (!d) {
+        perror(dir);
+        exit(1);
+    }
     int base_n = *nf;
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
-        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
+        if (dot && !strcmp(dot, ".safetensors")) { /* model.safetensors o model-0000N-of-... */
             int dup = 0;
             for (int i = 0; i < *nf; i++) {
                 const char *b = strrchr(files[i], '/');
 #ifdef _WIN32
-                const char *b2 = strrchr(files[i], '\\'); if (b2 && (!b || b2 > b)) b = b2;
+                const char *b2 = strrchr(files[i], '\\');
+                if (b2 && (!b || b2 > b)) b = b2;
 #endif
                 b = b ? b + 1 : files[i];
-                if (!strcmp(b, e->d_name)) { dup = 1; break; }  /* already taken from a higher-priority drive */
+                if (!strcmp(b, e->d_name)) {
+                    dup = 1;
+                    break;
+                } /* already taken from a higher-priority drive */
             }
             if (dup) continue;
-            if (*nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            if (*nf >= ST_MAX_SHARDS) {
+                fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS);
+                exit(1);
+            }
             snprintf(files[(*nf)++], 1024, "%s/%s", dir, e->d_name);
         }
     }
@@ -439,36 +528,54 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
  * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
 static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
-    S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
+    S->cap = 4096;
+    S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
-    static char files[ST_MAX_SHARDS][1024]; int nf = 0;
-    int c0 = 0; st_scan_dir(snap_dir, files, &nf, &c0);
+    static char files[ST_MAX_SHARDS][1024];
+    int nf = 0;
+    int c0 = 0;
+    st_scan_dir(snap_dir, files, &nf, &c0);
     int ndir = 1;
     if (extra_dirs && *extra_dirs) {
-        char buf[4096]; snprintf(buf, sizeof(buf), "%s", extra_dirs);
+        char buf[4096];
+        snprintf(buf, sizeof(buf), "%s", extra_dirs);
         char *p = buf;
         while (p && *p) {
-            char *sep = p; while (*sep && *sep != ';' && *sep != ',') sep++;
-            int last = (*sep == 0); *sep = 0;
+            char *sep = p;
+            while (*sep && *sep != ';' && *sep != ',') sep++;
+            int last = (*sep == 0);
+            *sep = 0;
             while (*p == ' ') p++;
-            size_t plen = strlen(p); while (plen > 0 && p[plen-1] == ' ') p[--plen] = 0;
+            size_t plen = strlen(p);
+            while (plen > 0 && p[plen - 1] == ' ') p[--plen] = 0;
             if (*p) {
-                int cN = 0; st_scan_dir(p, files, &nf, &cN);
+                int cN = 0;
+                st_scan_dir(p, files, &nf, &cN);
                 fprintf(stderr, "[SPLIT] +%s -> %d shard(s)\n", p, cN);
                 ndir++;
             }
             p = last ? NULL : sep + 1;
         }
-        fprintf(stderr, "[SPLIT] model across %d dir(s): %d shard(s) total (primary %s -> %d shard(s)), no duplication\n",
-                ndir, nf, snap_dir, c0);
+        fprintf(stderr,
+                "[SPLIT] model across %d dir(s): %d shard(s) total (primary %s -> %d shard(s)), no duplication\n", ndir,
+                nf, snap_dir, c0);
     }
-    for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
-        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; memcpy(tmp, files[a], 1024); memcpy(files[a], files[b], 1024); memcpy(files[b], tmp, 1024); }
+    for (int a = 0; a < nf; a++)
+        for (int b = a + 1; b < nf; b++)
+            if (strcmp(files[a], files[b]) > 0) {
+                char tmp[1024];
+                memcpy(tmp, files[a], 1024);
+                memcpy(files[a], files[b], 1024);
+                memcpy(files[b], tmp, 1024);
+            }
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
         struct stat sst;
-        if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
+        if (fstat(fd, &sst) != 0) {
+            perror("fstat shard");
+            exit(1);
+        }
         int64_t fsz = (int64_t)sst.st_size;
         uint64_t hlen;
         st_pread_full(fd, &hlen, 8, 0, "pread hlen");
@@ -477,17 +584,24 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
          * malloc gigante. */
         if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
+            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n", files[fi],
+                    (unsigned long long)hlen, (long long)fsz);
+            exit(1);
+        }
         char *hdr = malloc(hlen + 1);
-        if (!hdr) { perror("malloc safetensors header"); exit(1); }
+        if (!hdr) {
+            perror("malloc safetensors header");
+            exit(1);
+        }
         st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
         jval *root = json_parse(hdr, &arena);
         if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]);
+            exit(1);
+        }
         st_fmt_stamp_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
@@ -499,55 +613,75 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             /* un header crafted puo' omettere i campi o dare tipi sbagliati:
              * senza questi guard si dereferenzia NULL (json_get) o si legge
              * off->kids[0/1] oltre i limiti dell'array. */
-            if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
-                !shp || shp->t != J_ARR) {
-                fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
-                        files[fi], name); exit(1); }
+            if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 || !shp || shp->t != J_ARR) {
+                fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n", files[fi], name);
+                exit(1);
+            }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
             /* offset dichiarati dal file: non-negativi, ordinati e dentro al
              * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
              * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
              * oppure off punta fuori dal file. */
             if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
-                fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
-                        files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
+                fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n", files[fi], name,
+                        (long long)a0, (long long)b0, (long long)fsz);
+                exit(1);
+            }
             /* SEC: lo shape viene da un file non fidato (mirror). Senza il guard
              * di overflow, uno shape tipo [65535,65535,65535,...] fa avvolgere
              * numel a un valore piccolo/negativo che poi passerebbe il cross-check
              * numel*esz==nbytes in st_read_f32, riaprendo l'OOB. */
-            int64_t numel = 1; int bad_shape = 0;
+            int64_t numel = 1;
+            int bad_shape = 0;
             for (int k = 0; k < shp->len; k++) {
                 int64_t d = (int64_t)shp->kids[k]->num;
-                if (d < 0 || (d != 0 && numel > INT64_MAX / d)) { bad_shape = 1; break; }
+                if (d < 0 || (d != 0 && numel > INT64_MAX / d)) {
+                    bad_shape = 1;
+                    break;
+                }
                 numel *= d;
             }
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
-                        files[fi], name); exit(1); }
+                        files[fi], name);
+                exit(1);
+            }
             if (S->n == S->cap) {
                 S->cap *= 2;
-                st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
-                if (!nt) { fprintf(stderr, "OOM reallocating shard tensor array\n"); exit(1); }
+                st_tensor *nt = (st_tensor *)realloc(S->t, S->cap * sizeof(st_tensor));
+                if (!nt) {
+                    fprintf(stderr, "OOM reallocating shard tensor array\n");
+                    exit(1);
+                }
                 S->t = nt;
             }
             st_tensor *t = &S->t[S->n++];
-            t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
-            t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            t->name = strdup(name);
+            t->fd = fd;
+            t->off = data_start + a0;
+            t->nbytes = b0 - a0;
+            t->dtype = st_dtype_code(dt->str);
+            t->numel = numel;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
-            { int esz = st_dtype_esz(t->dtype);
-              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
-                  fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
-                          files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
+            {
+                int esz = st_dtype_esz(t->dtype);
+                if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+                    fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n", files[fi],
+                            name, (long long)numel, (long long)t->nbytes, esz);
+                    exit(1);
+                }
+            }
         }
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
     }
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
-    S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
+    S->hcap = 1;
+    while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = malloc(S->hcap * sizeof(int));
     for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
     for (int i = 0; i < S->n; i++) {
@@ -570,7 +704,8 @@ static st_tensor *st_find(shards *S, const char *name) {
         }
         return NULL;
     }
-    for (int i = 0; i < S->n; i++) if (!strcmp(S->t[i].name, name)) return &S->t[i];
+    for (int i = 0; i < S->n; i++)
+        if (!strcmp(S->t[i].name, name)) return &S->t[i];
     return NULL;
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
@@ -599,7 +734,7 @@ static void st_die_missing(shards *S, const char *name) {
         b = b ? b + 1 : S->paths[i];
         int idx, tot;
         if (sscanf(b, "model-%d-of-%d", &idx, &tot) == 2) declared = tot;
-        else if (sscanf(b, "out-%d", &idx) != 1) continue;   /* out-mtp-* etc: not numbered */
+        else if (sscanf(b, "out-%d", &idx) != 1) continue; /* out-mtp-* etc: not numbered */
         numbered++;
         if (lo < 0 || idx < lo) lo = idx;
         if (idx > hi) hi = idx;
@@ -607,10 +742,9 @@ static void st_die_missing(shards *S, const char *name) {
     int complete = declared > 0 && numbered >= declared;
     fprintf(stderr, "  indexed %d tensors from %d shard file(s)\n", S->n, S->nfd);
     if (declared > 0 && numbered < declared)
-        fprintf(stderr, "  shard filenames declare %d shards, but only %d are here -- %d MISSING\n",
-                declared, numbered, declared - numbered);
-    else if (declared > 0)
-        fprintf(stderr, "  shard filenames declare %d shards and %d are here\n", declared, numbered);
+        fprintf(stderr, "  shard filenames declare %d shards, but only %d are here -- %d MISSING\n", declared, numbered,
+                declared - numbered);
+    else if (declared > 0) fprintf(stderr, "  shard filenames declare %d shards and %d are here\n", declared, numbered);
     else if (numbered > 0)
         fprintf(stderr, "  shards numbered %05d..%05d, %d file(s)%s\n", lo, hi, numbered,
                 numbered == hi - lo + 1 ? " (contiguous: a gap would be at the tail)" : " (GAPS in the numbering)");
@@ -618,25 +752,26 @@ static void st_die_missing(shards *S, const char *name) {
      * re-download sends them round a loop that cannot help them. */
     if (complete) {
         fprintf(stderr,
-            "\n  '%s' is a core tensor the engine cannot run without, and every shard the\n"
-            "  filenames declare is present -- so this is NOT the usual truncated download.\n"
-            "  Either the container was built without this tensor, or the engine is looking\n"
-            "  for the wrong name. Please report it with this output.\n", name);
+                "\n  '%s' is a core tensor the engine cannot run without, and every shard the\n"
+                "  filenames declare is present -- so this is NOT the usual truncated download.\n"
+                "  Either the container was built without this tensor, or the engine is looking\n"
+                "  for the wrong name. Please report it with this output.\n",
+                name);
         exit(1);
     }
     /* The final norm and lm_head sit at the END of the model, so an interrupted transfer
      * loses them first -- worth saying, but only where it's true. */
     if (strstr(name, "model.norm") || strstr(name, "lm_head"))
-        fprintf(stderr, "\n  '%s' is written into one of the LAST shards, so a container whose tail\n"
-                        "  never arrived indexes almost everything and then fails exactly here.\n", name);
-    else
-        fprintf(stderr, "\n  '%s' is a core tensor: the engine cannot run without it.\n", name);
-    fprintf(stderr,
-        "  An incomplete transfer is far more likely than a corrupt engine. Re-running the\n"
-        "  download resumes only the missing shards; the HF xet backend is known to stall\n"
-        "  mid-transfer (#452), so disable it:\n"
-        "      HF_HUB_DISABLE_XET=1 hf download <repo> --local-dir <model-dir>\n"
-        "  If your shard count is already complete, that IS a bug worth reporting.\n");
+        fprintf(stderr,
+                "\n  '%s' is written into one of the LAST shards, so a container whose tail\n"
+                "  never arrived indexes almost everything and then fails exactly here.\n",
+                name);
+    else fprintf(stderr, "\n  '%s' is a core tensor: the engine cannot run without it.\n", name);
+    fprintf(stderr, "  An incomplete transfer is far more likely than a corrupt engine. Re-running the\n"
+                    "  download resumes only the missing shards; the HF xet backend is known to stall\n"
+                    "  mid-transfer (#452), so disable it:\n"
+                    "      HF_HUB_DISABLE_XET=1 hf download <repo> --local-dir <model-dir>\n"
+                    "  If your shard count is already complete, that IS a bug worth reporting.\n");
     exit(1);
 }
 
@@ -658,7 +793,10 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        exit(1);
+    }
     /* SEC: numel viene dallo shape, nbytes dagli offset — due campi indipendenti
      * del file. Se non concordano, la memcpy F32 (nbytes) o i loop BF16/F16
      * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
@@ -670,21 +808,32 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
      * sbagliati, in silenzio. Con soli i dtype 0/1/2/3 il fallthrough era corretto;
      * dal momento in cui ne esistono altri, non lo e' piu'. */
     if (t->dtype >= 3) {
-        fprintf(stderr, "%s: tensor '%s' is %s — not a float tensor; read it with st_read_raw\n",
-                name, name, st_dtype_name(t->dtype)); exit(1); }
+        fprintf(stderr, "%s: tensor '%s' is %s — not a float tensor; read it with st_read_raw\n", name, name,
+                st_dtype_name(t->dtype));
+        exit(1);
+    }
     int esz = st_dtype_esz(t->dtype);
     if (t->numel < 0 || t->numel > t->nbytes / esz || t->numel * (int64_t)esz != t->nbytes) {
-        fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
-                name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
+        fprintf(stderr,
+                "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or "
+                "corrupt file)\n",
+                name, name, (long long)t->numel, (long long)t->nbytes, t->dtype);
+        exit(1);
+    }
     void *raw = malloc(t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) {
+        fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name);
+        exit(1);
+    }
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+        uint16_t *p = (uint16_t *)raw;
+        for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
     } else {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
+        uint16_t *p = (uint16_t *)raw;
+        for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
     }
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
@@ -698,18 +847,25 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
  * self-consistent and may keep using st_read_f32. */
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        exit(1);
+    }
     if (t->numel < 0 || t->numel > cap) {
-        fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
-                name, (long long)t->numel, (long long)cap); exit(1); }
+        fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n", name, (long long)t->numel,
+                (long long)cap);
+        exit(1);
+    }
     return st_read_f32(S, name, out, drop);
 }
 
 static int64_t st_numel(shards *S, const char *name) {
-    st_tensor *t = st_find(S, name); return t ? t->numel : -1;
+    st_tensor *t = st_find(S, name);
+    return t ? t->numel : -1;
 }
 static int64_t st_nbytes(shards *S, const char *name) {
-    st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
+    st_tensor *t = st_find(S, name);
+    return t ? t->nbytes : -1;
 }
 
 /* --- ue8m0_to_f32 / st_read_scale_f32: sidecar di scale a 1 byte ------------
@@ -733,7 +889,12 @@ static int64_t st_nbytes(shards *S, const char *name) {
  * con la politica gia' documentata per i pesi fp8 in quant.h -- la rete di
  * sicurezza sta a valle, sul sampler (test_logit_nan.c), non qui. */
 static inline float ue8m0_to_f32(uint8_t v) {
-    if (v == 0xff) { uint32_t n = 0x7fc00000u; float f; memcpy(&f, &n, 4); return f; }
+    if (v == 0xff) {
+        uint32_t n = 0x7fc00000u;
+        float f;
+        memcpy(&f, &n, 4);
+        return f;
+    }
     /* ldexpf e NON il trucco `(uint32_t)v << 23`: quel trucco e' esatto per
      * v in [1,254], ma a v==0 produce il pattern di bit 0x00000000, che in IEEE
      * 754 e' ZERO ESATTO e non 2^-127. Un blocco di pesi con quella scala
@@ -749,20 +910,31 @@ static inline float ue8m0_to_f32(uint8_t v) {
  * che il chiamante ha allocato, come in st_read_f32_cap. */
 static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        exit(1);
+    }
     if (t->numel < 0 || t->numel > cap) {
-        fprintf(stderr, "scale %s: numel %lld exceeds destination capacity %lld\n",
-                name, (long long)t->numel, (long long)cap); exit(1); }
+        fprintf(stderr, "scale %s: numel %lld exceeds destination capacity %lld\n", name, (long long)t->numel,
+                (long long)cap);
+        exit(1);
+    }
     if (t->dtype == 2 || t->dtype == 0 || t->dtype == 1) return st_read_f32(S, name, out, drop);
     if (t->dtype != 5) {
-        fprintf(stderr, "scale %s: dtype %s is neither F32 nor F8_E8M0\n",
-                name, st_dtype_name(t->dtype)); exit(1); }
+        fprintf(stderr, "scale %s: dtype %s is neither F32 nor F8_E8M0\n", name, st_dtype_name(t->dtype));
+        exit(1);
+    }
     /* stessa validazione byte-vs-numel dei percorsi float: 1 byte per scala */
     if (t->nbytes != t->numel) {
-        fprintf(stderr, "scale %s: F8_E8M0 numel %lld disagrees with %lld bytes\n",
-                name, (long long)t->numel, (long long)t->nbytes); exit(1); }
-    uint8_t *raw = (uint8_t*)malloc((size_t)t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name); exit(1); }
+        fprintf(stderr, "scale %s: F8_E8M0 numel %lld disagrees with %lld bytes\n", name, (long long)t->numel,
+                (long long)t->nbytes);
+        exit(1);
+    }
+    uint8_t *raw = (uint8_t *)malloc((size_t)t->nbytes);
+    if (!raw) {
+        fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name);
+        exit(1);
+    }
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread ue8m0 scale");
     for (int64_t i = 0; i < t->numel; i++) out[i] = ue8m0_to_f32(raw[i]);
     free(raw);
@@ -786,7 +958,10 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
  * A new caller with none of those wants st_read_raw_cap below. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        exit(1);
+    }
     st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
@@ -797,10 +972,17 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
  * check -- and one that has none cannot silently do the wrong thing. */
 static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        exit(1);
+    }
     if (t->nbytes < 0 || t->nbytes > cap) {
-        fprintf(stderr, "%s: tensor declares %lld bytes, destination holds %lld — refusing "
-                "(untrusted container)\n", name, (long long)t->nbytes, (long long)cap); exit(1); }
+        fprintf(stderr,
+                "%s: tensor declares %lld bytes, destination holds %lld — refusing "
+                "(untrusted container)\n",
+                name, (long long)t->nbytes, (long long)cap);
+        exit(1);
+    }
     st_read_raw(S, name, out, drop);
 }
 
@@ -809,21 +991,36 @@ static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap,
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (t->dtype >= 3) {   /* stesso motivo di st_read_f32 sopra */
-        fprintf(stderr, "slice %s: tensor is %s — not a float tensor\n",
-                name, st_dtype_name(t->dtype)); exit(1); }
+    if (!t) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        exit(1);
+    }
+    if (t->dtype >= 3) { /* stesso motivo di st_read_f32 sopra */
+        fprintf(stderr, "slice %s: tensor is %s — not a float tensor\n", name, st_dtype_name(t->dtype));
+        exit(1);
+    }
     int esz = st_dtype_esz(t->dtype);
-    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
-        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
-                name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
+    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel ||
+        n_elems > t->numel - elem_off) { /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
+        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n", name, (long long)elem_off,
+                (long long)n_elems, (long long)t->numel);
+        exit(1);
+    }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
+    if (!raw) {
+        fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name);
+        exit(1);
+    }
+    st_pread_full(t->fd, raw, nb, boff, "pread slice"); /* dev #331: chunked + EINTR + honest short-read */
     if (t->dtype == 2) memcpy(out, raw, nb);
-    else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
-    else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+    else if (t->dtype == 0) {
+        uint16_t *p = raw;
+        for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]);
+    } else {
+        uint16_t *p = raw;
+        for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]);
+    }
     free(raw);
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }

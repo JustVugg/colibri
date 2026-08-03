@@ -11,17 +11,23 @@
 #include "../kv_prefix.h"
 
 static int failures;
-#define CHECK(cond, ...) do { if (!(cond)) { \
-    fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
-    fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); failures++; } } while (0)
+#define CHECK(cond, ...)                                                                                               \
+    do {                                                                                                               \
+        if (!(cond)) {                                                                                                 \
+            fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);                                                       \
+            fprintf(stderr, __VA_ARGS__);                                                                              \
+            fputc('\n', stderr);                                                                                       \
+            failures++;                                                                                                \
+        }                                                                                                              \
+    } while (0)
 
 int main(void) {
     kv_prefix p = {0};
     CHECK(kv_prefix_alloc(&p, 16), "alloc failed");
 
     const int turn1[] = {5, 6, 7};
-    const int turn2[] = {5, 6, 7, 8, 9};          /* extends turn1 */
-    const int other[] = {5, 6, 99, 8, 9};         /* diverges at index 2 */
+    const int turn2[] = {5, 6, 7, 8, 9};  /* extends turn1 */
+    const int other[] = {5, 6, 99, 8, 9}; /* diverges at index 2 */
 
     /* nothing recorded yet */
     CHECK(kv_prefix_reuse(&p, turn2, 5) == 0, "empty record must not be reused");
@@ -68,7 +74,7 @@ int main(void) {
     CHECK(kv_prefix_alloc(&p, 4), "realloc failed");
     kv_prefix_record(&p, turn1, 0, 3);
     const int spill[] = {1, 2, 3};
-    kv_prefix_record(&p, spill, 3, 3);            /* 3+3 > cap 4 */
+    kv_prefix_record(&p, spill, 3, 3); /* 3+3 > cap 4 */
     CHECK(p.len == 0, "overflowing write must drop the record, len=%d", p.len);
     CHECK(kv_prefix_reuse(&p, turn2, 5) == 0, "dropped record must not be reused");
 
@@ -81,12 +87,11 @@ int main(void) {
      * longer prompt, so reuse could never fire in a growing conversation, the
      * one situation it exists for. */
     kv_prefix_record(&p, turn1, 0, 3);
-    kv_prefix_record(&p, gen, 3, 2);                       /* 5 positions held */
+    kv_prefix_record(&p, gen, 3, 2); /* 5 positions held */
     CHECK(kv_prefix_grow(&p, 64, 5), "grow failed");
     CHECK(p.cap == 64, "cap=%d after grow, want 64", p.cap);
     CHECK(p.len == 5, "len=%d after grow, want 5 preserved", p.len);
-    CHECK(kv_prefix_reuse(&p, turn3, 6) == 5,
-          "a preserved record must still be reusable after growing");
+    CHECK(kv_prefix_reuse(&p, turn3, 6) == 5, "a preserved record must still be reusable after growing");
 
     /* keep is clamped by what is actually held: a caller that copied FEWER
      * positions than it claims must not end up describing uninitialised ones. */
@@ -101,21 +106,23 @@ int main(void) {
     /* Shrinking below what is held keeps only what fits, never past the end. */
     kv_prefix_record(&p, turn1, 0, 3);
     CHECK(kv_prefix_grow(&p, 2, 3), "grow failed");
-    CHECK(p.len <= 2 && p.cap == 2, "len=%d cap=%d must stay within cap",
-          p.len, p.cap);
+    CHECK(p.len <= 2 && p.cap == 2, "len=%d cap=%d must stay within cap", p.len, p.cap);
 
     /* Defensive: a NULL record is inert, not a crash. Engines disable reuse by
      * leaving fed==NULL when the allocation fails. */
     kv_prefix nul = {0};
     CHECK(kv_prefix_reuse(&nul, turn2, 5) == 0, "NULL record reuses nothing");
-    kv_prefix_record(&nul, turn1, 0, 3);          /* must not crash */
+    kv_prefix_record(&nul, turn1, 0, 3); /* must not crash */
     kv_prefix_clear(&nul);
     kv_prefix_free(&nul);
 
     kv_prefix_free(&p);
     CHECK(p.fed == NULL && p.cap == 0, "free must clear the record");
 
-    if (failures) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
+    if (failures) {
+        fprintf(stderr, "%d check(s) failed\n", failures);
+        return 1;
+    }
     puts("kv_prefix: ok");
     return 0;
 }

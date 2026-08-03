@@ -25,19 +25,23 @@
 
 static int fails = 0;
 
-static void check(int cond, const char *what)
-{
-    if (!cond) { printf("  FAIL %s\n", what); fails++; }
+static void check(int cond, const char *what) {
+    if (!cond) {
+        printf("  FAIL %s\n", what);
+        fails++;
+    }
 }
 
-int main(void)
-{
+int main(void) {
     /* --- the whole UE8M0 domain --- */
     int bad = 0;
     for (int v = 0; v < 256; v++) {
         float got = ue8m0_to_f32((uint8_t)v);
         if (v == 0xff) {
-            if (!isnan(got)) { printf("  FAIL 0xff must be NaN, got %g\n", got); bad++; }
+            if (!isnan(got)) {
+                printf("  FAIL 0xff must be NaN, got %g\n", got);
+                bad++;
+            }
             continue;
         }
         double want = ldexp(1.0, v - 127);
@@ -57,9 +61,9 @@ int main(void)
     printf("  ok   v=0 -> %g (not zero)\n", (double)ue8m0_to_f32(0));
 
     /* --- the values a reader is most likely to hit --- */
-    check(ue8m0_to_f32(127) == 1.0f,   "v=127 -> 1.0");
-    check(ue8m0_to_f32(128) == 2.0f,   "v=128 -> 2.0");
-    check(ue8m0_to_f32(126) == 0.5f,   "v=126 -> 0.5");
+    check(ue8m0_to_f32(127) == 1.0f, "v=127 -> 1.0");
+    check(ue8m0_to_f32(128) == 2.0f, "v=128 -> 2.0");
+    check(ue8m0_to_f32(126) == 0.5f, "v=126 -> 0.5");
     /* the two scales actually observed in DeepSeek-V4's attention tensors */
     check((double)ue8m0_to_f32(115) == ldexp(1.0, -12), "v=115 -> 2^-12 (real checkpoint value)");
     check((double)ue8m0_to_f32(116) == ldexp(1.0, -11), "v=116 -> 2^-11 (real checkpoint value)");
@@ -77,9 +81,9 @@ int main(void)
 
     /* --- the codes themselves must not move: containers on disk depend on the
      *     reader agreeing with what wrote them --- */
-    check(st_dtype_code("BF16") == 0 && st_dtype_code("F16") == 1 &&
-          st_dtype_code("F32")  == 2 && st_dtype_code("U8")  == 3 &&
-          st_dtype_code("I8")   == 3, "existing dtype codes are unchanged");
+    check(st_dtype_code("BF16") == 0 && st_dtype_code("F16") == 1 && st_dtype_code("F32") == 2 &&
+              st_dtype_code("U8") == 3 && st_dtype_code("I8") == 3,
+          "existing dtype codes are unchanged");
     check(st_dtype_code("F8_E4M3") == 4 && st_dtype_code("float8_e4m3fn") == 4,
           "F8_E4M3 and its safetensors spelling both map to 4");
     check(st_dtype_code("F8_E8M0") == 5, "F8_E8M0 maps to 5");

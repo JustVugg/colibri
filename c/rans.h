@@ -88,11 +88,11 @@
 #include <arm_neon.h>
 #endif
 
-#define RANS_L        (1u << 23)   /* lower bound of the normalization interval */
+#define RANS_L (1u << 23) /* lower bound of the normalization interval */
 #define RANS_ALPHABET 16
-#define RANS_NSTREAMS 256          /* int4-rans256-g0's stream count */
-#define RANS_SLACK    64           /* readable bytes required past record buffers */
-#define RANS_SCALE_BITS_MAX 15     /* rans_table_init's upper bound on scale_bits */
+#define RANS_NSTREAMS 256      /* int4-rans256-g0's stream count */
+#define RANS_SLACK 64          /* readable bytes required past record buffers */
+#define RANS_SCALE_BITS_MAX 15 /* rans_table_init's upper bound on scale_bits */
 
 /* ---- scalar stream codec (ported unmodified from the proven prototype) --- */
 
@@ -101,13 +101,11 @@
  * exclusive prefix sum; every symbol present in the input needs freq > 0.
  * Returns the byte OFFSET where the valid stream begins (stream occupies
  * out_buf[offset..out_cap)), or (size_t)-1 if out_cap was too small. */
-static size_t rans_encode_stream(const uint8_t *nibbles, size_t n,
-                                 const uint32_t *freq, const uint32_t *start,
-                                 uint32_t scale_bits,
-                                 uint8_t *out_buf, size_t out_cap) {
+static size_t rans_encode_stream(const uint8_t *nibbles, size_t n, const uint32_t *freq, const uint32_t *start,
+                                 uint32_t scale_bits, uint8_t *out_buf, size_t out_cap) {
     uint32_t x = RANS_L;
-    uint8_t *ptr = out_buf + out_cap;              /* write backwards from the end */
-    for (size_t i = n; i-- > 0; ) {
+    uint8_t *ptr = out_buf + out_cap; /* write backwards from the end */
+    for (size_t i = n; i-- > 0;) {
         /* mask to the nibble alphabet: an out-of-range input byte must never
          * index past freq[16]/start[16] (record-level entry points refuse
          * such input by name BEFORE encoding; the mask makes this primitive
@@ -118,13 +116,13 @@ static size_t rans_encode_stream(const uint8_t *nibbles, size_t n,
         /* renormalize: keep x below x_max so the update keeps x in [L, L*256) */
         uint32_t x_max = ((RANS_L >> scale_bits) << 8) * f;
         while (x >= x_max) {
-            if (ptr <= out_buf) return (size_t)-1;  /* overflow guard */
+            if (ptr <= out_buf) return (size_t)-1; /* overflow guard */
             *--ptr = (uint8_t)(x & 0xff);
             x >>= 8;
         }
         x = ((x / f) << scale_bits) + (x % f) + st;
     }
-    for (int b = 0; b < 4; b++) {                  /* flush final state, 4 bytes */
+    for (int b = 0; b < 4; b++) { /* flush final state, 4 bytes */
         if (ptr <= out_buf) return (size_t)-1;
         *--ptr = (uint8_t)(x & 0xff);
         x >>= 8;
@@ -138,9 +136,8 @@ static size_t rans_encode_stream(const uint8_t *nibbles, size_t n,
  * `else break` in the renorm is load-bearing: the encoder stops feeding bytes
  * once drained, so a stream's final symbols legally decode with x < RANS_L;
  * a decoder that reads past `end` instead produces wrong tail symbols. */
-static int rans_decode_stream(const uint8_t *in_buf, size_t in_size, size_t n,
-                              const uint32_t *freq, const uint32_t *start,
-                              const uint16_t *slot_to_symbol, uint32_t scale_bits,
+static int rans_decode_stream(const uint8_t *in_buf, size_t in_size, size_t n, const uint32_t *freq,
+                              const uint32_t *start, const uint16_t *slot_to_symbol, uint32_t scale_bits,
                               uint8_t *out_nibbles) {
     const uint8_t *ptr = in_buf;
     const uint8_t *end = in_buf + in_size;
@@ -174,73 +171,94 @@ static int rans_decode_stream(const uint8_t *in_buf, size_t in_size, size_t n,
 typedef enum {
     RANS_OK = 0,
     /* record-level refusals (rans_record_parse) */
-    RANS_E_TRUNCATED,          /* blob shorter than its own framing claims  */
-    RANS_E_EMPTY,              /* n_symbols == 0                            */
-    RANS_E_COUNT_MISMATCH,     /* packed_bytes != ceil(n_symbols/2)         */
-    RANS_E_OVERSIZE,           /* n_symbols impossibly large for payload    */
-    RANS_E_OFFSET_FIRST,       /* stream_offsets[0] != 0                    */
-    RANS_E_OFFSETS_MONOTONIC,  /* stream_offsets not non-decreasing         */
-    RANS_E_STREAM_SHORT,       /* a stream shorter than its 4-byte state    */
-    RANS_E_LENGTH_MISMATCH,    /* blob length != derived framing length     */
-    RANS_E_PAD_NONZERO,        /* a derived padding byte is not zero        */
-    RANS_E_UNALIGNED,          /* record buffer not 4-byte aligned          */
-    RANS_E_NSTREAMS,           /* n_streams zero / wrong for the format     */
+    RANS_E_TRUNCATED,         /* blob shorter than its own framing claims  */
+    RANS_E_EMPTY,             /* n_symbols == 0                            */
+    RANS_E_COUNT_MISMATCH,    /* packed_bytes != ceil(n_symbols/2)         */
+    RANS_E_OVERSIZE,          /* n_symbols impossibly large for payload    */
+    RANS_E_OFFSET_FIRST,      /* stream_offsets[0] != 0                    */
+    RANS_E_OFFSETS_MONOTONIC, /* stream_offsets not non-decreasing         */
+    RANS_E_STREAM_SHORT,      /* a stream shorter than its 4-byte state    */
+    RANS_E_LENGTH_MISMATCH,   /* blob length != derived framing length     */
+    RANS_E_PAD_NONZERO,       /* a derived padding byte is not zero        */
+    RANS_E_UNALIGNED,         /* record buffer not 4-byte aligned          */
+    RANS_E_NSTREAMS,          /* n_streams zero / wrong for the format     */
     /* table-level refusals (rans_table_init) */
-    RANS_E_TABLE_SCALE,        /* scale_bits out of range (1..15)           */
-    RANS_E_TABLE_FREQ_SUM,     /* freq[] does not sum to M                  */
-    RANS_E_TABLE_START,        /* start[] not the prefix sum of freq[]      */
-    RANS_E_TABLE_SLOT,         /* slot_to_symbol inconsistent with freq[]   */
+    RANS_E_TABLE_SCALE,    /* scale_bits out of range (1..15)           */
+    RANS_E_TABLE_FREQ_SUM, /* freq[] does not sum to M                  */
+    RANS_E_TABLE_START,    /* start[] not the prefix sum of freq[]      */
+    RANS_E_TABLE_SLOT,     /* slot_to_symbol inconsistent with freq[]   */
     /* stream-level refusals (rans_decode_stream_checked)                   */
     RANS_E_STREAM_STATE_RANGE, /* initial state outside [L, 256L)           */
     RANS_E_STREAM_UNDERRUN,    /* fewer than 4 bytes for the initial state  */
     RANS_E_STREAM_LEFTOVER,    /* decode finished with bytes unconsumed     */
     RANS_E_STREAM_FINAL_STATE, /* final state != L (not an encoder output)  */
     /* encode-side refusals */
-    RANS_E_SYMBOL_UNCODABLE,   /* input contains a value > 15 or a symbol
-                                  whose table frequency is zero             */
-    RANS_E_SCRATCH,            /* encoder scratch/output bound exhausted
-                                  (a bound failure, NOT a memory condition) */
+    RANS_E_SYMBOL_UNCODABLE, /* input contains a value > 15 or a symbol
+                                whose table frequency is zero             */
+    RANS_E_SCRATCH,          /* encoder scratch/output bound exhausted
+                                (a bound failure, NOT a memory condition) */
     /* misc */
     RANS_E_NOMEM,
-    RANS_E_PATH_UNAVAILABLE    /* RANS_PATH forced an arm this build/CPU/env
-                                  cannot provide (never silently downgraded) */
+    RANS_E_PATH_UNAVAILABLE /* RANS_PATH forced an arm this build/CPU/env
+                               cannot provide (never silently downgraded) */
 } rans_err;
 
 static const char *rans_err_name(rans_err e) {
     switch (e) {
-        case RANS_OK:                   return "OK";
-        case RANS_E_TRUNCATED:          return "E_TRUNCATED";
-        case RANS_E_EMPTY:              return "E_EMPTY";
-        case RANS_E_COUNT_MISMATCH:     return "E_COUNT_MISMATCH";
-        case RANS_E_OVERSIZE:           return "E_OVERSIZE";
-        case RANS_E_OFFSET_FIRST:       return "E_OFFSET_FIRST";
-        case RANS_E_OFFSETS_MONOTONIC:  return "E_OFFSETS_MONOTONIC";
-        case RANS_E_STREAM_SHORT:       return "E_STREAM_SHORT";
-        case RANS_E_LENGTH_MISMATCH:    return "E_LENGTH_MISMATCH";
-        case RANS_E_PAD_NONZERO:        return "E_PAD_NONZERO";
-        case RANS_E_UNALIGNED:          return "E_UNALIGNED";
-        case RANS_E_NSTREAMS:           return "E_NSTREAMS";
-        case RANS_E_SYMBOL_UNCODABLE:   return "E_SYMBOL_UNCODABLE";
-        case RANS_E_SCRATCH:            return "E_SCRATCH";
-        case RANS_E_TABLE_SCALE:        return "E_TABLE_SCALE";
-        case RANS_E_TABLE_FREQ_SUM:     return "E_TABLE_FREQ_SUM";
-        case RANS_E_TABLE_START:        return "E_TABLE_START";
-        case RANS_E_TABLE_SLOT:         return "E_TABLE_SLOT";
-        case RANS_E_STREAM_STATE_RANGE: return "E_STREAM_STATE_RANGE";
-        case RANS_E_STREAM_UNDERRUN:    return "E_STREAM_UNDERRUN";
-        case RANS_E_STREAM_LEFTOVER:    return "E_STREAM_LEFTOVER";
-        case RANS_E_STREAM_FINAL_STATE: return "E_STREAM_FINAL_STATE";
-        case RANS_E_NOMEM:              return "E_NOMEM";
-        case RANS_E_PATH_UNAVAILABLE:   return "E_PATH_UNAVAILABLE";
+    case RANS_OK:
+        return "OK";
+    case RANS_E_TRUNCATED:
+        return "E_TRUNCATED";
+    case RANS_E_EMPTY:
+        return "E_EMPTY";
+    case RANS_E_COUNT_MISMATCH:
+        return "E_COUNT_MISMATCH";
+    case RANS_E_OVERSIZE:
+        return "E_OVERSIZE";
+    case RANS_E_OFFSET_FIRST:
+        return "E_OFFSET_FIRST";
+    case RANS_E_OFFSETS_MONOTONIC:
+        return "E_OFFSETS_MONOTONIC";
+    case RANS_E_STREAM_SHORT:
+        return "E_STREAM_SHORT";
+    case RANS_E_LENGTH_MISMATCH:
+        return "E_LENGTH_MISMATCH";
+    case RANS_E_PAD_NONZERO:
+        return "E_PAD_NONZERO";
+    case RANS_E_UNALIGNED:
+        return "E_UNALIGNED";
+    case RANS_E_NSTREAMS:
+        return "E_NSTREAMS";
+    case RANS_E_SYMBOL_UNCODABLE:
+        return "E_SYMBOL_UNCODABLE";
+    case RANS_E_SCRATCH:
+        return "E_SCRATCH";
+    case RANS_E_TABLE_SCALE:
+        return "E_TABLE_SCALE";
+    case RANS_E_TABLE_FREQ_SUM:
+        return "E_TABLE_FREQ_SUM";
+    case RANS_E_TABLE_START:
+        return "E_TABLE_START";
+    case RANS_E_TABLE_SLOT:
+        return "E_TABLE_SLOT";
+    case RANS_E_STREAM_STATE_RANGE:
+        return "E_STREAM_STATE_RANGE";
+    case RANS_E_STREAM_UNDERRUN:
+        return "E_STREAM_UNDERRUN";
+    case RANS_E_STREAM_LEFTOVER:
+        return "E_STREAM_LEFTOVER";
+    case RANS_E_STREAM_FINAL_STATE:
+        return "E_STREAM_FINAL_STATE";
+    case RANS_E_NOMEM:
+        return "E_NOMEM";
+    case RANS_E_PATH_UNAVAILABLE:
+        return "E_PATH_UNAVAILABLE";
     }
     return "E_UNKNOWN";
 }
 
-static rans_err rans_decode_stream_checked(const uint8_t *in_buf, size_t in_size,
-                                           size_t n,
-                                           const uint32_t *freq, const uint32_t *start,
-                                           const uint16_t *slot_to_symbol,
-                                           uint32_t scale_bits,
+static rans_err rans_decode_stream_checked(const uint8_t *in_buf, size_t in_size, size_t n, const uint32_t *freq,
+                                           const uint32_t *start, const uint16_t *slot_to_symbol, uint32_t scale_bits,
                                            uint8_t *out_nibbles) {
     const uint8_t *ptr = in_buf;
     const uint8_t *end = in_buf + in_size;
@@ -250,7 +268,7 @@ static rans_err rans_decode_stream_checked(const uint8_t *in_buf, size_t in_size
     for (int b = 0; b < 4; b++) x = (x << 8) | *ptr++;
     /* the encoder's state invariant: x stays in [L, 256L) at every step, so
      * the flushed initial state must land there too */
-    if (x < RANS_L) return RANS_E_STREAM_STATE_RANGE;   /* x < 256L is implicit: 32-bit */
+    if (x < RANS_L) return RANS_E_STREAM_STATE_RANGE; /* x < 256L is implicit: 32-bit */
     for (size_t i = 0; i < n; i++) {
         uint32_t slot = x & mask;
         uint32_t s = slot_to_symbol[slot];
@@ -263,8 +281,8 @@ static rans_err rans_decode_stream_checked(const uint8_t *in_buf, size_t in_size
     }
     /* a genuine encoder output is consumed exactly and drains back to the
      * encoder's initial state — anything else is corruption */
-    if (ptr != end)   return RANS_E_STREAM_LEFTOVER;
-    if (x != RANS_L)  return RANS_E_STREAM_FINAL_STATE;
+    if (ptr != end) return RANS_E_STREAM_LEFTOVER;
+    if (x != RANS_L) return RANS_E_STREAM_FINAL_STATE;
     return RANS_OK;
 }
 
@@ -272,13 +290,13 @@ static rans_err rans_decode_stream_checked(const uint8_t *in_buf, size_t in_size
 
 typedef struct {
     uint32_t scale_bits;
-    uint32_t M;                       /* 1u << scale_bits */
+    uint32_t M; /* 1u << scale_bits */
     uint32_t freq[RANS_ALPHABET];
     uint32_t start[RANS_ALPHABET];
-    const uint16_t *slot_to_symbol;   /* borrowed, M entries */
-    uint8_t *sym8;                    /* owned u8 mirror, M + RANS_SLACK bytes:
-                                         halves the hot-table footprint and lets
-                                         the SIMD arms use a scale-1 dword gather */
+    const uint16_t *slot_to_symbol; /* borrowed, M entries */
+    uint8_t *sym8;                  /* owned u8 mirror, M + RANS_SLACK bytes:
+                                       halves the hot-table footprint and lets
+                                       the SIMD arms use a scale-1 dword gather */
 } rans_table;
 
 /* Validate freq/start/slot_to_symbol coherence and build the sym8 mirror.
@@ -286,8 +304,7 @@ typedef struct {
  * with rans_table_free. On failure the table is zeroed and the named error
  * returned; decode with an unvalidated table would be garbage in a way no
  * downstream byte comparison could explain, so this refuses instead. */
-static rans_err rans_table_init(rans_table *t, uint32_t scale_bits,
-                                const uint32_t *freq, const uint32_t *start,
+static rans_err rans_table_init(rans_table *t, uint32_t scale_bits, const uint32_t *freq, const uint32_t *start,
                                 const uint16_t *slot_to_symbol) {
     memset(t, 0, sizeof(*t));
     if (scale_bits < 1 || scale_bits > 15) return RANS_E_TABLE_SCALE;
@@ -344,8 +361,7 @@ static uint64_t rans_record_bound(uint64_t n_symbols, uint32_t n_streams) {
     if (n_streams == 0) return 0;
     uint64_t per = n_symbols / n_streams + 1u;
     uint64_t per_bytes = (per * RANS_SCALE_BITS_MAX + 7u) / 8u + 4u + 64u;
-    return rans_record_header_bytes(n_streams) +
-           rans_round16(per_bytes * n_streams);
+    return rans_record_header_bytes(n_streams) + rans_round16(per_bytes * n_streams);
 }
 
 /* Encode n nibbles as one int4-rans256-g0 chunk record (n_streams round-robin
@@ -357,16 +373,13 @@ static uint64_t rans_record_bound(uint64_t n_symbols, uint32_t n_streams) {
  * frequency is zero — detected by a pre-scan BEFORE any encoding work),
  * RANS_E_SCRATCH (a codec bound was exceeded — a logic/bound failure, never
  * reported as a memory condition), RANS_E_NOMEM (malloc failed). */
-static rans_err rans_record_encode(const uint8_t *nibbles, uint64_t n,
-                                   const rans_table *t, uint32_t n_streams,
-                                   uint8_t *out, uint64_t out_cap,
-                                   uint64_t *out_len) {
+static rans_err rans_record_encode(const uint8_t *nibbles, uint64_t n, const rans_table *t, uint32_t n_streams,
+                                   uint8_t *out, uint64_t out_cap, uint64_t *out_len) {
     if (n_streams == 0) return RANS_E_NSTREAMS;
     if (n == 0) return RANS_E_EMPTY;
     /* pre-scan: refuse uncodable input by name, before touching `out` */
     for (uint64_t j = 0; j < n; j++)
-        if (nibbles[j] > 15u || t->freq[nibbles[j]] == 0)
-            return RANS_E_SYMBOL_UNCODABLE;
+        if (nibbles[j] > 15u || t->freq[nibbles[j]] == 0) return RANS_E_SYMBOL_UNCODABLE;
     uint64_t head = rans_record_header_bytes(n_streams);
     if (out_cap < head) return RANS_E_SCRATCH;
     uint64_t sub_max = n / n_streams + 1u;
@@ -375,36 +388,56 @@ static rans_err rans_record_encode(const uint8_t *nibbles, uint64_t n,
     uint64_t scap = (sub_max * t->scale_bits + 7u) / 8u + 4u + 64u;
     uint8_t *sub = (uint8_t *)malloc(sub_max ? sub_max : 1);
     uint8_t *enc = (uint8_t *)malloc(scap);
-    if (!sub || !enc) { free(sub); free(enc); return RANS_E_NOMEM; }
+    if (!sub || !enc) {
+        free(sub);
+        free(enc);
+        return RANS_E_NOMEM;
+    }
 
     memset(out, 0, head);
     uint64_t packed_bytes = n / 2u + (n & 1u);
     memcpy(out, &n, 8);
     memcpy(out + 8, &packed_bytes, 8);
 
-    uint64_t pos = 0;                                /* payload cursor */
+    uint64_t pos = 0; /* payload cursor */
     uint8_t *payload = out + head;
     for (uint32_t i = 0; i < n_streams; i++) {
-        uint64_t ns = 0;                             /* gather sub-stream i */
+        uint64_t ns = 0; /* gather sub-stream i */
         for (uint64_t j = i; j < n; j += n_streams) sub[ns++] = nibbles[j];
-        size_t off = rans_encode_stream(sub, ns, t->freq, t->start,
-                                        t->scale_bits, enc, scap);
-        if (off == (size_t)-1) { free(sub); free(enc); return RANS_E_SCRATCH; }
+        size_t off = rans_encode_stream(sub, ns, t->freq, t->start, t->scale_bits, enc, scap);
+        if (off == (size_t)-1) {
+            free(sub);
+            free(enc);
+            return RANS_E_SCRATCH;
+        }
         uint64_t len = scap - off;
-        if (head + pos + len > out_cap) { free(sub); free(enc); return RANS_E_SCRATCH; }
+        if (head + pos + len > out_cap) {
+            free(sub);
+            free(enc);
+            return RANS_E_SCRATCH;
+        }
         memcpy(payload + pos, enc + off, len);
         uint32_t pos32 = (uint32_t)pos;
         memcpy(out + 16 + (uint64_t)i * 4u, &pos32, 4);
         pos += len;
-        if (pos > 0xFFFFFFFFu) { free(sub); free(enc); return RANS_E_SCRATCH; }
+        if (pos > 0xFFFFFFFFu) {
+            free(sub);
+            free(enc);
+            return RANS_E_SCRATCH;
+        }
     }
     uint32_t total32 = (uint32_t)pos;
     memcpy(out + 16 + (uint64_t)n_streams * 4u, &total32, 4);
     uint64_t total = head + rans_round16(pos);
-    if (total > out_cap) { free(sub); free(enc); return RANS_E_SCRATCH; }
+    if (total > out_cap) {
+        free(sub);
+        free(enc);
+        return RANS_E_SCRATCH;
+    }
     memset(payload + pos, 0, rans_round16(pos) - pos);
     *out_len = total;
-    free(sub); free(enc);
+    free(sub);
+    free(enc);
     return RANS_OK;
 }
 
@@ -413,7 +446,7 @@ static rans_err rans_record_encode(const uint8_t *nibbles, uint64_t n,
 typedef struct {
     uint64_t n_symbols;
     uint64_t packed_bytes;
-    const uint32_t *stream_offsets;   /* n_streams+1 entries, payload-relative */
+    const uint32_t *stream_offsets; /* n_streams+1 entries, payload-relative */
     const uint8_t *payload;
     uint64_t payload_len;
 } rans_record;
@@ -428,8 +461,7 @@ typedef struct {
  * RANS_SLACK contract (header comment) — parsing alone does not read past
  * blob_len, and it performs no allocation (in particular nothing
  * proportional to the untrusted n_symbols field). */
-static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
-                                  uint32_t n_streams, rans_record *out) {
+static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len, uint32_t n_streams, rans_record *out) {
     memset(out, 0, sizeof(*out));
     if (n_streams == 0) return RANS_E_NSTREAMS;
     if (((uintptr_t)blob & 3u) != 0) return RANS_E_UNALIGNED;
@@ -442,8 +474,7 @@ static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
     /* non-wrapping form of packed_bytes == ceil(n_symbols/2): the additive
      * form (n_symbols+1)/2 wraps at UINT64_MAX and would accept
      * packed_bytes == 0 for it */
-    if (packed_bytes != n_symbols / 2u + (n_symbols & 1u))
-        return RANS_E_COUNT_MISMATCH;
+    if (packed_bytes != n_symbols / 2u + (n_symbols & 1u)) return RANS_E_COUNT_MISMATCH;
     uint32_t off_prev, off_cur;
     memcpy(&off_prev, blob + 16, 4);
     if (off_prev != 0) return RANS_E_OFFSET_FIRST;
@@ -455,7 +486,7 @@ static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
         if (off_cur - off_prev < 4u) return RANS_E_STREAM_SHORT;
         off_prev = off_cur;
     }
-    uint64_t payload_len = off_prev;               /* == offsets[n_streams] */
+    uint64_t payload_len = off_prev; /* == offsets[n_streams] */
     if (head + payload_len > blob_len) return RANS_E_TRUNCATED;
     if (blob_len != head + rans_round16(payload_len)) return RANS_E_LENGTH_MISMATCH;
     /* amplification bound: a symbol costs at least log2(M/(M-1)) bits under
@@ -465,9 +496,8 @@ static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
      * impossible for ANY table this format admits — refuse the
      * decompression bomb here, before any consumer sizes buffers from
      * n_symbols. (No overflow: payload_len < 2^32, M_max = 2^15.) */
-    if (n_symbols > payload_len * 8u * (uint64_t)(1u << RANS_SCALE_BITS_MAX))
-        return RANS_E_OVERSIZE;
-    const uint32_t *offs = (const uint32_t *)(blob + 16);  /* aligned: checked */
+    if (n_symbols > payload_len * 8u * (uint64_t)(1u << RANS_SCALE_BITS_MAX)) return RANS_E_OVERSIZE;
+    const uint32_t *offs = (const uint32_t *)(blob + 16); /* aligned: checked */
     /* derived padding must be zero: bits hiding in the pad would make two
      * "identical" containers differ and defeat writer determinism */
     for (uint64_t i = 16u + ((uint64_t)n_streams + 1u) * 4u; i < head; i++)
@@ -485,8 +515,8 @@ static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
 /* ---- batched decode: path selection + envelope ---------------------------- */
 
 typedef enum {
-    RANS_PATH_SCALAR = 0,      /* portable, branchy renorm (mirrors the oracle) */
-    RANS_PATH_SCALAR_BF = 1,   /* portable, branch-free renorm (the SIMD algebra) */
+    RANS_PATH_SCALAR = 0,    /* portable, branchy renorm (mirrors the oracle) */
+    RANS_PATH_SCALAR_BF = 1, /* portable, branch-free renorm (the SIMD algebra) */
     RANS_PATH_NEON = 2,
     RANS_PATH_AVX512 = 3,
     RANS_PATH_INVALID = -1
@@ -494,28 +524,31 @@ typedef enum {
 
 static const char *rans_path_name(rans_path p) {
     switch (p) {
-        case RANS_PATH_SCALAR:    return "scalar";
-        case RANS_PATH_SCALAR_BF: return "scalar_bf";
-        case RANS_PATH_NEON:      return "neon";
-        case RANS_PATH_AVX512:    return "avx512";
-        default:                  return "invalid";
+    case RANS_PATH_SCALAR:
+        return "scalar";
+    case RANS_PATH_SCALAR_BF:
+        return "scalar_bf";
+    case RANS_PATH_NEON:
+        return "neon";
+    case RANS_PATH_AVX512:
+        return "avx512";
+    default:
+        return "invalid";
     }
 }
 
 #define RANS_G_SCALAR 8u
-#define RANS_G_NEON   16u
+#define RANS_G_NEON 16u
 #define RANS_G_AVX512 16u
 
 static uint32_t rans_path_group_width(rans_path p) {
     if (p == RANS_PATH_AVX512) return RANS_G_AVX512;
-    if (p == RANS_PATH_NEON)   return RANS_G_NEON;
+    if (p == RANS_PATH_NEON) return RANS_G_NEON;
     return RANS_G_SCALAR;
 }
 
 /* forward declaration: the selftest below round-trips through the kernels */
-static rans_err rans_record_decode_packed(const rans_record *rec,
-                                          const rans_table *t,
-                                          uint32_t n_streams, rans_path p,
+static rans_err rans_record_decode_packed(const rans_record *rec, const rans_table *t, uint32_t n_streams, rans_path p,
                                           uint8_t *out_packed);
 
 /* First-use round-trip selftest for one vector arm (same envelope discipline
@@ -547,11 +580,14 @@ static int rans__selftest_arm(rans_path p) {
     }
     uint32_t sb = 10, M = 1u << sb;
     uint32_t freq[RANS_ALPHABET] = {0}, start[RANS_ALPHABET] = {0};
-    for (int s = 1; s <= 7; s++) freq[s] = 1;          /* rare symbols */
-    for (int s = 8; s <= 14; s++) freq[s] = 3;         /* rare, off-lattice */
-    freq[15] = M - 7 - 21;                              /* dominant symbol */
+    for (int s = 1; s <= 7; s++) freq[s] = 1;  /* rare symbols */
+    for (int s = 8; s <= 14; s++) freq[s] = 3; /* rare, off-lattice */
+    freq[15] = M - 7 - 21;                     /* dominant symbol */
     uint64_t acc = 0;
-    for (int s = 0; s < RANS_ALPHABET; s++) { start[s] = (uint32_t)acc; acc += freq[s]; }
+    for (int s = 0; s < RANS_ALPHABET; s++) {
+        start[s] = (uint32_t)acc;
+        acc += freq[s];
+    }
     uint16_t slot[1u << 10];
     for (int s = 0; s < RANS_ALPHABET; s++)
         for (uint32_t i = 0; i < freq[s]; i++) slot[start[s] + i] = (uint16_t)s;
@@ -563,8 +599,7 @@ static int rans__selftest_arm(rans_path p) {
     uint8_t out_a[(NSYM + 1) / 2], out_b[(NSYM + 1) / 2], packed_ref[(NSYM + 1) / 2];
     int ok = 0;
     uint64_t rec_len = 0;
-    if (rec_buf &&
-        rans_record_encode(data, NSYM, &t, NT, rec_buf, cap, &rec_len) == RANS_OK) {
+    if (rec_buf && rans_record_encode(data, NSYM, &t, NT, rec_buf, cap, &rec_len) == RANS_OK) {
         rans_record rec;
         if (rans_record_parse(rec_buf, rec_len, NT, &rec) == RANS_OK) {
             /* MACHINE-CHECKED band coverage: the load-bearing property of
@@ -596,14 +631,13 @@ static int rans__selftest_arm(rans_path p) {
             }
             if (kb2 == 0) {
                 fprintf(stderr, "[rans] selftest fixture lost multi-byte "
-                        "renorm coverage — fixture bug, arm not trusted\n");
+                                "renorm coverage — fixture bug, arm not trusted\n");
                 free(rec_buf);
                 rans_table_free(&t);
                 return 0;
             }
             memset(packed_ref, 0, sizeof(packed_ref));
-            for (int i = 0; i < NSYM; i++)
-                packed_ref[i >> 1] |= (uint8_t)(data[i] << ((i & 1) * 4));
+            for (int i = 0; i < NSYM; i++) packed_ref[i >> 1] |= (uint8_t)(data[i] << ((i & 1) * 4));
             memset(out_a, 0xAA, sizeof(out_a));
             memset(out_b, 0x55, sizeof(out_b));
             if (rans_record_decode_packed(&rec, &t, NT, RANS_PATH_SCALAR, out_a) == RANS_OK &&
@@ -615,47 +649,44 @@ static int rans__selftest_arm(rans_path p) {
     }
     free(rec_buf);
     rans_table_free(&t);
-    if (!ok)
-        fprintf(stderr, "[rans] %s selftest FAILED: arm disabled, scalar fallback\n",
-                rans_path_name(p));
+    if (!ok) fprintf(stderr, "[rans] %s selftest FAILED: arm disabled, scalar fallback\n", rans_path_name(p));
     return ok;
 }
 
 static int rans_path_available(rans_path p) {
     switch (p) {
-        case RANS_PATH_SCALAR:
-        case RANS_PATH_SCALAR_BF:
-            return 1;
+    case RANS_PATH_SCALAR:
+    case RANS_PATH_SCALAR_BF:
+        return 1;
 #ifdef __ARM_NEON
-        case RANS_PATH_NEON: {
-            static int cached = -1;                     /* -1 unknown, else 0/1 */
-            const char *e = getenv("RANS_NEON");        /* kill-switch */
-            if (e && atoi(e) == 0) return 0;
-            if (cached < 0) cached = rans__selftest_arm(RANS_PATH_NEON);
-            return cached;
-        }
+    case RANS_PATH_NEON: {
+        static int cached = -1;              /* -1 unknown, else 0/1 */
+        const char *e = getenv("RANS_NEON"); /* kill-switch */
+        if (e && atoi(e) == 0) return 0;
+        if (cached < 0) cached = rans__selftest_arm(RANS_PATH_NEON);
+        return cached;
+    }
 #endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-        case RANS_PATH_AVX512: {
-            static int cached = -1;
-            const char *e = getenv("RANS_AVX512");      /* kill-switch */
-            if (e && atoi(e) == 0) return 0;
+    case RANS_PATH_AVX512: {
+        static int cached = -1;
+        const char *e = getenv("RANS_AVX512"); /* kill-switch */
+        if (e && atoi(e) == 0) return 0;
 #if defined(__GNUC__) || defined(__clang__)
-            if (!(__builtin_cpu_supports("avx512f") &&
-                  __builtin_cpu_supports("avx512bw"))) return 0;
+        if (!(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw"))) return 0;
 #endif
-            if (cached < 0) cached = rans__selftest_arm(RANS_PATH_AVX512);
-            return cached;
-        }
+        if (cached < 0) cached = rans__selftest_arm(RANS_PATH_AVX512);
+        return cached;
+    }
 #endif
-        default:
-            return 0;
+    default:
+        return 0;
     }
 }
 
 static rans_path rans_path_best(void) {
     if (rans_path_available(RANS_PATH_AVX512)) return RANS_PATH_AVX512;
-    if (rans_path_available(RANS_PATH_NEON))   return RANS_PATH_NEON;
+    if (rans_path_available(RANS_PATH_NEON)) return RANS_PATH_NEON;
     /* scalar_bf over scalar: the closed-form renorm removes a data-dependent,
      * badly-predicted branch from the inner loop (measured ~1.9x on an
      * M-series host in the prototype round); both are byte-exact. */
@@ -669,10 +700,10 @@ static rans_path rans_path_select(void) {
     const char *e = getenv("RANS_PATH");
     if (!e || !*e) return rans_path_best();
     rans_path p = RANS_PATH_INVALID;
-    if      (!strcmp(e, "scalar"))    p = RANS_PATH_SCALAR;
+    if (!strcmp(e, "scalar")) p = RANS_PATH_SCALAR;
     else if (!strcmp(e, "scalar_bf")) p = RANS_PATH_SCALAR_BF;
-    else if (!strcmp(e, "neon"))      p = RANS_PATH_NEON;
-    else if (!strcmp(e, "avx512"))    p = RANS_PATH_AVX512;
+    else if (!strcmp(e, "neon")) p = RANS_PATH_NEON;
+    else if (!strcmp(e, "avx512")) p = RANS_PATH_AVX512;
     else return RANS_PATH_INVALID;
     return rans_path_available(p) ? p : RANS_PATH_INVALID;
 }
@@ -683,16 +714,15 @@ static rans_path rans_path_select(void) {
 typedef struct {
     const rans_table *tab;
     const uint8_t *payload;
-    const uint32_t *offs;      /* n_streams+1 */
-    uint64_t n;                /* n_symbols, even on the fast path */
-    uint32_t N;                /* n_streams, even */
-    uint8_t *out;              /* packed output, n/2 bytes */
+    const uint32_t *offs; /* n_streams+1 */
+    uint64_t n;           /* n_symbols, even on the fast path */
+    uint32_t N;           /* n_streams, even */
+    uint8_t *out;         /* packed output, n/2 bytes */
 } rans_kctx;
 
 /* Big-endian 4-byte state load (the format's stream-init rule). */
 static uint32_t rans_be32(const uint8_t *p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
 /* Number of COMPLETE rounds for the group of G streams based at stream b: a
@@ -706,8 +736,7 @@ static uint64_t rans_full_rounds(uint64_t n, uint32_t N, uint32_t b, uint32_t G)
 /* Branchy (oracle-shaped) decode of the final, partially-populated round of
  * a group, given the per-lane states/cursors the main loop left behind.
  * k = min(G, n-p) is even on the fast path (n even, p = R*N+b even). */
-static void rans_group_tail(const rans_kctx *K, uint32_t b, uint32_t G,
-                            uint64_t R, uint32_t *x, uint32_t *cur,
+static void rans_group_tail(const rans_kctx *K, uint32_t b, uint32_t G, uint64_t R, uint32_t *x, uint32_t *cur,
                             const uint32_t *end) {
     uint64_t p = R * (uint64_t)K->N + b;
     if (p >= K->n) return;
@@ -725,13 +754,16 @@ static void rans_group_tail(const rans_kctx *K, uint32_t b, uint32_t G,
         uint32_t slot = xx & mask;
         uint32_t sy = sym[slot];
         xx = fq[sy] * (xx >> sb) + slot - st[sy];
-        while (xx < RANS_L) { if (c < e) xx = (xx << 8) | pl[c++]; else break; }
-        x[l] = xx; cur[l] = c;
+        while (xx < RANS_L) {
+            if (c < e) xx = (xx << 8) | pl[c++];
+            else break;
+        }
+        x[l] = xx;
+        cur[l] = c;
         s[l] = (uint8_t)sy;
     }
     uint8_t *op = K->out + (p >> 1);
-    for (uint32_t i = 0; i < k / 2u; i++)
-        op[i] = (uint8_t)(s[2 * i] | (s[2 * i + 1] << 4));
+    for (uint32_t i = 0; i < k / 2u; i++) op[i] = (uint8_t)(s[2 * i] | (s[2 * i + 1] << 4));
 }
 
 static void rans_kernel_scalar(const rans_kctx *K, uint32_t g0, uint32_t g1) {
@@ -765,11 +797,15 @@ static void rans_kernel_scalar(const rans_kctx *K, uint32_t g0, uint32_t g1) {
                 uint32_t sy = sym[slot];
                 xx = fq[sy] * (xx >> sb) + slot - st[sy];
                 /* byte-at-a-time renorm, verbatim from the stream decoder */
-                while (xx < RANS_L) { if (c < e) xx = (xx << 8) | pl[c++]; else break; }
-                x[l] = xx; cur[l] = c; s[l] = (uint8_t)sy;
+                while (xx < RANS_L) {
+                    if (c < e) xx = (xx << 8) | pl[c++];
+                    else break;
+                }
+                x[l] = xx;
+                cur[l] = c;
+                s[l] = (uint8_t)sy;
             }
-            for (uint32_t i = 0; i < G / 2u; i++)
-                op[i] = (uint8_t)(s[2 * i] | (s[2 * i + 1] << 4));
+            for (uint32_t i = 0; i < G / 2u; i++) op[i] = (uint8_t)(s[2 * i] | (s[2 * i + 1] << 4));
             op += ostride;
         }
         rans_group_tail(K, b, G, R, x, cur, end);
@@ -811,19 +847,18 @@ static void rans_kernel_scalar_bf(const rans_kctx *K, uint32_t g0, uint32_t g1) 
                 uint32_t slot = xx & mask;
                 uint32_t sy = sym[slot];
                 xx = fq[sy] * (xx >> sb) + slot - st[sy];
-                uint32_t kb = (uint32_t)(xx < (1u << 23)) +
-                              (uint32_t)(xx < (1u << 15)) +
-                              (uint32_t)(xx < (1u << 7));
+                uint32_t kb = (uint32_t)(xx < (1u << 23)) + (uint32_t)(xx < (1u << 15)) + (uint32_t)(xx < (1u << 7));
                 uint32_t rem = end[l] - c;
                 if (rem < kb) kb = rem;
-                uint32_t be = rans_be32(pl + c);    /* RANS_SLACK over-read */
+                uint32_t be = rans_be32(pl + c); /* RANS_SLACK over-read */
                 uint32_t val = (kb == 0) ? 0u : (be >> (8u * (4u - kb)));
                 xx = (kb == 0) ? xx : ((xx << (8u * kb)) | val);
                 c += kb;
-                x[l] = xx; cur[l] = c; s[l] = (uint8_t)sy;
+                x[l] = xx;
+                cur[l] = c;
+                s[l] = (uint8_t)sy;
             }
-            for (uint32_t i = 0; i < G / 2u; i++)
-                op[i] = (uint8_t)(s[2 * i] | (s[2 * i + 1] << 4));
+            for (uint32_t i = 0; i < G / 2u; i++) op[i] = (uint8_t)(s[2 * i] | (s[2 * i + 1] << 4));
             op += ostride;
         }
         rans_group_tail(K, b, G, R, x, cur, end);
@@ -846,7 +881,7 @@ static void rans_kernel_scalar_bf(const rans_kctx *K, uint32_t g0, uint32_t g1) 
  * tests/test_rans.c. Needs the RANS_SLACK contract (4-byte fetches at
  * cursors that may sit at a stream end). */
 static void rans_kernel_neon(const rans_kctx *K, uint32_t g0, uint32_t g1) {
-    const uint32_t G = RANS_G_NEON;   /* 16 */
+    const uint32_t G = RANS_G_NEON; /* 16 */
     const uint32_t sb = K->tab->scale_bits;
     const uint8_t *sym = K->tab->sym8;
     const uint8_t *pl = K->payload;
@@ -905,31 +940,22 @@ static void rans_kernel_neon(const rans_kctx *K, uint32_t g0, uint32_t g1) {
             }
             for (uint32_t l = 0; l < G; l++) {
                 sarr[l] = sym[slt[l]];
-                bew[l] = rans_be32(pl + cl[l]);   /* RANS_SLACK over-read */
+                bew[l] = rans_be32(pl + cl[l]); /* RANS_SLACK over-read */
             }
             uint8x16_t sidx = vld1q_u8(sarr);
             uint8x16_t flo = vqtbl1q_u8(vfq_lo, sidx), fhi = vqtbl1q_u8(vfq_hi, sidx);
             uint8x16_t slo = vqtbl1q_u8(vst_lo, sidx), shi = vqtbl1q_u8(vst_hi, sidx);
-            uint16x8_t f16a = vorrq_u16(vmovl_u8(vget_low_u8(flo)),
-                                        vshlq_n_u16(vmovl_u8(vget_low_u8(fhi)), 8));
-            uint16x8_t f16b = vorrq_u16(vmovl_u8(vget_high_u8(flo)),
-                                        vshlq_n_u16(vmovl_u8(vget_high_u8(fhi)), 8));
-            uint16x8_t s16a = vorrq_u16(vmovl_u8(vget_low_u8(slo)),
-                                        vshlq_n_u16(vmovl_u8(vget_low_u8(shi)), 8));
-            uint16x8_t s16b = vorrq_u16(vmovl_u8(vget_high_u8(slo)),
-                                        vshlq_n_u16(vmovl_u8(vget_high_u8(shi)), 8));
-            uint32x4_t f[4] = {vmovl_u16(vget_low_u16(f16a)),
-                               vmovl_u16(vget_high_u16(f16a)),
-                               vmovl_u16(vget_low_u16(f16b)),
-                               vmovl_u16(vget_high_u16(f16b))};
-            uint32x4_t st[4] = {vmovl_u16(vget_low_u16(s16a)),
-                                vmovl_u16(vget_high_u16(s16a)),
-                                vmovl_u16(vget_low_u16(s16b)),
-                                vmovl_u16(vget_high_u16(s16b))};
+            uint16x8_t f16a = vorrq_u16(vmovl_u8(vget_low_u8(flo)), vshlq_n_u16(vmovl_u8(vget_low_u8(fhi)), 8));
+            uint16x8_t f16b = vorrq_u16(vmovl_u8(vget_high_u8(flo)), vshlq_n_u16(vmovl_u8(vget_high_u8(fhi)), 8));
+            uint16x8_t s16a = vorrq_u16(vmovl_u8(vget_low_u8(slo)), vshlq_n_u16(vmovl_u8(vget_low_u8(shi)), 8));
+            uint16x8_t s16b = vorrq_u16(vmovl_u8(vget_high_u8(slo)), vshlq_n_u16(vmovl_u8(vget_high_u8(shi)), 8));
+            uint32x4_t f[4] = {vmovl_u16(vget_low_u16(f16a)), vmovl_u16(vget_high_u16(f16a)),
+                               vmovl_u16(vget_low_u16(f16b)), vmovl_u16(vget_high_u16(f16b))};
+            uint32x4_t st[4] = {vmovl_u16(vget_low_u16(s16a)), vmovl_u16(vget_high_u16(s16a)),
+                                vmovl_u16(vget_low_u16(s16b)), vmovl_u16(vget_high_u16(s16b))};
             for (int q = 0; q < 4; q++) {
                 /* x = f*(x>>sb) + slot - start */
-                vx[q] = vaddq_u32(vmulq_u32(f[q], vshlq_u32(vx[q], vsb_neg)),
-                                  vsubq_u32(sl[q], st[q]));
+                vx[q] = vaddq_u32(vmulq_u32(f[q], vshlq_u32(vx[q], vsb_neg)), vsubq_u32(sl[q], st[q]));
                 /* closed-form renorm count, capped by bytes remaining */
                 uint32x4_t kb = vandq_u32(vcltq_u32(vx[q], t23), one);
                 kb = vaddq_u32(kb, vandq_u32(vcltq_u32(vx[q], t15), one));
@@ -986,8 +1012,7 @@ static void rans_kernel_avx512(const rans_kctx *K, uint32_t g0, uint32_t g1) {
     const __m512i t23 = _mm512_set1_epi32((int)(1u << 23));
     const __m512i t15 = _mm512_set1_epi32((int)(1u << 15));
     const __m512i t7 = _mm512_set1_epi32((int)(1u << 7));
-    const __m512i bswap = _mm512_set4_epi32(0x0C0D0E0F, 0x08090A0B,
-                                            0x04050607, 0x00010203);
+    const __m512i bswap = _mm512_set4_epi32(0x0C0D0E0F, 0x08090A0B, 0x04050607, 0x00010203);
     const __m512i vfreq = _mm512_loadu_si512((const void *)K->tab->freq);
     const __m512i vstart = _mm512_loadu_si512((const void *)K->tab->start);
 
@@ -1009,14 +1034,11 @@ static void rans_kernel_avx512(const rans_kctx *K, uint32_t g0, uint32_t g1) {
 
         for (uint64_t r = 0; r < R; r++) {
             __m512i slot = _mm512_and_si512(vx, vmask);
-            __m512i s = _mm512_and_si512(
-                _mm512_i32gather_epi32(slot, (const void *)sym, 1), vff);
+            __m512i s = _mm512_and_si512(_mm512_i32gather_epi32(slot, (const void *)sym, 1), vff);
             __m512i f = _mm512_permutexvar_epi32(s, vfreq);
             __m512i st = _mm512_permutexvar_epi32(s, vstart);
 
-            vx = _mm512_add_epi32(
-                _mm512_mullo_epi32(f, _mm512_srli_epi32(vx, (int)sb)),
-                _mm512_sub_epi32(slot, st));
+            vx = _mm512_add_epi32(_mm512_mullo_epi32(f, _mm512_srli_epi32(vx, (int)sb)), _mm512_sub_epi32(slot, st));
 
             __m512i kb = _mm512_setzero_si512();
             kb = _mm512_mask_add_epi32(kb, _mm512_cmplt_epu32_mask(vx, t23), kb, one);
@@ -1024,12 +1046,10 @@ static void rans_kernel_avx512(const rans_kctx *K, uint32_t g0, uint32_t g1) {
             kb = _mm512_mask_add_epi32(kb, _mm512_cmplt_epu32_mask(vx, t7), kb, one);
             kb = _mm512_min_epu32(kb, _mm512_sub_epi32(vend, vcur));
 
-            __m512i be = _mm512_shuffle_epi8(
-                _mm512_i32gather_epi32(vcur, (const void *)pl, 1), bswap);
+            __m512i be = _mm512_shuffle_epi8(_mm512_i32gather_epi32(vcur, (const void *)pl, 1), bswap);
             __m512i shl = _mm512_mullo_epi32(kb, eight);
             __m512i shr = _mm512_mullo_epi32(_mm512_sub_epi32(four, kb), eight);
-            vx = _mm512_or_si512(_mm512_sllv_epi32(vx, shl),
-                                 _mm512_srlv_epi32(be, shr));
+            vx = _mm512_or_si512(_mm512_sllv_epi32(vx, shl), _mm512_srlv_epi32(be, shr));
             vcur = _mm512_add_epi32(vcur, kb);
 
             /* fused repack: byte 0 of each 64-bit element is the packed byte,
@@ -1052,8 +1072,8 @@ static void rans_kernel_avx512(const rans_kctx *K, uint32_t g0, uint32_t g1) {
 
 /* Portable per-stream reference: whole record to one NIBBLE per byte. Works
  * for any n_symbols/n_streams combination, including odd n_symbols. */
-static void rans_record_decode_nibbles(const rans_record *rec, const rans_table *t,
-                                       uint32_t n_streams, uint8_t *out_nibbles) {
+static void rans_record_decode_nibbles(const rans_record *rec, const rans_table *t, uint32_t n_streams,
+                                       uint8_t *out_nibbles) {
     const uint32_t sb = t->scale_bits;
     const uint32_t mask = t->M - 1u;
     const uint32_t *fq = t->freq;
@@ -1068,7 +1088,10 @@ static void rans_record_decode_nibbles(const rans_record *rec, const rans_table 
             uint32_t slot = x & mask;
             uint32_t s = sym[slot];
             x = fq[s] * (x >> sb) + slot - st[s];
-            while (x < RANS_L) { if (ptr < e) x = (x << 8) | *ptr++; else break; }
+            while (x < RANS_L) {
+                if (ptr < e) x = (x << 8) | *ptr++;
+                else break;
+            }
             out_nibbles[j] = (uint8_t)s;
         }
     }
@@ -1076,8 +1099,7 @@ static void rans_record_decode_nibbles(const rans_record *rec, const rans_table 
 
 /* Fast path applies when whole groups tile the streams and the fused repack
  * can own whole output bytes; otherwise 0 => use the generic path. */
-static uint32_t rans_record_group_count(const rans_record *rec, uint32_t n_streams,
-                                        rans_path p) {
+static uint32_t rans_record_group_count(const rans_record *rec, uint32_t n_streams, rans_path p) {
     uint32_t G = rans_path_group_width(p);
     if (n_streams % G) return 0;
     if (rec->n_symbols & 1u) return 0;
@@ -1088,10 +1110,8 @@ static uint32_t rans_record_group_count(const rans_record *rec, uint32_t n_strea
  * only the bytes its own streams own, so disjoint group ranges may run
  * concurrently on the same output buffer with no synchronization — this is
  * the parallel entry point a threaded consumer (E2) partitions work with. */
-static void rans_record_decode_groups(const rans_record *rec, const rans_table *t,
-                                      uint32_t n_streams, rans_path p,
-                                      uint32_t g0, uint32_t g1,
-                                      uint8_t *out_packed) {
+static void rans_record_decode_groups(const rans_record *rec, const rans_table *t, uint32_t n_streams, rans_path p,
+                                      uint32_t g0, uint32_t g1, uint8_t *out_packed) {
     rans_kctx K;
     K.tab = t;
     K.payload = rec->payload;
@@ -1101,29 +1121,36 @@ static void rans_record_decode_groups(const rans_record *rec, const rans_table *
     K.out = out_packed;
     switch (p) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-        case RANS_PATH_AVX512:    rans_kernel_avx512(&K, g0, g1); return;
+    case RANS_PATH_AVX512:
+        rans_kernel_avx512(&K, g0, g1);
+        return;
 #endif
 #ifdef __ARM_NEON
-        case RANS_PATH_NEON:      rans_kernel_neon(&K, g0, g1); return;
+    case RANS_PATH_NEON:
+        rans_kernel_neon(&K, g0, g1);
+        return;
 #endif
-        case RANS_PATH_SCALAR_BF: rans_kernel_scalar_bf(&K, g0, g1); return;
-        default:                  rans_kernel_scalar(&K, g0, g1); return;
+    case RANS_PATH_SCALAR_BF:
+        rans_kernel_scalar_bf(&K, g0, g1);
+        return;
+    default:
+        rans_kernel_scalar(&K, g0, g1);
+        return;
     }
 }
 
 /* Whole record to packed bytes (out_packed must hold rec->packed_bytes).
  * Dispatches to the requested arm's fast path, or the generic per-stream
  * path when the record shape cannot use groups. RANS_PATH_INVALID refuses. */
-static rans_err rans_record_decode_packed(const rans_record *rec, const rans_table *t,
-                                          uint32_t n_streams, rans_path p,
+static rans_err rans_record_decode_packed(const rans_record *rec, const rans_table *t, uint32_t n_streams, rans_path p,
                                           uint8_t *out_packed) {
     /* n_streams == 0 would decode zero streams and return uninitialized
      * scratch as "successful" output — refuse before any path can run */
     if (n_streams == 0) return RANS_E_NSTREAMS;
     if (p == RANS_PATH_INVALID) return RANS_E_PATH_UNAVAILABLE;
-    /* an arm this build did not compile refuses rather than silently running
-     * scalar: a quiet downgrade would let "we tested <arm>" become a false
-     * claim (same rule rans_path_select applies to the env override) */
+        /* an arm this build did not compile refuses rather than silently running
+         * scalar: a quiet downgrade would let "we tested <arm>" become a false
+         * claim (same rule rans_path_select applies to the env override) */
 #ifndef __ARM_NEON
     if (p == RANS_PATH_NEON) return RANS_E_PATH_UNAVAILABLE;
 #endif

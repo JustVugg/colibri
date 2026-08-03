@@ -19,16 +19,12 @@
  * header entry points it can and does pin n_streams to the format's 256 —
  * a zero or wrong-for-format value is refused by name before any division
  * or decode dispatch (the header entries additionally refuse zero). */
-static int rc__nstreams_ok(uint32_t n_streams) {
-    return n_streams == RANS_NSTREAMS;
-}
+static int rc__nstreams_ok(uint32_t n_streams) { return n_streams == RANS_NSTREAMS; }
 
 /* Encode n nibbles into one chunk record. Returns the record length, or the
  * negated rans_err on failure. out_cap should come from rc_record_bound. */
-RC_EXPORT int64_t rc_record_encode(const uint8_t *nibbles, uint64_t n,
-                                   const uint32_t *freq, const uint32_t *start,
-                                   const uint16_t *slot_to_symbol,
-                                   uint32_t scale_bits, uint32_t n_streams,
+RC_EXPORT int64_t rc_record_encode(const uint8_t *nibbles, uint64_t n, const uint32_t *freq, const uint32_t *start,
+                                   const uint16_t *slot_to_symbol, uint32_t scale_bits, uint32_t n_streams,
                                    uint8_t *out, uint64_t out_cap) {
     if (!rc__nstreams_ok(n_streams)) return -(int64_t)RANS_E_NSTREAMS;
     rans_table t;
@@ -42,15 +38,14 @@ RC_EXPORT int64_t rc_record_encode(const uint8_t *nibbles, uint64_t n,
 }
 
 RC_EXPORT uint64_t rc_record_bound(uint64_t n_symbols, uint32_t n_streams) {
-    if (!rc__nstreams_ok(n_streams)) return 0;   /* callers treat 0 as refusal */
+    if (!rc__nstreams_ok(n_streams)) return 0; /* callers treat 0 as refusal */
     return rans_record_bound(n_symbols, n_streams);
 }
 
 /* Parse + fully validate a record blob; fills n_symbols/packed_bytes on
  * success. Returns a rans_err. */
-RC_EXPORT int32_t rc_record_parse(const uint8_t *blob, uint64_t blob_len,
-                                  uint32_t n_streams,
-                                  uint64_t *n_symbols, uint64_t *packed_bytes) {
+RC_EXPORT int32_t rc_record_parse(const uint8_t *blob, uint64_t blob_len, uint32_t n_streams, uint64_t *n_symbols,
+                                  uint64_t *packed_bytes) {
     if (!rc__nstreams_ok(n_streams)) return (int32_t)RANS_E_NSTREAMS;
     rans_record rec;
     rans_err e = rans_record_parse(blob, blob_len, n_streams, &rec);
@@ -66,12 +61,9 @@ RC_EXPORT int32_t rc_record_parse(const uint8_t *blob, uint64_t blob_len,
  * hold the record's packed_bytes; the CALLER must satisfy the RANS_SLACK
  * contract (blob allocated with >= RANS_SLACK readable bytes past blob_len —
  * the Python side copies each record into a padded buffer). */
-RC_EXPORT int32_t rc_record_decode(const uint8_t *blob, uint64_t blob_len,
-                                   uint32_t n_streams,
-                                   const uint32_t *freq, const uint32_t *start,
-                                   const uint16_t *slot_to_symbol,
-                                   uint32_t scale_bits, int32_t path,
-                                   uint8_t *out_packed) {
+RC_EXPORT int32_t rc_record_decode(const uint8_t *blob, uint64_t blob_len, uint32_t n_streams, const uint32_t *freq,
+                                   const uint32_t *start, const uint16_t *slot_to_symbol, uint32_t scale_bits,
+                                   int32_t path, uint8_t *out_packed) {
     if (!rc__nstreams_ok(n_streams)) return (int32_t)RANS_E_NSTREAMS;
     rans_record rec;
     rans_err e = rans_record_parse(blob, blob_len, n_streams, &rec);
@@ -87,21 +79,13 @@ RC_EXPORT int32_t rc_record_decode(const uint8_t *blob, uint64_t blob_len,
 
 /* Checked per-stream decode (verification invariants: state range, exact
  * consumption, final state). Returns a rans_err. */
-RC_EXPORT int32_t rc_stream_decode_checked(const uint8_t *in_buf, uint64_t in_size,
-                                           uint64_t n,
-                                           const uint32_t *freq, const uint32_t *start,
-                                           const uint16_t *slot_to_symbol,
-                                           uint32_t scale_bits,
+RC_EXPORT int32_t rc_stream_decode_checked(const uint8_t *in_buf, uint64_t in_size, uint64_t n, const uint32_t *freq,
+                                           const uint32_t *start, const uint16_t *slot_to_symbol, uint32_t scale_bits,
                                            uint8_t *out_nibbles) {
-    return (int32_t)rans_decode_stream_checked(in_buf, (size_t)in_size, (size_t)n,
-                                               freq, start, slot_to_symbol,
+    return (int32_t)rans_decode_stream_checked(in_buf, (size_t)in_size, (size_t)n, freq, start, slot_to_symbol,
                                                scale_bits, out_nibbles);
 }
 
-RC_EXPORT const char *rc_err_name(int32_t e) {
-    return rans_err_name((rans_err)(e < 0 ? -e : e));
-}
+RC_EXPORT const char *rc_err_name(int32_t e) { return rans_err_name((rans_err)(e < 0 ? -e : e)); }
 
-RC_EXPORT const char *rc_path_name(void) {
-    return rans_path_name(rans_path_select());
-}
+RC_EXPORT const char *rc_path_name(void) { return rans_path_name(rans_path_select()); }

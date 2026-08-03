@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
-#include <unistd.h>   /* close() dopo mkstemp */
+#include <unistd.h> /* close() dopo mkstemp */
 #endif
 #include "../compat.h"
 
@@ -29,23 +29,28 @@
 
 static int fails = 0;
 
-static void check(int cond, const char *what)
-{
+static void check(int cond, const char *what) {
     printf("  %s %s\n", cond ? "ok  " : "FAIL", what);
     if (!cond) fails++;
 }
 
-int main(void)
-{
+int main(void) {
     char path[] = "serve_sentinel_XXXXXX";
     /* mkstemp gives a unique name; we want a FILE* we control the mode of, so
      * close the fd and reopen by name. */
     int fd = mkstemp(path);
-    if (fd < 0) { perror("mkstemp"); return 2; }
+    if (fd < 0) {
+        perror("mkstemp");
+        return 2;
+    }
     close(fd);
 
-    FILE *f = fopen(path, "w");          /* deliberately TEXT mode: the bug's condition */
-    if (!f) { perror("fopen"); remove(path); return 2; }
+    FILE *f = fopen(path, "w"); /* deliberately TEXT mode: the bug's condition */
+    if (!f) {
+        perror("fopen");
+        remove(path);
+        return 2;
+    }
 
     /* Same call the serve loops make before emitting the handshake. On Windows it
      * flips the stream to binary; elsewhere it is a no-op. We point it at stdout,
@@ -59,8 +64,12 @@ int main(void)
     fprintf(f, "STAT 0 0.0 0.0 %.2f 0 0\n", 1.0);
     fclose(f);
 
-    FILE *r = fopen(path, "rb");         /* rb: read the bytes as they landed */
-    if (!r) { perror("fopen rb"); remove(path); return 2; }
+    FILE *r = fopen(path, "rb"); /* rb: read the bytes as they landed */
+    if (!r) {
+        perror("fopen rb");
+        remove(path);
+        return 2;
+    }
     char buf[256];
     size_t n = fread(buf, 1, sizeof(buf), r);
     fclose(r);
@@ -69,10 +78,8 @@ int main(void)
     printf("test_serve_sentinel: %zu bytes written\n", n);
 
     check(n >= sizeof(SENTINEL) - 1, "something was written");
-    check(memcmp(buf, SENTINEL, sizeof(SENTINEL) - 1) == 0,
-          "READY sentinel is byte-exact");
-    check(memchr(buf, '\r', n) == NULL,
-          "no CR anywhere -- a TEXT-mode stream would have inserted one (#748)");
+    check(memcmp(buf, SENTINEL, sizeof(SENTINEL) - 1) == 0, "READY sentinel is byte-exact");
+    check(memchr(buf, '\r', n) == NULL, "no CR anywhere -- a TEXT-mode stream would have inserted one (#748)");
 
     /* The STAT line is matched by a "^STAT " regex on a line basis, so its
      * terminator has to be a bare LF too. */

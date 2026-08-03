@@ -34,72 +34,89 @@
 #define SGB_MAX_DEPTH 32
 
 typedef struct {
-    char  *s; size_t len, cap;      /* output GBNF text */
-    int    nrule;                   /* next composite rule id */
-    int    use_str, use_num, use_int;  /* shared terminal rules actually referenced */
-    char   err[160];
-    int    fail;
+    char *s;
+    size_t len, cap;               /* output GBNF text */
+    int nrule;                     /* next composite rule id */
+    int use_str, use_num, use_int; /* shared terminal rules actually referenced */
+    char err[160];
+    int fail;
 } SgbCtx;
 
-static void sgb_put(SgbCtx *C, const char *t){
+static void sgb_put(SgbCtx *C, const char *t) {
     size_t n = strlen(t);
-    if (C->len + n + 1 > C->cap){
+    if (C->len + n + 1 > C->cap) {
         size_t nc = C->cap ? C->cap * 2 : 1024;
         while (nc < C->len + n + 1) nc *= 2;
         char *ns = (char *)realloc(C->s, nc);
-        if (!ns){ C->fail = 1; return; }
-        C->s = ns; C->cap = nc;
+        if (!ns) {
+            C->fail = 1;
+            return;
+        }
+        C->s = ns;
+        C->cap = nc;
     }
-    memcpy(C->s + C->len, t, n); C->len += n; C->s[C->len] = 0;
+    memcpy(C->s + C->len, t, n);
+    C->len += n;
+    C->s[C->len] = 0;
 }
 
-static void sgb_fail(SgbCtx *C, const char *what){
+static void sgb_fail(SgbCtx *C, const char *what) {
     if (!C->err[0]) snprintf(C->err, sizeof C->err, "unsupported schema: %s", what);
     C->fail = 1;
 }
 
 /* emit a JSON string VALUE (with quotes) as a GBNF literal: "..." with the JSON
  * text embedded, escaping for the GBNF literal syntax (\" \\ \xHH). */
-static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
-    sgb_put(C, "\"\\\"");                       /* GBNF literal opening: "\"  */
+static void sgb_put_json_string_lit(SgbCtx *C, const char *raw) {
+    sgb_put(C, "\"\\\""); /* GBNF literal opening: "\"  */
     char b[8];
-    for (const unsigned char *p = (const unsigned char *)raw; *p; p++){
+    for (const unsigned char *p = (const unsigned char *)raw; *p; p++) {
         unsigned char c = *p;
-        if (c == '"')       sgb_put(C, "\\\\\\\"");   /* JSON \"  inside GBNF literal */
+        if (c == '"') sgb_put(C, "\\\\\\\""); /* JSON \"  inside GBNF literal */
         else if (c == '\\') sgb_put(C, "\\\\\\\\");
-        else if (c < 0x20){ snprintf(b, sizeof b, "\\x%02x", c); sgb_put(C, b); } /* raw ctl byte (invalid JSON anyway) */
-        else if (c == 0x7f) sgb_put(C, "\\x7f");
-        else { b[0] = (char)c; b[1] = 0; sgb_put(C, b); }
+        else if (c < 0x20) {
+            snprintf(b, sizeof b, "\\x%02x", c);
+            sgb_put(C, b);
+        } /* raw ctl byte (invalid JSON anyway) */
+        else if (c == 0x7f)
+            sgb_put(C, "\\x7f");
+        else {
+            b[0] = (char)c;
+            b[1] = 0;
+            sgb_put(C, b);
+        }
     }
     sgb_put(C, "\\\"\"");
 }
 
 /* emit a number the way a model would print it: shortest round-trip via %g */
-static void sgb_put_number_lit(SgbCtx *C, double d){
-    char b[64]; snprintf(b, sizeof b, "\"%.17g\"", d);
+static void sgb_put_number_lit(SgbCtx *C, double d) {
+    char b[64];
+    snprintf(b, sizeof b, "\"%.17g\"", d);
     /* trim %.17g noise for integers */
-    if (d == (double)(long long)d && d < 1e15 && d > -1e15)
-        snprintf(b, sizeof b, "\"%lld\"", (long long)d);
+    if (d == (double)(long long)d && d < 1e15 && d > -1e15) snprintf(b, sizeof b, "\"%lld\"", (long long)d);
     sgb_put(C, b);
 }
 
-static int sgb_is_annotation(const char *k){
-    return !strcmp(k,"$schema") || !strcmp(k,"title") || !strcmp(k,"description")
-        || !strcmp(k,"default") || !strcmp(k,"examples")
-        || !strcmp(k,"additionalProperties");
+static int sgb_is_annotation(const char *k) {
+    return !strcmp(k, "$schema") || !strcmp(k, "title") || !strcmp(k, "description") || !strcmp(k, "default") ||
+           !strcmp(k, "examples") || !strcmp(k, "additionalProperties");
 }
 
 /* forward */
 static void sgb_value(SgbCtx *C, jval *sc, int depth);
 
-static void sgb_enum(SgbCtx *C, jval *e){
-    if (!e || e->t != J_ARR || e->len < 1){ sgb_fail(C, "empty enum"); return; }
+static void sgb_enum(SgbCtx *C, jval *e) {
+    if (!e || e->t != J_ARR || e->len < 1) {
+        sgb_fail(C, "empty enum");
+        return;
+    }
     sgb_put(C, "( ");
-    for (int i = 0; i < e->len && !C->fail; i++){
+    for (int i = 0; i < e->len && !C->fail; i++) {
         if (i) sgb_put(C, " | ");
         jval *v = e->kids[i];
-        if (v->t == J_STR)       sgb_put_json_string_lit(C, v->str);
-        else if (v->t == J_NUM)  sgb_put_number_lit(C, v->num);
+        if (v->t == J_STR) sgb_put_json_string_lit(C, v->str);
+        else if (v->t == J_NUM) sgb_put_number_lit(C, v->num);
         else if (v->t == J_BOOL) sgb_put(C, v->boolean ? "\"true\"" : "\"false\"");
         else if (v->t == J_NULL) sgb_put(C, "\"null\"");
         else sgb_fail(C, "enum member type");
@@ -107,22 +124,37 @@ static void sgb_enum(SgbCtx *C, jval *e){
     sgb_put(C, " )");
 }
 
-static void sgb_object(SgbCtx *C, jval *sc, int depth){
+static void sgb_object(SgbCtx *C, jval *sc, int depth) {
     jval *props = json_get(sc, "properties");
-    jval *req   = json_get(sc, "required");
-    if (!props || props->t != J_OBJ){ sgb_fail(C, "object without properties"); return; }
-    if (props->len == 0){ sgb_put(C, "\"{\" jws \"}\""); return; }
-    if (req){
-        if (req->t != J_ARR){ sgb_fail(C, "required not an array"); return; }
+    jval *req = json_get(sc, "required");
+    if (!props || props->t != J_OBJ) {
+        sgb_fail(C, "object without properties");
+        return;
+    }
+    if (props->len == 0) {
+        sgb_put(C, "\"{\" jws \"}\"");
+        return;
+    }
+    if (req) {
+        if (req->t != J_ARR) {
+            sgb_fail(C, "required not an array");
+            return;
+        }
         /* strict semantics: every property must be required (OpenAI structured
          * outputs contract). A proper subset would need optional-group emission
          * with ambiguous separators — out of v1 scope. */
-        if (req->len != props->len){ sgb_fail(C, "required must list every property (strict)"); return; }
-        for (int i = 0; i < props->len; i++){
+        if (req->len != props->len) {
+            sgb_fail(C, "required must list every property (strict)");
+            return;
+        }
+        for (int i = 0; i < props->len; i++) {
             int found = 0;
             for (int j = 0; j < req->len; j++)
                 if (req->kids[j]->t == J_STR && !strcmp(req->kids[j]->str, props->keys[i])) found = 1;
-            if (!found){ sgb_fail(C, "property not in required (strict)"); return; }
+            if (!found) {
+                sgb_fail(C, "property not in required (strict)");
+                return;
+            }
         }
     }
     /* jws at every separator: whitespace tolerance is strictly acceptance-positive
@@ -132,7 +164,7 @@ static void sgb_object(SgbCtx *C, jval *sc, int depth){
      * them keep drafting. Measured on GLM-5.2 current main: the sloppy-JSON
      * continuation costs a compact grammar most of its spans. */
     sgb_put(C, "\"{\" jws ");
-    for (int i = 0; i < props->len && !C->fail; i++){
+    for (int i = 0; i < props->len && !C->fail; i++) {
         if (i) sgb_put(C, " \",\" jws ");
         sgb_put_json_string_lit(C, props->keys[i]);
         sgb_put(C, " jws \":\" jws ");
@@ -142,13 +174,19 @@ static void sgb_object(SgbCtx *C, jval *sc, int depth){
     sgb_put(C, " \"}\"");
 }
 
-static void sgb_array(SgbCtx *C, jval *sc, int depth){
+static void sgb_array(SgbCtx *C, jval *sc, int depth) {
     jval *items = json_get(sc, "items");
-    jval *mi    = json_get(sc, "minItems");
+    jval *mi = json_get(sc, "minItems");
     int min1 = mi && mi->t == J_NUM && mi->num >= 1;
-    if (mi && mi->t == J_NUM && mi->num > 1){ sgb_fail(C, "minItems > 1"); return; }
-    if (!items){ sgb_fail(C, "array without items"); return; }
-    if (min1){
+    if (mi && mi->t == J_NUM && mi->num > 1) {
+        sgb_fail(C, "minItems > 1");
+        return;
+    }
+    if (!items) {
+        sgb_fail(C, "array without items");
+        return;
+    }
+    if (min1) {
         sgb_put(C, "\"[\" jws ");
         sgb_value(C, items, depth + 1);
         sgb_put(C, " jws ( \",\" jws ");
@@ -163,52 +201,74 @@ static void sgb_array(SgbCtx *C, jval *sc, int depth){
     }
 }
 
-static void sgb_value(SgbCtx *C, jval *sc, int depth){
+static void sgb_value(SgbCtx *C, jval *sc, int depth) {
     if (C->fail) return;
-    if (depth > SGB_MAX_DEPTH){ sgb_fail(C, "nesting too deep"); return; }
-    if (!sc || sc->t != J_OBJ){ sgb_fail(C, "schema node not an object"); return; }
+    if (depth > SGB_MAX_DEPTH) {
+        sgb_fail(C, "nesting too deep");
+        return;
+    }
+    if (!sc || sc->t != J_OBJ) {
+        sgb_fail(C, "schema node not an object");
+        return;
+    }
 
     /* reject unknown constraint keywords (fail-closed) */
-    for (int i = 0; i < sc->len; i++){
+    for (int i = 0; i < sc->len; i++) {
         const char *k = sc->keys[i];
-        if (strcmp(k,"type") && strcmp(k,"properties") && strcmp(k,"required")
-            && strcmp(k,"items") && strcmp(k,"enum") && strcmp(k,"const")
-            && strcmp(k,"minItems") && !sgb_is_annotation(k)){
-            sgb_fail(C, k); return;
+        if (strcmp(k, "type") && strcmp(k, "properties") && strcmp(k, "required") && strcmp(k, "items") &&
+            strcmp(k, "enum") && strcmp(k, "const") && strcmp(k, "minItems") && !sgb_is_annotation(k)) {
+            sgb_fail(C, k);
+            return;
         }
     }
 
     jval *cst = json_get(sc, "const");
-    if (cst){
-        if (cst->t == J_STR)       sgb_put_json_string_lit(C, cst->str);
-        else if (cst->t == J_NUM)  sgb_put_number_lit(C, cst->num);
+    if (cst) {
+        if (cst->t == J_STR) sgb_put_json_string_lit(C, cst->str);
+        else if (cst->t == J_NUM) sgb_put_number_lit(C, cst->num);
         else if (cst->t == J_BOOL) sgb_put(C, cst->boolean ? "\"true\"" : "\"false\"");
         else if (cst->t == J_NULL) sgb_put(C, "\"null\"");
         else sgb_fail(C, "const type");
         return;
     }
     jval *en = json_get(sc, "enum");
-    if (en){ sgb_enum(C, en); return; }
+    if (en) {
+        sgb_enum(C, en);
+        return;
+    }
 
     jval *ty = json_get(sc, "type");
-    if (!ty || ty->t != J_STR){ sgb_fail(C, "missing type"); return; }
+    if (!ty || ty->t != J_STR) {
+        sgb_fail(C, "missing type");
+        return;
+    }
     const char *t = ty->str;
-    if      (!strcmp(t, "object"))  sgb_object(C, sc, depth);
-    else if (!strcmp(t, "array"))   sgb_array(C, sc, depth);
-    else if (!strcmp(t, "string")){ C->use_str = 1; sgb_put(C, "jstr"); }
-    else if (!strcmp(t, "number")){ C->use_num = 1; sgb_put(C, "jnum"); }
-    else if (!strcmp(t, "integer")){ C->use_int = 1; sgb_put(C, "jint"); }
-    else if (!strcmp(t, "boolean")) sgb_put(C, "( \"true\" | \"false\" )");
-    else if (!strcmp(t, "null"))    sgb_put(C, "\"null\"");
+    if (!strcmp(t, "object")) sgb_object(C, sc, depth);
+    else if (!strcmp(t, "array")) sgb_array(C, sc, depth);
+    else if (!strcmp(t, "string")) {
+        C->use_str = 1;
+        sgb_put(C, "jstr");
+    } else if (!strcmp(t, "number")) {
+        C->use_num = 1;
+        sgb_put(C, "jnum");
+    } else if (!strcmp(t, "integer")) {
+        C->use_int = 1;
+        sgb_put(C, "jint");
+    } else if (!strcmp(t, "boolean")) sgb_put(C, "( \"true\" | \"false\" )");
+    else if (!strcmp(t, "null")) sgb_put(C, "\"null\"");
     else sgb_fail(C, t);
 }
 
-static void sgb_free_jval(jval *v){
+static void sgb_free_jval(jval *v) {
     if (!v) return;
-    if (v->t == J_OBJ){
-        for (int i = 0; i < v->len; i++){ free(v->keys[i]); sgb_free_jval(v->kids[i]); }
-        free(v->keys); free(v->kids);
-    } else if (v->t == J_ARR){
+    if (v->t == J_OBJ) {
+        for (int i = 0; i < v->len; i++) {
+            free(v->keys[i]);
+            sgb_free_jval(v->kids[i]);
+        }
+        free(v->keys);
+        free(v->kids);
+    } else if (v->t == J_ARR) {
         for (int i = 0; i < v->len; i++) sgb_free_jval(v->kids[i]);
         free(v->kids);
     } else if (v->t == J_STR) free(v->str);
@@ -217,10 +277,14 @@ static void sgb_free_jval(jval *v){
 
 /* Compile a JSON-Schema string to GBNF. Returns a malloc'd GBNF text (caller
  * frees) or NULL with a message in err (if err != NULL). */
-static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
-    SgbCtx C; memset(&C, 0, sizeof C);
+static char *schema_to_gbnf(const char *schema_json, char *err, int errsz) {
+    SgbCtx C;
+    memset(&C, 0, sizeof C);
     jval *sc = json_parse(schema_json, NULL);
-    if (!sc){ if (err) snprintf(err, errsz, "schema: json parse failed"); return NULL; }
+    if (!sc) {
+        if (err) snprintf(err, errsz, "schema: json parse failed");
+        return NULL;
+    }
 
     sgb_put(&C, "root ::= jws ");
     sgb_value(&C, sc, 0);
@@ -231,14 +295,15 @@ static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
                     "jchar ::= [^\"\\\\\\x00-\\x1f] | \"\\\\\" ( [\"\\\\/bfnrt] | \"u\" jhex jhex jhex jhex )\n"
                     "jhex ::= [0-9a-fA-F]\n");
     if (C.use_num)
-        sgb_put(&C, "jnum ::= \"-\"? ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( ( \"e\" | \"E\" ) ( \"+\" | \"-\" )? [0-9]+ )?\n");
-    if (C.use_int)
-        sgb_put(&C, "jint ::= \"-\"? ( \"0\" | [1-9] [0-9]* )\n");
+        sgb_put(&C, "jnum ::= \"-\"? ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( ( \"e\" | \"E\" ) ( \"+\" | \"-\" )? "
+                    "[0-9]+ )?\n");
+    if (C.use_int) sgb_put(&C, "jint ::= \"-\"? ( \"0\" | [1-9] [0-9]* )\n");
 
     sgb_free_jval(sc);
-    if (C.fail || !C.s){
+    if (C.fail || !C.s) {
         if (err) snprintf(err, errsz, "%s", C.err[0] ? C.err : "schema: compile failed");
-        free(C.s); return NULL;
+        free(C.s);
+        return NULL;
     }
     return C.s;
 }
