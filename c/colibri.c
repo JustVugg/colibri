@@ -459,6 +459,9 @@ static inline int vk_reg_served(int layer,int eid){
     if(!g_vk_reg || layer<0 || layer>=g_vk_reg_NL || eid<0 || eid>=g_vk_reg_E) return 0;
     return g_vk_reg[((size_t)layer*g_vk_reg_E+eid)*3] != NULL;
 }
+int coli_vk_reg_has(int layer, int eid) {
+    return vk_reg_served(layer, eid);
+}
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
 static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */

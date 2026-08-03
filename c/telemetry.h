@@ -136,6 +136,10 @@ static void tiers_emit(Model *m){
     fflush(stdout);
 }
 
+#ifdef COLI_VULKAN
+int coli_vk_reg_has(int layer, int eid);
+#endif
+
 static void emap_emit(Model *m){
     Cfg *c=&m->c;
     int rows=0;
@@ -151,10 +155,12 @@ static void emap_emit(Model *m){
             int tier=0;
             ESlot *P=m->pin[i];
             for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
-#ifdef COLI_CUDA
-                tier = P[z].g.cuda?2:1;
-#else
                 tier = 1;
+#ifdef COLI_CUDA
+                if (P[z].g.cuda) tier = 2;
+#endif
+#ifdef COLI_VULKAN
+                if (coli_vk_reg_has(i, e)) tier = 2;
 #endif
                 break; }
             if(!tier && m->ecache && m->ecache[i])
