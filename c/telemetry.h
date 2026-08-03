@@ -96,7 +96,7 @@ static void hwinfo_emit(Model *m){
     hw_probe(cpu,sizeof(cpu),&cores,&ram_total,&ram_avail);
     int ngpu=0; double vram_total=0;
     char gpu_name[128]="";
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA)
     ngpu=g_cuda_ndev; vram_total=m->gpu_expert_bytes/1e9;
     for(int i=0;i<g_cuda_ndev;i++){
         size_t fr=0,to=0; coli_cuda_mem_info(g_cuda_devices[i],&fr,&to);
@@ -104,6 +104,17 @@ static void hwinfo_emit(Model *m){
     }
     if(g_cuda_ndev>0)
         snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+#elif defined(COLI_VULKAN)
+    ngpu = (coli_vk_available() ? 1 : 0) + (coli_vk_dev2_available() ? 1 : 0);
+    vram_total = m->gpu_expert_bytes / 1e9;
+    double used, budget;
+    if (coli_vk_available() && coli_vk_mem_budget(&used, &budget)) {
+        vram_total = budget;
+        if (coli_vk_dev2_available() && coli_vk_mem_budget2(&used, &budget)) {
+            vram_total += budget;
+        }
+    }
+    if(ngpu > 0) snprintf(gpu_name, sizeof(gpu_name), "Vulkan device x%d", ngpu);
 #endif
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
         cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
