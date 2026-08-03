@@ -33,6 +33,13 @@ jobs:
         run: make -C c lint-c
       - name: ruff
         run: make -C c lint-py
+      - name: Build-configuration matrix
+        # Every engine parsed under every combination of the optional backends.
+        # A function referenced only from inside `#ifdef COLI_CUDA` looks unused
+        # to a default CPU build, so deleting it breaks a build no other Linux
+        # job compiles -- until now the only thing that noticed was the
+        # five-minute Windows CUDA job. This is -fsyntax-only: seconds, no SDK.
+        run: make -C c check-configs
 
   # Separate from `lint` because it is a full compile plus analysis of each of
   # the four engines -- minutes, not seconds. Keeping it apart means the fast

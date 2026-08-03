@@ -116,6 +116,11 @@ static void rt_init(const char *engine, int n_layers, int n_experts) {
 static uint32_t **rt_counts_all(void) { return rt_c; }
 static uint32_t *rt_counts(int layer) { return (rt_c && layer >= 0 && layer <= rt_nl) ? rt_c[layer] : NULL; }
 
+/* Used only under COLI_CUDA (colibri.c's device router bails out when a trace is
+ * being recorded), so a default CPU build sees it as unused. Do not "clean it up"
+ * on that basis -- deleting it breaks the CUDA build, which is how it came back. */
+static int rt_tracing(void) { return rt_fp != NULL; }
+
 /* Release a layer's counter row, so rt_counts(layer) is NULL for a layer that does not
  * route. rt_init cannot know which those are — an engine learns its own sparsity while it
  * builds its layers, after it has told us its dimensions — so it drops them afterwards.

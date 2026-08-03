@@ -741,6 +741,39 @@ efficiency-report:
 	$(PYTHON) tests/test_efficiency_report.py
 
 
+
+# --- build-configuration matrix -----------------------------------------
+# Every engine, parsed under every combination of the optional backends.
+#
+# This exists because deleting an unused function is NOT safe just because all
+# four engines build without it: a function can be referenced only from inside
+# `#ifdef COLI_CUDA`, so a default CPU build says "unused" while the CUDA build
+# stops compiling. That is exactly what happened with route_trace.h's
+# rt_tracing, and the only CI job that noticed was the Windows CUDA build --
+# a five-minute Windows job, for a mistake a one-second syntax pass catches.
+#
+# -fsyntax-only, so no backend SDK is needed: COLI_CUDA/COLI_METAL only gate
+# engine code here, and their headers are declaration-only. (backend_cuda.cu and
+# backend_metal.mm are compiled by the CUDA/HIP jobs, not by this.)
+#
+# implicit-function-declaration is forced to an error: it is a WARNING on
+# gcc <= 13 and an ERROR on gcc >= 14, so a missing declaration looks fine
+# locally and fails CI. Pin the strict behaviour instead of depending on the
+# host compiler's age.
+CONFIG_MATRIX = "" "-DCOLI_CUDA" "-DCOLI_VULKAN" "-DCOLI_METAL" "-DCOLI_ANS" \
+                "-DCOLI_CUDA -DCOLI_VULKAN" "-DCOLI_CUDA -DCOLI_ANS" "-DCOLI_VULKAN -DCOLI_ANS"
+
+check-configs:
+	@rc=0; for eng in $(LINT_TIDY_SRC); do \
+	   for cfg in $(CONFIG_MATRIX); do \
+	     if $(CC) $(CFLAGS) $$cfg \
+	          -Werror=implicit-function-declaration -Werror=implicit-int \
+	          -fsyntax-only "$$eng" 2>/tmp/cfgchk.$$$$; then :; else \
+	       echo "FAIL: $$eng [$${cfg:-default}]" >&2; grep 'error:' /tmp/cfgchk.$$$$ | head -3 >&2; rc=1; fi; \
+	   done; \
+	 done; rm -f /tmp/cfgchk.$$$$; \
+	 [ $$rc = 0 ] && echo "config matrix: 4 engines x 8 configurations ok"; exit $$rc
+
 # --- lint ---------------------------------------------------------------
 # Formatting and Python static checks. Both are advisory locally and enforced
 # in CI; neither needs a model, a GPU or any build.
@@ -823,7 +856,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: lint lint-c lint-py lint-tidy all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: lint lint-c lint-py lint-tidy check-configs all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
