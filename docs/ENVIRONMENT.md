@@ -34,6 +34,38 @@ CLI doesn't surface, or to override what the CLI would set.
 
 Format: `VAR` — default — effect.
 
+## Checking what the engine actually received
+
+Every engine validates the environment at startup against the registry in
+`c/coli_env.h` and reports what it cannot use:
+
+```console
+$ COLI_PREFIL_CHUNK=512 ./colibri ...
+[env] unknown variable COLI_PREFIL_CHUNK -- did you mean COLI_PREFILL_CHUNK?
+
+$ K3_BITS=8 ./colibri ...
+[env] K3_BITS is not read by colibri (it belongs to kimi_k3) -- it will have no effect
+```
+
+Both of those used to be silent: the run proceeded with the default and
+produced a plausible number for a configuration you did not set. That is the
+mistake this check exists to catch, and it is why the engine-ownership table
+above matters.
+
+It warns rather than exits, so nothing that works today stops working. Two
+knobs:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_ENV_STRICT` | `0` | `=1` turns those warnings into `exit(2)`. For CI and for anyone who wants the guarantee rather than the notice. |
+| `COLI_ENV_DUMP` | `0` | `=1` prints every variable this engine reads, its type, and whether it is currently set — the fastest answer to "is my export reaching the engine?" |
+
+Variables the engine does not own are left alone: an unrelated `EDITOR` or
+`MY_VAR` in the environment is never reported. Only `COLI_*`, `K3_*` and
+`INK_*` names are checked, since an unrecognised one of those is almost
+certainly meant for us.
+
+
 ---
 
 ## Common — everyday use

@@ -1789,8 +1789,17 @@ test-asan:
 	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
 	@echo "test-asan: suite clean under ASan + UBSan"
 
+# --- environment-variable registry --------------------------------------
+# c/coli_env.h is the single list of every variable the engines read. This
+# target asserts it still matches the sources: a getenv() with no row, a row
+# nothing reads, an unsorted table (coli_env_find binary-searches it) or a
+# duplicate name all fail here. Needs no build, no model and no GPU.
+check-env:
+	@$(PYTHON) tools/check_env_registry.py
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
+	$(MAKE) check-env
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test
@@ -1843,6 +1852,7 @@ bench: iobench$(EXE)
 .PHONY: bench-omp-grain
 .PHONY: test-asan
 .PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
+.PHONY: check-env
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
