@@ -259,7 +259,7 @@ export default function App() {
           <div className="section-title"><Activity className="size-3.5" /> {t("sidebar.runtime")}</div>
           {health?.hwinfo ? <div className="hw-panel">
             {health.hwinfo.cpu ? <div className="hw-row"><Cpu className="size-3.5" /><span>{health.hwinfo.cpu}</span></div> : null}
-            {health.hwinfo.gpus > 0 ? <div className="hw-row"><MonitorDot className="size-3.5" /><span>{health.hwinfo.gpus}× GPU<small>{health.hwinfo.vram_total_gb.toFixed(0)} GB VRAM</small></span></div> : null}
+            {health.hwinfo.gpus > 0 || health.hwinfo.backend === "vulkan" ? <div className="hw-row"><MonitorDot className="size-3.5" /><span>{Math.max(1, health.hwinfo.gpus)}× {health.hwinfo.backend === "vulkan" ? t("hwinfo.backendVulkan") : health.hwinfo.backend === "cuda" ? t("hwinfo.backendCuda") : "GPU"}<small>{health.hwinfo.vram_total_gb.toFixed(0)} GB VRAM</small></span></div> : null}
             <div className="hw-row"><MemoryStick className="size-3.5" /><span>{health.hwinfo.ram_total_gb.toFixed(0)} GB RAM<small>{health.hwinfo.ram_avail_gb.toFixed(0)} GB free</small></span></div>
             <div className="hw-row"><HardDrive className="size-3.5" /><span>{health.hwinfo.cores} cores</span></div>
           </div> : null}

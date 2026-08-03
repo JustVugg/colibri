@@ -1472,11 +1472,19 @@ class Engine:
                         events.put(("done", stats))
                 elif kind == "HWINFO" and len(fields) >= 7:
                     parts = " ".join(fields[6:]).split("|")
+                    gpu_name = parts[1].strip() if len(parts)>1 else ""
+                    if "vulkan" in gpu_name.lower():
+                        backend = "vulkan"
+                    elif int(fields[4]) > 0:
+                        backend = "cuda"
+                    else:
+                        backend = "cpu"
                     self.hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
                                    "ram_avail_gb": float(fields[3]), "gpus": int(fields[4]),
                                    "vram_total_gb": float(fields[5]),
                                    "cpu": parts[0].strip() if len(parts)>0 else "",
-                                   "gpu": parts[1].strip() if len(parts)>1 else ""}
+                                   "gpu": gpu_name,
+                                   "backend": backend}
                 elif kind == "EMAP" and len(fields) == 4:
                     self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
                 elif kind == "HITS" and len(fields) == 4:

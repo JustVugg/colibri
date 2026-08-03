@@ -28,6 +28,10 @@ const it: Record<string, string> = {
   "dashboard.prompt": "prompt",
   "dashboard.completion": "completion",
 
+  "hwinfo.backendVulkan": "GPU Vulkan",
+  "hwinfo.backendCuda": "GPU CUDA",
+  "hwinfo.backendCpu": "CPU",
+
   "tier.vram": "VRAM",
   "tier.ram": "RAM",
   "tier.disk": "Disco",

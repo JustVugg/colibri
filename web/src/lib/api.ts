@@ -39,6 +39,7 @@ export interface HwinfoHealth {
   vram_total_gb: number
   cpu: string
   gpu: string
+  backend?: "cuda" | "vulkan" | "cpu"
 }
 
 export interface HealthResponse {

@@ -32,6 +32,10 @@ const en: Record<string, string> = {
   "dashboard.prompt": "prompt",
   "dashboard.completion": "completion",
 
+  "hwinfo.backendVulkan": "Vulkan GPU",
+  "hwinfo.backendCuda": "CUDA GPU",
+  "hwinfo.backendCpu": "CPU",
+
   // sidebar — tiers
   "tier.vram": "VRAM",
   "tier.ram": "RAM",

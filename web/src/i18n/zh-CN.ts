@@ -28,6 +28,10 @@ const zhCN: Record<string, string> = {
   "dashboard.prompt": "提示词",
   "dashboard.completion": "补全",
 
+  "hwinfo.backendVulkan": "Vulkan GPU",
+  "hwinfo.backendCuda": "CUDA GPU",
+  "hwinfo.backendCpu": "CPU",
+
   "tier.vram": "VRAM",
   "tier.ram": "RAM",
   "tier.disk": "磁盘",
