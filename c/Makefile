@@ -856,7 +856,15 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: lint lint-c lint-py lint-tidy check-configs all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+
+# Own lines on purpose. c/Makefile appears in most open PRs, and any two that each
+# append to a single shared .PHONY conflict on that line by construction -- the same
+# failure the TEST_RULES comment above describes for TEST_BINS, fixed there by
+# deriving the list. make accumulates multiple .PHONY declarations, so adding a
+# target means adding a line, not editing a line every other branch is editing.
+.PHONY: lint lint-c lint-py lint-tidy
+.PHONY: check-configs
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
