@@ -20,6 +20,7 @@ class CliOutputLanguageTest(unittest.TestCase):
             [sys.executable, str(CLI), *args],
             cwd=HERE,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=False,
             timeout=10,

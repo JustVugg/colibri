@@ -27,7 +27,7 @@ static void write_snap(const char *dir, int truncate_bytes) {
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
     unsigned char data[96];
     for (int i = 0; i < 96; i++) data[i] = (unsigned char)(i * 7 + 3);
-    const char *hdr = "{\"t\":{\"dtype\":\"U8\",\"shape\":[96],\"data_offsets\":[0,96]}}";
+    const char *hdr = "{\"t\":{\"dtype\":\"U8\",\"shape\":[2,3,16],\"data_offsets\":[0,96]}}";
     uint64_t hlen = strlen(hdr);
     FILE *f = fopen(path, "wb");
     fwrite(&hlen, 8, 1, f);
@@ -45,6 +45,15 @@ int main(void) {
     /* 1) chunk loop: 96-byte tensor read 7 bytes at a time, content exact */
     write_snap(dir, 0);
     shards S; st_init(&S, dir);
+    st_tensor *tensor = st_find(&S, "t");
+    CHECK(tensor != NULL);
+    CHECK(tensor->rank == 3);
+    CHECK(tensor->shape[0] == 2 && tensor->shape[1] == 3 && tensor->shape[2] == 16);
+    CHECK(tensor->shape[3] == 0);
+    CHECK(S.nfd == 1);
+    struct stat indexed_sb;
+    CHECK(fstat(S.fds[0], &indexed_sb) == 0);
+    CHECK(S.sizes[0] == (int64_t)indexed_sb.st_size);
     unsigned char out[96] = {0};
     st_read_raw(&S, "t", out, 0);
     for (int i = 0; i < 96; i++) CHECK(out[i] == (unsigned char)(i * 7 + 3));

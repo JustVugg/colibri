@@ -12,6 +12,7 @@ tools/librans_c.so
 tools/librans_c.dylib
 tools/rans_c.dll
 tests/fuzz_rans
+tests/bench_omp_grain
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped

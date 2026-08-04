@@ -24,6 +24,7 @@
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
  * malloc gigante prima ancora di leggere: lo respingiamo. */
 #define ST_MAX_HEADER (512ll << 20)
+#define ST_MAX_RANK 8
 
 typedef struct {
     char   *name;
@@ -32,6 +33,8 @@ typedef struct {
     int64_t nbytes;
     int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 */
     int64_t numel;
+    int     rank;
+    int64_t shape[ST_MAX_RANK];
 } st_tensor;
 
 typedef struct {
@@ -40,6 +43,7 @@ typedef struct {
     int        fds[512];
     int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
     char      *paths[512];
+    int64_t    sizes[512];  /* indexed primary shard sizes, parallel to fds/paths */
     int        nfd;
 #define ST_MAX_MIR 4       /* extra read replicas beyond the primary (multi-SSD) */
     int        mfds[ST_MAX_MIR][512];  /* MIRROR: fds of replica copy r+1 (multi-SSD), -1 = absent */
@@ -136,7 +140,10 @@ static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
     if (fd < 0) { perror(path); exit(1); }
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) { perror("fstat shard"); close(fd); exit(1); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
+    S->sizes[S->nfd] = (int64_t)sb.st_size;
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
@@ -467,9 +474,9 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
-        struct stat sst;
-        if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
-        int64_t fsz = (int64_t)sst.st_size;
+        int fidx = st_fidx(S, fd);
+        if (fidx < 0) { fprintf(stderr, "%s: indexed shard fd is missing\n", files[fi]); exit(1); }
+        int64_t fsz = S->sizes[fidx];
         uint64_t hlen;
         st_pread_full(fd, &hlen, 8, 0, "pread hlen");
         /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
@@ -500,7 +507,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * senza questi guard si dereferenzia NULL (json_get) o si legge
              * off->kids[0/1] oltre i limiti dell'array. */
             if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
-                !shp || shp->t != J_ARR) {
+                !shp || shp->t != J_ARR || shp->len > ST_MAX_RANK) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
@@ -517,8 +524,12 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * numel*esz==nbytes in st_read_f32, riaprendo l'OOB. */
             int64_t numel = 1; int bad_shape = 0;
             for (int k = 0; k < shp->len; k++) {
-                int64_t d = (int64_t)shp->kids[k]->num;
-                if (d < 0 || (d != 0 && numel > INT64_MAX / d)) { bad_shape = 1; break; }
+                jval *dim = shp->kids[k];
+                if (!dim || dim->t != J_NUM || !isfinite(dim->num) ||
+                    dim->num < 0.0 || dim->num >= ldexp(1.0, 63) ||
+                    floor(dim->num) != dim->num) { bad_shape = 1; break; }
+                int64_t d = (int64_t)dim->num;
+                if (d != 0 && numel > INT64_MAX / d) { bad_shape = 1; break; }
                 numel *= d;
             }
             if (bad_shape) {
@@ -531,8 +542,11 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 S->t = nt;
             }
             st_tensor *t = &S->t[S->n++];
+            memset(t, 0, sizeof(*t));
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            t->rank = shp->len;
+            for (int k = 0; k < t->rank; k++) t->shape[k] = (int64_t)shp->kids[k]->num;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
