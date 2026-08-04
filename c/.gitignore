@@ -27,3 +27,17 @@ tests/test_int3
 tests/test_int3_load
 tests/test_tok_o200k
 tests/test_pipe_block
+
+# build outputs, by pattern (per-file lists leak new sources' objects)
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
+*.bak
+
+coli_cuda*.dll
+
+# DirectStorage redistributables (from the nuget package, not vendored)
+dstorage.dll
+dstoragecore.dll
