@@ -177,11 +177,19 @@ static int lora_write_file(const char *path, const void *buf, size_t n){
 }
 
 /* mkdir -p: create every missing component (adapter-out paths are often nested
- * like adapters/run1 — a single mkdir fails with ENOENT on the parent) */
+ * like adapters/run1 — a single mkdir fails with ENOENT on the parent).
+ * Windows' CRT _mkdir() takes the path only — no mode argument — and accepts
+ * either separator, so backslash paths split correctly too. */
+#ifdef _WIN32
+#include <direct.h>
+#define LORA_MKDIR(p) _mkdir(p)
+#else
+#define LORA_MKDIR(p) mkdir((p),0755)
+#endif
 static void lora_mkpath(const char *dir){
     char p[2048]; snprintf(p,sizeof(p),"%s",dir);
-    for(char *c=p+1;*c;c++) if(*c=='/'){ *c=0; mkdir(p,0755); *c='/'; }
-    mkdir(p,0755);
+    for(char *c=p+1;*c;c++) if(*c=='/'||*c=='\\'){ char sep=*c; *c=0; LORA_MKDIR(p); *c=sep; }
+    LORA_MKDIR(p);
 }
 
 static int lora_save(const char *dir, const LoraAdapter *a){
