@@ -137,12 +137,14 @@ def sprite_lines():
         out.append(row+"\033[0m")
     return out
 
-def banner(sub=""):
+def banner(sub="", cuda=None):
     sp=sprite_lines()
+    # cuda: True -> GPU active, False -> CPU, None -> backend not decided yet
+    mode = "" if cuda is None else (" · GPU (CUDA)" if cuda else " · streaming CPU")
     txt=[
         f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
-        f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
+        f"{C.gray}GLM-5.2 · 744B MoE · int4{mode}{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
         "",
     ]
@@ -226,13 +228,20 @@ def cuda_binary():
         return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
     return False
 
+def _env_num(env, key, default, cast=float):
+    """Parse a numeric env var tolerantly: 'auto'/blank/garbage -> default."""
+    v = env.get(key)
+    if v is None:
+        return cast(default)
+    try:
+        return cast(v)
+    except (TypeError, ValueError):
+        return cast(default)
+
 def resource_request(a, env):
-    ctx=a.ctx or int(env.get("CTX",4096))
-    def num(v):
-        try: return float(v)
-        except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
-    ram=a.ram or num(env.get("RAM_GB",0))
-    vram=a.vram or num(env.get("CUDA_EXPERT_GB",0))
+    ctx=a.ctx or _env_num(env,"CTX",4096,int)
+    ram=a.ram or _env_num(env,"RAM_GB",0)
+    vram=a.vram or _env_num(env,"CUDA_EXPERT_GB",0)
     gpu=a.gpu
     if gpu is None:
         gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
@@ -706,8 +715,8 @@ def cmd_run(a):
     engine=engine_for(a.model)
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
-    banner("run")
     if arch=="deepseek_v4":
+        banner("run")
         prompt_path=None
         try:
             cmd=[engine,os.path.abspath(a.model)]
@@ -734,6 +743,7 @@ def cmd_run(a):
     # <think> open so the engine emits its reasoning block; the default stays nothink.
     tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
+    banner("run", e.get("COLI_CUDA")=="1")  # after env_for so the backend is known
     sys.exit(subprocess.call([GLM, str(a.cap if a.cap is not None else 0)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
@@ -897,10 +907,11 @@ def cmd_chat(a):
                 try: p.wait(timeout=10)
                 except subprocess.TimeoutExpired: p.kill()
     need_model(a.model)
-    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
+    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}",
+           e.get("COLI_CUDA")=="1")  # after env_for so the backend is known
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
     # protocol coli reads one byte at a time) never flushes and chat hangs at
@@ -1204,7 +1215,10 @@ def cmd_mirror(a):
 
 def main():
     common=argparse.ArgumentParser(add_help=False)
-    common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
+    common.add_argument("--model", default=DEF_MODEL)
+    # float: the engine parses RAM_GB with atof, and the cache warning
+    # suggests fractional budgets. 0 = auto (88% of free RAM).
+    common.add_argument("--ram", type=float, default=0)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
     common.add_argument("--no-tune-profile",action="store_true",
                         help="ignore a saved measured tuning profile")
