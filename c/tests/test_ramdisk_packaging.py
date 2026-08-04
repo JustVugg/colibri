@@ -15,6 +15,33 @@ ROOT = C_DIR.parent
 MAKE = shutil.which("make")
 PIP_AVAILABLE = importlib.util.find_spec("pip") is not None
 SETUPTOOLS_AVAILABLE = importlib.util.find_spec("setuptools") is not None
+
+
+def _setuptools_supports_spdx_license():
+    """The donor declares setuptools>=77.0.1 for its SPDX ``license`` field.
+
+    A non-isolated wheel build uses the AMBIENT backend, so it only succeeds
+    when the ambient setuptools understands the PEP 639 string license form.
+    The dedicated wheel lanes install this minimum; ``make check`` may run on a
+    host whose ambient setuptools is older, in which case the non-isolated
+    wheel build is an unsupported configuration and must skip rather than fail.
+    """
+    if not SETUPTOOLS_AVAILABLE:
+        return False
+    try:
+        import setuptools
+
+        parsed = tuple(
+            int(part) for part in setuptools.__version__.split(".")[:3]
+        )
+        while len(parsed) < 3:
+            parsed += (0,)
+    except Exception:
+        return False
+    return parsed >= (77, 0, 1)
+
+
+SETUPTOOLS_SUPPORTS_SPDX = _setuptools_supports_spdx_license()
 ISOLATED_PEP517_REQUESTED = (
     os.environ.get("COLIBRI_TEST_ISOLATED_PEP517") == "1"
 )
@@ -225,8 +252,9 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertIn("prepare", smoke.stdout)
 
     @unittest.skipUnless(
-        SETUPTOOLS_AVAILABLE,
-        "wheel backend unavailable; source/install packaging contracts still run",
+        SETUPTOOLS_AVAILABLE and SETUPTOOLS_SUPPORTS_SPDX,
+        "non-isolated wheel build requires the declared setuptools>=77.0.1 "
+        "(SPDX license); covered by the dedicated wheel lanes otherwise",
     )
     def test_wheel_contains_runnable_ramdisk_control_plane(self):
         """The selected ambient backend builds without package-index access."""
@@ -693,7 +721,16 @@ class RamdiskPackagingTest(unittest.TestCase):
                 capture_output=True,
                 check=True,
             )
-            self.assertTrue(all(not artifact.exists() for artifact in artifacts))
+            remaining = [
+                str(artifact)
+                for artifact in artifacts
+                if artifact.exists()
+            ]
+            self.assertFalse(
+                remaining,
+                "clean.py left %d artifact(s) behind: %s"
+                % (len(remaining), remaining[:20]),
+            )
             self.assertTrue(all(not cache_dir.exists() for cache_dir in cache_dirs))
 
     def test_environment_reference_documents_rammap_contract(self):
