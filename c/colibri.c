@@ -67,8 +67,15 @@
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
+/* Shims for a build without an OpenMP runtime (Apple clang without Homebrew
+ * libomp is the common case; the Makefile warns and carries on). Every omp_*
+ * the engine calls needs one, or the fallback only appears to work: the CPU
+ * build compiled because it happens not to reach omp_in_parallel(), while
+ * METAL=1 does and failed. */
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
+static inline int omp_in_parallel(void){ return 0; }     /* no runtime: never inside a team */
+static inline void omp_set_num_threads(int n){ (void)n; }
 #endif
 #include "omp_tune.h"
 #ifdef COLI_CUDA
@@ -79,7 +86,12 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
-#include <omp.h>
+/* No <omp.h> here: the guarded include above already provides it under _OPENMP
+ * and shims omp_get_max_threads/omp_get_thread_num without it. Including it
+ * unconditionally defeated that fallback and made METAL=1 unbuildable on a
+ * stock macOS -- exactly the platform this backend targets -- even though the
+ * Makefile advertises the single-threaded path ("libomp not found: building
+ * single-threaded"). */
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
@@ -3191,7 +3203,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                 m->dsa_nsel=malloc((size_t)S*sizeof(int));
             }
-            #pragma omp parallel for schedule(dynamic,1)
+            /* if(S>1): at decode S is 1, so this region has exactly ONE iteration --
+             * and OpenMP still forks and joins the whole team to run it. That is
+             * pure overhead on the hottest path there is: once per layer, per
+             * token, whether or not the body does any work (both early `continue`
+             * branches below are taken on short contexts, and the fork happens
+             * anyway). The clause makes the single-iteration case run inline;
+             * S>1 prefill is untouched, and the results are identical either way. */
+            #pragma omp parallel for schedule(dynamic,1) if(S > 1)
             for(int s=0;s<S;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;
                 int pos=positions?positions[s]:pos_base+s, nk=pos+1;
@@ -8131,6 +8150,34 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
 
+/* Automatic history pinning and the adaptive LRU share the expert RAM budget.
+ * Preserve the LRU capacity affordable before pinning, up to the requested
+ * cap; explicit PIN/PIN_GB settings bypass this policy and remain authoritative. */
+static double autopin_preserve_lru(double planned_pin, double expert_available,
+                                   double lru_reserve){
+    if(planned_pin<=0.0 || expert_available<=lru_reserve) return 0.0;
+    double max_pin=expert_available-lru_reserve;
+    return planned_pin<max_pin?planned_pin:max_pin;
+}
+
+static double autopin_lru_reserve(double expert_available, double bytes_per_slot,
+                                  int requested_cap, int *preserved_cap){
+    int cap=0;
+    if(expert_available>0.0 && bytes_per_slot>0.0 && requested_cap>0){
+        int affordable=(int)(expert_available/bytes_per_slot);
+        cap=requested_cap<affordable?requested_cap:affordable;
+    }
+    if(preserved_cap) *preserved_cap=cap;
+    return (double)cap*bytes_per_slot;
+}
+
+static double expert_cache_bytes_per_slot(Model *m, int ebits){
+    int nsp=0;
+    for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
+    if(m->has_mtp) nsp+=2;
+    return (double)nsp*(double)expert_bytes_probe(m,ebits);
+}
+
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
  * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
@@ -9184,7 +9231,19 @@ int main(int argc, char **argv){
            * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
            * qualche ora di chat) arriva a meta' del budget expert. */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
-          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
+          double expert_available=expert_avail(&m,ram_env,ebits,est_ctx);
+          double planned_pin=expert_available*0.5*conf;
+          int preserved_cap=0;
+          double lru_reserve=autopin_lru_reserve(
+              expert_available,expert_cache_bytes_per_slot(&m,ebits),
+              m.ecap,&preserved_cap);
+          double pin_bytes=autopin_preserve_lru(
+              planned_pin,expert_available,lru_reserve);
+          if(pin_bytes+1.0<planned_pin)
+              fprintf(stderr,"[PIN] auto: %.1f GB plan capped to %.1f GB to preserve "
+                  "the no-pin LRU cap %d/layer\n",
+                  planned_pin/1e9,pin_bytes/1e9,preserved_cap);
+          double pin_gb=pin_bytes/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.

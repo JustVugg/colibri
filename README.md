@@ -457,6 +457,25 @@ Two things that differ per model, both documented in the per-model page:
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
+## DeepSeek V4
+
+The experimental CPU path for **DeepSeek V4 Flash** uses native FP4 experts,
+automatic RAM planning, shared `st.h` / `quant.h` infrastructure, and a
+persistent target engine. DSpark is intentionally kept for a separate stacked
+follow-up. The target engine is supported on x86-64/aarch64 Linux and
+Windows/MSYS2.
+
+```bash
+cd c
+make deepseek-v4
+python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
+  "What is the capital of France?"
+# The same model also works with: coli chat / coli serve / coli web
+```
+
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for status, checkpoint
+validation, unified CLI/server usage, and the generated tiny independent oracle.
+
 ## What's next
 
 - **Inference-systems research is the product.** The current hierarchy is LRU +
@@ -499,7 +518,7 @@ c/
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client)
 desktop/                  Tauri v2 desktop shell wrapping the web UI
-docs/                     reference docs, experiments, media
+docs/                     reference docs, experiments, media, DeepSeek V4
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small

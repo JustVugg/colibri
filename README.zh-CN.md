@@ -283,6 +283,25 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 | 语法强制草稿（结构化输出） | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | 环境变量完整清单 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
+## DeepSeek V4
+
+实验性的 **DeepSeek V4 Flash** CPU 路径使用原生 FP4 专家、自动 RAM
+规划、共享的 `st.h`／`quant.h` 基础设施，以及常驻 target engine。
+DSpark 有意保留给紧随其后的独立 stacked PR。本 target engine 支持
+x86-64／aarch64 Linux 与 Windows／MSYS2。
+
+```bash
+cd c
+make deepseek-v4
+python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
+  "法国的首都是哪里？"
+# 同一模型也支持：coli chat / coli serve / coli web
+```
+
+状态、checkpoint 验证、统一 CLI／server 用法和动态生成的 tiny 独立
+oracle 说明，请参阅[中文版 DeepSeek V4 文档](docs/deepseek-v4.zh-CN.md)；
+英文原文见 [docs/deepseek-v4.md](docs/deepseek-v4.md)。
+
 ## 下一步
 
 - **推理系统研究就是产品。**当前层级采用 LRU 与学习型固定集；正在研究模型格式、压缩、
@@ -323,7 +342,7 @@ c/
 └── tests/                零依赖的 C 与 Python 测试
 web/                      浏览器 UI（纯 OpenAI API client）
 desktop/                  封装网页 UI 的 Tauri v2 桌面 shell
-docs/                     参考文档、实验与媒体文件
+docs/                     参考文档、实验、媒体文件与 DeepSeek V4 说明
 ```
 
 运行时路径刻意保持扁平、易读：`colibri.c` 加上若干头文件。

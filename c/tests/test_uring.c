@@ -27,9 +27,11 @@ static int test_expert_layout(int fd){
     for(int k=0;k<3;k++){
         char name[300];
         snprintf(name,sizeof(name),"model.layers.1.mlp.experts.7.%s.weight",proj[k]);
-        m.S.t[k]=(st_tensor){strdup(name),fd,wo,wbytes[k],3,wbytes[k]}; wo+=wbytes[k];
+        m.S.t[k]=(st_tensor){.name=strdup(name),.fd=fd,.off=wo,
+            .nbytes=wbytes[k],.dtype=3 /* U8 */,.numel=wbytes[k]}; wo+=wbytes[k];
         size_t n=strlen(name); memcpy(name+n,".qs",4);
-        m.S.t[3+k]=(st_tensor){strdup(name),fd,so,sbytes[k],2,sbytes[k]/4}; so+=sbytes[k];
+        m.S.t[3+k]=(st_tensor){.name=strdup(name),.fd=fd,.off=so,
+            .nbytes=sbytes[k],.dtype=2 /* F32 */,.numel=sbytes[k]/4}; so+=sbytes[k];
     }
     if(uring_batch_init(&batch)){ free(m.S.t); return fail("expert ring init"); }
     uring_batch_reset(&batch);

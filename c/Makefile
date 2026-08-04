@@ -250,6 +250,23 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
+
+# DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
+# tests run everywhere; the engine and token-exact fixture run on x86-64
+# Linux/Windows and aarch64 Linux. SIMD fast paths are gated per-feature
+# inside the sources, so a plain armv8-a build stays correct.
+COLI_V4_SUPPORTED :=
+ifneq (,$(X86_64))
+ifneq (,$(IS_WIN)$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+ifneq (,$(AARCH64))
+ifneq (,$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+
 # Gates are exactly the tests that have a build rule further down -- derived from those
 # rules, so adding a gate means adding your tests/test_*.c and its rule, and nothing else.
 # There is no shared list to conflict on.
@@ -261,11 +278,16 @@ CUDA_OBJ  =
 # work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
 # they fail to link. Having a rule is the honest definition of "this is a gate".
 TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
-# test_uring has a rule but is Linux-only; it is appended conditionally just below.
-TEST_EXCLUDE = test_uring
+# test_uring is Linux-only. V4 engine tests are appended below only on supported
+# x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
+# unconditional rules and therefore remain portable gates.
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+endif
+ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
 endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -367,6 +389,47 @@ VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_ab
 endif
 
 all: colibri$(EXE)
+
+.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
+	deepseek-v4-tiny-check deepseek-v4-clean
+ifeq ($(COLI_V4_SUPPORTED),1)
+deepseek-v4:
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+
+deepseek-v4-clean:
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+
+deepseek-v4-tiny-generate:
+	$(PYTHON) tools/make_deepseek_v4_tiny.py \
+		--output ./deepseek_v4_tiny --force
+
+deepseek-v4-tiny-check: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
+	$(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+
+deepseek-v4-oracle: deepseek-v4
+	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--output tests/deepseek_v4_oracle.json \
+		--memory-gb $(or $(MEMORY_GB),32) \
+		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
+		--validate \
+		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
+		--greedy $(or $(ORACLE_GREEDY),20)
+else
+deepseek-v4 deepseek-v4-oracle:
+	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
+deepseek-v4-clean:
+	@:
+deepseek-v4-tiny-check:
+	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-generate:
+	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+endif
 
 # phony targets — 'glm' kept for backward compatibility
 colibri: colibri$(EXE)
@@ -558,8 +621,14 @@ tests/test_json$(EXE): tests/test_json.c json.h
 
 tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
+tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -657,6 +726,59 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h tensor.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+
+ifeq ($(COLI_V4_SUPPORTED),1)
+include Makefile.deepseek-v4.units
+V4_TEST_LINK_OBJS = \
+	COLI_V4_UNIT_ST.o \
+	COLI_V4_UNIT_CONFIG.o \
+	COLI_V4_UNIT_MATH.o \
+	COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o \
+	COLI_V4_UNIT_PROMPT.o \
+	$(addsuffix .o,$(V4_TEST_UNITS)) \
+	COLI_V4_UNIT_NATIVE_QUANT.o
+
+tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
+		Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
+	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
+V4_OWN_DIR = build/ownership
+V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
+V4_OWNERSHIP_OBJS = \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o
+
+$(V4_OWN_DIR):
+	mkdir -p $(V4_OWN_DIR)
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h st.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h quant.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+
+tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
+	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
+
+endif
+
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -735,19 +857,34 @@ efficiency-cuda:
 efficiency-report:
 	$(PYTHON) tests/test_efficiency_report.py
 
+
+# What a parallel region costs before its body runs. Backs the `if(S > 1)`
+# clause in the DSA indexer: at decode that region has one iteration, and the
+# fork/join is paid anyway. Not a gate -- a measurement, run it when changing
+# how the engine parallelises.
+#   make -C c bench-omp-grain
+# Honours OMP_NUM_THREADS/OMP_WAIT_POLICY, so measure with the settings the
+# engine actually runs under (omp_tune.h sizes the team to physical cores).
+bench-omp-grain: tests/bench_omp_grain.c
+	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
+	./tests/bench_omp_grain
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE)
+install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	@if [ -f deepseek_v4$(EXE) ]; then \
+	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
+	fi
 	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
@@ -769,7 +906,13 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable \
+	test-c test-python test check clean install uninstall bench
+
+# Own line: see the TEST_RULES note above on shared .PHONY lines.
+.PHONY: bench-omp-grain
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

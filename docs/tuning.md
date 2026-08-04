@@ -28,6 +28,10 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 | `KVSAVE=0` | disable KV-cache persistence |
 | `TF=1` | teacher-forcing validation |
 
+Automatic history pinning and the adaptive LRU share the same expert RAM
+budget. Colibri caps automatic pinning to preserve the no-pin LRU capacity;
+explicit `PIN` and `PIN_GB` settings remain authoritative.
+
 ## Resource policy
 
 `coli plan` reports the planned hot (VRAM), warm (RAM), and cold backing (disk)
