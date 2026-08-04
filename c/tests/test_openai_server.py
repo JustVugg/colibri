@@ -413,6 +413,32 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+
+    def test_parses_hwinfo_backends(self):
+        def respond(process, frame):
+            pass
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model", kv_slots=2)
+            
+        # The engine spawns a thread running _dispatch_stdout automatically!
+        # Just feed the data and then wait for it to process.
+        process.stdout.feed(b"HWINFO 32 197.0 153.3 1 30.6 CPU|Vulkan device x1\n")
+        import time
+        time.sleep(0.1)
+        self.assertEqual(engine.hwinfo["backend"], "vulkan")
+
+        process.stdout.feed(b"HWINFO 32 197.0 153.3 2 30.6 CPU|CUDA device x2\n")
+        time.sleep(0.1)
+        self.assertEqual(engine.hwinfo["backend"], "cuda")
+
+        process.stdout.feed(b"HWINFO 32 197.0 153.3 0 0.0 CPU|\n")
+        time.sleep(0.1)
+        self.assertEqual(engine.hwinfo["backend"], "cpu")
+        engine.close()
+
+
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 

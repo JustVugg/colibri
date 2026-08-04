@@ -86,6 +86,28 @@ def _cuda_available() -> bool:
 
 @unittest.skipUnless(_engine_present(), _skip_reason() or "glm.exe + glm_tiny required")
 class TinyEfficiencyTest(unittest.TestCase):
+
+    def test_vulkan_telemetry_parses(self):
+        from tools import diag_harness, efficiency
+        stdout = ""
+        stderr = """
+[VK] ready: AMD Radeon RX 7900 XTX
+[VK] dev2 ready: AMD Radeon RX 7900 XTX
+[VK] dev2 tier: 12 hot experts resident (15.5 GB VRAM)
+[VK] dense preloaded: 4 tensors, 2.3 GB VRAM
+"""
+        metrics = diag_harness.extract_metrics(stdout, stderr)
+        vk_devices = metrics.get('vk_devices', [])
+        self.assertEqual(len(vk_devices), 2)
+        self.assertEqual(metrics['vk_tier']['resident'], 12)
+        self.assertEqual(metrics['vk_tier']['vram_gb'], 15.5)
+        self.assertEqual(metrics['vk_dense']['tensors'], 4)
+        
+        parsed = efficiency.parse_run(stdout, stderr)
+        self.assertTrue(parsed['vk']['enabled'])
+        self.assertEqual(parsed['vk']['expert_count'], 12)
+        self.assertEqual(parsed['vk']['expert_gb'], 15.5)
+        self.assertEqual(parsed['vk']['resident_tensors'], 4)
     """Asserted regression tests on the resident tiny model. Gates CI."""
 
     def _run(self, **overlay):
