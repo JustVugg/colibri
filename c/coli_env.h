@@ -4,8 +4,10 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * The engines read 212 environment variables from 187 scattered getenv() call
- * sites, and until this header there was no list of them anywhere in the code.
+ * The engines read 220 environment variables from getenv() call sites
+ * scattered across the sources, and until this header there was no list of
+ * them anywhere in the code. (`make check-env` prints the current count; it is
+ * the one number here that cannot go stale, because it is computed.)
  * Two consequences, both of which cost real debugging time:
  *
  *   COLI_PREFIL_CHUNK=512 ./colibri ...      <- typo: silently ignored
@@ -19,7 +21,7 @@
  *
  * This is the approach vLLM converged on (vllm/envs.py): one declaration point,
  * one prefix convention, validation at the boundary. It is worth stating that
- * vLLM carries 284 of these to our 212 -- the count is not the problem in
+ * vLLM carries 284 of these to our 220 -- the count is not the problem in
  * either project, the absence of a registry was.
  *
  * WHAT IT DELIBERATELY DOES NOT DO
@@ -65,6 +67,10 @@ typedef enum { CE_BOOL, CE_INT, CE_FLOAT, CE_STR, CE_PATH } ColiEnvType;
 #define CE_KIMI     0x2
 #define CE_INKLING  0x4
 #define CE_OLMOE    0x8
+#define CE_DSV4     0x10
+/* CE_ALL is the four engines that share route_trace.h / rans.h / omp_tune.h.
+ * deepseek_v4.c includes none of them, so it is deliberately NOT in CE_ALL --
+ * adding it there would claim every shared-header knob is read by V4 too. */
 #define CE_ALL      (CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE)
 
 #define CE_DEPRECATED 0x1   /* still read; `replacement` names what to use */
@@ -139,6 +145,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_MODEL",                      CE_STR   , CE_COLIBRI , 0             , NULL},
     {"COLI_MODEL_DIRS",                 CE_PATH  , CE_COLIBRI , 0             , NULL},
     {"COLI_MODEL_MIRROR",               CE_STR   , CE_COLIBRI , 0             , NULL},
+    {"COLI_MTP_GUARD_PCT",              CE_INT   , CE_COLIBRI , 0             , NULL},
+    {"COLI_MTP_GUARD_WINDOW",           CE_INT   , CE_COLIBRI , 0             , NULL},
     {"COLI_NO_FUSED_PAIR",              CE_INT   , CE_COLIBRI , 0             , NULL},
     {"COLI_NO_OMP_TUNE",                CE_STR   , CE_ALL     , 0             , NULL},
     {"COLI_NUMA",                       CE_INT   , CE_COLIBRI , 0             , NULL},
@@ -154,6 +162,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_TEMP",                       CE_FLOAT , CE_ALL     , 0             , NULL},
     {"COLI_USAGE",                      CE_STR   , CE_ALL     , 0             , NULL},
     {"COLI_USAGE_DECAY",                CE_FLOAT , CE_ALL     , 0             , NULL},
+    {"COLI_V4_EXPERT_PREFETCH",         CE_BOOL  , CE_DSV4    , 0             , NULL},
     {"COLI_VK_ATTN",                    CE_INT   , CE_COLIBRI , 0             , NULL},
     {"COLI_VK_DENSE",                   CE_INT   , CE_COLIBRI , 0             , NULL},
     {"COLI_VK_DEV2",                    CE_STR   , CE_COLIBRI , 0             , NULL},
@@ -174,6 +183,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"CTX_MAX",                         CE_STR   , CE_INKLING , 0             , NULL},
     {"CUDA_DENSE",                      CE_INT   , CE_COLIBRI , 0             , NULL},
     {"CUDA_EXPERT_GB",                  CE_FLOAT , CE_COLIBRI , 0             , NULL},
+    {"CUDA_EXPERT_LOAD_BALANCE",        CE_INT   , CE_COLIBRI , 0             , NULL},
     {"CUDA_RAW_EXPERTS",                CE_INT   , CE_ALL     , 0             , NULL},
     {"CUDA_RELEASE_HOST",               CE_INT   , CE_COLIBRI , 0             , NULL},
     {"CUDA_RESERVE_GB",                 CE_FLOAT , CE_COLIBRI , 0             , NULL},
@@ -200,6 +210,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"IDOT",                            CE_INT   , CE_ALL     , 0             , NULL},
     {"INK_DENSE_Q4",                    CE_STR   , CE_INKLING , 0             , NULL},
     {"INK_METAL_MIN_S",                 CE_INT   , CE_INKLING , 0             , NULL},
+    {"INK_METAL_SHARED",                CE_BOOL  , CE_INKLING , 0             , NULL},
     {"INK_PREFIX_LOG",                  CE_STR   , CE_INKLING , 0             , NULL},
     {"K3_BITS",                         CE_INT   , CE_KIMI    , 0             , NULL},
     {"K3_CHAT_IDS",                     CE_STR   , CE_KIMI    , 0             , NULL},
@@ -290,6 +301,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"TOPP",                            CE_FLOAT , CE_ALL     , 0             , NULL},
     {"URING",                           CE_INT   , CE_COLIBRI , 0             , NULL},
     {"USAGE_SAVE",                      CE_STR   , CE_ALL     , 0             , NULL},
+    {"V4_PREFIX_LOG",                   CE_STR   , CE_DSV4    , 0             , NULL},
     {"VK_PROF",                         CE_STR   , CE_ALL     , 0             , NULL},
     {"WARMUP",                          CE_INT   , CE_OLMOE   , 0             , NULL},
     {"WIDE",                            CE_INT   , CE_OLMOE   , 0             , NULL},
