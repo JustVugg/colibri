@@ -1,6 +1,21 @@
 # Python dependencies for the colibri offline converter / oracle / download tools
 # (c/tools/*.py and c/*.py). Minimum-version pins; for a fully reproducible env,
 # freeze exact versions into your own lockfile with `pip freeze > locked.txt`.
+#
+# DEVELOPMENT TOOLING ONLY — none of this is a Colibri runtime dependency. The
+# engine is a C binary; once a model (or the generated glm_tiny oracle) exists on
+# disk, running it needs no Python at all.
+#
+# Installing this whole file is only needed for the download/convert tools. To
+# generate the tiny GLM oracle (tools/make_glm_oracle.py) the direct set is just:
+#
+#     torch  transformers>=5.11  safetensors
+#
+# transformers>=5.11 is a hard requirement there, not a preference: the generator
+# exits rather than run below it, because older releases apply split-half Llama
+# RoPE and silently emit an oracle the engine cannot match (issue #281). See
+# docs/windows.md "Generating the synthetic GLM oracle model" for an isolated
+# CPU-only setup.
 torch>=2.4
 safetensors>=0.4
 huggingface-hub>=0.24

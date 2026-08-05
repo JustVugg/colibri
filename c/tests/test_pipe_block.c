@@ -58,9 +58,11 @@ static int build_fixture(Model *m,int fd){
         for(int k=0;k<3;k++){
             char name[300];
             snprintf(name,sizeof(name),"model.layers.%d.mlp.experts.%d.%s.weight",LAYER,e,proj[k]);
-            m->S.t[e*6+k]=(st_tensor){strdup(name),fd,wo,WB,3,WB}; wo+=WB;
+            m->S.t[e*6+k]=(st_tensor){.name=strdup(name),.fd=fd,.off=wo,
+                .nbytes=WB,.dtype=3 /* U8 */,.numel=WB}; wo+=WB;
             size_t n=strlen(name); memcpy(name+n,".qs",4);
-            m->S.t[e*6+3+k]=(st_tensor){strdup(name),fd,so,sbytes[k],2,sbytes[k]/4}; so+=sbytes[k];
+            m->S.t[e*6+3+k]=(st_tensor){.name=strdup(name),.fd=fd,.off=so,
+                .nbytes=sbytes[k],.dtype=2 /* F32 */,.numel=sbytes[k]/4}; so+=sbytes[k];
         }
     }
     return 0;

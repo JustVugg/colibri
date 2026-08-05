@@ -500,11 +500,11 @@ static void pin_hot_experts(Model *m) {
     for (int l = 0; l < c->n_layers; l++) {
         uint32_t *freq_l = m->freq[l];
         if (!freq_l) continue;                    /* a layer with no row cannot be ranked */
-        
+
         uint64_t layer_total = 0;
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
         if (layer_total == 0) continue;
-        
+
         int max_pin = m->cache[l].cap - 8;
         if (max_pin < 4) max_pin = 4;
         
@@ -763,7 +763,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
             pthread_mutex_unlock(&g_pilot_mx);
             return; /* all pinned/in-flight, skip */
         }
-        
+
         /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
         if (g_pilot_evict_guard && m->freq && m->freq[layer] && m->last_access &&
             lc->slots[lru].eid >= 0) {
@@ -776,7 +776,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
                 return; /* drop speculation */
             }
         }
-        
+
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;

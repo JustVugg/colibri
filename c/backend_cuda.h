@@ -35,11 +35,20 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
+/* Per-device form of coli_cuda_group_stats; unknown devices return zeros. */
+COLI_CUDA_DLLEXPORT void coli_cuda_group_stats_device(
+    int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,
+    double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
 /* Publish the E8 codebook (quant.h's e8_grid, 256x4 bytes) to every configured
  * device. Must be called after coli_cuda_init and before any fmt=6 upload; the
  * backend keeps no copy of the table so it cannot drift from the CPU decoder. */
 COLI_CUDA_DLLEXPORT int coli_cuda_e8_set_grid(const void *grid);
+
+/* Publish the fmt=8 e4m3 decode table (quant.h's E4M3_LUT, 256 f32) the same
+ * way. Must be called after coli_cuda_init; fmt=8 uploads are refused until it
+ * succeeds, because kernels would decode against a zero-initialized table. */
+COLI_CUDA_DLLEXPORT int coli_cuda_fp8_set_lut(const float *lut);
 
 /* Upload without executing, so capacity failures happen during model startup. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,

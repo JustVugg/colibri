@@ -22,6 +22,39 @@ jobs:
   # that inkling and kimi_k3 did not compile under msys2/UCRT64 at all was invisible
   # for months, and binary releases silently shipped the GLM engine alone (#720).
   # Each engine is built separately so one failure does not mask the others.
+  # The container image. Nothing built docker/Dockerfile.slim in CI before, so a
+  # rename or a moved file under c/ could break the image and only a user would
+  # find out -- the same gap the .mm and fuzz-rans paths had.
+  #
+  # Only Dockerfile.slim is built here, on purpose. docker/Dockerfile does
+  # `git clone` of the upstream repo (that is its point -- README's zero-setup
+  # path downloads that one file and needs no checkout), so building it in CI
+  # would test upstream/main rather than this PR. Its Dockerfile is linted for
+  # syntax instead.
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the slim image
+        run: docker build -t colibri:ci -f docker/Dockerfile.slim .
+      - name: The image actually runs
+        # Building is not the same as working: a missing COPY only shows up when
+        # the entrypoint tries to import what is not there. --version needs no
+        # model, so it exercises the launcher end to end without a 372 GB mount.
+        run: |
+          docker run --rm colibri:ci --version
+          docker run --rm colibri:ci --help > /dev/null
+      - name: The engine binary is in the image and is executable
+        run: docker run --rm --entrypoint /app/colibri colibri:ci --help 2>&1 | head -5 || true
+      - name: Lint both Dockerfiles
+        # docker/Dockerfile is not built here (see above) but it is still shipped
+        # and followed by users, so it gets checked for syntax at least.
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile
+          failure-threshold: error
+
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
     strategy:
@@ -45,6 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: matrix.os == 'windows-latest'
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -53,6 +87,7 @@ jobs:
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
       - name: Build every engine
@@ -65,6 +100,53 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+
+      # The Windows backend-DLL loader contract (c/tests/test_backend_loader.py)
+      # had no CI anywhere: the `python` job below is Linux-only, where these
+      # tests do not apply. They need no GPU and no HIP SDK — the fixtures are
+      # stub DLLs this job's MinGW gcc/objdump build on the fly.
+      #
+      # shell: pwsh overrides the job default so the tests run outside the MSYS2
+      # shell; MSYS2 is on PATH only so gcc/objdump/make are reachable for
+      # fixture compilation. The tests themselves are separator-agnostic (they
+      # normalise both sides before comparing), so neither interpreter choice nor
+      # the shape of the temp root can decide the outcome.
+      - name: Windows backend-loader contract tests (no GPU)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          # Nothing here may reach a real GPU, runtime or backend.
+          COLI_CUDA: ''
+          COLI_GPU: ''
+          CUDA_DENSE: ''
+          COLI_HIP_RUNTIME_DIR: ''
+          HIP_PATH: ''
+        run: |
+          # ucrt64\bin for gcc/objdump AND usr\bin for make: without make, the
+          # host-matrix class skips at setUpClass and the run silently loses
+          # tests instead of failing.
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          $env:PATH = "$msys\ucrt64\bin;$msys\usr\bin;$env:PATH"
+          foreach ($v in 'COLI_CUDA','COLI_GPU','COLI_GPUS','CUDA_DENSE','CUDA_EXPERT_GB',
+                         'COLI_HIP_RUNTIME_DIR','HIP_PATH','ROCM_PATH','ROCM_HOME',
+                         'HIP_DEVICE_LIB_PATH','HSA_OVERRIDE_GFX_VERSION',
+                         'HIP_VISIBLE_DEVICES','CUDA_VISIBLE_DEVICES') {
+            Remove-Item "env:$v" -ErrorAction SilentlyContinue
+          }
+          python -c "import sys, os, tempfile; print('python', sys.executable); print('os.sep', repr(os.sep)); print('tmp', tempfile.gettempdir())"
+          gcc --version | Select-Object -First 1
+          make --version | Select-Object -First 1
+          cd c
+          $out = python -m unittest tests.test_backend_loader -v 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0) { throw "loader contract tests failed" }
+          # A missing toolchain shows up as setUpClass skips, not failures, so a
+          # green run with a shrunken test count would hide the real problem.
+          if ($out -notmatch '(?m)^Ran (\d+) tests') { throw "could not parse the test count" }
+          $ran = [int]$Matches[1]
+          $skipped = ([regex]::Matches($out, '\.\.\. skipped')).Count
+          "ran=$ran skipped=$skipped"
+          if ($skipped -gt 0) { throw "$skipped loader test(s) skipped: the Windows toolchain is incomplete" }
 
   engine-cuda-syntax:
     name: CUDA syntax check
@@ -120,7 +202,68 @@ jobs:
           # forward); the greedy pass exits non-zero on any mismatch, so this
           # gate fails the moment a shared-code change regresses the engine.
           python3 tools/make_tiny_inkling.py tiny_inkling
-          SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_inkling.json
+          # The oracle at several cache capacities (#784): a capacity-1 cache
+          # exercises eviction on every routed expert, which is where a slot
+          # bookkeeping bug shows up and a capacity-8 run never would.
+          for cap in 1 2 8; do
+            SNAP=tiny_inkling ./inkling "$cap" 0 tiny_inkling/ref_inkling.json
+          done
+      - name: KV prefix reuse is token-identical (serve, two turns)
+        run: |
+          cd c
+          # Reusing a previous turn's attention state must change the timing and
+          # nothing else. A wrong reuse length does not crash -- it answers from
+          # another conversation's state and still reads plausibly -- so this is
+          # the only gate that would catch it. Needs the fixture above, which is
+          # why it runs here and not in `make check`.
+          INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
+
+  # The efficiency suite against the tiny GLM oracle. These 8 tests existed but
+  # had never run anywhere: they looked for c/glm.exe, a name that stopped
+  # existing at the glm -> colibri rename, so _engine_present() was False on
+  # every platform and all of them skipped. With that fixed they need only the
+  # generated fixture, same shape as inkling-oracle above.
+  #
+  # Only the four that assert STRUCTURE are run, not the throughput floor:
+  # a shared runner's tok/s is not reproducible, and a flaky perf gate gets
+  # muted within a week. What these catch is real all the same -- the telemetry
+  # lines the whole efficiency tooling parses, PROFILE phases going missing or
+  # negative (double-counting), a fully-resident model becoming I/O bound, and
+  # two identical greedy runs diverging.
+  efficiency:
+    name: Efficiency suite (tiny oracle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build colibri
+        run: make -C c colibri
+      - name: Generate the glm_tiny fixture
+        run: cd c && python3 tools/make_glm_oracle.py
+      - name: Token-exact oracle (teacher forcing)
+        # The fixture is only trustworthy if the engine reproduces it, so assert
+        # that before reading anything else out of a run.
+        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Structural efficiency tests
+        # test_cpu_vs_cpu_determinism is NOT in this list. Despite the name its
+        # second assertion is a tok/s stability bound (two runs within 25%), and
+        # the tiny replay is 15 ms end to end -- it measured 38.8% between two
+        # identical runs on a quiet local box, so a shared runner would make it
+        # flaky on day one. Its first assertion (hit-rate identical) IS a real
+        # determinism check and does hold; splitting the two is worth doing, but
+        # not silently from a CI change.
+        run: |
+          cd c
+          python3 -m unittest -v \
+            tests.test_inefficiency.TinyEfficiencyTest.test_telemetry_parses \
+            tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
+            tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant
 
   engine-hip-syntax:
     name: HIP syntax check

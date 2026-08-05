@@ -2,11 +2,32 @@
 
 Reference for the environment variables read by the colibrì engine.
 
-**Generated from `dev @ d5327e2`** by scanning every `getenv()` site in `c/glm.c` and the other C sources (`c/olmoe.c`, `c/backend_cuda.cu`, `c/backend_metal.mm`). Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
+**Generated from `dev @ 7fb1159`** by scanning every `getenv()` / `getenv_utf8()` site in `c/*.c`, `c/*.h`, `c/*.cu` and `c/*.mm`. Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
 
 ## Which program reads these?
 
-The C engine binary (`c/glm`, built from `c/glm.c`) reads **all** of these. You rarely export them by hand — the `coli` CLI and `openai_server.py` translate most of their flags into these variables before launching `glm` (e.g. `--temp` → `TEMP`, `--ctx` → `CTX`). See [SETTINGS.md](SETTINGS.md) for the flag → variable mapping. Export a variable directly only to reach a knob the CLI doesn't surface, or to override what the CLI would set.
+**There are four engine binaries, and they do not share a knob set.** The main
+engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
+what follows, but the sister engines read their own:
+
+| Engine | Source | Its own variables |
+|---|---|---|
+| `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
+| `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
+| `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
+| `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
+
+Setting an `INK_*` variable while running `colibri` does nothing, and vice
+versa; nothing warns you about it. A few variables are genuinely shared because
+they live in headers every engine includes (`COLI_USAGE`, `USAGE_SAVE`,
+`COLI_USAGE_DECAY` in `route_trace.h`; `RANS_*` in `rans.h`;
+`COLI_NO_OMP_TUNE` / `OMP_NUM_THREADS` in `omp_tune.h`).
+
+You rarely export any of them by hand — the `coli` CLI and `openai_server.py`
+translate most of their flags into these variables before launching the engine
+(e.g. `--temp` → `TEMP`, `--ctx` → `CTX`). See [SETTINGS.md](SETTINGS.md) for
+the flag → variable mapping. Export a variable directly only to reach a knob the
+CLI doesn't surface, or to override what the CLI would set.
 
 Format: `VAR` — default — effect.
 
@@ -40,8 +61,20 @@ Format: `VAR` — default — effect.
 | `COLI_METAL` | off | Enable the Apple-Silicon Metal GPU backend. Requires a `make METAL=1` build. |
 | `COLI_METAL_GEMM_MIN` | `16` | Minimum matmul rows to dispatch a GEMM to the GPU (below this, stays on CPU). |
 | `COLI_METAL_SPIN` | off | Keep a GPU keep-alive spinner running (reduces dispatch latency; costs power). |
+| `COLI_METAL_PREFILL` | `0` (off) | `=1` runs S>4 (prefill) attention on the GPU. Off by default because the CPU path is bit-exact; this one is an opt-in speed/exactness trade. |
+| `COLI_GEMM_CHUNK` | `1` (on) | Split a large GEMM dispatch into ≤2^25-thread chunks. `=0` restores the single full dispatch (the pre-fix behaviour), so the fix can be A/B'd on one binary. |
+| `COLI_RTOP8` | `1` (on) | Parallel top-8 router kernel. `=0` falls back to the serial one. |
+| `COLI_METAL_RESSET` | off | `=1` uses an `MTLResidencySet` (macOS 15+) for the resident buffers instead of per-dispatch `useResource` calls. |
 | `PIPE` | `0` (off) | Overlap expert disk-load with matmul via I/O worker threads. Byte-identical output; reorders I/O. `PIPE=1` opts in. |
 | `PIPE_WORKERS` | `8` | Number of pthread loaders when `PIPE=1`, or the io-wq worker maximum per ring when `URING=1` (capped at 64). Tune to SSD queue depth and available cores. |
+| `COLI_PIPE_BLOCK` | `0` (spin) | `=1` makes `pipe_wait` block instead of spinning. Spinning wins on an idle box; blocking is better when the cores are contended. |
+| `PILOT_WORKERS` | `1` | Pilot loader threads on the blocking (non-`URING`) `PILOT_REAL` path, via an SPMC ring. `>1` raises NVMe queue depth. Clamped to [1,16]; `1` is byte-identical to the historic behaviour. |
+| `PILOT_EVICT_GUARD` | `1` (on) | Keep pilot-prefetched experts from being evicted before they are used. `=0` restores plain LRU eviction (A/B). Also read by `olmoe`. |
+| `RSS_GUARD_GB` | the resolved RAM budget | Resident-set ceiling (GB) checked every 16 emitted tokens; the cache is trimmed when it is crossed. Set explicitly to guard tighter or looser than the RAM budget. |
+| `XEXP` | `0` (off) | `=1` runs ONE OpenMP region across all experts of a batch-union block instead of ~2 fork/joins per expert. Engages only at S=1 with an all-resident int4 block, off the speculation window, and with the int4-IDOT S=1 family (`I4S<=1`); output is byte-identical to that family. Measured +11.6% on a 2-socket 48-core Ice Lake, but neutral-to-negative on a 24-core box — hence opt-in. Measure on your host. |
+| `COLI_KV_SHARE` | `0` (off) | `=1` lets a new serve slot adopt an existing slot's KV prefix instead of re-prefilling it. Measured on 6x5090 with a 675-token shared prefix: slot TTFT 50.1s → 1.7s, generated tokens identical. |
+| `COLI_GROUP_ASYNC` | `0` (off) | `=1` issues and collects CUDA expert groups asynchronously so CPU and GPU overlap at decode (S≤4). |
+| `COLI_DISKCLASS_WINDOW` | see source | Recency window (in ticks) for the DISK-CLASS heat statistic. |
 | `URING` | `0` (off) | Linux-only queued expert I/O. `URING=1` implies `PIPE=1`, forces cold reads through io-wq (`IOSQE_ASYNC`), replaces blocking loader pthreads and spin waits with batched SQEs/CQEs, and batches `PILOT_REAL` loads on a separate ring. Use `DIRECT=1` for cold NVMe to avoid page-cache copy/readahead limits. Fails clearly if the kernel denies io_uring; incompatible with `COLI_MMAP=1`. |
 | `DIRECT` | `0` (off) | Use `O_DIRECT`/unbuffered reads for expert slabs. **Drive-dependent — measure it on your hardware.** On real NVMe with DRAM cache and headroom it is often a large win (measured +34% decode with `PIPE=1` on a Blackwell/Windows box, and 4.25→9.69 GB/s in iobench on a GB10); on QLC/DRAM-less drives or slow/virtualised disks it can be neutral to negative. Helps sustained NVMe; keeps the zero-copy GPU path. |
 | `COLI_NO_OMP_TUNE` | off | **Kill-switch** for the OpenMP hot-thread tuning (`OMP_WAIT_POLICY=active` spin + proc-bind). Set `=1` when the CPU is mostly waiting on the GPU (Metal) so spin doesn't steal the shared power budget. |
@@ -54,7 +87,7 @@ Format: `VAR` — default — effect.
 | `COLI_MMAP` | `0` | `mmap` the weights instead of read()-ing into slabs. |
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
-| `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
+| `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. Automatic pinning is capped so it cannot reduce the adaptive LRU capacity that fits before pinning; explicit `PIN`/`PIN_GB` settings remain authoritative. |
 | `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
@@ -135,6 +168,8 @@ re-measuring. Details that matter when you meet this file in the wild:
 | `COLI_MODEL_DIRS` | unset | SPLIT the model across 2+ drives: a `;`/`,`-separated list of extra directories, each holding a **distinct** subset of the `.safetensors` shards (no duplication). Shards act as a search path — every shard is read from whichever drive holds it, so concurrent expert loads parallelise across drives and combined capacity is used. Scales to N drives. Metadata (config/tokenizer/`.coli_usage`) stays in the primary `COLI_MODEL` dir. Pairs well with `PIPE=1` (concurrent loaders) + `DIRECT=1`. Distinct from — and composable with — `COLI_MODEL_MIRROR`: the mirror is matched per-shard by basename against the merged (split) index, so a mirror dir may hold a copy of any subset of the split's shards. |
 | `COLI_MODEL_MIRROR` | unset | `;`/`,`-separated list of directories, each a byte-identical (read-only) copy of the model on another drive; expert reads split across the primary and every mirror. Partial mirrors work (only the shards present are used). |
 | `COLI_DISK_WEIGHTS` | unset (startup bandwidth probe) | Split ratio `<primary>,<mirror>[,<mirror2>...]` — one positive weight per drive (e.g. `1,1` for 50/50, `9,3` for a fast+slow pair, `1,1,1` for a 3-way mirror). Unset = probe every drive with the engine's own access pattern at startup. |
+| `SNAP_MIRROR` | unset | Legacy alias for `COLI_MODEL_MIRROR`, consulted only when that is unset or empty. |
+| `COLI_MIR_STRIPE` | see source | Stripe granularity for splitting a single expert read across mirror replicas. |
 
 Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRECT=1` so the two copies never compete for page cache.
 
@@ -147,6 +182,19 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_EXPERTS` | `320` | Pinned VRAM expert tier size: top-N experts by `.coli_usage` heat uploaded once at startup and served from VRAM with no RAM slot or disk read. `0` disables the tier (experts stay on the CPU path). ~19 MB VRAM per int4 expert. |
 | `COLI_VK_DENSE` | `0` | Run the resident dense matmuls (attention projections, shared expert) on the GPU. |
 | `COLI_VK_ATTN` | `0` | Run the S≤4 MLA absorb attention core (+ fused o-projection) on the GPU, with a persistent device-side KV mirror. |
+| `COLI_VK_QPREP` | `1` (on) | Fuse the Q-prep step (RMSNorm + rope + compress) into one GPU dispatch instead of splitting it, which cost three fences where one suffices. `0` restores the split path; `2` additionally keeps CPU reference copies of Q and comp for A/B comparison. |
+| `COLI_VK_RESERVE_GB` | `3.0` | VRAM (GB) held back from the expert tier for the lazily-allocated dense weights, KV mirror and staging buffers (measured ~1.7 GB at 4k ctx, growing with `max_t`). Only meaningful when the driver reports `VK_EXT_memory_budget`; without it the `COLI_VK_EXPERTS` count cap applies alone. |
+| `COLI_VK_SPIN_US` | `300` | Microseconds to spin-poll a fence before blocking. `0` always blocks — lower latency at idle, at the cost of a core spinning. |
+
+### Second Vulkan device (opt-in)
+
+A second GPU can hold the *next* heat-ranked experts after dev0's budget stops. Deliberately separate from the first device so the dev0 hot path is untouched and both groups can be in flight at once.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_VK_DEV2` | unset (off) | Enable the second device tier. A number selects that physical device index; `auto` picks a distinct real GPU (a second *logical* device on the same physical GPU is accepted only when forced by index — that is the pre-hardware test mode). |
+| `COLI_VK_EXPERTS2` | `512` | Expert count cap for the dev2 tier (only read when `COLI_VK_DEV2` brought a device up). |
+| `COLI_VK_RESERVE2_GB` | `0.5` | VRAM (GB) held back on dev2, as `COLI_VK_RESERVE_GB` is for dev0. |
 
 See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=1` (see that doc for why).
 
@@ -157,12 +205,19 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_CUDA` | off | Enable the CUDA backend. Requires a CUDA build. An explicit `COLI_CUDA=0` disables it **and suppresses the Windows bare-run auto-enable** (before this, Windows "CPU" runs with `COLI_CUDA=0` silently got a VRAM expert tier). The CLI flag `--gpu none` is the canonical hard off-switch on every platform. |
 | `COLI_GPU` / `COLI_GPUS` | unset | Device selection (`auto`, `none`, or a list like `0,1`). Requires `COLI_CUDA=1`. |
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. Off by default the engine reports `routed experts only (resident dense on CPU)`: on a host where the CPU is the limiter this leaves the dense path of every layer on the CPU while the VRAM tier serves experts only. Measured x2.8 on a 4x A6000 / 24-core host (1.53 -> 4.26 tok/s). |
-| `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
+| `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. Also accepts `auto`. |
+| `CUDA_RESERVE_GB` | `2.0` | VRAM (GB) held back from the expert tier for activations, scratch and the KV cache. |
+| `CUDA_EXPERT_LOAD_BALANCE` | `0` (off) | Experimental multi-GPU expert assignment: keep the same frequency-ranked GPU prefix, but greedily distribute it by accumulated profile weight instead of resident bytes alone. On one 6×RTX 5090 fixed replay its three-run median was +2.9%, with large variance; leave off unless validated on the target workload. |
 | `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
+| `COLI_CUDA_ROUTER` | `0` (off) | `=1` runs the MoE router (logits + top-k select) on the GPU at S=1. Skipped while a routing trace is being recorded, under `CACHE_ROUTE`, and above 4096 experts / topk 64. |
+| `COLI_CUDA_RESID` | `0` (off) | `=1` keeps the residual stream on the device between layers instead of copying it back to the host each time. |
+| `COLI_DSA_GATHER` | `0` (off) | `=1` gathers the DSA-selected KV rows on the GPU. With `DSA_FORCE=1` (identity selection) the output is byte-identical to the dense CUDA path, which is how the gather is validated. |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_ATTN_PREFIX` | off | Reuse one uploaded decode activation across `q_a` and `kv_a` while preserving the stock CPU RMSNorm path. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
+| `COLI_MTP_GUARD_PCT` | `70` | Pause MTP after the guard window when recent acceptance falls below this percentage. |
+| `COLI_MTP_GUARD_WINDOW` | `24` | Number of MTP proposals used by the soft acceptance guard. |
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |
 | `COLI_CUDA_PIPE_SHARD` | off | `=1` runs the multi-device P2P head-shard attention path (opt-in for NVLink topologies; serializes ~95 MB/layer over a star PCIe topology). |
 | `COLI_CUDA_PIPE_S_MIN` | `1` single-GPU, `8` multi-GPU | Minimum prefill batch S to engage the pipe2 CUDA path. |
@@ -229,6 +284,84 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `TF` | unset | Teacher-forcing mode. |
 | `CHAT_TEMPLATE` | `1` | Apply the GLM chat template (`0` = raw prompt). |
 | `PPL` | off (`olmoe.c` only) | `PPL=1` enters teacher-forced NLL/perplexity meter mode in the OLMoE sister engine. |
+| `ABLATE_SCORE` | unset | Causal-ablation sweep over `ABLATE_SCORE=<file>`, with a per-target-position final-logit read-out. Runs before `SCORE` and exits when done. |
+| `ABLATE_OUT` | unset | Where the ablation sweep writes its logit read-out. Pair with `ABLATE_SCORE`; an optional `ROUTE_TRACE` records the post-ablation router trace. |
+| `DEBUG_LOGITS` | unset | In reference-comparison mode, dump per-position logit diagnostics. |
+| `COLI_LOGIT_DUMP` | unset | `=1` prints the top-5 `id:logit` pairs per step to stderr — for comparing two engine configs on identical forced context (backend-exactness triage). |
+| `I3_AVX512` | auto | Force the AVX-512 int3 kernel on (`1`) or off (`0`). |
+| `I3_AVX512_TEST` | unset | Run the AVX-512 int3 self-test and exit. |
+| `COLI_GPU_FAIL_AFTER` | unset | Fault injection: make GPU compute calls start failing after N of them, to exercise the CPU fallback without real hardware faults. Uploads and queries are not gated. |
+| `COLI_VK_TEST_BALLAST` | `0` | Allocate N extra dummy Vulkan buffers to reproduce decode attention degrading with expert-tier size even when VRAM is free (measured 7.9s @2.6k buffer objects → 15.6s @4.3k with 2.9 GB still free). |
+| `COLI_SERVE_ALL_STOPS` | unset | In batched serve mode, keep every stop token instead of filtering to the EOS-like ones. Trades the #401 tool-call safety for behaviour some non-tool clients prefer. |
+| `VK_PROF` | unset | If set, time the Vulkan expert-group path and report it. |
+| `COLI_USAGE` | `<model>/.coli_usage` | Path to the expert-usage history to seed the ranking from, and to write back to. Shared by every engine (`route_trace.h`). |
+| `COLI_USAGE_DECAY` | `1.0` (no decay) | Per-run multiplier applied to the recorded counts before ranking, i.e. a half-life. Without one the ranking freezes: after ~18M recorded selections one more turn moves it by 0.2% and the profile stops following the workload (#780). Values outside `(0,1]` are ignored. |
+| `USAGE_SAVE` | `1` (on) | `=0` runs read-only — the usage history is loaded but never written back. For benchmark loops that would otherwise skew the profile they are measuring. |
+| `RANS_PATH` | auto (best available) | Force a specific rANS kernel (`scalar`, `neon`, `avx512`, …). An unavailable choice yields `invalid` and fails loudly — never a silent downgrade. |
+| `RANS_NEON` | on where built | `=0` kill-switch for the NEON rANS path. |
+| `RANS_AVX512` | on where built | `=0` kill-switch for the AVX-512 rANS path. |
+| `OMP_NUM_THREADS` | unset | Standard OpenMP variable. Setting it disables the engine's own OpenMP hot-thread tuning entirely — the user is assumed to be in charge. |
+
+---
+
+## Kimi K3 engine (`kimi_k3`)
+
+Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quantization selection, so it does not share the `colibri` knobs above.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `K3_BITS` | `4` | Expert quantization width. Setting it at all also pins the choice (the engine otherwise infers it from the container). |
+| `K3_MLA_BITS` | `8` | Quantization width for the MLA attention tensors. |
+| `K3_HEAD_BITS` | `8` | Quantization width for the LM head. |
+| `K3_EXPERT_GB` | `8.0` | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. |
+| `K3_LAYERS` | `0` (all) | Load only the first N layers — for smoke tests and trace-only runs. |
+| `K3_MAXT` | `np + ngen` one-shot, `8192` in serve | KV cache capacity in tokens. In serve mode it is also the prompt-rejection bound. |
+| `K3_CHUNK` | `32` | Prefill chunk size in tokens. Clamped to [1,512]. |
+| `K3_DIRECT` | `1` (on) | Use `O_DIRECT`/unbuffered reads for expert loads. `=0` for buffered. |
+| `K3_IDOT` | `1` (on) | Integer dot-product kernels. `=0` uses exact f32 (A/B numerical checks). |
+| `K3_PIPE` | `1` (on) | Overlap expert disk-load with compute. `=0` serializes. |
+| `K3_LOAD_THREADS` | `4` | Loader threads for the pipe path. Clamped to [1,16]. |
+| `K3_DIRS` | unset | Extra shard directories (`;`/`,`-separated) for a multi-drive split, as `COLI_MODEL_DIRS` is for `colibri`. |
+| `K3_TOPP` | `0` (off) | Prune routed experts to this cumulative gate weight. A quality lever — A/B it against `K3_LOGITS`. |
+| `K3_THINK` | `1` (on) | Emit a reasoning block. `=0` disables. |
+| `K3_VK` | `1` (on where built) | Vulkan expert tier. `=0` forces CPU-only. |
+| `K3_VK_GB` | `0` (driver budget) | VRAM cap (GB) for the K3 Vulkan expert tier. |
+| `K3_VK_UP` | `8` | Expert uploads allowed per step while filling the VRAM tier. |
+| `K3_PREFIX_LOG` | unset | Log the KV-prefix reuse decision either way, with the reason when it is "no" — "it did not get faster" is otherwise indistinguishable from "reuse is off". |
+| `K3_CHAT_IDS` | unset | Print the chat-template token ids for the built prompt, then continue. |
+| `K3_TRACE` | unset | Write a routing trace to `K3_TRACE=<file>`. |
+| `K3_LOGITS` | unset | Write per-step logits to `K3_LOGITS=<file>`. |
+| `K3_X0` | unset | Read input rows `[T, hidden]` as f32 from this file, bypassing the embedding — for feeding activations captured elsewhere. |
+
+## Inkling engine (`inkling`)
+
+Read **only** by `c/inkling.c`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CTX_MAX` | `8192` | Served KV bound. A prompt plus its requested generation beyond this is rejected rather than truncated. |
+| `PIN_N` | `cap / 2` | Experts pinned per layer. Measured on the 975B: `cap/4` (19/layer) gave 83.6% hit / 0.32 tok/s, 40/layer gave 95.6% / 0.80 tok/s — decode fills run at queue depth ~1, so every pinned expert removes a ~35 ms stall. Clamped to `cap - 8`. |
+| `REP_PEN` | `1.1` | Repetition penalty over a 128-token history (prompt tail + emitted). |
+| `INK_DENSE_Q4` | auto | Use the `dense-int4g64/` sidecar for dense weights when that directory exists. `=0` forces the unquantized dense path. |
+| `INK_METAL_MIN_S` | `1` | Minimum batch S to send the MoE block to Metal. `=2` restores the prefill-only gate (which mattered when the residency set was absent and per-block `useResource` churn cost ~135 ms). |
+| `INK_PREFIX_LOG` | unset | Log the KV-prefix reuse decision and its reason, as `K3_PREFIX_LOG` does for K3. |
+| `GPU_DEV` | `0` | CUDA device index for the inkling CUDA backend. |
+| `NOGPU` | unset | If set, skip GPU init entirely (both CUDA and Metal), regardless of the other GPU variables. |
+
+## OLMoE engine (`olmoe`)
+
+Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache research, so most of these are experiment knobs.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CHAT` | unset | Interactive chat mode; bypasses the `ref.json` harness entirely. |
+| `MAX_NEW` | `512` | Max tokens to generate in chat mode. |
+| `HOT` | `0` | Number of hottest experts to pin at startup. |
+| `WARMUP` | `5` | Tokens observed before the hot set is considered learned. |
+| `WIDE` | `1` | Router width multiplier for the prefetch prediction. Clamped to [1,4]. |
+| `SMOOTH` | `0.3` | EMA factor for routing momentum (gate logits smoothed across tokens). Clamped to [0, 0.95]. |
+| `CONF_LIMIT` | `0.92` | Confidence ceiling for the router prediction. Clamped to [0.1, 1.0]. |
+| `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
 
 ---
 

@@ -364,6 +364,20 @@ def physical_cpu_count():
             _physical_cores_warn("GetLogicalProcessorInformationEx returned no cores")
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
+    if sys.platform == "darwin":
+        # macOS has no lscpu. sysctl reports physical cores directly, and on
+        # Apple Silicon hw.physicalcpu counts P+E cores with no SMT sibling to
+        # dedupe. Without this branch the lscpu probe below fails and every run
+        # prints a spurious over-subscription warning on a machine that cannot
+        # over-subscribe.
+        try:
+            result = subprocess.run(["sysctl", "-n", "hw.physicalcpu"], text=True,
+                                    capture_output=True, check=True, timeout=5)
+            cores = int(result.stdout.strip())
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _physical_cores_warn(f"sysctl core probe failed: {error}")
     try:
         # Ask lscpu for exactly core,socket and dedupe on (core, socket).
         # Counting un-deduplicated rows would return logical threads (SMT),

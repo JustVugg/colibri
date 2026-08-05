@@ -374,7 +374,7 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-ARCH = "glm"   # set in main(): "glm" | "inkling" | "kimi" (auto-detected)
+ARCH = "glm"   # set in main(): glm | inkling | kimi | deepseek_v4
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -654,6 +654,51 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
         else:
             parts.append(f"M {role} {len(text.encode('utf-8'))}\n{text}")
     parts.append(f"G {1 if enable_thinking else 0}\n")
+    return "".join(parts)
+
+
+def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                   tool_choice=None):
+    """DeepSeek V4's native multi-turn chat template.
+
+    The target engine receives this as a raw prompt. Prior assistant turns end
+    with the checkpoint's EOS marker; the final assistant marker selects the
+    thinking or direct-answer prefix for the new turn.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for DeepSeek V4 yet.",
+                       "tools", "unsupported_parameter")
+    bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
+    user = "<\uff5cUser\uff5c>"
+    assistant = "<\uff5cAssistant\uff5c>"
+    eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+    parts = [bos]
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            parts.append(text)
+        elif role == "user":
+            parts.extend((user, text))
+        else:
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            parts.append(assistant)
+            if reasoning:
+                parts.extend(("<think>", reasoning, "</think>"))
+            else:
+                parts.append("</think>")
+            parts.extend((text, eos))
+    parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
     return "".join(parts)
 
 
@@ -1340,6 +1385,8 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
+        return "deepseek_v4"
     return "glm"
 
 
@@ -1675,7 +1722,22 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
-        super().handle_one_request()
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            # The client hung up mid-response. That is not an error here, it is
+            # how HTTP clients behave: `coli chat` polls /health while the model
+            # loads and drops each connection as soon as it has its answer, and
+            # Ctrl-C during a stream closes the socket by design -- the banner
+            # tells the user to do exactly that. Without this, socketserver's
+            # handler prints a full traceback per occurrence, so a normal start
+            # buried the loading spinner under BrokenPipeError stack traces and
+            # every cancelled answer looked like a crash.
+            #
+            # Caught here rather than in send_json() so it also covers the SSE
+            # writes in the streaming path, which is where Ctrl-C lands.
+            self.close_connection = True
+            return
         if not self.close_connection:
             self._drain_request_body()
 
@@ -2263,7 +2325,8 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else render_chat)
+                    render_chat_kimi if ARCH == "kimi" else
+                    render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
         audio_clips = [] if ARCH == "inkling" else None
         if audio_clips is not None:
             prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
@@ -2541,7 +2604,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi") and kv_slots != 1:
+    if ARCH in ("inkling", "kimi", "deepseek_v4") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -2578,7 +2641,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2607,7 +2670,9 @@ def main():
         ARCH = model_arch(args.model)
     if args.model_id is None:
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
-                         "kimi-k3-colibri" if ARCH == "kimi" else "glm-5.2-colibri")
+                         "kimi-k3-colibri" if ARCH == "kimi" else
+                         "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
+                         "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

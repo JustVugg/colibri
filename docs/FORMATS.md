@@ -35,7 +35,9 @@ discussion separate from the CPU+Metal implementation.
 
 ## Known formats
 
-Every row below is verified against this PR pair's current restack: the
+Every row below is verified against this PR pair's current restack (the
+ordinal-less `int4-rans256-g0` row, which landed later, instead states its
+own verification anchor in its sources bullet): the
 stamp+registry series (#529) stacked directly on the fp8-passthrough series
 (#528), which is in turn based on dev `292ed4c` (post-#465, post-#457
 Metal grouped-GEMV merge, post-#705 Vulkan/Kimi-K3 MXFP4 merge) — no
@@ -65,9 +67,14 @@ the bytes alone say.
 | 6 | `e8-iq3-lattice` (E8/IQ3 lattice) | `O*ceil(I/256)*98` bytes (98-byte self-contained super-blocks: E8 lattice indices + parity signs + fp16 super-scales; `E8_QK=256`, `E8_BBYTES=98`) | none as a separate array — scales live **inside** the super-blocks; the `.qs` sidecar is a single-float tag (`ns==4` is the loader's discriminator). NOTE: stores `W@Q` (block-diagonal FWHT rotation) — activations must be rotated before the kernel | **stable, upstream** — [#465](https://github.com/JustVugg/colibri/pull/465) MERGED 2026-07-21 | dev `dce7012` |
 | 7 | `mxfp4` (no in-tree name string — dev has no stamp feature) | `O*ceil(I/2)` bytes (e2m1 nibbles, 2 packed values/byte — same nibble packing as fmt=2/4) | in the **container**: 1 **UE8M0** byte (u8 power-of-two exponent) per **group** of `gs=32` inputs; expanded to 1 `f32` per group at Vulkan upload (`c/kimi_k3.c`'s `mx4_scale` loop — the shader is float-only). Host gate: `gs >= 8 && gs % 8 == 0` (`c/backend_vulkan.c`) | **stable, upstream** — Kimi K3 native routed-expert tier, **Vulkan backend only** (`c/backend_vulkan.c`, `c/shaders/qmatmul.comp`); NOT a CPU/`QT` format — `qt_resolve_fmt` never returns 7 and the Metal backend refuses it | merged [#676](https://github.com/JustVugg/colibri/issues/676)/[#705](https://github.com/JustVugg/colibri/pull/705) |
 | **8** | `fp8-e4m3-b128` | `O*I` × 1 byte (`q8`, raw e4m3, byte-identical layout to fmt=1) | a **declared property**, not one fixed layout — see "Scale encoding is a declared property" below. **f32** (1 per 128×128 block, `ceil(O/128)*ceil(I/128)` entries) is IMPLEMENTED; **UE8M0** (1 byte/block, same block grid) is RECOGNIZED and refused by name, not yet implemented | **this PR pair** — CPU/Metal/repack/collision-refusal on `fmt7/fp8-passthrough`, this stamp+registry PR stacked on top; developed under the PRIVATE ORDINAL BLOCK as `fmt=100`; assigned fmt=7 by the maintainer on #524, renumbered to **fmt=8** after #705 merged claiming 7 for MXFP4 while this pair was open (see "ID assignment" below) | `fmt7/fp8-passthrough` (PR 1) |
+| *(none)* | `int4-rans256-g0` | **data-dependent** — an opaque `U8` blob (safetensors dtype `U8`, shape `[record_len]`; the tensor keeps its original logical name) holding the chunk record of `docs/int4-rans256-g0.md`: u64 `n_symbols` + u64 `packed_bytes` + `N+1` u32 stream offsets + `N=256` concatenated single-state rANS streams (`RANS_NSTREAMS=256`, `c/rans.h`) that losslessly entropy-code the source tensor's packed int4 bytes — byte-exact reconstruction, ~0.76 of the source packed bytes on the GLM-5.2 full-corpus census. **No `expected_bytes(O,I)` formula exists**, so byte-arithmetic inference is structurally impossible for this format: the `__metadata__["colibri.fmt"]` stamp naming `int4-rans256-g0` is **MANDATORY**, and the shared decode table ships once per shard in `__metadata__["colibri.int4-rans256-g0.table"]` | per-row **f32** `.qs` sidecar, raw and unchanged from the source `int4-row`-geometry container (`O` entries) | **merged, offline tools only** — codec `c/rans.h`, writer `c/tools/repack_rans.py`, validator `c/tools/rans_verify.py`. **No engine DECODE path exists** (no compiled `fmt` constant anywhere, not even a private-block one; `qt_resolve_fmt` has no branch for it), so it holds **no public ordinal** — and none can be claimed before engine code consuming the format (the ladder's PR 2 loader/CPU-decode stage) first merges into dev: this row's gloss on the "ID assignment" rule below, for a format with nothing to compile a number into. The engine is NOT inert against repacked shards, though: discovery-time stamp ingest and load-time byte-arithmetic inference both run, and the routed-expert load sites — this format's entire target population — pass `stamped_name=NULL`, so the MANDATORY stamp is **not consulted there today**. Pointing the current engine at a repacked directory is **unsupported** (typical outcome: a named refusal from the byte-arithmetic mismatch); the stamp becomes load-bearing only when PR 2 wires stamp-gated dispatch **ahead of** inference, exactly as the format spec warns (depth: sources bullet below) | merged [#671](https://github.com/JustVugg/colibri/pull/671) (dev `a3a5a75`) |
 
 With fmt 0–8 all assigned, the next free public ordinal is **9** — per the
 convention below it isn't claimed here; an ID is only settled at merge.
+(`int4-rans256-g0`'s row above claims none either: a stamp-identified
+container format with no engine consumer has nothing to compile an ordinal
+into, and its row exists so name-collision scans find it — exactly what
+this registry is for.)
 
 **ID assignment.** An ordinal is claimed by the first merge into dev that
 ships it — there is no reservation mechanism, and an assignment made on an
@@ -129,6 +136,36 @@ pair's current restack, base dev `292ed4c`):
   override that default — see "The metadata stamp" below for the exact
   rule in both cases. FMT_NAMES table (name string <-> fmt int):
   `c/colibri.c:1316`.
+- **no ordinal** (`int4-rans256-g0`, merged tools-only tier — line numbers
+  at dev `7fb1159`, post-#671 merge `a3a5a75`, not at this PR pair's
+  restack base) — codec + record reader/writer: `c/rans.h`
+  (`RANS_NSTREAMS 256`, `c/rans.h:93`; the record layout in the file-header
+  comment, `c/rans.h:17-34`; that same header names its engine consumer
+  "a future engine decode stage", `c/rans.h:4` — the format's own statement
+  that none exists yet). Identity constants: `c/tools/rans_format.py:40-46`
+  (`FORMAT_NAME = "int4-rans256-g0"`; `METADATA_KEY = "colibri.fmt"` — the
+  same key/shape as the fmt=8 stamp convention below, but MANDATORY here
+  rather than a cross-check, because there is no byte arithmetic to fall
+  back on; `TABLE_KEY = "colibri.int4-rans256-g0.table"`). Writer
+  `c/tools/repack_rans.py` (deterministic; verifies every record byte-exact
+  before writing); validator `c/tools/rans_verify.py` (TRUST-VERIFY-REFUSE,
+  named refusal classes in its module docstring). Full specification:
+  `docs/int4-rans256-g0.md`. Engine-interaction status, stated precisely
+  (why the ordinal column is empty, and what still runs): `qt_resolve_fmt`
+  (`c/colibri.c:1374`) has no branch that returns this format, and
+  `c/colibri.c`/`c/quant.h`/`c/st.h` contain no reference to it — no
+  decode path, hence no ordinal. But a repacked shard is not invisible to
+  the engine: `st_fmt_stamp_ingest` (`c/st.h:317`, called from
+  `st_init_multi`'s discovery loop) parses its mandatory `colibri.fmt`
+  stamp map at container-discovery time, and the three routed-expert load
+  sites — exactly this format's target population — resolve formats by
+  byte arithmetic alone with `stamped_name=NULL` (`c/colibri.c:2217`,
+  `c/colibri.c:2386`, `c/colibri.c:2580`, each marked
+  `/* routed expert: never stamped */`), so the stamp is never consulted
+  where it would matter most. A future consumer must wire stamp-gated
+  dispatch AHEAD of that inference — `docs/int4-rans256-g0.md`'s
+  "THE STAMP IS MANDATORY" section states why that ordering is
+  load-bearing.
 
 ## Scale encoding is a declared property (fmt=8)
 

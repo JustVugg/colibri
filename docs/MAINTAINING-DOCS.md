@@ -20,29 +20,58 @@ cd <repo>
 git fetch upstream
 HASH=$(git rev-parse --short upstream/dev); echo "documenting $HASH"
 
-# Environment variables (defaults + inline comments):
-git grep -n 'getenv("' upstream/dev -- 'c/*.c'
+# Environment variables (defaults + inline comments).
+# Scan .h/.cu/.mm too, not just .c: route_trace.h, rans.h, sample.h and
+# omp_tune.h own knobs that every engine inherits, and the CUDA/Metal/Vulkan
+# backends own their own. Scanning 'c/*.c' alone silently drops them.
+# c/tests/ is excluded: test fixtures read their own variables (EXPERT_RAW,
+# TMPDIR) that are not part of the engine's user-facing surface.
+# getenv_utf8/compat_getenv_utf8 are the Windows-safe wrappers -- COLI_PROMPT is
+# read through one, so a plain 'getenv(' grep reports it as removed.
+git grep -nE '(compat_)?getenv(_utf8)?\("' upstream/dev -- 'c/*.c' 'c/*.h' 'c/*.cu' 'c/*.mm' ':!c/tests/*'
 
 # CLI settings:
 git grep -nE 'add_parser\(|add_argument\(' upstream/dev -- c/coli c/openai_server.py
 
 # Quick sanity: how many distinct env vars exist now?
-git grep -hoE 'getenv\("[A-Z0-9_]+"\)' upstream/dev -- 'c/*.c' \
-  | sed -E 's/getenv\("(.*)"\)/\1/' | sort -u | wc -l
+git grep -hoE '(compat_)?getenv(_utf8)?\("[A-Z0-9_]+"' upstream/dev -- 'c/*.c' 'c/*.h' 'c/*.cu' 'c/*.mm' ':!c/tests/*' \
+  | grep -oE '"[A-Z0-9_]+"' | tr -d '"' | sort -u | wc -l
+```
+
+**Which engine reads it matters.** There are four binaries (`colibri`,
+`kimi_k3`, `inkling`, `olmoe`) and they do NOT share a knob set -- `K3_*` is
+kimi_k3-only, `INK_*` is inkling-only, and a variable set for the wrong engine
+is silently ignored. Record the owner when you add a row:
+
+```bash
+# who reads $V ?
+V=K3_BITS; git grep -lE "getenv(_utf8)?\\(\"$V\"" upstream/dev -- 'c/*.c' 'c/*.h' 'c/*.cu' 'c/*.mm' ':!c/tests/*'
 ```
 
 ## Step 2 — diff against what's documented
 
 ```bash
 # vars currently in the code:
-git grep -hoE 'getenv\("[A-Z0-9_]+"\)' upstream/dev -- 'c/*.c' \
-  | sed -E 's/getenv\("(.*)"\)/\1/' | sort -u > /tmp/code_vars.txt
-# vars currently in the doc (crude: grab `VAR` cells):
-grep -oE '`[A-Z0-9_]{2,}`' docs/ENVIRONMENT.md | tr -d '`' | sort -u > /tmp/doc_vars.txt
+git grep -hoE '(compat_)?getenv(_utf8)?\("[A-Z0-9_]+"' upstream/dev -- 'c/*.c' 'c/*.h' 'c/*.cu' 'c/*.mm' ':!c/tests/*' \
+  | grep -oE '"[A-Z0-9_]+"' | tr -d '"' | sort -u > /tmp/code_vars.txt
+# vars currently in the doc (crude: grab `VAR` cells; drop bare numbers, which
+# the backtick grep also picks up out of prose):
+grep -oE '`[A-Z0-9_]{2,}`' docs/ENVIRONMENT.md | tr -d '`' | grep -vE '^[0-9]+$' | sort -u > /tmp/doc_vars.txt
 
 comm -23 /tmp/code_vars.txt /tmp/doc_vars.txt   # in code, NOT documented -> add these
-comm -13 /tmp/code_vars.txt /tmp/doc_vars.txt   # documented, NOT in code -> remove these
+comm -13 /tmp/code_vars.txt /tmp/doc_vars.txt   # documented, NOT in C -> see below
 ```
+
+Before deleting anything the second `comm` reports, check the Python side --
+`COLI_API_KEY`, `COLI_DEBUG`, `COLI_TOOL_SALVAGE` and friends are real, they are
+just read by `openai_server.py`/`coli` rather than by the C engine:
+
+```bash
+grep -rn "$V" c/coli c/openai_server.py
+```
+
+It also reports things like `O_DIRECT` and `F_NOCACHE`, which are prose in the
+doc, not variables. Only a name that no program reads should actually go.
 
 ## Step 3 — update the tables (AI-assisted)
 

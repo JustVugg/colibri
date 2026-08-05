@@ -5,6 +5,9 @@ import math
 import socket
 import tempfile
 import threading
+import sys
+import time
+import struct
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -856,6 +859,58 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+
+class ClientHangupTest(unittest.TestCase):
+    """A client that disconnects mid-response must not print a traceback.
+
+    `coli chat` polls /health on a 2 s timeout while the model loads and drops
+    each connection the moment it has an answer; Ctrl-C during a stream closes
+    the socket by design -- the banner tells the user to do exactly that. Both
+    reach the handler as BrokenPipeError, and socketserver logs an unhandled
+    exception per occurrence, so a normal DeepSeek V4 start buried the loading
+    spinner under stack traces and every cancelled answer looked like a crash.
+    """
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model",
+                                None, 16, kv_slots=1)
+        self.errors = []
+        # socketserver routes an escaped exception here; the base class prints
+        # it to stderr. Recording instead of printing is what lets the test
+        # assert on it rather than on captured output.
+        self.server.handle_error = lambda request, address: self.errors.append(
+            sys.exc_info()[1])
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.thread.join, 2)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.scheduler.close)
+
+    def _hang_up_after_request(self, path):
+        """Send a request, then close without reading the response."""
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port), 2)
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     f"Connection: close\r\n\r\n".encode())
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("ii", 1, 0))   # RST rather than a clean FIN
+        sock.close()
+        time.sleep(0.3)
+
+    def test_hangup_on_health_is_not_an_error(self):
+        for _ in range(5):
+            self._hang_up_after_request("/health")
+        self.assertEqual(self.errors, [],
+                         "client disconnect surfaced as a server error")
+
+    def test_the_server_still_answers_afterwards(self):
+        """The real damage would be a handler thread lost to the exception."""
+        self._hang_up_after_request("/health")
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
 
 
 class StaticServingTest(unittest.TestCase):

@@ -28,6 +28,10 @@ c/backend_loader.o
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
+c/coli_hip.dll
+c/coli_hip.lib
+c/coli_hip.exp
+c/coli_hip.pdb
 c/tests/test_*
 !c/tests/test_*.c
 !c/tests/test_*.cu

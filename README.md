@@ -15,8 +15,8 @@
 
 **Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
 parameters** — on consumer and heterogeneous hardware, in pure C with zero
-engine dependencies, by treating storage, RAM, and VRAM as one inference
-hierarchy.
+engine dependencies, by treating storage, RAM, and VRAM as a single inference
+hierarchy (AI memory multitiering).
 
 Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 (2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
@@ -28,7 +28,7 @@ Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 > storage I/O, placement, scheduling, kernels, speculation, and CPU/GPU
 > overlap — so large models depend less on scarce hardware and cost less to run.
 
-Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy, and it is
+Colibrì treats VRAM, RAM, and storage as a single multitier hierarchy, and it is
 deliberately a place to test aggressive systems ideas — so there is **no SLA on
 speed, and a hard guarantee on semantics**: experiments must earn their place
 through reproducible end-to-end measurements, and the default policy **never
@@ -68,12 +68,12 @@ as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists c
 
 ## The research mission
 
-Frontier inference should not require datacenter-class hardware by default.
-Colibrì's research target is simple: **reduce the hardware dependency and total
-cost of inference by optimizing every part of the inference path that evidence
-shows is limiting it**.
+With Colibrì, private frontier model access is not limited by availability of hyperscaler-class hardware.
 
-That includes changing how weights are represented and moved, deciding what
+With its multitiering features Colibrì **removes proprietary hardware dependencies aggressively 
+optimizing functional inference engine pipelines**.
+
+Our operational mission includes changing how weights are represented and moved, deciding what
 lives in VRAM, RAM, or storage, overlapping heterogeneous compute, reducing
 launch and synchronization overhead, exploiting sparsity and reuse, and testing
 new decoding algorithms. Nothing is protected merely because it is conventional;
@@ -81,7 +81,7 @@ nothing is adopted merely because a microbenchmark looks fast. The deciding
 result is end-to-end inference on real machines, with correctness and quality
 measured alongside throughput, latency, memory, and cost.
 
-The practical consequence is accessibility: run a 744B-parameter model on
+The practical consequence is **accessibility**: run a 744B-parameter model on
 hardware you already own, watch every expert fire in real time, and change the
 code that does it. Not renting intelligence behind an API — *holding* it:
 probing it, measuring it, improving it. The engine is deliberately small enough
@@ -89,7 +89,7 @@ that the next useful optimization can come from anyone willing to measure it.
 
 ## Core techniques and measured findings
 
-- **One hierarchy, not one memory threshold.** VRAM, RAM, and NVMe are placement
+- **One hierarchy, not limited by tier capacity.** VRAM, RAM, and NVMe are placement
   tiers for the same weights; limited fast memory changes speed, not model semantics.
 - **A JIT for weights.** Measured routing heat drives a per-layer LRU, a learned
   pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
@@ -460,6 +460,25 @@ Two things that differ per model, both documented in the per-model page:
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
+## DeepSeek V4
+
+The experimental CPU path for **DeepSeek V4 Flash** uses native FP4 experts,
+automatic RAM planning, shared `st.h` / `quant.h` infrastructure, and a
+persistent target engine. DSpark is intentionally kept for a separate stacked
+follow-up. The target engine is supported on x86-64/aarch64 Linux and
+Windows/MSYS2.
+
+```bash
+cd c
+make deepseek-v4
+python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
+  "What is the capital of France?"
+# The same model also works with: coli chat / coli serve / coli web
+```
+
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for status, checkpoint
+validation, unified CLI/server usage, and the generated tiny independent oracle.
+
 ## What's next
 
 - **Inference-systems research is the product.** The current hierarchy is LRU +
@@ -502,7 +521,7 @@ c/
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client)
 desktop/                  Tauri v2 desktop shell wrapping the web UI
-docs/                     reference docs, experiments, media
+docs/                     reference docs, experiments, media, DeepSeek V4
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small
@@ -522,6 +541,52 @@ releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
 (Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
 contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
 This project is proof of what open weights make possible.
+
+The project's expert placement, compression, and routing experiments also build
+on ideas and evidence from the following open research and systems work:
+
+- [REAP](https://github.com/CerebrasResearch/reap) and
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP) for output-aware and
+  domain-specific expert importance.
+- [SERE](https://github.com/JL-Cheng/SERE) for similarity-based expert
+  re-routing, and [ReMoE](https://github.com/BUAA-OSCAR/ReMoE) for
+  cache-locality-aware router fine-tuning.
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE) for routing-guided expert
+  merging and compression.
+- [MoBE](https://github.com/inclusionAI/MoBE) and
+  [D²-MoE](https://github.com/lliai/D2MoE) for shared expert bases and
+  low-rank expert deltas.
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE) for hybrid CPU/GPU expert
+  scheduling, [ScMoE](https://arxiv.org/abs/2404.05019) for overlapping expert
+  communication with computation, and
+  [OD-MoE](https://arxiv.org/abs/2512.03927) for distributed on-demand expert
+  loading.
+- [vLLM](https://github.com/vllm-project/vllm),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp), and
+  [kTransformers](https://github.com/kvcache-ai/ktransformers) for the open
+  inference systems and expert-offload work that make comparisons reproducible.
+
+The engine also stands on concrete engineering work, not only ideas. Each of
+these is used or reimplemented in the tree today:
+
+- [safetensors](https://github.com/huggingface/safetensors) — the container
+  every engine reads (`c/st.h`), including its fp8 and I64 dtypes.
+- [tiktoken](https://github.com/openai/tiktoken) — `c/tok.h` reimplements its
+  `byte_pair_encode` exactly, merging the adjacent pair whose concatenation has
+  the lowest vocab id, so a tiktoken-derived vocabulary needs no merges list.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) — the GBNF grammar subset
+  in `c/grammar.h` follows its syntax and its set-of-stacks PDA, and the Metal
+  path borrows its `newBufferWithBytesNoCopy` residency trick.
+- [vLLM](https://github.com/vllm-project/vllm) — the reference for output
+  semantics the engine matches position by position (e.g. where the final norm
+  lands relative to the LM head).
+- [transformers](https://github.com/huggingface/transformers) — the oracle:
+  CI reproduces a random-init model token for token against it.
+- [DietGPU](https://github.com/facebookresearch/dietgpu) — the GPU ANS codec
+  behind the experimental compressed expert tier (`COLI_ANS`).
+- [rocWMMA](https://github.com/ROCm/rocWMMA) — the HIP backend maps CUDA's
+  `nvcuda::wmma` fragment/mma_sync API onto it (`c/backend_gpu_compat.h`), which
+  is what lets one .cu source compile for both vendors.
 
 ## License
 

@@ -1,0 +1,5 @@
+{
+  "source": "Short prefix of glm52_replay_python.json for CUDA smoke tests",
+  "prompt_ids": [576, 729, 1265, 537, 990, 279, 5798, 3419],
+  "full_ids": [576, 729, 1265, 537, 990, 279, 5798, 3419, 1565]
+}

@@ -33,7 +33,8 @@
 #endif
 #include "st.h"
 #include "tok.h"
-#include "route_trace.h"                          /* shared routing telemetry (#700) */
+#include "route_trace.h"
+#include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -143,6 +144,9 @@ typedef struct {
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
+    /* KV prefix reuse: what the current K/V and conv states were built from.
+     * See kv_prefix.h — recorded where the tokens are fed, never derived. */
+    kv_prefix kvp;
 } Model;
 
 /* ---------- utility ---------- */
@@ -795,6 +799,28 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             LDW(sh_g, "mlp.shared_experts.gate_proj");
             LDW(sh_u, "mlp.shared_experts.up_proj");
             LDW(sh_d, "mlp.shared_experts.down_proj");
+#ifdef COLI_METAL
+            /* Move the bf16 shared-expert weights into one page-aligned slab
+             * (gates, then ups, then downs) and repoint the Wt handles into
+             * it: the CPU path reads the same bytes it always did, and the
+             * slab registers once so the GPU fmt=5 path can resolve it. */
+            if (g_metal && l->sh_g.h && l->sh_u.h && l->sh_d.h) {
+                int64_t I = c->moe_inter, ns = c->n_shared;
+                size_t one = (size_t)ns*I*D*2, pg = 16384;
+                size_t len = (3*one + pg - 1) / pg * pg;
+                void *sl = NULL;
+                if (!posix_memalign(&sl, pg, len)) {
+                    memcpy((char*)sl,           l->sh_g.h, one);
+                    memcpy((char*)sl + one,     l->sh_u.h, one);
+                    memcpy((char*)sl + 2*one,   l->sh_d.h, one);
+                    free(l->sh_g.h); free(l->sh_u.h); free(l->sh_d.h);
+                    l->sh_g.h = (uint16_t*)sl;
+                    l->sh_u.h = (uint16_t*)((char*)sl + one);
+                    l->sh_d.h = (uint16_t*)((char*)sl + 2*one);
+                    coli_metal_register(sl, len);
+                }
+            }
+#endif
         }
         #undef LD
         #undef LDW
@@ -1128,6 +1154,28 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
  * (2) fill ALL missing experts in one parallel burst (the NVMe wants queue
  * depth — during prefill this batches the whole sequence's misses), then
  * (3) compute. */
+/* shared experts for all S positions: gamma inside (before down_proj is
+ * linear, so applied at the end). Factored out so the Metal path can run it
+ * on the CPU while the last routed-expert round is in flight on the GPU. */
+static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
+                               float *out, const float *wgt,
+                               float *g, float *u, float *hh) {
+    Cfg *c = &m->c;
+    int D = c->hidden, K = c->topk, I = c->moe_inter, ns = c->n_shared;
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (int64_t)s*D;
+        float *os = out + (int64_t)s*D;
+        const float *w = wgt + (int64_t)s*(K+ns);
+        for (int j = 0; j < ns; j++) {
+            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
+            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
+            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
+            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+        }
+    }
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter, ns = c->n_shared;
@@ -1201,6 +1249,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
+    int shared_done = 0;                /* set when overlapped with the last GPU round */
     int64_t npair = (int64_t)S*K;
 #ifdef COLI_METAL
     /* per-round scratch for the batched GPU submit: pairs grouped by expert,
@@ -1221,6 +1270,39 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         mslot = malloc(cap*sizeof(Slot*));
         mxoff = malloc((cap+1)*sizeof(int)); mnr = malloc(cap*sizeof(int));
         mrows = malloc(cap*sizeof(int)); mgi = malloc(cap*sizeof(int)); mfp = malloc(cap*sizeof(int));
+    }
+    /* Shared experts as ONE bf16 (fmt=5) block, submitted BEFORE the routed
+     * rounds so it rides the GPU while the CPU routes, fills, and packs.
+     * Every token uses every shared expert, so group j is simply all S rows
+     * with weight w[K+j]. Falls back to the CPU loop if begin refuses. */
+    ColiMetalMoeHandle *sh_h = NULL;
+    float *sxg = NULL, *srw = NULL;
+    if (mxg && ns > 0 && ns <= 8 && l->sh_g.h && l->sh_u.h && l->sh_d.h &&
+        !(getenv("INK_METAL_SHARED") && *getenv("INK_METAL_SHARED") == '0')) {
+        double ts = now_s();
+        sxg = falloc((int64_t)ns*S*D); srw = falloc((int64_t)ns*S);
+        const void *sgp[8], *sup[8], *sdp[8];
+        const float *sscale[8];
+        int sxoff[9], snr[8];
+        int *srows = malloc((size_t)ns*S*sizeof(int));
+        for (int j = 0; j < ns; j++) {
+            sgp[j] = l->sh_g.h + (int64_t)j*I*D;
+            sup[j] = l->sh_u.h + (int64_t)j*I*D;
+            sdp[j] = l->sh_d.h + (int64_t)j*D*I;
+            sscale[j] = (const float*)sgp[j];        /* fmt=5 never reads scales */
+            sxoff[j] = j*S; snr[j] = S;
+            for (int s = 0; s < S; s++) {
+                memcpy(sxg + ((int64_t)j*S + s)*D, x + (int64_t)s*D, (size_t)D*sizeof(float));
+                srows[j*S + s] = s;
+                srw[j*S + s] = wgt[(int64_t)s*(K+ns) + K + j];
+            }
+        }
+        sxoff[ns] = ns*S;
+        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, sgp, sup, sdp,
+                                          sscale, sscale, sscale,
+                                          sxg, sxoff, snr, srows, srw);
+        free(srows);
+        m->t_shared += now_s() - ts;
     }
 #endif
     for (int64_t base = 0; base < npair; base += cap) {
@@ -1245,6 +1327,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             #pragma omp parallel for schedule(dynamic,1)
             for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
             m->t_fill += now_s() - tf;
+        }
+        /* Validate before the CPU/Metal split: either backend must refuse a
+         * cache slot whose weights belong to a different routed expert. */
+        for (int64_t t = base; t < end; t++) {
+            Slot *e = use[t - base];
+            if (!e) continue;                              /* scartato da TOPP */
+            int s = (int)(t / K), kk = (int)(t % K);
+            if (e->eid != idx[(int64_t)s*K + kk]) {
+                fprintf(stderr, "layer %d: cache served expert %d for requested expert %d\n",
+                        layer, e->eid, idx[(int64_t)s*K + kk]);
+                exit(1);
+            }
         }
         double te = now_s();
 #ifdef COLI_METAL
@@ -1278,6 +1372,28 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     Slot *e = mslot[j];
                     mgp[j] = e->p13; mup[j] = e->p13 + (int64_t)I*m->rb13; mdp[j] = e->p2;
                     mgs[j] = e->s13; mus[j] = e->s13 + I; mds[j] = e->s2;
+                }
+                /* Last round: submit async and run the shared experts on the
+                 * CPU while the GPU computes the routed ones — they are
+                 * independent (both read x, both accumulate into out, and the
+                 * GPU only touches out in _end's scatter-add, after the wait).
+                 * On a GPU fault _end returns 0 and the CPU loop below redoes
+                 * the round; shared_done stays set either way. */
+                if (base + cap >= npair && !sh_h) {
+                    ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
+                        nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                        mxg, mxoff, mnr, mrows, mrw);
+                    if (h) {
+                        double ts = now_s();
+                        shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
+                        double sh = now_s() - ts;
+                        m->t_shared += sh;
+                        shared_done = 1;
+                        int ok = coli_metal_moe_block_end(h, out);
+                        m->t_expert += (now_s() - te) - sh;
+                        if (ok) continue;                  /* round done on the GPU */
+                        te = now_s();                      /* fault: CPU redo below */
+                    }
                 }
                 if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
                                          mxg, mxoff, mnr, mrows, mrw, out, S)) {
@@ -1317,20 +1433,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_expert += now_s() - te;
     }
-    /* shared experts: una volta per token, fuori dai giri (non usano la cache) */
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        float *os = out + (int64_t)s*D;
-        float *w = wgt + (int64_t)s*(K+ns);
+#ifdef COLI_METAL
+    /* GPU shared block: wait + scatter-add. A fault falls through to CPU. */
+    if (sh_h) {
         double ts = now_s();
-        /* gamma inside (before down_proj is linear, so applied at the end) */
-        for (int j = 0; j < ns; j++) {
-            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
-            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
-            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
-            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
-        }
+        if (coli_metal_moe_block_end(sh_h, out)) shared_done = 1;
+        m->t_shared += now_s() - ts;
+    }
+#endif
+    /* shared experts: una volta per token, fuori dai giri (non usano la cache).
+     * Under Metal these run on the GPU as an fmt=5 block overlapped with the
+     * routed rounds (or on the CPU during the last GPU round); either path
+     * sets shared_done. */
+    if (!shared_done) {
+        double ts = now_s();
+        shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
         m->t_shared += now_s() - ts;
     }
     free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
@@ -1341,6 +1458,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         free(mgs); free(mus); free(mds); free(mslot);
         free(mxoff); free(mnr); free(mrows); free(mgi); free(mfp);
     }
+    free(sxg); free(srw);
 #endif
 }
 
@@ -1406,6 +1524,11 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos0 + S;
+    /* record what was just fed, at the positions it went to (kv_prefix.h).
+     * Audio taints the record: every frame carries the same token id while the
+     * mel payload differs, so ids alone cannot tell two clips apart. */
+    kv_prefix_record(&m->kvp, ids, pos0, S);
+    if (dmel && naud > 0) kv_prefix_taint(&m->kvp);
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
     if (tf_out) {
@@ -1431,6 +1554,7 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
 static void state_reset(Model *m) {
     Cfg *c = &m->c;
     m->kv_len = 0;
+    kv_prefix_clear(&m->kvp);
     for (int i = 0; i < c->n_layers; i++) {
         int kvdim = L_KV(c,i) * L_HD(c,i);
         for (int j = 0; j < 4; j++)
@@ -1441,14 +1565,44 @@ static void state_reset(Model *m) {
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
     if (m->K && max_t <= m->max_t) return;   /* reuse across prompts when big enough */
-    if (m->K) for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
-    free(m->K); free(m->V);
+
+    /* GROW, DO NOT RESTART.
+     *
+     * This used to free the buffers and allocate fresh ones, which discarded
+     * every position already computed. That was invisible while each turn
+     * re-prefilled anyway — but it defeats KV prefix reuse in exactly the case
+     * reuse exists for: a conversation whose prompt is longer every turn asks
+     * for a larger max_t every turn, so the state was thrown away just before
+     * the point of using it.
+     *
+     * K/V are laid out [kv_head][max_t][hd], so a larger max_t changes the
+     * stride: the old contents cannot be realloc'd, they have to be re-laid-out
+     * head by head. That copy costs a memcpy of what is already computed, which
+     * is nothing beside re-running the prefill that produced it. */
+    float **oldK = m->K, **oldV = m->V;
+    int old_max = m->max_t;
+    int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
+
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
-        m->V[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
+        int kv = L_KV(c,i), hd = L_HD(c,i);
+        m->K[i] = falloc((int64_t)kv * max_t * hd);
+        m->V[i] = falloc((int64_t)kv * max_t * hd);
+        for (int h = 0; h < kv && keep; h++) {
+            memcpy(m->K[i] + (int64_t)h * max_t * hd,
+                   oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+            memcpy(m->V[i] + (int64_t)h * max_t * hd,
+                   oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+        }
     }
+    if (oldK) for (int i = 0; i < c->n_layers; i++) { free(oldK[i]); free(oldV[i]); }
+    free(oldK); free(oldV);
+
+    /* the record describes those same positions, so it survives with them --
+     * unless its own allocation fails, in which case reuse simply stops. */
+    if (kv_prefix_grow(&m->kvp, max_t, keep)) m->kv_len = keep;
+    else                                      m->kv_len = 0;
 }
 
 /* greedy generation, olmoe.c-style */
@@ -1646,13 +1800,49 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
                m->audio_norm ? "" : " — snapshot has no audio tensors");
         fflush(stdout); free(ids); return;
     }
-    state_reset(m);
+    /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
+     * A chat client resends the whole transcript each turn, so turn N used to
+     * re-process turns 1..N-1 from scratch — the cost of a message grew with
+     * the conversation, and every replayed position pulled its experts off
+     * disk again. When this prompt begins with the sequence the state already
+     * holds, that state IS the state at that position: keep it and prefill
+     * only the tail.
+     *
+     * Requirements, all necessary:
+     *   - kv_alloc must not have grown (it frees the K/V fed[] describes), so
+     *     the reuse decision is taken AFTER it
+     *   - at least one new token, since the state cannot be rewound
+     *   - no audio on either side: every audio frame carries the same token id,
+     *     so ids alone cannot tell two different clips apart
+     * Either the reused positions are token-identical or nothing is reused;
+     * the emitted tokens are unchanged in both cases. */
     kv_alloc(m, np + q->max_tok + 8);
+    /* naud>0 taints this turn before the comparison, not after: a request that
+     * brings its own audio must not match a text-only state either. */
+    if (naud > 0) kv_prefix_taint(&m->kvp);
+    int reuse = kv_prefix_reuse(&m->kvp, ids, np);
+    if (getenv("INK_PREFIX_LOG")) {
+        /* Report the decision either way, with the reason when it is no. "It
+         * did not get faster" is otherwise indistinguishable from "reuse is not
+         * wired up", both for a user and for the CI gate. */
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, np, 100.0 * reuse / np);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
+                    m->kvp.len, m->kvp.cap, np,
+                    m->kvp.tainted ? " tainted" : "",
+                    (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
+        fflush(stderr);
+    }
+    if (!reuse) state_reset(m);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
     double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
-    float *logit = step_mm(m, ids, np, 0, NULL, q->audio, naud);
+    /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
+     * the KV slots are position-indexed, so this has to be the real offset. */
+    float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */

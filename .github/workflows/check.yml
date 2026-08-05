@@ -9,9 +9,21 @@ on:
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+
 jobs:
   linux:
+    name: Linux
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: make check
@@ -20,7 +32,9 @@ jobs:
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64
     # (MSYS2/UCRT64), the exact toolchain the README's Windows port targets.
+    name: Windows UCRT64
     runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: msys2 {0}
@@ -45,13 +59,31 @@ jobs:
           name: colibri-windows-exe
           path: c/colibri.exe
 
+  v4-tiny:
+    name: Linux (generated tiny V4 target oracle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Generate fixture and run target oracle
+        run: make -C c deepseek-v4-tiny-check
+
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
     # single-threaded automatically if it's ever missing).
+    name: macOS (colibri + V4 platform gate)
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: install libomp
         run: brew install libomp
-      - name: make check
+      - name: make check (V4 execution gated off)
         run: make -C c check

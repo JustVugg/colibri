@@ -10,18 +10,44 @@ static int64_t tbytes(int O,int I,int bits){
     return (int64_t)O*((I+1)/2) + (int64_t)O*4;
 }
 
-static int64_t expert_bytes_probe(Model *m, int ebits){
-    Cfg *c=&m->c; int64_t eb=0; char nm[256];
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",c->first_dense);
-    if(st_nbytes(&m->S,nm)>0){
-        const char *suf[3]={"gate_proj","up_proj","down_proj"};
-        for(int k=0;k<3;k++){
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",c->first_dense,suf[k]);
-            eb+=st_nbytes(&m->S,nm);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
-            int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
-        }
+/* Container bytes of expert 0 of one layer (weights + .qs scales); 0 if absent. */
+static int64_t expert_bytes_layer(Model *m, int layer){
+    int64_t eb=0; char nm[256];
+    const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",layer);
+    if(st_nbytes(&m->S,nm)<=0) return 0;
+    for(int k=0;k<3;k++){
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",layer,suf[k]);
+        eb+=st_nbytes(&m->S,nm);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",layer,suf[k]);
+        int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
     }
+    return eb;
+}
+
+/* MAX over the widths the container actually holds, not the first MoE layer.
+ * ws[] slots and the per-layer LRU slabs are reused ACROSS layers, and slab_cap
+ * grows to the largest expert a slot has ever held and is never shrunk (see the
+ * ESlot comment). So on a container that MIXES widths -- int4 routed layers with
+ * an int8 MTP head, which is how GLM-5.2 ships -- every slot ends up costing the
+ * widest one, while probing only c->first_dense reports the narrowest.
+ *
+ * cap_for_ram() divides by this, so the error goes straight into the cap. #766,
+ * measured on 4x A6000 / 251 GiB:
+ *
+ *     layer 3  (int4 routed) 21.23 MB   <- what this used to return
+ *     layer 78 (int8 MTP)    37.79 MB   <- what a slot actually costs
+ *
+ *   --auto-tier -> cap 113 -> 257 GB RSS -> OOM-kill
+ *   113 * 21.23/37.79 = 63.5, and cap 64 is the measured point that survives at
+ *   118 GB. The projection's shape was right; only this constant was wrong.
+ *
+ * nsp += 2 in cap_for_ram() already nods at the MTP row costing double, but that
+ * corrects one row out of nsp; the slabs grow on all of them. */
+static int64_t expert_bytes_probe(Model *m, int ebits){
+    Cfg *c=&m->c;
+    int64_t eb=expert_bytes_layer(m,c->first_dense);
+    if(m->has_mtp){ int64_t mtp=expert_bytes_layer(m,c->n_layers); if(mtp>eb) eb=mtp; }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
     return eb;
 }

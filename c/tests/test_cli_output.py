@@ -1,6 +1,6 @@
 import importlib.util
 import json
-import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -21,6 +21,7 @@ class CliOutputLanguageTest(unittest.TestCase):
             [sys.executable, str(CLI), *args],
             cwd=HERE,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=False,
             timeout=10,
@@ -132,6 +133,98 @@ class ChatCapForwardingTest(unittest.TestCase):
     def test_absent_cap_stays_absent(self):
         cmd = self._chat_server_cmd(cap=None)
         self.assertNotIn("--cap", cmd)
+
+
+class BannerModelLineTest(unittest.TestCase):
+    """The banner's third line must describe the model that is loaded.
+
+    It said "GLM-5.2 · 744B MoE · int4 · streaming CPU" for every checkpoint,
+    because model_arch() answers "glm" for anything it does not recognise --
+    the right default for choosing an engine, and a wrong statement of fact.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_banner_under_test", str(CLI))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    def make_model(self, config, shard_bytes=0):
+        directory = Path(tempfile.mkdtemp(prefix="coli-banner-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        if shard_bytes:
+            # An empty file: the size is reported by the getsize patch in
+            # line(). truncate() to the real size would be sparse on ext4 and
+            # APFS but NOT on NTFS, where it allocates -- the first revision of
+            # this test asked a Windows runner for 372 GB and got
+            # "OSError: [Errno 28] No space left on device".
+            (directory / "model-00001.safetensors").write_bytes(b"")
+        return directory
+
+    def line(self, config, shard_bytes=0):
+        directory = self.make_model(config, shard_bytes)
+        if not shard_bytes:
+            return self.coli.model_banner_line(str(directory))
+        real_getsize = os.path.getsize
+
+        def fake_getsize(path):
+            return shard_bytes if str(path).endswith(".safetensors") else real_getsize(path)
+
+        with mock.patch.object(self.coli.os.path, "getsize", fake_getsize):
+            return self.coli.model_banner_line(str(directory))
+
+    def test_each_engine_names_itself(self):
+        for model_type, expected in (
+            ("glm5_moe", "GLM-5.2"),
+            ("inkling", "Inkling"),
+            ("kimi_k3", "Kimi K3"),
+            ("deepseek_v4", "DeepSeek V4 Flash"),
+            ("olmoe", "OLMoE"),
+        ):
+            with self.subTest(model_type=model_type):
+                line = self.line({"model_type": model_type, "n_routed_experts": 8})
+                self.assertTrue(line.startswith(expected), line)
+
+    def test_deepseek_v4_is_not_read_as_glm(self):
+        """The regression this exists for: a non-GLM checkpoint said GLM-5.2."""
+        line = self.line({"model_type": "deepseek_v4", "n_routed_experts": 256})
+        self.assertNotIn("GLM", line)
+        self.assertNotIn("744B", line)
+
+    def test_unknown_model_states_its_own_type(self):
+        """No forcing into the roster: an unknown checkpoint speaks for itself."""
+        line = self.line({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+                          "n_routed_experts": 128})
+        self.assertIn("qwen3_moe", line)
+        self.assertIn("48L x 128E", line)
+        self.assertNotIn("GLM", line)
+
+    def test_missing_model_type_does_not_invent_one(self):
+        line = self.line({"num_hidden_layers": 32})
+        self.assertIn("unknown model", line)
+        self.assertNotIn("GLM-5.2", line)
+
+    def test_no_model_keeps_the_generic_tagline(self):
+        self.assertIn("GLM-5.2", self.coli.model_banner_line(None))
+
+    def test_unreadable_model_falls_back_instead_of_raising(self):
+        """`coli info` banners before validating the path; it must not crash."""
+        self.assertIn("GLM-5.2", self.coli.model_banner_line("/nonexistent/xyz"))
+
+    def test_size_is_reported_without_rounding_to_zero(self):
+        small = self.line({"model_type": "olmoe"}, shard_bytes=4_200_000_000)
+        self.assertIn("4.2 GB on disk", small)
+        large = self.line({"model_type": "glm5_moe"}, shard_bytes=372_000_000_000)
+        self.assertIn("372 GB on disk", large)
+        tiny = self.line({"model_type": "olmoe"}, shard_bytes=3_000_000)
+        self.assertIn("MB on disk", tiny)
+
+    def test_model_is_keyword_only(self):
+        """banner(sub, x) must not read x as a path: other PRs add arguments."""
+        with self.assertRaises(TypeError):
+            self.coli.banner("run", True)
 
 
 if __name__ == "__main__":
