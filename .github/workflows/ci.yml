@@ -64,13 +64,18 @@ jobs:
           - os: ubuntu-latest
             name: linux
             shell: bash
+            engines: colibri inkling kimi_k3 olmoe deepseek-v4
+          # deepseek-v4 is supported only on x86-64/aarch64 Linux and
+          # Windows/MSYS2, so the macOS leg builds everything but it.
           - os: macos-latest
             name: macos
             shell: bash
+            engines: colibri inkling kimi_k3 olmoe
           - os: windows-latest
             name: windows
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
             shell: "msys2 {0}"
+            engines: colibri inkling kimi_k3 olmoe deepseek-v4
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -94,7 +99,7 @@ jobs:
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3 olmoe; do
+          for t in ${{ matrix.engines }}; do
             echo "::group::$t"
             make $t || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
@@ -116,11 +121,11 @@ jobs:
         shell: pwsh
         env:
           # Nothing here may reach a real GPU, runtime or backend.
-          COLI_CUDA: ''
-          COLI_GPU: ''
-          CUDA_DENSE: ''
-          COLI_HIP_RUNTIME_DIR: ''
-          HIP_PATH: ''
+          COLI_CUDA: ""
+          COLI_GPU: ""
+          CUDA_DENSE: ""
+          COLI_HIP_RUNTIME_DIR: ""
+          HIP_PATH: ""
         run: |
           # ucrt64\bin for gcc/objdump AND usr\bin for make: without make, the
           # host-matrix class skips at setUpClass and the run silently loses
@@ -158,7 +163,7 @@ jobs:
         with:
           # v0.2.19's version table stops at 12.6.2 — 12.6.3 fails the install
           # step with "Version not available" before nvcc is ever reached.
-          cuda: '12.6.2'
+          cuda: "12.6.2"
           method: network
           sub-packages: '["nvcc"]'
       - name: Compile backend_cuda.cu (syntax only, no GPU)
@@ -187,7 +192,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: c/tools/oracle-requirements.txt
       - name: Install torch (CPU) + transformers
@@ -237,7 +242,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: c/tools/oracle-requirements.txt
       - name: Install torch (CPU) + transformers
@@ -337,7 +342,7 @@ jobs:
           # 12.6.2. This installs to the default "C:\Program Files\NVIDIA GPU
           # Computing Toolkit\..." path, so CUDA_HOME is space-bearing here —
           # which is exactly the #314 regression this job would have caught.
-          cuda: '12.6.2'
+          cuda: "12.6.2"
           method: network
           # cudart as well as nvcc: unlike the Linux job (which only needs to
           # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
@@ -383,7 +388,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
@@ -399,6 +404,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'

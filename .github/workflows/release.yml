@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -16,10 +16,17 @@ jobs:
             name: linux-x86_64
             ext: ""
             make_args: "ARCH=x86-64-v3"
+            # Binary names, as engine_for() resolves them next to coli. The
+            # deepseek make TARGET is hyphenated (deepseek-v4) but the binary
+            # it produces is deepseek_v4; the build step maps one to the other.
+            sibling_engines: inkling kimi_k3 olmoe deepseek_v4
+          # deepseek-v4 is supported only on x86-64/aarch64 Linux and
+          # Windows/MSYS2, so the macOS archive ships without it.
           - os: macos-latest
             name: macos-arm64
             ext: ""
             make_args: ""
+            sibling_engines: inkling kimi_k3 olmoe
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"
@@ -27,6 +34,7 @@ jobs:
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
             # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
             shell: "msys2 {0}"
+            sibling_engines: inkling kimi_k3 olmoe deepseek_v4
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -56,14 +64,15 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri inkling kimi_k3 olmoe; do
-            make $t ${{ matrix.make_args }}
+          for t in colibri ${{ matrix.sibling_engines }}; do
+            case $t in deepseek_v4) tgt=deepseek-v4 ;; *) tgt=$t ;; esac
+            make $tgt ${{ matrix.make_args }}
+            ls -lh $t${{ matrix.ext }}
           done
-          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }}
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -93,10 +102,10 @@ jobs:
           cp c/colibri${{ matrix.ext }} dist/colibri${{ matrix.ext }}
           # The sibling engines go in under their plain names too: `coli` resolves the
           # engine from the model's config.json and looks for kimi_k3/inkling next to
-          # itself (c/coli, engine_for()). ~830 KB for all four.
-          cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
-          cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
-          cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+          # itself (c/coli, engine_for()). Well under a megabyte for the lot.
+          for e in ${{ matrix.sibling_engines }}; do
+            cp c/$e${{ matrix.ext }} dist/$e${{ matrix.ext }}
+          done
           # Kimi K3 ships tiktoken.model, not tokenizer.json; k3_tokenizer.py synthesizes
           # it. Without this the engine is in the archive but `coli chat` still cannot
           # run it -- the second half of #720.
@@ -137,7 +146,7 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          for e in inkling kimi_k3 olmoe; do
+          for e in ${{ matrix.sibling_engines }}; do
             test -x $e${{ matrix.ext }} || { echo "FAIL: $e missing from archive"; ls -la; exit 1; }
           done
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
@@ -152,7 +161,7 @@ jobs:
           python3 - <<'PYCHK'
           import os, sys
           exe = ".exe" if os.name == "nt" else ""
-          missing = [n for n in ("inkling", "kimi_k3", "olmoe")
+          missing = [n for n in "${{ matrix.sibling_engines }}".split()
                      if not os.path.exists(os.path.join(".", n + exe))]
           if missing:
               sys.exit("FAIL: coli would not resolve these next to itself: " + ", ".join(missing))

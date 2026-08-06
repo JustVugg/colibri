@@ -19,6 +19,9 @@ c/inkling
 c/kimi_k3
 c/kimi_k3.exe
 c/olmoe.exe
+c/deepseek_v4
+c/deepseek_v4.exe
+c/COLI_V4_UNIT_*.o
 c/iobench
 c/iobench.exe
 c/tok_test
