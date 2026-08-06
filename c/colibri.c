@@ -6043,25 +6043,16 @@ static int grammar_draft(GrDraft *g, int *draft, int cap){
 /* STOP MORBIDO (serve/chat): SIGINT chiude il turno CORRENTE per la stessa via
  * del tetto NGEN (stats, usage_save, KV append, sentinella END tutti normali)
  * invece di uccidere il motore; :more puo' continuare la risposta interrotta.
+ * SIGTERM usa la stessa chiusura morbida, poi termina il serve-loop con successo.
  * Il flag e' armato solo nei serve-loop (intr_install): nei run one-shot e in
- * validazione SIGINT resta il default (morte immediata). Solo POSIX: su
+ * validazione SIGINT/SIGTERM restano default. Solo POSIX: su
  * Windows il comportamento di Ctrl-C non cambia.
  * EN: soft stop (serve/chat): SIGINT ends the CURRENT turn through the same
  * path as the NGEN cap — stats/usage/KV/END sentinel all normal — instead of
- * killing the engine; :more can continue the interrupted answer. Armed only
- * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
-static volatile sig_atomic_t g_intr=0;
-#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
-static void intr_sig(int s){ (void)s; g_intr=1; }
-static void intr_install(void){
-    struct sigaction sa; memset(&sa,0,sizeof(sa));
-    sa.sa_handler=intr_sig; sigemptyset(&sa.sa_mask);
-    sa.sa_flags=SA_RESTART;              /* getline/pread non devono vedere EINTR */
-    sigaction(SIGINT,&sa,NULL);
-}
-#else
-static void intr_install(void){}
-#endif
+ * killing the engine; :more can continue the interrupted answer. SIGTERM uses
+ * that same soft-stop path, then exits the serve loop successfully. Armed only
+ * in serve loops; one-shot runs keep default SIGINT/SIGTERM. POSIX only. */
+#include "serve_signal.h"
 /* #678: mid-turn STOP/CANCEL for the single-slot speculative serve path. With
  * KV_SLOTS=1 the whole turn runs inside ONE spec_decode call, so run_serve_mux's
  * stdin poll never runs mid-turn and a server-sent STOP (raised when its stop
@@ -7302,6 +7293,7 @@ static void run_serve_mux(Model *m, const char *snap){
                                           * via normale di mux_done (DONE+stats+KV coerenti) */
             for(int i=0;i<nctx;i++) if(req[i].active) mux_done(m,&ctx[i],&req[i]);
         }
+        if(g_term) break;
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
@@ -7311,9 +7303,12 @@ static void run_serve_mux(Model *m, const char *snap){
         int ready=0;
         if(!eof){
 #if defined(__APPLE__) || defined(__linux__) ||	defined(__FreeBSD__)
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+            fd_set rfds; FD_ZERO(&rfds);
+            FD_SET(STDIN_FILENO,&rfds); FD_SET(g_term_pipe_r,&rfds);
+            int maxfd=STDIN_FILENO>g_term_pipe_r?STDIN_FILENO:g_term_pipe_r;
             struct timeval tv={0,0}, *ptv=active?&tv:NULL;
-            ready=select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
+            ready=select(maxfd+1,&rfds,NULL,NULL,ptv);
+            if(ready>0 && FD_ISSET(g_term_pipe_r,&rfds)){ term_pipe_drain(); ready=0; }
             if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds))
 #elif defined(_WIN32)
             HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
@@ -7466,7 +7461,8 @@ static void run_serve(Model *m, const char *snap){
     intr_install();                      /* Ctrl-C = fine turno, non fine processo */
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     tiers_emit(m);
-    while((nr=getline(&line,&cap,stdin))>0){
+    while(!g_term && (nr=getline(&line,&cap,stdin))>0){
+        if(g_term) break;
         g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
