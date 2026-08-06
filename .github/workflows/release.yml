@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -56,14 +56,14 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri inkling kimi_k3 olmoe; do
+          for t in colibri inkling kimi_k3 olmoe deepseek-v4; do
             make $t ${{ matrix.make_args }}
           done
-          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} deepseek-v4${{ matrix.ext }}
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -93,10 +93,11 @@ jobs:
           cp c/colibri${{ matrix.ext }} dist/colibri${{ matrix.ext }}
           # The sibling engines go in under their plain names too: `coli` resolves the
           # engine from the model's config.json and looks for kimi_k3/inkling next to
-          # itself (c/coli, engine_for()). ~830 KB for all four.
+          # itself (c/coli, engine_for()). Roughly a megabyte for all five.
           cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
           cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
           cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+          cp c/deepseek-v4${{ matrix.ext }} dist/deepseek-v4${{ matrix.ext }}
           # Kimi K3 ships tiktoken.model, not tokenizer.json; k3_tokenizer.py synthesizes
           # it. Without this the engine is in the archive but `coli chat` still cannot
           # run it -- the second half of #720.
@@ -137,7 +138,7 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          for e in inkling kimi_k3 olmoe; do
+          for e in inkling kimi_k3 olmoe deepseek-v4; do
             test -x $e${{ matrix.ext }} || { echo "FAIL: $e missing from archive"; ls -la; exit 1; }
           done
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
@@ -152,7 +153,7 @@ jobs:
           python3 - <<'PYCHK'
           import os, sys
           exe = ".exe" if os.name == "nt" else ""
-          missing = [n for n in ("inkling", "kimi_k3", "olmoe")
+          missing = [n for n in ("inkling", "kimi_k3", "olmoe", "deepseek-v4")
                      if not os.path.exists(os.path.join(".", n + exe))]
           if missing:
               sys.exit("FAIL: coli would not resolve these next to itself: " + ", ".join(missing))
