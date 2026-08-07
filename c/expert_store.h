@@ -57,6 +57,13 @@ typedef struct {
  *   still has an active lease.
  */
 typedef struct {
+    int rows;              /* expert layers */
+    int cols;              /* experts per layer */
+    int resident;          /* experts currently resident in RAM */
+    uint64_t record_bytes; /* bytes per expert record (tier GB estimate) */
+} ColiStoreTelemetry;
+
+typedef struct {
     /* Returns zero on success. The view remains valid until release(). */
     int (*lookup)(ColiExpertStore *store, ColiExpertKey key,
                   ColiExpertView *view);
@@ -65,6 +72,12 @@ typedef struct {
     int (*prefetch)(ColiExpertStore *store, const ColiExpertKey *keys,
                     size_t count);
     void (*stats)(const ColiExpertStore *store, ColiExpertStoreStats *stats);
+    /* Dashboard telemetry (optional): fill a per-expert tier/heat hex map,
+     * 2 hex chars per expert: (tier << 6) | heat, tier 0=disk 1=RAM, heat =
+     * log2(usage) capped at 63. hex must hold rows*cols*2+1 bytes; returns 0
+     * on success and fills *out. NULL when unsupported. */
+    int (*emap)(const ColiExpertStore *store, char *hex, size_t hex_cap,
+                ColiStoreTelemetry *out);
     void (*destroy)(ColiExpertStore *store);
 } ColiExpertStoreOps;
 

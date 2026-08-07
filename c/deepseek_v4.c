@@ -5331,6 +5331,54 @@ static void stats(const ColiExpertStore *store, ColiExpertStoreStats *output) {
     *output = state->stats;
     pthread_mutex_unlock(&state->mutex);
 }
+/* Dashboard telemetry: per-expert tier/heat hex map (2 hex chars per expert:
+ * (tier << 6) | heat; tier 0=disk 1=RAM, heat = log2(slot usage) capped at
+ * 63). Implemented here, next to the slots it reads, and exposed through
+ * ColiExpertStoreOps.emap so the serve loop (a different amalgamated unit)
+ * never needs the store internals. */
+static int store_emap(const ColiExpertStore *store, char *hex, size_t hex_cap,
+                      ColiStoreTelemetry *out) {
+    if (!store || !store->state || !hex || !out) return -1;
+    V4ExpertStoreState *state = store->state;
+    int rows = state->layers;
+    int cols = state->experts_per_layer;
+    if (rows < 1 || cols < 1 || !state->slots) return -1;
+    size_t need = (size_t)rows * cols * 2 + 1;
+    if (hex_cap < need) return -1;
+    int resident = 0;
+    int w = 0;
+    pthread_mutex_lock(&state->mutex);
+    for (int layer = 0; layer < rows; layer++) {
+        V4ExpertSlot *layer_slots =
+            state->slots + (size_t)layer * state->slots_per_layer;
+        for (int expert = 0; expert < cols; expert++) {
+            int tier = 0;
+            uint64_t used = 0;
+            for (int z = 0; z < state->slots_per_layer; z++) {
+                V4ExpertSlot *slot = &layer_slots[z];
+                if (slot->slab && slot->expert == expert) {
+                    tier = 1;
+                    if (slot->used > used) used = slot->used;
+                }
+            }
+            if (tier) resident++;
+            int heat = 0;
+            while (used) { heat++; used >>= 1; }
+            if (heat > 63) heat = 63;
+            int b = (tier << 6) | heat;
+            hex[w++] = "0123456789abcdef"[b >> 4];
+            hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    pthread_mutex_unlock(&state->mutex);
+    hex[w] = 0;
+    out->rows = rows;
+    out->cols = cols;
+    out->resident = resident;
+    out->record_bytes = state->record_bytes;
+    return 0;
+}
+
 
 static void destroy(ColiExpertStore *store) {
     if (!store) return;
@@ -5357,7 +5405,7 @@ int coli_deepseek_v4_expert_store_open(
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
     static const ColiExpertStoreOps operations = {
-        lookup, release, prefetch, stats, destroy
+        lookup, release, prefetch, stats, store_emap, destroy
     };
     if (!options || !output || !options->model_dir || options->layers < 1 ||
         options->experts_per_layer < 1 || !options->cache_bytes)
@@ -5977,7 +6025,7 @@ int COLI_V4_ROWS16_STORE_OPEN(
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
     static const ColiExpertStoreOps hot_operations = {
-        lookup_hot, release, prefetch, stats, destroy_hot
+        lookup_hot, release, prefetch, stats, store_emap, destroy_hot
     };
     int result = coli_deepseek_v4_expert_store_open_base(
         options, output, error, error_size);
@@ -8376,6 +8424,72 @@ static void v4_serve_error(const char *id, const char *message) {
     fflush(stdout);
 }
 
+/* ---- dashboard telemetry (serve protocol) ---------------------------------
+ * openai_server.py parses HWINFO / TIERS / EMAP / PROF lines from engine
+ * stdout to feed the web dashboard. The GLM engine and the sibling engines
+ * already emit them; the V4 target engine did not, so the Brain/Profiling
+ * pages sat on "waiting for engine". Same line formats, V4 data. */
+
+static void v4_serve_hwinfo(void) {
+    char cpu[256] = "";
+    int cores = 0;
+    double ram_total = 0, ram_avail = 0;
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) {
+        char ln[256];
+        while (fgets(ln, sizeof(ln), ci))
+            if (!strncmp(ln, "model name", 10)) {
+                char *p = strchr(ln, ':');
+                if (p) {
+                    p++;
+                    while (*p == ' ') p++;
+                    int n = (int)strlen(p);
+                    if (n > 0 && p[n - 1] == '\n') p[--n] = 0;
+                    snprintf(cpu, sizeof(cpu), "%s", p);
+                }
+                break;
+            }
+        fclose(ci);
+    }
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) {
+        char ln[256];
+        double v = 0;
+        while (fgets(ln, sizeof(ln), mi)) {
+            if (sscanf(ln, "MemTotal: %lf", &v) == 1) ram_total = v / 1e6;
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ram_avail = v / 1e6;
+        }
+        fclose(mi);
+    }
+    printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, ram_total, ram_avail,
+           cpu[0] ? cpu : "unknown");
+    fflush(stdout);
+}
+
+static void v4_serve_tiers_emap(ColiV4Engine *engine) {
+    ColiExpertStore *store = engine ? engine->experts : NULL;
+    if (!store || !store->ops || !store->ops->emap) return;
+    char *hex = malloc(65536);
+    if (!hex) return;
+    ColiStoreTelemetry tm;
+    if (store->ops->emap(store, hex, 65536, &tm) != 0 ||
+        tm.rows < 1 || tm.cols < 1) {
+        free(hex);
+        return;
+    }
+    int total = tm.rows * tm.cols;
+    double ram_gb = tm.record_bytes
+        ? (double)tm.resident * (double)tm.record_bytes / 1e9 : 0.0;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", tm.resident, total - tm.resident,
+           ram_gb);
+    printf("EMAP %d %d %s\n", tm.rows, tm.cols, hex);
+    fflush(stdout);
+    free(hex);
+}
+
 static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                          V4ServeRequest *request) {
     if (request->extension_bytes) {
@@ -8435,6 +8549,17 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     int length_limited = !stream.cancelled && !stats.eos_stopped &&
                          stats.generated_tokens >= request->max_tokens;
     double decode = stats.decode_sec > 0.0 ? stats.decode_sec : elapsed;
+    /* Dashboard telemetry for this turn: hardware panel, tier bar + expert
+     * cortex, then the per-turn PROF line. The V4 engine does not split
+     * decode into phase timers yet, so the phase fields are 0 and the whole
+     * wall time lands in the UI's "other" bucket — honest, and the wall/token
+     * columns still render. */
+    v4_serve_hwinfo();
+    v4_serve_tiers_emap(engine);
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",
+           elapsed, stats.prompt_tokens, completion,
+           0.0, 0.0, 0.0, 0.0, 0.0,
+           (unsigned long long)(completion > 0 ? completion + 1 : 1));
     /* Trailing field: prompt tokens served from the previous turn's attention
      * state instead of being prefilled again. Appended rather than inserted --
      * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
@@ -8492,6 +8617,11 @@ static int v4_serve_main(void) {
     fputs("\x01\x01READY\x01\x01\n", stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n", v4_serve_rss_gb());
     fflush(stdout);
+    /* Dashboard hardware/tier/cortex snapshot right after the handshake so
+     * the panels render before the first request (the dispatcher reads these
+     * lines after read_engine_turn has consumed READY + STAT). */
+    v4_serve_hwinfo();
+    v4_serve_tiers_emap(engine);
     for (;;) {
         V4ServeRequest request = {0};
         int result;
@@ -9407,7 +9537,7 @@ int coli_deepseek_v4_expert_store_open(
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
     static const ColiExpertStoreOps operations = {
-        lookup, release, prefetch, stats, destroy
+        lookup, release, prefetch, stats, 0, destroy
     };
     if (!options || !output || !options->model_dir || options->layers < 1 ||
         options->experts_per_layer < 1 || !options->cache_bytes)
