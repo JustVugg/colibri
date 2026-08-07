@@ -4,7 +4,7 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * The engines read 220 environment variables from getenv() call sites
+ * The engines read 236 environment variables from getenv() call sites
  * scattered across the sources, and until this header there was no list of
  * them anywhere in the code. (`make check-env` prints the current count; it is
  * the one number here that cannot go stale, because it is computed.)
@@ -21,7 +21,7 @@
  *
  * This is the approach vLLM converged on (vllm/envs.py): one declaration point,
  * one prefix convention, validation at the boundary. It is worth stating that
- * vLLM carries 284 of these to our 220 -- the count is not the problem in
+ * vLLM carries 284 of these to our 236 -- the count is not the problem in
  * either project, the absence of a registry was.
  *
  * WHAT IT DELIBERATELY DOES NOT DO
@@ -162,7 +162,14 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_TEMP",                       CE_FLOAT , CE_ALL     , 0             , NULL},
     {"COLI_USAGE",                      CE_STR   , CE_ALL     , 0             , NULL},
     {"COLI_USAGE_DECAY",                CE_FLOAT , CE_ALL     , 0             , NULL},
+    {"COLI_V4_AUTOPIN",                 CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"COLI_V4_DIRECT",                  CE_BOOL  , CE_DSV4    , 0             , NULL},
     {"COLI_V4_EXPERT_PREFETCH",         CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"COLI_V4_MARKOV_BLOCK",            CE_INT   , CE_DSV4    , 0             , NULL},
+    {"COLI_V4_MARKOV_KEEP",             CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"COLI_V4_MARKOV_SPEC",             CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"COLI_V4_PREWARM",                 CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"COLI_V4_SAVE_USAGE",              CE_BOOL  , CE_DSV4    , 0             , NULL},
     {"COLI_VK_ATTN",                    CE_INT   , CE_COLIBRI , 0             , NULL},
     {"COLI_VK_DENSE",                   CE_INT   , CE_COLIBRI , 0             , NULL},
     {"COLI_VK_DEV2",                    CE_STR   , CE_COLIBRI , 0             , NULL},
@@ -215,6 +222,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"K3_BITS",                         CE_INT   , CE_KIMI    , 0             , NULL},
     {"K3_CHAT_IDS",                     CE_STR   , CE_KIMI    , 0             , NULL},
     {"K3_CHUNK",                        CE_INT   , CE_KIMI    , 0             , NULL},
+    {"K3_CUDA",                         CE_INT   , CE_KIMI    , 0             , NULL},
     {"K3_DIRECT",                       CE_INT   , CE_KIMI    , 0             , NULL},
     {"K3_DIRS",                         CE_PATH  , CE_KIMI    , 0             , NULL},
     {"K3_EXPERT_GB",                    CE_FLOAT , CE_KIMI    , 0             , NULL},
@@ -301,6 +309,14 @@ static const ColiEnvVar coli_env_table[] = {
     {"TOPP",                            CE_FLOAT , CE_ALL     , 0             , NULL},
     {"URING",                           CE_INT   , CE_COLIBRI , 0             , NULL},
     {"USAGE_SAVE",                      CE_STR   , CE_ALL     , 0             , NULL},
+    {"V4_DRAFT",                        CE_INT   , CE_DSV4    , 0             , NULL},
+    {"V4_MTP",                          CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"V4_MTP_DRAFT",                    CE_INT   , CE_DSV4    , 0             , NULL},
+    {"V4_MTP_GB",                       CE_FLOAT , CE_DSV4    , 0             , NULL},
+    {"V4_MTP_MIN",                      CE_INT   , CE_DSV4    , 0             , NULL},
+    {"V4_MTP_PARTIAL_KEEP",             CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"V4_NGRAM",                        CE_BOOL  , CE_DSV4    , 0             , NULL},
+    {"V4_NGRAM_PARTIAL_KEEP",           CE_BOOL  , CE_DSV4    , 0             , NULL},
     {"V4_PREFIX_LOG",                   CE_STR   , CE_DSV4    , 0             , NULL},
     {"VK_PROF",                         CE_STR   , CE_ALL     , 0             , NULL},
     {"WARMUP",                          CE_INT   , CE_OLMOE   , 0             , NULL},
