@@ -112,6 +112,24 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
           ctx.fillRect(c * (cell + gap), r * (cell + gap), cell, cell)
         }
       }
+      // Explicit grid lines: the inter-cell gap alone scales away when the
+      // canvas bitmap is CSS-scaled to fit the wrapper (non-integer scale
+      // factors drop some column/row separations). Stroke every boundary so
+      // the grid is complete at any display size.
+      ctx.strokeStyle = "#000"
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      for (let c = 1; c < cols; c++) {
+        const x = c * (cell + gap) - 0.5
+        ctx.moveTo(x, 0)
+        ctx.lineTo(x, canvas.height)
+      }
+      for (let r = 1; r < rows; r++) {
+        const y = r * (cell + gap) - 0.5
+        ctx.moveTo(0, y)
+        ctx.lineTo(canvas.width, y)
+      }
+      ctx.stroke()
       let alive = false
       if (p) for (let i = 0; i < p.length; i++) { if (p[i] > 0.01) { p[i] *= 0.94; alive = true } else p[i] = 0 }
       if (alive) rafRef.current = requestAnimationFrame(draw)
