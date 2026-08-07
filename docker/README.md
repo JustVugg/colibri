@@ -121,6 +121,13 @@ sudo docker build -t colibri-i .
 
 Wait for it to finish (a few minutes). If everything goes well, you will see: `Successfully tagged colibri-i:latest`
 
+> **This builds the code on GitHub, not the code on your disk.** The Dockerfile
+> clones the repository inside the image — that is what makes this path work
+> with a single downloaded file and no checkout. If you are *developing* and
+> want your local changes in the image, use `Dockerfile.slim` instead (see
+> [Slim image](#slim-image-developers--production) below); it copies `c/` from the build
+> context.
+
 > **If you want to receive repository updates**: First delete the old image with `docker rmi colibri-i` and rebuild.
 
 ---

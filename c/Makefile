@@ -216,8 +216,46 @@ endif
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
 # machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
 HIP       ?= 0
+# HIP_DLL=1 is the AMD sibling of CUDA_DLL=1 (Windows only): MinGW gcc cannot
+# compile .cu and hipcc on Windows targets the MSVC ABI, so the backend goes
+# into a standalone coli_hip.dll and the host loads it at runtime — exactly the
+# split the CUDA path already uses. The host never links amdhip64. Same single
+# source and same coli_cuda_* ABI the Linux HIP path reuses, so the host keeps
+# -DCOLI_CUDA; -DCOLI_HIP_DLL only records WHICH DLL it will look for.
+HIP_DLL   ?= 0
+ifneq ($(IS_WIN),)
+# One runtime DLL per host binary: the loader resolves a single hardcoded DLL
+# name, so a host built for both would silently be a host built for whichever
+# arm ran last. Checked FIRST, before the arch and flag guards below, so the
+# contradiction is reported instead of whichever downstream check trips.
+ifeq ($(CUDA_DLL)$(HIP_DLL),11)
+$(error choose CUDA_DLL=1 or HIP_DLL=1, not both)
+endif
+endif
 ROCM_HOME ?= /opt/rocm
+ifneq ($(IS_WIN),)
+# --- Windows HIP SDK contract (HIP_DLL only; the Linux ROCM_HOME contract
+# above is untouched) ---
+# NOTHING here may hardcode an install location: HIP_PATH is the variable the
+# official Windows HIP SDK installer sets, and a source-built or relocated SDK
+# is selected with HIP_SDK_ROOT=<path> (e.g. from `rocm-sdk path --root`).
+# Backslashes become forward slashes so the value survives the shell.
+#
+# Every component is separately overridable because packaged ROCm layouts do
+# not all keep runtime, development and device files under one root:
+#   HIP_SDK_ROOT         SDK root                  (--hip-path)
+#   HIP_INCLUDE_DIR      headers                   (-I)
+#   HIP_LIB_DIR          amdhip64.lib import lib   (-L)
+#   HIP_DEVICE_LIB_PATH  amdgcn device bitcode     (--rocm-device-lib-path)
+HIP_SDK_ROOT        ?= $(subst \,/,$(HIP_PATH))
+HIP_BIN_DIR         ?= $(HIP_SDK_ROOT)/bin
+HIP_INCLUDE_DIR     ?= $(HIP_SDK_ROOT)/include
+HIP_LIB_DIR         ?= $(HIP_SDK_ROOT)/lib
+HIP_DEVICE_LIB_PATH ?= $(HIP_SDK_ROOT)/lib/llvm/amdgcn/bitcode
+HIPCC               ?= $(HIP_BIN_DIR)/hipcc.exe
+else
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+endif
 HIP_ARCH  ?= native
 # HIP_ARCH accepts a list (space- or comma-separated, e.g. "gfx906 gfx1030")
 # to fat-bundle several targets into one binary; COLI_GPUS picks at runtime.
@@ -234,7 +272,48 @@ $(error HIP_ARCH=native but rocm_agent_enumerator found no GPUs; set HIP_ARCH=gf
 endif
 endif
 endif
+# Guards for the Windows HIP path, active ONLY when the hip-dll TARGET is
+# requested — never for HIP_DLL=1 alone. HIP_DLL=1 selects the host arm, which
+# compiles backend_loader.c and links colibri.exe against no HIP library and no
+# SDK header: demanding an SDK there blocks a build that needs nothing from one
+# (and HIP_PATH is not visible in every shell, e.g. an MSYS2 login shell).
+# The default CPU build must never depend on a HIP path either.
+#
+# Only the string checks live here. Existence checks (hipcc, headers, import
+# library, device bitcode) run in the hip-dll recipe instead. The stock Windows
+# HIP SDK location may contain spaces, and $(wildcard) splits its argument on
+# them, so a parse-time $(wildcard) check can incorrectly report a valid
+# installation as missing. The recipe's shell tests are quoted and handle
+# spaces correctly.
+ifneq ($(IS_WIN),)
+HIP_DLL_TARGET_REQUESTED := $(filter hip-dll,$(MAKECMDGOALS))
+ifneq ($(HIP_DLL_TARGET_REQUESTED),)
+ifeq ($(strip $(HIP_SDK_ROOT)),)
+$(error Windows HIP build: no HIP SDK selected. Set HIP_PATH, or pass HIP_SDK_ROOT=<path> (e.g. from `rocm-sdk path --root`))
+endif
+# Windows has no rocm_agent_enumerator to resolve `native` against, and the
+# enumerator branch above is HIP=1-only, so an unset HIP_ARCH would reach hipcc
+# as --offload-arch=native and fail deep inside the compiler. Demand the arch
+# here, where the cause is still visible.
+ifeq ($(strip $(HIP_ARCH)),native)
+$(error Windows HIP build: set an explicit HIP_ARCH=gfxNNNN (rocm_agent_enumerator is not available here), e.g. HIP_ARCH=gfx1151)
+endif
+ifeq ($(strip $(HIP_ARCH)),)
+$(error Windows HIP build: HIP_ARCH is empty; set HIP_ARCH=gfxNNNN, e.g. HIP_ARCH=gfx1151)
+endif
+endif
+endif
+ifneq ($(IS_WIN),)
+# No -fPIE on Windows: it is there for the Linux PIE link of backend_cuda.o into
+# the gcc engine (the readelf guard in ci.yml exists because dropping it made
+# that link fail), and it is meaningless for a PE DLL MinGW never links against.
+# -Wall/-Wextra DO carry over unchanged — hipcc is clang and takes GCC-style
+# warning flags directly. nvcc's -Xcompiler=-W3 workaround above is specific to
+# nvcc driving cl.exe as its host compiler and must NOT be copied here.
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra
+else
 HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra -fPIE
+endif
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
@@ -250,6 +329,23 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
+
+# DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
+# tests run everywhere; the engine and token-exact fixture run on x86-64
+# Linux/Windows and aarch64 Linux. SIMD fast paths are gated per-feature
+# inside the sources, so a plain armv8-a build stays correct.
+COLI_V4_SUPPORTED :=
+ifneq (,$(X86_64))
+ifneq (,$(IS_WIN)$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+ifneq (,$(AARCH64))
+ifneq (,$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+
 # Gates are exactly the tests that have a build rule further down -- derived from those
 # rules, so adding a gate means adding your tests/test_*.c and its rule, and nothing else.
 # There is no shared list to conflict on.
@@ -261,17 +357,31 @@ CUDA_OBJ  =
 # work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
 # they fail to link. Having a rule is the honest definition of "this is a gate".
 TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
-# test_uring has a rule but is Linux-only; it is appended conditionally just below.
-TEST_EXCLUDE = test_uring
+# test_uring is Linux-only. V4 engine tests are appended below only on supported
+# x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
+# unconditional rules and therefore remain portable gates.
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
+ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
+endif
 
-# Windows CUDA DLL path: host links the loader, NOT cudart.
+# Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
+# (CUDA_DLL/HIP_DLL mutual exclusion is enforced at the HIP_DLL declaration.)
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
 CFLAGS  += -DCOLI_CUDA
+CUDA_OBJ = backend_loader.o
+endif
+ifeq ($(HIP_DLL),1)
+# -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
+# coli_cuda_* surface); -DCOLI_HIP_DLL is only the build discriminator, so a
+# later phase can point the loader at coli_hip.dll. No LDFLAGS change: linking
+# amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
+CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
 CUDA_OBJ = backend_loader.o
 endif
 endif
@@ -368,6 +478,50 @@ endif
 
 all: colibri$(EXE)
 
+.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
+	deepseek-v4-tiny-check deepseek-v4-clean
+ifeq ($(COLI_V4_SUPPORTED),1)
+deepseek-v4:
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+
+deepseek-v4-clean:
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+
+deepseek-v4-tiny-generate:
+	$(PYTHON) tools/make_deepseek_v4_tiny.py \
+		--output ./deepseek_v4_tiny --force
+
+deepseek-v4-tiny-check: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
+	$(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	$(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+deepseek-v4-oracle: deepseek-v4
+	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--output tests/deepseek_v4_oracle.json \
+		--memory-gb $(or $(MEMORY_GB),32) \
+		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
+		--validate \
+		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
+		--greedy $(or $(ORACLE_GREEDY),20)
+else
+deepseek-v4 deepseek-v4-oracle:
+	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
+deepseek-v4-clean:
+	@:
+deepseek-v4-tiny-check:
+	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-generate:
+	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+endif
+
 # phony targets — 'glm' kept for backward compatibility
 colibri: colibri$(EXE)
 glm: colibri$(EXE)
@@ -379,7 +533,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -392,7 +546,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -417,6 +571,42 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
+
+# Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
+# backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
+# the same coli_cuda_* surface — which is why COLI_CUDA_BUILDING_DLL, and not a
+# new HIP-specific export macro, is the correct switch here. No cl.exe guard
+# like cuda-dll's: hipcc brings its own clang host pass, but it still needs the
+# MSVC linker and Windows SDK, so run this from a vcvars64 shell.
+#
+# --hip-path pins the SDK: a machine can carry BOTH a driver-installed HIP SDK
+# and a source-built one, and clang injects the driver install via -idirafter on
+# its own. Without --hip-path the headers came from one tree while -L/-lamdhip64
+# and the device bitcode came from the other — the mismatch that made
+# <rocwmma/rocwmma.hpp> unfindable even though the selected SDK ships it.
+# --hip-path alone resolves both hip/ and rocwmma/ from the selected root;
+# -I"$(HIP_INCLUDE_DIR)" is kept because it takes precedence (verified) and is
+# the override point for layouts that split headers off the SDK root.
+# --rocm-device-lib-path is kept for determinism: clang can otherwise find the
+# bitcode relative to its own resource dir, which is a guess, not a contract.
+# Every SDK-derived path is quoted so an install under "C:\Program Files\..."
+# survives. No path is hardcoded — see the HIP SDK contract above.
+#
+#   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
+hip-dll: backend_cuda.cu backend_cuda.h backend_gpu_compat.h
+	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
+	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
+	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
+	@case "$(HIPCCFLAGS)" in *COLI_HIP_NO_WMMA*) ;; *) test -f "$(HIP_INCLUDE_DIR)/rocwmma/rocwmma.hpp" || { echo "rocwmma/rocwmma.hpp missing under \"$(HIP_INCLUDE_DIR)\": install the rocWMMA component, or set HIP_INCLUDE_DIR=<path>" >&2; exit 1; } ;; esac
+	@test -d "$(HIP_LIB_DIR)" || { echo "HIP lib dir not found: \"$(HIP_LIB_DIR)\" — set HIP_LIB_DIR=<path>" >&2; exit 1; }
+	@test -f "$(HIP_LIB_DIR)/amdhip64.lib" || { echo "amdhip64.lib missing under \"$(HIP_LIB_DIR)\" — set HIP_LIB_DIR=<path>" >&2; exit 1; }
+	@test -d "$(HIP_DEVICE_LIB_PATH)" || { echo "device bitcode dir not found: \"$(HIP_DEVICE_LIB_PATH)\" — set HIP_DEVICE_LIB_PATH=<path>" >&2; exit 1; }
+	"$(HIPCC)" $(HIPCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		--hip-path="$(HIP_SDK_ROOT)" \
+		-I"$(HIP_INCLUDE_DIR)" \
+		--rocm-device-lib-path="$(HIP_DEVICE_LIB_PATH)" \
+		-L"$(HIP_LIB_DIR)" -lamdhip64 \
+		backend_cuda.cu -o coli_hip.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -498,8 +688,24 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
+# ENGINES WITHOUT A CUDA BACKEND (#783).
+# kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
+# CUDA=1 appends -DCOLI_CUDA to the global CFLAGS and the cudart libs to
+# LDFLAGS, so `make kimi_k3 CUDA=1` used to compile a define that matches
+# nothing, link a runtime it never calls, and emit no warning: every
+# observable signal said "CUDA build" and the GPUs stayed idle. Strip the
+# flags for these targets and say so once, loudly.
+comma := ,
+NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+                   -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
+
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+ifeq ($(CUDA),1)
+	@echo "*** kimi_k3 has no CUDA backend (#783): building without it."
+	@echo "*** On NVIDIA, Kimi K3 runs on the Vulkan path — build VULKAN=1 and set COLI_VULKAN=1."
+endif
+	$(CC) $(NOCUDA_CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(NOCUDA_LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -534,8 +740,14 @@ tests/test_json$(EXE): tests/test_json.c json.h
 
 tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
+tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -555,6 +767,9 @@ tests/test_ablate$(EXE): tests/test_ablate.c abl.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
@@ -633,6 +848,59 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h tensor.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+
+ifeq ($(COLI_V4_SUPPORTED),1)
+include Makefile.deepseek-v4.units
+V4_TEST_LINK_OBJS = \
+	COLI_V4_UNIT_ST.o \
+	COLI_V4_UNIT_CONFIG.o \
+	COLI_V4_UNIT_MATH.o \
+	COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o \
+	COLI_V4_UNIT_PROMPT.o \
+	$(addsuffix .o,$(V4_TEST_UNITS)) \
+	COLI_V4_UNIT_NATIVE_QUANT.o
+
+tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
+		Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
+	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
+V4_OWN_DIR = build/ownership
+V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
+V4_OWNERSHIP_OBJS = \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o
+
+$(V4_OWN_DIR):
+	mkdir -p $(V4_OWN_DIR)
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h st.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h quant.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+
+tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
+	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
+
+endif
+
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -677,6 +945,9 @@ tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json
 tests/test_pilot_ring$(EXE): tests/test_pilot_ring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 
@@ -713,13 +984,25 @@ efficiency-cuda:
 efficiency-report:
 	$(PYTHON) tests/test_efficiency_report.py
 
+
+# What a parallel region costs before its body runs. Backs the `if(S > 1)`
+# clause in the DSA indexer: at decode that region has one iteration, and the
+# fork/join is paid anyway. Not a gate -- a measurement, run it when changing
+# how the engine parallelises.
+#   make -C c bench-omp-grain
+# Honours OMP_NUM_THREADS/OMP_WAIT_POLICY, so measure with the settings the
+# engine actually runs under (omp_tune.h sizes the team to physical cores).
+bench-omp-grain: tests/bench_omp_grain.c
+	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
+	./tests/bench_omp_grain
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE)
+install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
@@ -728,6 +1011,9 @@ install: colibri$(EXE) olmoe$(EXE)
 	chmod 644 '$(DESTDIR)$(BINDIR)/coli.libexec'
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	@if [ -f deepseek_v4$(EXE) ]; then \
+	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
+	fi
 	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py ramdisk.py ramdisk_ui.py ramdisk_textual.py requirements-tui.txt $(DESTDIR)$(LIBEXECDIR)/
 	rm -rf "$(DESTDIR)$(LIBEXECDIR)/ramdisk_support"
 	$(INSTALL) -d -m 755 "$(DESTDIR)$(LIBEXECDIR)/ramdisk_support"
@@ -753,4 +1039,13 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable \
+	test-c test-python test check clean install uninstall bench
+
+# Own line: see the TEST_RULES note above on shared .PHONY lines.
+.PHONY: bench-omp-grain
+
+tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
+	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

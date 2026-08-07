@@ -26,6 +26,26 @@ static void check(const char *label, int cli_given, int cli, int env, int platfo
     }
 }
 
+static void check_autopin(const char *label, double planned, double available,
+                          double lru, double expected){
+    double got=autopin_preserve_lru(planned,available,lru);
+    if(fabs(got-expected)>1e-9){
+        fprintf(stderr,"FAIL %-36s -> %.3f (want %.3f)\n",label,got,expected);
+        failures++;
+    }
+}
+
+static void check_lru_reserve(const char *label, double available, double slot,
+                              int requested, int expected_cap, double expected_bytes){
+    int cap=-1;
+    double got=autopin_lru_reserve(available,slot,requested,&cap);
+    if(cap!=expected_cap || fabs(got-expected_bytes)>1e-9){
+        fprintf(stderr,"FAIL %-36s -> cap %d, %.3f (want %d, %.3f)\n",
+                label,cap,got,expected_cap,expected_bytes);
+        failures++;
+    }
+}
+
 int main(void){
     /* bare invocation (argc<=1, no positional): byte-identical to the old
      * argc>1?atoi(argv[1]):64 fallback on every non-qualifying path. */
@@ -51,6 +71,17 @@ int main(void){
      * nonsensical cap -- the engine has never validated cap's range; this
      * test pins the precedence contract, not value sanity. */
     check("negative CLI still explicit",      1, -1, 0, 1, -1, 1);
+
+    check_autopin("nine slots preserve eight",4.5,9.0,8.0,1.0);
+    check_autopin("sixteen slots keep half",8.0,16.0,8.0,8.0);
+    check_autopin("twenty slots keep plan",10.0,20.0,8.0,10.0);
+    check_autopin("insufficient for requested LRU",4.0,6.0,8.0,0.0);
+    check_autopin("small plan capped",2.0,9.0,8.0,1.0);
+    check_autopin("zero plan",0.0,9.0,8.0,0.0);
+    check_lru_reserve("requested cap fits",16.0,1.0,8,8,8.0);
+    check_lru_reserve("reserve only affordable cap",9.0,2.0,8,4,8.0);
+    check_lru_reserve("zero slot size",9.0,0.0,8,0,0.0);
+    check_lru_reserve("zero requested cap",9.0,1.0,0,0,0.0);
 
     if(failures){
         fprintf(stderr, "cap precedence tests: %d FAILURE(S)\n", failures);

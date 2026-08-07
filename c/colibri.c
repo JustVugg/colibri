@@ -66,9 +66,17 @@
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
+/* Shims for a build without an OpenMP runtime (Apple clang without Homebrew
+ * libomp is the common case; the Makefile warns and carries on). Every omp_*
+ * the engine calls needs one, or the fallback only appears to work: the CPU
+ * build compiled because it happens not to reach omp_in_parallel(), while
+ * METAL=1 does and failed. */
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
+static inline int omp_in_parallel(void){ return 0; }     /* no runtime: never inside a team */
+static inline void omp_set_num_threads(int n){ (void)n; }
 #endif
+#include "omp_tune.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -77,7 +85,12 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
-#include <omp.h>
+/* No <omp.h> here: the guarded include above already provides it under _OPENMP
+ * and shims omp_get_max_threads/omp_get_thread_num without it. Including it
+ * unconditionally defeated that fallback and made METAL=1 unbuildable on a
+ * stock macOS -- exactly the platform this backend targets -- even though the
+ * Makefile advertises the single-threaded path ("libomp not found: building
+ * single-threaded"). */
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
@@ -542,6 +555,7 @@ static void cuda_disabled_note(void){
         CUDA_DISABLED_LOUD_AT);
 }
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
+static int g_cuda_fp8_ready;  /* e4m3 LUT published to the devices (see cuda_boot) */
 #endif
 #ifdef COLI_VULKAN
 /* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
@@ -571,16 +585,11 @@ static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x,
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
-    if(t->fmt==8) return 0;   /* fp8-e4m3 passthrough: no CUDA kernel yet either (matches the
-                               * fmt=5/6 idiom above; matmul_qt_ex's own caller-side fmt exclusion
-                               * already keeps this from being reached with cuda_eligible tensors
-                               * in the exact-kernel path, but row_bytes()/weight_at() in
-                               * backend_cuda.cu have no fmt=8 case either -- explicit early-
-                               * return here so a future caller doesn't have to rediscover that by
-                               * tracing through to the CUDA source. UNVERIFIED at runtime: no CUDA
-                               * toolchain on this macOS build host to compile-check. */
+    if(t->fmt==8 && !g_cuda_fp8_ready) return 0;  /* same idiom: fp8 without its e4m3 LUT stays
+                                                   * CPU-side (an old DLL without the symbol
+                                                   * leaves the flag 0, exactly like fmt=6) */
     const void *weights = t->fmt==0 ? (const void*)t->qf
-                        : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+                        : (t->fmt==1||t->fmt==8) ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
                      * upload would truncate them to O floats and the group kernels
                      * would read garbage. An old DLL without the _g symbol returns 0
@@ -596,7 +605,7 @@ static int qt_cuda_upload_compressed(QT *t){
 #endif
 static int qt_cuda_update(QT *t){
     const void *weights=t->fmt==0?(const void*)t->qf:
-                        t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+                        (t->fmt==1||t->fmt==8)?(const void*)t->q8:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
@@ -618,6 +627,13 @@ static void cuda_stats_print(void){
         "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
         (unsigned long long)rows,(double)experts/calls,
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
+    if(calls&&g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
+        uint64_t dc=0,de=0,dr=0;
+        coli_cuda_group_stats_device(g_cuda_devices[i],&dc,&de,&dr,NULL,NULL,NULL);
+        fprintf(stderr,"[CUDA]   device %d groups: %llu call, %llu expert, %llu rows "
+            "(%.2f expert/call)\n",g_cuda_devices[i],(unsigned long long)dc,
+            (unsigned long long)de,(unsigned long long)dr,dc?(double)de/dc:0.0);
+    }
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
@@ -928,17 +944,15 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
 #ifdef COLI_CUDA
-    /* fmt=8 excluded exactly like fmt=5/6: the CUDA backend's row_bytes()/weight_at()
-     * (backend_cuda.cu) have no case for it and fall through to `return 0` / undefined
-     * weight_at() behavior. row_bytes()==0 already makes coli_cuda_tensor_upload_g
-     * refuse (defensive fail-closed), but that path is reached only after paying an
-     * upload attempt and printing a "disabled after an error" message every load;
-     * excluding it here up front is the same fmt=5/6 idiom, silent and immediate.
-     * UNVERIFIED on this build (no CUDA toolchain on macOS to compile-check; traced
-     * from backend_cuda.cu source only). */
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=8 && !omp_in_parallel()){
+    /* fmt=5 excluded like fmt=6-without-codebook: the CUDA backend has no int3
+     * kernel. fmt=8 flows once its e4m3 LUT is published (g_cuda_fp8_ready,
+     * cuda_boot): quant_matmul dispatches it by format, deriving the 128x128
+     * block-scale geometry from the dims alone. Without the LUT (old DLL) it is
+     * excluded up front — same silent-and-immediate idiom as fmt=5. */
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 &&
+       (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
-                            : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+                            : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
         if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
@@ -3505,6 +3519,7 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;
+static int g_metal_prefill=0; /* default 0: S>4 prefill attention stays on the CPU (bit-exact). COLI_METAL_PREFILL=1 opts it onto the GPU (~4x, near-tie divergence — see docs/metal.md, #622) */
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 static int g_cuda_router=0; /* COLI_CUDA_ROUTER=1 (#431 PR-A): router on the layer home device at decode */
@@ -3777,7 +3792,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
      * these four checks are the same discipline extended to the tensors that
      * flow through the shared per-fmt shader. */
-    if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+    if(g_metal_enabled && !kvs && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
        && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
@@ -3941,7 +3956,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                 m->dsa_nsel=malloc((size_t)S*sizeof(int));
             }
-            #pragma omp parallel for schedule(dynamic,1)
+            /* if(S>1): at decode S is 1, so this region has exactly ONE iteration --
+             * and OpenMP still forks and joins the whole team to run it. That is
+             * pure overhead on the hottest path there is: once per layer, per
+             * token, whether or not the body does any work (both early `continue`
+             * branches below are taken on short contexts, and the fork happens
+             * anyway). The clause makes the single-iteration case run inline;
+             * S>1 prefill is untouched, and the results are identical either way. */
+            #pragma omp parallel for schedule(dynamic,1) if(S > 1)
             for(int s=0;s<S;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;
                 int pos=positions?positions[s]:pos_base+s, nk=pos+1;
@@ -4895,6 +4917,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * no pipe_wait is needed here; the CPU loop keeps its own waits. Any issue
          * failure drops the layer back to the collect-in-loop + sync-group path. */
         int early_issued=0, done_j[64]={0};
+        double early_issue_start=0;
         {
             static int g_group_async2=-1;
             if(g_group_async2<0) g_group_async2=getenv("COLI_GROUP_ASYNC")?atoi(getenv("COLI_GROUP_ASYNC")):0;
@@ -4939,7 +4962,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(all){
                         static int announced2;
                         if(!announced2){ announced2=1; fprintf(stderr,"[CUDA] expert group overlap active\n"); }
-                        early_issued=1; g_ovl_mark=now_s();
+                        early_issued=1; early_issue_start=tg0; g_ovl_mark=now_s();
                         for(int q=0;q<npg;q++) done_j[pg_j[q]]=1;
                         /* stash packing for the take phase */
                         for(int di=0;di<g_cuda_ndev;di++){ dev_nc0[di]=pd_nc[di]; dev_off0[di]=pd_off[di]; dev_total0[di]=pd_total[di];
@@ -5243,6 +5266,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
             m->t_emm+=now_s()-tg1; g_ovl_take+=now_s()-tg1;
+            if(g_prof&&early_issue_start>0) m->t_egpu+=now_s()-early_issue_start;
         }
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
@@ -5289,6 +5313,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         memcpy(group_y+(int64_t)dev_off[di]*D,hy,(size_t)dev_total[di]*D*sizeof(float)); }
                     else dev_ok[di]=0;      /* per-device sync failure: CPU fallback below */
                 }
+                if(g_prof) m->t_egpu+=now_s()-tg;
             } else for(int di=0;di<g_cuda_ndev;di++)
                 if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
         }
@@ -6163,11 +6188,12 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
+    double tl0=now_s();
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
-            fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+            fprintf(stderr,"[prefill] layer %d/%d · %d token · +%.2fs\n", i+1, c->n_layers, S, now_s()-tl0);
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
         if(pipe2 && l->sparse && i<c->n_layers &&
@@ -6654,6 +6680,10 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * EN: soft MTP guard (#163): 24-proposal window, pause and re-arm instead of the
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
+    int gd_min_pct=getenv("COLI_MTP_GUARD_PCT")?atoi(getenv("COLI_MTP_GUARD_PCT")):70;
+    int gd_window=getenv("COLI_MTP_GUARD_WINDOW")?atoi(getenv("COLI_MTP_GUARD_WINDOW")):24;
+    if(gd_min_pct<0)gd_min_pct=0;if(gd_min_pct>100)gd_min_pct=100;
+    if(gd_window<4)gd_window=4;if(gd_window>256)gd_window=256;
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
     while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
@@ -6662,7 +6692,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
-        if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
+        /* One-shot generation does not need logits or KV for the last token.
+         * Stateful callers do: their kv_out becomes chat history, feeds MORE,
+         * and is persisted to .coli_kv.  Let those callers take the normal
+         * g=0 step_all path below so the final token is really committed; just
+         * incrementing kv would serialize an uninitialized KV row. */
+        if(emitted>=n_new && !kv_out) break;
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
         if(g_grd.on){                                   /* metodo F: prima la grammatica — dove
                                                          * forza, l'acceptance e' ~1 (#48) */
@@ -6699,7 +6734,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
              * ma il vecchio g_draft=0 era permanente. EN: adaptive pause; the old
              * g_draft=0 latch was permanent. */
             if(gd_pause>0){ gd_pause--; if(!gd_pause){ gd_prop0=m->mtp_prop; gd_acc0=m->mtp_acc; } }
-            else if(m->mtp_prop-gd_prop0>=24 && (m->mtp_acc-gd_acc0)*10 < m->mtp_prop-gd_prop0){
+            else if(m->mtp_prop-gd_prop0>=(uint64_t)gd_window &&
+                    (m->mtp_acc-gd_acc0)*100 < (m->mtp_prop-gd_prop0)*(uint64_t)gd_min_pct){
                 fprintf(stderr,"[MTP] %.0f%% acceptance over the last %llu proposals: drafts paused for %d tokens\n",
                     100.0*(m->mtp_acc-gd_acc0)/(m->mtp_prop-gd_prop0),
                     (unsigned long long)(m->mtp_prop-gd_prop0), (int)GUARD_PAUSE_TOKENS);
@@ -7177,6 +7213,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     double dt=now_s()-t0, tot=m->hits+m->miss;
     printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
         steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n",g_cp_enq);
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
@@ -8694,6 +8731,9 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
      * count and pinned only the leftovers (measured: 9,280 VRAM + 1,721 RAM
      * on a box whose RAM fits ~11k — the cold tail then paid disk forever). */
     double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    double placed_w[COLI_CUDA_MAX_DEVICES]={0};
+    int load_balance=getenv("CUDA_EXPERT_LOAD_BALANCE")?
+                     atoi(getenv("CUDA_EXPERT_LOAD_BALANCE")):0;
     int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0, prefix_est=0;
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
@@ -8795,7 +8835,10 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                 for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
                     int best=-1;
                     for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=projected &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
+                        (best<0||
+                         (load_balance && (placed_w[i]<placed_w[best] ||
+                           (placed_w[i]==placed_w[best]&&placed_b[i]<placed_b[best])))||
+                         (!load_balance&&placed_b[i]<placed_b[best]))) best=i;
                     if(best<0) break;
                     tried[best]=1;
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
@@ -8818,6 +8861,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        placed_w[best]+=(double)r[a].c;
                         if(g_cuda_release_host) expert_host_release(m,s);
                         placed=1;
                     } else {
@@ -8841,6 +8885,8 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
             g_cuda_expert_auto?safe_total/1e9:budget/1e9,
             g_cuda_expert_auto?", auto":"",
             g_cuda_reserve_gb);
+        if(load_balance) fprintf(stderr,
+            "[CUDA] expert device assignment: frequency-load balanced (experimental)\n");
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
         /* #653: on integrated / unified-memory GPUs (Grace-Blackwell GB10, Jetson) the
@@ -8922,6 +8968,34 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
 
+/* Automatic history pinning and the adaptive LRU share the expert RAM budget.
+ * Preserve the LRU capacity affordable before pinning, up to the requested
+ * cap; explicit PIN/PIN_GB settings bypass this policy and remain authoritative. */
+static double autopin_preserve_lru(double planned_pin, double expert_available,
+                                   double lru_reserve){
+    if(planned_pin<=0.0 || expert_available<=lru_reserve) return 0.0;
+    double max_pin=expert_available-lru_reserve;
+    return planned_pin<max_pin?planned_pin:max_pin;
+}
+
+static double autopin_lru_reserve(double expert_available, double bytes_per_slot,
+                                  int requested_cap, int *preserved_cap){
+    int cap=0;
+    if(expert_available>0.0 && bytes_per_slot>0.0 && requested_cap>0){
+        int affordable=(int)(expert_available/bytes_per_slot);
+        cap=requested_cap<affordable?requested_cap:affordable;
+    }
+    if(preserved_cap) *preserved_cap=cap;
+    return (double)cap*bytes_per_slot;
+}
+
+static double expert_cache_bytes_per_slot(Model *m, int ebits){
+    int nsp=0;
+    for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
+    if(m->has_mtp) nsp+=2;
+    return (double)nsp*(double)expert_bytes_probe(m,ebits);
+}
+
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
  * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
@@ -8969,10 +9043,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
     if(floored){
         double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
+        /* eb is printed because it is the one term nobody can check from outside:
+         * every projection here divides by it, so a wrong width is indistinguishable
+         * from a wrong budget in this message (#766). */
         fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
-            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB).%s\n",
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB).%s\n",
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
-            m->resident_bytes/1e9,slack/1e9,
+            m->resident_bytes/1e9,slack/1e9,(double)eb/1e6,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
 #ifdef COLI_CUDA
         /* #686: on a single GPU that also holds host copies of the VRAM tier, the
@@ -9596,6 +9673,13 @@ int main(int argc, char **argv){
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+    /* #718: the hot-team block above tunes wake latency but historically left
+     * GLM at libgomp's logical-CPU default.  Memory-bound quantized matmuls can
+     * collapse when SMT siblings share each core, measured 2.3x on a 5950X.
+     * The shared helper already protects kimi_k3/olmoe: apply its independent
+     * physical-core sizing here too.  This must stay after the possible re-exec;
+     * omp_set_num_threads() is a runtime API and needs no second exec. */
+    coli_omp_tune_threads("colibri");
 #ifdef _WIN32
     _setmode(fileno(stdout), O_BINARY);
 #endif
@@ -9758,6 +9842,7 @@ int main(int argc, char **argv){
     rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
+    g_metal_prefill = getenv("COLI_METAL_PREFILL")?atoi(getenv("COLI_METAL_PREFILL")):0; /* default 0: S>4 attention on CPU (bit-exact); =1 opt-in GPU prefill */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
      * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.
@@ -9795,6 +9880,8 @@ int main(int argc, char **argv){
          * the backend never keeps a second copy that could drift (#452). An older
          * DLL without the symbol leaves this 0 and fmt=6 tensors stay CPU-side. */
         g_cuda_e8_ready=coli_cuda_e8_set_grid(e8_grid);
+        /* fmt=8 decodes against quant.h's E4M3_LUT — same arrangement. */
+        g_cuda_fp8_ready=coli_cuda_fp8_set_lut(E4M3_LUT);
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
 #endif
@@ -10054,7 +10141,19 @@ int main(int argc, char **argv){
            * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
            * qualche ora di chat) arriva a meta' del budget expert. */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
-          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
+          double expert_available=expert_avail(&m,ram_env,ebits,est_ctx);
+          double planned_pin=expert_available*0.5*conf;
+          int preserved_cap=0;
+          double lru_reserve=autopin_lru_reserve(
+              expert_available,expert_cache_bytes_per_slot(&m,ebits),
+              m.ecap,&preserved_cap);
+          double pin_bytes=autopin_preserve_lru(
+              planned_pin,expert_available,lru_reserve);
+          if(pin_bytes+1.0<planned_pin)
+              fprintf(stderr,"[PIN] auto: %.1f GB plan capped to %.1f GB to preserve "
+                  "the no-pin LRU cap %d/layer\n",
+                  planned_pin/1e9,pin_bytes/1e9,preserved_cap);
+          double pin_gb=pin_bytes/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.

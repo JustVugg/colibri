@@ -15,12 +15,13 @@
 
 **Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
 parameters** — on consumer and heterogeneous hardware, in pure C with zero
-engine dependencies, by treating storage, RAM, and VRAM as one inference
-hierarchy.
+engine dependencies, by treating storage, RAM, and VRAM as a single inference
+hierarchy (AI memory multitiering).
 
-Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
-`coli serve` / `coli web` front end. [Full roster ↓](#other-supported-models)
+Five families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T), **DeepSeek V4 Flash** (284B) and **OLMoE** (7B) — one C file each, the
+same `coli chat` / `coli serve` / `coli web` front end.
+[Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
 > platform.** Its primary goal is to pursue inference-side performance across
@@ -28,7 +29,7 @@ Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 > storage I/O, placement, scheduling, kernels, speculation, and CPU/GPU
 > overlap — so large models depend less on scarce hardware and cost less to run.
 
-Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy, and it is
+Colibrì treats VRAM, RAM, and storage as a single multitier hierarchy, and it is
 deliberately a place to test aggressive systems ideas — so there is **no SLA on
 speed, and a hard guarantee on semantics**: experiments must earn their place
 through reproducible end-to-end measurements, and the default policy **never
@@ -68,12 +69,12 @@ as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists c
 
 ## The research mission
 
-Frontier inference should not require datacenter-class hardware by default.
-Colibrì's research target is simple: **reduce the hardware dependency and total
-cost of inference by optimizing every part of the inference path that evidence
-shows is limiting it**.
+With Colibrì, private frontier model access is not limited by availability of hyperscaler-class hardware.
 
-That includes changing how weights are represented and moved, deciding what
+With its multitiering features Colibrì **removes proprietary hardware dependencies aggressively 
+optimizing functional inference engine pipelines**.
+
+Our operational mission includes changing how weights are represented and moved, deciding what
 lives in VRAM, RAM, or storage, overlapping heterogeneous compute, reducing
 launch and synchronization overhead, exploiting sparsity and reuse, and testing
 new decoding algorithms. Nothing is protected merely because it is conventional;
@@ -81,7 +82,7 @@ nothing is adopted merely because a microbenchmark looks fast. The deciding
 result is end-to-end inference on real machines, with correctness and quality
 measured alongside throughput, latency, memory, and cost.
 
-The practical consequence is accessibility: run a 744B-parameter model on
+The practical consequence is **accessibility**: run a 744B-parameter model on
 hardware you already own, watch every expert fire in real time, and change the
 code that does it. Not renting intelligence behind an API — *holding* it:
 probing it, measuring it, improving it. The engine is deliberately small enough
@@ -89,7 +90,7 @@ that the next useful optimization can come from anyone willing to measure it.
 
 ## Core techniques and measured findings
 
-- **One hierarchy, not one memory threshold.** VRAM, RAM, and NVMe are placement
+- **One hierarchy, not limited by tier capacity.** VRAM, RAM, and NVMe are placement
   tiers for the same weights; limited fast memory changes speed, not model semantics.
 - **A JIT for weights.** Measured routing heat drives a per-layer LRU, a learned
   pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
@@ -376,6 +377,7 @@ the model's `config.json`):
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
+> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 22 GB comfortable | not needed |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -386,6 +388,7 @@ the model's `config.json`):
 | **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
+| **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
@@ -513,6 +516,38 @@ namespace must be tmpfs-backed and complete, proving the engine bound
 `COLI_WEIGHTS_DIR` rather than falling back to SNAP. Both tests skip when their
 environment gates are absent.
 
+## DeepSeek V4
+
+**DeepSeek V4 Flash** streams the official checkpoint with no conversion: routed
+experts stay **native fp4**, the dense set stays **fp8-e4m3** with UE8M0 block
+scales. MLA + DSA sparse attention, 43 layers, 256 routed experts plus one
+shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2.
+
+```bash
+cd c
+make deepseek-v4
+python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
+# also: coli run / coli serve / coli web
+```
+
+Greedy decode, one KV slot; tools and grammar are not wired up yet.
+
+**Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
+touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`
+is the single most valuable knob, and it changes speed only, never output.
+
+**Speculative drafting exists and is off.** DSpark's markov drafter and full MTP
+are both implemented and verified: a draft can save forward passes but never
+change a token, because every accepted token is still the target's own argmax.
+Measured on real multi-turn chat, they accepted 1 in 15 and 10 in 24, and the
+rejected-suffix replay of this engine's recurrent attention state cost more than
+the drafts saved — one 14-token answer took 495 seconds. So `V4_DRAFT` and
+`V4_MTP` default to `0` and the code stays, with the numbers beside it, for
+whoever retries this on faster storage.
+
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for checkpoint validation, the
+generated tiny independent oracle, and the full knob list.
+
 ## What's next
 
 - **Inference-systems research is the product.** The current hierarchy is LRU +
@@ -543,24 +578,46 @@ today its numbers come from a community of real machines. If it's useful to you:
 ```
 Makefile                  root build/check entry point
 c/
-├── glm.c                 single-file GLM engine
-├── st.h, tok.h, json.h   runtime headers
-├── backend_cuda.*        optional CUDA tier
+├── colibri.c             GLM-5.2 engine  (make glm)
+├── inkling.c             Inkling engine  (make inkling)
+├── kimi_k3.c             Kimi K3 engine  (make kimi_k3)
+├── deepseek_v4.c         DeepSeek V4 Flash engine  (make deepseek-v4)
+├── olmoe.c               OLMoE engine  (make olmoe)
+│
+├── st.h                  safetensors index and range reads
+├── quant.h               canonical container decoders
+├── tok.h, json.h         tokenizer and JSON parser
+├── compat.h              Windows/macOS shims (POSIX names, one place)
+├── expert_store.h        streaming expert cache
+├── route_trace.h         routing telemetry and .coli_usage, engine-agnostic
+├── kv_prefix.h           KV prefix reuse across turns
+│
+├── backend_cuda.*        optional CUDA tier   (CUDA=1)
+├── backend_metal.*       optional Metal tier  (METAL=1)
+├── backend_vulkan.*      optional Vulkan tier (VULKAN=1)
+│
 ├── Makefile              build and local checks
 ├── coli                  user-facing CLI
 ├── openai_server.py      OpenAI-compatible HTTP gateway
-├── setup.sh              one-command local setup
+├── resource_plan.py      RAM/VRAM planner behind `coli plan` and `coli doctor`
 ├── tools/                offline conversion, fixtures and benchmarks
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client)
 desktop/                  Tauri v2 desktop shell wrapping the web UI
+docker/                   container images
 docs/                     reference docs, experiments, media
 ```
 
-The runtime path intentionally stays flat and readable: `glm.c` plus its small
-headers. From the repository root, `make`, `make check`, and `make clean`
-delegate to the engine Makefile.
+**One `.c` per model family, over shared single headers.** An engine owns its
+architecture and nothing else; anything two engines both need — the safetensors
+reader, the container decoders, the tokenizer, the expert cache — lives in a
+header they both include, so a fix reaches all of them at once. That rule is not
+decorative: the defects that keep recurring here are the ones where a mechanism
+landed in one engine and never reached its siblings.
+
+From the repository root, `make`, `make check` and `make clean` delegate to the
+engine Makefile.
 
 ## Why "colibrì"
 
@@ -575,6 +632,52 @@ releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
 (Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
 contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
 This project is proof of what open weights make possible.
+
+The project's expert placement, compression, and routing experiments also build
+on ideas and evidence from the following open research and systems work:
+
+- [REAP](https://github.com/CerebrasResearch/reap) and
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP) for output-aware and
+  domain-specific expert importance.
+- [SERE](https://github.com/JL-Cheng/SERE) for similarity-based expert
+  re-routing, and [ReMoE](https://github.com/BUAA-OSCAR/ReMoE) for
+  cache-locality-aware router fine-tuning.
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE) for routing-guided expert
+  merging and compression.
+- [MoBE](https://github.com/inclusionAI/MoBE) and
+  [D²-MoE](https://github.com/lliai/D2MoE) for shared expert bases and
+  low-rank expert deltas.
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE) for hybrid CPU/GPU expert
+  scheduling, [ScMoE](https://arxiv.org/abs/2404.05019) for overlapping expert
+  communication with computation, and
+  [OD-MoE](https://arxiv.org/abs/2512.03927) for distributed on-demand expert
+  loading.
+- [vLLM](https://github.com/vllm-project/vllm),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp), and
+  [kTransformers](https://github.com/kvcache-ai/ktransformers) for the open
+  inference systems and expert-offload work that make comparisons reproducible.
+
+The engine also stands on concrete engineering work, not only ideas. Each of
+these is used or reimplemented in the tree today:
+
+- [safetensors](https://github.com/huggingface/safetensors) — the container
+  every engine reads (`c/st.h`), including its fp8 and I64 dtypes.
+- [tiktoken](https://github.com/openai/tiktoken) — `c/tok.h` reimplements its
+  `byte_pair_encode` exactly, merging the adjacent pair whose concatenation has
+  the lowest vocab id, so a tiktoken-derived vocabulary needs no merges list.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) — the GBNF grammar subset
+  in `c/grammar.h` follows its syntax and its set-of-stacks PDA, and the Metal
+  path borrows its `newBufferWithBytesNoCopy` residency trick.
+- [vLLM](https://github.com/vllm-project/vllm) — the reference for output
+  semantics the engine matches position by position (e.g. where the final norm
+  lands relative to the LM head).
+- [transformers](https://github.com/huggingface/transformers) — the oracle:
+  CI reproduces a random-init model token for token against it.
+- [DietGPU](https://github.com/facebookresearch/dietgpu) — the GPU ANS codec
+  behind the experimental compressed expert tier (`COLI_ANS`).
+- [rocWMMA](https://github.com/ROCm/rocWMMA) — the HIP backend maps CUDA's
+  `nvcuda::wmma` fragment/mma_sync API onto it (`c/backend_gpu_compat.h`), which
+  is what lets one .cu source compile for both vendors.
 
 ## License
 

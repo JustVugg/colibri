@@ -26,6 +26,16 @@ Parity rules:
      explicitly ("no in-tree name string" -- the MXFP4 row's marker), so
      a new registry row can't silently claim a name the reader won't
      recognize.
+  3. ORDINAL-LESS rows (a non-numeric ordinal cell such as "*(none)*" --
+     the int4-rans256-g0 row's convention for a merged, stamp-identified
+     format with no engine consumer) are rows too, not parse noise:
+     their NAME must be unique across the whole table (an ordinal-less
+     row silently shadowing a numbered row's name is exactly the
+     stamp-string collision this registry exists to prevent); the name
+     must NOT appear in FMT_NAMES (a compiled name means the format HAS
+     an ordinal and the row must carry it); and the row must declare
+     "no public ordinal" explicitly, the ordinal-less analogue of rule
+     2's say-so marker.
 """
 import os
 import re
@@ -49,29 +59,53 @@ def parse_fmt_names(path):
 
 
 def parse_doc_rows(path):
+    """Returns (numeric_rows, ordinal_less_rows).
+
+    numeric_rows: {ordinal: (first_backticked_name, name_cell)} as before.
+    ordinal_less_rows: [(ordinal_cell, first_backticked_name, full_line)]
+    for table rows whose ordinal cell is NOT a plain integer. To qualify,
+    a line must still look like a registry row, not a header/separator or
+    prose table elsewhere in the doc: at least 5 '|'-separated cells and a
+    backticked token in the name (second) cell.
+    """
     rows = {}
+    ordinal_less = []
     with open(path, encoding="utf-8") as f:
         lines = f.readlines()
     for line in lines:
         m = re.match(r"\|\s*\*{0,2}(\d+)\*{0,2}\s*\|\s*(.+)$", line)
-        if not m:
+        if m:
+            ordinal = int(m.group(1))
+            name_cell = m.group(2).split("|")[0]
+            first_tick = re.search(r"`([^`]+)`", name_cell)
+            rows[ordinal] = (first_tick.group(1) if first_tick else None,
+                             name_cell)
             continue
-        ordinal = int(m.group(1))
-        name_cell = m.group(2).split("|")[0]
-        first_tick = re.search(r"`([^`]+)`", name_cell)
-        rows[ordinal] = (first_tick.group(1) if first_tick else None, name_cell)
-    return rows
+        if not line.startswith("|"):
+            continue
+        cells = line.strip().strip("|").split("|")
+        if len(cells) < 5:
+            continue
+        name_tick = re.search(r"`([^`]+)`", cells[1])
+        if not name_tick:
+            continue  # header row / separator / non-registry table
+        ordinal_less.append((cells[0].strip(), name_tick.group(1), line))
+    return rows, ordinal_less
 
 
 class RegistryParityTest(unittest.TestCase):
     def setUp(self):
         self.c_names = parse_fmt_names(COLIBRI_C)
-        self.doc_rows = parse_doc_rows(FORMATS_MD)
+        self.doc_rows, self.ordinal_less = parse_doc_rows(FORMATS_MD)
         # plausibility floors: an anchor drift must fail HERE, loudly.
         self.assertGreaterEqual(len(self.c_names), 8,
                                 "FMT_NAMES parse found suspiciously few entries")
         self.assertGreaterEqual(len(self.doc_rows), 9,
                                 "FORMATS.md table parse found suspiciously few rows")
+        self.assertGreaterEqual(len(self.doc_rows) + len(self.ordinal_less), 10,
+                                "FORMATS.md parse lost the ordinal-less rows "
+                                "(int4-rans256-g0 landed as one; if every row is "
+                                "numbered again, update this floor deliberately)")
 
     def test_every_c_name_matches_its_doc_row(self):
         for fmt, name in sorted(self.c_names.items()):
@@ -90,6 +124,36 @@ class RegistryParityTest(unittest.TestCase):
                           f"FORMATS.md row fmt={fmt} ('{doc_name}') has no FMT_NAMES entry "
                           f"and is not marked 'no in-tree name string' -- a tool stamping "
                           f"this documented name would be refused as unrecognized")
+
+    def test_names_are_unique_across_all_rows(self):
+        seen = {}
+        numbered = [(f"fmt={fmt}", doc_name)
+                    for fmt, (doc_name, _cell) in sorted(self.doc_rows.items())
+                    if doc_name is not None]
+        unnumbered = [(f"ordinal cell {oc!r}", name)
+                      for oc, name, _line in self.ordinal_less]
+        for where, name in numbered + unnumbered:
+            self.assertNotIn(name, seen,
+                             f"registry NAME '{name}' appears twice ({seen.get(name)} "
+                             f"and {where}) -- the name column IS the stamp identity; "
+                             f"two rows may never share it")
+            seen[name] = where
+
+    def test_ordinal_less_rows_do_not_claim_a_compiled_name(self):
+        compiled = set(self.c_names.values())
+        for oc, name, _line in self.ordinal_less:
+            self.assertNotIn(name, compiled,
+                             f"ordinal-less row ({oc!r}) names '{name}', which IS in "
+                             f"FMT_NAMES -- a compiled name has an ordinal, and its row "
+                             f"must carry that number, not '{oc}'")
+
+    def test_ordinal_less_rows_declare_no_public_ordinal(self):
+        for oc, name, line in self.ordinal_less:
+            self.assertIn("no public ordinal", line,
+                          f"ordinal-less row '{name}' ({oc!r}) does not declare "
+                          f"'no public ordinal' -- rule 3's say-so marker: a row with "
+                          f"no number must state that the number's absence is "
+                          f"deliberate and what its identity rests on instead")
 
 
 if __name__ == "__main__":

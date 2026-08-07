@@ -4,10 +4,11 @@ Status: format specification + offline tools, PR 1 of a 3-PR ladder. This PR
 adds the codec (`c/rans.h`), the repack/verify tools
 (`c/tools/repack_rans.py`, `c/tools/rans_verify.py`) and this document —
 **no engine code paths change**. PR 2 (loader + CPU decode on expert load)
-and PR 3 (Metal batched decode) build on it. A registry row is *proposed*
-here, not claimed: the format's identity is the NAME string
-`int4-rans256-g0`; the numeric `fmt` ordinal is left for the maintainer to
-assign whenever a registry (FORMATS.md) lands.
+and PR 3 (Metal batched decode) build on it. The format's identity is the
+NAME string `int4-rans256-g0`; its registry row has since landed in
+FORMATS.md with ordinal *(none)* — no numeric `fmt` ordinal exists or is
+claimed before engine code consuming the format (PR 2) first merges into
+dev (see "Registry row (landed)" below).
 
 ## What it is, in one paragraph
 
@@ -235,8 +236,17 @@ integrity** — these exact bytes came from that mint run; container
 engine-side load check ships with the consumer PR. The record wire format
 is untouched by all of this: the manifest is a sidecar file.
 
-## Proposed registry row
+## Registry row (landed)
+
+The registry row this section originally *proposed* now exists in
+`docs/FORMATS.md` (the authoritative copy — this table is a summary):
 
 | ordinal | name | weight bytes | scale layout | status |
 |---|---|---|---|---|
-| *(maintainer-assigned)* | `int4-rans256-g0` | data-dependent (chunk record above; **stamp mandatory**) | per-row `F32` `.qs`, raw (unchanged from int4-row) | proposed, offline tools only |
+| *(none)* | `int4-rans256-g0` | data-dependent (chunk record above; **stamp mandatory**) | per-row `F32` `.qs`, raw (unchanged from int4-row) | merged, offline tools only |
+
+The ordinal cell reads *(none)*, not *(maintainer-assigned)*: with no
+engine decode path there is nothing to compile an ordinal into, so — as
+the FORMATS.md row glosses the registry's ID-assignment rule — no public
+ordinal is claimed before engine code consuming the format (this ladder's
+PR 2) first merges into dev.

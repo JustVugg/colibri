@@ -30,6 +30,12 @@ FILES = [
     # qmatmul.spv is checked in; only the other Vulkan shaders are generated.
     "shaders/qmatmul_gate_up.spv", "shaders/attention_absorb.spv",
     "shaders/rmsnorm.spv",
+    # HIP backend artifacts (hipcc emits .lib/.exp/.pdb alongside the DLL).
+    "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
+    "deepseek_v4", "deepseek_v4.exe",
+    # native-quant built objects.
+    "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
+    "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]
 # Test binaries are extensionless on Unix and `.exe` on Windows. The set of
 # test binaries is exactly what the Makefile builds under tests/<name>$(EXE), so
@@ -69,11 +75,14 @@ TEST_GLOBS = [
     for name in TEST_BASENAMES + ON_DEMAND_BASENAMES
     for suffix in ("", ".exe")
 ]
+# V4 per-unit built objects (generated, not checked in).
+EXTRA_GLOBS = ["COLI_V4_UNIT_*.o"]
 # Directories to remove.
 DIRS = [
     "__pycache__",
     "ramdisk_support/__pycache__",
     "tests/__pycache__",
+    "build/ownership",
 ]
 
 removed = 0
@@ -81,7 +90,7 @@ for f in FILES:
     if os.path.exists(f):
         os.remove(f)
         removed += 1
-for pattern in TEST_GLOBS:
+for pattern in TEST_GLOBS + EXTRA_GLOBS:
     for f in glob.glob(pattern):
         os.remove(f)
         removed += 1

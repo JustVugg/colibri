@@ -1,0 +1,77 @@
+# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux and Windows/MSYS2 only.
+# Uses GNU ld -Wl,--wrap and gcc -march; do not invoke from macOS/PowerPC
+# `make check` (the parent Makefile gates COLI_V4_SUPPORTED).
+
+ifeq ($(OS),Windows_NT)
+IS_WIN := 1
+UNAME_S :=
+UNAME_M :=
+else
+IS_WIN :=
+UNAME_S := $(shell uname -s 2>/dev/null)
+UNAME_M := $(shell uname -m 2>/dev/null)
+endif
+
+COLI_V4_OK :=
+ifeq ($(IS_WIN),1)
+COLI_V4_OK := 1
+else ifeq ($(UNAME_S),Linux)
+ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+endif
+endif
+
+ifneq ($(COLI_V4_OK),1)
+$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux and Windows/MSYS2)
+endif
+
+ifneq ($(IS_WIN),)
+CC = gcc
+ARCH ?= x86-64-v3
+CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
+	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+LDFLAGS = -lm -fopenmp -static -pthread
+V4_BINARY := deepseek_v4.exe
+else
+CC = gcc
+ARCH ?= native
+CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
+	-Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+LDFLAGS = -lm -fopenmp -pthread
+V4_BINARY := deepseek_v4
+endif
+
+LTO ?= 1
+ifeq ($(LTO),1)
+CFLAGS += -flto
+LDFLAGS += -flto
+endif
+
+include Makefile.deepseek-v4.units
+
+TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
+TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
+V4_OBJS = $(TARGET_OBJS)
+
+.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
+deepseek-v4: $(V4_BINARY)
+
+$(V4_BINARY): $(V4_OBJS)
+	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h
+	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
+
+deepseek-v4-clean:
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS)

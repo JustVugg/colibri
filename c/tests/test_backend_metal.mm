@@ -96,11 +96,17 @@ static float ref_e4m3(uint8_t b) {
                        : (1.0f+(float)mant*(1.0f/8.0f))*powf(2.0f,(float)exp-7.0f);
   return sign ? -val : val;
 }
-static int fp8_nblk(int n){ return (n+127)/128; }
+/* Renamed from fp8_nblk: quant.h, included further down this same
+ * translation unit, now declares `static inline int64_t fp8_nblk`.
+ * Matching the return type alone still collides (inline vs non-inline),
+ * and this file keeps its own reference implementations on purpose --
+ * see the E4M3 note above -- so it takes the ref_ prefix the other
+ * independent helpers here already use. (#838) */
+static int64_t ref_fp8_nblk(int n){ return (n+127)/128; }
 
 static void cpu_ref_fp8(const uint8_t *q8, const float *bscale, const float *x,
                         double *y, double *mag, int S, int I, int O) {
-  int nblkI = fp8_nblk(I);
+  int nblkI = ref_fp8_nblk(I);
   for (int o=0;o<O;o++){
     const uint8_t *w = q8 + (size_t)o*I;
     const float *scl = bscale + (size_t)(o/128)*nblkI;
@@ -172,7 +178,7 @@ static int run_grouped(int O, int I, int gs, int S, int outlier, const char *nam
 // the block-scale accumulation, avoiding cancellation-noise false positives on
 // near-zero results).
 static int run_fp8(int O, int I, int S, const char *name) {
-  int nblkO=fp8_nblk(O), nblkI=fp8_nblk(I), nblk=nblkO*nblkI;
+  int nblkO=ref_fp8_nblk(O), nblkI=ref_fp8_nblk(I), nblk=nblkO*nblkI;
   std::vector<uint8_t> W((size_t)O*I);
   std::vector<float> scale((size_t)nblk), x((size_t)S*I), yg((size_t)S*O);
   std::vector<double> yr((size_t)S*O), mag((size_t)S*O);
@@ -213,7 +219,7 @@ static int run_fp8(int O, int I, int S, const char *name) {
 static int run_fp8_lut(const char *name) {
   enum { O=256, I=1 };
   std::vector<uint8_t> W(O*I); for (int b=0;b<O;b++) W[b]=(uint8_t)b;
-  std::vector<float> scale(fp8_nblk(O)*fp8_nblk(I), 1.0f);   // nblkO=2,nblkI=1 -> both blocks scale=1
+  std::vector<float> scale(ref_fp8_nblk(O)*ref_fp8_nblk(I), 1.0f);   // nblkO=2,nblkI=1 -> both blocks scale=1
   std::vector<float> x(I, 1.0f), yg(O);
   ColiMetalTensor *t=nullptr;
   if (!coli_metal_matmul(&t, yg.data(), x.data(), W.data(), scale.data(), FP8, 1, I, O, 0)) {

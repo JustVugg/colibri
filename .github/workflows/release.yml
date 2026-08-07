@@ -232,6 +232,25 @@ jobs:
           if [ -z "$NOTES" ]; then
             NOTES="Release ${TAG}"
           fi
-          gh release create "$TAG" artifacts/* \
-            --title "colibri ${TAG}" \
-            --notes "$NOTES"
+          # Attach to an existing release rather than failing on it.
+          #
+          # `gh release create` errors with "a release with the same tag name
+          # already exists" whenever the release was published by hand before
+          # the tag build finished -- which is how any release with hand-written
+          # notes happens. v1.5.0 hit exactly that: all three platforms built,
+          # the checksums printed, and then the job went red having attached
+          # nothing, so the release had notes and no downloads until the
+          # artifacts were recovered from that run by hand.
+          #
+          # Uploading is the operation that matters and --clobber makes it
+          # idempotent, so upload when the release exists and write notes only
+          # when creating one. Notes a human already published are never
+          # overwritten by the CHANGELOG fallback.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — uploading artifacts to it"
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            gh release create "$TAG" artifacts/* \
+              --title "colibri ${TAG}" \
+              --notes "$NOTES"
+          fi

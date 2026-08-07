@@ -22,6 +22,9 @@
  * Kimi e' il motore piu' disk-bound del progetto (misurato: 6.7% di hit,
  * 891 GB letti per 32 token), cioe' esattamente il regime in cui la seconda
  * meta' fa danno. Aggiungergliela sarebbe stato un peggioramento misurabile.
+ * GLM now calls this same helper after its optional hot-team re-exec, so it
+ * receives the physical-core sizing without changing the independent spin-wait
+ * policy that its existing block controls.
  *
  * PERCHE' QUI NON SERVE IL RE-EXEC.
  * colibri.c si ri-esegue perche' OMP_WAIT_POLICY & co. le legge il COSTRUTTORE
@@ -38,6 +41,7 @@
 #define COLI_OMP_TUNE_H
 
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,6 +54,33 @@
 #endif
 
 /* Numero di core FISICI, o 0 se non determinabile. Mai un valore inventato. */
+#if defined(_WIN32)
+static int coli_count_windows_physical_cores(const void *buf, DWORD bytes)
+{
+    const char *p = (const char *)buf;
+    const char *end = p + bytes;
+    const size_t header_size = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                                        Processor);
+    int cores = 0;
+
+    while ((size_t)(end - p) >= header_size) {
+        LOGICAL_PROCESSOR_RELATIONSHIP relationship;
+        DWORD record_size;
+        memcpy(&relationship,
+               p + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship),
+               sizeof(relationship));
+        memcpy(&record_size,
+               p + offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size),
+               sizeof(record_size));
+        if (record_size < header_size || (size_t)(end - p) < record_size)
+            break; /* Reject a zero, truncated, or otherwise malformed record. */
+        if (relationship == RelationProcessorCore) cores++;
+        p += record_size;
+    }
+    return cores;
+}
+#endif
+
 static int coli_physical_cores(void)
 {
 #if defined(_WIN32)
@@ -58,17 +89,9 @@ static int coli_physical_cores(void)
     if (!need) return 0;
     void *buf = malloc(need);
     if (!buf) return 0;
-    int cores = 0;
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore, buf, &need)) {
-        char *p = (char *)buf, *end = p + need;
-        while (p + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) <= end) {
-            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e =
-                (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)p;
-            if (!e->Size) break;                 /* mai avanzare di 0: loop infinito */
-            if (e->Relationship == RelationProcessorCore) cores++;
-            p += e->Size;
-        }
-    }
+    int cores = GetLogicalProcessorInformationEx(RelationProcessorCore, buf, &need)
+                    ? coli_count_windows_physical_cores(buf, need)
+                    : 0;
     free(buf);
     return cores;
 
@@ -95,7 +118,10 @@ static int coli_physical_cores(void)
     while ((e = readdir(d)) && n < 1024) {
         if (strncmp(e->d_name, "cpu", 3) != 0 || e->d_name[3] < '0' || e->d_name[3] > '9')
             continue;
-        char path[256], line[64];
+        /* d_name can be up to 255 bytes; leave enough room for the fixed
+         * sysfs prefix/suffix so -Wformat-truncation stays honest when this
+         * shared helper is compiled into the GLM engine too. */
+        char path[512], line[64];
         snprintf(path, sizeof(path),
                  "/sys/devices/system/cpu/%s/topology/thread_siblings_list", e->d_name);
         FILE *f = fopen(path, "r");
@@ -129,9 +155,9 @@ static void coli_omp_tune_threads(const char *engine)
     if (phys >= logical) return;           /* niente SMT da evitare: silenzio */
 
     omp_set_num_threads(phys);
-    fprintf(stderr, "[OMP] %s: %d thread (core fisici) invece di %d logici — "
-                    "l'SMT dimezza il decode su alcune CPU (#718); "
-                    "OMP_NUM_THREADS=<n> per decidere tu\n",
+    fprintf(stderr, "[OMP] %s: %d physical-core threads instead of %d logical CPUs; "
+                    "SMT can halve decode throughput on some CPUs (#718); "
+                    "set OMP_NUM_THREADS=<n> to override\n",
             engine, phys, logical);
 #else
     (void)engine;

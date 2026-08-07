@@ -53,7 +53,19 @@ def analyze_model(model):
     dense_bytes = 0
     expert_groups = {}
     for shard in shards:
-        for name, size in _tensor_sizes(shard):
+        try:
+            sizes = list(_tensor_sizes(shard))
+        except OSError as error:
+            # Name the file. An OSError raised by read() on an already-open
+            # stream carries no filename, so `coli doctor` reported bare
+            # "[Errno 5] Input/output error" for a bad sector or a dropped
+            # network mount — indistinguishable from a corrupt download, which
+            # is what the reporter in #191 assumed and re-downloaded 372 GB to
+            # rule out. Which shard failed is the whole diagnosis: one file is
+            # storage, all of them is the mount.
+            raise OSError(error.errno,
+                          f"{error.strerror or error}: {shard}") from error
+        for name, size in sizes:
             match = EXPERT_RE.search(name)
             if match:
                 key = tuple(map(int, match.groups()))
@@ -423,6 +435,20 @@ def physical_cpu_count():
             _physical_cores_warn("GetLogicalProcessorInformationEx returned no cores")
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
+    if sys.platform == "darwin":
+        # macOS has no lscpu. sysctl reports physical cores directly, and on
+        # Apple Silicon hw.physicalcpu counts P+E cores with no SMT sibling to
+        # dedupe. Without this branch the lscpu probe below fails and every run
+        # prints a spurious over-subscription warning on a machine that cannot
+        # over-subscribe.
+        try:
+            result = subprocess.run(["sysctl", "-n", "hw.physicalcpu"], text=True,
+                                    capture_output=True, check=True, timeout=5)
+            cores = int(result.stdout.strip())
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _physical_cores_warn(f"sysctl core probe failed: {error}")
     try:
         # Ask lscpu for exactly core,socket and dedupe on (core, socket).
         # Counting un-deduplicated rows would return logical threads (SMT),

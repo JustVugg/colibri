@@ -28,11 +28,27 @@ c/backend_loader.o
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
+c/coli_hip.dll
+c/coli_hip.lib
+c/coli_hip.exp
+c/coli_hip.pdb
 c/tests/test_*
 !c/tests/test_*.c
 !c/tests/test_*.cu
 !c/tests/test_*.mm
 !c/tests/test_*.py
+# bench_* and fuzz_* build to extensionless binaries in the same directory and
+# were not covered here, which is how c/tests/bench_omp_grain reached the tree.
+c/tests/bench_*
+!c/tests/bench_*.c
+!c/tests/bench_*.cu
+!c/tests/bench_*.mm
+!c/tests/bench_*.py
+c/tests/fuzz_*
+!c/tests/fuzz_*.c
+!c/tests/fuzz_*.cu
+!c/tests/fuzz_*.mm
+!c/tests/fuzz_*.py
 result
 c/tests/test_cap_precedence
 c/tests/test_cap_precedence.exe

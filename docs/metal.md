@@ -15,6 +15,17 @@ containers. Set `COLI_METAL_GEMM_MIN=100000` to keep every GEMM on the CPU for
 bit-exact prefill (`DEBUG_LOGITS=1` on a `TF=1` run dumps the top-5 logits and the
 top1–top2 margin at each mismatch, so you can see how close the tie was).
 
+`COLI_METAL_PREFILL=1` extends the fused attention to **prefill** (S>4): the whole
+attention — projections, scores, softmax, value, output — runs on the GPU in one
+command buffer instead of the CPU. On a 544-token prompt this cuts prefill attention
+~4x (35.9 s → 9.0 s). It is **off by default**: like the prefill GEMM above, the GPU
+accumulates in a different order and can pick a different top token on near-tie logits
+(same [#622](https://github.com/JustVugg/colibri/issues/622) family), so a greedy stream
+is not guaranteed bit-identical to the CPU — on natural prompts it stays consistent, on
+pathological repetitive prompts an early token can flip. Turn it on when prefill latency
+matters more than exact CPU parity; prompts past the single-dispatch thread cap fall
+back to the CPU automatically.
+
 ```bash
 cd c
 make colibri METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)

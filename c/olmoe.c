@@ -500,11 +500,11 @@ static void pin_hot_experts(Model *m) {
     for (int l = 0; l < c->n_layers; l++) {
         uint32_t *freq_l = m->freq[l];
         if (!freq_l) continue;                    /* a layer with no row cannot be ranked */
-        
+
         uint64_t layer_total = 0;
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
         if (layer_total == 0) continue;
-        
+
         int max_pin = m->cache[l].cap - 8;
         if (max_pin < 4) max_pin = 4;
         
@@ -657,7 +657,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
                 if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
             }
-            idx[kk] = best; val[kk] = bv;
+            /* SEC: all-NaN probabilities leave best at -1, which reaches
+             * expert_get() and then last_access[layer*E - 1] -- a heap write at
+             * a negative index. See rt_router_pick in route_trace.h. */
+            best = rt_router_pick(best, kk, E, layer);
+            idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
         /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
@@ -763,7 +767,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
             pthread_mutex_unlock(&g_pilot_mx);
             return; /* all pinned/in-flight, skip */
         }
-        
+
         /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
         if (g_pilot_evict_guard && m->freq && m->freq[layer] && m->last_access &&
             lc->slots[lru].eid >= 0) {
@@ -776,7 +780,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
                 return; /* drop speculation */
             }
         }
-        
+
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;

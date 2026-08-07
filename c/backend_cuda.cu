@@ -27,9 +27,24 @@
 struct RaggedKVEntry {
     const void *key;
     const float *host_l,*host_r;
-    float *latent,*rope;
-    int length,capacity,K,R;
+    float **latent_pages,**rope_pages;
+    int length,page_count,K,R;
 };
+
+#ifndef COLI_KV_PAGE_TOKENS
+#define COLI_KV_PAGE_TOKENS 64
+#endif
+
+static void ragged_kv_clear(RaggedKVEntry *e) {
+    for (int i=0;i<e->page_count;i++) {
+        if (e->latent_pages[i]) cudaFree(e->latent_pages[i]);
+        if (e->rope_pages[i]) cudaFree(e->rope_pages[i]);
+    }
+    std::free(e->latent_pages);
+    std::free(e->rope_pages);
+    e->latent_pages=e->rope_pages=nullptr;
+    e->length=e->page_count=0;
+}
 
 struct ColiCudaTensor {
     void *weights;
@@ -86,6 +101,12 @@ static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
+static uint64_t g_device_group_calls[COLI_CUDA_MAX_DEVICES];
+static uint64_t g_device_group_experts[COLI_CUDA_MAX_DEVICES];
+static uint64_t g_device_group_rows[COLI_CUDA_MAX_DEVICES];
+static double g_device_group_h2d_ms[COLI_CUDA_MAX_DEVICES];
+static double g_device_group_kernel_ms[COLI_CUDA_MAX_DEVICES];
+static double g_device_group_d2h_ms[COLI_CUDA_MAX_DEVICES];
 static std::mutex g_group_stats_mu;
 #ifdef COLI_ANS
 static FILE *g_ans_sidecar;
@@ -145,12 +166,21 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)(I + 1) / 2;   /* grouped int4: nibbles like fmt 2 */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
+    if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
     return 0;
 }
 
 /* The E8 codebook, uploaded once per device from quant.h's e8_grid so the table
  * has a single source of truth and cannot drift from the CPU decoder. */
 __constant__ uint8_t c_e8_grid[256][4];
+
+/* The fmt=8 e4m3 decode table, uploaded once per device from quant.h's
+ * E4M3_LUT — same single-source-of-truth arrangement as c_e8_grid. Uploads of
+ * fmt=8 tensors are refused until it is published (g_fp8_lut_ready): a kernel
+ * reading the zero-initialized table would compute silent zeros, the exact
+ * failure mode this format's dispatch work exists to prevent. */
+__constant__ float c_e4m3[256];
+static int g_fp8_lut_ready;
 
 /* A super-block is 98 bytes, so nothing inside it is guaranteed 4- or 2-byte
  * aligned: assemble the words byte-wise instead of dereferencing. */
@@ -246,6 +276,17 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
             if (g >= ng) g = ng - 1;  /* tail elements in the last (partial) group */
             sum += xs[i] * weight_at(weights, fmt, row, i) * scl[g];
         }
+    } else if (fmt == 8) {
+        /* fp8-e4m3 (matmul_fp8): one byte per weight (layout of fmt=1), one f32
+         * scale per 128x128 BLOCK of [O,I] — scales[(o/128)*ceil(I/128) + i/128].
+         * The block edge is a fixed property of the format (FP8_BLOCK), so the
+         * geometry derives from I alone and gs/ng are ignored: this branch is
+         * correct no matter which call site launched it. NaN bytes decode to NaN
+         * through the LUT and propagate, same policy as the CPU path. */
+        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
+        const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
+        for (int i = threadIdx.x; i < I; i += blockDim.x)
+            sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -259,7 +300,7 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         __syncthreads();
     }
     if (!threadIdx.x)
-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6) ? partial[0] * scales[o] : partial[0];
+        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 8) ? partial[0] * scales[o] : partial[0];
 }
 
 /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
@@ -576,6 +617,43 @@ __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
 }
 
+/* fmt=8 fp8-e4m3 variants: same structure as the g4 kernels, but one byte per
+ * weight (decoded through c_e4m3) and the scale is per 128x128 BLOCK of the
+ * member's [O,I] matrix — sc[(o/128)*ceil(I/128) + i/128]. The block edge is a
+ * property of the format, so the geometry derives from the dims alone; these
+ * kernels require every member to be fmt=8 (no ride-along: a per-row member's
+ * scales are [O], which this indexing would read out of bounds). */
+__global__ static void grouped_hidden_f8_dual(float *gate,float *up,const float *x,
+                                              const GroupDesc *desc,int I,int D){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*D;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*D;
+    int nblk=(D+127)>>7;
+    const float *gsc=d.gs+(size_t)(o>>7)*nblk;
+    const float *usc=d.us+(size_t)(o>>7)*nblk;
+    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    for(int i=threadIdx.x;i<D;i+=blockDim.x){float xv=xs[i];int b=i>>7;
+        ga+=xv*c_e4m3[gr[i]]*gsc[b];ua+=xv*c_e4m3[ur[i]]*usc[b];}
+    __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
+    /* same fused epilogue as the w4/g4 duals: scales applied in the
+     * accumulation, silu(gate)*up lands in gate[], up[] is never written */
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=gp[0],u=upv[0];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
+}
+__global__ static void grouped_down_f8(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*I;
+    int nblk=(I+127)>>7;
+    const float *dsc=d.ds+(size_t)(o>>7)*nblk;
+    const float *xs=x+(size_t)(d.offset+s)*I;float sum=0;
+    for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=xs[i]*c_e4m3[row[i]]*dsc[i>>7];
+    __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
+}
+
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
                                                 int fmt,int H,int Q,int R,int V,int K,int T,float scale,
@@ -634,18 +712,18 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
 __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
         const float *const *latent,const float *const *rope,const int *lengths,
         const void *weights,const float *wscale,int fmt,int S,int H,int Q,int R,
-        int V,int K,int T,float scale,int gs,int ng){
+        int V,int K,int T,int page_stride,float scale,int gs,int ng){
     int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=lengths[s],rbase=h*(Q+V);
     if(s>=S||nt<1||nt>T)return;
     extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
     const float *qs=q+((size_t)s*H+h)*(Q+R);
-    const float *ls=latent[s],*rs=rope[s];
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
           absorb_scale(wscale,fmt,gs,ng,rbase+d,k);qa[k]=a;}
     __syncthreads();
-    for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=ls+(size_t)t*K;
-        const float *rt=rs+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
+    for(int t=tid;t<nt;t+=blockDim.x){float a=0;int pg=t/COLI_KV_PAGE_TOKENS,pt=t%COLI_KV_PAGE_TOKENS;
+        const float *lt=latent[(size_t)s*page_stride+pg]+(size_t)pt*K;
+        const float *rt=rope[(size_t)s*page_stride+pg]+(size_t)pt*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
         for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[t]=a*scale;}
     __syncthreads();
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
@@ -656,7 +734,10 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
     __syncthreads();
-    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)a+=scores[t]*ls[(size_t)t*K+k];cl[k]=a;}
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++){
+        const float *lt=latent[(size_t)s*page_stride+t/COLI_KV_PAGE_TOKENS]+
+                        (size_t)(t%COLI_KV_PAGE_TOKENS)*K;
+        a+=scores[t]*lt[k];}cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k)*
@@ -665,11 +746,15 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
 }
 
 __global__ static void ragged_kv_append(float *const *latent,float *const *rope,
-        const float *packed,const int *old_len,const int *add,const int *offset,int K,int R){
+        const float *packed,const int *old_len,const int *add,const int *offset,
+        int K,int R,int page_stride){
     int s=blockIdx.x,n=add[s],base=offset[s];
-    for(int i=threadIdx.x;i<n*(K+R);i+=blockDim.x){
-        if(i<n*K)latent[s][(size_t)old_len[s]*K+i]=packed[base+i];
-        else rope[s][(size_t)old_len[s]*R+i-n*K]=packed[base+i];
+    for(int t=0;t<n;t++){
+        int pos=old_len[s]+t,pg=pos/COLI_KV_PAGE_TOKENS,pt=pos%COLI_KV_PAGE_TOKENS;
+        float *lp=latent[(size_t)s*page_stride+pg]+(size_t)pt*K;
+        float *rp=rope[(size_t)s*page_stride+pg]+(size_t)pt*R;
+        for(int k=threadIdx.x;k<K;k+=blockDim.x)lp[k]=packed[base+(size_t)t*K+k];
+        for(int r=threadIdx.x;r<R;r+=blockDim.x)rp[r]=packed[base+(size_t)n*K+(size_t)t*R+r];
     }
 }
 
@@ -770,6 +855,19 @@ extern "C" int coli_cuda_e8_set_grid(const void *grid) {
     return 1;
 }
 
+/* Publish quant.h's E4M3_LUT the same way — one source of truth for the fmt=8
+ * decode on CPU and GPU. Until this succeeds, fmt=8 uploads are refused. */
+extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
+    if (!lut || g_nctx < 1) return 0;
+    for (int i = 0; i < g_nctx; i++) {
+        if (!select_ctx(&g_ctx[i])) return 0;
+        if (!cuda_ok(cudaMemcpyToSymbol(c_e4m3, lut, sizeof(c_e4m3)), "e4m3 LUT upload"))
+            return 0;
+    }
+    g_fp8_lut_ready = 1;
+    return 1;
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
@@ -781,7 +879,17 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     {
         const char *t = std::getenv("TEMP");
         struct stat st;
+        /* Same test on both hosts; only the CRT spelling differs. The MSVC CRT
+         * (Windows hipcc's host pass) has no S_ISDIR and no unsetenv — it spells
+         * the directory bit _S_IFDIR/_S_IFMT and clears a variable by assigning
+         * an empty value. This is an OS/CRT difference, NOT a vendor one, so it
+         * stays a _WIN32 branch and adds no CUDA-vs-HIP conditional. */
+#ifdef _WIN32
+        if (t && *t && (stat(t, &st) != 0 ||
+                        (st.st_mode & _S_IFMT) != _S_IFDIR)) _putenv_s("TEMP", "");
+#else
         if (t && *t && (stat(t, &st) != 0 || !S_ISDIR(st.st_mode))) unsetenv("TEMP");
+#endif
     }
 #endif
     int available = 0;
@@ -907,6 +1015,20 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
 }
 
+extern "C" void coli_cuda_group_stats_device(
+    int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,
+    double *h2d_ms, double *kernel_ms, double *d2h_ms) {
+    std::lock_guard<std::mutex> lock(g_group_stats_mu);
+    int index=-1;
+    for(int i=0;i<g_nctx;i++) if(g_ctx[i].device==device){ index=i; break; }
+    if(calls) *calls=index<0?0:g_device_group_calls[index];
+    if(experts) *experts=index<0?0:g_device_group_experts[index];
+    if(rows) *rows=index<0?0:g_device_group_rows[index];
+    if(h2d_ms) *h2d_ms=index<0?0:g_device_group_h2d_ms[index];
+    if(kernel_ms) *kernel_ms=index<0?0:g_device_group_kernel_ms[index];
+    if(d2h_ms) *d2h_ms=index<0?0:g_device_group_d2h_ms[index];
+}
+
 /* group size for the NEXT upload on this thread (fmt=4): routed through a
  * thread_local so the widely-wired upload signature (and the Windows DLL ABI)
  * stays untouched. pin_load uploads in parallel, hence thread_local. */
@@ -934,12 +1056,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
      * quantized format that legitimately arrives with scales == NULL. */
     if (!rb || (fmt && fmt != 6 && !scales)) return 0;
+    if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
     t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
     t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
     t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
+    if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
+        t->ng = (I + 127) / 128;
+        t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
+    }
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
         !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
         coli_cuda_tensor_free(t);
@@ -1268,7 +1395,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -1282,10 +1409,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         any_e8|=g->fmt==6||u->fmt==6||d->fmt==6;
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
+        any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
+        all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
-    /* Mixed E8 groups cannot use either homogeneous grouped kernel. */
-    if(any_e8&&!all_e8){
+    /* Mixed E8/FP8 groups cannot use a homogeneous grouped kernel. */
+    if((any_e8&&!all_e8)||(any_f8&&!all_f8)){
         int off=0;
         for(int c=0;c<count;c++){
             if(!coli_cuda_expert_mlp(gates[c],ups[c],downs[c],
@@ -1333,6 +1462,11 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
         if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_f8){
+        /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
@@ -1401,10 +1535,13 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
-        /* generic path decodes fmt 0/1/2/3 only — a fmt=4 group that slipped the
-         * gates above (odd gs) must NOT be silently decoded as int2 (#334). */
+        /* generic path decodes fmt 0/1/2/3 only — refuse everything else rather
+         * than whitelist known offenders: a fmt=4 group that slipped the gates
+         * above (odd gs) must NOT be silently decoded as int2 (#334), and any
+         * group/block-scaled format that gains CUDA tensors later (fmt=5, fmt=8)
+         * would be mis-decoded by weight_at the same way. */
         for(int c=0;c<count;c++)
-            if(host[c].gf==4||host[c].uf==4||host[c].df==4) return 0;
+            if(host[c].gf>3||host[c].uf>3||host[c].df>3) return 0;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
@@ -1423,11 +1560,18 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         cudaEventElapsedTime(&a,ev[0],ev[1]); cudaEventElapsedTime(&b,ev[1],ev[2]);
         cudaEventElapsedTime(&c,ev[2],ev[3]);
         { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-          g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c; }
+          int index=(int)(ctx-g_ctx);
+          g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c;
+          g_device_group_h2d_ms[index]+=a;
+          g_device_group_kernel_ms[index]+=b;
+          g_device_group_d2h_ms[index]+=c; }
         for(int i=0;i<4;i++) cudaEventDestroy(ev[i]);
     }
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+      int index=(int)(ctx-g_ctx);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+      g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
 }
 
@@ -1449,7 +1593,8 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
-    int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1;
+    int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
+        all_q4=1,any_g4=0,any_f8=0,all_f8=1;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -1461,9 +1606,15 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         any_e8|=g->fmt==6||u->fmt==6||d->fmt==6;
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
+        all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
+                !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
+        any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
+        any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
+        all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(any_e8&&!all_e8) return 0;
+    if(any_f8&&!all_f8) return 0;   /* mixed FP8: no homogeneous kernel, sync path has the per-expert loop */
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
@@ -1486,6 +1637,14 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
         if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_f8){
+        /* fp8-e4m3 groups on the async decode path: same kernels as the sync
+         * dispatch, silu fused in the dual epilogue. */
+        GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
+        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
@@ -1499,7 +1658,28 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 ctx->gate,ctx->up,(size_t)total*I);
         }
         grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
-    } else for(int c=0;c<count;c++){
+    } else if(all_q4&&any_g4){
+        /* grouped int4 (fmt=4) present in the async decode path: per-group
+         * scales via the #334 kernels (fmt=2 members ride along as ng=1). The
+         * previous fallback ran quant_matmul with gs=0,ng=1, which silently
+         * applied one per-row scale to a grouped container -> wrong output. */
+        GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
+        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        /* silu is fused in the dual kernel's epilogue (like the sync path):
+         * an extra silu_mul here would re-apply it against the never-written
+         * ctx->up buffer. */
+        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    } else {
+        /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
+         * That is only correct for fmt 0/1/2/3: refuse group/block-scaled
+         * members (fmt=4 with odd gs today; fmt=5/8 if they ever gain CUDA
+         * tensors) instead of silently mis-scaling them, mirroring the sync
+         * path's refusal (#334). fmt=6 cannot reach here (any_e8 gates above). */
+        for(int c=0;c<count;c++)
+            if(host[c].gf>3||host[c].uf>3||host[c].df>3) return 0;
+        for(int c=0;c<count;c++){
         int r=rows[c];
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
         float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
@@ -1510,13 +1690,16 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
         quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
             host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
-    }
+    }}
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+      int index=(int)(ctx-g_ctx);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+      g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
 }
 
@@ -1530,11 +1713,19 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
 }
 
 
+/* The absorb kernels decode `w` through weight_at + absorb_scale, which know
+ * per-row and fmt=4 group scales only. Refuse anything else (fmt=5/6/8) rather
+ * than mis-decode it — the caller keeps its CPU attention path. (`proj`
+ * tensors are exempt: they run through quant_matmul, which dispatches every
+ * format it uploads.) A dedicated block-scale absorb for fmt=8 is follow-up
+ * work, same shape as routing fmt=4 through the grouped kernels was. */
+static int absorb_fmt_ok(const ColiCudaTensor *w){ return w && w->fmt <= 4; }
+
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,
                                             int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!ctx||!q||!latent||!rope||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
+    if(!absorb_fmt_ok(w)||!ctx||!q||!latent||!rope||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
@@ -1556,7 +1747,7 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
 static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
         const float *q,const float *latent,const float *rope,int S,int H,int Q,int R,int V,
         int K,int T,float scale){
-    if(!w||!out||!q||!latent||!rope||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
+    if(!absorb_fmt_ok(w)||!out||!q||!latent||!rope||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
        T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -1602,55 +1793,71 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
         float *out,const float *q,const void *const *keys,
         const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int T,float scale){
-    if(!w||!proj||!out||!q||!keys||!latent||!rope||!lengths||S<1||S>512||T<1||T>8192||
+    if(!absorb_fmt_ok(w)||!proj||!out||!q||!keys||!latent||!rope||!lengths||S<1||S>512||T<1||T>8192||
        H<1||Q<1||R<1||V<1||K<1||K>512||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);
     if(!select_ctx(dc))return 0;
-    float **dl=(float**)std::malloc((size_t)S*sizeof(*dl));
-    float **dr=(float**)std::malloc((size_t)S*sizeof(*dr));
     int *old=(int*)std::malloc((size_t)S*sizeof(*old));
     int *add=(int*)std::malloc((size_t)S*sizeof(*add));
     int *off=(int*)std::malloc((size_t)S*sizeof(*off));int packed_n=0;
-    if(!dl||!dr||!old||!add||!off){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+    if(!old||!add||!off){std::free(old);std::free(add);std::free(off);return 0;}
+    int page_stride=0;
     for(int s=0;s<S;s++){
-        if(!keys[s]||lengths[s]<1||lengths[s]>T){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+        if(!keys[s]||lengths[s]<1||lengths[s]>T){std::free(old);std::free(add);std::free(off);return 0;}
         RaggedKVEntry *e=nullptr;
         for(int i=0;i<w->ragged_count;i++)if(w->ragged[i].key==keys[s]){e=&w->ragged[i];break;}
         if(!e){
-            if(w->ragged_count>=512){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+            if(w->ragged_count>=512){std::free(old);std::free(add);std::free(off);return 0;}
             e=&w->ragged[w->ragged_count++];std::memset(e,0,sizeof(*e));e->key=keys[s];
         }
         if(e->K!=K||e->R!=R||e->host_l!=latent[s]||e->host_r!=rope[s]||lengths[s]<e->length){
-            if(e->latent)cudaFree(e->latent);if(e->rope)cudaFree(e->rope);
-            e->latent=e->rope=nullptr;e->length=e->capacity=0;
+            ragged_kv_clear(e);
             e->K=K;e->R=R;e->host_l=latent[s];e->host_r=rope[s];
         }
-        if(lengths[s]>e->capacity){
-            int cap=(lengths[s]+63)&~63;float *nl=nullptr,*nr=nullptr;
-            if(!cuda_ok(cudaMalloc(&nl,(size_t)cap*K*sizeof(float)),"ragged KV latent page")||
-               !cuda_ok(cudaMalloc(&nr,(size_t)cap*R*sizeof(float)),"ragged KV rope page")){
-                if(nl)cudaFree(nl);if(nr)cudaFree(nr);std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;
+        int need=(lengths[s]+COLI_KV_PAGE_TOKENS-1)/COLI_KV_PAGE_TOKENS;
+        if(need>e->page_count){
+            float **nl=(float**)std::calloc((size_t)need,sizeof(*nl));
+            float **nr=(float**)std::calloc((size_t)need,sizeof(*nr));
+            if(!nl||!nr){std::free(nl);std::free(nr);std::free(old);std::free(add);std::free(off);return 0;}
+            for(int i=0;i<e->page_count;i++){nl[i]=e->latent_pages[i];nr[i]=e->rope_pages[i];}
+            int made=e->page_count;
+            for(;made<need;made++){
+                if(!cuda_ok(cudaMalloc(&nl[made],(size_t)COLI_KV_PAGE_TOKENS*K*sizeof(float)),"ragged KV latent page")||
+                   !cuda_ok(cudaMalloc(&nr[made],(size_t)COLI_KV_PAGE_TOKENS*R*sizeof(float)),"ragged KV rope page"))break;
             }
-            if(e->length){
-                cudaMemcpyAsync(nl,e->latent,(size_t)e->length*K*sizeof(float),cudaMemcpyDeviceToDevice,dc->stream);
-                cudaMemcpyAsync(nr,e->rope,(size_t)e->length*R*sizeof(float),cudaMemcpyDeviceToDevice,dc->stream);
+            if(made<need){
+                if(nl[made])cudaFree(nl[made]);if(nr[made])cudaFree(nr[made]);
+                for(int i=e->page_count;i<made;i++){cudaFree(nl[i]);cudaFree(nr[i]);}
+                std::free(nl);std::free(nr);std::free(old);std::free(add);std::free(off);return 0;
             }
-            if(e->latent)cudaFree(e->latent);if(e->rope)cudaFree(e->rope);
-            e->latent=nl;e->rope=nr;e->capacity=cap;
+            std::free(e->latent_pages);std::free(e->rope_pages);
+            e->latent_pages=nl;e->rope_pages=nr;e->page_count=need;
         }
-        dl[s]=e->latent;dr[s]=e->rope;old[s]=e->length;add[s]=lengths[s]-e->length;
+        if(e->page_count>page_stride)page_stride=e->page_count;
+        old[s]=e->length;add[s]=lengths[s]-e->length;
         off[s]=packed_n;packed_n+=add[s]*(K+R);
+    }
+    size_t table_n=(size_t)S*page_stride;
+    float **dl=(float**)std::calloc(table_n,sizeof(*dl));
+    float **dr=(float**)std::calloc(table_n,sizeof(*dr));
+    if(!dl||!dr){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+    for(int s=0;s<S;s++)for(int i=0;i<w->ragged_count;i++)if(w->ragged[i].key==keys[s]){
+        for(int p=0;p<w->ragged[i].page_count;p++){
+            dl[(size_t)s*page_stride+p]=w->ragged[i].latent_pages[p];
+            dr[(size_t)s*page_stride+p]=w->ragged[i].rope_pages[p];
+        }
+        break;
     }
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float);
     size_t cb=(size_t)S*H*V*sizeof(float),ob=(size_t)S*proj->O*sizeof(float);
     size_t pb=(size_t)packed_n*sizeof(float);
-    size_t desc=(size_t)S*(2*sizeof(float*)+4*sizeof(int));
+    size_t desc=2*table_n*sizeof(float*)+(size_t)S*4*sizeof(int);
     int ok=reserve(&dc->aq,&dc->aq_cap,qb)&&reserve(&dc->ac,&dc->ac_cap,cb)&&
            reserve(&dc->y,&dc->y_cap,ob)&&reserve_bytes(&dc->group_desc,&dc->group_desc_cap,desc)&&
            (!pb||(reserve(&dc->al,&dc->al_cap,pb)&&reserve_pinned(&dc->host_kv,&dc->host_kv_cap,pb)));
-    char *db=(char*)dc->group_desc;float **ddl=(float**)db,**ddr=ddl+S;
-    int *dn=(int*)(ddr+S),*dold=dn+S,*dadd=dold+S,*doff=dadd+S;
+    char *db=(char*)dc->group_desc;float **ddl=(float**)db,**ddr=ddl+table_n;
+    int *dn=(int*)(ddr+table_n),*dold=dn+S,*dadd=dold+S,*doff=dadd+S;
     if(ok&&pb){
         for(int s=0;s<S;s++)if(add[s]){
             float *p=dc->host_kv+off[s];
@@ -1660,20 +1867,20 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
         ok=cuda_ok(cudaMemcpyAsync(dc->al,dc->host_kv,pb,cudaMemcpyHostToDevice,dc->stream),"ragged KV append upload");
     }
     if(ok)ok=cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"ragged q upload")&&
-             cuda_ok(cudaMemcpyAsync(ddl,dl,(size_t)S*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged latent pointers")&&
-             cuda_ok(cudaMemcpyAsync(ddr,dr,(size_t)S*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged rope pointers")&&
+             cuda_ok(cudaMemcpyAsync(ddl,dl,table_n*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged latent page table")&&
+             cuda_ok(cudaMemcpyAsync(ddr,dr,table_n*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged rope page table")&&
              cuda_ok(cudaMemcpyAsync(dn,lengths,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged lengths upload")&&
              cuda_ok(cudaMemcpyAsync(dold,old,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged old lengths")&&
              cuda_ok(cudaMemcpyAsync(dadd,add,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged append lengths")&&
              cuda_ok(cudaMemcpyAsync(doff,off,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged append offsets");
-    if(ok&&pb)ragged_kv_append<<<S,256,0,dc->stream>>>(ddl,ddr,dc->al,dold,dadd,doff,K,R);
+    if(ok&&pb)ragged_kv_append<<<S,256,0,dc->stream>>>(ddl,ddr,dc->al,dold,dadd,doff,K,R,page_stride);
     if(ok)for(int s=0;s<S;s++){
         for(int i=0;i<w->ragged_count;i++)if(w->ragged[i].key==keys[s]){w->ragged[i].length=lengths[s];break;}
     }
     std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);if(!ok)return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_ragged_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,ddl,ddr,
-        dn,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale,w->gs,w->ng);
+        dn,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,page_stride,scale,w->gs,w->ng);
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
         proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->gs,proj->ng);
     return cuda_ok(cudaGetLastError(),"ragged attention launch")&&
@@ -1702,10 +1909,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     }
     if (tensor->weights&&tensor->weights_owned) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
-    for(int i=0;i<tensor->ragged_count;i++){
-        if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
-        if(tensor->ragged[i].rope)cudaFree(tensor->ragged[i].rope);
-    }
+    for(int i=0;i<tensor->ragged_count;i++)ragged_kv_clear(&tensor->ragged[i]);
     std::free(tensor);
 }
 
@@ -2030,7 +2234,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!proj||!out||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+    if(!absorb_fmt_ok(w)||!proj||!out||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -2094,7 +2298,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+    if(!absorb_fmt_ok(w)||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -2116,7 +2320,7 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+    if(!absorb_fmt_ok(w)||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
@@ -2131,7 +2335,7 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
         const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
         float scale){
     if (fault_injected()) return 0;
-    if(!w||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
+    if(!absorb_fmt_ok(w)||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);

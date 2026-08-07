@@ -1,0 +1,2 @@
+[console_scripts]
+coli = colibri.cli:main
