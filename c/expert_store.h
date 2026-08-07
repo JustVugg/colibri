@@ -78,6 +78,13 @@ typedef struct {
      * on success and fills *out. NULL when unsupported. */
     int (*emap)(const ColiExpertStore *store, char *hex, size_t hex_cap,
                 ColiStoreTelemetry *out);
+    /* Dashboard telemetry (optional): drain + clear a hex bitmap (1 bit per
+     * expert, rows*cols bits; bit i = byte i>>3, bit i&7) of experts routed
+     * since the last call, so the Brain cortex can flash live. hex must hold
+     * ((rows*cols+7)/8)*2+1 bytes; returns 0 on success and fills *out.
+     * NULL when unsupported. */
+    int (*hits)(const ColiExpertStore *store, char *hex, size_t hex_cap,
+                ColiStoreTelemetry *out);
     void (*destroy)(ColiExpertStore *store);
 } ColiExpertStoreOps;
 

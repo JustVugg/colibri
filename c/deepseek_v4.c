@@ -5075,6 +5075,8 @@ typedef struct {
     uint64_t clock;
     unsigned active_leases;
     ColiExpertStoreStats stats;
+    unsigned char *hits;   /* routed-expert bitmap, rows*cols bits (telemetry) */
+    size_t hits_bytes;
     pthread_mutex_t mutex;
 } V4ExpertStoreState;
 
@@ -5245,6 +5247,11 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
+    if (state->hits && state->hits_bytes) {
+        size_t hit_bit = (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->hits[hit_bit >> 3] |= (unsigned char)(1u << (hit_bit & 7));
+    }
+
     memset(view, 0, sizeof(*view));
     view->key = key;
     fill_tensor_view(&view->gate, record, slot, V4_W1);
@@ -5379,6 +5386,34 @@ static int store_emap(const ColiExpertStore *store, char *hex, size_t hex_cap,
     return 0;
 }
 
+/* Dashboard telemetry: drain + clear the routed-expert bitmap as a hex
+ * string (1 bit per expert, byte i>>3 bit i&7 — same layout the gateway
+ * consumers expect), so the Brain cortex can flash experts live per token. */
+static int store_hits(const ColiExpertStore *store, char *hex, size_t hex_cap,
+                      ColiStoreTelemetry *out) {
+    if (!store || !store->state || !hex || !out) return -1;
+    V4ExpertStoreState *state = store->state;
+    int rows = state->layers;
+    int cols = state->experts_per_layer;
+    if (rows < 1 || cols < 1 || !state->hits || !state->hits_bytes) return -1;
+    size_t need = state->hits_bytes * 2 + 1;
+    if (hex_cap < need) return -1;
+    pthread_mutex_lock(&state->mutex);
+    int w = 0;
+    for (size_t b = 0; b < state->hits_bytes; b++) {
+        hex[w++] = "0123456789abcdef"[state->hits[b] >> 4];
+        hex[w++] = "0123456789abcdef"[state->hits[b] & 15];
+    }
+    memset(state->hits, 0, state->hits_bytes);
+    pthread_mutex_unlock(&state->mutex);
+    hex[w] = 0;
+    out->rows = rows;
+    out->cols = cols;
+    out->resident = 0;
+    out->record_bytes = 0;
+    return 0;
+}
+
 
 static void destroy(ColiExpertStore *store) {
     if (!store) return;
@@ -5396,6 +5431,7 @@ static void destroy(ColiExpertStore *store) {
         coli_st_index_close(state->index);
         free(state->records);
         free(state->slots);
+        free(state->hits);
         free(state);
     }
     free(store);
@@ -5405,7 +5441,7 @@ int coli_deepseek_v4_expert_store_open(
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
     static const ColiExpertStoreOps operations = {
-        lookup, release, prefetch, stats, store_emap, destroy
+        lookup, release, prefetch, stats, store_emap, store_hits, destroy
     };
     if (!options || !output || !options->model_dir || options->layers < 1 ||
         options->experts_per_layer < 1 || !options->cache_bytes)
@@ -5467,6 +5503,12 @@ int coli_deepseek_v4_expert_store_open(
         state->slots[i].expert = -1;
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
+    state->hits_bytes = ((size_t)state->layers * state->experts_per_layer + 7) / 8;
+    state->hits = calloc(state->hits_bytes, 1);
+    if (!state->hits) {
+        set_error(error, error_size, "out of memory creating expert hits bitmap");
+        goto fail;
+    }
     store->ops = &operations;
     store->state = state;
     *output = store;
@@ -5474,6 +5516,7 @@ int coli_deepseek_v4_expert_store_open(
 
 fail:
     if (state->slots) free(state->slots);
+    if (state->hits) free(state->hits);
     free(state->records);
     coli_st_index_close(state->index);
     pthread_mutex_destroy(&state->mutex);
@@ -5878,6 +5921,11 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             slot = &slots[i]; slot->references++;
             state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
+            if (state->hits && state->hits_bytes) {
+                size_t hit_bit = (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->hits[hit_bit >> 3] |= (unsigned char)(1u << (hit_bit & 7));
+    }
+
             if (hot_is_pinned(policy, key.layer, key.expert))
                 hot_pack_slot_locked(policy, state, record, slot);
             memset(view, 0, sizeof(*view)); view->key = key;
@@ -5931,6 +5979,11 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+    if (state->hits && state->hits_bytes) {
+        size_t hit_bit = (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->hits[hit_bit >> 3] |= (unsigned char)(1u << (hit_bit & 7));
+    }
+
     if (hot_is_pinned(policy, key.layer, key.expert))
         hot_pack_slot_locked(policy, state, record, slot);
     memset(view, 0, sizeof(*view)); view->key = key;
@@ -6025,7 +6078,7 @@ int COLI_V4_ROWS16_STORE_OPEN(
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
     static const ColiExpertStoreOps hot_operations = {
-        lookup_hot, release, prefetch, stats, store_emap, destroy_hot
+        lookup_hot, release, prefetch, stats, store_emap, store_hits, destroy_hot
     };
     int result = coli_deepseek_v4_expert_store_open_base(
         options, output, error, error_size);
@@ -8321,6 +8374,7 @@ typedef struct {
     ColiV4Session *session;
     const char *request_id;
     int cancelled;
+    ColiExpertStore *store;   /* for live HITS telemetry during decode */
 } V4ServeStream;
 
 static double v4_serve_rss_gb(void) {
@@ -8397,6 +8451,15 @@ static int v4_serve_token(void *user_data, int token, float logit,
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
         v4_serve_data(stream->request_id, piece, bytes);
+    }
+    if (stream->store && stream->store->ops && stream->store->ops->hits) {
+        char *hex = malloc(65536);
+        if (hex) {
+            ColiStoreTelemetry tm;
+            if (stream->store->ops->hits(stream->store, hex, 65536, &tm) == 0)
+                printf("HITS %d %d %s\n", tm.rows, tm.cols, hex);
+            free(hex);
+        }
     }
     while (coli_stdin_readable()) {
         V4ServeRequest queued = {0};
@@ -8522,7 +8585,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     ColiExpertStoreStats before = {0}, after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &before);
-    V4ServeStream stream = {session, request->id, 0};
+    V4ServeStream stream = {session, request->id, 0, engine->experts};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
     double started = spec_now();
@@ -9537,7 +9600,7 @@ int coli_deepseek_v4_expert_store_open(
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
     static const ColiExpertStoreOps operations = {
-        lookup, release, prefetch, stats, 0, destroy
+        lookup, release, prefetch, stats, 0, 0, destroy
     };
     if (!options || !output || !options->model_dir || options->layers < 1 ||
         options->experts_per_layer < 1 || !options->cache_bytes)
