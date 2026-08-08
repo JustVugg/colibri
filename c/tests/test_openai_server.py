@@ -930,6 +930,99 @@ class DispatcherTest(unittest.TestCase):
         self.assertIsNone(profile["physical_ssd_bytes"])
         self.assertIs(profile["physical_ssd_valid"], False)
 
+    def test_prof_rejects_unsupported_field_count(self):
+        # Only 10, 17, and 18 fields are well-formed. Counts between the
+        # accepted shapes (15) and beyond the eighteen-field form (19) are
+        # protocol errors, not silently truncated or ignored.
+        frames = {
+            "fifteen fields": (
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536\n"
+            ),
+            "nineteen fields": (
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250 1 EXTRA\n"
+            ),
+        }
+        for label, telemetry in frames.items():
+            with self.subTest(label=label):
+                def respond(process, _frame, telemetry=telemetry):
+                    process.stdout.feed(telemetry)
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "PROF"):
+                    engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+                engine.close()
+
+    def test_prof_rejects_non_finite_numeric(self):
+        # Every float field must be finite; nan/inf would poison the
+        # /profile scorecards. Both base and additive floats are guarded.
+        frames = {
+            "nan wall_s": (
+                b"PROF nan 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250 1\n"
+            ),
+            "inf ttft_ms": (
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 inf 1.250 1\n"
+            ),
+        }
+        for label, telemetry in frames.items():
+            with self.subTest(label=label):
+                def respond(process, _frame, telemetry=telemetry):
+                    process.stdout.feed(telemetry)
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "PROF"):
+                    engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+                engine.close()
+
+    def test_prof_physical_ssd_valid_requires_literal_one(self):
+        # Validity is "==" against the literal token "1": a "2" (which the
+        # old bool(int()) path wrongly treated as valid) is reported as
+        # unverified, not as a protocol error — the frame is well-formed.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250 2\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertIs(profile["physical_ssd_valid"], False)
+        self.assertIsNone(profile["physical_ssd_bytes"])
+
+    def test_prof_accepts_legacy_seventeen_field_frame(self):
+        # The 17-field producer carries no validity token; a positive byte
+        # count is known-valid and zero is unverified (None). This shape must
+        # remain accepted now that field counts are restricted to 10/17/18.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertEqual(profile["physical_ssd_bytes"], 4096)
+        self.assertIs(profile["physical_ssd_valid"], True)
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
