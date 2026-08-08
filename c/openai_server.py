@@ -2079,23 +2079,21 @@ class APIHandler(BaseHTTPRequestHandler):
             self._check_host()
             path = urlsplit(self.path).path
             if path == "/health":
-                # Liveness is always public; hardware/scheduler internals only when a
-                # request is authed (or no key set), so a configured key isn't leaked
-                # past a bare 200 to an unauthenticated probe. (#SEC-8)
                 payload = {"status": "ok"}
-                if self._is_authed():
-                    payload["scheduler"] = self.server.scheduler.snapshot()
-                    payload["kv_slots"] = self.server.kv_slots
-                    tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
-                    if tiers: payload["tiers"] = tiers
-                    hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
-                    if hwinfo: payload["hwinfo"] = hwinfo
+                payload["scheduler"] = self.server.scheduler.snapshot()
+                payload["kv_slots"] = self.server.kv_slots
+                tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                if tiers:
+                    payload["tiers"] = tiers
+                hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                if hwinfo:
+                    payload["hwinfo"] = hwinfo
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
                 payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
                 eng = self.server.engine
-                if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
+                if eng and getattr(eng, "emap", None):
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq

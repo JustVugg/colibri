@@ -163,7 +163,9 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
 void coli_vk_alloc_priority(float p) { G.prio = p < 0 ? 0 : p > 1 ? 1 : p; }
 
 /* Device-local heap usage/budget in GB (VK_EXT_memory_budget). Returns 0 when the
- * extension is absent — callers then keep their count-based caps unchanged. */
+ * extension is absent — callers then keep their count-based caps unchanged.
+ * Set COLI_VK_IGNORE_BUDGET=1 to use raw heap size as the budget instead of the
+ * driver-reported heapBudget, so COLI_VK_RESERVE_GB remains a real limit. */
 int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
 #ifdef VK_EXT_memory_budget
     if (!G.has_budget || !G.phys) return 0;
@@ -175,7 +177,10 @@ int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
     double u = 0, b = 0;
     for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
         if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
+            u += (double)bud.heapUsage[i];
+            b += getenv("COLI_VK_IGNORE_BUDGET")
+                     ? (double)mp2.memoryProperties.memoryHeaps[i].size
+                     : (double)bud.heapBudget[i];
         }
     if (used_gb) *used_gb = u / 1e9;
     if (budget_gb) *budget_gb = b / 1e9;
@@ -446,6 +451,8 @@ int coli_vk_init(const char *spv_path) {
 }
 
 int coli_vk_available(void) { return G.ready; }
+int coli_vk_expert_count(void) { return G.ready ? G.tensor_count : 0; }
+int64_t coli_vk_expert_bytes(void) { return G.ready ? (int64_t)G.used_bytes : 0; }
 
 void coli_vk_mem_info(size_t *used, size_t *count) {
     if (used) *used = G.used_bytes;
