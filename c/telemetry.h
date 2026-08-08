@@ -263,6 +263,26 @@ static void hwinfo_emit(Model *m){
     gpus_emit(m);
 }
 
+typedef struct {
+    int experts;
+    double bytes;
+} ColiRamTier;
+
+/* Price anonymous host residents separately from the direct RAMMAP arena.
+ * Keeping this arithmetic pure makes mixed CUDA/RAMMAP accounting testable
+ * without a CUDA device. */
+static ColiRamTier tiers_ram_account(double priced_bytes, int anon_ram,
+                                     int rammap_experts, int vram,
+                                     int64_t rammap_bytes){
+    ColiRamTier ram={anon_ram+rammap_experts,priced_bytes};
+    if(vram>0){
+        double avg=anon_ram+vram>0 ? ram.bytes/(double)(anon_ram+vram) : 0.0;
+        ram.bytes-=avg*(double)vram; if(ram.bytes<0) ram.bytes=0;
+    }
+    ram.bytes+=(double)rammap_bytes;
+    return ram;
+}
+
 static void tiers_emit(Model *m){
     Cfg *c=&m->c; int nsp=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
@@ -274,8 +294,6 @@ static void tiers_emit(Model *m){
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
 #endif
     int anon_ram=pinned-vram+lru; if(anon_ram<0) anon_ram=0;
-    int ram=anon_ram+m->rammap_experts;
-    int disk=total-vram-ram; if(disk<0) disk=0;
     /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
      * box where Windows still showed 140 GB free, because every resident expert was
      * being priced as an int8 MTP one (#856). A tier figure that disagrees with the
@@ -285,12 +303,11 @@ static void tiers_emit(Model *m){
         int64_t w=expert_bytes_row(m,i,m->ebits);
         ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
     }
-    if(vram>0){                       /* the VRAM tier's host copies are not RAM-tier bytes */
-        double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;
-        ram_b -= avg*(double)vram; if(ram_b<0) ram_b=0;
-    }
-    ram_b += (double)m->rammap_bytes; /* RAM-mapped resident experts (engine RAMMAP) */
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_b/1e9);
+    ColiRamTier ram=tiers_ram_account(
+        ram_b,anon_ram,m->rammap_experts,vram,m->rammap_bytes);
+    int disk=total-vram-ram.experts; if(disk<0) disk=0;
+    printf("TIERS %d %d %d %.2f %.2f\n",
+        vram,ram.experts,disk,vram_gb,ram.bytes/1e9);
     fflush(stdout);
 }
 
