@@ -146,6 +146,13 @@ static void *uploader(void *arg){
     }
 }
 
+/* R4 role split: lm_head as a resident int8 tensor on its own device.
+ * The dense-i8 quantization (engine-side) provides q/sc with the same
+ * per-row semantics quant_matmul's fmt=1 applies (y[o] = acc * sc[o]),
+ * so CPU and GPU compute the same numbers up to accumulation order. */
+static struct { ColiCudaTensor *t; int dev, dev_ok, on; } G_lmh;
+
+
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
@@ -175,6 +182,32 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     int have=coli_cuda_device_count();
     if(have<G.ndev){ G.ndev=have; }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no CUDA devices -> CPU path\n"); return 0; }
+
+    /* R4 role split: the lm_head device (COLI_LMHEAD_GPU) is initialized above
+     * but removed from the expert PLACEMENT list. Zeroing its budget instead
+     * is not enough: home() still hashes experts onto it, and those can never
+     * be placed — measured as a hit-rate collapse 89.9% -> 49.5% (only the
+     * half of the hot set homed to the remaining device got resident). Its
+     * take() would also pace every layer (Quadro: 12.8 ms/token vs 3070 2.4),
+     * while lm_head is one latency-tolerant call per token. If it is the ONLY
+     * device, experts stay on it — a role split needs two cards. */
+    {
+        const char *lhx=getenv("COLI_LMHEAD_GPU");
+        if(lhx && *lhx){
+            int ld=atoi(lhx), w=0, present=0;
+            for(int i=0;i<G.ndev;i++){ if(G.dev[i]==ld) present=1; else G.dev[w++]=G.dev[i]; }
+            if(present){
+                /* remember: the device HAS a CUDA context even after it leaves
+                 * the placement list — qt_lmhead_init keys on this, not on the
+                 * compacted list */
+                G_lmh.dev=ld; G_lmh.dev_ok=1;
+                if(w>0){
+                    G.ndev=w;
+                    fprintf(stderr,"[qtier] dev %d reserved for lm_head: excluded from expert placement\n",ld);
+                } /* w==0: lm_head device is the only one — experts stay on it */
+            } else fprintf(stderr,"[qtier] COLI_LMHEAD_GPU=%d not in COLI_GPUS -> lm_head stays on CPU\n",ld);
+        }
+    }
 
     /* per-device budget: CUDA_EXPERT_GB, or auto = free minus 1 GB headroom.
      * Scale counts follow the container: per-row (expert_gs=0) or grouped
@@ -240,6 +273,28 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
 }
 
 int qt_ready(void){ return G.on; }
+
+int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
+    if(!G_lmh.dev_ok||!G.on||!q||!sc) return 0;
+    int dev=G_lmh.dev;
+    if(!coli_cuda_tensor_upload(&G_lmh.t,q,sc,1,I,O,dev)){
+        fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
+        return 0;
+    }
+    G_lmh.dev=dev; G_lmh.on=1;
+    fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
+            O,I,dev,(double)O*I/1073741824.0);
+    return 1;
+}
+
+int qt_lmhead_matmul(float *y, const float *x, int I, int O){
+    if(!G_lmh.on) return 0;
+    /* cached-tensor path: upload params are ignored once *t exists */
+    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0)) return 1;
+    fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
+    G_lmh.on=0;
+    return 0;
+}
 
 /* Is (layer,eid) currently VRAM-resident? (used to free RAM-side int8 copies) */
 int qt_is_resident(int layer,int eid){

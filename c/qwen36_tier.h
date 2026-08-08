@@ -29,6 +29,13 @@
 /* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
  * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
  * qualche container mente (cfr. il rilevamento in qwen36.c). */
+/* R4 role split: park the dense-i8 lm_head on its own CUDA device
+ * (COLI_LMHEAD_GPU=<dev>). One GEMV per token, at token end — outside the
+ * per-layer latency chain — so a slower second card can host it without
+ * pacing the expert stream. qt_init places no experts on that device. */
+int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O);
+int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
+
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
@@ -68,6 +75,8 @@ void qt_stats(void);
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
