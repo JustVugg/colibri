@@ -75,6 +75,24 @@ errors before streaming headers are sent. `GET /health` exposes
 active/queued/completed/rejected counters, and successful generation responses
 include `x-colibri-queue-wait-ms`.
 
+## RAM-workspace lifecycle JSON
+
+The separate `coli ramdisk` command exposes versioned JSON suitable for local
+automation. It does not add HTTP endpoints to the serving API.
+
+| Action | Success schema |
+|---|---|
+| `plan --json` | `colibri.ramdisk.plan.v1`, plus `plan_token` |
+| `stage` / `prepare` | `colibri.ramdisk.stage.v1` |
+| `status --json` | `colibri.ramdisk.status.v1`, plus `deployment_token` when present |
+| `verify --json` | `colibri.ramdisk.verify.v1` |
+| `destroy --json` | `colibri.ramdisk.destroy.v1` |
+
+Expected failures use `colibri.ramdisk.error.v1` and return status 2. JSON
+mode writes one JSON document and never mixes human-oriented rendering into
+the output. Mutation tokens are mandatory and bind the exact reviewed plan or
+deployment snapshot; a changed snapshot requires a new read-only review.
+
 ## Anthropic-protocol endpoint (`/v1/messages`)
 
 The same server also speaks the **Anthropic Messages API**, so clients that only talk

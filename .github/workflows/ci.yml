@@ -537,3 +537,64 @@ jobs:
             'tests.test_convert_positioned_write'
           )
           python -m unittest -v @suites
+
+  ramdisk-integration:
+    # P0.1: the only Python test that mounts a REAL tmpfs (prepare/status/destroy,
+    # swap-before/after, durable-state survival) is gated on COLI_RAMDISK_INTEGRATION=1
+    # and otherwise never runs -- so those documented invariants were unverified in CI.
+    # Run the whole test as root in a private mount namespace. --kill-child and
+    # namespace teardown contain mounts even if the test or workflow is interrupted.
+    name: RAM-disk integration (real tmpfs lifecycle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real-tmpfs prepare/status/destroy
+        run: |
+          cd c
+          sudo unshare --mount --fork --kill-child --propagation private \
+            env COLI_RAMDISK_INTEGRATION=1 \
+            /usr/bin/python3 -m unittest discover \
+            -s tests -p 'test_ramdisk_integration.py' -v
+
+  ramdisk-e2e:
+    # P0.2: launch the REAL engine on a tmpfs int4 model and assert the live PROF
+    # output reports ~0 physical SSD reads (the zero-SSD-read contract the unit
+    # suite fakes via FakeEngine). This is the first CI job to generate and run a
+    # model, so it leans on the HF GLM modeling code in tools/make_glm_bench_model
+    # staying importable. This is a blocking contract: a physical-read regression
+    # must fail the pull request.
+    name: RAM-disk e2e (real engine, zero-SSD-read)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install fixture deps
+        run: |
+          pip install --no-input torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-input transformers safetensors
+      - name: Build colibri
+        run: cd c && make colibri
+      - name: Generate canonical int4 fixture and stage it onto tmpfs
+        run: |
+          cd c
+          canonical="${RUNNER_TEMP}/glm_i4"
+          staged="/dev/shm/glm_i4"
+          python3 tools/make_glm_bench_model.py --fp8 \
+            --output "${RUNNER_TEMP}/glm_fp8" --device cpu
+          python3 tools/convert_fp8_to_int4.py \
+            --indir "${RUNNER_TEMP}/glm_fp8" --outdir "${canonical}" \
+            --ebits 4 --group-size 128 --min-free-gb 1
+          mkdir -p "${staged}"
+          cp -a --reflink=never "${canonical}/." "${staged}/"
+          findmnt -T "${canonical}" -n -o FSTYPE | grep -Ex 'ext4|xfs'
+          findmnt -T "${staged}" -n -o FSTYPE | grep -Fx 'tmpfs'
+          test "$(stat -c %d "${canonical}")" != "$(stat -c %d "${staged}")"
+          find "${canonical}" -maxdepth 1 -type f -name '*.safetensors' \
+            -exec mv -- '{}' '{}.canonical-only' \;
+      - name: Zero-SSD-read end-to-end assertion
+        env:
+          COLI_RAMMAP_E2E_CANONICAL: ${{ runner.temp }}/glm_i4
+          COLI_RAMMAP_E2E_STAGED: /dev/shm/glm_i4
+        run: cd c && python3 -m unittest discover -s tests -p 'test_rammap_e2e.py' -v

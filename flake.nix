@@ -1,9 +1,8 @@
 {
   description = "colibrì — run GLM-5.2 (744B MoE) on a consumer machine with ~25 GB RAM";
 
-  # Reproducibility: these inputs track a branch, so torch/numpy/etc. float across
-  # rebuilds. For deterministic builds run `nix flake lock` once and COMMIT the
-  # generated flake.lock (it pins each input to a commit SHA). (#D2)
+  # Reproducibility: flake.lock pins each branch input to an exact commit.
+  # Update it intentionally with `nix flake update` and review the lockfile diff.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
@@ -31,6 +30,28 @@
             ]
         );
 
+        ramdiskSupportFiles = builtins.concatStringsSep " " (
+          map (name: "c/ramdisk_support/${name}") [
+            "__init__.py"
+            "accelerator.py"
+            "cli.py"
+            "common.py"
+            "contracts.py"
+            "discovery.py"
+            "lifecycle.py"
+            "linux_ops.py"
+            "model.py"
+            "mounts.py"
+            "planning.py"
+            "platform_ops.py"
+            "presentation.py"
+            "presets.py"
+            "processes.py"
+            "state.py"
+            "tokens.py"
+          ]
+        );
+
         colibri = pkgs.stdenv.mkDerivation {
           pname = "colibri";
           version = "1.0";
@@ -38,14 +59,17 @@
 
           nativeBuildInputs = with pkgs; [makeWrapper];
 
-          buildInputs = with pkgs; [
-            gcc
-            gmp
-          ];
+          buildInputs =
+            (with pkgs; [
+              gcc
+              gmp
+            ])
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.psmisc
+              pkgs.util-linux
+            ];
 
-          # python3 is needed by checkPhase: `make test-c` shells out to
-          # `python3 tools/run_tests.py` (see c/Makefile, PYTHON ?= python3).
-          nativeCheckInputs = with pkgs; [python3];
+          nativeCheckInputs = [pythonEnv];
 
           # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
           ARCH =
@@ -66,24 +90,29 @@
             # source tree `coli` runs in (see the path-resolution logic at the
             # top of c/coli): the engine, the coli CLI script, the support
             # modules it imports (openai_server.py, resource_plan.py,
-            # doctor.py), and tools/ all sit next to each other.
+            # doctor.py, ramdisk.py, ramdisk_support/), and tools/ all sit
+            # next to each other.
             mkdir -p $out/lib/colibri/tools $out/bin
             cp c/colibri         $out/lib/colibri/colibri
             cp c/coli            $out/lib/colibri/coli
             chmod +x $out/lib/colibri/coli
-            cp c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/version.py \
+            cp c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/version.py c/ramdisk.py \
               $out/lib/colibri/
+            install -d -m 755 $out/lib/colibri/ramdisk_support
+            install -m 644 ${ramdiskSupportFiles} $out/lib/colibri/ramdisk_support/
             cp -r c/tools/*      $out/lib/colibri/tools/
 
             # $out/bin holds the user-facing entry points.
             ln -s ../lib/colibri/colibri $out/bin/colibri
+            ln -s colibri $out/bin/glm
 
             # Wrap coli: point it at the bundled engine (COLI_ENGINE) so it is
             # found by default, and at the module dir (PYTHONPATH) so
-            # `import openai_server` / `resource_plan` / `doctor` resolve.
+            # `import openai_server` / `resource_plan` / `doctor` / `ramdisk` resolve.
             makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
               --add-flags "$out/lib/colibri/coli" \
               --set-default COLI_ENGINE "$out/lib/colibri/colibri" \
+              ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "--prefix PATH : ${pkgs.lib.makeBinPath [pkgs.psmisc pkgs.util-linux]}"} \
               --set PYTHONPATH "$out/lib/colibri:${pythonEnv}/${pkgs.python3.sitePackages}"
             runHook postInstall
           '';
@@ -91,7 +120,8 @@
           checkPhase = ''
             runHook preCheck
             cd c
-            make test-c
+            export PYTHONDONTWRITEBYTECODE=1
+            make test
             cd ..
             runHook postCheck
           '';

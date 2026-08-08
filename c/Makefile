@@ -1089,12 +1089,17 @@ install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepsee
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+	printf '%s\n' '$(LIBEXECDIR)' > '$(DESTDIR)$(BINDIR)/coli.libexec'
+	chmod 644 '$(DESTDIR)$(BINDIR)/coli.libexec'
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
-	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py ramdisk.py $(DESTDIR)$(LIBEXECDIR)/
+	rm -rf "$(DESTDIR)$(LIBEXECDIR)/ramdisk_support"
+	$(INSTALL) -d -m 755 "$(DESTDIR)$(LIBEXECDIR)/ramdisk_support"
+	$(INSTALL) -m 644 $(addprefix ramdisk_support/,$(RAMDISK_SUPPORT_MODULES)) "$(DESTDIR)$(LIBEXECDIR)/ramdisk_support/"
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
@@ -1106,8 +1111,14 @@ install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepsee
 	  echo "web/dist absent -- skipping the dashboard (build it with: cd web && npm run build)"; \
 	fi
 
+RAMDISK_SUPPORT_MODULES = \
+	__init__.py accelerator.py cli.py common.py contracts.py discovery.py \
+	lifecycle.py linux_ops.py model.py mounts.py planning.py platform_ops.py \
+	presentation.py presets.py processes.py state.py tokens.py
+
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/coli
+	rm -f $(DESTDIR)$(BINDIR)/coli.libexec
 	rm -rf $(DESTDIR)$(LIBEXECDIR)
 
 clean:

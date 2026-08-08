@@ -26,6 +26,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
+| `ramdisk` | Run the headless Linux NUMA-aware RAM-workspace lifecycle. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
