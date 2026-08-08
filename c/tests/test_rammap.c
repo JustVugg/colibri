@@ -13,9 +13,16 @@
 #include "../colibri.c"
 #undef main
 
-#ifdef __linux__
 static int fail(const char *what){ fprintf(stderr,"FAIL: %s\n",what); return 1; }
 
+static int test_mixed_tier_accounting(void){
+    ColiRamTier ram=tiers_ram_account(300.0,2,1,1,50);
+    if(ram.experts!=3 || ram.bytes!=250.0)
+        return fail("mixed anonymous/VRAM/RAMMAP tier accounting");
+    return 0;
+}
+
+#ifdef __linux__
 static int expert_greedy_token(ESlot *slot,const float x[4],float out[4]){
     float gate[3],up[3],hidden[3];
     matmul_qt(gate,x,&slot->g,1); matmul_qt(up,x,&slot->u,1);
@@ -103,6 +110,7 @@ static int check_direct_quant_format(int fd,long fs_magic,int fmt,int hidden,int
 #endif
 
 int main(void){
+    if(test_mixed_tier_accounting()) return 1;
 #ifndef __linux__
     puts("test_rammap: skipped (Linux only)"); return 0;
 #else
