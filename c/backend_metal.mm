@@ -154,7 +154,8 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
-// scale live at gpuAddresses waddr[e]/saddr[e] (zero-copy in the RAM slab). fmt 1=i8, 2=i4.
+// scale live at gpuAddresses waddr[e]/saddr[e] (zero-copy in the RAM slab). fmt 1=i8,
+// 2=i4, 4=grouped i4.
 // One SIMDGROUP per output row, 4 rows/threadgroup, 8-value loads: measured 1.5-2.1x over
 // one-threadgroup-per-row with uchar2 loads (358-389 GB/s on engine-like block shapes).
 kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong* saddr [[buffer(1)]],
@@ -179,6 +180,9 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
       float4 w1=float4(float(int(b.z&0xF)-8),float(int(b.z>>4)-8),float(int(b.w&0xF)-8),float(int(b.w>>4)-8));
       acc+=dot(w0,x4[2*c])+dot(w1,x4[2*c+1]); }
     for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]; }
+  } else if (fmt == 4) { int rb=(K+1)/2, ng=(K+63)/64; device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
+    device const float* scales=sc+(long)o*ng;
+    for(int i=slane*2;i<K;i+=64){ uchar b=w[i>>1]; int g=i/64; acc+=float(int(b&0xF)-8)*xr[i]*scales[g]; if(i+1<K) acc+=float(int(b>>4)-8)*xr[i+1]*scales[(i+1)/64]; }
   } else if (fmt == 6) {                            // E8/IQ3: 98B per 256 weights, scales in-block
     long rb=((long)(K+255)/256)*98;                 // host guards K%256==0 (GLM dims are)
     device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
@@ -216,7 +220,7 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row] = (fmt==6||fmt==5) ? acc : acc*sc[o];   // fmt 6: in-block scales; fmt 5: none
+  if(slane==0) yout[row] = (fmt==6||fmt==5||fmt==4) ? acc : acc*sc[o];   // grouped scales are folded per group
 }
 
 // fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
@@ -1200,7 +1204,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 6)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6)) return nil;
   if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
                      * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
     if ((D & 255) || (Iinter & 31)) return nil;

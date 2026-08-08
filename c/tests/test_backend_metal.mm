@@ -256,7 +256,7 @@ static int run_fp8_gemm_gate(const char *name) {
 // up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
 // (q4, NULL/stale for an fmt=8 tensor whose weights live in q8) tagged as fmt=8.
 // This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
-// `fmt != 1 && fmt != 2` as its very FIRST statement, before any of g/u/d/gs/us/ds is
+// unsupported formats as its very FIRST statement, before any of g/u/d/gs/us/ds is
 // dereferenced or even resolve()'d -- so an fmt=8 submission is refused before the
 // bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
 // test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
@@ -317,6 +317,37 @@ static int run_moe(const std::vector<int>& nrv, const char* name) {
   printf("  %-22s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
   for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
   return pass?0:1;
+}
+
+static int run_moe_grouped(const std::vector<int>& nrv, const char* name) {
+  const int D=6144, I=2048, gs=64, fmt=4; int rb=(D+1)/2, nb=(int)nrv.size();
+  int R=0; std::vector<int> xoff(nb),nr(nrv); for(int e=0;e<nb;e++){ xoff[e]=R; R+=nr[e]; }
+  std::vector<void*> slabs(nb), scales(nb); std::vector<const void*> g(nb),u(nb),d(nb);
+  std::vector<const float*> sg(nb),su(nb),sd(nb);
+  size_t wb=roundpg((size_t)I*rb*2+(size_t)D*rb), sb=roundpg((size_t)I*((D+gs-1)/gs)*sizeof(float)*2+(size_t)D*((I+gs-1)/gs)*sizeof(float));
+  srand(9090+nb);
+  for(int e=0;e<nb;e++){
+    posix_memalign(&slabs[e],16384,wb); posix_memalign(&scales[e],16384,sb);
+    auto* w=(uint8_t*)slabs[e]; for(size_t i=0;i<(size_t)I*rb*2+(size_t)D*rb;i++) w[i]=(uint8_t)(rand()&0xFF);
+    auto* s=(float*)scales[e]; size_t ns=sb/sizeof(float); for(size_t i=0;i<ns;i++) s[i]=0.01f+(rand()%50)/50000.f;
+    g[e]=w; u[e]=w+(size_t)I*rb; d[e]=w+(size_t)I*rb*2;
+    sg[e]=s; su[e]=s+(size_t)I*((D+gs-1)/gs); sd[e]=su[e]+(size_t)I*((D+gs-1)/gs);
+    coli_metal_register(slabs[e],wb); coli_metal_register(scales[e],sb);
+  }
+  std::vector<float> x((size_t)R*D); for(float& v:x) v=((rand()%2000)-1000)/1000.f;
+  std::vector<int> rows(R,0); std::vector<float> rw(R,1.f);
+  std::vector<float> ref((size_t)D,0), gg(I),uu(I),hh(D);
+  for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++){
+    const float* xr=&x[(size_t)(xoff[e]+r)*D];
+    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++){ uint8_t b=((const uint8_t*)g[e])[(size_t)o*rb+(k>>1)]; int v=(k&1)?(b>>4):(b&0xF); a+=(float)(v-8)*xr[k]*sg[e][(size_t)o*((D+gs-1)/gs)+(k/gs)]; } gg[o]=a; }
+    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++){ uint8_t b=((const uint8_t*)u[e])[(size_t)o*rb+(k>>1)]; int v=(k&1)?(b>>4):(b&0xF); a+=(float)(v-8)*xr[k]*su[e][(size_t)o*((D+gs-1)/gs)+(k/gs)]; } uu[o]=a; }
+    for(int o=0;o<I;o++){ float v=gg[o]; gg[o]=(v/(1.f+expf(-v)))*uu[o]; }
+    for(int o=0;o<D;o++){ float a=0; for(int k=0;k<I;k++){ uint8_t b=((const uint8_t*)d[e])[(size_t)o*((I+1)/2)+(k>>1)]; int v=(k&1)?(b>>4):(b&0xF); a+=(float)(v-8)*gg[k]*sd[e][(size_t)o*((I+gs-1)/gs)+(k/gs)]; } ref[o]+=a; }
+  }
+  std::vector<float> out((size_t)D,0); int ok=coli_metal_moe_block(nb,D,I,fmt,g.data(),u.data(),d.data(),sg.data(),su.data(),sd.data(),x.data(),xoff.data(),nr.data(),rows.data(),rw.data(),out.data(),1);
+  double err=0,scale=0; for(int i=0;i<D;i++){err=fmax(err,fabs(out[i]-ref[i]));scale=fmax(scale,fabs(ref[i]));}
+  for(int e=0;e<nb;e++){coli_metal_unregister(slabs[e]);coli_metal_unregister(scales[e]);free(slabs[e]);free(scales[e]);}
+  int pass=ok&&err/(scale+1e-9)<1e-4; printf("  %-22s grouped nerr=%.2e  %s\n",name,err/(scale+1e-9),pass?"ok":"*** MISMATCH"); return pass?0:1;
 }
 
 // ---- fmt=6 (E8/IQ3) moe_block vs the engine's own scalar decoder ----
@@ -678,6 +709,7 @@ int main(void) {
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
+  fail |= run_moe_grouped({1,1,1,1}, "grouped-int4 moe nb=4");
   printf("Metal fmt=6 (E8/IQ3) moe_block tests:\n");
   fail |= run_moe_e8({1,1,1,1,1,1,1,1}, "e8 decode nb=8");
   fail |= run_moe_e8({3,1,4,2,1,5},     "e8 ragged nb=6");

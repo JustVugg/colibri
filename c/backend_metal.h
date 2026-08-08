@@ -137,12 +137,8 @@ int coli_metal_resset_stats(double *flush_s);
  *
  *  D           = hidden size, Iinter = moe intermediate size
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
- *  gs/us/ds[e] = pointers to expert e's per-row scales
- *  fmt         = quant format (shared across experts). NOTE: fmt=4 (grouped int4) is
- *                NOT yet supported here -- gates to {1,2} and returns 0 (CPU fallback)
- *                for fmt=4 experts, same as before this stage. Grouped-int4 gained GPU
- *                support in mm_gemv (coli_metal_matmul/coli_metal_gemm/bind_gemv) only;
- *                extending the batched routed-expert path is future work (see PR_BODY.md).
+ *  gs/us/ds[e] = pointers to expert e's scales (per-row or per-group)
+ *  fmt         = quant format (shared across experts), including fmt=4 grouped int4.
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target

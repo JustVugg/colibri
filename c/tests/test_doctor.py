@@ -86,7 +86,7 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(report["mode"], "standard")
         self.assertEqual(report["status"], "ok")
         self.assertIsNotNone(report["plan"])
-        self.assertEqual(checks["accelerator.cuda"]["status"], "skip")
+        self.assertEqual(checks["accelerator.gpu"]["status"], "skip")
         self.assertEqual(checks["memory.ram"]["status"], "pass")
         self.assertEqual(checks["model.shards"]["details"]["shards"], 1)
         self.assertEqual(exit_code(report), 0)
@@ -122,7 +122,7 @@ class DoctorTest(unittest.TestCase):
 
     def test_requested_missing_gpu_is_a_failure(self):
         report = self.report(gpu_indices=[1])
-        check = self.checks_by_id(report)["accelerator.cuda"]
+        check = self.checks_by_id(report)["accelerator.gpu"]
 
         self.assertEqual(check["status"], "fail")
         self.assertEqual(check["details"], {"requested": [1], "detected": []})
@@ -132,11 +132,19 @@ class DoctorTest(unittest.TestCase):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
                "free_bytes": 10 * GB}
         report = self.report(gpu_indices=None, gpus=[gpu])
-        check = self.checks_by_id(report)["accelerator.cuda"]
+        check = self.checks_by_id(report)["accelerator.gpu"]
 
         self.assertEqual(check["status"], "warn")
         self.assertEqual(report["status"], "warning")
         self.assertEqual(exit_code(report), 0)
+
+    def test_gpu_check_uses_backend_neutral_identifier(self):
+        gpu = {"index": 0, "name": "Intel Arc B570", "total_bytes": 10 * GB,
+               "free_bytes": 9 * GB}
+        report = self.report(gpu_indices=None, gpus=[gpu])
+        checks = self.checks_by_id(report)
+        self.assertIn("accelerator.gpu", checks)
+        self.assertNotIn("accelerator.cuda", checks)
 
     def test_missing_cuda_runtime_is_a_failure(self):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
@@ -145,8 +153,8 @@ class DoctorTest(unittest.TestCase):
                              linkage={"linked": False, "missing": True})
 
         self.assertEqual(
-            self.checks_by_id(report)["accelerator.cuda"]["summary"],
-            "CUDA runtime library is missing",
+            self.checks_by_id(report)["accelerator.gpu"]["summary"],
+            "GPU runtime library is missing",
         )
         self.assertEqual(report["status"], "error")
 

@@ -105,3 +105,11 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# CNRE local experiment outputs (the source tools and methodology are tracked;
+# generated traces, profiles, and result dumps are not repository artifacts).
+cnre-results/
+c/cnre-results/
+*.trace
+*.coli_usage
+.coli_kv*

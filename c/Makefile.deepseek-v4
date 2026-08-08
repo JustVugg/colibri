@@ -62,6 +62,13 @@ V4_OBJS = $(TARGET_OBJS)
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)
 
+# Vulkan support is currently implemented by the GLM/Kimi sibling engines, not
+# by the amalgamated DeepSeek V4 runtime. Keep `make deepseek-v4 VK=1` from
+# implying that COLI_VULKAN=1 can dispatch V4 work.
+ifeq ($(VK),1)
+$(warning DeepSeek V4 does not currently include a Vulkan backend; VK is ignored)
+endif
+
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 

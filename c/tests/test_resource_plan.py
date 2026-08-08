@@ -203,6 +203,28 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertIn("clamped", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
 
+    def test_unified_memory_uses_one_shared_pool(self):
+        gpus = [{"index": 0, "name": "NVIDIA GB10", "total_bytes": 130 * GB,
+                 "free_bytes": 128 * GB, "unified_memory": True}]
+        plan = build_plan(self.model, ram_gb=100, vram_gb=65,
+                          available_memory=121 * GB, available_disk=1,
+                          gpus=gpus, physical_cpus=8, cpu_sockets=1)
+        ram = plan["tiers"]["ram"]["budget_bytes"]
+        vram = plan["tiers"]["vram"]["budget_bytes"]
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertLessEqual(ram + vram + plan["model"]["dense_bytes"], 121 * GB)
+        self.assertTrue(any("share one physical memory" in warning
+                            for warning in plan["warnings"]))
+
+    def test_nvidia_unified_device_is_marked_from_name(self):
+        output = "0, NVIDIA GB10, 130000, 120000\n"
+        with mock.patch("resource_plan.subprocess.run",
+                        return_value=subprocess.CompletedProcess(
+                            args=[], returncode=0, stdout=output, stderr="")):
+            from resource_plan import _discover_nvidia_gpus
+            devices = _discover_nvidia_gpus()
+        self.assertTrue(devices[0]["unified_memory"])
+
     def test_auto_tier_thread_count_uses_physical_cores(self):
         # End-to-end for #325: build_plan + environment_for_plan must export the
         # physical (not logical SMT) core count as OMP_NUM_THREADS. The original
@@ -508,6 +530,15 @@ class PhysicalCpuCountTest(unittest.TestCase):
              mock.patch("resource_plan.os.cpu_count", return_value=None), \
              mock.patch("sys.stderr"):
             self.assertEqual(physical_cpu_count(), 1)
+
+    def test_apple_silicon_prefers_performance_cores(self):
+        def sysctl(command, **kwargs):
+            value = "8\n" if command[-1] == "hw.perflevel0.logicalcpu" else "10\n"
+            return subprocess.CompletedProcess(args=command, returncode=0,
+                                               stdout=value, stderr="")
+        with mock.patch("resource_plan.subprocess.run", side_effect=sysctl), \
+             mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(physical_cpu_count(), 8)
 
 
 if __name__ == "__main__":

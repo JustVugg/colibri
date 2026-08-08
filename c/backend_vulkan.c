@@ -295,7 +295,18 @@ int coli_vk_init(const char *spv_path) {
     if (!nd) { fprintf(stderr, "[VK] no devices\n"); return 0; }
     VkPhysicalDevice devs[8]; if (nd > 8) nd = 8;
     vkEnumeratePhysicalDevices(G.inst, &nd, devs);
-    // Prefer a real GPU over a CPU/software device (llvmpipe) on multi-adapter hosts:
+    // Prefer a real GPU over a CPU/software device (llvmpipe) on multi-adapter hosts.
+    // COLI_VK_DEV selects the primary physical-device enumeration index; this
+    // makes multi-GPU and Intel/AMD hybrid systems diagnosable and reproducible.
+    const char *requested = getenv("COLI_VK_DEV");
+    if (requested && *requested) {
+        char *end = NULL; long index = strtol(requested, &end, 10);
+        if (*end || index < 0 || index >= (long)nd) {
+            fprintf(stderr, "[VK] invalid COLI_VK_DEV=%s (devices=%u)\n", requested, nd);
+            return 0;
+        }
+        G.phys = devs[index];
+    } else {
     // discrete > integrated > virtual > other/cpu. Falls back to devs[0] if all equal.
     G.phys = devs[0];
     int bestrank = -1;
@@ -306,6 +317,7 @@ int coli_vk_init(const char *spv_path) {
                    p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? 2 :
                    p.deviceType == VK_PHYSICAL_DEVICE_TYPE_OTHER          ? 1 : 0; // CPU last
         if (rank > bestrank) { bestrank = rank; G.phys = devs[i]; }
+    }
     }
 
     uint32_t nq = 0;

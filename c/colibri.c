@@ -9321,7 +9321,7 @@ int main(int argc, char **argv){
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
         g_metal_enabled = coli_metal_init();
         if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
-        fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
+        fprintf(stderr,"[METAL] device initialized; routed expert dispatch is format-dependent\n");
         if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
         if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
     }
