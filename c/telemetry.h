@@ -4,6 +4,11 @@
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
 
+/* PR #377: forward decl — rammap_slot() is defined in colibri.c below the point
+ * this header is #included, but emap_emit/tiers_emit consult it for the tmpfs
+ * direct tier. telemetry.h is included after Model/ESlot are defined. */
+static ESlot *rammap_slot(Model *m, int layer, int eid);
+
 static int64_t tbytes(int O,int I,int bits){
     if(bits>=16) return (int64_t)O*I*4;
     if(bits>=5)  return (int64_t)O*I + (int64_t)O*4;
@@ -150,6 +155,93 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
 #endif
 }
 
+/* Per-device CUDA placement.  Keep the documented GPUS line for older
+ * dashboards, then publish an integer-byte, versioned record for control-plane
+ * consumers that need to distinguish model tensors from card-wide VRAM use.
+ *
+ * GPUDETAIL v1 record (eight fields per device):
+ *   <cuda_ordinal> <identity-or-dash> <total_bytes> <free_bytes>
+ *   <model_bytes> <expert_bytes> <nonexpert_bytes> <expert_count>
+ *
+ * The CUDA backend currently exposes ordinals but not PCI/UUID identity, so
+ * identity is "-".  The reserved token makes adding a backend identity query
+ * wire-compatible later. */
+static void gpus_emit(Model *m){
+    int ndev=0,valid_count=0;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled) ndev=g_cuda_ndev;
+    uint64_t expert_bytes[COLI_CUDA_MAX_DEVICES]={0};
+    int expert_count[COLI_CUDA_MAX_DEVICES]={0};
+    size_t free_bytes[COLI_CUDA_MAX_DEVICES]={0};
+    size_t total_bytes[COLI_CUDA_MAX_DEVICES]={0};
+    size_t model_bytes[COLI_CUDA_MAX_DEVICES]={0};
+    unsigned char detail_valid[COLI_CUDA_MAX_DEVICES]={0};
+    if(ndev){
+        Cfg *c=&m->c;
+        for(int li=0;li<=c->n_layers;li++) for(int z=0;z<m->npin[li];z++){
+            ESlot *s=&m->pin[li][z];
+            if(!s->g.cuda && !s->u.cuda && !s->d.cuda) continue;
+            int device=s->g.cuda?s->g.cuda_device:
+                       s->u.cuda?s->u.cuda_device:s->d.cuda_device;
+            int di=-1;
+            for(int i=0;i<ndev;i++) if(g_cuda_devices[i]==device){ di=i; break; }
+            if(di<0) continue;
+            expert_count[di]++;
+            expert_bytes[di]+=(uint64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                             +(uint64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                             +(uint64_t)coli_cuda_tensor_bytes(s->d.cuda);
+        }
+        for(int i=0;i<ndev;i++){
+            size_t tensor_count=0;
+            int memory_ok=coli_cuda_mem_info(
+                g_cuda_devices[i],&free_bytes[i],&total_bytes[i]);
+            coli_cuda_stats(g_cuda_devices[i],&tensor_count,&model_bytes[i]);
+            (void)tensor_count;
+            if(memory_ok
+                    && total_bytes[i]>0
+                    && free_bytes[i]<=total_bytes[i]
+                    && model_bytes[i]<=total_bytes[i]
+                    && expert_bytes[i]<=(uint64_t)model_bytes[i]){
+                detail_valid[i]=1;
+                valid_count++;
+            }
+        }
+    }
+#else
+    (void)m;
+#endif
+    /* GPUS has implicit ordinal positions, so a partial sample cannot be
+     * represented safely. Fail that legacy advisory closed as an empty set. */
+    int legacy_count=valid_count==ndev?ndev:0;
+    printf("GPUS %d",legacy_count);
+#ifdef COLI_CUDA
+    if(legacy_count) for(int i=0;i<ndev;i++){
+        double used_gb=(double)(total_bytes[i]-free_bytes[i])/1e9;
+        printf(" %.3f %.3f %d",used_gb,
+            (double)total_bytes[i]/1e9,expert_count[i]);
+    }
+#endif
+    putchar('\n');
+    /* GPUDETAIL carries explicit ordinals, so valid devices remain useful
+     * while an omitted device makes control-plane completeness checks stale. */
+    printf("GPUDETAIL 1 %d",valid_count);
+#ifdef COLI_CUDA
+    for(int i=0;i<ndev;i++) if(detail_valid[i]){
+        uint64_t nonexpert_bytes=(uint64_t)model_bytes[i]-expert_bytes[i];
+        printf(" %d - %llu %llu %llu %llu %llu %d",
+            g_cuda_devices[i],
+            (unsigned long long)total_bytes[i],
+            (unsigned long long)free_bytes[i],
+            (unsigned long long)model_bytes[i],
+            (unsigned long long)expert_bytes[i],
+            (unsigned long long)nonexpert_bytes,
+            expert_count[i]);
+    }
+#endif
+    putchar('\n');
+    fflush(stdout);
+}
+
 static void hwinfo_emit(Model *m){
     Cfg *c=&m->c; (void)c;
     char cpu[256]; int cores; double ram_total,ram_avail;
@@ -168,6 +260,7 @@ static void hwinfo_emit(Model *m){
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
         cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
     fflush(stdout);
+    gpus_emit(m);
 }
 
 static void tiers_emit(Model *m){
@@ -180,7 +273,8 @@ static void tiers_emit(Model *m){
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
 #endif
-    int ram=pinned-vram+lru; if(ram<0) ram=0;
+    int anon_ram=pinned-vram+lru; if(anon_ram<0) anon_ram=0;
+    int ram=anon_ram+m->rammap_experts;
     int disk=total-vram-ram; if(disk<0) disk=0;
     /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
      * box where Windows still showed 140 GB free, because every resident expert was
@@ -195,6 +289,7 @@ static void tiers_emit(Model *m){
         double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;
         ram_b -= avg*(double)vram; if(ram_b<0) ram_b=0;
     }
+    ram_b += (double)m->rammap_bytes; /* RAM-mapped resident experts (engine RAMMAP) */
     printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_b/1e9);
     fflush(stdout);
 }
@@ -211,9 +306,9 @@ static void emap_emit(Model *m){
         int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
-            int tier=0;
+            int tier=rammap_slot(m,i,e)?1:0;
             ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+            for(int z=0;!tier && z<m->npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
 #else
