@@ -66,14 +66,6 @@ def optional_module_available(name):
     return importlib.util.find_spec(name) is not None
 
 
-def requires_curses_ui(function):
-    """Skip a test that needs the optional curses_ui frontend module."""
-    return unittest.skipUnless(
-        optional_module_available("ramdisk_support.curses_ui"),
-        "curses UI bundle not installed in this headless build",
-    )(function)
-
-
 def requires_benchmark(function):
     """Skip a test that needs the optional benchmark bundle module."""
     return unittest.skipUnless(
@@ -273,7 +265,6 @@ __all__ = [
     "ramdisk",
     "assert_platform_skip_inventory",
     "requires_benchmark",
-    "requires_curses_ui",
     "requires_linux_operational",
     "requires_linux_pidfd",
     "requires_linux_stdlib_pidfd",

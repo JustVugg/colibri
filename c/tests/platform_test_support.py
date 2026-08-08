@@ -23,6 +23,8 @@ _LINUX_OPERATIONAL_TESTS = frozenset(
         "test_ramdisk_mounts.MountAndCopyTest.test_prepare_promotes_only_the_exact_recorded_mount_identity",
         "test_ramdisk_mounts.MountAndCopyTest.test_prepare_rollback_refuses_exact_mount_with_nested_child",
         "test_ramdisk_mounts.MountAndCopyTest.test_runner_oserror_retains_pending_without_absence_reconciliation",
+        "test_ramdisk_presentation.HeadlessPresentationContractTest.test_cancelled_prepare_does_not_hide_rollback_failure",
+        "test_ramdisk_presentation.HeadlessPresentationContractTest.test_clean_prepare_cancellation_removes_recovery_manifest",
         "test_ramdisk_processes.ManagedLaunchTest.test_exact_popen_attempt_is_reaped_across_registration_boundaries",
         "test_ramdisk_processes.ManagedLaunchTest.test_postfork_popen_exception_retains_and_reaps_exact_child",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_busy_mount_scan_includes_the_manager_process",
@@ -46,30 +48,11 @@ _LINUX_OPERATIONAL_TESTS = frozenset(
     }
 )
 
-_SIGTERM_HANDLER_TESTS = frozenset(
-    {
-        "test_ramdisk_cli_module.CliModuleTest.test_cli_termination_guard_restores_the_previous_handler",
-        "test_ramdisk_cli_smoke.CliJsonSmokeTest.test_cli_sigterm_defers_until_stop_transaction_finishes",
-        "test_ramdisk_cli_smoke.CliJsonSmokeTest.test_cli_sigterm_requests_cooperative_prepare_rollback",
-        "test_ramdisk_cli_smoke.CliJsonSmokeTest.test_curses_repeated_sigterm_is_deferred_until_cleanup_guard_exits",
-        "test_ramdisk_cli_smoke.CliJsonSmokeTest.test_curses_sigterm_uses_cleanup_exception_and_restores_handler",
-    }
-)
+_SIGTERM_HANDLER_TESTS = frozenset()
 
-_SIGINT_HANDLER_TESTS = frozenset(
-    {
-        "test_ramdisk_cli_module.CliModuleTest.test_prepare_and_destroy_confirmations_keep_ctrl_c_interruptible",
-        "test_ramdisk_cli_module.CliModuleTest.test_prepare_restores_cooperative_ctrl_c_after_confirmation",
-        "test_ramdisk_cli_module.CliModuleTest.test_real_tty_ctrl_c_interrupts_confirmation_without_input",
-        "test_ramdisk_cli_smoke.CliJsonSmokeTest.test_cli_repeated_sigint_stays_cooperative_through_start_rollback",
-    }
-)
+_SIGINT_HANDLER_TESTS = frozenset()
 
-_POSIX_PTY_TESTS = frozenset(
-    {
-        "test_ramdisk_cli_module.CliModuleTest.test_real_tty_ctrl_c_interrupts_confirmation_without_input",
-    }
-)
+_POSIX_PTY_TESTS = frozenset()
 
 _POSIX_FIFO_TESTS = frozenset(
     {
@@ -92,7 +75,11 @@ _LINUX_PIDFD_TESTS = frozenset(
     }
 )
 
-_LINUX_STDLIB_PIDFD_TESTS = frozenset()
+_LINUX_STDLIB_PIDFD_TESTS = frozenset(
+    {
+        "test_coli_stop.ColiStopIdentityTest.test_pidfd_is_used_instead_of_numeric_pid_when_available",
+    }
+)
 
 _TARGET_PLATFORM = os.environ.get(
     "COLIBRI_TEST_TARGET_PLATFORM",
@@ -132,7 +119,7 @@ def _native_dirfd_supported():
 PLATFORM_SKIP_INVENTORY = {
     "linux_operational": {
         "supported": _TARGET_PLATFORM.startswith("linux"),
-        "reason": "requires Linux mount, procfs, process-group, or benchmark operations",
+        "reason": "requires Linux mount, procfs, or process-group operations",
         "tests": _LINUX_OPERATIONAL_TESTS,
     },
     "sigterm_handler": {

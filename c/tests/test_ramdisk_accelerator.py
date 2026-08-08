@@ -351,7 +351,7 @@ class ManagedAcceleratorTest(unittest.TestCase):
             token,
         )
 
-    def test_tui_selection_change_preserves_proven_cuda_capability(self):
+    def test_selection_change_preserves_proven_cuda_capability(self):
         with ModelFixture() as fixture:
             plan = _gpu_plan(fixture.root)
         args = argparse.Namespace(
@@ -377,7 +377,7 @@ class ManagedAcceleratorTest(unittest.TestCase):
             "available",
         )
 
-    def test_rejected_selection_does_not_partially_mutate_tui_draft(self):
+    def test_rejected_selection_does_not_partially_mutate_planning_draft(self):
         with ModelFixture() as fixture:
             plan = _gpu_plan(fixture.root)
         args = argparse.Namespace(
