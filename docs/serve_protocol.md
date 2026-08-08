@@ -88,7 +88,7 @@ turn end, not only at exit.
 | `HWINFO` | `HWINFO <cores> <ram_total> <ram_avail> <ngpu> <vram_total> <cpu>\|<gpu>` | host snapshot (GBs are floats) |
 | `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM), 6-bit log₂-bucketed usage heat |
 | `HITS` | `HITS <rows> <cols> <hex>` | 1 bit per expert, experts routed since the previous `HITS` |
-| `PROF` | `PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <forwards> [<fwd_p50_ms> <fwd_p99_ms> <physical_ssd_bytes> <rammap_experts> <rammap_bytes> <ttft_ms> <prefault_s> <physical_ssd_valid>]` | Per-turn phase metrics. On Linux, `physical_ssd_bytes` is the request-window delta of `/proc/self/io` `read_bytes` (process-wide). `physical_ssd_valid=0` distinguishes unavailable accounting from a measured zero; JSON clients expose unavailable bytes as `null`. The bracketed additive fields power persistent RAM-disk scorecards; older ten- and seventeen-field producers remain accepted, but a legacy zero is treated as unverified. |
+| `PROF` | `PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <forwards> [<fwd_p50_ms> <fwd_p99_ms> <physical_ssd_bytes> <rammap_experts> <rammap_bytes> <ttft_ms> <prefault_s> <physical_ssd_valid>]` | Per-turn phase metrics. **Enforced contract** (normative): the server accepts only frames with exactly **10, 17, or 18** fields; any other `PROF` field count is a protocol error. Every float field (`wall_s`, `edisk`, `ewait`, `emm`, `attn`, `head`, and — when the additive tail is present — `fwd_p50_ms`, `fwd_p99_ms`, `ttft_ms`, `prefault_s`) must be finite; `nan`/`inf` is a protocol error. For the 18-field form, `physical_ssd_valid` is `true` **iff the field is the literal token `1`** (`==1`); any other token, including `0` and `2`, is `false`. On Linux, `physical_ssd_bytes` is the request-window delta of `/proc/self/io` `read_bytes` (process-wide); when `physical_ssd_valid` is `false` the bytes are exposed as `null`. The bracketed additive fields power persistent RAM-disk scorecards; older ten- and seventeen-field producers remain accepted, but a legacy zero (the 17-field form, which carries no validity token) is treated as unverified. |
 | `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |
 | `ENTROPY` | `ENTROPY <h0> <h1> …` | per-sparse-layer routing entropy of the turn, bits |
 | `GPUS` | `GPUS <n> (<used_gb> <total_gb> <experts>)×n` | per-device VRAM + resident expert count (CUDA builds) |
@@ -109,7 +109,11 @@ Consumers must reject duplicate ordinals, negative counts, `free_bytes` or
 
 All telemetry is advisory: servers render what they know and skip the rest.
 An unknown telemetry kind or unsupported `GPUDETAIL` version is ignored. A
-malformed record of a known, supported kind is a protocol error.
+malformed record of a known, supported kind is a protocol error; for `PROF`
+that means a field count other than 10/17/18 or any non-finite float field,
+per the enforced contract above. Note that a non-`1` `physical_ssd_valid`
+token is **not** a protocol error — the frame is well-formed, only the SSD
+bytes are reported as unverified (`physical_ssd_valid=false`, bytes `null`).
 
 ## HTTP surface (`openai_server.py`)
 
