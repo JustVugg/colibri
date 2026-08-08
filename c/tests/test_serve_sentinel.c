@@ -47,13 +47,12 @@ int main(void)
     FILE *f = fopen(path, "w");          /* deliberately TEXT mode: the bug's condition */
     if (!f) { perror("fopen"); remove(path); return 2; }
 
-    /* Same call the serve loops make before emitting the handshake. On Windows it
-     * flips the stream to binary; elsewhere it is a no-op. We point it at stdout,
-     * so exercise the same primitive here on our own stream. */
-    coli_serve_binary_mode();
-#ifdef _WIN32
-    _setmode(_fileno(f), _O_BINARY);
-#endif
+    /* Exercise the real serve binary-mode primitive on the SAME stream we
+     * assert against, so a Windows no-op regression actually fails this test
+     * (#748). coli_serve_binary_mode() applies this to stdin/stdout in
+     * production;coli_serve_binary_mode_stream() exposes that exact logic to a
+     * chosen stream. */
+    coli_serve_binary_mode_stream(f);
 
     fputs(SENTINEL, f);
     fprintf(f, "STAT 0 0.0 0.0 %.2f 0 0\n", 1.0);
