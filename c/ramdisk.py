@@ -11,7 +11,6 @@ import argparse
 import contextlib
 import copy
 import functools
-import hashlib
 import importlib
 import json
 import math
@@ -202,6 +201,11 @@ from ramdisk_support.state import (
     _usage_read as _state_usage_read,
     _usage_write as _state_usage_write,
     _validate_usage_for_plan,
+)
+from ramdisk_support.tokens import (
+    deployment_token as _deployment_token,
+    plan_token as _plan_token,
+    validate_token as _validate_token,
 )
 
 
@@ -693,6 +697,32 @@ def prepare(
     )
 
 
+def stage(
+    args,
+    progress=None,
+    display_plan=True,
+    expected_plan_token=None,
+    cancel_event=None,
+):
+    """Preflight and stage exactly the plan identified by a public token."""
+    token = _validate_token(expected_plan_token, "plan token")
+    reviewed_plan = build_plan(args)
+    if _plan_confirmation_token(reviewed_plan) != token:
+        raise RamdiskError(
+            "RAM-disk plan changed since review; inspect the updated plan "
+            "and confirm again"
+        )
+    # ``prepare`` acquires the lifecycle lock and rebuilds the plan.  Passing
+    # the same expected token keeps the donor's under-lock TOCTOU check.
+    return prepare(
+        args,
+        progress=progress,
+        display_plan=display_plan,
+        expected_plan_token=token,
+        cancel_event=cancel_event,
+    )
+
+
 def _process_group_members(pgid):
     return _processes_module()._process_group_members(
         pgid,
@@ -969,7 +999,7 @@ def _managed_path(path, mount_root):
 
 
 @_exclusive_lifecycle(require_process_control=True)
-def destroy(args, expected_manifest_token=None):
+def _destroy_locked(args, expected_manifest_token=None):
     return _lifecycle_destroy(
         args,
         expected_manifest_token=expected_manifest_token,
@@ -991,6 +1021,23 @@ def destroy(args, expected_manifest_token=None):
     )
 
 
+def destroy(args, expected_manifest_token=None):
+    """Destroy a reviewed deployment, with a pre-lock stale-token check."""
+    if expected_manifest_token is not None:
+        token = _validate_token(expected_manifest_token, "deployment token")
+        manifest = _load_manifest(required=True)
+        if _manifest_confirmation_token(manifest) != token:
+            raise RamdiskError(
+                "RAM workspace changed since review; inspect the active "
+                "deployment and confirm Destroy again"
+            )
+    else:
+        # Retained for Python compatibility; every public CLI path supplies a
+        # validated deployment token before reaching this compatibility seam.
+        token = None
+    return _destroy_locked(args, expected_manifest_token=token)
+
+
 def status(deep=True):
     """Return lifecycle status, optionally skipping deep revalidation."""
     return _lifecycle_status(
@@ -1003,7 +1050,50 @@ def status(deep=True):
         validate_namespace=_validate_namespace,
         process_matches=_process_matches,
         managed_child_liveness=_managed_child_liveness,
+        deployment_token=_manifest_confirmation_token,
     )
+
+
+def verify():
+    """Return the versioned deep-verification projection for one snapshot."""
+    report = status(deep=True)
+    mounts = report.get("mounts") or []
+    processes = report.get("processes") or []
+    state = report.get("state")
+    mounts_verified = bool(mounts) and all(
+        mount.get("verified") is True
+        and mount.get("namespace_verified") is True
+        for mount in mounts
+    )
+    if state == "running":
+        processes_verified = bool(processes) and all(
+            process.get("running") is True
+            and process.get("verified") is True
+            for process in processes
+        )
+    elif state == "stopped":
+        processes_verified = all(
+            not process.get("running") and process.get("reason") == "stopped"
+            for process in processes
+        )
+    else:
+        processes_verified = state == "ready" and not processes
+    verified = bool(
+        report.get("present")
+        and report.get("deep_validation") is True
+        and report.get("source_fingerprint_verified") is True
+        and state in ("ready", "running", "stopped")
+        and mounts_verified
+        and processes_verified
+        and not report.get("recovery")
+    )
+    return {
+        "schema": "colibri.ramdisk.verify.v1",
+        "version": 1,
+        "verified": verified,
+        "deployment_token": report.get("deployment_token"),
+        "report": report,
+    }
 
 
 def _node_core_count(plan, node=None):
@@ -1079,81 +1169,14 @@ def _placement_summary(plan, base_port=8000):
 
 
 def _plan_confirmation_token(plan):
-    reviewed = {
-        "schema": plan.get("schema"),
-        "version": plan.get("version"),
-        "model_fingerprint": plan.get("model", {}).get("fingerprint"),
-        "mode": plan.get("mode"),
-        "topology": plan.get("topology"),
-        "placement": plan.get("placement"),
-        "mount_root": plan.get("mount_root"),
-        "capacity_bytes": plan.get("capacity_bytes"),
-        "selected_shards": plan.get("staging", {}).get("selected_shards"),
-        "linked_shards": plan.get("staging", {}).get("linked_shards"),
-        "total_staged_bytes": plan.get("staging", {}).get(
-            "total_staged_bytes"
-        ),
-        "total_required_bytes": plan.get("reserve", {}).get(
-            "total_required_bytes"
-        ),
-        "mounts": plan.get("mounts"),
-        "mount_options": plan.get("mount_options"),
-        "prefault": plan.get("prefault"),
-        "parallel": plan.get("parallel"),
-        "managed_runtime": plan.get("managed_runtime"),
-        "managed_accelerator": plan.get("managed_accelerator"),
-        "preset": plan.get("preset"),
-    }
-    payload = json.dumps(
-        reviewed,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return _plan_token(plan)
 
 
 def _manifest_confirmation_token(manifest):
-    mounts = []
-    for record in manifest.get("mounts", []):
-        identity = record.get("identity", {})
-        mounts.append(
-            {
-                "path": record.get("path"),
-                "node": record.get("node"),
-                "mount_id": identity.get("mount_id"),
-                "device": identity.get("device"),
-            }
-        )
-    processes = []
-    for record in manifest.get("processes", []):
-        processes.append(
-            {
-                "pid": record.get("pid"),
-                "pgid": record.get("pgid"),
-                "uid": record.get("uid"),
-                "starttime": record.get("starttime"),
-                "nonce": record.get("nonce"),
-                "port": record.get("port"),
-                "node": record.get("node"),
-            }
-        )
-    reviewed = {
-        "version": manifest.get("version"),
-        "deployment_id": manifest.get("deployment_id"),
-        "created_at": manifest.get("created_at"),
-        "state": manifest.get("state"),
-        "base_port": _persisted_base_port(manifest),
-        "model_fingerprint": manifest.get("model_fingerprint"),
-        "plan_token": _plan_confirmation_token(manifest.get("plan", {})),
-        "mounts": mounts,
-        "processes": processes,
-    }
-    payload = json.dumps(
-        reviewed,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return _deployment_token(
+        manifest,
+        persisted_base_port=_persisted_base_port,
+    )
 
 
 def dispatch(args, cli_path=None, engine_path=None, system=None):
@@ -1163,9 +1186,13 @@ def dispatch(args, cli_path=None, engine_path=None, system=None):
         engine_path=engine_path,
         system=system,
         build_plan=build_plan,
-        prepare=prepare,
+        stage=stage,
         status=status,
+        verify=verify,
         destroy=destroy,
+        plan_token=_plan_confirmation_token,
+        deployment_token=_manifest_confirmation_token,
+        validate_token=_validate_token,
         human_plan=_human_plan,
         human_status=_human_status,
         json_print=_json_print,
