@@ -36,9 +36,11 @@ RUN apt-get update && \
 WORKDIR /app
 
 # The engine binary plus the launcher and the files it resolves at runtime
-# (version.py, the gateway, resource planner, doctor, tokenizer headers, tools).
+# (version.py, the gateway, resource planner, doctor, RAM-disk control plane,
+# tokenizer headers, and tools).
 COPY --from=build /src/c/colibri            ./colibri
-COPY c/coli c/version.py c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py ./
+COPY c/coli c/version.py c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py c/ramdisk.py ./
+COPY c/ramdisk_support/ ./ramdisk_support/
 COPY c/tools/ ./tools/
 
 ENV COLI_MODEL=/model \

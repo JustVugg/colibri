@@ -1,6 +1,7 @@
 # CI: run the repo's own dependency-free gate (`make check` = clean + portable
 # CPU build + C unit suites + Python stdlib tests) on the three claimed
-# platforms. No model downloads, no CUDA, no external deps — by design (#140).
+# platforms, then validate the locked Nix package on Linux and macOS. No model
+# downloads or full-model inference — by design (#140).
 name: check
 
 on:
@@ -20,6 +21,37 @@ env:
   PYTHONUTF8: '1'
 
 jobs:
+  committed-range:
+    name: Committed range whitespace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject whitespace errors in the exact committed range
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            range="${PR_BASE_SHA}...${PR_HEAD_SHA}"
+            echo "checking pull-request range ${range}"
+            git diff --check "$range"
+          elif [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+            empty_tree="$(git hash-object -t tree /dev/null)"
+            echo "checking new-history range ${empty_tree}..${PUSH_HEAD_SHA}"
+            git diff --check "$empty_tree" "$PUSH_HEAD_SHA"
+          else
+            range="${PUSH_BEFORE_SHA}..${PUSH_HEAD_SHA}"
+            echo "checking push range ${range}"
+            git diff --check "$range"
+          fi
+
   linux:
     name: Linux
     runs-on: ubuntu-latest
@@ -28,6 +60,67 @@ jobs:
       - uses: actions/checkout@v4
       - name: make check
         run: make -C c check
+
+  wheel-backend:
+    name: Wheel backend (Linux, ${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: setuptools 77.0.1 minimum
+            requirement: setuptools==77.0.1
+            expected: 77.0.1
+          - label: current setuptools
+            requirement: setuptools
+            expected: current
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # This is the lane's only dependency resolution step. The packaging test
+      # itself builds and installs without package-index access, using
+      # --no-index and --no-build-isolation.
+      - name: Install selected wheel backend
+        run: python -m pip install --upgrade "${{ matrix.requirement }}"
+      - name: Verify selected backend
+        env:
+          EXPECTED_SETUPTOOLS: ${{ matrix.expected }}
+        run: |
+          python - <<'PY'
+          import os
+          import setuptools
+
+          actual = setuptools.__version__
+          expected = os.environ["EXPECTED_SETUPTOOLS"]
+          print("setuptools", actual)
+          if expected != "current" and actual != expected:
+              raise SystemExit(
+                  "expected setuptools %s, got %s" % (expected, actual)
+              )
+          PY
+      - name: Build and smoke-test wheel without index access
+        run: >-
+          python -m unittest -v
+          c.tests.test_ramdisk_packaging.RamdiskPackagingTest.test_wheel_contains_runnable_ramdisk_control_plane
+
+  wheel-isolated:
+    name: Wheel backend (Linux, default isolated PEP 517)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Report packaging frontend
+        run: python -m pip --version
+      - name: Build, install, and smoke-test with default PEP 517 isolation
+        env:
+          COLIBRI_TEST_ISOLATED_PEP517: '1'
+        run: >-
+          python -m unittest -v
+          c.tests.test_ramdisk_packaging.RamdiskPackagingTest.test_default_isolated_pep517_wheel_installs_and_runs
 
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64
@@ -87,3 +180,26 @@ jobs:
         run: brew install libomp
       - name: make check (V4 execution gated off)
         run: make -C c check
+
+  nix:
+    name: Nix flake (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        # cachix/install-nix-action v31.10.7, pinned to its verified release commit.
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate locked, model-free flake
+        run: |
+          nix flake check --no-update-lock-file --print-build-logs
+          nix build --no-link --print-build-logs .#colibri

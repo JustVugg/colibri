@@ -80,11 +80,18 @@ Inside you'll find:
 | `colibri.exe` | **the engine** — the C program that actually runs the model |
 | `coli` | the command-line launcher (`chat`, `serve`, `convert`, `doctor`, …) |
 | `openai_server.py`, `resource_plan.py`, `doctor.py`, `autotune.py` | Python support for the API server, placement planner, diagnostics, and measured tuning |
+| `ramdisk.py`, `ramdisk_support/` | Dependency-free headless RAM-workspace planning, staging, verification, status, and recovery |
 
 One setup step: **install Python 3** from
 [python.org](https://www.python.org/downloads/) — the `coli` launcher and the
 API gateway are Python scripts (the engine itself is pure C and needs nothing).
 No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
+
+On Linux, inspect optional NUMA-aware RAM staging with
+`./coli ramdisk plan --model /path/to/model --json`. Save the returned
+`plan_token` and pass it to `stage --plan-token TOKEN --yes --json`; later use
+the `deployment_token` from `status --json` for a reviewed `destroy`. A bare
+`coli ramdisk` prints the complete headless action list.
 
 For better understanding, from powershell prompt, a complete invocation line 
 (relying on py launcher, to be launched from the folder where colibri.exe is) is:

@@ -405,11 +405,36 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mi
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
 ./coli web  --model /nvme/glm52_i4        # API + dashboard, and opens a browser
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
+./coli ramdisk plan --model /nvme/glm52_i4 --json  # review Linux RAM staging
 ```
 
 On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
+
+#### Headless RAM-workspace lifecycle (Linux)
+
+`coli ramdisk` can stage a reviewed full or profile-selected model namespace
+onto NUMA-aware tmpfs without a terminal frontend. Mutations are bound to the
+exact JSON snapshot an operator reviewed:
+
+```bash
+# Save the plan_token from this response.
+./coli ramdisk plan --model /nvme/glm52_i4 --json
+
+./coli ramdisk stage --model /nvme/glm52_i4 \
+  --plan-token <64-lowercase-hex> --yes --json
+
+./coli ramdisk status --json
+./coli ramdisk verify --json
+
+# Save the deployment_token from status, then destroy that exact deployment.
+./coli ramdisk destroy --deployment-token <64-lowercase-hex> --yes --json
+```
+
+`prepare` is an exact alias of `stage`. A bare `coli ramdisk` prints the
+headless action help and exits with status 2. Managed engine `start`, `stop`,
+and benchmark actions are not part of this lifecycle layer.
 
 #### The same commands run any of the models
 
@@ -459,6 +484,7 @@ Two things that differ per model, both documented in the per-model page:
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| Headless RAM-workspace CLI and tokens | [docs/SETTINGS.md#ramdisk-linux-only](docs/SETTINGS.md#ramdisk-linux-only) |
 
 ## DeepSeek V4
 
