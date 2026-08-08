@@ -1882,38 +1882,67 @@ class Engine:
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
-                elif kind == "PROF" and len(fields) >= 10:
+                elif kind == "PROF" and len(fields) in {10, 17, 18}:
                     # PROF has no request id. The mux engine emits it immediately
                     # before DONE and Inkling emits it immediately after DONE.
+                    # Only the legacy ten-field frame and its seventeen- and
+                    # eighteen-field extensions are well-formed; any other field
+                    # count is a protocol error (caught by the known-kind guard
+                    # below). Every float field must be finite — nan/inf would
+                    # poison the /profile scorecards. See docs/serve_protocol.md
+                    # for the normative contract.
+                    wall_s = float(fields[1])
+                    expert_disk_s = float(fields[4])
+                    expert_wait_s = float(fields[5])
+                    expert_matmul_s = float(fields[6])
+                    attention_s = float(fields[7])
+                    lm_head_s = float(fields[8])
+                    if not all(math.isfinite(value) for value in (
+                            wall_s, expert_disk_s, expert_wait_s,
+                            expert_matmul_s, attention_s, lm_head_s)):
+                        raise RuntimeError(f"invalid engine PROF: {' '.join(fields)}")
                     profile = {
-                        "wall_s": float(fields[1]),
+                        "wall_s": wall_s,
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
-                        "expert_disk_s": float(fields[4]),
-                        "expert_wait_s": float(fields[5]),
-                        "expert_matmul_s": float(fields[6]),
-                        "attention_s": float(fields[7]),
-                        "lm_head_s": float(fields[8]),
+                        "expert_disk_s": expert_disk_s,
+                        "expert_wait_s": expert_wait_s,
+                        "expert_matmul_s": expert_matmul_s,
+                        "attention_s": attention_s,
+                        "lm_head_s": lm_head_s,
                         "forwards": int(fields[9]),
                     }
                     if len(fields) >= 17:
+                        forward_p50_ms = float(fields[10])
+                        forward_p99_ms = float(fields[11])
                         physical_bytes = int(fields[12])
+                        ttft_ms = float(fields[15])
+                        prefault_seconds = float(fields[16])
+                        if not all(math.isfinite(value) for value in (
+                                forward_p50_ms, forward_p99_ms,
+                                ttft_ms, prefault_seconds)):
+                            raise RuntimeError(f"invalid engine PROF: {' '.join(fields)}")
                         if len(fields) >= 18:
-                            physical_valid = bool(int(fields[17]))
+                            # Only the literal token "1" attests to a real SSD
+                            # measurement; "0" and any other value mean the
+                            # accounting is unverified, so clients expose the
+                            # bytes as null. This is a validity rule, not a
+                            # protocol error — the frame is still well-formed.
+                            physical_valid = fields[17] == "1"
                         else:
                             # Legacy producers used zero both for a measured
                             # zero and for unsupported accounting. A positive
                             # legacy count is known-valid; zero is unknown.
                             physical_valid = True if physical_bytes > 0 else None
                         profile.update({
-                            "forward_p50_ms": None if float(fields[10]) < 0 else float(fields[10]),
-                            "forward_p99_ms": None if float(fields[11]) < 0 else float(fields[11]),
+                            "forward_p50_ms": None if forward_p50_ms < 0 else forward_p50_ms,
+                            "forward_p99_ms": None if forward_p99_ms < 0 else forward_p99_ms,
                             "physical_ssd_bytes": physical_bytes if physical_valid else None,
                             "physical_ssd_valid": physical_valid,
                             "rammap_experts": int(fields[13]),
                             "rammap_bytes": int(fields[14]),
-                            "ttft_ms": float(fields[15]),
-                            "prefault_seconds": float(fields[16]),
+                            "ttft_ms": ttft_ms,
+                            "prefault_seconds": prefault_seconds,
                         })
                     stats = self._pending_done_profile
                     self._pending_done_profile = None
