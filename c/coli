@@ -10,6 +10,8 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
   coli plan                 Disk / RAM / VRAM resource plan
   coli mirror               Plan, stage, or verify a learned partial mirror
   coli doctor               installation and execution-plan diagnostics
+  coli ramdisk              NUMA-aware headless RAM-disk lifecycle
+  coli ramdisk plan --json  scriptable RAM-disk capacity and staging plan
   coli bench [task...]      quality benchmarks (MMLU/HellaSwag/...)
   coli convert              convert GLM-5.2-FP8 to int4, one shard at a time
   coli build                build the engine
@@ -54,22 +56,134 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-# version.py sits next to this script in a source checkout, but an installed
-# layout puts the launcher in $(PREFIX)/bin while the support modules live in
-# $(PREFIX)/libexec/colibri — and a packager may strip it entirely (#575,
-# FreeBSD port). The launcher must never crash over a version string.
+_CONVENTIONAL_LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_LIBEXEC = _CONVENTIONAL_LIBEXEC
+_LAYOUT_FILE = os.path.join(HERE, "coli.libexec")
+_layout_present = os.path.isfile(_LAYOUT_FILE)
+try:
+    with open(_LAYOUT_FILE, "r", encoding="utf-8") as _layout:
+        _configured_libexec = _layout.readline(4097).strip()
+except FileNotFoundError:
+    _configured_libexec = None
+except OSError as _layout_error:
+    raise SystemExit("coli: cannot read install layout %s: %s" % (_LAYOUT_FILE, _layout_error))
+if _layout_present:
+    if not _configured_libexec or not os.path.isabs(_configured_libexec):
+        raise SystemExit("coli: invalid install layout in %s" % _LAYOUT_FILE)
+    _LIBEXEC = os.path.normpath(_configured_libexec)
+
+_SUPPORT_MODULES = (
+    "resource_plan.py",
+    "doctor.py",
+    "autotune.py",
+    "openai_server.py",
+    "ramdisk.py",
+)
+_SUPPORT_PACKAGE = "ramdisk_support"
+_SUPPORT_PACKAGE_MODULES = (
+    "__init__.py",
+    "accelerator.py",
+    "cli.py",
+    "common.py",
+    "contracts.py",
+    "discovery.py",
+    "linux_ops.py",
+    "lifecycle.py",
+    "model.py",
+    "mounts.py",
+    "planning.py",
+    "platform_ops.py",
+    "presentation.py",
+    "presets.py",
+    "processes.py",
+    "state.py",
+)
+_engine_module_dir = (
+    os.path.dirname(os.path.abspath(os.environ["COLI_ENGINE"]))
+    if os.environ.get("COLI_ENGINE")
+    else None
+)
+
+def _support_presence(directory):
+    if not directory or not os.path.isdir(directory):
+        return ()
+    present = [
+        name for name in _SUPPORT_MODULES if os.path.isfile(os.path.join(directory, name))
+    ]
+    package_path = os.path.join(directory, _SUPPORT_PACKAGE)
+    if os.path.lexists(package_path):
+        present.append(_SUPPORT_PACKAGE + "/")
+    return tuple(present)
+
+def _complete_support(directory, label):
+    present = _support_presence(directory)
+    if not present:
+        return False
+    missing_required = []
+    unsafe = []
+    for name in _SUPPORT_MODULES:
+        path = os.path.join(directory, name)
+        if os.path.islink(path):
+            unsafe.append(name)
+        elif not os.path.isfile(path):
+            missing_required.append(name)
+    package_path = os.path.join(directory, _SUPPORT_PACKAGE)
+    if os.path.islink(package_path):
+        unsafe.append(_SUPPORT_PACKAGE + "/")
+    if not os.path.isdir(package_path):
+        missing_required.append(_SUPPORT_PACKAGE + "/")
+    else:
+        for name in _SUPPORT_PACKAGE_MODULES:
+            member_path = os.path.join(package_path, name)
+            if os.path.islink(member_path):
+                unsafe.append(_SUPPORT_PACKAGE + "/" + name)
+            elif not os.path.isfile(member_path):
+                missing_required.append(_SUPPORT_PACKAGE + "/" + name)
+    if unsafe:
+        raise SystemExit(
+            "coli: unsafe %s support bundle at %s; symlinked %s"
+            % (label, directory, ", ".join(unsafe))
+        )
+    if missing_required:
+        raise SystemExit(
+            "coli: incomplete %s support bundle at %s; missing %s"
+            % (label, directory, ", ".join(missing_required))
+        )
+    return True
+
+if _layout_present:
+    if not _complete_support(_LIBEXEC, "configured"):
+        raise SystemExit("coli: configured support bundle is missing: %s" % _LIBEXEC)
+    _SUPPORT_DIR = _LIBEXEC
+elif _complete_support(HERE, "colocated"):
+    _SUPPORT_DIR = HERE
+elif _complete_support(_CONVENTIONAL_LIBEXEC, "installed"):
+    _SUPPORT_DIR = _CONVENTIONAL_LIBEXEC
+elif _complete_support(_engine_module_dir, "engine-directory"):
+    _SUPPORT_DIR = _engine_module_dir
+else:
+    raise SystemExit(
+        "coli: no complete Python support bundle found beside the launcher or in %s"
+        % _CONVENTIONAL_LIBEXEC
+    )
+
+# Select one complete support directory tree. Remove every competing candidate
+# path, including the launcher's automatic sys.path[0], then expose exactly one.
+for _candidate in (HERE, _LIBEXEC, _CONVENTIONAL_LIBEXEC, _engine_module_dir):
+    while _candidate and _candidate in sys.path:
+        sys.path.remove(_candidate)
+sys.path.insert(0, _SUPPORT_DIR)
+# A packager may strip version.py entirely (#575, FreeBSD port). The launcher
+# must never crash over a version string once the required support bundle is
+# otherwise complete.
 try:
     from version import __version__ as _version
 except ModuleNotFoundError:
-    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "libexec", "colibri"))
-    try:
-        from version import __version__ as _version
-    except ModuleNotFoundError:
-        _version = "unknown"
+    _version = "unknown"
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
-# support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
+# support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py,
+# ramdisk.py and ramdisk_support/) and
 # tools/ all live next to this script — unchanged from before.
 #
 # Installed layout ("make install"): this script is $(PREFIX)/bin/coli,
@@ -78,7 +192,6 @@ except ModuleNotFoundError:
 # by users. COLI_ENGINE overrides the engine path explicitly if neither
 # guess is right (e.g. a custom packaging layout).
 _EXE = ".exe" if sys.platform == "win32" else ""
-_LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
 _here_colibri = os.path.join(HERE, "colibri" + _EXE)
 _here_glm = os.path.join(HERE, "glm" + _EXE)
 
@@ -94,7 +207,8 @@ elif os.path.exists(_here_glm):
 else:
     GLM = os.path.join(_LIBEXEC, "colibri" + _EXE)
     TOOLS = os.path.join(_LIBEXEC, "tools")
-    sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
+    if _LIBEXEC not in sys.path:
+        sys.path.insert(1, _LIBEXEC)  # support custom layouts even before their directory exists
 
 # No invented default: a path from whoever's machine this was written on is worse than
 # no path at all, because every downstream error then names a directory the user never
@@ -1098,7 +1212,7 @@ def chat_attached(a, base, model_id):
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
-    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load): a chat
+    """SERVE mode silently resumes .coli_kv from durable state (glm.c kv_disk_load): a chat
     started today continues a conversation from days ago, with `first=0` so the
     turn is appended WITHOUT the [gMASK]<sop> prefix. The engine does announce it
     on stderr — but nothing here ever shows that: the drain thread's
@@ -1114,7 +1228,8 @@ def kv_resume_notice(model_dir):
 
     So say it here, in Python, from the file itself: no pipe, no thread, no
     Windows deadlock risk (see the stderr comment below)."""
-    p=os.path.join(model_dir, ".coli_kv")
+    state_dir=os.environ.get("COLI_STATE_DIR") or model_dir
+    p=os.path.join(state_dir, ".coli_kv")
     try:
         with open(p,"rb") as f:
             if f.read(8)!=b"COLIKV1\0": return
@@ -1330,6 +1445,97 @@ def _serve_engine_env(a, arch):
     env["COLI_SERVE_PORT"]=str(a.port)
     return env
 
+def _stop_process_facts(pid, port=None):
+    """Return a signal-safe identity only for a demonstrable Colibri server."""
+    try:
+        proc=f"/proc/{int(pid)}"
+        if os.stat(proc).st_uid != os.geteuid(): return None
+        with open(f"{proc}/stat") as stream: raw=stream.read()
+        close=raw.rfind(")")
+        fields=raw[close+2:].split()
+        if close<0 or len(fields)<20: return None
+        starttime=int(fields[19])
+        with open(f"{proc}/cmdline","rb") as stream: cmdline=stream.read()
+        argv=[item.decode("utf-8","replace") for item in cmdline.split(b"\0") if item]
+        with open(f"{proc}/comm") as stream: comm=stream.read().strip()
+        with open(f"{proc}/environ","rb") as stream: environ=stream.read()
+    except (OSError,ValueError,IndexError,PermissionError):
+        return None
+    try: serve_index=argv.index("serve")
+    except ValueError: serve_index=-1
+    if port is None:
+        wrapper=serve_index>0 and any(
+            os.path.basename(value)=="coli" for value in argv[:serve_index]
+        )
+        engine=(
+            comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4")
+            and b"SERVE=1" in set(environ.split(b"\0"))
+        )
+    else:
+        wrapper=_serve_cmdline_matches_port(cmdline,port)
+        engine=(
+            comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4")
+            and _serve_environ_matches_port(environ,port)
+        )
+    if not wrapper and not engine: return None
+    return {
+        "pid":int(pid),
+        "starttime":starttime,
+        "kind":"wrapper" if wrapper else "engine",
+        "port":port,
+    }
+
+def _open_stop_target(pid, description, port=None):
+    """Pin a verified target with pidfd where available, closing PID-reuse races."""
+    facts=_stop_process_facts(pid,port)
+    if not facts: return None
+    pidfd=None
+    if hasattr(os,"pidfd_open") and hasattr(signal,"pidfd_send_signal"):
+        try:
+            pidfd=os.pidfd_open(int(pid),0)
+            after=_stop_process_facts(pid,port)
+            if not after or (
+                after["starttime"],after["kind"]
+            ) != (
+                facts["starttime"],facts["kind"]
+            ):
+                os.close(pidfd); return None
+            facts=after
+        except OSError:
+            if pidfd is not None:
+                try: os.close(pidfd)
+                except OSError: pass
+            pidfd=None
+    facts["description"]=description
+    facts["pidfd"]=pidfd
+    return facts
+
+def _stop_target_matches(target):
+    current=_stop_process_facts(target["pid"],target.get("port"))
+    return bool(
+        current
+        and current["starttime"]==target["starttime"]
+        and current["kind"]==target["kind"]
+    )
+
+def _signal_stop_target(target, signum):
+    """Revalidate immediately, then signal the pinned identity when possible."""
+    if not _stop_target_matches(target):
+        raise ProcessLookupError("managed process identity changed")
+    if target.get("pidfd") is not None:
+        signal.pidfd_send_signal(target["pidfd"],signum,None,0)
+    else:
+        # The fallback retains a tiny read→kill race on older Python/kernels,
+        # but still removes the former two-second blind PID-reuse window.
+        os.kill(target["pid"],signum)
+
+def _close_stop_targets(targets):
+    for target in targets:
+        pidfd=target.get("pidfd")
+        if pidfd is not None:
+            try: os.close(pidfd)
+            except OSError: pass
+
 def cmd_serve(a):
     arch=model_arch(a.model)
     engine=engine_for(a.model)
@@ -1357,49 +1563,66 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
-def cmd_stop(a):
+def cmd_stop(a, platform_name=None):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
     not `glm`: every `pkill -x glm` in history silently killed nothing (that is
     how two 17+5 GB ghost engines OOM'd this box on 2026-07-16). This finds the
-    real processes: the pidfile first, then /proc by cmdline/environ — only
-    the requested port's tagged engine and matching `coli serve` wrapper."""
+    real processes: the pidfile first, then /proc by cmdline/environ. It targets
+    only the requested port's tagged engine and matching `coli serve` wrapper."""
+    selected_platform = sys.platform if platform_name is None else platform_name
+    if not str(selected_platform).startswith("linux"):
+        raise SystemExit(
+            "coli stop is supported only on Linux; use your platform process "
+            "manager to stop coli serve"
+        )
     banner("stop")
-    targets={}  # pid -> descrizione
+    targets={}  # pid -> immutable start-time/signature identity (+ optional pidfd)
     pf=serve_pidfile(a.port)
     try:
-        with open(pf) as f: pid=int(f.read().split()[0])
-        os.kill(pid,0); targets[pid]=f"coli serve (pidfile, port {a.port})"
+        with open(pf) as stream: pid=int(stream.read().split()[0])
+        target=_open_stop_target(pid,f"coli serve (pidfile, port {a.port})",a.port)
+        if target: targets[pid]=target
     except (OSError,ValueError,IndexError): pass
     try: proc_entries=os.listdir("/proc")
     except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
     for pd in proc_entries:
         if not pd.isdigit(): continue
         pid=int(pd)
-        try:
-            with open(f"/proc/{pd}/cmdline","rb") as f: cmd=f.read()
-            if pid!=os.getpid() and _serve_cmdline_matches_port(cmd,a.port):
-                targets.setdefault(pid,f"coli serve (cmdline, port {a.port})")
-            with open(f"/proc/{pd}/comm") as f: comm=f.read().strip()
-            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4"):
-                with open(f"/proc/{pd}/environ","rb") as f: env=f.read()
-                if _serve_environ_matches_port(env,a.port):
-                    targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
-        except (OSError,PermissionError): continue
+        if pid==os.getpid() or pid in targets: continue
+        facts=_stop_process_facts(pid,a.port)
+        if not facts: continue
+        description=(
+            f"coli serve (verified cmdline, port {a.port})"
+            if facts["kind"]=="wrapper"
+            else f"Colibri engine (verified SERVE=1, port {a.port})"
+        )
+        target=_open_stop_target(pid,description,a.port)
+        if target: targets[pid]=target
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
-    for pid,desc in targets.items(): print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
-    if a.dry_run: return
-    for pid in targets:
-        try: os.kill(pid, signal.SIGTERM)
+    selected=list(targets.values())
+    try:
+        for target in selected:
+            print(
+                f"  {'would stop' if a.dry_run else 'stopping'} "
+                f"{target['pid']}: {target['description']}"
+            )
+        if a.dry_run: return
+        for target in selected:
+            try: _signal_stop_target(target,signal.SIGTERM)
+            except (OSError,ProcessLookupError): pass
+        time.sleep(2.0)
+        for target in selected:
+            try:
+                _signal_stop_target(target,signal.SIGKILL)
+                print(f"  {target['pid']}: forced (SIGKILL)")
+            except (OSError,ProcessLookupError): pass       # exited or identity changed: never signal a replacement
+        try: os.unlink(pf)
         except OSError: pass
-    time.sleep(2.0)
-    for pid in targets:
-        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
-        except OSError: pass       # gia' morto: bene
-    try: os.unlink(pf)
-    except OSError: pass
-    print(f"  {C.grn}✓ stopped{C.r} — RAM released")
+        print(f"  {C.grn}✓ stopped{C.r} — RAM released")
+    finally:
+        _close_stop_targets(selected)
 
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
@@ -1505,7 +1728,6 @@ def cmd_convert(a):
     print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
 
-
 def cmd_mirror(a):
     if not a.mirror:
         sys.exit("mirror path required: pass --mirror or set COLI_MODEL_MIRROR")
@@ -1526,7 +1748,18 @@ def cmd_mirror(a):
     return subprocess.call(command)
 
 
-def main():
+def cmd_ramdisk(a):
+    import ramdisk
+    if getattr(a,"ramdisk_action",None) is not None:
+        return ramdisk.dispatch(a,cli_path=os.path.abspath(__file__),engine_path=GLM)
+    parser = getattr(a, "_ramdisk_parser", None)
+    if parser is not None:
+        parser.print_help()
+    else:
+        print("coli ramdisk: choose plan, prepare, status, or destroy")
+    return 2
+
+def main(argv=None):
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
@@ -1566,6 +1799,10 @@ def main():
     pm.add_argument("--usage")
     pm.add_argument("--budget-gib", type=float, default=0)
     pm.add_argument("--reserve-gib", type=float, default=10)
+    import ramdisk
+    prd=sub.add_parser("ramdisk",parents=[common],help="manage NUMA-aware tmpfs weight staging")
+    ramdisk.configure_parser(prd, common_parent=common)
+    prd.set_defaults(_ramdisk_parser=prd)
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pd.add_argument("--deep",action="store_true",
@@ -1628,11 +1865,11 @@ def main():
     pc.add_argument("--group-size",type=int,default=64,
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
-    a=ap.parse_args()
+    a=ap.parse_args(argv)
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"web":cmd_web,"ramdisk":cmd_ramdisk}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 
