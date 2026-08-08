@@ -1331,7 +1331,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         sxoff[ns] = ns*S;
-        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, sgp, sup, sdp,
+        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, 0, sgp, sup, sdp,
                                           sscale, sscale, sscale,
                                           sxg, sxoff, snr, srows, srw);
         free(srows);
@@ -1414,7 +1414,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * the round; shared_done stays set either way. */
                 if (base + cap >= npair && !sh_h) {
                     ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
-                        nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                        nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
                     if (h) {
                         double ts = now_s();
@@ -1428,7 +1428,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                         te = now_s();                      /* fault: CPU redo below */
                     }
                 }
-                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                                          mxg, mxoff, mnr, mrows, mrw, out, S)) {
                     m->t_expert += now_s() - te;
                     continue;                              /* round done on the GPU */

@@ -586,25 +586,28 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
+    requested_vram_before_clamp = requested_vram
+    unified_pool = max(0, available_memory - info["dense_bytes"] - runtime_bytes)
     if unified:
         # Unified devices expose one physical pool to CUDA and the host. Do not
-        # let an auto/explicit VRAM tier consume pages that the RAM tier also
-        # believes are available.
-        unified_pool = max(0, available_memory - info["dense_bytes"] - runtime_bytes)
+        # let an expert tier consume pages that the RAM tier also believes are
+        # available. Dense/runtime reservations are shared exactly once below.
         requested_vram = min(requested_vram, unified_pool)
-    vram_budget = min(requested_vram, safe_vram, info["expert_bytes"])
+    vram_limit = unified_pool if unified else safe_vram
+    vram_budget = min(requested_vram, vram_limit, info["expert_bytes"])
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
     warnings = []
     if unified:
-        ram_available = max(0, available_memory - vram_budget)
-        requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(ram_available * 0.88)
-        ram_budget = min(requested_ram, ram_available)
-        if requested_ram > ram_available:
-            warnings = [
+        requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
+        requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)
+        ram_expert_bytes = min(requested_ram_experts,
+                               max(0, unified_pool - vram_budget))
+        ram_budget = info["dense_bytes"] + runtime_bytes + ram_expert_bytes
+        if requested_ram_experts > ram_expert_bytes:
+            warnings.append(
                 f"RAM budget clamped from {format_bytes(requested_ram)} to "
-                f"{format_bytes(ram_budget)} because the GPU shares physical memory"
-            ]
+                f"{format_bytes(ram_budget)} because the GPU shares physical memory")
     else:
         ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
     if ram_budget < 4 * GB:
@@ -620,8 +623,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
-    if gpus and vram_budget < requested_vram:
-        warnings.append("VRAM tier was clamped by free VRAM or model expert size")
+    if gpus and vram_budget < requested_vram_before_clamp:
+        warnings.append("VRAM tier was clamped by free VRAM, shared memory, or model expert size")
     if unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")

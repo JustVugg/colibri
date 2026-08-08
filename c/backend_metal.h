@@ -139,12 +139,13 @@ int coli_metal_resset_stats(double *flush_s);
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
  *  gs/us/ds[e] = pointers to expert e's scales (per-row or per-group)
  *  fmt         = quant format (shared across experts), including fmt=4 grouped int4.
+ *  group_size  = common fmt=4 group size (0 for non-grouped formats).
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target
  * Returns 1 on success, 0 to signal the caller to fall back to the CPU path.
  */
-int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
+int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int group_size,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
@@ -159,7 +160,7 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
-ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, int group_size,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,

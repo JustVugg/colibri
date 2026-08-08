@@ -22,7 +22,7 @@ class BackendContractTests(unittest.TestCase):
     def test_metal_moe_grouped_shader_has_per_group_scale_path(self):
         source = (ROOT / "backend_metal.mm").read_text(encoding="utf-8")
         self.assertIn("device const float* scales", source)
-        self.assertIn("i/64", source)
+        self.assertIn("i/GS", source)
 
     def test_vulkan_primary_device_can_be_selected(self):
         source = (ROOT / "backend_vulkan.c").read_text(encoding="utf-8")
