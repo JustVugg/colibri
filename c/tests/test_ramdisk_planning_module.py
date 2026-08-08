@@ -213,11 +213,13 @@ class PlanningModuleTest(unittest.TestCase):
         self.assertEqual(planning._node_core_count(plan), 1)
         self.assertEqual(planning._engine_cpu_list(plan), "8-9")
         self.assertEqual(planning._memory_node_list(plan), "2")
+        self.assertEqual(ramdisk._memory_node_list(plan), "2")
         self.assertEqual(planning._node_core_count(plan, node=2), 3)
         self.assertEqual(
             planning._engine_cpu_list(plan, node=2),
             "4-5,7",
         )
+        self.assertEqual(ramdisk._memory_node_list(plan, node=2), "2")
 
     def test_runtime_topology_falls_back_to_recorded_hardware(self):
         plan = {

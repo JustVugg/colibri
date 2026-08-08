@@ -3403,6 +3403,7 @@ def status(
     validate_namespace,
     process_matches,
     managed_child_liveness,
+    deployment_token=None,
 ):
     """Return lifecycle status, optionally skipping deep revalidation."""
     manifest = load_manifest(required=False)
@@ -3423,6 +3424,8 @@ def status(
     }
     if not manifest:
         return result
+    if deployment_token is not None:
+        result["deployment_token"] = deployment_token(manifest)
     recovery = manifest.get("recovery")
     retained_processes = _retained_process_recovery(manifest)
     pending_launches = _pending_launch_recovery(manifest)

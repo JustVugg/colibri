@@ -97,6 +97,7 @@ _SUPPORT_PACKAGE_MODULES = (
     "presets.py",
     "processes.py",
     "state.py",
+    "tokens.py",
 )
 _engine_module_dir = (
     os.path.dirname(os.path.abspath(os.environ["COLI_ENGINE"]))

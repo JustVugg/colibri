@@ -991,6 +991,13 @@ def _load_manifest(
     recovery = manifest.get("recovery")
     if recovery is not None and not isinstance(recovery, dict):
         raise RamdiskError("RAM-disk manifest has invalid recovery metadata")
+    if isinstance(recovery, dict) and (
+        recovery.get("operation")
+        not in (None, "prepare", "start", "stop", "destroy")
+        or recovery.get("state")
+        not in (None, "attention-required", "clean", "reconciled")
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid recovery metadata")
     retained_processes = (
         recovery.get("retained_processes", [])
         if isinstance(recovery, dict)
@@ -1195,6 +1202,7 @@ def _load_manifest(
             if isinstance(retained, dict)
             else None
         )
+        error = retained.get("error") if isinstance(retained, dict) else None
         if (
             not _positive_int(pid)
             or pgid != pid
@@ -1204,6 +1212,10 @@ def _load_manifest(
             or not _valid_usage_snapshot(baseline)
             or not isinstance(merge_id, str)
             or not re.fullmatch(r"[0-9a-f]{32}", merge_id)
+            or (
+                error is not None
+                and (not isinstance(error, str) or not error)
+            )
         ):
             raise RamdiskError(
                 "RAM-disk manifest has unsafe retained process recovery"

@@ -149,16 +149,36 @@ def configure_parser(parser, common_parent=None):
         help="show an exact staging and reserve plan",
     )
     plan.add_argument("--json", action="store_true")
-    prepare_parser = actions.add_parser(
-        "prepare",
+    stage_parsers = (
+        actions.add_parser(
+            "stage",
+            parents=[after],
+            help="mount, stage, and validate the token-bound plan",
+        ),
+        actions.add_parser(
+            "prepare",
+            parents=[after],
+            help="exact alias of stage",
+        ),
+    )
+    for stage_parser in stage_parsers:
+        stage_parser.add_argument(
+            "--plan-token",
+            default=None,
+            help="lowercase 64-hex identity emitted by plan --json",
+        )
+        stage_parser.add_argument(
+            "--yes",
+            action="store_true",
+            help="accept the reviewed plan non-interactively",
+        )
+        stage_parser.add_argument("--json", action="store_true")
+    verify_parser = actions.add_parser(
+        "verify",
         parents=[after],
-        help="mount, stage, and validate weights",
+        help="deeply validate sources, mounts, namespaces, and processes",
     )
-    prepare_parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="accept the reviewed plan non-interactively",
-    )
+    verify_parser.add_argument("--json", action="store_true")
     status_parser = actions.add_parser(
         "status",
         parents=[after],
@@ -170,11 +190,48 @@ def configure_parser(parser, common_parent=None):
         parents=[after],
         help="unmount volatile weights safely",
     )
+    destroy_parser.add_argument(
+        "--deployment-token",
+        default=None,
+        help="lowercase 64-hex identity emitted by status --json",
+    )
     destroy_parser.add_argument("--yes", action="store_true")
+    destroy_parser.add_argument("--json", action="store_true")
 
 
 def _json_print(value):
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _stage_projection(manifest, reviewed_plan_token, deployment_token):
+    return {
+        "schema": "colibri.ramdisk.stage.v1",
+        "version": 1,
+        "state": manifest.get("state"),
+        "deployment_id": manifest.get("deployment_id"),
+        "plan_token": reviewed_plan_token,
+        "deployment_token": deployment_token(manifest),
+        "mounts": [
+            {"path": record.get("path"), "node": record.get("node")}
+            for record in manifest.get("mounts", [])
+        ],
+    }
+
+
+def _destroy_projection(result):
+    projection = {
+        "schema": "colibri.ramdisk.destroy.v1",
+        "version": 1,
+    }
+    for name in (
+        "destroyed",
+        "durable_state_preserved",
+        "benchmark_history_preserved",
+        "empty_mountpoints_preserved",
+    ):
+        if name in result:
+            projection[name] = result[name]
+    return projection
 
 
 @contextlib.contextmanager
@@ -274,9 +331,13 @@ def dispatch(
     system=None,
     *,
     build_plan,
-    prepare,
+    stage,
     status,
+    verify,
     destroy,
+    plan_token,
+    deployment_token,
+    validate_token,
     human_plan,
     human_status,
     json_print=None,
@@ -295,21 +356,54 @@ def dispatch(
         if action == "plan":
             value = build_plan(args)
             if getattr(args, "json", False):
-                emit_json(value)
+                projection = dict(value)
+                projection["plan_token"] = plan_token(value)
+                emit_json(projection)
             else:
                 human_plan(value)
             return 2 if value["blockers"] else 0
-        if action == "prepare":
+        if action in ("stage", "prepare"):
+            json_mode = bool(getattr(args, "json", False))
+            reviewed_token = validate_token(
+                getattr(args, "plan_token", None),
+                "plan token",
+            )
+            if not getattr(args, "yes", False):
+                raise RamdiskError("stage requires --yes")
+            progress = (lambda _name, _size, _elapsed: None) if json_mode else None
             with guard(True) as termination:
-                value = prepare(
+                value = stage(
                     args,
+                    progress=progress,
+                    display_plan=not json_mode,
+                    expected_plan_token=reviewed_token,
                     cancel_event=termination["cancel_event"],
                 )
-            print(
-                "RAM-disk ready: %s"
-                % ", ".join(record["path"] for record in value["mounts"])
-            )
+            if json_mode:
+                emit_json(
+                    _stage_projection(
+                        value,
+                        reviewed_token,
+                        deployment_token,
+                    )
+                )
+            else:
+                print(
+                    "RAM-disk ready: %s"
+                    % ", ".join(record["path"] for record in value["mounts"])
+                )
             return _cli_exit_after_signal(termination, 0)
+        if action == "verify":
+            value = verify()
+            if getattr(args, "json", False):
+                emit_json(value)
+            else:
+                human_status(value["report"])
+                print(
+                    "RAM-disk deep verification: %s"
+                    % ("verified" if value["verified"] else "not verified")
+                )
+            return 0 if value["verified"] else 2
         if action == "status":
             value = status()
             if getattr(args, "json", False):
@@ -318,12 +412,21 @@ def dispatch(
                 human_status(value)
             return 0
         if action == "destroy":
-            with guard(False) as termination:
-                value = destroy(args)
-            print(
-                "RAM-disk destroyed; durable state and benchmark history "
-                "preserved"
+            reviewed_token = validate_token(
+                getattr(args, "deployment_token", None),
+                "deployment token",
             )
+            if not getattr(args, "yes", False):
+                raise RamdiskError("destroy requires --yes")
+            with guard(False) as termination:
+                value = destroy(
+                    args,
+                    expected_manifest_token=reviewed_token,
+                )
+            if getattr(args, "json", False):
+                emit_json(_destroy_projection(value))
+            else:
+                print("RAM-disk destroyed; durable state preserved")
             return _cli_exit_after_signal(termination, 0)
         raise RamdiskError("choose a ramdisk action; run with --help")
     except (RamdiskError, OSError, subprocess.SubprocessError) as exc:
@@ -332,7 +435,7 @@ def dispatch(
                 {
                     "schema": "colibri.ramdisk.error.v1",
                     "version": 1,
-                    "error": str(exc),
+                    "error": getattr(exc, "public_message", str(exc)),
                 }
             )
         else:

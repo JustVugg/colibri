@@ -4481,6 +4481,61 @@ class StateAndSafetyTest(unittest.TestCase):
         self.assertNotIn("expected_command", serialized)
         self.assertNotIn("weights_dir", serialized)
 
+    def test_manifest_rejects_nested_public_recovery_scalars(self):
+        for key, value in (
+            ("operation", {"private": "ARBITRARY-NESTED-SECRET"}),
+            ("state", ["ARBITRARY-NESTED-SECRET"]),
+        ):
+            with self.subTest(key=key):
+                manifest = self.manifest(state="error")
+                manifest["recovery"] = {
+                    "operation": "start",
+                    "state": "attention-required",
+                    "retained_mounts": [],
+                    "released_mounts": [],
+                }
+                manifest["recovery"][key] = value
+                path = Path(ramdisk._manifest_path())
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "invalid recovery metadata",
+                ):
+                    ramdisk._load_manifest(required=True)
+
+        manifest = self.manifest(state="error")
+        state_dir = os.path.join(
+            ramdisk._state_root(),
+            "engines",
+            self.FINGERPRINT.split(":", 1)[1],
+            "interleaved",
+        )
+        Path(state_dir).mkdir(parents=True, exist_ok=True)
+        manifest["recovery"] = {
+            "operation": "start",
+            "state": "attention-required",
+            "retained_processes": [
+                {
+                    "pid": 14001,
+                    "pgid": 14001,
+                    "node": None,
+                    "state_dir": state_dir,
+                    "usage_baseline": {},
+                    "usage_merge_id": "7" * 32,
+                    "error": {"private": "ARBITRARY-NESTED-SECRET"},
+                }
+            ],
+        }
+        path = Path(ramdisk._manifest_path())
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(
+            ramdisk.RamdiskError,
+            "unsafe retained process recovery",
+        ):
+            ramdisk._load_manifest(required=True)
+
     def test_deep_status_preserves_recovery_when_source_scan_raises_oserror(self):
         manifest = self.manifest(state="error")
         manifest["recovery"] = {

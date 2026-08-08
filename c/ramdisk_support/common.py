@@ -33,6 +33,12 @@ USAGE_MERGE_RE = re.compile(r"^# coli-ramdisk-merge ([0-9a-f]{32})$")
 class RamdiskError(RuntimeError):
     """An expected, user-actionable lifecycle failure."""
 
+    def __init__(self, message, *, public_message=None):
+        super().__init__(message)
+        self.public_message = (
+            str(message) if public_message is None else str(public_message)
+        )
+
 class _OperationCancelled(RamdiskError):
     """A cooperative cancellation that reached a clean lifecycle checkpoint."""
 
