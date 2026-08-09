@@ -465,6 +465,14 @@ void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot);
 extern "C" {
 #endif
 
+#ifdef COLI_DSV4_CUDA
+int coli_v4_expert_forward_tiered(float *output, const ColiExpertView *expert,
+                                  const float *input, float route_weight,
+                                  float swiglu_limit);
+#else
+#define coli_v4_expert_forward_tiered coli_v4_expert_forward_ref
+#endif
+
 int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit);

@@ -1,6 +1,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifdef COLI_DSV4_CUDA
+#include "backend_cuda_dsv4.h"   /* DS4 CUDA kernels (ported from ZacharyZcR fork) */
+#endif
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
@@ -3175,7 +3178,7 @@ static int moe_token(float *output,
             result = -1;
             break;
         }
-        result = coli_v4_expert_forward_ref(expert_output, &expert, input,
+        result = coli_v4_expert_forward_tiered(expert_output, &expert, input,
                                              route_weights[rank],
                                              config->swiglu_limit);
         coli_expert_release(store, &expert);
@@ -3738,7 +3741,7 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active[slot] = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
+        if (!result) result = coli_v4_expert_forward_tiered(
             expert_output, &expert, input, expert_weights[current],
             config->swiglu_limit);
         coli_expert_release(store, &expert);
@@ -3771,7 +3774,7 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
+        if (!result) result = coli_v4_expert_forward_tiered(
             expert_output, &expert, input, expert_weights[current],
             config->swiglu_limit);
         coli_expert_release(store, &expert);
@@ -5078,6 +5081,10 @@ typedef struct {
     uint64_t used;
     unsigned char *slab;
     int aligned_slab;
+#ifdef COLI_DSV4_CUDA
+    Dsv4CudaTensor *cu[V4_MATRIX_COUNT]; /* VRAM fp4 handles; all NULL = CPU tier */
+    int cu_expert;                       /* expert owning cu[] (=-1 none) */
+#endif
 } V4ExpertSlot;
 
 typedef struct {
@@ -5471,6 +5478,12 @@ typedef struct V4HotPolicy {
     uint64_t history_total;
     int history_seeded;
     char *history_path;
+#ifdef COLI_DSV4_CUDA
+    int cuda_on;            /* runtime toggle (COLI_DSV4_CUDA env, default ON) */
+    int cuda_initialized;   /* this policy owns a CUDA context ref */
+    int vram_per_layer;     /* how many of the top pins per layer live in VRAM */
+    long long vram_uploads, vram_drops;
+#endif
     struct V4HotPolicy *next;
 } V4HotPolicy;
 
@@ -5818,6 +5831,121 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
             usage[expert] = (usage[expert] + 1) / 2;
 }
 
+#ifdef COLI_DSV4_CUDA
+static int v4_cuda_ctx_refs = 0;
+
+/* VRAM rank of (layer,expert): position inside the per-layer VRAM window
+ * (top of the active pin set). -1 when the expert is not VRAM-resident. */
+static int v4_vram_rank(const V4HotPolicy *policy, int layer, int expert) {
+    if (!policy || !policy->cuda_on || policy->vram_per_layer < 1 ||
+        !policy->pins || policy->pin_count < 1) return -1;
+    int active = policy->pin_count;
+#if COLI_V4_PIN_RAMP_REQUESTS > 0
+    if (!policy->history_seeded && active > 4) {
+        uint64_t grown = policy->layer_requests[layer] /
+                         COLI_V4_PIN_RAMP_REQUESTS;
+        active = grown >= (uint64_t)(active - 4)
+            ? active : 4 + (int)grown;
+    }
+#endif
+    int top = policy->vram_per_layer < active
+        ? policy->vram_per_layer : active;
+    const int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    for (int r = 0; r < top; r++)
+        if (pins[r] == expert) return r;
+    return -1;
+}
+
+/* Upload the slot's native FP4 bytes (already resident in RAM) to VRAM.
+ * Called with state->mutex held. Returns 0 on success, -1 on failure. */
+static int v4_vram_upload(V4HotPolicy *policy, const V4ExpertRecord *record,
+                          V4ExpertSlot *slot, int expert) {
+    ColiTensorView gate, down, up;
+    Dsv4CudaTensor *tg = NULL, *tu = NULL, *td = NULL;
+    if (!policy || !record || !slot || slot->cu[V4_W1] || expert < 0) return -1;
+    fill_tensor_view(&gate, record, slot, V4_W1);
+    fill_tensor_view(&down, record, slot, V4_W2);
+    fill_tensor_view(&up, record, slot, V4_W3);
+    if (!dsv4_cuda_upload_fp4(
+            &tg, (const uint8_t *)gate.data, (const uint8_t *)gate.scales,
+            (int)gate.rows, (int)gate.columns, 0) ||
+        !dsv4_cuda_upload_fp4(
+            &tu, (const uint8_t *)up.data, (const uint8_t *)up.scales,
+            (int)up.rows, (int)up.columns, 0) ||
+        !dsv4_cuda_upload_fp4(
+            &td, (const uint8_t *)down.data, (const uint8_t *)down.scales,
+            (int)down.rows, (int)down.columns, 0)) {
+        if (tg) dsv4_cuda_tensor_free(tg);
+        if (tu) dsv4_cuda_tensor_free(tu);
+        if (td) dsv4_cuda_tensor_free(td);
+        return -1;
+    }
+    slot->cu[V4_W1] = tg; slot->cu[V4_W3] = tu; slot->cu[V4_W2] = td;
+    slot->cu_expert = expert;
+    policy->vram_uploads++;
+    return 0;
+}
+
+static void v4_vram_drop(V4HotPolicy *policy, V4ExpertSlot *slot) {
+    int dropped = 0;
+    if (!slot) return;
+    for (int m = 0; m < V4_MATRIX_COUNT; m++)
+        if (slot->cu[m]) {
+            dsv4_cuda_tensor_free(slot->cu[m]);
+            slot->cu[m] = NULL;
+            dropped = 1;
+        }
+    slot->cu_expert = -1;
+    if (dropped && policy) policy->vram_drops++;
+}
+
+/* Keep the slot's VRAM residency aligned with the per-layer VRAM window.
+ * Called with state->mutex held, after the slot is materialized.
+ * The upload MUST see native FP4 bytes: when the slot was already rows16-
+ * packed (resident hot expert), the pack rewrote the slab in place, so the
+ * record is re-read from disk before uploading. */
+static void v4_vram_sync(V4ExpertStoreState *state, V4HotPolicy *policy,
+                         const V4ExpertRecord *record, V4ExpertSlot *slot,
+                         int layer, int expert) {
+    if (!policy || !policy->cuda_on || !slot || !record) return;
+    if (v4_vram_rank(policy, layer, expert) >= 0) {
+        if (slot->cu[V4_W1] && slot->cu_expert == expert) return;
+        if (slot->cu[V4_W1]) v4_vram_drop(policy, slot);
+        size_t sidx = hot_slot_index(state, slot);
+        if (policy->packed && policy->packed[sidx]) {
+            policy->packed[sidx] = 0;          /* slab holds packed rows16 */
+            if (policy->packed_slots) policy->packed_slots--;
+            if (v4_read_expert_record(state, record, slot)) return;
+            slot->expert = expert;             /* re-read does not touch it */
+        }
+        v4_vram_upload(policy, record, slot, expert);
+    } else if (slot->cu[V4_W1]) {
+        v4_vram_drop(policy, slot);           /* demoted: free VRAM handles */
+    }
+}
+
+/* Tiered routed-expert compute: GPU (fp4 kernels, fp8-simulated activations)
+ * when the slot holds VRAM handles, CPU reference otherwise. GPU launch
+ * failure degrades gracefully to the CPU reference. */
+int coli_v4_expert_forward_tiered(float *output, const ColiExpertView *expert,
+                                  const float *input, float route_weight,
+                                  float swiglu_limit) {
+    if (expert && expert->lease) {
+        V4ExpertSlot *slot = (V4ExpertSlot *)expert->lease;
+        Dsv4CudaTensor *g = slot->cu[V4_W1];
+        if (g && slot->cu_expert == expert->key.expert) {
+            Dsv4CudaTensor *u = slot->cu[V4_W3], *d = slot->cu[V4_W2];
+            float w = route_weight;
+            if (dsv4_cuda_expert_group(&g, &u, &d, &w, 1, swiglu_limit,
+                                       output, input))
+                return 0;   /* output = w * expert(x), written by the kernel */
+        }
+    }
+    return coli_v4_expert_forward_ref(output, expert, input, route_weight,
+                                      swiglu_limit);
+}
+#endif /* COLI_DSV4_CUDA */
+
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
                       ColiExpertView *view) {
     if (!store || !store->state || !view) {
@@ -5846,6 +5974,9 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             slot = &slots[i]; slot->references++;
             state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
+#ifdef COLI_DSV4_CUDA
+            v4_vram_sync(state, policy, record, slot, key.layer, key.expert);
+#endif
             if (hot_is_pinned(policy, key.layer, key.expert))
                 hot_pack_slot_locked(policy, state, record, slot);
             memset(view, 0, sizeof(*view)); view->key = key;
@@ -5899,6 +6030,9 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+#ifdef COLI_DSV4_CUDA
+    v4_vram_sync(state, policy, record, slot, key.layer, key.expert);
+#endif
     if (hot_is_pinned(policy, key.layer, key.expert))
         hot_pack_slot_locked(policy, state, record, slot);
     memset(view, 0, sizeof(*view)); view->key = key;
@@ -5917,6 +6051,20 @@ static void destroy_hot(ColiExpertStore *store) {
     if (policy) *link = policy->next;
     pthread_mutex_unlock(&hot_policies_mutex);
     if (policy) {
+#ifdef COLI_DSV4_CUDA
+        if (store && store->state) {
+            V4ExpertStoreState *state = store->state;
+            for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+                v4_vram_drop(policy, &state->slots[i]);
+        }
+        if (policy->cuda_initialized && v4_cuda_ctx_refs > 0) {
+            v4_cuda_ctx_refs--;
+            if (v4_cuda_ctx_refs == 0) dsv4_cuda_shutdown();
+        }
+        fprintf(stderr, "v4_cuda_tier uploads=%lld drops=%lld\n",
+                (long long)policy->vram_uploads,
+                (long long)policy->vram_drops);
+#endif
         hot_usage_save(policy, store ? store->state : NULL);
         fprintf(stderr, "v4_rows16 packed_slots=%llu\n",
                 (unsigned long long)policy->packed_slots);
@@ -6057,6 +6205,52 @@ int COLI_V4_ROWS16_STORE_OPEN(
     policy->next = hot_policies; hot_policies = policy;
     pthread_mutex_unlock(&hot_policies_mutex);
     (*output)->ops = &hot_operations;
+#ifdef COLI_DSV4_CUDA
+    {
+        const char *enable = getenv("COLI_DSV4_CUDA");
+        policy->cuda_on = enable ? atoi(enable) != 0 : 1;
+        policy->vram_per_layer = 0;
+        if (policy->cuda_on && pin_count > 0) {
+            double budget_gb = 4.0;
+            const char *gb = getenv("CUDA_EXPERT_GB");
+            if (gb && strtod(gb, NULL) > 0) budget_gb = strtod(gb, NULL);
+            long long budget_bytes = (long long)(budget_gb * 1e9);
+            int by_layer = (int)(budget_bytes /
+                ((long long)state->layers * state->record_bytes + 1));
+            if (by_layer < 1) by_layer = 1;
+            if (by_layer > pin_count) by_layer = pin_count;
+            if (by_layer > state->experts_per_layer)
+                by_layer = state->experts_per_layer;
+            if (v4_cuda_ctx_refs == 0) {
+                int devices[1] = {0};
+                const char *gpus = getenv("COLI_GPUS");
+                if (gpus && *gpus) devices[0] = atoi(gpus);
+                else {
+                    const char *single = getenv("COLI_GPU");
+                    if (single && *single) devices[0] = atoi(single);
+                }
+                if (dsv4_cuda_init(devices, 1)) v4_cuda_ctx_refs++;
+            }
+            if (v4_cuda_ctx_refs > 0) {
+                policy->vram_per_layer = by_layer;
+                policy->cuda_initialized = 1;
+                fprintf(stderr,
+                        "v4_cuda_tier vram_per_layer=%d budget_gb=%.2f "
+                        "expert_mb=%.1f vram_experts_gb=%.2f\n",
+                        by_layer, budget_gb, state->record_bytes / 1048576.0,
+                        (double)by_layer * state->layers *
+                            state->record_bytes / 1e9);
+            } else {
+                policy->cuda_on = 0;
+                fprintf(stderr,
+                        "v4_cuda_tier init failed; expert GPU tier disabled\n");
+            }
+        } else if (pin_count < 1) {
+            fprintf(stderr,
+                    "v4_cuda_tier off (no pin slots; raise RAM_GB cache)\n");
+        }
+    }
+#endif
     fprintf(stderr,
             "v4_hot_policy pin_slots_per_layer=%d repin_interval=%llu "
             "mode=resident-ram rows16=hot-pins\n", pin_count,
@@ -7003,6 +7197,14 @@ static int has_sentence_end(const char *text, int length) {
     return 0;
 }
 
+/* Expert RAM cache for the CLI test main: RAM_GB env (GiB), default 4 GiB. */
+static uint64_t v4_cli_cache_bytes(void) {
+    const char *ram = getenv("RAM_GB");
+    if (ram && strtod(ram, NULL) > 0)
+        return (uint64_t)(strtod(ram, NULL) * 1073741824.0);
+    return UINT64_C(4) * 1024 * 1024 * 1024;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3 || argc > 6) {
         fprintf(stderr, "usage: %s MODEL_DIR INPUT_TOKEN_ID [TOKEN_COUNT]\n"
@@ -7028,7 +7230,7 @@ int main(int argc, char **argv) {
         coli_deepseek_v4_expert_store_open(
             &(ColiDeepSeekV4ExpertStoreOptions){
                 argv[1], config.num_hidden_layers, config.n_routed_experts,
-                UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
+                v4_cli_cache_bytes(), -1, 0,
             }, &experts, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;

@@ -59,6 +59,38 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_OBJS = $(TARGET_OBJS)
 
+# --- CUDA DS4 expert backend (ported from ZacharyZcR fork; arch-agnostic) ---
+# CUDA=1 compiles backend_cuda_dsv4.cu with nvcc and links the DS4 kernels
+# into deepseek_v4. CUDA_ARCH=native => build GPU SASS (default); explicit
+# CUDA_ARCH=sm_86 or portable multi-gencode list target other GPUs.
+CUDA ?= 0
+ifeq ($(CUDA),1)
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+CUDA_ARCH ?= native
+ifeq ($(strip $(CUDA_ARCH)),)
+CUDA_ARCH = native
+endif
+ifeq ($(CUDA_ARCH),portable)
+CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
+               -gencode arch=compute_86,code=sm_86 \
+               -gencode arch=compute_89,code=sm_89 \
+               -gencode arch=compute_90,code=sm_90 \
+               -gencode arch=compute_120,code=sm_120
+else
+CUDA_GENCODE = -arch=$(CUDA_ARCH)
+endif
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE)
+DSV4_CUDA_OBJ = backend_cuda_dsv4.o
+V4_OBJS += $(DSV4_CUDA_OBJ)
+CFLAGS += -DCOLI_DSV4_CUDA
+LDFLAGS += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 \
+           -lcudart -lcublasLt -lstdc++
+
+$(DSV4_CUDA_OBJ): backend_cuda_dsv4.cu backend_cuda_dsv4.h
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+endif
+
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)
 
