@@ -4145,20 +4145,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     /* ---- DEGRADE_ZERO: zero-fill miss slots below the gate-weight threshold --------
      * When a prefetch deadline is missed, blocking on a demand-load stalls the compute
-     * thread.  For experts whose aggregate gate weight across the batch is below
-     * DEGRADE_TAU, the contribution is small enough that zeroing the slot costs less
-     * in output quality than the I/O stall costs in latency (issue #865: tau=0.03
-     * zeroes 21.8% of slots for +2.9% perplexity).
+     * thread.  For experts whose per-position gate weight is below DEGRADE_TAU the
+     * contribution is small enough that zeroing the slot costs less in output quality
+     * than the I/O stall costs in latency (issue #865: tau=0.03 zeroes 21.8% of slots
+     * for +2.9% perplexity).  tau is compared per-position (post-norm_topk,
+     * pre-routed_scale) — each position independently, matching the measured numbers.
+     * No renorm: the approximation IS the dropped mass; renorm would hide it and bias
+     * the output upward.
      * Opt-in only (DEGRADE_ZERO=1); decode-only (S<=4) for the same reason as
      * EXPERT_BUDGET: during prefill every dropped expert corrupts the KV cache. */
     if(g_degrade_zero && S<=4){
-        /* compute aggregate gate weight per unique expert across the batch */
-        float *dg_wsum=falloc(nu); for(int j=0;j<nu;j++) dg_wsum[j]=0;
-        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
-            int e=idxs[(int64_t)s*K+kk];
-            for(int j=0;j<nu;j++) if(uniq[j]==e){ dg_wsum[j]+=ws[(int64_t)s*K+kk]; break; }
-        }
-        /* residency scan: only misses are eligible — cache hits are free, never drop */
+        /* residency scan: hits are always kept regardless of weight */
         unsigned char *dg_keep=xzalloc((size_t)nu,"moe dg_keep");
         for(int j=0;j<nu;j++){
             int eid=uniq[j], resident=0;
@@ -4166,8 +4163,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ resident=1; break; }
             if(!resident){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ resident=1; break; } }
-            /* keep if: resident (hit), or gate weight meets threshold */
-            if(resident || dg_wsum[j]>=g_degrade_tau) dg_keep[j]=1;
+            if(resident) dg_keep[j]=1;
+        }
+        /* per-position tau gate: a miss expert is kept if ANY position routes to it
+         * with weight >= tau.  Each position's weight is tested independently — this
+         * is the gate the +2.9% ppl measurement was taken under. */
+        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
+            float wv=ws[(int64_t)s*K+kk];
+            if(wv>=g_degrade_tau){
+                int e=idxs[(int64_t)s*K+kk];
+                for(int j=0;j<nu;j++) if(uniq[j]==e){ dg_keep[j]=1; break; }
+            }
         }
         /* rescue: no position may end up with zero routed experts.
          * If all of a position's experts were misses below tau, reinstate the
@@ -4187,7 +4193,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             seen[be]=1;
             for(int j=0;j<nu;j++) if(uniq[j]==be && !dg_keep[j]){ dg_keep[j]=1; break; }
         }
-        /* apply: remove dropped experts from each position's routing list */
+        /* apply: compact routing lists, no renorm — survivors keep original weights */
         int dg_dropped=0;
         for(int j=0;j<nu;j++) if(!dg_keep[j]) dg_dropped++;
         if(dg_dropped){
@@ -4195,30 +4201,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             memset(seen,0,(size_t)E);
             for(int j=0;j<nu;j++) if(dg_keep[j]) seen[uniq[j]]=1;
             for(int s=0;s<S;s++){
-                int w=0; float sold=0, snew=0;
+                int w=0;
                 for(int kk=0;kk<keff[s];kk++){
                     int e=idxs[(int64_t)s*K+kk]; float wv=ws[(int64_t)s*K+kk];
-                    sold+=wv;
-                    if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=wv; snew+=wv; w++; }
+                    if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=wv; w++; }
                 }
-                if(w<keff[s]){
-                    keff[s]=w;
-                    if(c->norm_topk && w>0){
-                        float sm=0; for(int kk=0;kk<w;kk++) sm+=ws[(int64_t)s*K+kk]; sm+=1e-20f;
-                        for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]/=sm;
-                        for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=c->routed_scale;
-                    } else if(w>0 && snew>1e-20f && sold>snew){
-                        float sc=sold/snew;
-                        for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=sc;
-                    }
-                }
+                if(w<keff[s]) keff[s]=w;
             }
             /* compact uniq[] to kept experts only */
             int nu2=0;
             for(int j=0;j<nu;j++) if(dg_keep[j]) uniq[nu2++]=uniq[j];
             nu=nu2;
         }
-        free(dg_wsum); free(dg_keep);
+        free(dg_keep);
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
