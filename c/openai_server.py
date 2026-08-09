@@ -385,9 +385,10 @@ class InklingStreamSplit:
     answer). Buffers partial markers across chunk boundaries so a marker split
     between two DATA frames never leaks."""
 
-    def __init__(self, on_content, on_reasoning=None):
+    def __init__(self, on_content, on_reasoning=None, on_reasoning_end=None):
         self.on_content = on_content
         self.on_reasoning = on_reasoning
+        self.on_reasoning_end = on_reasoning_end
         self.mode = "content"
         self.buf = ""
 
@@ -404,6 +405,8 @@ class InklingStreamSplit:
                 return
             i, m = min(hits)
             self._emit(self.buf[:i])
+            if m == INK_TEXT and self.mode == "reasoning" and self.on_reasoning_end:
+                self.on_reasoning_end()
             self.mode = "reasoning" if m == INK_THINK else "content"
             self.buf = self.buf[i + len(m):]
 
@@ -702,6 +705,44 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
     return "".join(parts)
 
 
+def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """OLMoE-Instruct's native chat_template (tokenizer_config.json): one
+    bos_token, then per-message <|system|>/<|user|>/<|assistant|> turns each
+    closed by a newline, prior assistant turns also closed by eos_token
+    (bos_token == eos_token == "|||IP_ADDRESS|||", a PII-scrubbing artifact
+    repurposed as this tokenizer's BOS/EOS marker), and a trailing
+    "<|assistant|>\\n" generation prompt. No tool-call syntax and no thinking
+    mode exist in this template, so both parameters are accepted but unused.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet.",
+                       "tools", "unsupported_parameter")
+    boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
+    parts = [boundary]
+    last = len(messages) - 1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            parts.append(f"<|system|>\n{text}\n")
+        elif role == "user":
+            parts.append(f"<|user|>\n{text}\n")
+        else:
+            parts.append(f"<|assistant|>\n{text}{boundary}")
+            if index != last:
+                parts.append("\n")
+    parts.append("<|assistant|>\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -782,7 +823,18 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
     if enable_thinking:
-        effort = "High" if reasoning_effort == "high" else "Max"
+        # The endpoint accepts none/minimal/low/medium/high/xhigh, and this used
+        # to render every one of them except "high" as Max -- so a client asking
+        # for `minimal` got more reasoning than one asking for `high`, and the
+        # mapping was not even monotonic (#809). On a single machine that is not
+        # a cosmetic mismatch: unrequested reasoning spends the token budget
+        # before the answer starts.
+        #
+        # GLM-5.2's template takes a word here, not a number, so the levels map
+        # onto the ones it understands, in order. `none` cannot appear: it turns
+        # thinking off upstream and never reaches this branch.
+        effort = {"minimal": "Low", "low": "Low", "medium": "Medium",
+                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "High")
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
@@ -857,6 +909,18 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
+
+
+def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                         tool_choice=None, audio_out=None):
+    """Render a chat request with the active engine's native prompt contract."""
+    if ARCH == "inkling":
+        return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, audio_out=audio_out)
+    renderer = (render_chat_kimi if ARCH == "kimi" else
+                render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_olmoe if ARCH == "olmoe" else render_chat)
+    return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -1374,8 +1438,8 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 def model_arch(model):
     """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
-    (including an unreadable config) is glm."""
+    rule as coli's model_arch(): "inkling"/"kimi"/"olmoe" substring, everything
+    else (including an unreadable config) is glm."""
     try:
         with open(Path(model) / "config.json", encoding="utf-8") as fh:
             model_type = (json.load(fh).get("model_type") or "").lower()
@@ -1387,6 +1451,8 @@ def model_arch(model):
         return "kimi"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    if "olmoe" in model_type:
+        return "olmoe"
     return "glm"
 
 
@@ -1415,6 +1481,35 @@ def cap_for_arch(arch, cap):
     return 0 if arch == "glm" else 8
 
 
+def tune_child_env(env, arch):
+    """Apply the engine-local defaults that a direct server launch otherwise misses.
+
+    ``coli chat`` already supplies these values, but users also launch this file
+    directly.  Keep setdefault semantics so every explicit operator setting wins.
+    """
+    if arch != "deepseek_v4":
+        return env
+    if not env.get("COLI_NO_OMP_TUNE"):
+        from resource_plan import physical_cpu_count
+        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        env.setdefault("OMP_WAIT_POLICY", "active")
+        env.setdefault("GOMP_SPINCOUNT", "200000")
+        env.setdefault("OMP_DYNAMIC", "FALSE")
+        if sys.platform != "win32":
+            env.setdefault("OMP_PROC_BIND", "close")
+            env.setdefault("OMP_PLACES", "cores")
+    # All speculative paths stay opt-in: partial acceptance requires expensive
+    # recurrent-attention replay on this engine.
+    env.setdefault("V4_DRAFT", "0")
+    env.setdefault("V4_MTP", "0")
+    env.setdefault("V4_MTP_DRAFT", "3")
+    env.setdefault("V4_MTP_GB", "0.45")
+    env.setdefault("V4_MTP_MISS", "96")
+    env.setdefault("V4_MTP_MIN", "3")
+    env.setdefault("V4_MTP_CONF", "0.55")
+    return env
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -1423,10 +1518,12 @@ class Engine:
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
+        arch = model_arch(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        tune_child_env(child_env, arch)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(model_arch(model), cap))], env=child_env,
+            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
@@ -1677,8 +1774,37 @@ def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
 
 
+def _positive_env(name, default):
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    # SEC: ThreadingHTTPServer spawns one thread per TCP connection with no
+    # ceiling, and each carries a default 8 MiB stack. Opening connections and
+    # never completing a request therefore grows thread count -- and memory --
+    # without bound, before any Host check or auth runs. max_queue bounds the
+    # inference queue, not the accept loop.
+    #
+    # 64 is deliberately small: the engine serves one request at a time
+    # (kv_slots) behind a queue of 8, so hundreds of concurrent connections buy
+    # nothing a dashboard plus a handful of clients does not already have. Over
+    # the cap we close immediately rather than queue, so the cost of a flood is
+    # paid by the attacker's socket and not by our address space.
+    MAX_CONNECTIONS = _positive_env("COLI_MAX_CONNECTIONS", 64)
+
+    # A global cap alone turns memory exhaustion into connection starvation: one
+    # attacker holding all 64 slots still locks every real client out. Measured
+    # exactly that while testing the cap. So also bound what a single source may
+    # hold, and keep it well under the global cap: a browser opens a handful of
+    # parallel connections, an SDK fewer, so 8 is generous for any one client and
+    # leaves 56 slots that one address cannot touch.
+    MAX_CONNECTIONS_PER_IP = _positive_env("COLI_MAX_CONNECTIONS_PER_IP", 8)
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
@@ -1697,15 +1823,105 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        self._conn_lock = threading.Lock()
+        self._conn_live = 0
+        self._conn_by_ip = {}
+        self._conn_owner = {}
+
+    def process_request(self, request, client_address):
+        """Refuse past the caps instead of spawning an unbounded thread."""
+        peer = client_address[0] if client_address else "?"
+        with self._conn_lock:
+            mine = self._conn_by_ip.get(peer, 0)
+            if self._conn_live >= self.MAX_CONNECTIONS:
+                reason = "server cap %d" % self.MAX_CONNECTIONS
+            elif mine >= self.MAX_CONNECTIONS_PER_IP:
+                reason = "per-address cap %d" % self.MAX_CONNECTIONS_PER_IP
+            else:
+                reason = None
+                self._conn_live += 1
+                self._conn_by_ip[peer] = mine + 1
+                self._conn_owner[id(request)] = peer
+        if reason:
+            sys.stderr.write("[api] %s - refused: %s\n" % (peer, reason))
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(request)
+            raise
+
+    def _release(self, request):
+        with self._conn_lock:
+            peer = self._conn_owner.pop(id(request), None)
+            if peer is None:
+                return                      # never counted, or already released
+            if self._conn_live > 0:
+                self._conn_live -= 1
+            left = self._conn_by_ip.get(peer, 1) - 1
+            if left > 0:
+                self._conn_by_ip[peer] = left
+            else:
+                self._conn_by_ip.pop(peer, None)   # do not grow a map per peer
+
+    def close_request(self, request):
+        self._release(request)
+        super().close_request(request)
+
+
+class _DeadlineReader:
+    """rfile wrapper enforcing a CUMULATIVE deadline on reading one request.
+
+    SEC: `timeout` below is per socket operation, so it restarts on every byte.
+    A client dripping one byte every 29 s renews it forever and holds a thread
+    and a connection slot indefinitely -- the code's own comment claimed the
+    opposite. The deadline here is absolute: every read shrinks the socket
+    timeout to the time left, so a drip runs the clock down instead of resetting
+    it.
+
+    It covers the request-read phase only. Generation is not on this clock: a
+    600-second answer is normal and must not be cut off, so send_response()
+    hands the socket back to the ordinary timeout once the status line is out.
+    """
+
+    def __init__(self, raw, sock, per_read, budget):
+        self._raw, self._sock, self._per_read = raw, sock, per_read
+        self._expires = time.monotonic() + budget
+
+    def _arm(self):
+        left = self._expires - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request read deadline exceeded")
+        self._sock.settimeout(min(self._per_read, left))
+
+    def readline(self, *args):
+        self._arm()
+        return self._raw.readline(*args)
+
+    def read(self, *args):
+        self._arm()
+        return self._raw.read(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
 
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
-                   # request line/body can't pin a worker thread (and a slot) forever
+    timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
+                   # it restarts on every byte received, so a drip renews it forever.
+                   # READ_DEADLINE below is the cumulative bound that actually does.
+    READ_DEADLINE = _positive_env("COLI_READ_DEADLINE", 30)  # accept -> request read
     server_version = "colibri"
     _committed = False    # status line already on the wire; reset per request below
     _body_read = False    # request body fully consumed, so nothing is left to drain
+
+    def setup(self):
+        super().setup()
+        # Keep the socket-backed reader; handle_one_request re-wraps it with a
+        # fresh deadline per request rather than wrapping a wrapper each time.
+        self._raw_rfile = self.rfile
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
@@ -1722,9 +1938,27 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
+        # Fresh budget per request: a keep-alive connection may serve many, and
+        # each is entitled to its own read window -- but none may drip forever.
+        self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
+                                     self.timeout, self.READ_DEADLINE)
         try:
             super().handle_one_request()
-        except (BrokenPipeError, ConnectionResetError):
+        except TimeoutError:
+            # The read budget ran out. Say so and close; do not answer, because
+            # we never received a complete request to answer.
+            sys.stderr.write("[api] %s - request read deadline exceeded\n"
+                             % self.address_string())
+            self.close_connection = True
+            return
+        except ConnectionError:
+            # ConnectionError, not (BrokenPipeError, ConnectionResetError): those two
+            # are SIBLINGS of ConnectionAbortedError under it, so the pair caught the
+            # POSIX spellings and let the Windows one through. #854's log is pages of
+            # `ConnectionAbortedError: [WinError 10053] An established connection was
+            # aborted by the software in your host machine` escaping to socketserver,
+            # from a `coli web` start that was otherwise healthy.
+            #
             # The client hung up mid-response. That is not an error here, it is
             # how HTTP clients behave: `coli chat` polls /health while the model
             # loads and drops each connection as soon as it has its answer, and
@@ -1745,6 +1979,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """Single choke point for "the status line is out". Overriding here rather than
         tracking it at each call site means no responder can forget (#597 item 3)."""
         self._committed = True
+        # The request is fully read by the time anything answers, so the read
+        # deadline has done its job. Restore the plain per-operation timeout:
+        # generation legitimately takes minutes and must not inherit a clock
+        # sized for reading a request header.
+        try:
+            self.connection.settimeout(self.timeout)
+        except OSError:
+            pass
         super().send_response(code, message)
 
     def _drain_request_body(self):
@@ -1933,9 +2175,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
+                # (#SEC-8) same gate as /health and /experts above: this endpoint
+                # is served before require_auth(), so an unauthenticated caller
+                # reached it even with --api-key set. It carries per-turn
+                # telemetry -- prompt and completion token counts, per-phase
+                # timings, up to 120 turns -- which describes what the operator
+                # is running and how much. The pass that added _is_authed() to
+                # the two endpoints above did not reach this one.
                 eng = self.server.engine
-                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
-                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
+                payload = {"seq": 0, "turns": []}
+                if self._is_authed() and eng:
+                    payload["seq"] = getattr(eng, "profile_seq", 0)
+                    payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
@@ -1984,8 +2235,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self._fail(error, request_id)
         except ClientCancelled:
             pass
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except ConnectionError:
+            pass                      # same widening as handle_one_request, same reason
         except Exception as error:
             self.log_error("request failed: %s", error)
             try:
@@ -2024,7 +2275,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi"):
+        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -2324,16 +2575,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else
-                    render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
         audio_clips = [] if ARCH == "inkling" else None
-        if audio_clips is not None:
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice, audio_out=audio_clips)
-        else:
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice)
+        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+                                      tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         audio=b"".join(audio_clips) if audio_clips else None)
@@ -2367,8 +2611,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
-                             tools, tool_choice)
+        prompt = render_chat_for_arch(messages, enable_thinking,
+                                      "high" if enable_thinking else None,
+                                      tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2399,8 +2644,12 @@ class APIHandler(BaseHTTPRequestHandler):
         def blocks_and_stop(text, stats):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
-            if enable_thinking:
+            reasoning = ""
+            if ARCH == "inkling":
+                text, reasoning = split_inkling(text)
+            elif enable_thinking:
                 reasoning, text = split_thinking_reply(text)
+            if enable_thinking:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
@@ -2538,8 +2787,13 @@ class APIHandler(BaseHTTPRequestHandler):
                               "signature": ANTHROPIC_LOCAL_SIGNATURE}})
                 send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
-            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                     if enable_thinking else None)
+            if ARCH == "inkling":
+                split = InklingStreamSplit(emit_answer,
+                                           emit_thinking if enable_thinking else None,
+                                           close_thinking if enable_thinking else None)
+            else:
+                split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
+                         if enable_thinking else None)
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -2551,7 +2805,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
             stop_filter.finish()
             if split:
-                split.finish()
+                split.close()
                 close_thinking()               # budget exhaustion before </think>
             if tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
@@ -2604,7 +2858,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4") and kv_slots != 1:
+    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -2641,7 +2895,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2672,6 +2926,7 @@ def main():
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
                          "kimi-k3-colibri" if ARCH == "kimi" else
                          "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
+                         "olmoe-colibri" if ARCH == "olmoe" else
                          "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,

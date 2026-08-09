@@ -54,6 +54,85 @@ jobs:
         with:
           dockerfile: docker/Dockerfile
           failure-threshold: error
+  # The C suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+  #
+  # Before this the only sanitized code in CI was nothing at all: fuzz-rans has
+  # always built with ASan+UBSan but was never wired to a job, and it covers
+  # rans.h alone. The engine's pointer arithmetic, mmap/pread paths and worker
+  # threads had never been run under a sanitizer here.
+  #
+  # Leak detection is off on purpose -- the engines allocate the tensor index,
+  # parsed config and weight slabs once and use them until exit (st.h calls this
+  # out: "intentionally leaked ... one-time startup parsing"). Reporting those
+  # would bury the findings that matter under noise nobody intends to fix. The
+  # flags live in c/Makefile's test-asan target, not here, so the same command
+  # reproduces it locally.
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: C suite under ASan + UBSan
+        run: make -C c test-asan
+      - name: rANS fuzz round-trip (ASan + UBSan)
+        # Already sanitized and already asserting byte identity across every
+        # compiled decode arm; it just had no job to run in.
+        run: make -C c fuzz-rans
+
+  # The Vulkan backend, COMPILED AND RUN. Before this job, `grep -rn "VK=1\|glslc\|vulkan"
+  # .github/workflows/` returned nothing: backend_vulkan.c and the four GLSL shaders were
+  # never built by any job, so they could be broken on dev and every check would stay green.
+  # Three Vulkan PRs were open at the time this landed, all written by people without the
+  # hardware and reviewed by reading the diff.
+  #
+  # Lavapipe (Mesa's software Vulkan) is what makes running it possible without a GPU. It
+  # says NOTHING about performance -- it is a CPU rasteriser and will be slower than the
+  # ordinary CPU path -- and it does not reproduce driver-specific behaviour, such as the
+  # VK_EXT_memory_budget under-reporting on RADV RX 6000 reported in #891. What it does
+  # prove is that the shaders compile, the device and queue negotiation works, the expert
+  # tier initialises, and the code path executes at all.
+  vulkan:
+    name: Vulkan (Lavapipe, software)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Vulkan toolchain and a software driver
+        run: |
+          sudo apt-get update
+          # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
+          # neither is present on the runner by default, which is half of why VK=1 was
+          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev glslc mesa-vulkan-drivers
+      - name: Build with VK=1
+        run: |
+          cd c
+          make colibri VK=1
+          # The shaders are a separate failure mode from the C: glslc can reject a .comp
+          # while backend_vulkan.c compiles perfectly. Assert all four exist.
+          ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+                shaders/attention_absorb.spv shaders/rmsnorm.spv
+          ldd colibri | grep -q libvulkan || { echo "FAIL: built without linking libvulkan"; exit 1; }
+      - name: Initialise the backend against Lavapipe
+        run: |
+          cd c
+          # A config.json is enough to reach coli_vk_init(): it runs before any weight is
+          # read, so the run fails afterwards on the missing model and that is expected.
+          # What is asserted is the [VK] banner, not a successful load.
+          mkdir -p /tmp/vkprobe
+          echo '{"model_type":"glm_moe_dsa"}' > /tmp/vkprobe/config.json
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+          COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 SNAP=/tmp/vkprobe \
+            timeout 120 ./colibri > vk.log 2>&1 || true
+          cat vk.log
+          # coli_vk_init() returns 0 and the engine exits 2 with "Vulkan backend
+          # unavailable" when the loader finds no device or the shaders are missing, so
+          # this line is the whole gate.
+          grep -q "\[VK\] ready:" vk.log || {
+            echo "FAIL: the Vulkan backend did not initialise"; exit 1; }
+          grep -q "expert tier active" vk.log || {
+            echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
+          echo "OK: shaders compiled, device negotiated, expert tier active"
 
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
@@ -64,13 +143,17 @@ jobs:
           - os: ubuntu-latest
             name: linux
             shell: bash
+            v4: "1"
           - os: macos-latest
             name: macos
             shell: bash
+            # No v4: the engine builds on x86-64 Linux/Windows and aarch64 Linux
+            # only (COLI_V4_SUPPORTED in c/Makefile); the target exits 1 here.
           - os: windows-latest
             name: windows
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
             shell: "msys2 {0}"
+            v4: "1"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -90,11 +173,18 @@ jobs:
             mingw-w64-ucrt-x86_64-binutils
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
+      # "Every engine" was four of five. deepseek-v4's only CI is the Linux
+      # v4-tiny job in check.yml, so the MSYS2 build of that engine had no job
+      # anywhere -- the release tag compiled it on Windows for the first time.
+      # The hyphenated target is appended rather than folded into the loop
+      # because it must not run on macos.
       - name: Build every engine
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3 olmoe; do
+          ENGINES="colibri inkling kimi_k3 olmoe"
+          if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
+          for t in $ENGINES; do
             echo "::group::$t"
             make $t || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"

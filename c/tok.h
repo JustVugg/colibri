@@ -12,7 +12,9 @@
  */
 #ifndef TOK_H
 #define TOK_H
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

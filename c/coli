@@ -248,6 +248,8 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "olmoe" in model_type:
+        return "olmoe"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
     return "glm"
@@ -256,7 +258,7 @@ def engine_for(model):
     arch = model_arch(model)
     if arch == "glm" or os.environ.get("COLI_ENGINE"):
         return GLM
-    name = {"inkling": "inkling", "kimi": "kimi_k3",
+    name = {"inkling": "inkling", "kimi": "kimi_k3", "olmoe": "olmoe",
             "deepseek_v4": "deepseek_v4"}[arch]
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
@@ -272,18 +274,76 @@ def need_model(model, engine=None):
     if not os.path.exists(engine):
         arch = model_arch(model)
         target = ("kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else
+                  "olmoe" if arch == "olmoe" else
                   "deepseek-v4" if arch == "deepseek_v4" else "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
+
+# One-shot runs keep the historic 1024. Interactive sessions get 16384, because
+# the browser and the TUI both offer a per-request limit and the server treats
+# --ngen as a hard ceiling it clamps to (#260) -- so a low ceiling makes the
+# user's own control inert instead of merely cautious. Still a ceiling, not a
+# target: generation ends at EOS either way.
+def ngen_for(a, interactive=False):
+    if getattr(a, "ngen", None): return a.ngen
+    return 16384 if interactive else 1024
 
 def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
     env = os.environ.copy()
-    if a.ngen: env["NGEN"] = str(a.ngen)
+    # OMP_NUM_THREADS for the sister engines too.
+    #
+    # #805 set this from physical cores "on every platform" -- but only inside
+    # env_for(), which this function calls only for glm. inkling, kimi_k3,
+    # olmoe and deepseek_v4 all took the branch below and got libgomp's
+    # default, nproc, i.e. LOGICAL cores. On any SMT host that is a 2x
+    # over-subscription of a memory-bound int4 GEMV, which is the collapse
+    # measured in #718 (2.3x on Zen3) and again here: an i7-1355U reports 6
+    # physical and 12 logical, and DeepSeek V4 was running the 12.
+    #
+    # Same defect shape as the one #805 fixed, one level out: a mechanism that
+    # reaches one engine and not its siblings.
+    #
+    # setdefault, so an explicit OMP_NUM_THREADS still wins -- which is also
+    # how to A/B it: OMP_NUM_THREADS=12 reproduces the old behaviour.
+    if not env.get("COLI_NO_OMP_TUNE"):
+        from resource_plan import physical_cpu_count
+        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        if arch == "deepseek_v4":
+            env.setdefault("OMP_WAIT_POLICY", "active")
+            env.setdefault("GOMP_SPINCOUNT", "200000")
+            env.setdefault("OMP_DYNAMIC", "FALSE")
+            if sys.platform != "win32":
+                env.setdefault("OMP_PROC_BIND", "close")
+                env.setdefault("OMP_PLACES", "cores")
+    env["NGEN"] = str(ngen_for(a))          # ngen_for keeps the historic 1024 here
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
-    if arch == "deepseek_v4":
+    if arch == "olmoe":
+        env["CHAT"] = "1"
+        env["MAX_NEW"] = str(ngen_for(a))
+        if a.temp is not None: env["TEMP"] = str(a.temp)
+    # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
+    # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
+    # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
+    # user's session ran itself out of memory with the flag apparently set.
+    if arch in ("deepseek_v4", "kimi"):
         if a.ram: env["RAM_GB"] = str(a.ram)
+    if arch == "deepseek_v4":
         if a.ctx: env["CTX"] = str(a.ctx)
+        # Speculation stays opt-in. Real multi-turn chat measured only 1/15
+        # accepted prompt-lookup candidates; recurrent-state replay dominated
+        # the visible decode. V4_DRAFT=5 remains available for repeated code.
+        env.setdefault("V4_DRAFT", "0")
+        # Full three-stage DSpark remains opt-in.  In a real multi-turn chat it
+        # accepted only 10/24 candidates and rejected-suffix replay turned a
+        # 14-token answer into 495 seconds.  V4_MTP=1 still enables A/B runs;
+        # exact zero-I/O prompt lookup above remains enabled by default.
+        env.setdefault("V4_MTP", "0")
+        env.setdefault("V4_MTP_DRAFT", "3")
+        env.setdefault("V4_MTP_GB", "0.45")
+        env.setdefault("V4_MTP_MISS", "96")
+        env.setdefault("V4_MTP_MIN", "3")
+        env.setdefault("V4_MTP_CONF", "0.55")
     return env
 
 def cuda_binary():
@@ -381,6 +441,12 @@ def env_for(a):
     if getattr(a, "topp", None): e["TOPP"]=str(getattr(a, "topp"))
     if getattr(a, "topk", None): e["TOPK"]=str(getattr(a, "topk"))
     if getattr(a, "temp", None) is not None: e["COLI_TEMP"]=str(getattr(a, "temp"))   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    e["COLI_POLICY"]=a.policy
+    if a.ram:  e["RAM_GB"]=str(a.ram)
+    e["NGEN"]=str(ngen_for(a))
+    if a.topp: e["TOPP"]=str(a.topp)
+    if a.topk: e["TOPK"]=str(a.topk)
+    if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
                                                         # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
     if getattr(a, "repin", None): e["REPIN"]=str(getattr(a, "repin"))
     if getattr(a, "ctx", None): e["CTX"]=str(getattr(a, "ctx"))
@@ -664,7 +730,7 @@ def cmd_build(a):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
     arch=model_arch(a.model) if a.model else "glm"
-    target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3",
+    target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3","olmoe":"olmoe",
             "deepseek_v4":"deepseek-v4"}[arch]
     sys.exit(subprocess.call(["make","-C",HERE,target]))
 
@@ -769,14 +835,29 @@ def cmd_tune(a):
         sys.exit(f"{C.yel}cannot create tuning plan:{C.r} {error}")
     a.auto_tier=True
     a.no_tune_profile=True
-    base_env=env_for(a)
-    prompt=f"[gMASK]<sop><|user|>{a.prompt}<|assistant|><think></think>"
+    # Dispatch like every other command. cmd_tune used to hardcode GLM: the
+    # banner read config.json and printed "DeepSeek V4 Flash", then calibration
+    # launched the GLM engine, which died on "this engine requires n_group=1"
+    # (#898). Same shape as #879, one command over -- the launcher naming a
+    # family it then mis-dispatched.
+    arch=model_arch(a.model)
+    engine=engine_for(a.model)
+    need_model(a.model,engine)
+    base_env=env_for_engine(a,arch) if arch!="glm" else env_for(a)
+    # The replay prompt has to be the engine's own template: GLM's [gMASK]<sop>
+    # markers are ordinary text to every other tokenizer, so the sweep would have
+    # measured a different workload than the one users run.
+    prompt=({"glm":     f"[gMASK]<sop><|user|>{a.prompt}<|assistant|><think></think>",
+             "inkling": f"<|user|>{a.prompt}<|assistant|>",
+             "kimi":    f"K3CHAT1\nM user {len(a.prompt)}\n{a.prompt}G 0\n\n",
+             "olmoe":   f"<|user|>\n{a.prompt}\n<|assistant|>\n",
+            }.get(arch, a.prompt))
     banner("tune · measured execution profile", model=a.model)
     print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
     print("  only quality-preserving scheduling knobs are eligible\n")
     try:
         profile,path=run_tune(
-            GLM,a.cap,base_env,plan,a.model,prompt,tokens=a.tokens,
+            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,tokens=a.tokens,
             repeats=a.repeats,timeout=a.timeout,min_gain=a.min_gain,
             profile_dir=a.profile_dir,
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
@@ -814,7 +895,7 @@ def cmd_run(a):
                 cmd += ["--prompt-file",prompt_path]
             else:
                 cmd.append(prompt)
-            cmd += ["--max-tokens",str(a.ngen)]
+            cmd += ["--max-tokens",str(ngen_for(a,interactive=True))]
             if a.ram: cmd += ["--memory-gb",str(a.ram)]
             if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
             result=subprocess.call(cmd,env=env_for_engine(a,arch))
@@ -823,6 +904,17 @@ def cmd_run(a):
                 try: os.unlink(prompt_path)
                 except OSError: pass
         sys.exit(result)
+    if arch=="olmoe":
+        # olmoe.c now speaks the gateway's SERVE protocol too (`coli chat`/
+        # `coli web`/`coli serve` use it), but `coli run` predates that and
+        # its one-shot contract is simpler without it: feed exactly one turn
+        # over the engine's plain stdin chat loop and close stdin, the engine
+        # emits the answer and exits cleanly. No reason to spin up the gateway
+        # for a single non-interactive prompt.
+        result=subprocess.run(
+            [engine, str(a.cap if a.cap is not None else 16), "8"],
+            input=prompt+"\n", text=True, env=env_for_engine(a,arch), check=False)
+        sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.
@@ -876,7 +968,7 @@ def chat_attached(a, base, model_id):
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         msgs.append({"role":"user","content":msg})
         body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
-                         "max_tokens":a.ngen}).encode()
+                         "max_tokens":ngen_for(a,interactive=True)}).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
@@ -960,7 +1052,8 @@ def cmd_chat(a):
         engine=engine_for(a.model)
         need_model(a.model,engine)
         model_id=("kimi-k3-colibri" if arch=="kimi" else
-                  "inkling-colibri" if arch=="inkling" else "deepseek-v4-colibri")
+                  "inkling-colibri" if arch=="inkling" else
+                  "olmoe-colibri" if arch=="olmoe" else "deepseek-v4-colibri")
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -970,7 +1063,7 @@ def cmd_chat(a):
         # legacy 8, an explicit value -- 0 included -- passes verbatim).
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
-             "--host","127.0.0.1","--port","8000","--max-tokens",str(a.ngen)]
+             "--host","127.0.0.1","--port","8000","--max-tokens",str(ngen_for(a,interactive=True))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -1110,8 +1203,8 @@ def cmd_chat(a):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
                 if st.get("interrupted"):
                     print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
-                elif st["tok"]>=a.ngen:
-                    print(f"  {C.yel}…stopped at --ngen ({a.ngen}); type :more to continue the response{C.r}")
+                elif st["tok"]>=ngen_for(a,interactive=True):
+                    print(f"  {C.yel}…stopped at --ngen ({ngen_for(a,interactive=True)}); type :more to continue the response{C.r}")
                 print()
             else:
                 if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted{C.r}")
@@ -1143,10 +1236,11 @@ def cmd_serve(a):
     model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
                             "inkling-colibri" if arch=="inkling" else
                             "deepseek-v4-colibri" if arch=="deepseek_v4" else
+                            "olmoe-colibri" if arch=="olmoe" else
                             "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,a.ngen,engine,env_for_engine(a,arch),a.cors_origin,
+              a.cap,ngen_for(a,interactive=True),engine,env_for_engine(a,arch),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))
@@ -1209,13 +1303,30 @@ def cmd_web(a):
     if not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():
-            for _ in range(600):                    # the 744B engine takes minutes to load
-                time.sleep(2)
+            # No iteration cap. It used to be `for _ in range(600)` with a 2 s sleep --
+            # a 20-minute budget, sized when "the engine takes minutes to load" meant
+            # GLM. #854 reported Kimi K3 never opening the browser on a 256 GB Windows
+            # box, and the log explains itself: `[K3] init done in 2540.5s`. The thread
+            # gave up 22 minutes before the server first answered /health, so the
+            # message promising it opens automatically was simply false.
+            #
+            # A ceiling here can only ever be wrong in one direction: too low fails
+            # silently on a slow load, too high costs a sleeping daemon thread. The
+            # thread is a daemon, so it cannot outlive the server it is waiting for --
+            # there is nothing for the cap to protect against.
+            waited = 0
+            while True:
+                time.sleep(2); waited += 2
                 try:
-                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=2)
-                    webbrowser.open(url); return
+                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=5)
                 except OSError:
+                    # Say something once, rather than looking hung. A 93-layer K3 load
+                    # is 40+ minutes and the user has no way to tell waiting from stuck.
+                    if waited == 300:
+                        print(f"still loading; the dashboard will open at {url} when the "
+                              f"engine is ready (Ctrl-C to stop, or --no-browser to skip)")
                     continue
+                webbrowser.open(url); return
         threading.Thread(target=opener, daemon=True).start()
     print(f"dashboard: {url}  (opens automatically when the engine is ready)")
     cmd_serve(a)
@@ -1315,7 +1426,11 @@ def main():
     # legacy 8 (openai_server.cap_for_arch). An explicit --cap N -- 0 included --
     # reaches the engine verbatim; see colibri.c's coli_resolve_cap().
     common.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
-    common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
+    # default None, resolved per command by ngen_for() below. 1024 is a sensible
+    # safety net for a one-shot `coli run`; it is the wrong number for a session
+    # where the browser shows a "max output tokens" control, because the server
+    # clamps to it and the control silently does nothing above 1024 (#889).
+    common.add_argument("--ngen", type=int, default=None)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")

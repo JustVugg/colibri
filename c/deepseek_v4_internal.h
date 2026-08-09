@@ -56,6 +56,13 @@ int coli_st_read_tensor(const ColiSafetensorsIndex *index,
                         const ColiSafetensorsTensor *tensor, void *destination);
 int coli_st_read_at(const ColiSafetensorsIndex *index, int shard,
                     uint64_t offset, size_t length, void *destination);
+/* Large, transient SSD read: prefer the index's O_DIRECT twin and use an
+ * aligned bounce buffer, falling back to the ordinary buffered path. */
+int coli_st_read_at_streaming(const ColiSafetensorsIndex *index, int shard,
+                              uint64_t offset, size_t length,
+                              void *destination);
+int coli_st_streaming_direct_available(const ColiSafetensorsIndex *index,
+                                       int shard);
 int coli_st_prefetch_at(const ColiSafetensorsIndex *index, int shard,
                         uint64_t offset, size_t length);
 const char *coli_st_dtype_name(ColiSafetensorsDType dtype);
@@ -70,6 +77,11 @@ int coli_tensor_load_f32(ColiFloatTensor *output,
 void coli_float_tensor_free(ColiFloatTensor *tensor);
 
 typedef struct ColiV4Engine ColiV4Engine;
+
+/* Runtime-selected full DSpark profile, shared with the separately compiled
+ * generation unit. */
+extern int coli_v4_full_dspark_wanted;
+double coli_v4_dspark_cache_gb(void);
 
 /* ==== begin deepseek_v4_math.h ==== */
 
@@ -99,6 +111,17 @@ int coli_v4_rope_precompute(float *cosines, float *sines,
                             int dimension, int sequence_length,
                             int original_sequence_length, float base,
                             float factor, int beta_fast, int beta_slow);
+
+int coli_v4_rope_precompute_range(float *cosines, float *sines,
+                                  int dimension, int start_position,
+                                  int sequence_length,
+                                  int original_sequence_length, float base,
+                                  float factor, int beta_fast, int beta_slow);
+
+int coli_v4_rope_position(float *cosines, float *sines,
+                          int dimension, int position,
+                          int original_sequence_length, float base,
+                          float factor, int beta_fast, int beta_slow);
 
 int coli_v4_rope_apply(float *vectors, int vector_count, int dimension,
                        const float *cosines, const float *sines, int inverse);
@@ -135,6 +158,10 @@ typedef struct {
     ColiSafetensorsDType dtype;
     int rank;
     int64_t shape[COLI_ST_MAX_RANK];
+    /* Dense FP8 weights may be transposed inside each 8-row tile after load.
+     * This is an in-memory execution layout only; checkpoint bytes and scales
+     * remain unchanged. */
+    int packed_rows8;
 } ColiDeepSeekV4TensorSpec;
 
 typedef struct {
@@ -606,6 +633,7 @@ typedef struct {
     uint64_t target_expert_cache_bytes;
     int pin_slots_per_layer;
     uint64_t repin_interval;
+    uint64_t dspark_reserve_bytes;
 } ColiDeepSeekV4RuntimeOptions;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
@@ -628,6 +656,15 @@ struct ColiV4Engine {
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
     } dense_resident;
+    struct {
+        uint16_t *markov_w1;
+        uint16_t *markov_w2;
+        uint64_t bytes;
+        int rank;
+        int block_size;
+        int stage;
+        int enabled;
+    } dspark;
     char *owned_target_model_dir;
     int owns_experts;
     int owns_index;
@@ -664,6 +701,10 @@ struct ColiV4Session {
      * from that position instead of re-prefilling it. */
     kv_prefix fed;
     int prefix_reused;   /* reuse length of the request in flight, for stats */
+    uint64_t spec_attempts;
+    uint64_t spec_drafted;
+    uint64_t spec_accepted;
+    int spec_disabled;
 };
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */

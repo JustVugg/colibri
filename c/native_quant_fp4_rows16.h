@@ -6,7 +6,7 @@
 /* Targets with a rows16 fast kernel: the matvec entry points below return 0
  * and the engine may pack hot experts into the 16-row interleaved layout.
  * Elsewhere they return -1 and callers keep the flat reference path. */
-#if defined(__AVX512F__) || defined(__aarch64__)
+#if defined(__AVX512F__) || defined(__AVX2__) || defined(__aarch64__)
 #define COLI_FP4_ROWS16_KERNEL 1
 #endif
 

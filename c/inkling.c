@@ -527,23 +527,43 @@ static void load_cfg(Cfg *c, const char *snap) {
     }
     if (c->n_layers > MAXL) { fprintf(stderr,"n_layers %d > MAXL\n", c->n_layers); exit(1); }
 
+    /* SEC: these loops run to n_layers -- a number from config.json, up to
+     * MAXL -- while indexing a JSON array whose length is a different, equally
+     * attacker-chosen number. "num_hidden_layers": 66 with a one-element
+     * layer_types[] read kids[1..65] past a malloc'd array that starts at
+     * capacity 8, then dereferenced whatever was there as a string. config.json
+     * alone was enough; no weights and no valid snapshot were needed.
+     *
+     * A short array now means "not specified for these layers", so the loop
+     * falls through to the same default it would have used had the key been
+     * absent. The element type is checked too: kids[i]->str is a union member
+     * that is only a valid pointer when t == J_STR. */
+    #define LT_STR(arr, i) \
+        ((arr) && (arr)->t == J_ARR && (i) < (arr)->len && \
+         (arr)->kids[i] && (arr)->kids[i]->t == J_STR ? (arr)->kids[i]->str : NULL)
+
     /* attention layer types: explicit layer_types[] > local_layer_ids[] > (i+1)%6 rule */
     jval *lt = json_get(r,"layer_types");
     jval *ll = json_get(r,"local_layer_ids");
     for (int i = 0; i < c->n_layers; i++) {
-        if (lt && lt->t == J_ARR) c->local[i] = (strcmp(lt->kids[i]->str,"hybrid_sliding")==0);
+        const char *ltype = LT_STR(lt, i);
+        if (ltype) c->local[i] = (strcmp(ltype,"hybrid_sliding")==0);
         else if (ll && ll->t == J_ARR) {
             c->local[i] = 0;
-            for (int j = 0; j < ll->len; j++) if ((int)ll->kids[j]->num == i) { c->local[i] = 1; break; }
+            for (int j = 0; j < ll->len; j++)
+                if (ll->kids[j] && ll->kids[j]->t == J_NUM &&
+                    (int)ll->kids[j]->num == i) { c->local[i] = 1; break; }
         } else c->local[i] = ((i + 1) % 6) != 0;
     }
     /* MLP types: explicit mlp_layer_types[] > dense_mlp_idx (first k layers dense) */
     jval *mt = json_get(r,"mlp_layer_types");
     int dense_idx = (int)jnum(r,"dense_mlp_idx",0);
     for (int i = 0; i < c->n_layers; i++) {
-        if (mt && mt->t == J_ARR) c->sparse[i] = (strcmp(mt->kids[i]->str,"sparse")==0);
+        const char *mtype = LT_STR(mt, i);
+        if (mtype) c->sparse[i] = (strcmp(mtype,"sparse")==0);
         else c->sparse[i] = (i >= dense_idx);
     }
+    #undef LT_STR
     free(buf); free(arena);
 }
 
@@ -557,7 +577,18 @@ static float *load_t(Model *m, const char *name) {
 }
 static float load_scalar(Model *m, const char *name, float dflt) {
     if (!st_has(&m->S, name)) return dflt;
-    float v; st_read_f32(&m->S, name, &v, 0); return v;
+    /* SEC: `v` is four bytes on the stack, and st_read_f32 writes as many as
+     * the FILE says the tensor holds -- it validates the header against itself
+     * (numel*esz == nbytes) and cannot know the destination size. A crafted
+     * snapshot declaring e.g. model.layers.0.mlp.gate.global_scale as F32
+     * shape [4096] therefore drops 16 KiB of attacker bytes over this frame
+     * and its return address; the reported crash had RSP fully controlled.
+     *
+     * st_read_f32_cap is the same read with the caller's capacity passed in.
+     * A scalar's capacity is 1. Anything larger is a hostile or corrupt file
+     * and stops the load, which is the behaviour every other bounds check in
+     * st.h already has. */
+    float v; st_read_f32_cap(&m->S, name, &v, 1, 0); return v;
 }
 
 /* chunked pread: a single pread caps at ~2.1 GB on Linux, and the bf16
@@ -1202,7 +1233,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 float ch = sigmoidf(lg[e]) + l->rbias[e];
                 if (!taken && ch > bv) { bv = ch; best = e; }
             }
-            si[kk] = best;
+            /* SEC: all-NaN logits leave best at -1, and lg[-1] / eusage[-1] are
+             * next. See rt_router_pick in route_trace.h. */
+            si[kk] = rt_router_pick(best, kk, E, layer);
         }
         /* combine weights: sigmoids of the raw logits of (topK routed + shared),
          * normalized to sum 1 over all K+ns, x route_scale x gate.global_scale */
@@ -1661,6 +1694,15 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     int gen = len - np;
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). Printed to stdout, which is what autotune captures.
+     * Tokens and seconds, not tok/s: the ratio is derived by the caller at full
+     * precision (#852 -- two decimals of tok/s is one significant digit at the
+     * rates this engine runs at). */
+    printf("TUNE decode: %d tokens in %.3fs\n", gen > 1 ? gen - 1 : gen, dt);
     double wall = now_s() - t0;
 #ifdef COLI_METAL
     if (g_metal) {
@@ -1761,7 +1803,21 @@ static int serve_read_cmd(const char *cur_id) {
         int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
         /* 6th field (optional, backward compatible): DMel byte count appended
          * verbatim after the text payload — frames x mel_bins u8 levels */
-        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26)) {
+        /* SEC: max_tok was the one field nobody validated, and it is the one
+         * the context check is built on. prompt_reject() asks
+         * `np + want > ctx_max`; a negative `want` makes that sum smaller than
+         * np, so the check passes for any prompt length. kv_alloc() is then
+         * sized on the same np + max_tok + 8 and comes out shorter than the
+         * prompt, and prefill writes past the end of the K/V cache -- a heap
+         * overflow whose length and contents both follow from the request.
+         *
+         * The official gateway forces a positive integer, so this is not
+         * reachable through openai_server.py. The SERVE protocol is public and
+         * anything bridging it (socat, a custom gateway, a sidecar) exposes it
+         * directly, so the check belongs here, next to the one plen already
+         * has, rather than in one of its callers. */
+        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
+            max_tok < 1 || max_tok > (1<<20)) {
             printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
         (void)slot;
         char *pl = malloc((size_t)plen + 1);

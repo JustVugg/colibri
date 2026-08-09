@@ -6,7 +6,9 @@
  *   - converte sempre in float32 in uscita (BF16/F16/F32 supportati). */
 #ifndef ST_H
 #define ST_H
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

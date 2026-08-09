@@ -190,3 +190,31 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .prof-tiles { grid-template-columns: 1fr 1fr; }
   .prof-charts { grid-template-columns: 1fr; }
 }
+
+/* --- markdown in the chat pane -------------------------------------------
+ * Matches what coli chat's TUI renders: fenced code in a labelled box, real
+ * bold, coloured inline code, headings and bullets. The pane sets
+ * white-space: pre-wrap for raw text; markdown blocks manage their own
+ * whitespace, so .md resets it and the code block turns it back on. */
+.md { white-space: normal; }
+.md > * + * { margin-top: 10px; }
+.md-p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.md-h { margin: 0; color: var(--primary); font-weight: 700; font-size: 14px; letter-spacing: .01em; }
+.md-li { display: grid; grid-template-columns: 14px minmax(0,1fr); gap: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.md-bullet { color: var(--primary); line-height: 1.75; }
+.md-inline { padding: 1px 5px; border: 1px solid var(--border); border-radius: 5px; background: rgba(255,255,255,.04); color: #f0b429; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+.md-code { border: 1px solid var(--border); border-radius: 9px; background: rgba(0,0,0,.28); overflow: hidden; }
+.md-code-head { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; border-bottom: 1px solid var(--border); color: #7f8c91; font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.md-code-head button { display: grid; place-items: center; padding: 3px; border: 0; border-radius: 5px; background: transparent; color: #7f8c91; cursor: pointer; }
+.md-code-head button:hover { color: #d8e0e2; background: rgba(255,255,255,.06); }
+/* overflow-x on the pre, never on the page: a long line must scroll inside
+ * its own box rather than widening the chat column. */
+.md-code pre { margin: 0; padding: 10px 12px; overflow-x: auto; }
+.md-code code { display: block; white-space: pre; color: #cfd8db; font-size: 12.5px; line-height: 1.6; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.tok-kw  { color: #7aa2f7; }
+.tok-str { color: #9ece6a; }
+.tok-num { color: #ff9e64; }
+.tok-com { color: #6b7780; font-style: italic; }
+.md-caret { display: inline-block; width: 7px; height: 13px; margin-left: 1px; background: var(--primary); opacity: .75; animation: md-blink 1s steps(2) infinite; vertical-align: text-bottom; }
+@keyframes md-blink { 50% { opacity: 0; } }

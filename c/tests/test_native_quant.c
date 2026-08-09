@@ -97,6 +97,32 @@ int main(void) {
         return 1;
     for (int i = 0; i < 128; i++)
         if (!close_enough(fp8_output[i], 128.0f)) return 1;
+
+    /* Flash layout: eight rows are interleaved by column.  It must be
+     * numerically equivalent to the guarded row-major reference path while
+     * exercising different values in every lane. */
+    uint8_t row_major[8 * 128], rows8[8 * 128];
+    float row_major_out[8], rows8_out[8];
+    for (int row = 0; row < 8; row++)
+        for (int column = 0; column < 128; column++)
+            row_major[row * 128 + column] =
+                (uint8_t)(0x30 + ((row + column) & 15));
+    for (int column = 0; column < 128; column++)
+        for (int row = 0; row < 8; row++)
+            rows8[column * 8 + row] = row_major[row * 128 + column];
+    ColiTensorView row_major_view = {
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
+        row_major, fp8_scales, sizeof(row_major), sizeof(fp8_scales),
+        8, 128, 128, 128
+    };
+    ColiTensorView rows8_view = row_major_view;
+    rows8_view.data = rows8;
+    rows8_view.block_rows = 8;
+    if (coli_fp8_matvec_ref(row_major_out, &row_major_view, input) != 0 ||
+        coli_fp8_matvec_ref(rows8_out, &rows8_view, input) != 0)
+        return 1;
+    for (int row = 0; row < 8; row++)
+        if (!close_enough(rows8_out[row], row_major_out[row])) return 1;
     puts("native quant tests: ok");
     return 0;
 }

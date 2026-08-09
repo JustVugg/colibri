@@ -31,6 +31,9 @@ typedef struct {
     int moe_intermediate_size;
     int num_hash_layers;
     int num_nextn_predict_layers;
+    int dspark_block_size;
+    int dspark_noise_token_id;
+    int dspark_markov_rank;
     int hc_mult;
     int hc_sinkhorn_iters;
     int vocab_size;
@@ -81,7 +84,7 @@ typedef struct {
     int context_tokens;             /* 0 => 4096 */
     int pin_slots_per_layer;        /* -1 => auto */
     uint64_t repin_interval;        /* 0 => auto */
-    int no_dspark;                  /* compatibility no-op in target-only engine */
+    int no_dspark;                  /* disable speculative draft/verification */
 } ColiV4EngineOpenOptions;
 
 typedef struct {
@@ -119,7 +122,7 @@ typedef struct {
 typedef struct {
     int max_new_tokens;      /* required; clamped by session cap */
     int stop_at_sentence;
-    int no_dspark;           /* compatibility no-op in target-only engine */
+    int no_dspark;           /* disable speculative draft/verification */
 } ColiV4SessionGenerateOptions;
 
 typedef struct {
@@ -128,6 +131,8 @@ typedef struct {
     int eos_stopped;
     double time_to_first_token_sec;
     double decode_sec;
+    uint64_t speculative_drafted;
+    uint64_t speculative_accepted;
 } ColiV4SessionGenerateStats;
 
 /* Return non-zero to stop generation. */

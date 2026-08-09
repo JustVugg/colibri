@@ -161,8 +161,20 @@ def check_session(
             f"session {name}: length mismatch: "
             f"prompt={prompt_count} generated={generated_count}"
         )
-    if compatibility_flag and "compatibility no-op" not in result.stderr:
-        raise AssertionError("--no-dspark compatibility notice was not emitted")
+    if compatibility_flag:
+        # --no-dspark used to be a no-op that only printed a notice, because the
+        # engine was target-only and had nothing to disable. It now disables
+        # verified speculative drafting for real, so asserting the old notice
+        # would require the engine to keep claiming it does nothing.
+        #
+        # What matters either way is that the run stays token-exact, which the
+        # checks above already prove, and that the flag actually suppresses
+        # speculation: with drafting off no attempt is ever made, so the
+        # counters the engine prints at exit must be zero.
+        attempts = re.search(r"v4_dspark attempts=(\d+)", result.stderr)
+        if attempts and int(attempts.group(1)) != 0:
+            raise AssertionError(
+                f"--no-dspark still attempted {attempts.group(1)} speculations")
     print(f"PASS target session {name}: exact IDs and exact length")
     return actual["full_ids"]
 
@@ -215,6 +227,20 @@ def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) ->
         ],
         env=dict(os.environ, CTX="768"),
     )
+    # `coli tune` compares candidates from tokens-and-elapsed, and before #898
+    # only the GLM engine emitted a parseable line -- so the tuner ran GLM at
+    # every checkpoint. Assert the line here rather than trusting a one-off
+    # manual check: the first placement of it compiled fine and sat in a branch
+    # text mode never reaches, so it never printed and nothing noticed.
+    tune = re.search(r"TUNE decode: (\d+) tokens in ([0-9.]+)s", result.stdout)
+    if not tune:
+        raise AssertionError(
+            f"target CLI: no TUNE decode line on stdout: {result.stdout!r}"
+        )
+    if int(tune.group(1)) != 1 or not float(tune.group(2)) > 0:
+        raise AssertionError(f"target CLI: implausible TUNE decode line {tune.group(0)!r}")
+    print("PASS target CLI: TUNE decode line is present and parseable")
+
     stats = re.search(r"v4_tokens prompt=(\d+) generated=(\d+)", result.stderr)
     if not stats or tuple(map(int, stats.groups())) != (prompt_tokens, 1):
         raise AssertionError(

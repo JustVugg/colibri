@@ -73,6 +73,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tens
  * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
+/* y[S,O] = x[S,I] @ dequant_mxfp4(W[O,I])^T, fmt=7 (OCP microscaling FP4).
+ * q4 is [O, ceil(I/2)] e2m1 nibbles, e8s is [O, ceil(I/32)] ue8m0 exponents --
+ * BYTES, not floats, which is why this is not folded into coli_cuda_matmul.
+ * Stateless: weights are uploaded per call, matching the streaming expert tier
+ * Kimi K3 uses. Returns 1 on success, 0 (y untouched) to fall back to CPU. */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
+                                               const unsigned char *q4,
+                                               const unsigned char *e8s,
+                                               int S, int I, int O);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,

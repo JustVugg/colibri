@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì — tiny engine, immense model">
 </p>
 
 <p align="center">
@@ -18,9 +18,10 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
-`coli serve` / `coli web` front end. [Full roster ↓](#other-supported-models)
+Five families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T), **DeepSeek V4 Flash** (284B) and **OLMoE** (7B) — one C file each, the
+same `coli chat` / `coli serve` / `coli web` front end.
+[Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
 > platform.** Its primary goal is to pursue inference-side performance across
@@ -373,6 +374,7 @@ the model's `config.json`):
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
+> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 22 GB comfortable | not needed |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -383,6 +385,7 @@ the model's `config.json`):
 | **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
+| **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
@@ -462,22 +465,35 @@ Two things that differ per model, both documented in the per-model page:
 
 ## DeepSeek V4
 
-The experimental CPU path for **DeepSeek V4 Flash** uses native FP4 experts,
-automatic RAM planning, shared `st.h` / `quant.h` infrastructure, and a
-persistent target engine. DSpark is intentionally kept for a separate stacked
-follow-up. The target engine is supported on x86-64/aarch64 Linux and
-Windows/MSYS2.
+**DeepSeek V4 Flash** streams the official checkpoint with no conversion: routed
+experts stay **native fp4**, the dense set stays **fp8-e4m3** with UE8M0 block
+scales. MLA + DSA sparse attention, 43 layers, 256 routed experts plus one
+shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2.
 
 ```bash
 cd c
 make deepseek-v4
-python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
-  "What is the capital of France?"
-# The same model also works with: coli chat / coli serve / coli web
+python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
+# also: coli run / coli serve / coli web
 ```
 
-See [docs/deepseek-v4.md](docs/deepseek-v4.md) for status, checkpoint
-validation, unified CLI/server usage, and the generated tiny independent oracle.
+Greedy decode, one KV slot; tools and grammar are not wired up yet.
+
+**Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
+touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`
+is the single most valuable knob, and it changes speed only, never output.
+
+**Speculative drafting exists and is off.** DSpark's markov drafter and full MTP
+are both implemented and verified: a draft can save forward passes but never
+change a token, because every accepted token is still the target's own argmax.
+Measured on real multi-turn chat, they accepted 1 in 15 and 10 in 24, and the
+rejected-suffix replay of this engine's recurrent attention state cost more than
+the drafts saved — one 14-token answer took 495 seconds. So `V4_DRAFT` and
+`V4_MTP` default to `0` and the code stays, with the numbers beside it, for
+whoever retries this on faster storage.
+
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for checkpoint validation, the
+generated tiny independent oracle, and the full knob list.
 
 ## What's next
 
@@ -509,24 +525,46 @@ today its numbers come from a community of real machines. If it's useful to you:
 ```
 Makefile                  root build/check entry point
 c/
-├── glm.c                 single-file GLM engine
-├── st.h, tok.h, json.h   runtime headers
-├── backend_cuda.*        optional CUDA tier
+├── colibri.c             GLM-5.2 engine  (make glm)
+├── inkling.c             Inkling engine  (make inkling)
+├── kimi_k3.c             Kimi K3 engine  (make kimi_k3)
+├── deepseek_v4.c         DeepSeek V4 Flash engine  (make deepseek-v4)
+├── olmoe.c               OLMoE engine  (make olmoe)
+│
+├── st.h                  safetensors index and range reads
+├── quant.h               canonical container decoders
+├── tok.h, json.h         tokenizer and JSON parser
+├── compat.h              Windows/macOS shims (POSIX names, one place)
+├── expert_store.h        streaming expert cache
+├── route_trace.h         routing telemetry and .coli_usage, engine-agnostic
+├── kv_prefix.h           KV prefix reuse across turns
+│
+├── backend_cuda.*        optional CUDA tier   (CUDA=1)
+├── backend_metal.*       optional Metal tier  (METAL=1)
+├── backend_vulkan.*      optional Vulkan tier (VULKAN=1)
+│
 ├── Makefile              build and local checks
 ├── coli                  user-facing CLI
 ├── openai_server.py      OpenAI-compatible HTTP gateway
-├── setup.sh              one-command local setup
+├── resource_plan.py      RAM/VRAM planner behind `coli plan` and `coli doctor`
 ├── tools/                offline conversion, fixtures and benchmarks
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client)
 desktop/                  Tauri v2 desktop shell wrapping the web UI
-docs/                     reference docs, experiments, media, DeepSeek V4
+docker/                   container images
+docs/                     reference docs, experiments, media
 ```
 
-The runtime path intentionally stays flat and readable: `glm.c` plus its small
-headers. From the repository root, `make`, `make check`, and `make clean`
-delegate to the engine Makefile.
+**One `.c` per model family, over shared single headers.** An engine owns its
+architecture and nothing else; anything two engines both need — the safetensors
+reader, the container decoders, the tokenizer, the expert cache — lives in a
+header they both include, so a fix reaches all of them at once. That rule is not
+decorative: the defects that keep recurring here are the ones where a mechanism
+landed in one engine and never reached its siblings.
+
+From the repository root, `make`, `make check` and `make clean` delegate to the
+engine Makefile.
 
 ## Why "colibrì"
 

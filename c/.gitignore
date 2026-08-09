@@ -13,6 +13,8 @@ tools/librans_c.dylib
 tools/rans_c.dll
 tests/fuzz_rans
 tests/bench_omp_grain
+tests/mxfp4_ref.o
+mxfp4_cuda_test
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped
@@ -27,3 +29,4 @@ tests/test_int3
 tests/test_int3_load
 tests/test_tok_o200k
 tests/test_pipe_block
+tests/test_kimi_request_state

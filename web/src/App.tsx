@@ -35,6 +35,7 @@ import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
+import { Markdown } from "@/components/Markdown"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
@@ -356,7 +357,14 @@ export default function App() {
               {messages.map((item) => (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.content || <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
+                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.content
+                    ? (item.role === "assistant"
+                        /* User turns stay literal: the person typed those
+                           characters and expects to see them back. Only the
+                           model's output is markdown. */
+                        ? <Markdown source={item.content} />
+                        : item.content)
+                    : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
                 </article>
               ))}
               <div ref={bottomRef} />

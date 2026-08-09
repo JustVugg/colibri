@@ -320,6 +320,12 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
+static inline int compat_unsetenv(const char *name){
+    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+}
+#define unsetenv(name) compat_unsetenv(name)
+
 /* --- getenv_utf8: read an env var as UTF-8, not through the ANSI codepage ---
  * Plain getenv()/_environ are populated by the CRT from the ANSI-codepage view
  * of the process environment block, not UTF-8. A parent that hands the child a

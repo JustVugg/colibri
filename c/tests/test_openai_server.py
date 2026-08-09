@@ -19,8 +19,8 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
-                           split_thinking_reply, stop_policy)
+                           render_chat, render_chat_kimi, render_chat_olmoe, serve,
+                           split_thinking_reply, stop_policy, tune_child_env)
 
 
 class FakeEngine:
@@ -113,6 +113,37 @@ class TemplateTest(unittest.TestCase):
                                "content": "answer"}], enable_thinking=True),
             "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
+
+    def test_olmoe_renders_native_chat_template(self):
+        # Matches allenai/OLMoE-1B-7B-0125-Instruct's tokenizer_config.json
+        # chat_template exactly: one leading bos_token, per-role turns closed
+        # by a trailing newline, a prior (non-final) assistant turn also closed
+        # by eos_token before that newline (bos_token == eos_token ==
+        # "|||IP_ADDRESS|||" in this tokenizer), and a trailing
+        # "<|assistant|>\n" generation prompt.
+        prompt = render_chat_olmoe([
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Continue"},
+        ])
+        self.assertEqual(
+            prompt,
+            "|||IP_ADDRESS|||<|system|>\nBe terse.\n<|user|>\nHi\n"
+            "<|assistant|>\nHello|||IP_ADDRESS|||\n<|user|>\nContinue\n"
+            "<|assistant|>\n",
+        )
+
+    def test_olmoe_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_olmoe([{"role": "user", "content": "Hi"}],
+                              tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_olmoe([{"role": "tool", "content": "result"}])
+
+    def test_olmoe_rejects_empty_messages(self):
+        with self.assertRaisesRegex(APIError, "non-empty array"):
+            render_chat_olmoe([])
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
@@ -661,6 +692,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("glm", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
+        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -670,7 +702,22 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
+        self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
+        self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
         self.assertEqual(model_arch("/nonexistent"), "glm")
+
+    def test_direct_v4_server_gets_bounded_dspark_defaults(self):
+        env = {"V4_MTP_CONF": "0.7"}
+        with patch("resource_plan.physical_cpu_count", return_value=6), \
+             patch("openai_server.sys.platform", "linux"):
+            tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertEqual(env["OMP_PROC_BIND"], "close")
+        self.assertEqual(env["V4_DRAFT"], "0")
+        self.assertEqual(env["V4_MTP"], "0")
+        self.assertEqual(env["V4_MTP_DRAFT"], "3")
+        self.assertEqual(env["V4_MTP_GB"], "0.45")
+        self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
 
 
 class HTTPTest(unittest.TestCase):
@@ -712,9 +759,17 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
-    def test_profile_reports_recent_turns_without_auth(self):
-        with urlopen(self.base + "/profile", timeout=2) as response:
-            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+    def test_profile_requires_auth(self):
+        """/profile is served before require_auth(), so it needs its own gate.
+
+        This test previously asserted the opposite -- that the telemetry was
+        readable without a key. That was not a client requirement: the web
+        dashboard sends `Authorization: Bearer` to /profile exactly as it does
+        to /health and /experts (web/src/lib/api.ts). The turns carry prompt and
+        completion token counts and per-phase timings for the last 120 requests,
+        which describes what the operator is running and how much of it, so an
+        anonymous caller now gets the same empty shape those two endpoints give.
+        """
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
                 "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
@@ -722,7 +777,11 @@ class HTTPTest(unittest.TestCase):
         self.engine.profile_seq = 1
         try:
             with urlopen(self.base + "/profile", timeout=2) as response:
-                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+                self.assertEqual(json.load(response), {"seq": 0, "turns": []},
+                                 "unauthenticated caller received telemetry")
+            with self.request("/profile") as response:
+                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]},
+                                 "authenticated caller lost access")
         finally:
             del self.engine.profile, self.engine.profile_seq
 
@@ -908,6 +967,47 @@ class ClientHangupTest(unittest.TestCase):
     def test_the_server_still_answers_afterwards(self):
         """The real damage would be a handler thread lost to the exception."""
         self._hang_up_after_request("/health")
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
+
+    def _abort(self, *args):
+        """Windows' spelling of the same disconnect, raised where it really lands.
+
+        In #854's log the traceback runs do_GET -> send_json -> end_headers ->
+        flush_headers -> wfile.write -> sendall, so raising from end_headers
+        reproduces the exact shape on any platform.
+        """
+        raise ConnectionAbortedError(
+            10053, "An established connection was aborted by the software in your "
+                   "host machine")
+
+    def test_windows_aborted_connection_is_not_an_error(self):
+        """ConnectionAbortedError is a SIBLING of BrokenPipeError and
+        ConnectionResetError under ConnectionError, not a subclass of either --
+        so catching the pair caught the POSIX spellings and let the Windows one
+        escape. #854 is pages of WinError 10053 tracebacks from a healthy start.
+        """
+        self.assertFalse(
+            issubclass(ConnectionAbortedError, (BrokenPipeError, ConnectionResetError)),
+            "the old except clause would have covered this; the test proves nothing")
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass                      # the client sees a broken response; that is fine
+            time.sleep(0.3)
+        self.assertEqual(self.errors, [],
+                         "WinError 10053 surfaced as a server error (#854)")
+
+    def test_the_server_survives_an_aborted_connection(self):
+        """Same as the hangup case: the damage is a lost handler, not the log."""
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass
+            time.sleep(0.3)
         with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
                      timeout=2) as response:
             self.assertEqual(json.load(response)["status"], "ok")
@@ -1653,6 +1753,112 @@ class ConversationCacheSlotTest(unittest.TestCase):
     def test_deterministic(self):
         conv = self._conv("same question", "same answer", "again")
         self.assertEqual(conversation_cache_slot(conv, 8), conversation_cache_slot(conv, 8))
+
+
+class ConnectionLimitTest(unittest.TestCase):
+    """Bounds on the accept loop, which nothing bounded before.
+
+    ThreadingHTTPServer spawns a thread per connection with no ceiling, and
+    `timeout` is per socket operation, so it restarts on every byte: a client
+    dripping one byte kept a thread and a slot forever. Threads at 8 MiB of
+    stack each made that a memory-exhaustion DoS, reachable before any Host
+    check or auth.
+    """
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        APIServer.MAX_CONNECTIONS = 6
+        APIServer.MAX_CONNECTIONS_PER_IP = 3
+        APIHandler.READ_DEADLINE = 2
+        self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS", 64)
+        self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS_PER_IP", 8)
+        self.addCleanup(setattr, APIHandler, "READ_DEADLINE", 30)
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "m", None, 16, kv_slots=1)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.scheduler.close)
+        self.port = self.server.server_port
+        self.held = []
+        self.addCleanup(self._drop_all)
+
+    def _drop_all(self):
+        for sock in self.held:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _dribble(self, count):
+        """Open connections that send a partial request line and never finish."""
+        for _ in range(count):
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port), 2)
+                sock.settimeout(2)
+                sock.sendall(b"GET /health HTTP/1.1\r\n")
+                self.held.append(sock)
+            except OSError:
+                pass
+        time.sleep(0.4)
+
+    def test_slowloris_cannot_grow_threads_without_bound(self):
+        self._dribble(40)
+        self.assertLessEqual(self.server._conn_live, APIServer.MAX_CONNECTIONS)
+
+    def test_one_address_cannot_take_every_slot(self):
+        """A global cap alone only turns exhaustion into starvation."""
+        self._dribble(40)
+        self.assertLessEqual(self.server._conn_live,
+                             APIServer.MAX_CONNECTIONS_PER_IP)
+        self.assertLess(self.server._conn_live, APIServer.MAX_CONNECTIONS,
+                        "one source filled the server cap")
+
+    def test_dripping_connections_are_reclaimed(self):
+        """The cumulative deadline, which the per-operation timeout is not."""
+        self._dribble(10)
+        self.assertGreater(self.server._conn_live, 0)
+        time.sleep(APIHandler.READ_DEADLINE + 1.5)
+        self.assertEqual(self.server._conn_live, 0,
+                         "dripping connections were never reclaimed")
+
+
+class ReasoningEffortTest(unittest.TestCase):
+    """render_chat mapped every level except "high" onto Max (#809).
+
+    The endpoint accepts none/minimal/low/medium/high/xhigh. Four of the five
+    that enable thinking rendered Max, so a client asking for `minimal` got
+    more reasoning than one asking for `high` -- and on a single machine
+    unrequested reasoning spends the token budget before the answer starts.
+    """
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def effort(self, level):
+        import re
+        text = render_chat(self.MESSAGES, enable_thinking=True,
+                           reasoning_effort=level)
+        found = re.search(r"Reasoning Effort: (\w+)", text)
+        return found.group(1) if found else None
+
+    def test_levels_are_distinct_and_ordered(self):
+        rendered = [self.effort(l) for l in
+                    ("minimal", "low", "medium", "high", "xhigh")]
+        rank = {"Low": 0, "Medium": 1, "High": 2, "Max": 3}
+        scores = [rank[r] for r in rendered]
+        self.assertEqual(scores, sorted(scores), rendered)
+        self.assertLess(scores[0], scores[-1],
+                        "minimal and xhigh render the same effort")
+
+    def test_minimal_is_not_max(self):
+        """The reported symptom, pinned on its own."""
+        self.assertNotEqual(self.effort("minimal"), "Max")
+        self.assertNotEqual(self.effort("low"), "Max")
+        self.assertNotEqual(self.effort("medium"), "Max")
+
+    def test_thinking_off_emits_no_effort_line(self):
+        text = render_chat(self.MESSAGES, enable_thinking=False,
+                           reasoning_effort="xhigh")
+        self.assertNotIn("Reasoning Effort", text)
 
 
 if __name__ == "__main__":

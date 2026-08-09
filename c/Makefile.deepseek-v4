@@ -28,7 +28,7 @@ endif
 ifneq ($(IS_WIN),)
 CC = gcc
 ARCH ?= x86-64-v3
-CFLAGS = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
+CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
@@ -38,13 +38,19 @@ V4_BINARY := deepseek_v4.exe
 else
 CC = gcc
 ARCH ?= native
-CFLAGS = -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
+CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
+endif
+
+LTO ?= 1
+ifeq ($(LTO),1)
+CFLAGS += -flto
+LDFLAGS += -flto
 endif
 
 include Makefile.deepseek-v4.units
@@ -60,7 +66,7 @@ $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h st.h json.h compat.h tensor.h quant.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@

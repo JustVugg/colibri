@@ -47,7 +47,19 @@ def analyze_model(model):
     dense_bytes = 0
     expert_groups = {}
     for shard in shards:
-        for name, size in _tensor_sizes(shard):
+        try:
+            sizes = list(_tensor_sizes(shard))
+        except OSError as error:
+            # Name the file. An OSError raised by read() on an already-open
+            # stream carries no filename, so `coli doctor` reported bare
+            # "[Errno 5] Input/output error" for a bad sector or a dropped
+            # network mount — indistinguishable from a corrupt download, which
+            # is what the reporter in #191 assumed and re-downloaded 372 GB to
+            # rule out. Which shard failed is the whole diagnosis: one file is
+            # storage, all of them is the mount.
+            raise OSError(error.errno,
+                          f"{error.strerror or error}: {shard}") from error
+        for name, size in sizes:
             match = EXPERT_RE.search(name)
             if match:
                 key = tuple(map(int, match.groups()))

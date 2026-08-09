@@ -83,6 +83,27 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
+/* Declared unconditionally (not just under COLI_METAL): on a non-Metal build it just sits
+ * at 0 forever, which is the correct value there (no Metal backend => never enabled). Kept
+ * outside the #ifdef so portable code — e.g. kvb_fmt_gate_notice below — can read "is Metal
+ * active" without needing COLI_METAL (and the backend_metal.h / Metal framework link it
+ * would drag in) on every platform's test build. */
+static int g_metal_enabled;
+/* COLI_SLAB_SHRINK=0 disables the #856 slab shrink at runtime.
+ *
+ * The shrink stops a wide slab migrating into a narrow row through the
+ * ws[]<->LRU swap, which is what lets the cap be priced per row. It is also the
+ * only new allocator work in that change: a slot alternating between the int8
+ * MTP row and the int4 main rows reallocates instead of staying wide, and at
+ * ~19-38 MB glibc serves that with mmap/munmap plus page faults on first touch.
+ * #869 stated that cost was unmeasured; #885 then measured five runs on an
+ * int4-g64 container at 1.12/0.98/1.11/0.97/1.05 -- spread 0.15, bimodal --
+ * against <=0.02 on every other arm of the same box.
+ *
+ * This exists so that hypothesis can be A/B'd without a rebuild. Setting it to 0
+ * restores grow-only and re-introduces the migration, so the per-row cap becomes
+ * optimistic again: a diagnostic, not a supported configuration. */
+static int g_slab_shrink = 1;
 #ifdef COLI_METAL
 #include "backend_metal.h"
 /* No <omp.h> here: the guarded include above already provides it under _OPENMP
@@ -91,8 +112,11 @@ static inline void omp_set_num_threads(int n){ (void)n; }
  * stock macOS -- exactly the platform this backend targets -- even though the
  * Makefile advertises the single-threaded path ("libomp not found: building
  * single-threaded"). */
-static int g_metal_enabled;
+/* g_metal_enabled is declared unconditionally above (#587) so portable code can
+ * read it; the duplicate that used to sit here was a tentative definition the
+ * linker merged, hence no warning and no symptom. */
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
+static int g_moe_exact=0;
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
 static const float *g_pre_sh;
 #endif
@@ -199,7 +223,15 @@ typedef struct {
 #ifdef COLI_VULKAN
     ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
 #endif
-    int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+    int cuda_eligible, cuda_device;   /* resident tensor, never a reused expert slot */
+    /* #767: the row count of the smallest call that has failed on this tensor, or 0 if
+     * none has. A CUDA failure here is almost always a scratch cudaMalloc under memory
+     * pressure, and that pressure scales with S -- so it is a property of the CALL, not
+     * of the tensor. Recording S instead of a boolean lets a narrower call retry: a
+     * prefill chunk that OOMs at S=512 does not condemn decode at S=1. A genuine device
+     * fault fails at S=1, records 1, and is never retried -- the old behaviour, reached
+     * as a special case of the general rule rather than as a separate one. */
+    int cuda_fail_s;
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -519,22 +551,27 @@ static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
-    t->cuda_failed=0;
+    t->cuda_fail_s=0;
 }
-/* #687: a resident tensor that fails to upload is disabled PERMANENTLY and silently
- * falls back to CPU. The per-tensor line below is easy to lose in a busy log, and the
- * end state -- GPU fully allocated, ~0% useful -- reads as healthy. Count them and say
- * it once, loudly, naming the knob that actually fixes it. */
+/* #687: a resident tensor that fails to upload falls back to CPU silently. The
+ * per-tensor line below is easy to lose in a busy log, and the end state -- GPU fully
+ * allocated, ~0% useful -- reads as healthy. Count them and say it once, loudly,
+ * naming the knob that actually fixes it.
+ *
+ * Since #767 the fallback is per-width rather than permanent (see cuda_fail_s), so a
+ * tensor counted here may recover on its own at a narrower S. The count is still worth
+ * shouting about: it means the tier left too little VRAM for the prompt being run. */
 static int g_cuda_disabled_n;
 static void cuda_disabled_note(void){
     enum { CUDA_DISABLED_LOUD_AT = 8 };
     if(++g_cuda_disabled_n != CUDA_DISABLED_LOUD_AT) return;
     fprintf(stderr,
-        "[CUDA] ***** %d resident tensors have been disabled and moved to CPU *****\n"
-        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is now\n"
-        "[CUDA] on CPU: this run will be at or below CPU speed while the card stays\n"
-        "[CUDA] allocated. The usual cause is the expert tier claiming all VRAM and\n"
-        "[CUDA] leaving nothing for the lazily-uploaded resident tensors.\n"
+        "[CUDA] ***** %d resident tensors have fallen back to CPU *****\n"
+        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is\n"
+        "[CUDA] running on CPU at this prompt width: expect at or below CPU speed while\n"
+        "[CUDA] the card stays allocated. They are retried at narrower S, so decode may\n"
+        "[CUDA] recover even when prefill does not. The usual cause is the expert tier\n"
+        "[CUDA] claiming all VRAM and leaving nothing for the lazily-uploaded tensors.\n"
         "[CUDA] Fix: set an explicit CUDA_EXPERT_GB below the auto value (leave room\n"
         "[CUDA] per device for dense + attention + workspace). See issue #687.\n",
         CUDA_DISABLED_LOUD_AT);
@@ -600,8 +637,8 @@ static void cuda_stats_print(void){
     /* #687: say it again at the end -- by now the per-tensor lines are thousands of
      * log lines back, and this is the number that explains a CPU-speed "GPU" run. */
     if(g_cuda_disabled_n) fprintf(stderr,
-        "[CUDA] %d tensors ran on CPU after failed uploads: this run did NOT use the GPU for "
-        "them. Lower CUDA_EXPERT_GB (#687).\n", g_cuda_disabled_n);
+        "[CUDA] %d tensors fell back to CPU after failed uploads at least once. Lower "
+        "CUDA_EXPERT_GB to leave room for them (#687, #767).\n", g_cuda_disabled_n);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
@@ -868,7 +905,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * fmt 1/2/4 in this build, so it fails CLOSED to the CPU branch below (matmul_fp8)
      * rather than being silently misread. coli_metal_gemm() also carries its own
      * internal fmt!=1&&fmt!=2&&fmt!=4 guard, so this is belt-and-braces. */
-    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||w->fmt==4) && !omp_in_parallel()){
+    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||(w->fmt==4&&!g_moe_exact)) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O,w->gs)) return;
     }
@@ -879,15 +916,18 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * cuda_boot): quant_matmul dispatches it by format, deriving the 128x128
      * block-scale geometry from the dims alone. Without the LUT (old DLL) it is
      * excluded up front — same silent-and-immediate idiom as fmt=5. */
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 &&
-       (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && (!w->cuda_fail_s || S < w->cuda_fail_s) &&
+       w->fmt!=5 && (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
-        w->cuda_failed=1;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)){
+            w->cuda_fail_s=0;          /* it fits again: forget the width that did not */
+            return;
+        }
+        w->cuda_fail_s = S;
         if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
-            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-                w->O,w->I,w->cuda_device);
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d fell back to CPU at S=%d; "
+                "narrower calls will still try the GPU\n", w->O,w->I,w->cuda_device,S);
         cuda_disabled_note();
     }
 #endif
@@ -1753,6 +1793,29 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 }
 #endif
 
+/* KV_B FMT-GATE NOTICE (#kvb): kernel contract — the fused Metal attention kernels
+ * (attention_rows' coli_metal_attn_decode and layer_forward_rows' coli_metal_layer_decode,
+ * both gated on `l->kv_b.fmt==2||l->kv_b.fmt==4`) only run against kv_b_proj stored INT4,
+ * either per-row (fmt=2) or grouped (fmt=4, since #587's kv_b grouped-int4 addition); any
+ * OTHER format silently falls through to the CPU absorb path for decode attention on that
+ * layer. v1-class mixed-precision containers can mint kv_b_proj at a format outside that
+ * pair, so this is a real trap, not a hypothetical: print it once (called from model_init,
+ * after all layer tensors are resolved) so it isn't silent. NOTICE ONLY — no gate/behavior
+ * change here. */
+static void kvb_fmt_gate_notice(Model *m){
+    Cfg *c=&m->c;
+    if(!g_metal_enabled) return;
+    int bad=0, first_fmt=-1;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kv_b.fmt!=2 && m->L[i].kv_b.fmt!=4){
+        bad++; if(first_fmt<0) first_fmt=m->L[i].kv_b.fmt; }
+    if(bad) fprintf(stderr,
+        "[METAL] kv_b_proj is fmt=%d (not int4) on %d/%d layer%s: the fused Metal "
+        "attention path requires kv_b in int4, per-row (fmt=2) or grouped (fmt=4), so "
+        "those layers run decode attention on the CPU absorb path instead. Requantize "
+        "kv_b to int4 (per-row --kvb-bits 4, or grouped) to re-enable the fused path.\n",
+        first_fmt, bad, c->n_layers, bad==1?"":"s");
+}
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
@@ -1828,6 +1891,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         }
         #undef P
     }
+    kvb_fmt_gate_notice(m);                       /* once per load, after all layer kv_b resolved */
     /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
     {
         /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
@@ -2263,8 +2327,34 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
-     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
-    if(!s->slab || wtot+8192 > s->slab_cap){
+     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini
+     *
+     * ...and reallocate when it is too LARGE, which is #856. Slabs do not stay in
+     * the row that grew them: the LRU promotion swaps ws[q] with a cache slot
+     * (search "promozione LRU"), so a ws[] slot widened to hold an int8 MTP expert
+     * comes back on the next token, loads a narrow int4 routed expert without
+     * resizing, and is then swapped into a MAIN layer's cache -- still carrying the
+     * MTP width. Up to 64 slabs per token bleed that way, so given enough tokens
+     * every cache slot in the model costs the widest width in the container.
+     *
+     * That is why cap_for_ram() charged every row the widest width: the pessimism
+     * was the true asymptote, not paranoia. It also halved the cache on GLM-5.2
+     * (154 -> 77 slots per row, measured in #856). Shrinking here removes the bleed,
+     * which is what lets the cap be computed from each row's REAL width.
+     *
+     * Hysteresis, not exact fit: alignment rounding alone makes slab_cap exceed the
+     * request under COLI_METAL, and a shrink for a few KB would churn the allocator
+     * on every miss. 25% is relative so it scales with the model; the floor only has
+     * to clear that 16 KB rounding. Experts within a row share a shape, so the only
+     * thing that crosses this threshold is a slab that came from a DIFFERENT row --
+     * which is exactly the migration being stopped.
+     *
+     * Never arena slices (aslab): those are interior pointers into one per-layer
+     * allocation and must not be freed. They are already per-layer-width, so they
+     * have nothing to shrink. */
+    int64_t want=wtot+8192;
+    int64_t hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;   /* 64 KB clears the 16 KB METAL rounding */
+    if(!s->slab || want > s->slab_cap || (g_slab_shrink && !s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
         if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -2280,7 +2370,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         numa_slab_bind(s->slab,(size_t)s->slab_cap);
 #endif
     }
-    if(!s->fslab || ftot > s->fslab_cap){
+    /* The scales migrate with their weights, so they shrink on the same rule (#856).
+     * fslab_cap counts FLOATS, so the hysteresis is in floats too. */
+    int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
+    if(!s->fslab || ftot > s->fslab_cap || (g_slab_shrink && !s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         /* page-align + register: the GPU reads the scales in place (unified memory).
          * Honours `fatal` exactly like the CPU arm below — a speculative pilot load
@@ -2486,7 +2579,12 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
     int64_t ftot=(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes)/4;
     if(wtot<=0 || ftot<=0) return uring_load_error(l,EINVAL,"io_uring expert size"),li;
-    if(!s->slab || wtot+8192>s->slab_cap){
+    /* Same shrink rule as the pread path (#856): a slot that once held a wider
+     * expert must not carry that width into a narrower row, or the per-row cap
+     * cap_for_ram() computes stops being true. Same hysteresis, same arena guard. */
+    int64_t want=wtot+8192, hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;
+    int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
+    if(!s->slab || want>s->slab_cap || (g_slab_shrink && !s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
         compat_aligned_free(s->slab);
@@ -2501,7 +2599,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         s->slab_cap=wtot+8192;
 #endif
     }
-    if(!s->fslab || ftot>s->fslab_cap){
+    if(!s->fslab || ftot>s->fslab_cap || (g_slab_shrink && !s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
         free(s->fslab); size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
@@ -3221,7 +3319,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * flow through the shared per-fmt shader. */
     if(g_metal_enabled && !kvs && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
-       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
+       && c->qk_rope==64 && vh==256 && (l->kv_b.fmt==2||(l->kv_b.fmt==4&&!g_moe_exact))
        && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
        && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
@@ -3237,7 +3335,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
                 WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
                 WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
-                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt, l->kv_b.gs,
                 WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
                 m->Lc[layer], m->Rc[layer], S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
             #undef WP_
@@ -3773,6 +3871,18 @@ static void metal_stage_rot_e8(float *mxg, const int *mrows, int p, int D){
     }
 }
 #endif
+/* moe()'s MB_BUILD subset builder (review F2): coli_metal_moe_block(_begin) take ONE
+ * fmt/qgs for an entire GPU batch of experts (+ optionally the fused shared expert), so
+ * a candidate member at (fmt,gs) is only safe to fold into a batch already established
+ * at (est_fmt,est_gs) if it can't disagree about layout: fmt=4 (grouped int4) is the
+ * only format with a group size to disagree ON, so this is a no-op (always compatible)
+ * for est_fmt!=4 (nothing established yet, or the batch isn't grouped) or fmt!=4 (the
+ * candidate itself isn't grouped -- its own fmt mismatch is a separate, pre-existing gap
+ * this guard does not cover, see MB_BUILD's comment). Pulled out of MB_BUILD as its own
+ * function so it's independently testable (see tests/test_moe_gs_guard.c). */
+static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
+    return !(est_fmt==4 && fmt==4 && gs!=est_gs);
+}
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
@@ -4203,19 +4313,37 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * batch's rows all share s, so this is one FWHT per token in practice. The down
          * input is rotated on-GPU by moe_fwht inside moe_submit. */
         int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
-        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
+        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, mgs=0, mgs_ok=1, sh_in=0;
         const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
         int xoffb[65],nrb[65];
         float *mxg=NULL; int *mrows=NULL; float *mrw=NULL;
-        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH) */
+        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH).
+         * mgs_ok (review F2): moe_submit takes ONE fmt/qgs for the WHOLE batch, so a
+         * fmt=4 subset needs every member's group size to agree with the first expert's
+         * (mgs) -- fmt equality alone (already checked below for the shared expert) isn't
+         * enough once fmt=4 has a group size to disagree on. Routed experts get the same
+         * guard against each other (first-expert-gs consistency): a v1-class mixed-
+         * precision container could in principle mint routed experts at different gs
+         * within one layer (qt_resolve_fmt derives fmt/gs per-tensor from the file, with
+         * no uniformity enforced across experts at load time), even though a normal
+         * single-pass conversion never would. mgs_ok=0 does NOT drop the mismatched
+         * expert's rows: it leaves nbb's bookkeeping untouched and instead suppresses the
+         * GPU submit call at the two call sites below, which leaves cpu_res/cpu_miss at
+         * their initial 1 -- the same state a genuine GPU submission failure leaves them
+         * in, so the existing CPU fallback loop (metal_done false) redoes this whole
+         * nb-expert block correctly regardless of the mismatch. (Not checked, and out of
+         * scope for this guard: per-expert fmt agreement across g/u/d, and gs agreement
+         * across sh_gate/sh_up/sh_down or across a single expert's own g/u/d -- see
+         * WORKER_REPORT UNCERTAINTIES.) */
         #define MB_BUILD(WANTMISS, TRY_SH) do{ \
-            nbb=0; Rtot=0; mfmt=-1; sh_in=0; \
+            nbb=0; Rtot=0; mfmt=-1; mgs=0; mgs_ok=1; sh_in=0; \
             for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; \
                 int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0; \
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
                     if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
                 if(!cnt) continue; \
-                if(mfmt<0) mfmt=e->g.fmt; \
+                if(mfmt<0){ mfmt=e->g.fmt; mgs=e->g.gs; } \
+                else if(!mb_gs_compat(mfmt,mgs,e->g.fmt,e->g.gs)) mgs_ok=0; \
                 MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
                 MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
                 MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \
@@ -4223,8 +4351,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++; \
             } \
             if(TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
-                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf){ \
-                    if(mfmt<0) mfmt=shf; \
+                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf \
+                   && mb_gs_compat(mfmt,mgs,shf,l->sh_gate.gs)){ \
+                    if(mfmt<0){ mfmt=shf; mgs=l->sh_gate.gs; } \
                     MG[nbb]=shf==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4; \
                     MU[nbb]=shf==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4; \
                     MD[nbb]=shf==1?(const void*)l->sh_down.q8:(const void*)l->sh_down.q4; \
@@ -4245,13 +4374,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             mxg=falloc((int64_t)(nb+1)*S*D);
             mrows=xalloc((size_t)(nb+1)*S*sizeof(int),"moe mrows"); mrw=xalloc((size_t)(nb+1)*S*sizeof(float),"moe mrw");
             MB_BUILD(0, base==0 && !g_pre_sh);
-            if(nbb>0){
+            if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
-                mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
+                mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
                 m->t_emm += now_s()-t0;
                 if(mh){ cpu_res=0; mh_shared=sh_in; }
-            } else cpu_res=0;
+            } else if(!nbb) cpu_res=0;   /* nbb==0: nothing in this subset. nbb>0 && !mgs_ok
+                                          * (F2): gs-heterogeneous fmt=4 subset -- leave
+                                          * cpu_res=1 so the CPU loop below redoes it. */
         }
 #endif
         /* Expert loads run HERE, after the resident-experts GPU submit above: under METAL the
@@ -4308,12 +4439,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
                 m->t_ewait += now_s()-tw; }
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
-            if(nbb>0){
+            if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
-                if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
+                if(coli_metal_moe_block(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
-            } else cpu_miss=0;
+            } else if(!nbb) cpu_miss=0;   /* see the resident-subset call site above */
             if(mh){ double t0=now_s();
                 if(coli_metal_moe_block_end(mh,out)){ if(mh_shared) shared_on_gpu=1; }
                 else cpu_res=1;
@@ -5499,7 +5630,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
-       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
+       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && (l->kv_b.fmt==2||(l->kv_b.fmt==4&&!g_moe_exact))
        && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
        && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
        && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)
@@ -5518,7 +5649,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                 WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
                 WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
                 WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
-                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt, l->kv_b.gs,
                 WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
                 WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt, l->sh_gate.gs,
                 WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,   l->sh_up.gs,
@@ -6051,13 +6182,34 @@ static int grammar_draft(GrDraft *g, int *draft, int cap){
  * killing the engine; :more can continue the interrupted answer. Armed only
  * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
 static volatile sig_atomic_t g_intr=0;
+/* #810: SIGINT and SIGTERM mean different things and cannot share a flag. SIGINT is a
+ * SOFT stop -- it ends the current turn and the serve loop clears g_intr and keeps
+ * serving. SIGTERM is a request to shut down, so it needs a flag the loop does NOT
+ * clear. It sets g_intr too, so the in-flight turn unwinds through the ordinary path
+ * (stats, usage_save, KV append, END sentinel) instead of being torn down. */
+static volatile sig_atomic_t g_shutdown=0;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
+static void term_sig(int s){ (void)s; g_intr=1; g_shutdown=1; }
 static void intr_install(void){
     struct sigaction sa; memset(&sa,0,sizeof(sa));
     sa.sa_handler=intr_sig; sigemptyset(&sa.sa_mask);
     sa.sa_flags=SA_RESTART;              /* getline/pread non devono vedere EINTR */
     sigaction(SIGINT,&sa,NULL);
+    /* SIGTERM deliberately WITHOUT SA_RESTART. The serve loop blocks in getline()
+     * waiting for the next request, and SA_RESTART would silently resume that read
+     * after the handler ran -- the flag would be set and never looked at again, so
+     * `systemctl stop` would hang until its TimeoutStopSec expired into SIGKILL.
+     * Without it, getline() returns -1/EINTR and the loop exits through its normal
+     * end. The original reason for SA_RESTART was "getline/pread must not see EINTR",
+     * and the pread half no longer applies: every read path retries EINTR itself
+     * (st.h st_pread_full, the mirror loop here, uring.h). getline is the only caller
+     * that needed protecting, and it is precisely the one a shutdown must interrupt.
+     * select() in run_serve_mux is unaffected: it tests `> 0`, so an EINTR return is
+     * just "no input this round" and the next iteration sees the flag. */
+    sa.sa_handler=term_sig;
+    sa.sa_flags=0;
+    sigaction(SIGTERM,&sa,NULL);
 }
 #else
 static void intr_install(void){}
@@ -6503,9 +6655,14 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     int64_t io=atomic_load_explicit(&g_prof_io,memory_order_relaxed)-b->io;
     uint64_t dh=m->hits-b->hits, dm=m->miss-b->miss, dq=m->ereq-b->ereq;
     double hitp=(dh+dm)?100.0*dh/(dh+dm):100.0;
-    double eb=(double)expert_bytes_probe(m,m->ebits);
-    int pinned=0,lru=0;
-    for(int i=0;i<=c->n_layers;i++){ if(m->npin)pinned+=m->npin[i]; if(m->ecn)lru+=m->ecn[i]; }
+    /* Per-row widths (#856): "resident experts: N (X GB)" is the line people quote
+     * when they compare the engine's own accounting against free RAM. */
+    int pinned=0,lru=0; double pin_b=0,lru_b=0;
+    for(int i=0;i<=c->n_layers;i++){
+        double w=(double)expert_bytes_row(m,i,m->ebits);
+        if(m->npin){ pinned+=m->npin[i]; pin_b+=(double)m->npin[i]*w; }
+        if(m->ecn){ lru+=m->ecn[i];      lru_b+=(double)m->ecn[i]*w; }
+    }
     double io_w=m->t_ewait-b->ewait;    /* stall the compute thread felt */
     double io_svc=edisk_s()-b->edisk;   /* read service on the loading threads (overlaps compute) */
     uint64_t dhp=m->hit_pin-b->hit_pin, dhe=m->hit_ecache-b->hit_ecache;   /* split #336 */
@@ -6552,7 +6709,7 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         }
     }
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
-        pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
+        pinned,pin_b/1e9,lru,lru_b/1e9,m->ecap);
     double emm=m->t_emm-b->emm, ecpu=m->t_ecpu-b->ecpu, egpu=m->t_egpu-b->egpu;
     double route=m->t_route-b->route,p2p=m->t_p2p-b->p2p;
     uint64_t np2p=m->n_p2p-b->n_p2p;
@@ -7302,6 +7459,11 @@ static void run_serve_mux(Model *m, const char *snap){
                                           * via normale di mux_done (DONE+stats+KV coerenti) */
             for(int i=0;i<nctx;i++) if(req[i].active) mux_done(m,&ctx[i],&req[i]);
         }
+        /* #810: SIGTERM. Ordered AFTER the mux_done sweep above on purpose -- the
+         * in-flight requests finish through their normal path first, then the loop
+         * ends. With no active request select() blocks with a NULL timeout, so the
+         * EINTR from an un-restarted SIGTERM is what wakes us to reach this line. */
+        if(g_shutdown) break;
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
@@ -7466,7 +7628,7 @@ static void run_serve(Model *m, const char *snap){
     intr_install();                      /* Ctrl-C = fine turno, non fine processo */
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     tiers_emit(m);
-    while((nr=getline(&line,&cap,stdin))>0){
+    while(!g_shutdown && (nr=getline(&line,&cap,stdin))>0){
         g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
@@ -8331,11 +8493,12 @@ static double autopin_lru_reserve(double expert_available, double bytes_per_slot
     return (double)cap*bytes_per_slot;
 }
 
+/* #856: nsp*widest -> the sum of each row's REAL width. The "nsp+=2" was an
+ * approximation of one wide MTP row while every OTHER row was charged the narrow
+ * width; once the probe started returning the widest for all of them the two
+ * compounded, and the autopin reserve inherited the same halving as the cap. */
 static double expert_cache_bytes_per_slot(Model *m, int ebits){
-    int nsp=0;
-    for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
-    if(m->has_mtp) nsp+=2;
-    return (double)nsp*(double)expert_bytes_probe(m,ebits);
+    return expert_cache_row_bytes(m,ebits);
 }
 
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
@@ -8343,8 +8506,13 @@ static double expert_cache_bytes_per_slot(Model *m, int ebits){
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
 static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    if(m->has_mtp) nsp+=2;                       /* riga cache MTP: conta ~doppia (expert int8 = 2x int4) */
+    if(m->has_mtp) nsp++;                        /* la riga MTP e' una riga; la sua LARGHEZZA
+                                                  * la porta row_b, non piu' un "conta doppio" */
+    /* eb = the WIDEST width in the container: correct for ws[], which is shared across
+     * rows, and only for that. row_b = the sum of the widths the rows really hold,
+     * which is what one LRU slot per row costs (#856). */
     int64_t eb=expert_bytes_probe(m,ebits);
+    double row_b=expert_cache_row_bytes(m,ebits);
     int auto_b = ram_gb<=0;
     if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
@@ -8374,7 +8542,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     double pc_b  = 2.5e9;
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
-    int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
+    int capmax = (avail>0 && row_b>0) ? (int)(avail/row_b) : 0;
     int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
     if(capmax<1) capmax=1;
     /* Il floor a 1 e' una bugia comoda: con avail negativo capmax sarebbe 0, cioe'
@@ -8384,14 +8552,16 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * nessun log, il motore muore muto (issue #305). Dirlo, e fermarsi se il picco
      * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
     if(floored){
-        double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
-        /* eb is printed because it is the one term nobody can check from outside:
-         * every projection here divides by it, so a wrong width is indistinguishable
-         * from a wrong budget in this message (#766). */
+        double peak = (double)m->resident_bytes + (double)capmax*row_b + slack;
+        /* The width is printed because it is the one term nobody can check from
+         * outside: every projection here divides by it, so a wrong width is
+         * indistinguishable from a wrong budget in this message (#766). Report the
+         * per-row AVERAGE, since that is now the divisor -- printing the widest while
+         * dividing by something else is how #856 stayed invisible for a release. */
         fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
-            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB).%s\n",
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB avg/row).%s\n",
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
-            m->resident_bytes/1e9,slack/1e9,(double)eb/1e6,
+            m->resident_bytes/1e9,slack/1e9,row_b/(nsp>0?nsp:1)/1e6,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
 #ifdef COLI_CUDA
         /* #686: on a single GPU that also holds host copies of the VRAM tier, the
@@ -8414,11 +8584,11 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
     if(capmax < m->ecap){
         fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
-            "experts %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
+            "experts %.1f MB avg x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
             ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
             kv_slot_count(),max_ctx,kv_b/1e9,kvb_b/1e9,
-            eb/1e6, nsp, m->ecap, capmax,
-            (m->resident_bytes + (double)capmax*nsp*eb + slack)/1e9);
+            row_b/(nsp>0?nsp:1)/1e6, nsp, m->ecap, capmax,
+            (m->resident_bytes + (double)capmax*row_b + slack)/1e9);
         m->ecap=capmax;
     } else {
         /* AUTO-RAISE (issue #12): il budget consente PIU' cache di quella chiesta.
@@ -8442,11 +8612,11 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             fprintf(stderr,"[RAM_GB=%.1f%s] cap raised %d->%d: budget allows it "
                 "(projected peak %.1f GB; set CAP_RAISE=0 to disable)\n",
                 ram_gb, auto_b?" auto":"", m->ecap, newcap,
-                (m->resident_bytes + (double)newcap*nsp*eb + slack)/1e9);
+                (m->resident_bytes + (double)newcap*row_b + slack)/1e9);
             m->ecap=newcap;
         } else
             fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
-                (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
+                (m->resident_bytes + (double)m->ecap*row_b + slack)/1e9);
     }
 }
 
@@ -8483,15 +8653,21 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
     if(g_metal_enabled) backend="Metal";
 #endif
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    int rows=nsp+(m->has_mtp?2:0);               /* stessa convenzione di cap_for_ram (MTP int8 = 2x) */
-    int pinned=0; for(int i=0;i<=c->n_layers;i++) if(m->npin) pinned+=m->npin[i];
-    double eb=(double)expert_bytes_probe(m,m->ebits);
+    /* #856: the cache figure comes from the same per-row sum the cap is computed
+     * from. Printing a projection derived differently from the cap is how the
+     * halving stayed invisible through a whole release. */
+    int pinned=0; double pin_b=0;
+    for(int i=0;i<=c->n_layers;i++) if(m->npin){
+        pinned+=m->npin[i];
+        pin_b+=(double)m->npin[i]*(double)expert_bytes_row(m,i,m->ebits);
+    }
+    (void)nsp;
     fprintf(stderr,"[PROF] machine: %s | %d cores (%d omp threads) | RAM %.1f GB total, %.1f GB available | backend %s\n",
         cpu[0]?cpu:"unknown CPU",cores,omp_get_max_threads(),rt,ra,backend);
     fprintf(stderr,"[PROF] config: RAM_GB=%s%.1f CTX=%d | expert cache cap %d/layer (up to %.1f GB) | pinned %d (%.1f GB) | "
         "DRAFT=%d PIPE=%d DIRECT=%d MMAP=%d IDOT=%d DSA=%s PILOT=%d CACHE_ROUTE=%d\n",
         ram_env<=0?"auto ":"",ram_env<=0?g_mem_avail_boot*0.88:ram_env,est_ctx,
-        m->ecap,(double)m->ecap*rows*eb/1e9,pinned,pinned*eb/1e9,
+        m->ecap,(double)m->ecap*expert_cache_row_bytes(m,m->ebits)/1e9,pinned,pin_b/1e9,
         g_draft,g_pipe,g_direct,g_mmap,g_idot,
         (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
 }
@@ -9056,6 +9232,11 @@ int main(int argc, char **argv){
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_pipe_block = getenv("COLI_PIPE_BLOCK")?atoi(getenv("COLI_PIPE_BLOCK")):0; /* blocking pipe_wait (default: spin) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    g_slab_shrink = getenv("COLI_SLAB_SHRINK") ? atoi(getenv("COLI_SLAB_SHRINK")) : 1;
+    if(!g_slab_shrink)
+        fprintf(stderr,"[SLAB] shrink disabled (COLI_SLAB_SHRINK=0): reused slots keep the widest "
+                       "width they have held, so the per-row cap is optimistic again. Diagnostic "
+                       "for #885 -- not a supported configuration.\n");
     { const char *dh=getenv("COLI_DISKCLASS_WINDOW");        /* DISK-CLASS recency window, see its declaration */
       if(dh){ g_direct_heat_ticks=(uint32_t)strtoul(dh,NULL,10); g_direct_heat_explicit=1; } }
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
@@ -9229,6 +9410,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
         if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
         if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
+        { const char *e=getenv("COLI_METAL_MOE_EXACT"); g_moe_exact=(e&&e[0]&&e[0]!='0'); }
     }
 #else
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
@@ -9388,10 +9570,30 @@ int main(int argc, char **argv){
               m.ecap,&preserved_cap);
           double pin_bytes=autopin_preserve_lru(
               planned_pin,expert_available,lru_reserve);
-          if(pin_bytes+1.0<planned_pin)
-              fprintf(stderr,"[PIN] auto: %.1f GB plan capped to %.1f GB to preserve "
-                  "the no-pin LRU cap %d/layer\n",
-                  planned_pin/1e9,pin_bytes/1e9,preserved_cap);
+          /* Print every term, every time, capped or not.
+           *
+           * This line used to appear ONLY when the clamp bit (pin_bytes <
+           * planned_pin), which makes "the reserve was zero" and "the reserve
+           * did not bind" indistinguishable from the outside -- and those are
+           * the two hypotheses anyone debugging placement is choosing between.
+           * #885 took fourteen instrumented runs on a 128 GB host to establish
+           * numbers this line already had in registers. @mohamedmastouri2000-boop
+           * asked for exactly this, twice, before anyone acted on it.
+           *
+           * budget  = what expert_avail() left after resident + slack
+           * plan    = 0.5 * budget * confidence(history), the autopin quota
+           * reserve = cap * per-row width, held back for the adaptive LRU (#815)
+           * max_pin = budget - reserve, the ceiling the plan is clamped to
+           *
+           * A reserve near the budget means the pin is being starved by a
+           * reservation the LRU may never claim, since the LRU is demand-filled
+           * and only allocates on a miss. That is visible here at a glance. */
+          fprintf(stderr,"[PIN] auto: budget %.1f GB | plan %.1f GB (conf %.2f, %lld selections) | "
+              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s\n",
+              expert_available/1e9, planned_pin/1e9, conf, (long long)hist,
+              lru_reserve/1e9, preserved_cap, expert_cache_bytes_per_slot(&m,ebits)/1e6,
+              (expert_available-lru_reserve)/1e9, pin_bytes/1e9,
+              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "");
           double pin_gb=pin_bytes/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
       }

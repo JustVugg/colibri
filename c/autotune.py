@@ -22,6 +22,12 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 PROMPT_RE = re.compile(r"\[PROMPT_TOKENS\]\s+\d+:\s*([0-9 ]+)")
 TOKENS_RE = re.compile(r"\[TOKENS\]\s+\d+\s+generated:\s*([0-9 ]+)")
+# Two shapes, one meaning. colibri emits the richer REPLAY line from its fixed
+# oracle replay; the sibling engines emit `TUNE decode: N tokens in T.TTTs` at
+# the end of an ordinary greedy run, which is deterministic for a fixed prompt
+# and NGEN and therefore comparable across candidates. Accepting both is what
+# lets `coli tune` work on more than GLM (#898).
+TIMING_RE = re.compile(r"(?:REPLAY|TUNE) decode:\s+(\d+)\s+tokens in\s+([0-9.]+)s")
 SPEED_RE = re.compile(r"REPLAY decode:\s+\d+\s+tokens.*?\|\s*([0-9.]+)\s+tok/s")
 HIT_RE = re.compile(r"expert hit\s+([0-9.]+)%")
 LATENCY_RE = re.compile(r"latency p50\s+([0-9.]+)\s*ms.*?p99\s+([0-9.]+)\s*ms")
@@ -134,8 +140,16 @@ def save_profile(profile: dict, profile_dir: str | None = None) -> Path:
     return path
 
 
-def candidate_steps(plan: dict, base_env: dict) -> list[tuple[str, dict]]:
-    """Return a bounded coordinate-descent sweep for this topology."""
+def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple[str, dict]]:
+    """Return a bounded coordinate-descent sweep for this topology and engine.
+
+    `arch` gates the knobs that are not universal. OMP_NUM_THREADS and COLI_NUMA
+    are read by every engine (they are OpenMP and NUMA, not engine features), so
+    they are always eligible. PIPE and DIRECT are read by colibri alone --
+    `grep -c 'getenv("PIPE")'` is 3 in colibri.c and 0 in the other four -- so
+    offering them elsewhere would sweep candidates that cannot differ, spend the
+    replay budget proving it, and report a 0% gain as if it were a measurement
+    (#898)."""
     steps = []
     cores = max(1, int(plan.get("cpu", {}).get("physical_cores", os.cpu_count() or 1)))
     current_threads = int(base_env.get("OMP_NUM_THREADS", cores))
@@ -152,7 +166,7 @@ def candidate_steps(plan: dict, base_env: dict) -> list[tuple[str, dict]]:
             if value != pipe:
                 steps.append((f"cuda-pipe-{value}", {"COLI_CUDA_PIPE": str(value)}))
         steps.append(("cuda-sync", {"COLI_CUDA_ASYNC": "0"}))
-    if plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) > 0:
+    if arch == "glm" and plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) > 0:
         direct = int(base_env.get("DIRECT", "0"))
         if direct != 1:
             steps.append(("direct-on", {"DIRECT": "1"}))
@@ -163,13 +177,22 @@ def candidate_steps(plan: dict, base_env: dict) -> list[tuple[str, dict]]:
 
 
 def parse_replay(output: str) -> dict:
+    timing = TIMING_RE.search(output)
     speed = SPEED_RE.search(output)
-    if not speed:
-        raise ValueError("engine did not emit REPLAY throughput")
+    if not timing and not speed:
+        raise ValueError("engine emitted neither a REPLAY nor a TUNE decode line")
+    # Prefer tokens/elapsed: the printed tok/s carries two decimals, which is one
+    # significant digit at 0.04 tok/s and decides the 3% gate on rounding (#852).
+    if timing and float(timing.group(2)) > 0:
+        tok_s = int(timing.group(1)) / float(timing.group(2))
+    elif speed:
+        tok_s = float(speed.group(1))
+    else:
+        raise ValueError("TUNE decode line reported zero elapsed time")
     hit = HIT_RE.search(output)
     latency = LATENCY_RE.search(output)
     return {
-        "tok_s": float(speed.group(1)),
+        "tok_s": tok_s,
         "hit_pct": float(hit.group(1)) if hit else None,
         "p50_ms": float(latency.group(1)) if latency else None,
         "p99_ms": float(latency.group(2)) if latency else None,
@@ -200,7 +223,8 @@ def create_replay(engine: str, cap: int, env: dict, prompt: str, tokens: int,
 
 
 def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
-             prompt: str, tokens: int = 16, repeats: int = 2, timeout: int = 900,
+             prompt: str, arch: str = "glm",
+             tokens: int = 16, repeats: int = 2, timeout: int = 900,
              min_gain: float = 0.03, profile_dir: str | None = None,
              progress=None) -> tuple[dict, Path]:
     """Coordinate-descent tuning with a reverse-order confirmation gate."""
@@ -240,7 +264,7 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
         winner = baseline
         accumulated = {}
         candidates = [baseline]
-        for name, change in candidate_steps(plan, base_env):
+        for name, change in candidate_steps(plan, base_env, arch):
             trial_env = dict(accumulated)
             trial_env.update(change)
             trial = measure(name, trial_env)
