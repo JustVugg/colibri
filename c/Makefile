@@ -766,6 +766,11 @@ tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 tests/test_ablate$(EXE): tests/test_ablate.c abl.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Standalone: exercises the DEGRADE_ZERO miss-slot zero-fill logic extracted from
+# moe() -- no model/weights needed (issue #865).
+tests/test_degrade_zero$(EXE): tests/test_degrade_zero.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
