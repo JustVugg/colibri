@@ -47,6 +47,14 @@ class StateAndSafetyTest(unittest.TestCase):
     USAGE_HEADER = "-1 1 2\n-2 1 %d\n" % GLM_ENGINE_ID
 
     def setUp(self):
+        self.containment_supervisor = UnitCgroupSupervisor()
+        self.containment_patch = mock.patch.object(
+            lifecycle_support,
+            "default_supervisor",
+            return_value=self.containment_supervisor,
+        )
+        self.containment_patch.start()
+        self.addCleanup(self.containment_patch.stop)
         self.descriptor_seam = contextlib.ExitStack()
         self.addCleanup(self.descriptor_seam.close)
         if not state_support._supports_native_dirfd():

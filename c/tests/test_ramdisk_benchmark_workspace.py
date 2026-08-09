@@ -2,6 +2,8 @@
 
 import copy
 import contextlib
+import hashlib
+import io
 import os
 import sys
 import tempfile
@@ -205,7 +207,14 @@ class WorkspaceFixture:
         for child in Path(path).iterdir():
             child.unlink()
 
-    def manager(self, *, available_bytes=1 << 40):
+    def manager(
+        self,
+        *,
+        available_bytes=1 << 40,
+        process_supervisor=None,
+        process_supervisor_factory=None,
+        process_starttime=None,
+    ):
         return benchmark.DurableWorkspaceManager(
             load_manifest=lambda required=True: self.manifest,
             save_manifest=self.save,
@@ -231,7 +240,144 @@ class WorkspaceFixture:
             source_still_matches=lambda _plan: None,
             umount_path=self.umount,
             available_for_mount=lambda _mount, plan=None: available_bytes,
+            process_supervisor=process_supervisor,
+            process_supervisor_factory=process_supervisor_factory,
+            process_starttime=process_starttime,
+            uid_provider=lambda: 1000,
         )
+
+
+class FakeGateProcess:
+    def __init__(self, pid):
+        self.pid = pid
+        self.returncode = None
+        self.stdin = None
+        self.stdout = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.returncode
+
+
+class FakeGate:
+    def __init__(self, pid):
+        self.process = FakeGateProcess(pid)
+        self.released = False
+
+
+class FakeProcessSupervisor:
+    def __init__(self, fixture):
+        self.fixture = fixture
+        self.events = []
+        self.environment = None
+        self.command = None
+        self.stdout_payload = None
+        self.containment = {
+            "version": 1,
+            "mode": "cgroup-v2",
+            "relative_path": "colibri/dtest/oreplicate",
+            "device": 41,
+            "inode": 42,
+        }
+        self.live = False
+        self.leaf_exists = False
+        self.removed = False
+
+    def create_leaf(self, deployment_id, operation_id):
+        self.containment["relative_path"] = "colibri/d%s/o%s" % (
+            hashlib.sha256(deployment_id.encode("utf-8")).hexdigest()[:24],
+            hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:24],
+        )
+        self.events.append(("create", deployment_id, operation_id))
+        self.leaf_exists = True
+        return copy.deepcopy(self.containment)
+
+    def reconcile_leaf_intent(self, _deployment_id, _operation_id):
+        return (
+            copy.deepcopy(self.containment)
+            if self.leaf_exists and not self.removed
+            else None
+        )
+
+    def spawn_gate(self, command, *, environment, **_kwargs):
+        self.command = list(command)
+        self.environment = dict(environment)
+        self.events.append(("spawn",))
+        self.live = True
+        gate = FakeGate(4321)
+        try:
+            import openai_server
+
+            gate.process.stdin = io.BytesIO()
+            payload = self.stdout_payload
+            if payload is None:
+                payload = openai_server.READY + b"STAT 0 0 0 0\n"
+            gate.process.stdout = io.BytesIO(payload)
+        except ImportError:
+            pass
+        self.gate = gate
+        return gate
+
+    def attach_gate(self, gate, containment):
+        self.events.append(("attach", gate.process.pid, containment["inode"]))
+
+    def release_gate(self, gate, _containment):
+        pending = self.fixture.manifest["benchmark_workspace"]["pending_process"]
+        self.events.append(("release", pending["containment_phase"]))
+        gate.released = True
+
+    def verify_gate(self, _gate, _containment):
+        return True
+
+    def close_gate(self, _gate):
+        self.events.append(("close-gate",))
+
+    def abort_gate(self, _gate):
+        self.events.append(("abort-gate",))
+        self.live = False
+        _gate.process.returncode = 1
+
+    def verify_record(self, record):
+        return (
+            self.live
+            and record.get("pid") == 4321
+            and record.get("containment") == self.containment,
+            None,
+        )
+
+    def terminate(self, _containment):
+        self.events.append(("terminate",))
+        self.fixture.events.append(("process-terminate",))
+        self.live = False
+        if hasattr(self, "gate"):
+            self.gate.process.returncode = 0
+        return {"status": "absent"}
+
+    def prove_absence(self, _containment):
+        if self.live:
+            raise RamdiskError("fake cgroup remains populated")
+        return True
+
+    def prove_removed(self, containment):
+        if self.leaf_exists:
+            if getattr(self, "replacement", False):
+                raise RamdiskError("cgroup containment identity changed")
+            if containment != self.containment:
+                raise RamdiskError("cgroup containment identity changed")
+            raise RamdiskError(
+                "cgroup containment remains present after removal"
+            )
+        return True
+
+    def remove_empty(self, _containment):
+        self.events.append(("remove",))
+        self.fixture.events.append(("process-remove",))
+        self.removed = True
+        self.leaf_exists = False
+        return True
 
 
 class DurableWorkspaceTest(unittest.TestCase):
@@ -259,6 +405,21 @@ class DurableWorkspaceTest(unittest.TestCase):
             [("mount", "pending", "pending")],
         )
         self.assertEqual(self.fixture.populate_sources, [str(self.fixture.prepared)])
+
+    def test_workspace_without_pending_process_does_not_discover_cgroups(self):
+        discoveries = []
+        manager = self.fixture.manager(
+            process_supervisor_factory=lambda: discoveries.append(True)
+        )
+
+        with manager.open(
+            self.fixture.manifest,
+            {"protocol_id": "a" * 64},
+            None,
+        ):
+            pass
+
+        self.assertEqual(discoveries, [])
         self.assertEqual(
             [item for item in self.fixture.events if item[0] == "stage"],
             [("stage", "pending")],
@@ -486,6 +647,56 @@ class DurableWorkspaceTest(unittest.TestCase):
                 state_root=lambda: str(self.fixture.state),
             )
 
+        for name, value in (("noswap", "false"), ("thp", 1)):
+            malformed_policy = copy.deepcopy(self.fixture.manifest)
+            malformed_policy["plan"]["mount_options"][name] = value
+            with self.subTest(name=name), self.assertRaisesRegex(
+                RamdiskError,
+                "mount options",
+            ):
+                state_support._validate_benchmark_workspace(
+                    copy.deepcopy(
+                        self.fixture.manifest["benchmark_workspace"]
+                    ),
+                    manifest=malformed_policy,
+                    state_root=lambda: str(self.fixture.state),
+                )
+
+        boolean_node = copy.deepcopy(
+            self.fixture.manifest["benchmark_workspace"]
+        )
+        local = next(
+            root for root in boolean_node["roots"]
+            if root["name"] == "local"
+        )
+        local.update(nodes=[False], node=False)
+        with self.assertRaisesRegex(RamdiskError, "workspace root"):
+            state_support._validate_benchmark_workspace(
+                boolean_node,
+                manifest=self.fixture.manifest,
+                state_root=lambda: str(self.fixture.state),
+            )
+
+        for name, value in (("effective_noswap", "false"), ("effective_thp", 1)):
+            malformed_effective = copy.deepcopy(
+                self.fixture.manifest["benchmark_workspace"]
+            )
+            scratch = next(
+                root for root in malformed_effective["roots"]
+                if root["role"] == "scratch"
+            )
+            scratch[name] = value
+            scratch["requested"][name] = value
+            with self.subTest(name=name), self.assertRaisesRegex(
+                RamdiskError,
+                "effective mount policy",
+            ):
+                state_support._validate_benchmark_workspace(
+                    malformed_effective,
+                    manifest=self.fixture.manifest,
+                    state_root=lambda: str(self.fixture.state),
+                )
+
         missing_deployment = copy.deepcopy(self.fixture.manifest)
         missing_deployment["deployment_id"] = None
         with self.assertRaisesRegex(RamdiskError, "invalid benchmark workspace"):
@@ -495,6 +706,612 @@ class DurableWorkspaceTest(unittest.TestCase):
                 state_root=lambda: str(self.fixture.state),
             )
 
+
+class BenchmarkProcessSupervisionTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.fixture = WorkspaceFixture(self.temporary.name)
+        self.supervisor = FakeProcessSupervisor(self.fixture)
+
+    def _starttime(self, pid):
+        if pid == 4321 and self.supervisor.live:
+            return 9001
+        raise FileNotFoundError("process is absent")
+
+    def _metadata(self, roots):
+        protocol_id = "a" * 64
+        treatment_id = "tmpfs-rammap-local"
+        launch_id = "b" * 32
+        state_dir = (
+            self.fixture.state
+            / "causal-benchmark-state"
+            / protocol_id
+            / ("0000-003-%s-%s" % (treatment_id, launch_id))
+        )
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "protocol_id": protocol_id,
+            "treatment_id": treatment_id,
+            "block_index": 0,
+            "sequence": 3,
+            "launch_id": launch_id,
+            "state_dir": str(state_dir),
+            "weights_dir": roots["local"]["path"],
+        }
+
+    def _pending_record(self, roots, phase, *, launch_id="b" * 32):
+        metadata = self._metadata(roots)
+        metadata["launch_id"] = launch_id
+        operation_id = "replicate:" + launch_id
+        containment = None
+        pid = None
+        starttime = None
+        if phase != "create-intent":
+            containment = copy.deepcopy(self.supervisor.containment)
+            containment["relative_path"] = "colibri/d%s/o%s" % (
+                hashlib.sha256(
+                    self.fixture.manifest["deployment_id"].encode("utf-8")
+                ).hexdigest()[:24],
+                hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:24],
+            )
+        if phase not in ("create-intent", "cgroup-created"):
+            pid = 4321
+            starttime = 9001
+        return {
+            "version": 1,
+            "operation_id": operation_id,
+            "workspace_operation_id": self.fixture.manifest[
+                "benchmark_workspace"
+            ]["operation_id"],
+            "protocol_id": metadata["protocol_id"],
+            "treatment_id": metadata["treatment_id"],
+            "block_index": metadata["block_index"],
+            "sequence": metadata["sequence"],
+            "launch_id": launch_id,
+            "uid": 1000,
+            "state_dir": metadata["state_dir"],
+            "weights_dir": metadata["weights_dir"],
+            "expected_command": ["/opt/colibri", "8"],
+            "environment_sha256": "e" * 64,
+            "containment": containment,
+            "containment_phase": phase,
+            "pid": pid,
+            "starttime": starttime,
+            "created_at": "2026-08-08T00:00:00+00:00",
+        }
+
+    def test_gate_release_follows_durable_attach_and_evidence_binds_exact_pid(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        with manager.open(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        ) as roots:
+            metadata = self._metadata(roots)
+            with manager.process_attempt(
+                recheck=lambda: self.supervisor.events.append(("recheck",)),
+                **metadata
+            ) as attempt:
+                process = attempt.spawn(
+                    ["/usr/bin/numactl", "/opt/colibri", "8"],
+                    child_env={
+                        "SNAP": roots["local"]["path"],
+                        "COLI_STATE_DIR": metadata["state_dir"],
+                        "SERVE": "1",
+                    },
+                    stderr=None,
+                )
+                child_environment = {
+                    "SNAP": roots["local"]["path"],
+                    "COLI_STATE_DIR": metadata["state_dir"],
+                    "SERVE": "1",
+                }
+                attempt.retire(process)
+                row = {
+                    "process": {"pid": process.pid, "starttime": 9001},
+                    "applied_environment": child_environment,
+                }
+                attempt.bind_evidence(row)
+                self.assertEqual(
+                    row["process"]["supervision_mode"], "cgroup-v2"
+                )
+                self.assertRegex(
+                    row["process"]["containment_identity_sha256"],
+                    r"^[0-9a-f]{64}$",
+                )
+                self.assertNotIn("nonce", row["process"])
+
+            self.assertNotIn(
+                "pending_process",
+                self.fixture.manifest["benchmark_workspace"],
+            )
+
+        self.assertIn(("release", "attached-verified"), self.supervisor.events)
+        self.assertEqual(
+            [event[0] for event in self.supervisor.events].count("recheck"), 2
+        )
+        self.assertEqual(self.supervisor.environment, child_environment)
+        self.assertNotIn("COLI_MANAGED_NONCE", self.supervisor.environment)
+        phases = [
+            snapshot["benchmark_workspace"]["pending_process"]["containment_phase"]
+            for snapshot in self.fixture.snapshots
+            if (snapshot.get("benchmark_workspace") or {}).get("pending_process")
+            and snapshot["benchmark_workspace"]["pending_process"].get(
+                "containment_phase"
+            )
+        ]
+        self.assertEqual(
+            phases[:5],
+            [
+                "create-intent",
+                "cgroup-created",
+                "gate-spawned",
+                "attached-verified",
+                "gate-released",
+            ],
+        )
+        self.assertLess(
+            self.fixture.events.index(("process-terminate",)),
+            next(
+                index for index, event in enumerate(self.fixture.events)
+                if event[0] == "umount"
+            ),
+        )
+
+    def test_engine_spawn_and_close_use_supervised_hooks_end_to_end(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        with manager.open(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        ) as roots:
+            metadata = self._metadata(roots)
+            with manager.process_attempt(
+                recheck=lambda: None,
+                **metadata
+            ) as attempt:
+                engine_type, _render, _cancelled = (
+                    benchmark._default_engine_dependencies(
+                        None,
+                        spawn_process=attempt.spawn,
+                        terminate_process=attempt.retire,
+                    )
+                )
+                engine = engine_type(
+                    "/opt/colibri",
+                    roots["local"]["path"],
+                    max_tokens=32,
+                    env={"COLI_STATE_DIR": metadata["state_dir"]},
+                )
+                applied_environment = copy.deepcopy(
+                    engine.benchmark_child_environment
+                )
+                engine.close()
+                row = {
+                    "process": {"pid": 4321, "starttime": 9001},
+                    "applied_environment": applied_environment,
+                }
+                attempt.bind_evidence(row)
+
+            self.assertEqual(
+                self.supervisor.environment,
+                applied_environment,
+            )
+            self.assertNotIn("COLI_MANAGED_NONCE", applied_environment)
+            self.assertEqual(row["process"]["launch_id"], "b" * 32)
+            self.assertNotIn(
+                "pending_process",
+                self.fixture.manifest["benchmark_workspace"],
+            )
+
+    def test_constructor_or_ready_failure_retires_containment_before_workspace(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        self.supervisor.stdout_payload = b""
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly"):
+            with manager.open(
+                self.fixture.manifest, {"protocol_id": "a" * 64}, None
+            ) as roots:
+                metadata = self._metadata(roots)
+                with manager.process_attempt(
+                    recheck=lambda: None,
+                    **metadata
+                ) as attempt:
+                    engine_type, _render, _cancelled = (
+                        benchmark._default_engine_dependencies(
+                            None,
+                            spawn_process=attempt.spawn,
+                            terminate_process=attempt.retire,
+                        )
+                    )
+                    engine_type(
+                        "/opt/colibri",
+                        roots["local"]["path"],
+                        max_tokens=32,
+                        env={"COLI_STATE_DIR": metadata["state_dir"]},
+                    )
+        self.assertTrue(self.supervisor.removed)
+        self.assertNotIn("benchmark_workspace", self.fixture.manifest)
+
+    def test_create_intent_recovery_adopts_only_an_exact_empty_leaf(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        record = self._pending_record(roots, "create-intent")
+        self.fixture.manifest["benchmark_workspace"]["pending_process"] = record
+
+        manager.recover(self.fixture.manifest)
+        self.assertFalse(
+            any(event[0] == "terminate" for event in self.supervisor.events)
+        )
+        self.assertNotIn("benchmark_workspace", self.fixture.manifest)
+
+        # A fresh operation with the deterministic leaf already created may be
+        # adopted only after proving that it has no members.
+        adopt_root = Path(self.temporary.name) / "adopt"
+        adopt_root.mkdir()
+        self.fixture = WorkspaceFixture(str(adopt_root))
+        self.supervisor = FakeProcessSupervisor(self.fixture)
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        record = self._pending_record(roots, "create-intent")
+        self.fixture.manifest["benchmark_workspace"]["pending_process"] = record
+        self.supervisor.containment = copy.deepcopy(
+            self._pending_record(roots, "cgroup-created")["containment"]
+        )
+        self.supervisor.leaf_exists = True
+
+        manager.recover(self.fixture.manifest)
+        self.assertTrue(self.supervisor.removed)
+        self.assertNotIn("benchmark_workspace", self.fixture.manifest)
+
+    def test_populated_create_intent_is_retained_without_unmount_or_signal(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        record = self._pending_record(roots, "create-intent")
+        self.fixture.manifest["benchmark_workspace"]["pending_process"] = record
+        self.supervisor.containment = copy.deepcopy(
+            self._pending_record(roots, "cgroup-created")["containment"]
+        )
+        self.supervisor.leaf_exists = True
+        self.supervisor.live = True
+
+        with self.assertRaisesRegex(
+            benchmark.WorkspaceCleanupError,
+            "populated",
+        ):
+            manager.recover(self.fixture.manifest)
+        self.assertIn(
+            "pending_process",
+            self.fixture.manifest["benchmark_workspace"],
+        )
+        self.assertFalse(
+            any(event[0] == "terminate" for event in self.supervisor.events)
+        )
+        self.assertFalse(
+            any(event[0] == "umount" for event in self.fixture.events)
+        )
+
+    def test_hard_crash_reloads_each_durable_gate_phase_with_no_live_handle(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        metadata = self._metadata(roots)
+        with manager.process_attempt(
+            recheck=lambda: None,
+            **metadata
+        ) as attempt:
+            process = attempt.spawn(
+                ["/opt/colibri", "8"],
+                child_env={
+                    "SNAP": roots["local"]["path"],
+                    "COLI_STATE_DIR": metadata["state_dir"],
+                },
+                stderr=None,
+            )
+            durable_by_phase = {
+                snapshot["benchmark_workspace"]["pending_process"][
+                    "containment_phase"
+                ]: copy.deepcopy(snapshot)
+                for snapshot in self.fixture.snapshots
+                if (snapshot.get("benchmark_workspace") or {}).get(
+                    "pending_process"
+                )
+            }
+            attempt.retire(process)
+
+        self.assertEqual(
+            set(durable_by_phase),
+            {
+                "create-intent",
+                "cgroup-created",
+                "gate-spawned",
+                "attached-verified",
+                "gate-released",
+            },
+        )
+        crash_cases = (
+            # before-commit means the kernel side effect happened while the
+            # preceding phase is the last durable copy.  Unreleased gates die
+            # on parent EOF; released gates may still be executing.
+            ("gate-spawn-before-commit", "cgroup-created", False),
+            ("gate-spawn-after-commit", "gate-spawned", False),
+            ("attach-before-commit", "gate-spawned", False),
+            ("attach-after-commit", "attached-verified", False),
+            ("release-before-commit", "attached-verified", True),
+            ("release-after-commit", "gate-released", True),
+        )
+        for label, durable_phase, process_live in crash_cases:
+            with self.subTest(label=label):
+                # Discard every live manager/gate object and reload only the
+                # last copy-on-success manifest snapshot.
+                self.fixture.manifest = copy.deepcopy(
+                    durable_by_phase[durable_phase]
+                )
+                fresh_supervisor = FakeProcessSupervisor(self.fixture)
+                record = self.fixture.manifest["benchmark_workspace"][
+                    "pending_process"
+                ]
+                fresh_supervisor.containment = copy.deepcopy(
+                    record["containment"]
+                )
+                fresh_supervisor.leaf_exists = True
+                fresh_supervisor.live = process_live
+
+                def starttime(pid):
+                    if pid == 4321 and fresh_supervisor.live:
+                        return 9001
+                    raise FileNotFoundError("process is absent")
+
+                fresh_manager = self.fixture.manager(
+                    process_supervisor=fresh_supervisor,
+                    process_starttime=starttime,
+                )
+                fresh_manager._recover_pending_process(
+                    self.fixture.manifest,
+                    gate=None,
+                )
+                self.assertNotIn(
+                    "pending_process",
+                    self.fixture.manifest["benchmark_workspace"],
+                )
+                self.assertTrue(fresh_supervisor.removed)
+                self.assertFalse(fresh_supervisor.live)
+                self.assertFalse(
+                    any(
+                        event[0] == "release"
+                        for event in fresh_supervisor.events
+                    )
+                )
+                # A second recovery from the same durable result is a no-op.
+                fresh_manager._recover_pending_process(
+                    self.fixture.manifest,
+                    gate=None,
+                )
+
+    def test_pending_process_state_rejects_spliced_or_mistyped_authority(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        workspace = self.fixture.manifest["benchmark_workspace"]
+        workspace["pending_process"] = self._pending_record(
+            roots, "gate-released"
+        )
+        state_support._validate_benchmark_workspace(
+            workspace,
+            manifest=self.fixture.manifest,
+            state_root=lambda: str(self.fixture.state),
+        )
+
+        mutations = {
+            "workspace operation": lambda record: record.update(
+                workspace_operation_id="benchmark:" + "f" * 32
+            ),
+            "protocol": lambda record: record.update(protocol_id="f" * 64),
+            "launch": lambda record: record.update(launch_id="c" * 32),
+            "block sequence": lambda record: record.update(sequence=7),
+            "state path": lambda record: record.update(state_dir="/tmp/escape"),
+            "weights path": lambda record: record.update(
+                weights_dir=str(self.fixture.model)
+            ),
+            "containment operation": lambda record: record[
+                "containment"
+            ].update(relative_path="colibri/dwrong/owrong"),
+            "boolean inode": lambda record: record["containment"].update(
+                inode=True
+            ),
+            "phase identity": lambda record: record.update(
+                containment_phase="cgroup-created"
+            ),
+            "non-UTC creation": lambda record: record.update(
+                created_at="2026-08-08T01:00:00+01:00"
+            ),
+            "environment hash": lambda record: record.update(
+                environment_sha256=True
+            ),
+            "uid": lambda record: record.update(uid=1001),
+            "create-intent removal": lambda record: record.update(
+                containment=None,
+                containment_phase="create-intent",
+                pid=None,
+                starttime=None,
+                containment_removal_authorized_at=(
+                    "2026-08-08T00:00:01+00:00"
+                ),
+                containment_removed_at="2026-08-08T00:00:02+00:00",
+            ),
+        }
+        for label, mutate in mutations.items():
+            changed = copy.deepcopy(workspace)
+            mutate(changed["pending_process"])
+            with self.subTest(label=label), self.assertRaises(RamdiskError):
+                state_support._validate_benchmark_workspace(
+                    changed,
+                    manifest=self.fixture.manifest,
+                    state_root=lambda: str(self.fixture.state),
+                )
+
+        active = copy.deepcopy(self.fixture.manifest)
+        active["processes"] = [{"pid": 999}]
+        with self.assertRaisesRegex(RamdiskError, "managed engines"):
+            state_support._validate_benchmark_workspace(
+                copy.deepcopy(workspace),
+                manifest=active,
+                state_root=lambda: str(self.fixture.state),
+            )
+
+    def test_inconclusive_proc_identity_retains_authority_and_workspace(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=lambda _pid: (_ for _ in ()).throw(
+                PermissionError("proc denied")
+            ),
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        record = self._pending_record(roots, "gate-released")
+        self.fixture.manifest["benchmark_workspace"]["pending_process"] = record
+        self.supervisor.containment = copy.deepcopy(record["containment"])
+        self.supervisor.leaf_exists = True
+
+        with self.assertRaisesRegex(
+            benchmark.WorkspaceCleanupError,
+            "inconclusive",
+        ):
+            manager.recover(self.fixture.manifest)
+        self.assertIn(
+            "pending_process",
+            self.fixture.manifest["benchmark_workspace"],
+        )
+        self.assertFalse(self.supervisor.removed)
+        self.assertFalse(
+            any(event[0] == "umount" for event in self.fixture.events)
+        )
+
+    def test_malformed_existing_pending_process_fails_as_cleanup_error(self):
+        manager = self.fixture.manager(
+            process_supervisor=self.supervisor,
+            process_starttime=self._starttime,
+        )
+        roots = manager._prepare(
+            self.fixture.manifest, {"protocol_id": "a" * 64}, None
+        )
+        self.fixture.manifest["benchmark_workspace"]["pending_process"] = {
+            "version": 1,
+            "operation_id": "replicate:" + "b" * 32,
+        }
+        with self.assertRaisesRegex(
+            benchmark._EngineCleanupError,
+            "cannot enter supervised",
+        ):
+            with manager.process_attempt(
+                recheck=lambda: None,
+                **self._metadata(roots)
+            ):
+                self.fail("malformed pending authority must prevent launch")
+        self.assertIsNone(manager._active_process_attempt)
+
+    def test_removed_marker_requires_the_exact_leaf_path_to_be_absent(self):
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                root = Path(self.temporary.name) / (
+                    "replacement" if replacement else "leaked"
+                )
+                root.mkdir()
+                fixture = WorkspaceFixture(str(root))
+                supervisor = FakeProcessSupervisor(fixture)
+
+                def starttime(_pid):
+                    raise FileNotFoundError("process is absent")
+
+                manager = fixture.manager(
+                    process_supervisor=supervisor,
+                    process_starttime=starttime,
+                )
+                roots = manager._prepare(
+                    fixture.manifest, {"protocol_id": "a" * 64}, None
+                )
+                original_fixture = self.fixture
+                original_supervisor = self.supervisor
+                try:
+                    self.fixture = fixture
+                    self.supervisor = supervisor
+                    record = self._pending_record(roots, "gate-released")
+                finally:
+                    self.fixture = original_fixture
+                    self.supervisor = original_supervisor
+                record.update(
+                    containment_removal_authorized_at=(
+                        "2026-08-08T00:00:01+00:00"
+                    ),
+                    containment_removed_at="2026-08-08T00:00:02+00:00",
+                )
+                fixture.manifest["benchmark_workspace"][
+                    "pending_process"
+                ] = record
+                supervisor.containment = copy.deepcopy(record["containment"])
+                supervisor.leaf_exists = True
+                supervisor.replacement = replacement
+
+                with self.assertRaisesRegex(
+                    benchmark.WorkspaceCleanupError,
+                    "remains present|identity changed",
+                ):
+                    manager._recover_pending_process(fixture.manifest)
+                self.assertIn(
+                    "pending_process",
+                    fixture.manifest["benchmark_workspace"],
+                )
+
+    @staticmethod
+    def _metadata_for_fixture(fixture, roots):
+        protocol_id = "a" * 64
+        treatment_id = "tmpfs-rammap-local"
+        launch_id = "b" * 32
+        state_dir = (
+            fixture.state
+            / "causal-benchmark-state"
+            / protocol_id
+            / ("0000-003-%s-%s" % (treatment_id, launch_id))
+        )
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "protocol_id": protocol_id,
+            "treatment_id": treatment_id,
+            "block_index": 0,
+            "sequence": 3,
+            "launch_id": launch_id,
+            "state_dir": str(state_dir),
+            "weights_dir": roots["local"]["path"],
+        }
 
 class WorkspaceBindingTest(unittest.TestCase):
     def test_workspace_binding_preserves_identity_and_rejects_alias_mounts(self):

@@ -12,6 +12,16 @@ from ramdisk_support import state as state_support
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def setUp(self):
+        self.containment_supervisor = UnitCgroupSupervisor()
+        self.containment_patch = mock.patch.object(
+            lifecycle_support,
+            "default_supervisor",
+            return_value=self.containment_supervisor,
+        )
+        self.containment_patch.start()
+        self.addCleanup(self.containment_patch.stop)
+
     def _exercise_launch_line_interrupt(
         self,
         source_fragment,
@@ -720,7 +730,7 @@ class ManagedLaunchTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     ramdisk.RamdiskError,
-                    "exact process promotion write failed.*direct child",
+                    "exact process promotion write failed.*contained launch rollback",
                 ):
                     ramdisk.start.__wrapped__(
                         argparse.Namespace(base_port=None),
@@ -741,6 +751,21 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(published["nonce"], nonce)
         self.assertEqual(published["usage_baseline"], {})
         self.assertEqual(published["usage_merge_id"], merge_id)
+        self.assertEqual(published["containment"]["mode"], "cgroup-v2")
+        self.assertEqual(
+            [
+                snapshot["pending_launches"][0]["containment_phase"]
+                for snapshot in successful
+                if snapshot.get("pending_launches")
+                and snapshot["pending_launches"][0].get("containment_phase")
+            ][-4:],
+            [
+                "cgroup-created",
+                "gate-spawned",
+                "attached-verified",
+                "gate-released",
+            ],
+        )
 
     def test_cancel_after_pending_save_is_rechecked_before_popen(self):
         manifest, snapshots, popen, _merge, _terminate, _group, caught = (
@@ -774,24 +799,23 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["pending_launches"], [])
         self.assertEqual(manifest["processes"], [])
 
-    def test_mocked_popen_oserror_retains_unknown_without_inspected_attempt(self):
+    def test_gated_popen_oserror_proves_no_engine_exec_and_clears_pending(self):
         manifest, snapshots, popen, merge, _terminate, _group, caught = (
             self._exercise_prepublication_popen_outcome(
                 popen_effect=OSError("parent-side Popen failure")
             )
         )
 
-        self.assertIsInstance(caught, ramdisk.RamdiskError)
-        self.assertIn("process creation outcome is unknown", str(caught))
-        self.assertIsInstance(caught.__cause__, OSError)
+        self.assertIsInstance(caught, OSError)
+        self.assertIn("parent-side Popen failure", str(caught))
         self.assertTrue(
             any(snapshot.get("pending_launches") for snapshot in snapshots)
         )
         popen.assert_called_once()
-        merge.assert_not_called()
+        merge.assert_called_once()
         self.assertEqual(manifest["state"], "error")
         self.assertEqual(manifest["processes"], [])
-        self.assertEqual(len(manifest["pending_launches"]), 1)
+        self.assertEqual(manifest["pending_launches"], [])
 
     def test_inspected_prefork_popen_exception_proves_child_absence(self):
         real_popen = subprocess.Popen
@@ -825,6 +849,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["processes"], [])
         self.assertEqual(manifest["pending_launches"], [])
 
+    @unittest.skip("superseded by real gated-exec EOF-abort coverage")
     @requires_linux_operational
     def test_postfork_popen_exception_retains_and_reaps_exact_child(self):
         real_popen = subprocess.Popen
@@ -897,6 +922,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["processes"], [])
         self.assertEqual(manifest["pending_launches"], [])
 
+    @unittest.skip("superseded by durable gate-phase boundary coverage")
     @requires_linux_operational
     def test_exact_popen_attempt_is_reaped_across_registration_boundaries(self):
         cases = (
@@ -964,28 +990,22 @@ class ManagedLaunchTest(unittest.TestCase):
                     manifest.get("recovery", {}).get("retained_processes")
                 )
 
-    def test_async_popen_interruption_retains_outcome_unknown_pending_launch(self):
+    def test_async_gated_popen_interruption_cannot_exec_engine(self):
         manifest, snapshots, popen, merge, _terminate, _group, caught = (
             self._exercise_prepublication_popen_outcome(
                 popen_effect=KeyboardInterrupt("asynchronous interrupt")
             )
         )
 
-        self.assertIsInstance(caught, ramdisk.RamdiskError)
-        self.assertIn("process creation outcome is unknown", str(caught))
-        self.assertIsInstance(caught.__cause__, KeyboardInterrupt)
+        self.assertIsInstance(caught, KeyboardInterrupt)
         self.assertTrue(
             any(snapshot.get("pending_launches") for snapshot in snapshots)
         )
         popen.assert_called_once()
-        merge.assert_not_called()
+        merge.assert_called_once()
         self.assertEqual(manifest["state"], "error")
         self.assertEqual(manifest["processes"], [])
-        self.assertEqual(len(manifest["pending_launches"]), 1)
-        pending = manifest["pending_launches"][0]
-        self.assertEqual(pending["operation_id"], "start:" + "e" * 32)
-        self.assertEqual(pending["nonce"], "d" * 48)
-        self.assertEqual(pending["usage_merge_id"], "e" * 32)
+        self.assertEqual(manifest["pending_launches"], [])
 
     def test_log_close_failure_rolls_back_returned_process_before_merge(self):
         events = []
@@ -1021,7 +1041,6 @@ class ManagedLaunchTest(unittest.TestCase):
             return False
 
         def merge_usage(*args, **kwargs):
-            self.assertIn("absence-proven", events)
             events.append("merge")
 
         (
@@ -1042,11 +1061,10 @@ class ManagedLaunchTest(unittest.TestCase):
 
         self.assertIsInstance(caught, OSError)
         popen.assert_called_once()
-        terminate.assert_called_once_with(process)
-        group.assert_called_once_with(process.pid)
+        terminate.assert_not_called()
+        group.assert_not_called()
         merge.assert_called_once()
-        self.assertLess(events.index("terminate"), events.index("merge"))
-        self.assertLess(events.index("absence-proven"), events.index("merge"))
+        self.assertLess(events.index("close"), events.index("merge"))
         self.assertEqual(manifest["pending_launches"], [])
         self.assertEqual(manifest["processes"], [])
 
@@ -1062,7 +1080,11 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertIsNone(load_error)
         authorities = self._launch_authorities(manifest)
         self.assertEqual(len(authorities), 1)
-        self.assertEqual(authorities[0][0], "retained")
+        self.assertEqual(authorities[0][0], "pending")
+        self.assertEqual(
+            manifest["pending_launches"][0]["containment"]["mode"],
+            "cgroup-v2",
+        )
 
     def test_interrupt_after_process_publication_keeps_published_authority_only(self):
         manifest, _snapshots, hits, caught, load_error, _verified = (
@@ -1117,36 +1139,9 @@ class ManagedLaunchTest(unittest.TestCase):
             [kind for kind, _ in self._launch_authorities(manifest)],
             ["published"],
         )
-        self.assertEqual(len(verified_records), 1)
+        self.assertEqual(verified_records, [])
         published = manifest["processes"][0]
-        self.assertEqual(
-            {
-                key: verified_records[0][key]
-                for key in (
-                    "pid",
-                    "pgid",
-                    "uid",
-                    "starttime",
-                    "nonce",
-                    "state_dir",
-                    "weights_dir",
-                    "usage_merge_id",
-                )
-            },
-            {
-                key: published[key]
-                for key in (
-                    "pid",
-                    "pgid",
-                    "uid",
-                    "starttime",
-                    "nonce",
-                    "state_dir",
-                    "weights_dir",
-                    "usage_merge_id",
-                )
-            },
-        )
+        self.assertEqual(published["containment"]["mode"], "cgroup-v2")
         self.assertEqual(published["uid"], host_uid())
         self.assertEqual(published["starttime"], 17298)
         self.assertEqual(published["nonce"], "6" * 48)
@@ -1198,7 +1193,7 @@ class ManagedLaunchTest(unittest.TestCase):
                     )
                 )
 
-    def test_mismatched_launch_identity_retains_pending_group_authority(self):
+    def test_mismatched_launch_identity_retains_pending_cgroup_authority(self):
         cases = {
             "pid": lambda value: dict(value, pid=value["pid"] + 1),
             "uid": lambda value: dict(value, uid=value["uid"] + 1),
@@ -1235,14 +1230,10 @@ class ManagedLaunchTest(unittest.TestCase):
                 self.assertEqual(manifest["processes"], [])
                 self.assertEqual(len(manifest["pending_launches"]), 1)
                 pending = manifest["pending_launches"][0]
-                self.assertEqual(
-                    pending["observed_group"]["pgid"],
-                    7298,
-                )
-                self.assertEqual(
-                    pending["observed_group"]["uid"],
-                    host_uid(),
-                )
+                self.assertEqual(pending["pid"], 7298)
+                self.assertEqual(pending["containment_phase"], "gate-released")
+                self.assertEqual(pending["containment"]["mode"], "cgroup-v2")
+                self.assertIn("remains live outside", pending["stop_error"])
                 self.assertFalse(
                     manifest.get("recovery", {}).get("retained_processes")
                 )
@@ -1347,7 +1338,7 @@ class ManagedLaunchTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     ramdisk.RamdiskError,
-                    "not ready.*direct child is still alive",
+                    "not ready.*direct child remains live outside",
                 ):
                     ramdisk.start.__wrapped__(
                         argparse.Namespace(base_port=None),
@@ -1359,7 +1350,10 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["state"], "error")
         self.assertNotIn("stopped_at", manifest["processes"][0])
         self.assertNotIn("usage_merged_at", manifest["processes"][0])
-        self.assertIn("direct child is still alive", manifest["processes"][0]["stop_error"])
+        self.assertIn(
+            "direct child remains live outside",
+            manifest["processes"][0]["stop_error"],
+        )
         self.assertFalse(
             manifest.get("recovery", {}).get("retained_processes", [])
         )
@@ -1392,12 +1386,12 @@ class ManagedLaunchTest(unittest.TestCase):
         ):
             stopped = ramdisk.stop.__wrapped__()
 
-        terminate.assert_called_once_with(reloaded["processes"][0])
+        terminate.assert_not_called()
         merge_after_stop.assert_called_once()
         self.assertEqual(stopped["state"], "stopped")
         self.assertNotIn("stop_error", stopped["processes"][0])
 
-    def test_two_engine_start_retains_survivor_when_sibling_dies_before_readiness(
+    def test_two_engine_start_contains_survivor_when_sibling_dies_before_readiness(
         self,
     ):
         # Owner interleaving: a multi-engine start publishes engine #1, then
@@ -1579,21 +1573,18 @@ class ManagedLaunchTest(unittest.TestCase):
             urlopen_mock.call_args.args[0].full_url,
             "http://127.0.0.1:%d/health" % survivor["port"],
         )
-        self.assertNotIn("stopped_at", survivor)
-        self.assertNotIn("usage_merged_at", survivor)
-        self.assertIn("alive", survivor["stop_error"])
+        self.assertIn("stopped_at", survivor)
+        self.assertIn("usage_merged_at", survivor)
+        self.assertIn("containment_removed_at", survivor)
+        self.assertNotIn("stop_error", survivor)
         self.assertFalse(
             manifest.get("recovery", {}).get("retained_processes", [])
         )
 
-        # A later verified stop recovers the retained survivor exactly once.
+        # A later stop only replays the stable accounting transaction; the
+        # failed start already proved containment absence and removed the leaf.
         reloaded = json.loads(json.dumps(manifest))
-        reloaded["processes"] = [
-            process
-            for process in reloaded["processes"]
-            if process["pid"] == survivor_pid and "stopped_at" not in process
-        ]
-        self.assertEqual(len(reloaded["processes"]), 1)
+        self.assertEqual(len(reloaded["processes"]), 2)
         stop_matches = mock.Mock(
             side_effect=[
                 (True, "running", dict(survivor_identity)),
@@ -1618,8 +1609,8 @@ class ManagedLaunchTest(unittest.TestCase):
         ):
             stopped = ramdisk.stop.__wrapped__()
 
-        stop_terminate.assert_called_once_with(reloaded["processes"][0])
-        stop_merge.assert_called_once()
+        stop_terminate.assert_not_called()
+        self.assertEqual(stop_merge.call_count, 2)
         self.assertEqual(stopped["state"], "stopped")
         self.assertNotIn("stop_error", stopped["processes"][0])
         # A verified recovery must not advertise stale launch-time errors.
@@ -2237,6 +2228,7 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["processes"], [])
         self.assertEqual(manifest["ports"], [])
         self.assertNotIn("launch_error", manifest)
+        self.assertNotIn("process_supervision_version", manifest)
 
     def test_launch_rollback_merges_every_context_when_manifest_saves_fail(self):
         nonce = "b" * 48
@@ -2318,4 +2310,4 @@ class ManagedLaunchTest(unittest.TestCase):
                     )
 
         merge.assert_called_once()
-        self.assertTrue(merge.call_args.kwargs["keep_journal"])
+        self.assertNotIn("keep_journal", merge.call_args.kwargs)

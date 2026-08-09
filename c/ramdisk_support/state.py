@@ -32,6 +32,16 @@ from .platform_ops import current_uid, get_platform_ops
 from .accelerator import _managed_accelerator_contract
 
 
+CONTAINMENT_VERSION = 1
+
+
+def validate_containment(value):
+    """Load runner containment validation only for versioned manifests."""
+    from .supervision import validate_containment as validate
+
+    return validate(value)
+
+
 try:
     import fcntl
 except ImportError:
@@ -76,6 +86,52 @@ def _valid_utc_timestamp(value):
     )
 
 
+def _validate_supervised_containment(record, *, pending):
+    """Validate one versioned cgroup identity and its durable transitions."""
+    try:
+        validate_containment(record.get("containment"))
+    except RamdiskError as exc:
+        raise RamdiskError(
+            "RAM-disk manifest has invalid managed containment: %s" % exc
+        ) from exc
+    authorized_at = record.get("containment_removal_authorized_at")
+    removed_at = record.get("containment_removed_at")
+    if (
+        authorized_at is not None
+        and not _valid_utc_timestamp(authorized_at)
+    ) or (
+        removed_at is not None
+        and not _valid_utc_timestamp(removed_at)
+    ) or (removed_at is not None and authorized_at is None):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid containment removal state"
+        )
+    if not pending:
+        return
+    phase = record.get("containment_phase")
+    pid = record.get("pid")
+    phases = (
+        "cgroup-created",
+        "gate-spawned",
+        "attached-verified",
+        "gate-released",
+    )
+    if phase not in phases:
+        raise RamdiskError(
+            "RAM-disk manifest has invalid managed containment phase"
+        )
+    if (
+        phase == "cgroup-created"
+        and pid is not None
+    ) or (
+        phase != "cgroup-created"
+        and not _positive_int(pid)
+    ):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid managed gate identity"
+        )
+
+
 def _benchmark_workspace_source_fingerprint(plan):
     selected = set((plan.get("staging") or {}).get("selected_shards") or [])
     shards = []
@@ -109,6 +165,156 @@ def _benchmark_workspace_source_fingerprint(plan):
     ).hexdigest()
 
 
+def _validate_benchmark_pending_process(record, *, workspace, manifest, state_root):
+    required = {
+        "version", "operation_id", "workspace_operation_id", "protocol_id",
+        "treatment_id", "block_index", "sequence", "launch_id", "uid",
+        "state_dir", "weights_dir", "expected_command", "environment_sha256",
+        "containment", "containment_phase", "pid", "starttime", "created_at",
+    }
+    optional = {
+        "containment_removal_authorized_at", "containment_removed_at",
+        "recovery_error",
+    }
+    phases = (
+        "create-intent", "cgroup-created", "gate-spawned",
+        "attached-verified", "gate-released",
+    )
+    treatments = {
+        "anon-pin-interleaved", "anon-pin-local",
+        "tmpfs-rammap-interleaved", "tmpfs-rammap-local",
+        "ssd-slab-control", "tmpfs-slab-control",
+        "cuda-fixed-budget-validation",
+    }
+    if (
+        not isinstance(record, dict)
+        or not required.issubset(record)
+        or not set(record).issubset(required | optional)
+        or record.get("version") != 1
+        or isinstance(record.get("version"), bool)
+        or not isinstance(record.get("operation_id"), str)
+        or re.fullmatch(r"replicate:[0-9a-f]{32}", record["operation_id"])
+        is None
+        or record.get("workspace_operation_id") != workspace.get("operation_id")
+        or record.get("protocol_id") != workspace.get("protocol_id")
+        or not isinstance(record.get("protocol_id"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["protocol_id"]) is None
+        or record.get("treatment_id") not in treatments
+        or isinstance(record.get("block_index"), bool)
+        or not isinstance(record.get("block_index"), int)
+        or record["block_index"] < 0
+        or isinstance(record.get("sequence"), bool)
+        or not isinstance(record.get("sequence"), int)
+        or record["sequence"] < 0
+        or record["sequence"] // len(treatments) != record["block_index"]
+        or not isinstance(record.get("launch_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", record["launch_id"]) is None
+        or record["operation_id"] != "replicate:" + record["launch_id"]
+        or isinstance(record.get("uid"), bool)
+        or not isinstance(record.get("uid"), int)
+        or record["uid"] != current_uid()
+        or not isinstance(record.get("environment_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["environment_sha256"])
+        is None
+        or record.get("containment_phase") not in phases
+        or not _valid_utc_timestamp(record.get("created_at"))
+        or not isinstance(record.get("expected_command"), list)
+        or not record["expected_command"]
+        or any(
+            not isinstance(item, str) or not item
+            for item in record["expected_command"]
+        )
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark process")
+    phase = record["containment_phase"]
+    pid = record.get("pid")
+    starttime = record.get("starttime")
+    containment = record.get("containment")
+    if phase == "create-intent":
+        if containment is not None or pid is not None or starttime is not None:
+            raise RamdiskError("RAM-disk manifest has invalid benchmark create intent")
+    else:
+        validated = validate_containment(containment)
+        expected_relative = "colibri/d%s/o%s" % (
+            hashlib.sha256(manifest["deployment_id"].encode("utf-8")).hexdigest()[:24],
+            hashlib.sha256(record["operation_id"].encode("utf-8")).hexdigest()[:24],
+        )
+        if validated["relative_path"] != expected_relative:
+            raise RamdiskError("RAM-disk benchmark containment belongs to another operation")
+        if phase == "cgroup-created":
+            if pid is not None or starttime is not None:
+                raise RamdiskError("RAM-disk manifest has invalid benchmark cgroup phase")
+        elif not _positive_int(pid) or not _positive_int(starttime):
+            raise RamdiskError("RAM-disk manifest has invalid benchmark gate identity")
+    state_dir = record.get("state_dir")
+    prefix = os.path.join(
+        state_root(), "causal-benchmark-state", record["protocol_id"]
+    )
+    expected_name = "%04d-%03d-%s-%s" % (
+        record["block_index"], record["sequence"], record["treatment_id"],
+        record["launch_id"],
+    )
+    if (
+        not isinstance(state_dir, str)
+        or not os.path.isabs(state_dir)
+        or os.path.dirname(state_dir) != prefix
+        or os.path.basename(state_dir) != expected_name
+        or not _path_without_symlinks(state_dir)
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark process state path")
+    workspace_names = {
+        "tmpfs-rammap-interleaved": "interleaved",
+        "tmpfs-slab-control": "interleaved",
+        "tmpfs-rammap-local": "local",
+    }
+    if record["treatment_id"] in workspace_names:
+        expected_weights = next(
+            root["path"] for root in workspace["roots"]
+            if root["name"] == workspace_names[record["treatment_id"]]
+        )
+    else:
+        expected_weights = manifest["plan"]["model"]["path"]
+    if record.get("weights_dir") != expected_weights:
+        raise RamdiskError("RAM-disk manifest has invalid benchmark process weights")
+    for name in (
+        "containment_removal_authorized_at", "containment_removed_at"
+    ):
+        if record.get(name) is not None and not _valid_utc_timestamp(record[name]):
+            raise RamdiskError("RAM-disk manifest has invalid benchmark recovery time")
+    if record.get("containment_removed_at") and not record.get(
+        "containment_removal_authorized_at"
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark removal authority")
+    if phase == "create-intent" and (
+        record.get("containment_removal_authorized_at") is not None
+        or record.get("containment_removed_at") is not None
+    ):
+        raise RamdiskError(
+            "RAM-disk benchmark create intent has removal authority"
+        )
+    ordered_times = [record["created_at"]] + [
+        record[name]
+        for name in (
+            "containment_removal_authorized_at",
+            "containment_removed_at",
+        )
+        if record.get(name) is not None
+    ]
+    parsed_times = [
+        datetime.datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+        for value in ordered_times
+    ]
+    if parsed_times != sorted(parsed_times):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark recovery order")
+    if record.get("recovery_error") is not None and (
+        not isinstance(record["recovery_error"], str)
+        or not record["recovery_error"]
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark recovery error")
+
+
 def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
     """Validate borrowed-deployment plus one-scratch recovery authority."""
     allowed_workspace = {
@@ -122,6 +328,7 @@ def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
         "created_at",
         "roots",
     }
+    allowed_with_process = allowed_workspace | {"pending_process"}
     deployment_id = manifest.get("deployment_id")
     plan = manifest.get("plan") or {}
     staged_bytes = (plan.get("staging") or {}).get("staged_bytes")
@@ -133,7 +340,7 @@ def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
     operation_id = workspace.get("operation_id")
     protocol_id = workspace.get("protocol_id")
     if (
-        set(workspace) != allowed_workspace
+        set(workspace) not in (allowed_workspace, allowed_with_process)
         or workspace.get("version") != 2
         or workspace.get("phase")
         not in ("pending", "mounted", "staged", "cleanup")
@@ -236,20 +443,41 @@ def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
             or root.get("name") != name
             or root.get("role") != role
             or root.get("mode") != mode
-            or root.get("nodes") != nodes
-            or root.get("node") != node
+            or not isinstance(root.get("nodes"), list)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in root["nodes"]
+            )
+            or root["nodes"] != nodes
+            or (node is None and root.get("node") is not None)
+            or (
+                node is not None
+                and (
+                    isinstance(root.get("node"), bool)
+                    or not isinstance(root.get("node"), int)
+                    or root["node"] != node
+                )
+            )
             or root.get("policy") != policy
             or root.get("size_bytes") != expected_size
             or root.get("source_fingerprint") != workspace["source_fingerprint"]
         ):
             raise RamdiskError("RAM-disk manifest has invalid benchmark workspace root")
         requested = root.get("requested")
+        mount_options = plan.get("mount_options")
+        if (
+            not isinstance(mount_options, dict)
+            or not isinstance(mount_options.get("thp"), str)
+            or mount_options["thp"] not in ("always", "advise", "never")
+            or not isinstance(mount_options.get("noswap"), bool)
+        ):
+            raise RamdiskError("RAM-disk benchmark mount options are malformed")
         base_requested = {
             "filesystem": "tmpfs",
             "source": "tmpfs",
             "size_bytes": expected_size,
-            "thp": (plan.get("mount_options") or {}).get("thp"),
-            "noswap": bool((plan.get("mount_options") or {}).get("noswap")),
+            "thp": mount_options["thp"],
+            "noswap": mount_options["noswap"],
             "safety_options": [
                 "noatime", "nodev", "nosuid", "noexec", "mode=0700"
             ],
@@ -259,6 +487,20 @@ def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
         for key in ("effective_thp", "effective_noswap"):
             if key in root:
                 expected_requested[key] = root[key]
+        if (
+            "effective_thp" in root
+            and (
+                not isinstance(root["effective_thp"], str)
+                or root["effective_thp"]
+                not in ("always", "advise", "never")
+            )
+        ) or (
+            "effective_noswap" in root
+            and not isinstance(root["effective_noswap"], bool)
+        ):
+            raise RamdiskError(
+                "RAM-disk benchmark effective mount policy is malformed"
+            )
         if requested != expected_requested:
             raise RamdiskError("RAM-disk manifest has invalid benchmark mount policy")
         identity = root.get("identity")
@@ -314,7 +556,15 @@ def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
                 or not exact_identity
                 or not isinstance(root.get("numa_allocation"), dict)
                 or not _valid_utc_timestamp(root.get("staged_at"))
-                or planned.get("node") != node
+                or (node is None and planned.get("node") is not None)
+                or (
+                    node is not None
+                    and (
+                        isinstance(planned.get("node"), bool)
+                        or not isinstance(planned.get("node"), int)
+                        or planned["node"] != node
+                    )
+                )
                 or planned.get("policy") != policy
                 or planned.get("size_bytes") != expected_size
             ):
@@ -408,6 +658,19 @@ def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
         raise RamdiskError("RAM-disk manifest has invalid benchmark mount phase")
     if workspace["phase"] == "staged" and scratch.get("stage_phase") != "staged":
         raise RamdiskError("RAM-disk manifest has invalid benchmark staging phase")
+    if workspace.get("pending_process") is not None:
+        if workspace["phase"] != "staged":
+            raise RamdiskError("RAM-disk benchmark process requires staged workspace")
+        if manifest.get("processes") or manifest.get("pending_launches"):
+            raise RamdiskError(
+                "RAM-disk benchmark process conflicts with managed engines"
+            )
+        _validate_benchmark_pending_process(
+            workspace["pending_process"],
+            workspace=workspace,
+            manifest=manifest,
+            state_root=state_root,
+        )
     return None
 
 
@@ -737,6 +1000,7 @@ def _validate_benchmark_workspace_v1_unshipped(
             "RAM-disk manifest has invalid benchmark staging phase"
         )
 
+
 def _validate_benchmark_workspace(workspace, *, manifest, state_root):
     """Validate the shipped borrowed-root workspace recovery authority."""
     if not isinstance(workspace, dict):
@@ -748,6 +1012,7 @@ def _validate_benchmark_workspace(workspace, *, manifest, state_root):
         manifest=manifest,
         state_root=state_root,
     )
+
 
 def _valid_usage_snapshot(value):
     if not isinstance(value, dict):
@@ -1576,6 +1841,22 @@ def _load_manifest(
         or not re.fullmatch(r"[0-9a-f]{32}", deployment_id)
     ):
         raise RamdiskError("RAM-disk manifest has an invalid deployment identity")
+    process_supervision_version = manifest.get("process_supervision_version")
+    if (
+        process_supervision_version is not None
+        and (
+            not isinstance(process_supervision_version, int)
+            or isinstance(process_supervision_version, bool)
+            or process_supervision_version != CONTAINMENT_VERSION
+        )
+    ):
+        raise RamdiskError(
+            "RAM-disk manifest has an unsupported process supervision version"
+        )
+    if process_supervision_version is not None and deployment_id is None:
+        raise RamdiskError(
+            "RAM-disk manifest supervision is missing deployment identity"
+        )
     plan = manifest.get("plan")
     mounts = manifest.get("mounts")
     processes = manifest.get("processes", [])
@@ -1692,6 +1973,11 @@ def _load_manifest(
         raise RamdiskError(
             "RAM-disk retained process recovery requires the error state"
         )
+    if process_supervision_version is not None and retained_processes:
+        raise RamdiskError(
+            "versioned cgroup supervision cannot contain legacy retained "
+            "process recovery"
+        )
     pending_launches = manifest.get("pending_launches", [])
     if not isinstance(pending_launches, list):
         raise RamdiskError("RAM-disk manifest has invalid pending launches")
@@ -1767,6 +2053,20 @@ def _load_manifest(
             if isinstance(pending, dict)
             else None
         )
+        if process_supervision_version is not None:
+            _validate_supervised_containment(pending, pending=True)
+        elif isinstance(pending, dict) and any(
+            key in pending
+            for key in (
+                "containment",
+                "containment_phase",
+                "containment_removal_authorized_at",
+                "containment_removed_at",
+            )
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has unversioned managed containment"
+            )
         observed_pgid = (
             observed_group.get("pgid")
             if isinstance(observed_group, dict)
@@ -2007,6 +2307,19 @@ def _load_manifest(
         usage_baseline = record.get("usage_baseline")
         usage_merge_id = record.get("usage_merge_id")
         usage_merged_at = record.get("usage_merged_at")
+        if process_supervision_version is not None:
+            _validate_supervised_containment(record, pending=False)
+        elif any(
+            key in record
+            for key in (
+                "containment",
+                "containment_removal_authorized_at",
+                "containment_removed_at",
+            )
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has unversioned managed containment"
+            )
         mount = next(
             (
                 item

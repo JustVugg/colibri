@@ -150,9 +150,13 @@ def raw_row(protocol, treatment_id, block_index, throughput=120.0, sequence=None
         "finished_at": "2026-08-08T00:00:01+00:00",
         "status": "ok",
         "process": {
-            "launch_id": "%s-%d" % (treatment_id, block_index),
+            "launch_id": "%032x" % (
+                1 + block_index * len(protocol["treatments"]) + treatment_index
+            ),
             "pid": 1000 + block_index * len(protocol["treatments"]) + treatment_index,
             "starttime": 9000 + block_index * len(protocol["treatments"]) + treatment_index,
+            "supervision_mode": "cgroup-v2",
+            "containment_identity_sha256": "c" * 64,
         },
         "applied_environment": applied_environment,
         "numa_policy": copy.deepcopy(treatment["numa_policy"]),
@@ -432,6 +436,53 @@ class RawEvidenceTest(unittest.TestCase):
         self.assertIn("engine did not start", failed["error"])
         benchmark.validate_raw_evidence_row(failed)
 
+    def test_raw_schema_rejects_boolean_numeric_authority(self):
+        protocol = build_protocol()
+        row = raw_row(protocol, "tmpfs-rammap-local", 0)
+
+        boolean_pid = copy.deepcopy(row)
+        boolean_pid["process"]["pid"] = True
+        with self.assertRaisesRegex(benchmark.RamdiskError, "PID"):
+            benchmark.validate_raw_evidence_row(boolean_pid)
+
+        boolean_prof = copy.deepcopy(row)
+        boolean_prof["profiler"]["physical_ssd_bytes"] = False
+        with self.assertRaisesRegex(benchmark.RamdiskError, "physical SSD"):
+            benchmark.validate_raw_evidence_row(boolean_prof)
+
+        unavailable_prof = copy.deepcopy(row)
+        unavailable_prof["profiler"].update(
+            physical_ssd_bytes=None,
+            physical_ssd_valid=None,
+        )
+        benchmark.validate_raw_evidence_row(unavailable_prof)
+
+        boolean_nodes = copy.deepcopy(row)
+        boolean_nodes["workspace_attempt"]["roots"]["local"].update(
+            nodes=[False],
+            node=False,
+        )
+        with self.assertRaisesRegex(benchmark.RamdiskError, "workspace root"):
+            benchmark.validate_raw_evidence_row(boolean_nodes)
+
+    def test_protocol_rejects_string_or_numeric_mount_policy_flags(self):
+        for name, value in (("noswap", "false"), ("thp", 1)):
+            manifest = sample_manifest()
+            manifest["plan"]["mount_options"][name] = value
+            with self.subTest(name=name), self.assertRaisesRegex(
+                benchmark.RamdiskError,
+                "mount options",
+            ):
+                build_protocol(manifest=manifest)
+
+        manifest = sample_manifest()
+        manifest["plan"]["placement"]["memory_nodes"] = [False, True]
+        with self.assertRaisesRegex(
+            benchmark.RamdiskError,
+            "NUMA nodes",
+        ):
+            build_protocol(manifest=manifest)
+
     def test_protocol_and_raw_reads_reject_symlink_substitution(self):
         protocol = build_protocol()
         row = raw_row(protocol, TREATMENT_IDS[0], 0)
@@ -651,6 +702,7 @@ class CausalExecutionTest(unittest.TestCase):
                 "PATH": "/reviewed/bin",
             }
             captured = {}
+            retired = []
             real_popen = subprocess.Popen
 
             def popen(command, **kwargs):
@@ -659,7 +711,14 @@ class CausalExecutionTest(unittest.TestCase):
                 captured.update(command=command, environment=dict(kwargs["env"]))
                 return Process()
 
-            engine_type, _render, _cancelled = benchmark._default_engine_dependencies(None)
+            def retire(process):
+                retired.append(process.pid)
+                process.terminate()
+
+            engine_type, _render, _cancelled = benchmark._default_engine_dependencies(
+                None,
+                terminate_process=retire,
+            )
             with mock.patch.object(openai_server.subprocess, "Popen", side_effect=popen):
                 engine = engine_type(
                     "/engine",
@@ -675,6 +734,7 @@ class CausalExecutionTest(unittest.TestCase):
                 engine.benchmark_child_environment,
             )
             self.assertEqual(set(captured["environment"]), set(supplied))
+            self.assertEqual(retired, [4321])
             for name in (
                 "SNAP", "SERVE", "SERVE_BATCH", "NGEN", "KV_SLOTS",
                 "GOMP_SPINCOUNT", "OMP_WAIT_POLICY", "V4_MTP_CONF",
@@ -922,7 +982,7 @@ class CausalExecutionTest(unittest.TestCase):
         self.assertIn("collector adapter", appended[0]["error"])
         self.assertEqual(result["attempted_replicates"], len(appended))
 
-    def test_engine_cleanup_failure_is_persisted_and_aborts_later_launches(self):
+    def test_engine_cleanup_failure_is_not_persisted_and_aborts_later_launches(self):
         protocol = build_protocol()
         appended = []
         launches = []
@@ -947,8 +1007,36 @@ class CausalExecutionTest(unittest.TestCase):
             )
 
         self.assertEqual(launches, ["launch"])
-        self.assertEqual(len(appended), 1)
-        self.assertEqual(appended[0]["status"], "error")
+        self.assertEqual(appended, [])
+
+    def test_pending_process_recovery_failure_is_not_persisted_or_skipped(self):
+        protocol = build_protocol()
+        appended = []
+        launches = []
+
+        def fail_recovery(*_args, **_kwargs):
+            launches.append("recovery")
+            raise benchmark.WorkspaceCleanupError(
+                "pending benchmark process is inconclusive"
+            )
+
+        with self.assertRaisesRegex(
+            benchmark.WorkspaceCleanupError,
+            "process is inconclusive",
+        ):
+            benchmark.run_causal_benchmark(
+                protocol,
+                raw_evidence_path="/not-written/raw.v1.jsonl",
+                prestage=lambda *_args: None,
+                replicate_runner=fail_recovery,
+                dram_collector=mock.sentinel.collector,
+                persist_protocol=lambda _path, value: value,
+                existing_rows=lambda _path: [],
+                append_row=lambda _path, row: appended.append(row),
+            )
+
+        self.assertEqual(launches, ["recovery"])
+        self.assertEqual(appended, [])
 
     def test_workspace_reverification_failure_aborts_later_launches(self):
         protocol = build_protocol()
@@ -1402,6 +1490,41 @@ class CausalExecutionTest(unittest.TestCase):
             )
             persisted = benchmark.read_raw_evidence(raw_path)
 
+            manifest["benchmark_workspace"] = {
+                "pending_process": {"recovery_error": "inconclusive"}
+            }
+            with self.assertRaisesRegex(
+                benchmark.WorkspaceCleanupError,
+                "process recovery authority remains durable",
+            ):
+                benchmark.run_benchmark(
+                    args,
+                    cli_path="/opt/colibri/coli",
+                    load_manifest=lambda required: manifest,
+                    assert_effective_masks_unchanged=lambda _plan: None,
+                    assert_ready_mounts=lambda _manifest: None,
+                    resolve_engine_path=lambda _cli, _engine: str(engine),
+                    source_build_identity=lambda: {"revision": "95128b5"},
+                    fingerprint_file=lambda path: "sha256:" + Path(path).name,
+                    state_root=lambda: str(state),
+                    ensure_private_dir=lambda path: Path(path).mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    ),
+                    assert_durable_state_dir=lambda _path, plan: None,
+                    admit_runtime=lambda *_args, **_kwargs: None,
+                    fresh_user_binary=lambda name: "/usr/bin/" + name,
+                    environ={},
+                    dram_preflight=lambda environ: mock.sentinel.collector,
+                    causal_runner=lambda protocol, **_kwargs: {
+                        "protocol_id": protocol["protocol_id"],
+                    },
+                    workspace_manager=FailingCleanupManager(),
+                    freeze_engine_environment=lambda *_args, **_kwargs: {},
+                    fingerprint_model_content=lambda *_args, **_kwargs: {},
+                )
+            self.assertEqual(len(benchmark.read_raw_evidence(raw_path)), 1)
+
         self.assertEqual((result["status"], result["claim"]), ("incomplete", "neutral"))
         self.assertIn("scratch unmount failed", " ".join(result["reasons"]))
         self.assertEqual(len(persisted), 1)
@@ -1628,7 +1751,7 @@ class CausalClaimTest(unittest.TestCase):
         extra = raw_row(protocol, TREATMENT_IDS[0], 0)
         extra["block_index"] = protocol["repetitions"]
         extra["sequence"] = protocol["repetitions"] * len(protocol["treatments"])
-        extra["process"]["launch_id"] = "extra-launch"
+        extra["process"]["launch_id"] = "f" * 32
         extra["process"]["pid"] = 50000
         extra["process"]["starttime"] = 60000
         rows.append(extra)

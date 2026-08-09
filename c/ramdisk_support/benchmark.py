@@ -17,6 +17,7 @@ from __future__ import print_function
 
 import copy
 import contextlib
+import datetime
 import errno
 import hashlib
 import json
@@ -215,6 +216,14 @@ def _workspace_source_fingerprint(plan):
 
 def _workspace_requirements(plan):
     """Freeze logical policy/capacity without physical attempt identities."""
+    mount_options = plan.get("mount_options")
+    if (
+        not isinstance(mount_options, dict)
+        or not isinstance(mount_options.get("thp"), str)
+        or mount_options["thp"] not in ("always", "advise", "never")
+        or not isinstance(mount_options.get("noswap"), bool)
+    ):
+        raise RamdiskError("causal benchmark mount options are malformed")
     size_bytes = DurableWorkspaceManager._workspace_size(plan)
     source_fingerprint = _workspace_source_fingerprint(plan)
     topology = plan.get("topology")
@@ -242,6 +251,539 @@ def _workspace_requirements(plan):
     }
 
 
+_BENCHMARK_PROCESS_PHASES = (
+    "create-intent",
+    "cgroup-created",
+    "gate-spawned",
+    "attached-verified",
+    "gate-released",
+)
+
+
+def _validate_pending_process_record(manifest, workspace, record, state_root):
+    required = {
+        "version",
+        "operation_id",
+        "workspace_operation_id",
+        "protocol_id",
+        "treatment_id",
+        "block_index",
+        "sequence",
+        "launch_id",
+        "uid",
+        "state_dir",
+        "weights_dir",
+        "expected_command",
+        "environment_sha256",
+        "containment",
+        "containment_phase",
+        "pid",
+        "starttime",
+        "created_at",
+    }
+    optional = {
+        "containment_removal_authorized_at",
+        "containment_removed_at",
+        "recovery_error",
+    }
+    if not isinstance(record, dict) or not required.issubset(record) or not set(
+        record
+    ).issubset(required | optional):
+        raise WorkspaceCleanupError(
+            "durable benchmark process authority is malformed"
+        )
+    phase = record.get("containment_phase")
+    pid = record.get("pid")
+    starttime = record.get("starttime")
+    treatment_id = record.get("treatment_id")
+    block_index = record.get("block_index")
+    sequence = record.get("sequence")
+    if (
+        record.get("version") != 1
+        or not isinstance(record.get("operation_id"), str)
+        or re.fullmatch(r"replicate:[0-9a-f]{32}", record["operation_id"])
+        is None
+        or record.get("workspace_operation_id") != workspace.get("operation_id")
+        or record.get("protocol_id") != workspace.get("protocol_id")
+        or not _is_hex_digest(record.get("protocol_id"))
+        or treatment_id not in TREATMENT_IDS
+        or isinstance(block_index, bool)
+        or not isinstance(block_index, int)
+        or block_index < 0
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+        or sequence // len(TREATMENT_IDS) != block_index
+        or not isinstance(record.get("launch_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", record["launch_id"]) is None
+        or record["operation_id"] != "replicate:" + record["launch_id"]
+        or isinstance(record.get("uid"), bool)
+        or not isinstance(record.get("uid"), int)
+        or record["uid"] < 0
+        or not _is_hex_digest(record.get("environment_sha256"))
+        or phase not in _BENCHMARK_PROCESS_PHASES
+        or not _valid_utc_text(record.get("created_at"))
+        or not isinstance(record.get("expected_command"), list)
+        or not record["expected_command"]
+        or any(
+            not isinstance(item, str) or not item
+            for item in record["expected_command"]
+        )
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process authority is malformed"
+        )
+    containment = record.get("containment")
+    if phase == "create-intent":
+        containment_valid = containment is None
+    else:
+        expected_relative = "colibri/d%s/o%s" % (
+            hashlib.sha256(str(manifest.get("deployment_id")).encode("utf-8")).hexdigest()[:24],
+            hashlib.sha256(record["operation_id"].encode("utf-8")).hexdigest()[:24],
+        )
+        containment_valid = (
+            _valid_process_containment(containment)
+            and containment.get("relative_path") == expected_relative
+        )
+    if not containment_valid:
+        raise WorkspaceCleanupError(
+            "durable benchmark process containment is malformed"
+        )
+    if (phase in ("create-intent", "cgroup-created")) != (
+        pid is None and starttime is None
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process identity phase is malformed"
+        )
+    if phase not in ("create-intent", "cgroup-created") and (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or isinstance(starttime, bool)
+        or not isinstance(starttime, int)
+        or starttime <= 0
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process identity is malformed"
+        )
+    state_dir = record.get("state_dir")
+    expected_parent = os.path.join(
+        state_root(), "causal-benchmark-state", record["protocol_id"]
+    )
+    expected_name = "%04d-%03d-%s-%s" % (
+        block_index,
+        sequence,
+        treatment_id,
+        record["launch_id"],
+    )
+    if (
+        not isinstance(state_dir, str)
+        or not os.path.isabs(state_dir)
+        or os.path.dirname(state_dir) != expected_parent
+        or os.path.basename(state_dir) != expected_name
+        or not _path_without_symlinks(state_dir)
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process state path is malformed"
+        )
+    workspace_names = {
+        "tmpfs-rammap-interleaved": "interleaved",
+        "tmpfs-slab-control": "interleaved",
+        "tmpfs-rammap-local": "local",
+    }
+    if treatment_id in workspace_names:
+        expected_weights = next(
+            root["path"]
+            for root in workspace["roots"]
+            if root.get("name") == workspace_names[treatment_id]
+        )
+    else:
+        expected_weights = (manifest.get("plan") or {}).get("model", {}).get(
+            "path"
+        )
+    if (
+        record.get("weights_dir") != expected_weights
+        or not isinstance(expected_weights, str)
+        or not os.path.isabs(expected_weights)
+        or not _path_without_symlinks(expected_weights)
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process weights path is malformed"
+        )
+    for name in (
+        "containment_removal_authorized_at",
+        "containment_removed_at",
+    ):
+        if record.get(name) is not None and not _valid_utc_text(record[name]):
+            raise WorkspaceCleanupError(
+                "durable benchmark process recovery time is malformed"
+            )
+    if record.get("containment_removed_at") and not record.get(
+        "containment_removal_authorized_at"
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process removal authority is malformed"
+        )
+    if phase == "create-intent" and (
+        record.get("containment_removal_authorized_at") is not None
+        or record.get("containment_removed_at") is not None
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark create intent has removal authority"
+        )
+    ordered_times = [record["created_at"]] + [
+        record[name]
+        for name in (
+            "containment_removal_authorized_at",
+            "containment_removed_at",
+        )
+        if record.get(name) is not None
+    ]
+    parsed_times = [
+        datetime.datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+        for value in ordered_times
+    ]
+    if parsed_times != sorted(parsed_times):
+        raise WorkspaceCleanupError(
+            "durable benchmark process recovery order is malformed"
+        )
+    if manifest.get("processes") or manifest.get("pending_launches"):
+        raise WorkspaceCleanupError(
+            "durable benchmark process conflicts with managed engines"
+        )
+    if record.get("recovery_error") is not None and (
+        not isinstance(record["recovery_error"], str)
+        or not record["recovery_error"]
+    ):
+        raise WorkspaceCleanupError(
+            "durable benchmark process recovery error is malformed"
+        )
+    return record
+
+
+def _valid_process_containment(value):
+    return bool(
+        isinstance(value, dict)
+        and set(value)
+        == {"version", "mode", "relative_path", "device", "inode"}
+        and isinstance(value.get("version"), int)
+        and not isinstance(value.get("version"), bool)
+        and value.get("version") == 1
+        and value.get("mode") == "cgroup-v2"
+        and isinstance(value.get("relative_path"), str)
+        and value["relative_path"]
+        and not os.path.isabs(value["relative_path"])
+        and os.path.normpath(value["relative_path"]) == value["relative_path"]
+        and all(part not in ("", ".", "..") for part in value["relative_path"].split("/"))
+        and all(
+            isinstance(value.get(name), int)
+            and not isinstance(value.get(name), bool)
+            and value[name] > 0
+            for name in ("device", "inode")
+        )
+    )
+
+
+def _valid_utc_text(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() == datetime.timedelta(0)
+    )
+
+
+class _BenchmarkProcessAttempt:
+    """One Engine spawn bound to durable cgroup recovery authority."""
+
+    def __init__(
+        self,
+        manager,
+        *,
+        protocol_id,
+        treatment_id,
+        block_index,
+        sequence,
+        launch_id,
+        state_dir,
+        weights_dir,
+        recheck,
+    ):
+        self.manager = manager
+        self.protocol_id = protocol_id
+        self.treatment_id = treatment_id
+        self.block_index = block_index
+        self.sequence = sequence
+        self.launch_id = launch_id
+        self.state_dir = state_dir
+        self.weights_dir = weights_dir
+        self.recheck = recheck
+        self.gate = None
+        self.spawned = False
+        self._retired_record = None
+
+    def __enter__(self):
+        try:
+            if self.manager._active_process_attempt is not None:
+                raise RamdiskError(
+                    "causal benchmark process attempt is already active"
+                )
+            manifest = self.manager._load_manifest(required=True)
+            workspace = self.manager._validate_workspace_record(manifest)
+            if workspace.get("pending_process") is not None:
+                self.manager._recover_pending_process(manifest)
+            if workspace.get("phase") != "staged":
+                raise RamdiskError("causal benchmark workspace is not staged")
+            self.manager._active_process_attempt = self
+            return self
+        except _EngineCleanupError:
+            raise
+        except BaseException as error:
+            raise _EngineCleanupError(
+                "cannot enter supervised benchmark process attempt: %s"
+                % error
+            ) from error
+
+    def spawn(self, command, *, child_env, stderr):
+        if self.spawned:
+            raise RamdiskError("causal benchmark Engine attempted multiple spawns")
+        self.spawned = True
+        manager = self.manager
+        supervisor = manager._supervisor()
+        if supervisor is None:
+            raise RamdiskError("causal benchmark cgroup supervision is unavailable")
+        if (
+            not isinstance(command, (list, tuple))
+            or not command
+            or any(not isinstance(item, str) or not item for item in command)
+            or not isinstance(child_env, dict)
+        ):
+            raise RamdiskError("causal benchmark spawn authority is malformed")
+        manifest = manager._load_manifest(required=True)
+        workspace = manager._validate_workspace_record(manifest)
+        if (
+            workspace.get("phase") != "staged"
+            or workspace.get("protocol_id") != self.protocol_id
+        ):
+            raise RamdiskError("causal benchmark process protocol is stale")
+        actual_environment = {
+            str(name): str(value) for name, value in child_env.items()
+        }
+        if (
+            actual_environment.get("SNAP") != self.weights_dir
+            or actual_environment.get("COLI_STATE_DIR") != self.state_dir
+        ):
+            raise RamdiskError(
+                "causal benchmark child paths differ from durable authority"
+            )
+        if (
+            not isinstance(self.launch_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", self.launch_id) is None
+        ):
+            raise RamdiskError("causal benchmark launch identity is malformed")
+        operation_id = "replicate:%s" % self.launch_id
+        record = {
+            "version": 1,
+            "operation_id": operation_id,
+            "workspace_operation_id": workspace["operation_id"],
+            "protocol_id": self.protocol_id,
+            "treatment_id": self.treatment_id,
+            "block_index": self.block_index,
+            "sequence": self.sequence,
+            "launch_id": self.launch_id,
+            "uid": manager._uid_provider(),
+            "state_dir": self.state_dir,
+            "weights_dir": self.weights_dir,
+            "expected_command": list(command),
+            "environment_sha256": _canonical_sha256(actual_environment),
+            "containment": None,
+            "containment_phase": "create-intent",
+            "pid": None,
+            "starttime": None,
+            "created_at": _utc_now(),
+        }
+        workspace["pending_process"] = record
+        try:
+            _validate_pending_process_record(
+                manifest, workspace, record, manager._state_root
+            )
+            manager._save_manifest(manifest)
+        except BaseException as primary:
+            try:
+                manager._recover_pending_process(manifest)
+            except BaseException as cleanup:
+                raise _EngineCleanupError(
+                    "%s; cgroup create-intent save recovery failed: %s"
+                    % (primary, cleanup)
+                ) from primary
+            raise
+        try:
+            containment = supervisor.create_leaf(
+                manifest["deployment_id"], operation_id
+            )
+        except BaseException as primary:
+            record["recovery_error"] = str(primary) or primary.__class__.__name__
+            try:
+                manager._save_manifest(manifest)
+            except BaseException:
+                pass
+            raise
+        record["containment"] = copy.deepcopy(containment)
+        record["containment_phase"] = "cgroup-created"
+        try:
+            manager._save_manifest(manifest)
+        except BaseException as primary:
+            try:
+                manager._recover_pending_process(manifest)
+            except BaseException as cleanup:
+                raise _EngineCleanupError(
+                    "%s; cgroup create-intent recovery failed: %s"
+                    % (primary, cleanup)
+                ) from primary
+            raise
+        try:
+            self.recheck()
+            self.gate = supervisor.spawn_gate(
+                list(command),
+                environment=actual_environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                bufsize=0,
+            )
+            pid = int(self.gate.process.pid)
+            starttime = manager._process_starttime(pid)
+            if (
+                pid <= 0
+                or isinstance(starttime, bool)
+                or not isinstance(starttime, int)
+                or starttime <= 0
+            ):
+                raise RamdiskError("causal benchmark gate identity is malformed")
+            record.update(
+                containment_phase="gate-spawned",
+                pid=pid,
+                starttime=starttime,
+            )
+            manager._save_manifest(manifest)
+            supervisor.attach_gate(self.gate, containment)
+            record["containment_phase"] = "attached-verified"
+            manager._save_manifest(manifest)
+            self.recheck()
+            supervisor.release_gate(self.gate, containment)
+            record["containment_phase"] = "gate-released"
+            manager._save_manifest(manifest)
+            supervisor.verify_gate(self.gate, containment)
+            supervisor.close_gate(self.gate)
+            return self.gate.process
+        except BaseException as primary:
+            try:
+                if self.gate is not None and not getattr(
+                    self.gate, "released", False
+                ):
+                    supervisor.abort_gate(self.gate)
+                manager._recover_pending_process(manifest, gate=self.gate)
+            except BaseException as cleanup:
+                raise _EngineCleanupError(
+                    "%s; supervised benchmark cleanup failed: %s"
+                    % (primary, cleanup)
+                ) from primary
+            raise
+
+    def retire(self, process):
+        """Retire the Engine through durable containment, never raw PID signals."""
+        manifest = self.manager._load_manifest(required=True)
+        workspace = self.manager._validate_workspace_record(manifest)
+        record = workspace.get("pending_process")
+        if record is None:
+            if self._retired_record is not None:
+                return
+            raise WorkspaceCleanupError(
+                "benchmark process retirement has no durable authority"
+            )
+        pid = getattr(process, "pid", None)
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid != record.get("pid")
+        ):
+            raise WorkspaceCleanupError(
+                "benchmark Engine process differs from durable authority"
+            )
+        retired = copy.deepcopy(record)
+        self.manager._recover_pending_process(manifest, gate=self.gate)
+        refreshed = self.manager._load_manifest(required=True)
+        if (refreshed.get("benchmark_workspace") or {}).get(
+            "pending_process"
+        ) is not None:
+            raise WorkspaceCleanupError(
+                "benchmark process retirement did not clear durable authority"
+            )
+        self._retired_record = retired
+
+    def bind_evidence(self, row):
+        manifest = self.manager._load_manifest(required=True)
+        workspace = self.manager._validate_workspace_record(manifest)
+        if workspace.get("pending_process") is not None:
+            raise RamdiskError(
+                "raw evidence cannot bind before durable process retirement"
+            )
+        record = self._retired_record
+        process = row.get("process") if isinstance(row, dict) else None
+        if (
+            not isinstance(record, dict)
+            or record.get("containment_phase") != "gate-released"
+            or not isinstance(process, dict)
+            or process.get("pid") != record.get("pid")
+            or process.get("starttime") != record.get("starttime")
+        ):
+            raise RamdiskError(
+                "raw evidence process differs from durable gate identity"
+            )
+        applied_environment = row.get("applied_environment")
+        if (
+            not isinstance(applied_environment, dict)
+            or _canonical_sha256(applied_environment)
+            != record.get("environment_sha256")
+        ):
+            raise RamdiskError(
+                "raw evidence environment differs from durable spawn authority"
+            )
+        process.clear()
+        process.update(
+            launch_id=record["launch_id"],
+            pid=record["pid"],
+            starttime=record["starttime"],
+            supervision_mode="cgroup-v2",
+            containment_identity_sha256=_canonical_sha256(
+                record["containment"]
+            ),
+        )
+        return row
+
+    def __exit__(self, kind, value, traceback):
+        self.manager._active_process_attempt = None
+        manifest = self.manager._load_manifest(required=True)
+        if (manifest.get("benchmark_workspace") or {}).get(
+            "pending_process"
+        ) is not None:
+            try:
+                self.manager._recover_pending_process(manifest, gate=self.gate)
+            except BaseException as cleanup:
+                raise _EngineCleanupError(
+                    "supervised benchmark process cleanup failed: %s" % cleanup
+                ) from value
+        return False
+
+
 class DurableWorkspaceManager:
     """Journal one opposite-policy scratch beside a prepared deployment root."""
 
@@ -267,6 +809,11 @@ class DurableWorkspaceManager:
         source_still_matches,
         umount_path,
         available_for_mount=None,
+        process_supervisor=None,
+        process_supervisor_factory=None,
+        process_starttime=None,
+        uid_provider=None,
+        sleep=None,
     ):
         self._load_manifest = load_manifest
         self._save_manifest = save_manifest
@@ -284,12 +831,44 @@ class DurableWorkspaceManager:
         self._source_still_matches = source_still_matches
         self._umount_path = umount_path
         self._available_for_mount = available_for_mount
+        self._process_supervisor = process_supervisor
+        self._process_supervisor_factory = process_supervisor_factory
+        self._process_starttime = process_starttime or _process_starttime
+        self._uid_provider = uid_provider or getattr(os, "getuid", lambda: 0)
+        self._sleep = sleep or time.sleep
+        self._active_process_attempt = None
+
+    def _supervisor(self):
+        if (
+            self._process_supervisor is None
+            and self._process_supervisor_factory is not None
+        ):
+            self._process_supervisor = self._process_supervisor_factory()
+        return self._process_supervisor
 
     @staticmethod
     def _validate_nodes(plan):
         placement = (plan.get("placement") or {}).get("memory_nodes") or []
         online = (plan.get("hardware") or {}).get("online_nodes") or []
         rows = (plan.get("hardware") or {}).get("nodes") or []
+        if (
+            not isinstance(placement, list)
+            or not isinstance(online, list)
+            or not isinstance(rows, list)
+            or any(
+                isinstance(node, bool) or not isinstance(node, int)
+                for node in placement + online
+            )
+            or any(
+                not isinstance(row, dict)
+                or isinstance(row.get("id"), bool)
+                or not isinstance(row.get("id"), int)
+                for row in rows
+            )
+        ):
+            raise RamdiskError(
+                "causal workspace has malformed persisted NUMA hardware"
+            )
         try:
             placement = {int(node) for node in placement}
             online = {int(node) for node in online}
@@ -362,12 +941,20 @@ class DurableWorkspaceManager:
     @classmethod
     def _requested(cls, plan, *, name, size_bytes):
         _mode, _nodes, _node, policy = cls._root_spec(name)
+        mount_options = plan.get("mount_options")
+        if (
+            not isinstance(mount_options, dict)
+            or not isinstance(mount_options.get("thp"), str)
+            or mount_options["thp"] not in ("always", "advise", "never")
+            or not isinstance(mount_options.get("noswap"), bool)
+        ):
+            raise RamdiskError("causal benchmark mount options are malformed")
         return {
             "filesystem": "tmpfs",
             "source": "tmpfs",
             "size_bytes": size_bytes,
-            "thp": plan["mount_options"]["thp"],
-            "noswap": bool(plan["mount_options"]["noswap"]),
+            "thp": mount_options["thp"],
+            "noswap": mount_options["noswap"],
             "safety_options": [
                 "noatime",
                 "nodev",
@@ -419,7 +1006,15 @@ class DurableWorkspaceManager:
             or identity.get("mount_id") <= 0
             or not isinstance(identity.get("device"), str)
             or not identity["device"]
-            or planned.get("node") != node
+            or (node is None and planned.get("node") is not None)
+            or (
+                node is not None
+                and (
+                    isinstance(planned.get("node"), bool)
+                    or not isinstance(planned.get("node"), int)
+                    or planned["node"] != node
+                )
+            )
             or planned.get("policy") != policy
             or planned.get("size_bytes") != size_bytes
             or not isinstance(record.get("operation_id"), str)
@@ -568,6 +1163,20 @@ class DurableWorkspaceManager:
             for key in ("effective_thp", "effective_noswap"):
                 if key in root:
                     expected_requested[key] = root[key]
+            if (
+                "effective_thp" in root
+                and (
+                    not isinstance(root["effective_thp"], str)
+                    or root["effective_thp"]
+                    not in ("always", "advise", "never")
+                )
+            ) or (
+                "effective_noswap" in root
+                and not isinstance(root["effective_noswap"], bool)
+            ):
+                raise WorkspaceCleanupError(
+                    "durable benchmark effective mount policy changed"
+                )
             expected_root_path = (
                 os.path.join(expected_path, name)
                 if root.get("role") == "scratch"
@@ -577,8 +1186,21 @@ class DurableWorkspaceManager:
                 root.get("path") != expected_root_path
                 or not _path_without_symlinks(root["path"])
                 or root.get("mode") != mode
-                or root.get("nodes") != nodes
-                or root.get("node") != node
+                or not isinstance(root.get("nodes"), list)
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int)
+                    for item in root["nodes"]
+                )
+                or root["nodes"] != nodes
+                or (node is None and root.get("node") is not None)
+                or (
+                    node is not None
+                    and (
+                        isinstance(root.get("node"), bool)
+                        or not isinstance(root.get("node"), int)
+                        or root["node"] != node
+                    )
+                )
                 or root.get("policy") != policy
                 or root.get("size_bytes") != workspace["size_bytes"]
                 or root.get("source_fingerprint")
@@ -625,7 +1247,136 @@ class DurableWorkspaceManager:
             raise WorkspaceCleanupError(
                 "durable benchmark scratch authority changed"
             )
+        if workspace.get("pending_process") is not None:
+            _validate_pending_process_record(
+                manifest,
+                workspace,
+                workspace["pending_process"],
+                self._state_root,
+            )
+            if workspace["pending_process"].get("uid") != self._uid_provider():
+                raise WorkspaceCleanupError(
+                    "durable benchmark process UID changed"
+                )
         return workspace
+
+    def process_attempt(self, **kwargs):
+        return _BenchmarkProcessAttempt(self, **kwargs)
+
+    def _original_process_absent(self, record):
+        pid = record.get("pid")
+        starttime = record.get("starttime")
+        if pid is None and starttime is None:
+            return True
+        for _attempt in range(20):
+            try:
+                observed = self._process_starttime(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                return True
+            except (OSError, ValueError, RamdiskError) as error:
+                raise WorkspaceCleanupError(
+                    "benchmark process identity check is inconclusive: %s"
+                    % error
+                ) from error
+            if observed != starttime:
+                return True
+            self._sleep(0.05)
+        return False
+
+    @staticmethod
+    def _reap_gate_process(gate):
+        process = getattr(gate, "process", None) if gate is not None else None
+        if process is None:
+            return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise WorkspaceCleanupError(
+                "benchmark engine did not exit after cgroup termination"
+            ) from error
+
+    def _clear_pending_process(self, manifest):
+        """Durably clear authority before changing the caller's live snapshot."""
+        candidate = copy.deepcopy(manifest)
+        candidate_workspace = candidate.get("benchmark_workspace") or {}
+        candidate_workspace.pop("pending_process", None)
+        self._save_manifest(candidate)
+        (manifest.get("benchmark_workspace") or {}).pop(
+            "pending_process", None
+        )
+
+    def _recover_pending_process(self, manifest, gate=None):
+        workspace = self._validate_workspace_record(manifest)
+        record = workspace.get("pending_process")
+        if record is None:
+            return True
+        supervisor = self._supervisor()
+        if supervisor is None:
+            raise WorkspaceCleanupError(
+                "benchmark process recovery requires cgroup supervision"
+            )
+        try:
+            if record.get("containment_phase") == "create-intent":
+                containment = supervisor.reconcile_leaf_intent(
+                    manifest["deployment_id"], record["operation_id"]
+                )
+                if containment is None:
+                    self._clear_pending_process(manifest)
+                    return True
+                supervisor.prove_absence(containment)
+                record["containment"] = copy.deepcopy(containment)
+                record["containment_phase"] = "cgroup-created"
+                self._save_manifest(manifest)
+            if gate is not None and not getattr(gate, "released", False):
+                supervisor.abort_gate(gate)
+            if record.get("containment_removed_at") is None:
+                authorized = record.get("containment_removal_authorized_at")
+                if authorized is None:
+                    supervisor.terminate(record["containment"])
+                    supervisor.prove_absence(record["containment"])
+                    self._reap_gate_process(gate)
+                    if not self._original_process_absent(record):
+                        raise WorkspaceCleanupError(
+                            "benchmark process remains live outside its cgroup"
+                        )
+                    record["containment_removal_authorized_at"] = _utc_now()
+                    record.pop("recovery_error", None)
+                    self._save_manifest(manifest)
+                elif not self._original_process_absent(record):
+                    raise WorkspaceCleanupError(
+                        "benchmark process remains live after removal authorization"
+                    )
+                try:
+                    supervisor.remove_empty(record["containment"])
+                except RamdiskError as error:
+                    if (
+                        record.get("containment_removal_authorized_at") is None
+                        or error.__class__.__name__ != "ContainmentMissing"
+                    ):
+                        raise
+                record["containment_removed_at"] = _utc_now()
+                record.pop("recovery_error", None)
+                self._save_manifest(manifest)
+            supervisor.prove_removed(record["containment"])
+            if not self._original_process_absent(record):
+                raise WorkspaceCleanupError(
+                    "benchmark process identity remains live after cgroup removal"
+                )
+            self._clear_pending_process(manifest)
+            if gate is not None:
+                supervisor.close_gate(gate)
+            return True
+        except BaseException as error:
+            record["recovery_error"] = str(error) or error.__class__.__name__
+            try:
+                self._save_manifest(manifest)
+            except BaseException:
+                pass
+            if isinstance(error, WorkspaceCleanupError):
+                raise
+            raise WorkspaceCleanupError(
+                "benchmark process recovery is inconclusive: %s" % error
+            ) from error
 
     def _verify_root(self, manifest, root, descriptor=None, *, namespace=False):
         plan = manifest["plan"]
@@ -769,6 +1520,16 @@ class DurableWorkspaceManager:
         if manifest.get("benchmark_workspace") is None:
             return True
         workspace = self._validate_workspace_record(manifest)
+        if workspace.get("pending_process") is not None:
+            self._recover_pending_process(
+                manifest,
+                gate=(
+                    self._active_process_attempt.gate
+                    if self._active_process_attempt is not None
+                    else None
+                ),
+            )
+            workspace = self._validate_workspace_record(manifest)
         scratch_roots = [
             root for root in workspace["roots"] if root.get("role") == "scratch"
         ]
@@ -1175,7 +1936,16 @@ def build_causal_protocol(
         )
 
     placement = plan.get("placement") or {}
-    selected_nodes = [int(node) for node in placement.get("memory_nodes") or []]
+    selected_nodes = placement.get("memory_nodes") or []
+    if (
+        not isinstance(selected_nodes, list)
+        or any(
+            isinstance(node, bool) or not isinstance(node, int)
+            for node in selected_nodes
+        )
+    ):
+        raise RamdiskError("causal benchmark has malformed reviewed NUMA nodes")
+    selected_nodes = list(selected_nodes)
     if not {0, 1}.issubset(selected_nodes):
         raise RamdiskError(
             "causal benchmark requires reviewed NUMA nodes 0 and 1"
@@ -1184,11 +1954,32 @@ def build_causal_protocol(
     selected_cpus = placement.get("cpus")
     if not isinstance(selected_cpus, list):
         selected_cpus = _parse_range_list(cpu_list or "")
+    elif any(
+        isinstance(cpu, bool) or not isinstance(cpu, int)
+        for cpu in selected_cpus
+    ):
+        raise RamdiskError("causal benchmark has malformed reviewed CPUs")
+    hardware_rows = (plan.get("hardware") or {}).get("nodes", [])
+    if (
+        not isinstance(hardware_rows, list)
+        or any(
+            not isinstance(row, dict)
+            or isinstance(row.get("id"), bool)
+            or not isinstance(row.get("id"), int)
+            or not isinstance(row.get("cpus"), list)
+            or any(
+                isinstance(cpu, bool) or not isinstance(cpu, int)
+                for cpu in row["cpus"]
+            )
+            for row in hardware_rows
+        )
+    ):
+        raise RamdiskError("causal benchmark has malformed NUMA hardware rows")
     node_zero = next(
         (
             row
-            for row in (plan.get("hardware") or {}).get("nodes", [])
-            if isinstance(row, dict) and row.get("id") == 0
+            for row in hardware_rows
+            if row.get("id") == 0
         ),
         None,
     )
@@ -1367,6 +2158,12 @@ def build_causal_protocol(
         },
         "source": source_identity,
         "workspace_requirements": _workspace_requirements(plan),
+        "process_supervision": {
+            "version": 1,
+            "mode": "cgroup-v2",
+            "launch_id": "32-lowercase-hex",
+            "environment_binding": "sha256",
+        },
         "dram_collector": copy.deepcopy(
             dram_collector
             or {
@@ -1410,7 +2207,12 @@ def _validate_workspace_roots(workspace_manager, roots, protocol=None):
             )
         if (
             descriptor.get("mode") != mode
-            or descriptor.get("nodes") != nodes
+            or not isinstance(descriptor.get("nodes"), list)
+            or any(
+                isinstance(node, bool) or not isinstance(node, int)
+                for node in descriptor["nodes"]
+            )
+            or descriptor["nodes"] != nodes
             or descriptor.get("verified") is not True
             or workspace_manager.verify(descriptor) is not True
         ):
@@ -1706,8 +2508,21 @@ def _validate_workspace_attempt(value):
             or not os.path.isabs(root["path"])
             or not _path_without_symlinks(root["path"])
             or root.get("mode") != expected_mode
-            or root.get("nodes") != expected_nodes
-            or root.get("node") != expected_node
+            or not isinstance(root.get("nodes"), list)
+            or any(
+                isinstance(node, bool) or not isinstance(node, int)
+                for node in root["nodes"]
+            )
+            or root["nodes"] != expected_nodes
+            or (expected_node is None and root.get("node") is not None)
+            or (
+                expected_node is not None
+                and (
+                    isinstance(root.get("node"), bool)
+                    or not isinstance(root.get("node"), int)
+                    or root["node"] != expected_node
+                )
+            )
             or not isinstance(root.get("policy"), str)
             or isinstance(root.get("size_bytes"), bool)
             or not isinstance(root.get("size_bytes"), int)
@@ -1737,7 +2552,7 @@ def _validate_workspace_attempt(value):
     return value
 
 
-def validate_raw_evidence_row(row):
+def validate_raw_evidence_row(row, *, allow_unbound_process=False):
     """Validate structure without discarding failed/incomplete measurements."""
     if not isinstance(row, dict):
         raise RamdiskError("raw evidence row must be an object")
@@ -1783,9 +2598,29 @@ def validate_raw_evidence_row(row):
         _require_mapping(row, name)
     if row["status"] == "ok":
         process = row["process"]
-        if not isinstance(process.get("launch_id"), str) or not process["launch_id"]:
+        expected_process_keys = {"launch_id", "pid", "starttime"}
+        if not allow_unbound_process:
+            expected_process_keys |= {
+                "supervision_mode",
+                "containment_identity_sha256",
+            }
+        if set(process) != expected_process_keys:
+            raise RamdiskError("raw evidence process identity is malformed")
+        if (
+            not isinstance(process.get("launch_id"), str)
+            or not process["launch_id"]
+            or (
+                not allow_unbound_process
+                and re.fullmatch(r"[0-9a-f]{32}", process["launch_id"])
+                is None
+            )
+        ):
             raise RamdiskError("raw evidence process launch_id is missing")
-        if not isinstance(process.get("pid"), int) or process["pid"] <= 0:
+        if (
+            isinstance(process.get("pid"), bool)
+            or not isinstance(process.get("pid"), int)
+            or process["pid"] <= 0
+        ):
             raise RamdiskError("raw evidence process PID is invalid")
         if (
             isinstance(process.get("starttime"), bool)
@@ -1793,6 +2628,15 @@ def validate_raw_evidence_row(row):
             or process["starttime"] <= 0
         ):
             raise RamdiskError("raw evidence process starttime is invalid")
+        if not allow_unbound_process and (
+            process.get("supervision_mode") != "cgroup-v2"
+            or not _is_hex_digest(
+                process.get("containment_identity_sha256")
+            )
+        ):
+            raise RamdiskError(
+                "raw evidence process containment identity is malformed"
+            )
         if not _is_hex_digest(row.get("output_sha256")):
             raise RamdiskError("raw evidence output_sha256 must be lowercase 64-hex")
         throughput = row["performance"].get("tokens_per_second")
@@ -1834,6 +2678,45 @@ def validate_raw_evidence_row(row):
             raise RamdiskError("successful raw evidence requires complete swap counters")
         if float(delta) != float(after) - float(before):
             raise RamdiskError("raw evidence swap delta is inconsistent")
+
+        profiler = row["profiler"]
+        if set(profiler) != {
+            "rammap_experts",
+            "rammap_bytes",
+            "physical_ssd_bytes",
+            "physical_ssd_valid",
+        }:
+            raise RamdiskError("raw evidence PROF telemetry is malformed")
+        for name in ("rammap_experts", "rammap_bytes"):
+            value = profiler.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise RamdiskError(
+                    "raw evidence PROF %s is invalid" % name
+                )
+        physical_valid = profiler.get("physical_ssd_valid")
+        physical_bytes = profiler.get("physical_ssd_bytes")
+        if (
+            physical_valid is not True
+            and physical_valid is not False
+            and physical_valid is not None
+        ) or (
+            physical_valid is True
+            and (
+                isinstance(physical_bytes, bool)
+                or not isinstance(physical_bytes, int)
+                or physical_bytes < 0
+            )
+        ) or (
+            physical_valid is not True
+            and physical_bytes is not None
+        ):
+            raise RamdiskError(
+                "raw evidence PROF physical SSD accounting is invalid"
+            )
 
         placement = row["numa_placement"]
         by_node = _numeric_node_map(placement.get("by_node"), "NUMA by_node")
@@ -2985,7 +3868,12 @@ def _benchmark_generate(engine, prompt, on_text, cancel_event, client_cancelled_
         watcher.join(timeout=1)
 
 
-def _default_engine_dependencies(cancel_event):
+def _default_engine_dependencies(
+    cancel_event,
+    *,
+    spawn_process=None,
+    terminate_process=None,
+):
     from openai_server import (
         READY,
         ClientCancelled,
@@ -3004,6 +3892,25 @@ def _default_engine_dependencies(cancel_event):
     )
 
     class RecordedEnvironmentEngine(cancellable_type):
+        def _spawn_process(self, command, *, child_env, stderr):
+            if spawn_process is None:
+                return super()._spawn_process(
+                    command,
+                    child_env=child_env,
+                    stderr=stderr,
+                )
+            return spawn_process(
+                command,
+                child_env=child_env,
+                stderr=stderr,
+            )
+
+        @staticmethod
+        def _terminate_process(process):
+            if terminate_process is None:
+                return cancellable_type._terminate_process(process)
+            return terminate_process(process)
+
         def __init__(
             self,
             executable,
@@ -3275,7 +4182,7 @@ def run_causal_replicate(
             row["workspace_attempt"] = copy.deepcopy(
                 treatment["_workspace_attempt"]
             )
-        return validate_raw_evidence_row(row)
+        return validate_raw_evidence_row(row, allow_unbound_process=True)
     finally:
         if dram_handle is not None:
             try:
@@ -3397,6 +4304,13 @@ def evaluate_causal_claim(protocol, rows):
         or _causal_protocol_identity(protocol) != protocol["protocol_id"]
     ):
         raise RamdiskError("causal protocol identity is invalid")
+    if protocol.get("process_supervision") != {
+        "version": 1,
+        "mode": "cgroup-v2",
+        "launch_id": "32-lowercase-hex",
+        "environment_binding": "sha256",
+    }:
+        raise RamdiskError("causal protocol process supervision is malformed")
     treatment_by_id = {
         treatment["id"]: treatment for treatment in protocol["treatments"]
     }
@@ -3805,8 +4719,12 @@ def _execute_causal_schedule(
                     dram_collector=dram_collector,
                     cancel_event=cancel_event,
                 )
+            except (_EngineCleanupError, WorkspaceCleanupError):
+                # Cleanup failure means durable process authority may remain.
+                # Recording a replicate (even a failed one) would let resume
+                # skip an attempt whose containment has not been reconciled.
+                raise
             except (
-                _EngineCleanupError,
                 _OperationCancelled,
                 WorkspaceVerificationError,
             ) as exc:
@@ -4165,6 +5083,7 @@ def run_benchmark(
                 sequence,
                 **kwargs
             ):
+                launch_id = secrets.token_hex(16)
                 state_dir = os.path.join(
                     state_root(),
                     "causal-benchmark-state",
@@ -4174,22 +5093,80 @@ def run_benchmark(
                         block_index,
                         sequence,
                         treatment["id"],
-                        secrets.token_hex(8),
+                        launch_id,
                     ),
                 )
                 ensure_private_dir(state_dir)
                 assert_durable_state_dir(state_dir, plan=plan)
-                return replicate_runner(
-                    current_protocol,
-                    treatment,
-                    block_index,
-                    sequence,
-                    engine_path=resolved_engine,
-                    state_dir=state_dir,
-                    environ=environment,
-                    fingerprint_file=fingerprint_file,
-                    **kwargs
+
+                def launch_recheck():
+                    assert_ready_mounts(manifest)
+                    _assert_frozen_artifacts(
+                        current_protocol,
+                        fingerprint_file,
+                        treatment=treatment,
+                    )
+                    workspace = workspace_by_path.get(treatment["weights_path"])
+                    if (
+                        workspace is not None
+                        and workspace_manager.verify(workspace) is not True
+                    ):
+                        raise WorkspaceVerificationError(
+                            "causal benchmark workspace changed at spawn for %s"
+                            % treatment["id"]
+                        )
+
+                attempt_factory = getattr(
+                    workspace_manager, "process_attempt", None
                 )
+                if not callable(attempt_factory):
+                    if replicate_runner is run_causal_replicate:
+                        raise RamdiskError(
+                            "causal benchmark process supervision is unavailable"
+                        )
+                    return replicate_runner(
+                        current_protocol,
+                        treatment,
+                        block_index,
+                        sequence,
+                        engine_path=resolved_engine,
+                        state_dir=state_dir,
+                        environ=environment,
+                        fingerprint_file=fingerprint_file,
+                        **kwargs
+                    )
+                with attempt_factory(
+                    protocol_id=current_protocol["protocol_id"],
+                    treatment_id=treatment["id"],
+                    block_index=block_index,
+                    sequence=sequence,
+                    launch_id=launch_id,
+                    state_dir=state_dir,
+                    weights_dir=treatment["weights_path"],
+                    recheck=launch_recheck,
+                ) as process_attempt:
+                    engine_type, render_prompt, cancelled_type = (
+                        _default_engine_dependencies(
+                            cancel_event,
+                            spawn_process=process_attempt.spawn,
+                            terminate_process=process_attempt.retire,
+                        )
+                    )
+                    row = replicate_runner(
+                        current_protocol,
+                        treatment,
+                        block_index,
+                        sequence,
+                        engine_path=resolved_engine,
+                        engine_factory=engine_type,
+                        render_prompt=render_prompt,
+                        client_cancelled_type=cancelled_type,
+                        state_dir=state_dir,
+                        environ=environment,
+                        fingerprint_file=fingerprint_file,
+                        **kwargs
+                    )
+                    return process_attempt.bind_evidence(row)
 
             return causal_runner(
                 protocol,
@@ -4207,6 +5184,14 @@ def run_benchmark(
     except WorkspaceCleanupError as exc:
         if protocol is None:
             raise
+        latest_manifest = load_manifest(required=True)
+        if (latest_manifest.get("benchmark_workspace") or {}).get(
+            "pending_process"
+        ) is not None:
+            raise WorkspaceCleanupError(
+                "%s; benchmark process recovery authority remains durable"
+                % exc
+            ) from exc
         event = workspace_cleanup_evidence_row(protocol, exc)
         with DurableEvidenceStore(
             raw_path,

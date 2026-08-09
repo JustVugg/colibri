@@ -26,8 +26,30 @@ from .common import (
 )
 
 
-_POPEN_BASE_TYPE = subprocess.Popen
 _PENDING_RECOVERY_ERROR_PREFIX = "pending managed-launch recovery: "
+_PROCESS_SUPERVISION_VERSION = 1
+_CONTAINMENT_PHASES = (
+    "cgroup-created",
+    "gate-spawned",
+    "attached-verified",
+    "gate-released",
+)
+
+
+def _supervision_module():
+    """Load Linux runner containment only when a managed operation needs it."""
+    from . import supervision
+
+    return supervision
+
+
+def default_supervisor():
+    """Preserve the injectable lifecycle seam without an eager Linux import."""
+    return _supervision_module().default_supervisor()
+
+
+def validate_containment(value):
+    return _supervision_module().validate_containment(value)
 
 
 def _managed_ports_for_plan(plan, base_port=8000):
@@ -97,6 +119,266 @@ def _retained_process_recovery(manifest):
 def _pending_launch_recovery(manifest):
     pending = manifest.get("pending_launches")
     return pending if isinstance(pending, list) else []
+
+
+def _contained_manifest(manifest):
+    return manifest.get("process_supervision_version") == (
+        _PROCESS_SUPERVISION_VERSION
+    )
+
+
+def _launch_contained_gate(
+    command,
+    environment,
+    context,
+    *,
+    manifest,
+    supervisor,
+    save_manifest,
+    **popen_kwargs,
+):
+    """Advance a blocked child through three separately durable phases."""
+    pending = context["pending_entry"]
+    containment = validate_containment(pending.get("containment"))
+    if pending.get("containment_phase") != "cgroup-created":
+        raise RamdiskError("managed launch cgroup phase is not initial")
+
+    gate = supervisor.spawn_gate(
+        command,
+        environment=environment,
+        **popen_kwargs,
+    )
+    context["gate"] = gate
+    context["process"] = gate.process
+    pending["pid"] = int(gate.process.pid)
+    pending["containment_phase"] = "gate-spawned"
+    save_manifest(manifest)
+
+    supervisor.attach_gate(gate, containment)
+    pending["containment_phase"] = "attached-verified"
+    save_manifest(manifest)
+
+    supervisor.release_gate(gate, containment)
+    pending["containment_phase"] = "gate-released"
+    save_manifest(manifest)
+    return gate
+
+
+def _retire_containment(
+    record,
+    *,
+    manifest,
+    supervisor,
+    save_manifest,
+    terminate,
+    managed_child_liveness=None,
+):
+    """Prove absence and durably authorize pathname removal before rmdir.
+
+    A missing cgroup is unsafe until the removal authorization has reached the
+    manifest.  Once that intent is durable, a crash between rmdir and the
+    final marker can be completed idempotently without treating a replacement
+    (different device/inode) as ours.
+    """
+    supervision = _supervision_module()
+    containment = supervision.validate_containment(record.get("containment"))
+    if record.get("containment_removed_at"):
+        return True
+
+    removal_authorized = bool(
+        record.get("containment_removal_authorized_at")
+    )
+    if not removal_authorized:
+        if terminate:
+            supervisor.terminate(containment)
+        supervisor.prove_absence(containment)
+        if (
+            managed_child_liveness is not None
+            and _positive_int(record.get("pid"))
+            and managed_child_liveness(record["pid"]) is True
+        ):
+            raise RamdiskError(
+                "retained direct child remains live outside its empty cgroup"
+            )
+        record["containment_removal_authorized_at"] = _utc_now()
+        # No pathname removal may happen if this durability boundary fails.
+        save_manifest(manifest)
+        removal_authorized = True
+
+    try:
+        supervisor.remove_empty(containment)
+    except supervision.ContainmentMissing:
+        if not removal_authorized:
+            raise
+        # Durable removal intent is the only authority under which a missing
+        # pathname can complete the transition.
+    record["containment_removed_at"] = _utc_now()
+    save_manifest(manifest)
+    return True
+
+
+def _contained_preflight(records, supervisor):
+    failures = []
+    for record in records:
+        if record.get("containment_removed_at"):
+            continue
+        label = record.get("pid", record.get("operation_id", "unknown"))
+        try:
+            containment = validate_containment(record.get("containment"))
+            members = supervisor.members(containment)
+            if not isinstance(members, list):
+                raise RamdiskError("cgroup membership result is invalid")
+        except BaseException as exc:
+            failures.append("%s: %s" % (label, exc))
+    return failures
+
+
+def _stop_contained(
+    manifest,
+    *,
+    supervisor,
+    save_manifest,
+    merge_usage,
+    bind_usage_transaction,
+    managed_child_liveness,
+):
+    """Stop a versioned cgroup deployment without PID/PGID fallback."""
+    if _retained_process_recovery(manifest):
+        raise RamdiskError(
+            "versioned cgroup supervision cannot use legacy retained-process "
+            "recovery"
+        )
+    non_managed_mounts = [
+        record
+        for record in manifest.get("mounts", [])
+        if record.get("ownership", "managed") != "managed"
+    ]
+    if non_managed_mounts:
+        raise RamdiskError(
+            "refusing stop while non-managed mount ownership requires recovery"
+        )
+
+    pending = list(_pending_launch_recovery(manifest))
+    processes = list(manifest.get("processes", []))
+    authorities = pending + processes
+    preflight_failures = _contained_preflight(authorities, supervisor)
+    if preflight_failures:
+        refusal = RamdiskError(
+            "refusing cgroup containment preflight: "
+            + "; ".join(preflight_failures)
+        )
+        manifest["state"] = "error"
+        manifest.setdefault("cleanup_errors", []).append(str(refusal))
+        try:
+            save_manifest(manifest)
+        except BaseException as save_exc:
+            raise RamdiskError(
+                "%s; could not persist containment refusal: %s"
+                % (refusal, save_exc)
+            ) from refusal
+        raise refusal
+
+    plan = manifest["plan"]
+    canonical_usage = os.path.join(plan["model"]["path"], ".coli_usage")
+    if authorities:
+        _bind_recovery_usage_transactions(
+            manifest,
+            authorities,
+            plan=plan,
+            bind_usage_transaction=bind_usage_transaction,
+        )
+        # All stable usage authorities and all cgroup identities are durable
+        # before the first contained signal.
+        save_manifest(manifest)
+
+    failures = []
+    for entry in pending:
+        label = "pending launch %s" % entry.get("operation_id", "unknown")
+        try:
+            _retire_containment(
+                entry,
+                manifest=manifest,
+                supervisor=supervisor,
+                save_manifest=save_manifest,
+                terminate=not bool(entry.get("containment_removed_at")),
+                managed_child_liveness=managed_child_liveness,
+            )
+            merge_usage(entry, canonical_usage, plan=plan)
+            if not entry.get("usage_merged_at"):
+                entry["usage_merged_at"] = _utc_now()
+            save_manifest(manifest)
+            previous = list(manifest.get("pending_launches", []))
+            manifest["pending_launches"] = [
+                item
+                for item in previous
+                if item.get("operation_id") != entry.get("operation_id")
+            ]
+            try:
+                save_manifest(manifest)
+            except BaseException:
+                manifest["pending_launches"] = previous
+                raise
+        except BaseException as exc:
+            entry["recovery_error"] = str(exc)
+            failures.append("%s: %s" % (label, exc))
+
+    for record in processes:
+        label = "PID %s" % record.get("pid", "unknown")
+        try:
+            _retire_containment(
+                record,
+                manifest=manifest,
+                supervisor=supervisor,
+                save_manifest=save_manifest,
+                terminate=(
+                    not bool(record.get("stopped_at"))
+                    and not bool(record.get("containment_removed_at"))
+                ),
+                managed_child_liveness=managed_child_liveness,
+            )
+            merge_usage(record, canonical_usage, plan=plan)
+            if not record.get("usage_merged_at"):
+                record["usage_merged_at"] = _utc_now()
+            record.setdefault("stopped_at", _utc_now())
+            record.pop("stop_error", None)
+            record.pop("usage_merge_error", None)
+            save_manifest(manifest)
+        except BaseException as exc:
+            record["stop_error"] = str(exc)
+            failures.append("%s: %s" % (label, exc))
+
+    planned_paths = {
+        item["path"] for item in plan.get("mounts", [])
+    }
+    recorded_paths = {
+        item["path"] for item in manifest.get("mounts", [])
+    }
+    incomplete_mount_layout = planned_paths != recorded_paths
+    remaining_pending = bool(_pending_launch_recovery(manifest))
+    incomplete_processes = any(
+        not record.get("containment_removed_at")
+        or record.get("stop_error")
+        or record.get("usage_merge_error")
+        for record in processes
+    )
+    manifest["state"] = (
+        "error"
+        if failures or remaining_pending or incomplete_processes
+        or incomplete_mount_layout
+        else "stopped"
+    )
+    if manifest["state"] == "stopped":
+        manifest.pop("launch_error", None)
+        manifest.pop("cleanup_errors", None)
+        manifest.pop("recovery", None)
+    else:
+        manifest.setdefault("cleanup_errors", []).extend(failures)
+    save_manifest(manifest)
+    if failures:
+        raise RamdiskError(
+            "managed cgroup cleanup is incomplete: " + "; ".join(failures)
+        )
+    return manifest
 
 
 def _unresolved_process_recovery_error(action):
@@ -1618,39 +1900,129 @@ def _rollback_launched_children(
     return cleanup_failures, surviving_groups
 
 
-def _construct_retained_popen(
-    popen_factory,
-    attempt_context,
-    *args,
-    **kwargs,
+def _rollback_contained_launches(
+    manifest,
+    launch_contexts,
+    *,
+    supervisor,
+    save_manifest,
+    merge_usage,
+    canonical_usage,
+    plan,
+    forget_managed_child,
 ):
-    """Construct Popen while retaining a real partially initialized attempt.
-
-    Normal callable test doubles remain opaque: if they raise, no object exists
-    whose child-creation fields can be inspected, so their outcome is unknown.
-    A real attempt is registered before ``__init__`` can create a child, making
-    its exact handle available to rollback even if construction is interrupted.
-    """
-    if not (
-        isinstance(popen_factory, type)
-        and issubclass(popen_factory, _POPEN_BASE_TYPE)
-    ):
+    """Rollback new launches exclusively through their cgroup authority."""
+    failures = []
+    published = {
+        (record.get("usage_merge_id"), record.get("state_dir")): record
+        for record in manifest.get("processes", [])
+        if isinstance(record, dict) and record.get("containment") is not None
+    }
+    for context in reversed(launch_contexts):
+        record = context.get("record") or published.get(
+            (context.get("usage_merge_id"), context.get("state_dir"))
+        )
+        if record is not None:
+            context["record"] = record
+        authority = record or context["pending_entry"]
+        gate = context.get("gate")
         try:
-            return popen_factory(*args, **kwargs), None, False
+            if gate is not None and not getattr(gate, "released", False):
+                supervisor.abort_gate(gate)
+            elif gate is not None:
+                supervisor.close_gate(gate)
+
+            def retained_gate_liveness(_pid):
+                if gate is None or not getattr(gate, "released", False):
+                    return None
+                try:
+                    return gate.process.poll() is None
+                except BaseException:
+                    return True
+
+            _retire_containment(
+                authority,
+                manifest=manifest,
+                supervisor=supervisor,
+                save_manifest=save_manifest,
+                terminate=bool(gate is not None and getattr(gate, "released", False)),
+                managed_child_liveness=retained_gate_liveness,
+            )
         except BaseException as exc:
-            return None, exc, False
+            failure = "contained rollback for %s failed: %s" % (
+                context.get("state_dir"),
+                exc,
+            )
+            authority["stop_error"] = failure
+            failures.append(failure)
+            continue
+        finally:
+            if gate is not None:
+                try:
+                    supervisor.close_gate(gate)
+                except BaseException as exc:
+                    failures.append(
+                        "could not close managed gate for %s: %s"
+                        % (context.get("state_dir"), exc)
+                    )
 
-    try:
-        attempt = popen_factory.__new__(popen_factory)
-    except BaseException as exc:
-        return None, exc, False
+        process = getattr(gate, "process", None) if gate is not None else None
+        if process is not None:
+            try:
+                process.wait(timeout=1)
+            except ChildProcessError:
+                pass
+            except subprocess.TimeoutExpired:
+                failures.append(
+                    "contained direct child %s was not reaped"
+                    % getattr(process, "pid", "unknown")
+                )
+            except BaseException as exc:
+                failures.append(
+                    "could not reap contained direct child %s: %s"
+                    % (getattr(process, "pid", "unknown"), exc)
+                )
+            try:
+                forget_managed_child(process.pid)
+            except BaseException as exc:
+                failures.append(
+                    "could not forget contained child %s: %s"
+                    % (process.pid, exc)
+                )
 
-    attempt_context["popen_attempt"] = attempt
-    try:
-        popen_factory.__init__(attempt, *args, **kwargs)
-    except BaseException as exc:
-        return attempt, exc, True
-    return attempt, None, True
+        try:
+            merge_usage(authority, canonical_usage, plan=plan)
+            if not authority.get("usage_merged_at"):
+                authority["usage_merged_at"] = _utc_now()
+            if record is not None:
+                record.setdefault("stopped_at", _utc_now())
+                record.pop("stop_error", None)
+            save_manifest(manifest)
+        except BaseException as exc:
+            authority["usage_merge_error"] = str(exc)
+            failures.append(
+                "contained usage recovery for %s failed: %s"
+                % (context.get("state_dir"), exc)
+            )
+            continue
+
+        if record is None:
+            previous = list(manifest.get("pending_launches", []))
+            manifest["pending_launches"] = [
+                entry
+                for entry in previous
+                if entry.get("operation_id")
+                != authority.get("operation_id")
+            ]
+            try:
+                save_manifest(manifest)
+            except BaseException as exc:
+                manifest["pending_launches"] = previous
+                failures.append(
+                    "could not remove reconciled contained launch %s: %s"
+                    % (context.get("state_dir"), exc)
+                )
+    return failures
 
 
 def _launch_identity_matches(
@@ -1719,6 +2091,7 @@ def start(
     terminate_verified_group,
     terminate_direct_child,
     forget_managed_child,
+    containment_supervisor=None,
 ):
     if apply_managed_accelerator_environment is None:
         from .accelerator import _apply_managed_accelerator_environment
@@ -1744,6 +2117,11 @@ def start(
             "manifest state is %s, not ready"
             % manifest.get("state")
         )
+    supervisor = (
+        default_supervisor()
+        if containment_supervisor is None
+        else containment_supervisor
+    )
     assert_effective_masks_unchanged(manifest["plan"])
     assert_ready_mounts(manifest)
     plan = manifest["plan"]
@@ -1768,6 +2146,59 @@ def start(
     recovery_records = []
     for record in manifest.get("processes", []):
         _raise_if_cancelled(cancel_event)
+        if _contained_manifest(manifest):
+            if record.get("containment") is None:
+                foreign.append(
+                    "PID %s (missing-versioned-containment)"
+                    % record.get("pid")
+                )
+                continue
+            if not record.get("containment_removed_at"):
+                try:
+                    contained_alive = supervisor.liveness(record)
+                except BaseException:
+                    contained_alive = None
+                try:
+                    retained_child_alive = managed_child_liveness(record["pid"])
+                except BaseException:
+                    retained_child_alive = None
+                if retained_child_alive is True and contained_alive is not True:
+                    contained_alive = None
+                if contained_alive is True:
+                    if not record.get("stopped_at"):
+                        raise RamdiskError(
+                            "managed engine is already running on port %s"
+                            % record.get("port")
+                        )
+                    foreign.append(
+                        "PID %s (stopped-record-cgroup-populated)"
+                        % record.get("pid")
+                    )
+                    continue
+                if contained_alive is not False:
+                    foreign.append(
+                        "PID %s (cgroup-liveness-inconclusive)"
+                        % record.get("pid")
+                    )
+                    continue
+                try:
+                    _retire_containment(
+                        record,
+                        manifest=manifest,
+                        supervisor=supervisor,
+                        save_manifest=save_manifest,
+                        terminate=False,
+                    )
+                except BaseException as containment_exc:
+                    foreign.append(
+                        "PID %s (cgroup-removal-inconclusive: %s)"
+                        % (record.get("pid"), containment_exc)
+                    )
+                    continue
+            recovery_records.append(
+                (record, "stopped" if record.get("stopped_at") else "crashed")
+            )
+            continue
         try:
             child_alive = managed_child_liveness(record["pid"])
             child_liveness_failure = None
@@ -1955,6 +2386,14 @@ def start(
     )
     previous_ports = list(manifest.get("ports", []))
     previous_base_port = persisted_base_port(manifest)
+    previous_had_deployment_id = "deployment_id" in manifest
+    previous_deployment_id = manifest.get("deployment_id")
+    previous_had_supervision_version = (
+        "process_supervision_version" in manifest
+    )
+    previous_supervision_version = manifest.get(
+        "process_supervision_version"
+    )
     manifest["base_port"] = base_port
     managed_numactl = (
         fresh_user_binary("numactl")
@@ -2056,6 +2495,26 @@ def start(
     )
     spawned = []
     launch_contexts = []
+    deployment_id = manifest.get("deployment_id")
+    if not (
+        isinstance(deployment_id, str)
+        and len(deployment_id) == 32
+        and all(character in "0123456789abcdef" for character in deployment_id)
+    ):
+        fingerprint = str(manifest.get("model_fingerprint", ""))
+        fingerprint_hex = fingerprint.split(":", 1)[-1]
+        if (
+            len(fingerprint_hex) >= 32
+            and all(
+                character in "0123456789abcdef"
+                for character in fingerprint_hex
+            )
+        ):
+            deployment_id = fingerprint_hex[:32]
+        else:
+            deployment_id = secrets.token_hex(16)
+        manifest["deployment_id"] = deployment_id
+    manifest["process_supervision_version"] = _PROCESS_SUPERVISION_VERSION
     manifest["processes"] = []
     manifest["ports"] = []
     manifest["pending_launches"] = []
@@ -2110,8 +2569,13 @@ def start(
                 raise RamdiskError(
                     "managed launch has an invalid process-start boundary"
                 )
+            operation_id = "start:%s" % usage_merge_id
+            containment = supervisor.create_leaf(
+                deployment_id,
+                operation_id,
+            )
             pending_entry = {
-                "operation_id": "start:%s" % usage_merge_id,
+                "operation_id": operation_id,
                 "nonce": launch_nonce,
                 "uid": launch_uid,
                 "port": port,
@@ -2125,6 +2589,8 @@ def start(
                 "expected_command": list(command),
                 "usage_baseline": baseline,
                 "usage_merge_id": usage_merge_id,
+                "containment": containment,
+                "containment_phase": "cgroup-created",
             }
             context = {
                 "node": node,
@@ -2134,6 +2600,7 @@ def start(
                 "pending_entry": pending_entry,
                 "spawn_outcome": "not-attempted",
                 "record": None,
+                "containment": containment,
             }
             launch_contexts.append(context)
             manifest["pending_launches"].append(pending_entry)
@@ -2226,71 +2693,24 @@ def start(
             )
             _raise_if_cancelled(cancel_event)
             log = open(log_path, "ab", buffering=0)
-            child_stdin = None
             try:
-                child_stdin = open(os.devnull, "rb")
-                # Retain outcome-unknown until a successful handle or a real
-                # partially initialized Popen attempt proves what happened.
                 context["spawn_outcome"] = "outcome-unknown"
-                (
-                    process,
-                    construction_error,
-                    attempt_inspected,
-                ) = _construct_retained_popen(
-                    subprocess.Popen,
-                    context,
+                gate = _launch_contained_gate(
                     command,
-                    env=environment,
-                    stdin=child_stdin,
+                    environment,
+                    context,
+                    manifest=manifest,
+                    supervisor=supervisor,
+                    save_manifest=save_manifest,
+                    stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    close_fds=True,
                 )
-                if construction_error is not None:
-                    child_created = bool(
-                        getattr(process, "_child_created", False)
-                    ) if process is not None else False
-                    child_pid = (
-                        getattr(process, "pid", None)
-                        if process is not None
-                        else None
-                    )
-                    exact_child_handle = (
-                        isinstance(child_pid, int)
-                        and not isinstance(child_pid, bool)
-                        and child_pid > 0
-                        and attempt_inspected
-                    )
-                    if exact_child_handle:
-                        # Popen writes pid immediately before _child_created;
-                        # normalize an interruption in that narrow window so
-                        # poll/wait/destruction retain the exact child handle.
-                        process._child_created = True
-                        spawned.append(process)
-                        context["spawn_outcome"] = "created"
-                    elif (
-                        isinstance(construction_error, Exception)
-                        and attempt_inspected
-                        and not child_created
-                        and child_pid is None
-                    ):
-                        # A normal exception plus the inspected attempt state
-                        # proves construction never published a child PID.
-                        context["spawn_outcome"] = "proven-absent"
-                    raise construction_error
-                if process is None:
-                    raise RamdiskError(
-                        "Popen returned no process handle"
-                    )
+                process = gate.process
                 spawned.append(process)
                 context["spawn_outcome"] = "created"
             finally:
-                try:
-                    if child_stdin is not None:
-                        child_stdin.close()
-                finally:
-                    log.close()
+                log.close()
             identity = None
             identity_deadline = time.monotonic() + 1.0
             while (
@@ -2334,6 +2754,7 @@ def start(
                     "attribution during launch; see %s"
                     % log_path
                 )
+            supervisor.verify_gate(gate, containment)
             record = {
                 "pid": identity["pid"],
                 "pgid": identity["pgid"],
@@ -2351,6 +2772,7 @@ def start(
                 "log": log_path,
                 "runtime_knobs": applied_runtime_knobs,
                 "accelerator_environment": applied_accelerator,
+                "containment": containment,
             }
             candidate_records = records + [record]
             manifest["processes"] = candidate_records
@@ -2371,6 +2793,7 @@ def start(
             save_manifest(manifest)
             records.append(record)
             context["record"] = record
+            supervisor.close_gate(gate)
 
         # Launch all nodes before waiting so replicated model loading proceeds
         # concurrently. Publish `running` only after every health check passes.
@@ -2391,6 +2814,67 @@ def start(
     except BaseException as launch_error:
         cleanup_failures = []
         surviving_groups = set()
+
+        if launch_contexts:
+            cleanup_failures.extend(
+                _rollback_contained_launches(
+                    manifest,
+                    launch_contexts,
+                    supervisor=supervisor,
+                    save_manifest=save_manifest,
+                    merge_usage=merge_usage,
+                    canonical_usage=canonical_usage,
+                    plan=plan,
+                    forget_managed_child=forget_managed_child,
+                )
+            )
+            if (
+                isinstance(launch_error, _OperationCancelled)
+                and not cleanup_failures
+            ):
+                manifest["state"] = previous_state
+                manifest["processes"] = previous_processes
+                manifest["ports"] = previous_ports
+                manifest["base_port"] = previous_base_port
+                manifest["pending_launches"] = []
+                if previous_had_deployment_id:
+                    manifest["deployment_id"] = previous_deployment_id
+                else:
+                    manifest.pop("deployment_id", None)
+                if previous_had_supervision_version:
+                    manifest["process_supervision_version"] = (
+                        previous_supervision_version
+                    )
+                else:
+                    manifest.pop("process_supervision_version", None)
+                manifest.pop("launch_error", None)
+                manifest.pop("cleanup_errors", None)
+                try:
+                    save_manifest(manifest)
+                except BaseException as save_exc:
+                    cleanup_failures.append(
+                        "could not persist clean contained cancellation: %s"
+                        % save_exc
+                    )
+                if not cleanup_failures:
+                    raise
+
+            manifest["state"] = "error"
+            manifest["launch_error"] = str(launch_error)
+            manifest["cleanup_errors"] = list(cleanup_failures)
+            try:
+                save_manifest(manifest)
+            except BaseException as save_exc:
+                cleanup_failures.append(
+                    "could not persist contained launch rollback: %s"
+                    % save_exc
+                )
+            if cleanup_failures:
+                raise RamdiskError(
+                    "%s; contained launch rollback/reporting errors: %s"
+                    % (launch_error, "; ".join(cleanup_failures))
+                ) from launch_error
+            raise
 
         # Close the line-level publication windows before rollback. A real
         # Popen attempt is registered in its context before __init__ can create
@@ -2588,6 +3072,16 @@ def start(
             manifest["processes"] = previous_processes
             manifest["ports"] = previous_ports
             manifest["base_port"] = previous_base_port
+            if previous_had_deployment_id:
+                manifest["deployment_id"] = previous_deployment_id
+            else:
+                manifest.pop("deployment_id", None)
+            if previous_had_supervision_version:
+                manifest["process_supervision_version"] = (
+                    previous_supervision_version
+                )
+            else:
+                manifest.pop("process_supervision_version", None)
             manifest.pop("launch_error", None)
             manifest.pop("cleanup_errors", None)
             try:
@@ -2628,6 +3122,7 @@ def stop(
     terminate_verified_group,
     merge_usage,
     bind_usage_transaction,
+    containment_supervisor=None,
     recover_benchmark_workspace=None,
 ):
     manifest = load_manifest(required=True)
@@ -2636,6 +3131,20 @@ def stop(
         and recover_benchmark_workspace is not None
     ):
         recover_benchmark_workspace(manifest)
+    if _contained_manifest(manifest):
+        supervisor = (
+            default_supervisor()
+            if containment_supervisor is None
+            else containment_supervisor
+        )
+        return _stop_contained(
+            manifest,
+            supervisor=supervisor,
+            save_manifest=save_manifest,
+            merge_usage=merge_usage,
+            bind_usage_transaction=bind_usage_transaction,
+            managed_child_liveness=managed_child_liveness,
+        )
     pending_preflights, pending_refusals = _preflight_pending_launches(
         manifest,
         discover_managed_launches=discover_managed_launches,
@@ -3103,6 +3612,20 @@ def destroy(
             "refusing destroy while unpublished managed-child absence is "
             "unproven; inspect recovery.retained_processes"
         )
+    if _contained_manifest(manifest):
+        unresolved_containment = [
+            record
+            for record in (
+                list(manifest.get("processes", []))
+                + list(_pending_launch_recovery(manifest))
+            )
+            if not record.get("containment_removed_at")
+        ]
+        if unresolved_containment:
+            raise RamdiskError(
+                "refusing destroy while managed cgroup absence/removal is "
+                "not durably proven"
+            )
     root = manifest["plan"]["mount_root"]
     preserved_mountpoints = []
     all_mounts_verified_here = True
@@ -3416,6 +3939,7 @@ def status(
     process_matches,
     managed_child_liveness,
     deployment_token=None,
+    containment_supervisor=None,
 ):
     """Return lifecycle status, optionally skipping deep revalidation."""
     manifest = load_manifest(required=False)
@@ -3436,6 +3960,15 @@ def status(
     }
     if not manifest:
         return result
+    supervisor = (
+        (
+            default_supervisor()
+            if containment_supervisor is None
+            else containment_supervisor
+        )
+        if _contained_manifest(manifest)
+        else None
+    )
     if deployment_token is not None:
         result["deployment_token"] = deployment_token(manifest)
     recovery = manifest.get("recovery")
@@ -3549,7 +4082,10 @@ def status(
                     "port": entry.get("port"),
                     "node": entry.get("node"),
                     "state_dir": entry.get("state_dir"),
-                    "state": "outcome-unknown",
+                    "state": entry.get(
+                        "containment_phase",
+                        "outcome-unknown",
+                    ),
                 }
                 for entry in pending_launches
                 if isinstance(entry, dict)
@@ -3647,47 +4183,91 @@ def status(
             }
         )
     for record in manifest.get("processes", []):
-        try:
-            matches, reason, _ = process_matches(record)
-        except Exception as identity_exc:
-            matches, reason = (
-                False,
-                "identity-check-failed: %s" % identity_exc,
-            )
-        try:
-            child_alive = managed_child_liveness(record.get("pid"))
-        except Exception as child_exc:
-            child_alive = None
-            if reason == "not-running":
-                reason = "retained-child-liveness-check-failed: %s" % child_exc
-        attention_required = False
-        if record.get("stopped_at"):
-            if matches:
-                reason = "stopped-record-process-group-live"
-                attention_required = True
-            elif child_alive is True:
-                reason = "stopped-record-retained-child-live"
-                attention_required = True
-            elif reason != "not-running":
+        if supervisor is not None:
+            try:
+                child_alive = managed_child_liveness(record.get("pid"))
+            except BaseException:
+                child_alive = None
+            if record.get("containment_removed_at"):
+                matches = False
+                contained_alive = False
+                reason = "stopped" if record.get("stopped_at") else "not-running"
+                attention_required = not bool(record.get("stopped_at"))
+            else:
+                try:
+                    contained_alive = supervisor.liveness(record)
+                    matches, verification_reason = supervisor.verify_record(record)
+                except BaseException as containment_exc:
+                    contained_alive = None
+                    matches = False
+                    verification_reason = str(containment_exc)
+                if contained_alive is True and matches:
+                    reason = "running"
+                    attention_required = bool(record.get("stopped_at"))
+                    if attention_required:
+                        reason = "stopped-record-cgroup-populated"
+                elif contained_alive is False:
+                    reason = "not-running"
+                    attention_required = not bool(record.get("stopped_at"))
+                    if record.get("stopped_at"):
+                        reason = "containment-removal-incomplete"
+                        attention_required = True
+                else:
+                    reason = "containment-inconclusive: %s" % (
+                        verification_reason or "unknown"
+                    )
+                    attention_required = True
+            if child_alive is True and contained_alive is not True:
+                running = True
+                matches = False
+                reason = "retained-child-outside-containment"
                 attention_required = True
             else:
-                reason = "stopped"
-        elif not matches and child_alive is True:
-            reason = "retained-managed-child-live"
-            attention_required = True
-        elif not matches and reason != "not-running":
-            attention_required = True
+                running = contained_alive is True
+        else:
+            try:
+                matches, reason, _ = process_matches(record)
+            except Exception as identity_exc:
+                matches, reason = (
+                    False,
+                    "identity-check-failed: %s" % identity_exc,
+                )
+            try:
+                child_alive = managed_child_liveness(record.get("pid"))
+            except Exception as child_exc:
+                child_alive = None
+                if reason == "not-running":
+                    reason = "retained-child-liveness-check-failed: %s" % child_exc
+            attention_required = False
+            if record.get("stopped_at"):
+                if matches:
+                    reason = "stopped-record-process-group-live"
+                    attention_required = True
+                elif child_alive is True:
+                    reason = "stopped-record-retained-child-live"
+                    attention_required = True
+                elif reason != "not-running":
+                    attention_required = True
+                else:
+                    reason = "stopped"
+            elif not matches and child_alive is True:
+                reason = "retained-managed-child-live"
+                attention_required = True
+            elif not matches and reason != "not-running":
+                attention_required = True
+            running = bool(matches or child_alive is True)
         result["processes"].append(
             {
                 "pid": record.get("pid"),
                 "port": record.get("port"),
                 "node": record.get("node"),
-                "running": bool(matches or child_alive is True),
+                "running": running,
                 "verified": matches,
                 "reason": reason,
                 "attention_required": attention_required,
                 "state_dir": record.get("state_dir"),
                 "log": record.get("log"),
+                "containment": record.get("containment"),
             }
         )
     result["model_fingerprint"] = manifest.get(

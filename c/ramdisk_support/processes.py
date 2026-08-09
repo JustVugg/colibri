@@ -21,6 +21,7 @@ from .common import (
     _utc_now,
 )
 from .platform_ops import get_platform_ops
+from .supervision import default_supervisor, validate_containment
 
 
 def _proc_identity(pid):
@@ -168,7 +169,31 @@ def _process_matches(
     *,
     proc_identity=None,
     process_group_members=None,
+    containment_supervisor=None,
 ):
+    if record.get("containment") is not None:
+        validate_containment(record.get("containment"))
+        if record.get("containment_removed_at"):
+            return False, "not-running", None
+        supervisor = (
+            default_supervisor()
+            if containment_supervisor is None
+            else containment_supervisor
+        )
+        verified, containment_reason = supervisor.verify_record(record)
+        if not verified:
+            contained_alive = supervisor.liveness(record)
+            if contained_alive is False:
+                return False, "not-running", None
+            return (
+                False,
+                "unverified-containment",
+                {
+                    "containment": record.get("containment"),
+                    "reason": containment_reason,
+                    "running": contained_alive,
+                },
+            )
     proc_identity = (
         _proc_identity
         if proc_identity is None
@@ -292,7 +317,20 @@ def _process_tree_alive(
     *,
     group_alive=None,
     proc_identity=None,
+    containment_supervisor=None,
 ):
+    if record.get("containment") is not None:
+        if record.get("containment_removed_at"):
+            return False
+        supervisor = (
+            default_supervisor()
+            if containment_supervisor is None
+            else containment_supervisor
+        )
+        alive = supervisor.liveness(record)
+        if alive is None:
+            raise RamdiskError("managed cgroup liveness is inconclusive")
+        return alive
     group_alive = _group_alive if group_alive is None else group_alive
     proc_identity = (
         _proc_identity
@@ -580,8 +618,29 @@ def _terminate_verified_group(
     managed_child_liveness=None,
     process_matches=None,
     ops=None,
+    containment_supervisor=None,
 ):
     """Terminate persisted members only through freshly verified pidfds."""
+    if record.get("containment") is not None:
+        validate_containment(record.get("containment"))
+        if record.get("containment_removed_at"):
+            return None
+        supervisor = (
+            default_supervisor()
+            if containment_supervisor is None
+            else containment_supervisor
+        )
+        try:
+            result = supervisor.terminate(
+                record["containment"],
+                term_seconds=term_seconds,
+                kill_seconds=kill_seconds,
+            )
+        except BaseException as exc:
+            return "cgroup termination is inconclusive: %s" % exc
+        if not isinstance(result, dict) or result.get("status") != "absent":
+            return "cgroup termination returned an invalid absence result"
+        return None
     managed_child_liveness = (
         _managed_child_liveness
         if managed_child_liveness is None

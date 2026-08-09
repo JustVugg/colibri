@@ -93,6 +93,122 @@ def host_uid():
     return getuid() if getuid is not None else 1000
 
 
+class UnitCgroupSupervisor:
+    """In-memory unit-test seam; never touches the host cgroup hierarchy."""
+
+    def __init__(self):
+        self._next = 1
+        self._groups = {}
+        self._gates = {}
+
+    def create_leaf(self, deployment_id, operation_id):
+        index = self._next
+        self._next += 1
+        authority = {
+            "version": 1,
+            "mode": "cgroup-v2",
+            "relative_path": "unit/d%s/o%s-%d" % (
+                str(deployment_id)[:8],
+                str(operation_id)[-8:],
+                index,
+            ),
+            "device": 1,
+            "inode": index,
+        }
+        self._groups[authority["relative_path"]] = {
+            "pid": None,
+            "removed": False,
+        }
+        return authority
+
+    def spawn_gate(self, command, *, environment, **kwargs):
+        options = dict(kwargs)
+        options.update(
+            env=dict(environment),
+            close_fds=True,
+            start_new_session=True,
+        )
+        process = ramdisk.subprocess.Popen(list(command), **options)
+        gate = mock.Mock()
+        gate.process = process
+        gate.release_fd = None
+        gate.pidfd = None
+        gate.released = False
+        return gate
+
+    def attach_gate(self, gate, authority):
+        self._groups[authority["relative_path"]]["pid"] = int(gate.process.pid)
+        self._gates[authority["relative_path"]] = gate
+        gate.pidfd = int(gate.process.pid) + 100000
+
+    def release_gate(self, gate, authority):
+        del authority
+        gate.released = True
+
+    def verify_gate(self, gate, authority):
+        return self._groups[authority["relative_path"]]["pid"] == gate.process.pid
+
+    def close_gate(self, gate):
+        gate.pidfd = None
+
+    def abort_gate(self, gate):
+        for group in self._groups.values():
+            if group.get("pid") == getattr(gate.process, "pid", None):
+                group["pid"] = None
+        gate.released = False
+        gate.pidfd = None
+
+    def members(self, authority):
+        group = self._groups[authority["relative_path"]]
+        if group["removed"]:
+            raise ramdisk.RamdiskError("unit cgroup is removed")
+        return [] if group["pid"] is None else [group["pid"]]
+
+    def terminate(self, authority, **kwargs):
+        del kwargs
+        self._groups[authority["relative_path"]]["pid"] = None
+        gate = self._gates.get(authority["relative_path"])
+        if gate is not None:
+            for attribute, value in (
+                ("returncode", -15),
+                ("alive", False),
+                ("_alive", False),
+            ):
+                if hasattr(gate.process, attribute):
+                    try:
+                        setattr(gate.process, attribute, value)
+                    except Exception:
+                        pass
+        return {"status": "absent"}
+
+    def prove_absence(self, authority):
+        if self.members(authority):
+            raise ramdisk.RamdiskError("unit cgroup is populated")
+        return True
+
+    def remove_empty(self, authority):
+        self.prove_absence(authority)
+        self._groups[authority["relative_path"]]["removed"] = True
+        return True
+
+    def verify_record(self, record):
+        try:
+            return (
+                int(record["pid"]) in self.members(record["containment"]),
+                None,
+            )
+        except Exception as exc:
+            return False, str(exc)
+
+    def liveness(self, record):
+        if record.get("containment_removed_at"):
+            return False
+        try:
+            return bool(self.members(record["containment"]))
+        except Exception:
+            return None
+
+
 def write_safetensors(path, tensors):
     """Write a tiny valid safetensors file without third-party packages."""
     offset = 0
@@ -250,6 +366,7 @@ __all__ = [
     "ModelFixture",
     "Path",
     "PLATFORM_SKIP_INVENTORY",
+    "UnitCgroupSupervisor",
     "argparse",
     "canonical_temporary_directory",
     "contextlib",

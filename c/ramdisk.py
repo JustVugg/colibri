@@ -232,6 +232,12 @@ def _benchmark_module():
     return importlib.import_module("ramdisk_support.benchmark")
 
 
+def _containment_supervisor():
+    return importlib.import_module(
+        "ramdisk_support.supervision"
+    ).default_supervisor()
+
+
 def _benchmark_workspace_manager():
     """Build the durable PR3 scratch-workspace owner from facade seams."""
     return _benchmark_module().DurableWorkspaceManager(
@@ -251,6 +257,8 @@ def _benchmark_workspace_manager():
         source_still_matches=_source_still_matches,
         umount_path=_umount_path,
         available_for_mount=_available_for_mount,
+        process_supervisor_factory=_containment_supervisor,
+        uid_provider=current_uid,
     )
 
 
