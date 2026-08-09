@@ -232,6 +232,10 @@ def _benchmark_module():
     return importlib.import_module("ramdisk_support.benchmark")
 
 
+def _runtime_monitor_module():
+    return importlib.import_module("ramdisk_support.runtime_monitor")
+
+
 def _containment_supervisor():
     return importlib.import_module(
         "ramdisk_support.supervision"
@@ -962,7 +966,13 @@ def _wait_managed_ready(
 
 
 @_exclusive_lifecycle(require_process_control=True)
-def start(args, cli_path=None, engine_path=None, cancel_event=None):
+def _start_locked(
+    args,
+    cli_path=None,
+    engine_path=None,
+    cancel_event=None,
+    expected_manifest_token=None,
+):
     return _lifecycle_start(
         args,
         cli_path=cli_path,
@@ -1006,11 +1016,14 @@ def start(args, cli_path=None, engine_path=None, cancel_event=None):
         terminate_verified_group=_terminate_verified_group,
         terminate_direct_child=_terminate_direct_child,
         forget_managed_child=_forget_managed_child,
+        expected_manifest_token=expected_manifest_token,
+        deployment_token=_manifest_confirmation_token,
+        recover_benchmark_workspace=_benchmark_workspace_manager().recover,
     )
 
 
 @_exclusive_lifecycle(require_process_control=True)
-def stop(args=None):
+def _stop_locked(args=None, expected_manifest_token=None):
     return _lifecycle_stop(
         args,
         load_manifest=_load_manifest,
@@ -1026,7 +1039,158 @@ def stop(args=None):
         recover_benchmark_workspace=(
             _benchmark_workspace_manager().recover
         ),
+        expected_manifest_token=expected_manifest_token,
+        deployment_token=_manifest_confirmation_token,
     )
+
+
+def _preflight_deployment_token(value, action):
+    token = _validate_token(value, "deployment token")
+    manifest = _load_manifest(required=True)
+    if _manifest_confirmation_token(manifest) != token:
+        raise RamdiskError(
+            "RAM workspace changed since review; inspect status and retry %s"
+            % action
+        )
+    return token, manifest
+
+
+def _assert_public_process_control():
+    ops = get_platform_ops()
+    if not getattr(ops, "is_linux", False):
+        raise RamdiskError(UNSUPPORTED_PLATFORM_REASON)
+    if not getattr(ops, "process_control_supported", False):
+        reason = getattr(ops, "process_control_reason", UNSUPPORTED_PLATFORM_REASON)
+        if not isinstance(reason, str) or not reason:
+            reason = UNSUPPORTED_PLATFORM_REASON
+        raise RamdiskError(reason)
+
+
+def _operation_authority_key(kind, record):
+    """Return an invocation-stable identity for one process authority."""
+    if kind == "pending":
+        operation_id = record.get("operation_id")
+        if operation_id is not None:
+            return (kind, "operation", str(operation_id))
+    return (
+        kind,
+        record.get("pid"),
+        record.get("pgid"),
+        record.get("starttime"),
+        record.get("nonce"),
+        record.get("state_dir"),
+        record.get("weights_dir"),
+    )
+
+
+def _operation_authorities(manifest):
+    """Index process, pending-launch, and retained recovery authorities."""
+    indexed = {}
+    for kind, records in (
+        ("process", manifest.get("processes") or []),
+        ("pending", manifest.get("pending_launches") or []),
+    ):
+        for record in records:
+            if isinstance(record, dict):
+                indexed[_operation_authority_key(kind, record)] = record
+    recovery = manifest.get("recovery")
+    if isinstance(recovery, dict):
+        for record in recovery.get("retained_processes") or []:
+            if isinstance(record, dict):
+                indexed[_operation_authority_key("retained", record)] = record
+    return indexed
+
+
+def _usage_merge_operation_summary(reviewed, result):
+    """Count only accounting authorities reconciled by this invocation."""
+    before = {
+        key: record
+        for key, record in _operation_authorities(reviewed).items()
+        if not record.get("usage_merged_at")
+    }
+    after = _operation_authorities(result)
+    summary = {
+        "merged_count": 0,
+        "pending_count": 0,
+        "error_count": 0,
+    }
+    for key in before:
+        record = after.get(key)
+        if record is None or record.get("usage_merged_at"):
+            summary["merged_count"] += 1
+        elif any(
+            record.get(field)
+            for field in ("usage_merge_error", "recovery_error", "stop_error")
+        ):
+            summary["error_count"] += 1
+        else:
+            summary["pending_count"] += 1
+    return summary
+
+
+def _stop_operation_authority_keys(manifest):
+    """Return exact authorities whose signal/removal work is unfinished."""
+    keys = set()
+    for key, record in _operation_authorities(manifest).items():
+        kind = key[0]
+        if kind in ("pending", "retained"):
+            keys.add(key)
+            continue
+        containment = record.get("containment")
+        if not record.get("stopped_at") or (
+            isinstance(containment, dict)
+            and not record.get("containment_removed_at")
+        ):
+            keys.add(key)
+    return keys
+
+
+def start(
+    args,
+    cli_path=None,
+    engine_path=None,
+    cancel_event=None,
+    expected_manifest_token=None,
+):
+    """Start only the exact deployment reviewed by a public caller."""
+    token = _validate_token(expected_manifest_token, "deployment token")
+    _assert_public_process_control()
+    token, reviewed = _preflight_deployment_token(token, "start")
+    reviewed = copy.deepcopy(reviewed)
+    result = _start_locked(
+        args,
+        cli_path=cli_path,
+        engine_path=engine_path,
+        cancel_event=cancel_event,
+        expected_manifest_token=token,
+    )
+    projected = dict(result)
+    projected["_operation_summary"] = {
+        "usage_merge": _usage_merge_operation_summary(reviewed, result)
+    }
+    return projected
+
+
+def stop(args=None, expected_manifest_token=None):
+    """Stop only the exact deployment reviewed by a public caller."""
+    token = _validate_token(expected_manifest_token, "deployment token")
+    _assert_public_process_control()
+    token, reviewed = _preflight_deployment_token(token, "stop")
+    reviewed = copy.deepcopy(reviewed)
+    stop_authorities = _stop_operation_authority_keys(reviewed)
+    result = _stop_locked(args, expected_manifest_token=token)
+    remaining_stop_authorities = _stop_operation_authority_keys(result)
+    projected = dict(result)
+    projected["_operation_summary"] = {
+        "stopped_count": len(stop_authorities - remaining_stop_authorities),
+        "usage_merge": _usage_merge_operation_summary(reviewed, result),
+    }
+    return projected
+
+
+# Preserve the established direct-under-lock test/integration seams.
+start.__wrapped__ = _start_locked.__wrapped__
+stop.__wrapped__ = _stop_locked.__wrapped__
 
 
 def _busy_mount_references(path, *, ops=None, hardware=None):
@@ -1058,7 +1222,7 @@ def _destroy_locked(args, expected_manifest_token=None):
         save_manifest=_save_manifest,
         manifest_confirmation_token=_manifest_confirmation_token,
         confirm=_confirm,
-        stop_action=stop,
+        stop_action=_stop_locked.__wrapped__,
         mount_table=_mount_table,
         path_is_below=_path_is_below,
         managed_path=_managed_path,
@@ -1092,9 +1256,9 @@ def destroy(args, expected_manifest_token=None):
     return _destroy_locked(args, expected_manifest_token=token)
 
 
-def status(deep=True):
-    """Return lifecycle status, optionally skipping deep revalidation."""
-    return _lifecycle_status(
+def status(deep=True, runtime=False):
+    """Return lifecycle status, optionally including advisory telemetry."""
+    report = _lifecycle_status(
         deep=deep,
         load_manifest=_load_manifest,
         manifest_path=_manifest_path,
@@ -1106,6 +1270,40 @@ def status(deep=True):
         managed_child_liveness=_managed_child_liveness,
         deployment_token=_manifest_confirmation_token,
     )
+    if not runtime:
+        return report
+    try:
+        manifest = _load_manifest(required=False) or {}
+        snapshot_token = (
+            _manifest_confirmation_token(manifest) if manifest else None
+        )
+        if report.get("deployment_token") != snapshot_token:
+            raise RamdiskError(
+                "runtime telemetry snapshot changed after status review"
+            )
+        supervisor = [None]
+
+        def verify_record(record):
+            if supervisor[0] is None:
+                supervisor[0] = _containment_supervisor()
+            return supervisor[0].verify_record(record)
+
+        monitor = _runtime_monitor_module().RuntimeMonitor(
+            load_manifest=_load_manifest,
+            verify_record=verify_record,
+        )
+        report["runtime"] = monitor.sample(
+            manifest=manifest,
+            report=report,
+            plan=manifest.get("plan") or {},
+            hardware=(manifest.get("plan") or {}).get("hardware") or {},
+        )
+    except Exception as exc:
+        report["runtime"] = {
+            "stale": True,
+            "error": str(exc),
+        }
+    return report
 
 
 def verify():
@@ -1282,6 +1480,8 @@ def dispatch(args, cli_path=None, engine_path=None, system=None):
         human_benchmark=_presentation_module()._human_benchmark_summary,
         json_print=_json_print,
         termination_guard=_cli_termination_guard,
+        start=start,
+        stop=stop,
     )
 
 
@@ -1289,7 +1489,7 @@ __all__ = sorted(
     set(
         name
         for name in globals()
-        if not name.startswith("_") and name not in {"start", "stop"}
+        if not name.startswith("_")
     )
     | set(
         name

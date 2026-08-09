@@ -57,29 +57,27 @@ def canonical_temporary_directory(*args, **kwargs):
 
 
 def optional_module_available(name):
-    """True when an OPTIONAL frontend/benchmark bundle module is importable.
+    """True when a module needed by a focused test is importable.
 
-    Headless builds physically exclude the textual/curses UI, benchmark, and
-    runtime-monitor modules; tests that exercise those features must skip
-    themselves instead of erroring when the module is absent.
+    Published PR3 bundles require the headless benchmark and runtime monitor;
+    this helper remains useful for partial source fixtures and older bundles.
     """
     return importlib.util.find_spec(name) is not None
 
 
 def requires_benchmark(function):
-    """Skip a test that needs the optional benchmark bundle module."""
+    """Skip only when a partial source fixture omitted the required runner."""
     return unittest.skipUnless(
         optional_module_available("ramdisk_support.benchmark"),
-        "benchmark bundle not installed in this headless build",
+        "benchmark runner is unavailable in this partial source fixture",
     )(function)
 
 
 def strip_headless_notice(stderr):
-    """Drop the benign launcher notice about an absent optional bundle.
+    """Drop a legacy launcher notice from older partial bundle fixtures.
 
-    A headless ``coli`` warns (never aborts) that the optional frontend gear
-    is not installed; JSON-pipeline contracts only care that no error or
-    traceback leaked onto stderr, so the notice is filtered before asserting.
+    Current bundles require every headless runner module. JSON-pipeline tests
+    still accept the historical notice when exercising an older fixture.
     """
     return "\n".join(
         line for line in stderr.splitlines()

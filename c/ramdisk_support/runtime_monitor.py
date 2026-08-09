@@ -1,4 +1,4 @@
-"""Read-only serving and accelerator telemetry for RAM-workspace frontends.
+"""Read-only serving and accelerator telemetry for headless status clients.
 
 ``RuntimeMonitor.sample`` returns a dependency-free plain dictionary:
 
@@ -636,7 +636,7 @@ def _managed_response_identity(manifest, record):
 
 
 class RuntimeMonitor:
-    """Stateful, read-only sampler shared by RAM-workspace frontends."""
+    """Stateful, read-only sampler for explicit headless status requests."""
 
     def __init__(
         self,

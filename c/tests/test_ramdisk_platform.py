@@ -156,7 +156,8 @@ actions = next(
     if isinstance(action, argparse._SubParsersAction)
 )
 assert set(actions.choices) == {
-    "plan", "stage", "prepare", "verify", "status", "destroy"
+    "plan", "stage", "prepare", "verify", "status", "destroy",
+    "benchmark", "start", "stop"
 }, set(actions.choices)
 status_args = parser.parse_args(["status", "--json"])
 
@@ -189,8 +190,8 @@ mutating_errors = {}
 empty_args = argparse.Namespace()
 for name, operation in (
     ("prepare", lambda: ramdisk.prepare(empty_args)),
-    ("start", lambda: ramdisk.start(empty_args)),
-    ("stop", lambda: ramdisk.stop()),
+    ("start", lambda: ramdisk.start(empty_args, expected_manifest_token="a" * 64)),
+    ("stop", lambda: ramdisk.stop(expected_manifest_token="a" * 64)),
     ("destroy", lambda: ramdisk.destroy(empty_args)),
 ):
     try:
@@ -401,8 +402,8 @@ import ramdisk
             ramdisk, "_lifecycle_lock", forbidden_lock
         ):
             for name, operation in (
-                ("start", lambda: ramdisk.start(empty_args)),
-                ("stop", lambda: ramdisk.stop()),
+                ("start", lambda: ramdisk.start(empty_args, expected_manifest_token="a" * 64)),
+                ("stop", lambda: ramdisk.stop(expected_manifest_token="a" * 64)),
                 ("destroy", lambda: ramdisk.destroy(empty_args)),
             ):
                 with self.subTest(operation=name), self.assertRaisesRegex(
@@ -435,7 +436,7 @@ import ramdisk
                 ramdisk.RamdiskError,
                 "requires Linux pidfd_open.*pidfd_send_signal",
             ):
-                ramdisk.stop()
+                ramdisk.stop(expected_manifest_token="a" * 64)
 
         forbidden_lock.assert_not_called()
 
@@ -528,7 +529,7 @@ import ramdisk
     def test_platform_skip_inventory_is_exact_and_drift_checked(self):
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_operational"]["tests"]),
-            35,
+            39,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["sigterm_handler"]["tests"]),
@@ -547,8 +548,12 @@ import ramdisk
             1,
         )
         self.assertEqual(
+            len(PLATFORM_SKIP_INVENTORY["posix_pass_fds"]["tests"]),
+            2,
+        )
+        self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["native_dirfd"]["tests"]),
-            4,
+            19,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_pidfd"]["tests"]),

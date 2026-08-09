@@ -13,12 +13,25 @@ TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def canonical_plan_projection(plan):
-    """Return exactly the reviewed fields bound by a plan token."""
+    """Bind stable mutation authority while excluding volatile observations."""
+    reserve = plan.get("reserve") or {}
     hardware = plan.get("hardware") or {}
+    stable_reserve = {
+        name: value
+        for name, value in reserve.items()
+        if name
+        not in {
+            "available_bytes",
+            "host_available_bytes",
+            "cgroup_available_bytes",
+            "cgroup_high_available_bytes",
+        }
+    }
     return {
         "schema": plan.get("schema"),
         "version": plan.get("version"),
-        "model_fingerprint": plan.get("model", {}).get("fingerprint"),
+        "model": plan.get("model"),
+        "source_shards": plan.get("source_shards"),
         "mode": plan.get("mode"),
         "topology": plan.get("topology"),
         "hardware": {
@@ -26,17 +39,10 @@ def canonical_plan_projection(plan):
         },
         "placement": plan.get("placement"),
         "mount_root": plan.get("mount_root"),
+        "mount_root_preexisting": plan.get("mount_root_preexisting"),
         "capacity_bytes": plan.get("capacity_bytes"),
-        "selected_shards": plan.get("staging", {}).get(
-            "selected_shards"
-        ),
-        "linked_shards": plan.get("staging", {}).get("linked_shards"),
-        "total_staged_bytes": plan.get("staging", {}).get(
-            "total_staged_bytes"
-        ),
-        "total_required_bytes": plan.get("reserve", {}).get(
-            "total_required_bytes"
-        ),
+        "staging": plan.get("staging"),
+        "reserve": stable_reserve,
         "mounts": plan.get("mounts"),
         "mount_options": plan.get("mount_options"),
         "prefault": plan.get("prefault"),
@@ -44,6 +50,7 @@ def canonical_plan_projection(plan):
         "managed_runtime": plan.get("managed_runtime"),
         "managed_accelerator": plan.get("managed_accelerator"),
         "preset": plan.get("preset"),
+        "durable_state": plan.get("durable_state"),
     }
 
 
@@ -62,31 +69,13 @@ def plan_token(plan):
 
 
 def canonical_deployment_projection(manifest, *, persisted_base_port):
-    """Return exactly the deployment fields bound by destructive review."""
-    mounts = []
-    for record in manifest.get("mounts", []):
-        identity = record.get("identity", {})
-        mounts.append(
-            {
-                "path": record.get("path"),
-                "node": record.get("node"),
-                "mount_id": identity.get("mount_id"),
-                "device": identity.get("device"),
-            }
-        )
-    processes = []
-    for record in manifest.get("processes", []):
-        processes.append(
-            {
-                "pid": record.get("pid"),
-                "pgid": record.get("pgid"),
-                "uid": record.get("uid"),
-                "starttime": record.get("starttime"),
-                "nonce": record.get("nonce"),
-                "port": record.get("port"),
-                "node": record.get("node"),
-            }
-        )
+    """Bind every persisted field that can authorize a live mutation.
+
+    Process commands, nonces, paths, and containment identities remain private
+    because only their canonical hash leaves this module.  Binding the full
+    validated authority records prevents a stale token from approving a
+    different signal, cgroup-removal, mount, usage, or recovery transaction.
+    """
     return {
         "version": manifest.get("version"),
         "deployment_id": manifest.get("deployment_id"),
@@ -95,8 +84,15 @@ def canonical_deployment_projection(manifest, *, persisted_base_port):
         "base_port": persisted_base_port(manifest),
         "model_fingerprint": manifest.get("model_fingerprint"),
         "plan_token": plan_token(manifest.get("plan", {})),
-        "mounts": mounts,
-        "processes": processes,
+        "process_supervision_version": manifest.get(
+            "process_supervision_version"
+        ),
+        "mounts": manifest.get("mounts", []),
+        "processes": manifest.get("processes", []),
+        "pending_launches": manifest.get("pending_launches", []),
+        "recovery": manifest.get("recovery"),
+        "benchmark_workspace": manifest.get("benchmark_workspace"),
+        "best_runtime": manifest.get("best_runtime"),
     }
 
 

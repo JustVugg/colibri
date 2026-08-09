@@ -141,6 +141,7 @@ jobs:
           mkdir -p dist/ramdisk_support
           cp c/ramdisk_support/__init__.py \
              c/ramdisk_support/accelerator.py \
+             c/ramdisk_support/benchmark.py \
              c/ramdisk_support/cli.py \
              c/ramdisk_support/common.py \
              c/ramdisk_support/contracts.py \
@@ -154,7 +155,9 @@ jobs:
              c/ramdisk_support/presentation.py \
              c/ramdisk_support/presets.py \
              c/ramdisk_support/processes.py \
+             c/ramdisk_support/runtime_monitor.py \
              c/ramdisk_support/state.py \
+             c/ramdisk_support/supervision.py \
              c/ramdisk_support/tokens.py \
              dist/ramdisk_support/
           cp LICENSE dist/

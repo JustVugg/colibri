@@ -391,12 +391,15 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 ### Headless RAM-workspace control plane
 
 These variables configure durable state for the Linux `coli ramdisk`
-plan/stage/verify/status/destroy lifecycle:
+plan/stage/prepare/verify/status/destroy/benchmark/start/stop lifecycle:
 
 | Variable | Default | Effect |
 |---|---|---|
 | `XDG_STATE_HOME` | `~/.local/state` | Durable state base. RAM-workspace state lives below `colibri/ramdisk`; the value must expand to an absolute, non-volatile path. |
 | `COLI_RAMDISK_MANIFEST` | `$XDG_STATE_HOME/colibri/ramdisk/manifest.json` | Absolute durable override for the managed deployment manifest. |
+| `COLI_CGROUP_DELEGATED_ROOT` | Current delegated cgroup-v2 directory | Absolute delegated cgroup-v2 root used for managed engine containment. Relative paths are rejected. |
+| `COLI_DRAM_COLLECTOR` | unset | Absolute command (or reviewed PATH command) implementing the benchmark `--preflight/--snapshot --json` byte-counter protocol. Missing or failed counters make the causal claim incomplete and neutral. |
+| `COLI_RAMDISK_START_TIMEOUT` | `7200` | Managed-engine readiness timeout in seconds; must be numeric and between 1 and 86400. |
 
 The staging namespace is volatile, but the manifest, lifecycle lock, and
 recovery record are deliberately durable. Do not point either variable at the

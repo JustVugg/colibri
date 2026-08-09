@@ -1,4 +1,4 @@
-"""Scriptable CLI orchestration and lazy terminal-frontend selection."""
+"""Scriptable orchestration for the dependency-free RAM-workspace CLI."""
 
 from __future__ import print_function
 
@@ -185,6 +185,33 @@ def configure_parser(parser, common_parent=None):
         help="show mounts and managed processes",
     )
     status_parser.add_argument("--json", action="store_true")
+    status_parser.add_argument(
+        "--runtime",
+        action="store_true",
+        help="include advisory live serving/GPU telemetry (requires --json)",
+    )
+    for action, help_text in (
+        ("start", "start token-bound managed engines"),
+        ("stop", "stop token-bound managed engines and merge usage"),
+    ):
+        managed = actions.add_parser(action, parents=[after], help=help_text)
+        managed.add_argument(
+            "--deployment-token",
+            default=None,
+            help="lowercase 64-hex identity emitted by status --json",
+        )
+        managed.add_argument("--yes", action="store_true")
+        managed.add_argument("--json", action="store_true")
+        if action == "start":
+            managed.add_argument(
+                "--base-port",
+                type=int,
+                default=None,
+                help=(
+                    "first numeric-loopback managed endpoint port; omitted "
+                    "reuses the prepared deployment's persisted port"
+                ),
+            )
     destroy_parser = actions.add_parser(
         "destroy",
         parents=[after],
@@ -270,6 +297,93 @@ def _destroy_projection(result):
         if name in result:
             projection[name] = result[name]
     return projection
+
+
+def _start_projection(manifest, deployment_token):
+    ports = sorted(
+        record.get("port")
+        for record in manifest.get("processes", [])
+        if not record.get("stopped_at") and isinstance(record.get("port"), int)
+    )
+    return {
+        "schema": "colibri.ramdisk.start.v1",
+        "version": 1,
+        "state": manifest.get("state"),
+        "deployment_id": manifest.get("deployment_id"),
+        "deployment_token": deployment_token(manifest),
+        "ports": ports,
+        "endpoints": sorted(
+            (
+                {
+                    "port": record.get("port"),
+                    "node": record.get("node"),
+                    "url": "http://127.0.0.1:%d" % record["port"],
+                }
+                for record in manifest.get("processes", [])
+                if not record.get("stopped_at")
+                and isinstance(record.get("port"), int)
+            ),
+            key=lambda item: (item["port"] is None, item["port"] or 0),
+        ),
+        "containment_mode": _containment_mode(manifest),
+        "usage_merge_summary": _usage_merge_summary(manifest),
+        "recovery_attention": _recovery_attention(manifest),
+    }
+
+
+def _stop_projection(manifest, deployment_token):
+    return {
+        "schema": "colibri.ramdisk.stop.v1",
+        "version": 1,
+        "state": manifest.get("state"),
+        "deployment_id": manifest.get("deployment_id"),
+        "deployment_token": deployment_token(manifest),
+        "stopped_count": int(
+            (manifest.get("_operation_summary") or {}).get("stopped_count", 0)
+        ),
+        "containment_mode": _containment_mode(manifest),
+        "usage_merge_summary": _usage_merge_summary(manifest),
+        "recovery_attention": _recovery_attention(manifest),
+    }
+
+
+def _containment_mode(manifest):
+    return (
+        "cgroup-v2"
+        if manifest.get("process_supervision_version") == 1
+        else "legacy-process-group"
+    )
+
+
+def _usage_merge_summary(manifest):
+    summary = (manifest.get("_operation_summary") or {}).get("usage_merge") or {}
+    return {
+        "merged_count": int(summary.get("merged_count", 0)),
+        "pending_count": int(summary.get("pending_count", 0)),
+        "error_count": int(summary.get("error_count", 0)),
+    }
+
+
+def _recovery_attention(manifest):
+    recovery = manifest.get("recovery")
+    return bool(
+        manifest.get("state") == "error"
+        or manifest.get("pending_launches")
+        or manifest.get("benchmark_workspace")
+        or (
+            isinstance(recovery, dict)
+            and (
+                recovery.get("retained_processes")
+                or recovery.get("retained_mounts")
+                or recovery.get("state") == "attention-required"
+            )
+        )
+        or any(
+            record.get("stop_error") or record.get("usage_merge_error")
+            for record in manifest.get("processes", [])
+            if isinstance(record, dict)
+        )
+    )
 
 
 @contextlib.contextmanager
@@ -382,6 +496,8 @@ def dispatch(
     human_benchmark,
     json_print=None,
     termination_guard=None,
+    start=None,
+    stop=None,
 ):
     """Route one parsed action through explicitly supplied application seams."""
     emit_json = _json_print if json_print is None else json_print
@@ -445,12 +561,44 @@ def dispatch(
                 )
             return 0 if value["verified"] else 2
         if action == "status":
-            value = status()
+            include_runtime = bool(getattr(args, "runtime", False))
+            if include_runtime and not getattr(args, "json", False):
+                raise RamdiskError("status --runtime requires --json")
+            value = status(runtime=True) if include_runtime else status()
             if getattr(args, "json", False):
                 emit_json(value)
             else:
                 human_status(value)
             return 0
+        if action in ("start", "stop"):
+            if not getattr(args, "json", False):
+                raise RamdiskError("%s requires --json" % action)
+            reviewed_token = validate_token(
+                getattr(args, "deployment_token", None),
+                "deployment token",
+            )
+            if not getattr(args, "yes", False):
+                raise RamdiskError("%s requires --yes" % action)
+            operation = start if action == "start" else stop
+            if operation is None:
+                raise RamdiskError("%s is unavailable" % action)
+            with guard(action == "start") as termination:
+                if action == "start":
+                    value = operation(
+                        args,
+                        cli_path=cli_path,
+                        engine_path=engine_path,
+                        cancel_event=termination["cancel_event"],
+                        expected_manifest_token=reviewed_token,
+                    )
+                    emit_json(_start_projection(value, deployment_token))
+                else:
+                    value = operation(
+                        args,
+                        expected_manifest_token=reviewed_token,
+                    )
+                    emit_json(_stop_projection(value, deployment_token))
+            return _cli_exit_after_signal(termination, 0)
         if action == "destroy":
             reviewed_token = validate_token(
                 getattr(args, "deployment_token", None),
@@ -484,11 +632,19 @@ def dispatch(
         raise RamdiskError("choose a ramdisk action; run with --help")
     except (RamdiskError, OSError, subprocess.SubprocessError) as exc:
         if getattr(args, "json", False):
+            public_error = (
+                exc.public_message
+                if isinstance(exc, RamdiskError)
+                else (
+                    "RAM-disk operation failed; rerun without --json for "
+                    "protected diagnostics"
+                )
+            )
             emit_json(
                 {
                     "schema": "colibri.ramdisk.error.v1",
                     "version": 1,
-                    "error": getattr(exc, "public_message", str(exc)),
+                    "error": public_error,
                 }
             )
         else:

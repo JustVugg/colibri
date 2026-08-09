@@ -1730,7 +1730,7 @@ class StateAndSafetyTest(unittest.TestCase):
         ) as terminate, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
         terminate.assert_not_called()
         self.assertEqual(discover.call_count, 2)
         merge.assert_called_once()
@@ -1799,7 +1799,7 @@ class StateAndSafetyTest(unittest.TestCase):
         ) as terminate_group, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
 
         terminate_group.assert_called_once()
         merge.assert_called_once()
@@ -1904,7 +1904,7 @@ class StateAndSafetyTest(unittest.TestCase):
         ) as terminate_group, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
 
         terminate_group.assert_called_once()
         merge.assert_called_once()
@@ -2142,7 +2142,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "multiple process groups",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -2160,7 +2160,7 @@ class StateAndSafetyTest(unittest.TestCase):
             "_managed_launch_processes",
             side_effect=[[], []],
         ), mock.patch.object(ramdisk, "_merge_usage"):
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
         self.assertEqual(stopped["state"], "stopped")
         self.assertNotIn("cleanup_errors", stopped)
 
@@ -2299,7 +2299,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "pending authority could not be removed",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         after_failure = ramdisk._load_manifest(required=True)
         self.assertEqual(len(after_failure["pending_launches"]), 1)
@@ -2312,7 +2312,7 @@ class StateAndSafetyTest(unittest.TestCase):
             "_managed_launch_processes",
             side_effect=[[], []],
         ), mock.patch.object(ramdisk, "_merge_usage", merge):
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
 
         self.assertEqual(merge.call_count, 2)
         self.assertEqual(applications, [pending["usage_merge_id"]])
@@ -2380,7 +2380,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "unpublished.*unproven",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -2973,7 +2973,7 @@ class StateAndSafetyTest(unittest.TestCase):
             os, "killpg"
         ) as kill:
             with self.assertRaisesRegex(ramdisk.RamdiskError, "unverified"):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
         kill.assert_not_called()
 
     def test_stop_persists_procfs_preflight_failure_before_any_signal(self):
@@ -2996,7 +2996,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "unverified.*procfs enumeration unreadable",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -3037,7 +3037,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "termination revalidation unreadable",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         merge.assert_not_called()
         persisted = ramdisk._load_manifest(required=True)
@@ -3066,7 +3066,7 @@ class StateAndSafetyTest(unittest.TestCase):
                         ramdisk.RamdiskError,
                         "non-managed mount ownership",
                     ):
-                        ramdisk.stop()
+                        ramdisk.stop.__wrapped__()
 
                 terminate.assert_not_called()
                 merge.assert_not_called()
@@ -3220,7 +3220,7 @@ class StateAndSafetyTest(unittest.TestCase):
             ramdisk, "_merge_usage", side_effect=ramdisk.RamdiskError("disk unavailable")
         ):
             with self.assertRaisesRegex(ramdisk.RamdiskError, "cleanup is incomplete"):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
         persisted = ramdisk._read_json(ramdisk._manifest_path())
         self.assertEqual(persisted["state"], "error")
         self.assertIn("disk unavailable", persisted["processes"][0]["usage_merge_error"])
@@ -3796,7 +3796,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "retained-managed-child-live",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -3832,7 +3832,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "identity changed after SIGTERM",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         merge.assert_not_called()
         persisted = ramdisk._load_manifest(required=True)
@@ -3852,7 +3852,7 @@ class StateAndSafetyTest(unittest.TestCase):
         manifest["mounts"].pop()
         ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
 
-        stopped = ramdisk.stop()
+        stopped = ramdisk.stop.__wrapped__()
 
         self.assertEqual(stopped["state"], "error")
         self.assertEqual(ramdisk._load_manifest(required=True)["state"], "error")
@@ -3879,6 +3879,22 @@ class StateAndSafetyTest(unittest.TestCase):
                 urlopen=mock.Mock(return_value=Response()),
             )
         self.assertIn("ready_at", record)
+
+    def test_managed_readiness_separates_public_error_from_private_log(self):
+        record = {
+            "pid": 123,
+            "port": 8123,
+            "log": "/private/state/engines/engine.log",
+        }
+        with mock.patch.object(
+            ramdisk,
+            "_process_matches",
+            return_value=(False, "exited", None),
+        ), self.assertRaises(ramdisk.RamdiskError) as raised:
+            ramdisk._wait_managed_ready(record, timeout=1)
+
+        self.assertIn(record["log"], str(raised.exception))
+        self.assertNotIn(record["log"], raised.exception.public_message)
 
     @requires_linux_operational
     def test_destroy_refuses_replaced_mount_identity(self):
@@ -4419,7 +4435,9 @@ class StateAndSafetyTest(unittest.TestCase):
         secret_nonce = "9" * 48
         secret_merge_id = "8" * 32
         manifest["launch_error"] = "engine readiness failed"
-        manifest["cleanup_errors"] = ["group absence unproven"]
+        manifest["cleanup_errors"] = [
+            "group absence unproven; inspect /private/cleanup.log"
+        ]
         manifest["recovery"] = {
             "operation": "start",
             "state": "attention-required",
@@ -4477,7 +4495,12 @@ class StateAndSafetyTest(unittest.TestCase):
             "engine readiness failed",
             report["recovery"]["errors"]["launch_error"],
         )
+        self.assertEqual(
+            report["recovery"]["errors"]["cleanup_errors"],
+            ["managed cleanup requires recovery attention"],
+        )
         serialized = json.dumps(report, sort_keys=True)
+        self.assertNotIn("/private/cleanup.log", serialized)
         self.assertNotIn(secret_nonce, serialized)
         self.assertNotIn(secret_merge_id, serialized)
         self.assertNotIn("usage_baseline", serialized)
@@ -4505,7 +4528,10 @@ class StateAndSafetyTest(unittest.TestCase):
                 manifest["recovery"][key] = value
                 path = Path(ramdisk._manifest_path())
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(manifest), encoding="utf-8")
+                path.write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
 
                 with self.assertRaisesRegex(
                     ramdisk.RamdiskError,
@@ -4698,7 +4724,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "stopped-record-process-group-live",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
             report = ramdisk.status(deep=False)
 
         popen.assert_not_called()

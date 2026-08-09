@@ -2092,6 +2092,9 @@ def start(
     terminate_direct_child,
     forget_managed_child,
     containment_supervisor=None,
+    expected_manifest_token=None,
+    deployment_token=None,
+    recover_benchmark_workspace=None,
 ):
     if apply_managed_accelerator_environment is None:
         from .accelerator import _apply_managed_accelerator_environment
@@ -2107,6 +2110,23 @@ def start(
     ):
         raise RamdiskError("managed launch has an invalid invoking UID")
     manifest = load_manifest(required=True)
+    if (
+        expected_manifest_token is not None
+        and (
+            deployment_token is None
+            or deployment_token(manifest) != expected_manifest_token
+        )
+    ):
+        raise RamdiskError(
+            "RAM workspace changed since review; inspect status and retry start"
+        )
+    if manifest.get("benchmark_workspace") is not None:
+        if recover_benchmark_workspace is None:
+            raise RamdiskError(
+                "unfinished benchmark workspace requires recovery before start"
+            )
+        recover_benchmark_workspace(manifest)
+        manifest = load_manifest(required=True)
     if _pending_launch_recovery(manifest):
         raise _pending_launch_recovery_error("start")
     if _retained_process_recovery(manifest):
@@ -2752,7 +2772,11 @@ def start(
                 raise RamdiskError(
                     "managed engine exited or failed exact identity "
                     "attribution during launch; see %s"
-                    % log_path
+                    % log_path,
+                    public_message=(
+                        "managed engine failed exact identity attribution "
+                        "during launch"
+                    ),
                 )
             supervisor.verify_gate(gate, containment)
             record = {
@@ -2860,8 +2884,17 @@ def start(
                     raise
 
             manifest["state"] = "error"
-            manifest["launch_error"] = str(launch_error)
-            manifest["cleanup_errors"] = list(cleanup_failures)
+            public_launch_error = getattr(
+                launch_error,
+                "public_message",
+                "managed engine launch failed; inspect protected diagnostics",
+            )
+            manifest["launch_error"] = public_launch_error
+            manifest["cleanup_errors"] = (
+                ["contained launch rollback requires recovery attention"]
+                if cleanup_failures
+                else []
+            )
             try:
                 save_manifest(manifest)
             except BaseException as save_exc:
@@ -2872,7 +2905,11 @@ def start(
             if cleanup_failures:
                 raise RamdiskError(
                     "%s; contained launch rollback/reporting errors: %s"
-                    % (launch_error, "; ".join(cleanup_failures))
+                    % (launch_error, "; ".join(cleanup_failures)),
+                    public_message=(
+                        public_launch_error
+                        + "; contained launch rollback requires recovery attention"
+                    ),
                 ) from launch_error
             raise
 
@@ -3095,7 +3132,12 @@ def start(
                 raise
 
         manifest["state"] = "error"
-        manifest["launch_error"] = str(launch_error)
+        public_launch_error = getattr(
+            launch_error,
+            "public_message",
+            "managed engine launch failed; inspect protected diagnostics",
+        )
+        manifest["launch_error"] = public_launch_error
         manifest["cleanup_errors"] = cleanup_failures
         rollback_save("could not persist launch rollback")
         if cleanup_failures:
@@ -3104,7 +3146,11 @@ def start(
                 % (
                     launch_error,
                     "; ".join(cleanup_failures),
-                )
+                ),
+                public_message=(
+                    public_launch_error
+                    + "; launch rollback requires recovery attention"
+                ),
             ) from launch_error
         raise
 
@@ -3124,12 +3170,25 @@ def stop(
     bind_usage_transaction,
     containment_supervisor=None,
     recover_benchmark_workspace=None,
+    expected_manifest_token=None,
+    deployment_token=None,
 ):
     manifest = load_manifest(required=True)
     if (
-        manifest.get("benchmark_workspace") is not None
-        and recover_benchmark_workspace is not None
+        expected_manifest_token is not None
+        and (
+            deployment_token is None
+            or deployment_token(manifest) != expected_manifest_token
+        )
     ):
+        raise RamdiskError(
+            "RAM workspace changed since review; inspect status and retry stop"
+        )
+    if manifest.get("benchmark_workspace") is not None:
+        if recover_benchmark_workspace is None:
+            raise RamdiskError(
+                "unfinished benchmark workspace requires recovery before stop"
+            )
         recover_benchmark_workspace(manifest)
     if _contained_manifest(manifest):
         supervisor = (
@@ -3974,6 +4033,7 @@ def status(
     recovery = manifest.get("recovery")
     retained_processes = _retained_process_recovery(manifest)
     pending_launches = _pending_launch_recovery(manifest)
+    benchmark_workspace = manifest.get("benchmark_workspace")
     planned_mount_paths = {
         record.get("path")
         for record in manifest.get("plan", {}).get("mounts", [])
@@ -4019,9 +4079,10 @@ def status(
     stop_errors = [
         {
             "pid": record.get("pid"),
-            "error": str(
-                record.get("stop_error")
-                or record.get("usage_merge_error")
+            "error": (
+                "managed process cleanup requires recovery attention"
+                if record.get("stop_error")
+                else "managed usage recovery requires attention"
             ),
         }
         for record in manifest.get("processes", [])
@@ -4034,13 +4095,14 @@ def status(
     }
     if cleanup_errors:
         error_summary["cleanup_errors"] = [
-            str(item) for item in cleanup_errors
+            "managed cleanup requires recovery attention"
         ]
     if stop_errors:
         error_summary["stop_errors"] = stop_errors
     if (
         isinstance(recovery, dict)
         or pending_launches
+        or isinstance(benchmark_workspace, dict)
         or retained_mounts
         or error_summary
     ):
@@ -4090,13 +4152,40 @@ def status(
                 for entry in pending_launches
                 if isinstance(entry, dict)
             ],
+            "benchmark_workspace": (
+                {
+                    "operation_id": benchmark_workspace.get("operation_id"),
+                    "phase": benchmark_workspace.get("phase"),
+                    "roots": [
+                        {
+                            "name": root.get("name"),
+                            "ownership": root.get("ownership"),
+                            "stage_phase": root.get("stage_phase"),
+                            "cleanup_authorized": bool(
+                                root.get("cleanup_authorized_at")
+                            ),
+                            "unmounted": bool(root.get("unmounted_at")),
+                            "removed": bool(root.get("removed_at")),
+                        }
+                        for root in benchmark_workspace.get("roots", [])
+                        if isinstance(root, dict)
+                    ],
+                }
+                if isinstance(benchmark_workspace, dict)
+                else None
+            ),
             "errors": error_summary,
             "action": (
-                "Run `coli ramdisk stop` to discover, stop, and reconcile "
-                "the outcome-unknown pending launch."
+                "Review `status --json`, then run token-bound stop with "
+                "`--deployment-token`, `--yes`, and `--json` to discover, "
+                "stop, and reconcile the outcome-unknown pending launch."
                 if pending_launches
-                else "Run `coli ramdisk stop` after the retained process "
-                "group exits to reconcile its exact usage transaction."
+                else "Retry start, stop, or destroy to recover the durable "
+                "benchmark workspace before any managed mutation."
+                if isinstance(benchmark_workspace, dict)
+                else "After the retained process group exits, review "
+                "`status --json` and run token-bound stop to reconcile its "
+                "exact usage transaction."
                 if retained_processes
                 else "Inspect pending ownership, the retained mount identity, "
                 "nested mounts, and busy references; explicitly reconcile "

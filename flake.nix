@@ -34,6 +34,7 @@
           map (name: "c/ramdisk_support/${name}") [
             "__init__.py"
             "accelerator.py"
+            "benchmark.py"
             "cli.py"
             "common.py"
             "contracts.py"
@@ -47,7 +48,9 @@
             "presentation.py"
             "presets.py"
             "processes.py"
+            "runtime_monitor.py"
             "state.py"
+            "supervision.py"
             "tokens.py"
           ]
         );

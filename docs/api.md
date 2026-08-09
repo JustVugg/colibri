@@ -85,13 +85,27 @@ automation. It does not add HTTP endpoints to the serving API.
 | `plan --json` | `colibri.ramdisk.plan.v1`, plus `plan_token` |
 | `stage` / `prepare` | `colibri.ramdisk.stage.v1` |
 | `status --json` | `colibri.ramdisk.status.v1`, plus `deployment_token` when present |
+| `status --runtime --json` | Status schema plus advisory `runtime` telemetry |
+| `start --json` | `colibri.ramdisk.start.v1`, plus a fresh `deployment_token` |
+| `stop --json` | `colibri.ramdisk.stop.v1`, plus a fresh `deployment_token` |
+| `benchmark --json` | `colibri.ramdisk.causal-benchmark.v1` with durable raw/protocol evidence paths |
 | `verify --json` | `colibri.ramdisk.verify.v1` |
 | `destroy --json` | `colibri.ramdisk.destroy.v1` |
 
 Expected failures use `colibri.ramdisk.error.v1` and return status 2. JSON
 mode writes one JSON document and never mixes human-oriented rendering into
-the output. Mutation tokens are mandatory and bind the exact reviewed plan or
-deployment snapshot; a changed snapshot requires a new read-only review.
+the output. Tokens are mandatory for lifecycle mutations
+(`stage`/`prepare`/`start`/`stop`/`destroy`) and bind the exact reviewed plan
+or deployment snapshot; a changed snapshot requires a new read-only review.
+Start and stop JSON expose only loopback endpoints and aggregate containment,
+usage-merge, and recovery state; commands, nonces, cgroup identities, logs, and
+private state paths remain hash-bound but are never returned.
+`start --base-port PORT` is optional; when omitted, start reuses the prepared
+deployment's persisted base port. The exact `start.v1` keys are `schema`,
+`version`, `state`, `deployment_id`, `deployment_token`, `ports`, `endpoints`,
+`containment_mode`, `usage_merge_summary`, and `recovery_attention`. The exact
+`stop.v1` keys are the same aggregate contract with `stopped_count` in place of
+`ports` and `endpoints`.
 
 ## Anthropic-protocol endpoint (`/v1/messages`)
 

@@ -19,6 +19,17 @@ sys.path.insert(0, str(C_DIR))
 from ramdisk_support.common import RamdiskError  # noqa: E402
 from ramdisk_support import supervision  # noqa: E402
 
+if __package__:
+    from .platform_test_support import (  # noqa: E402
+        requires_native_dirfd,
+        requires_posix_pass_fds,
+    )
+else:
+    from platform_test_support import (  # noqa: E402
+        requires_native_dirfd,
+        requires_posix_pass_fds,
+    )
+
 
 class CgroupFixture:
     def __init__(self, root):
@@ -45,12 +56,17 @@ class CgroupFixture:
 
 
 class StableCgroupIdentityTest(unittest.TestCase):
+    def test_delegated_root_must_be_absolute(self):
+        with self.assertRaisesRegex(RamdiskError, "absolute path"):
+            supervision.CgroupSupervisor(root="relative/delegation")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.fixture = CgroupFixture(self.temporary.name)
         self.supervisor = self.fixture.supervisor()
 
+    @requires_native_dirfd
     def test_create_leaf_returns_canonical_stable_identity(self):
         expected_relative = self.supervisor.relative_leaf(
             "deployment-a",
@@ -89,12 +105,14 @@ class StableCgroupIdentityTest(unittest.TestCase):
         descriptor = self.supervisor.reopen_verified(containment)
         os.close(descriptor)
 
+    @requires_native_dirfd
     def test_create_leaf_refuses_to_reuse_an_existing_operation(self):
         self.supervisor.create_leaf("deployment-a", "operation-a")
 
         with self.assertRaisesRegex(RamdiskError, "already exists"):
             self.supervisor.create_leaf("deployment-a", "operation-a")
 
+    @requires_native_dirfd
     def test_reopen_rejects_replaced_leaf(self):
         containment = self.supervisor.create_leaf("deployment-a", "operation-a")
         leaf = self.fixture.root / containment["relative_path"]
@@ -155,6 +173,7 @@ class StableCgroupIdentityTest(unittest.TestCase):
         with self.assertRaisesRegex(RamdiskError, "cannot reopen|symbolic"):
             self.supervisor.reopen_verified(containment)
 
+    @requires_native_dirfd
     def test_delegated_root_rejects_symlinked_ancestor(self):
         actual = self.fixture.root / "actual-root"
         child = actual / "child"
@@ -175,6 +194,7 @@ class StableCgroupIdentityTest(unittest.TestCase):
             with self.assertRaisesRegex(RamdiskError, "cannot discover"):
                 supervision.CgroupSupervisor.discover_root()
 
+    @requires_native_dirfd
     def test_missing_membership_is_inconclusive_not_absent(self):
         containment = self.supervisor.create_leaf("deployment-a", "operation-a")
 
@@ -183,12 +203,14 @@ class StableCgroupIdentityTest(unittest.TestCase):
         with self.assertRaises(supervision.ContainmentInconclusive):
             self.supervisor.prove_absence(containment)
 
+    @requires_native_dirfd
     def test_populated_zero_and_stably_empty_membership_proves_absence(self):
         containment = self.supervisor.create_leaf("deployment-a", "operation-a")
         self.fixture.materialize_leaf(containment, pids=(), populated=False)
 
         self.assertTrue(self.supervisor.prove_absence(containment))
 
+    @requires_native_dirfd
     def test_empty_procs_with_populated_one_is_inconclusive(self):
         containment = self.supervisor.create_leaf("deployment-a", "operation-a")
         self.fixture.materialize_leaf(containment, pids=(), populated=True)
@@ -201,6 +223,7 @@ class StableCgroupIdentityTest(unittest.TestCase):
 
         self.assertIsNone(self.supervisor.liveness({"containment": containment}))
 
+    @requires_native_dirfd
     def test_membership_is_compared_as_a_kernel_set_not_file_order(self):
         containment = self.supervisor.create_leaf("deployment-a", "operation-a")
         leaf = self.fixture.materialize_leaf(containment, pids=(4101, 4100, 4101))
@@ -223,6 +246,7 @@ class GatedExecTest(unittest.TestCase):
             % str(marker),
         ]
 
+    @requires_posix_pass_fds
     def test_gate_cannot_exec_before_release_and_keeps_the_same_pid(self):
         marker = self.root / "executed"
         gate = supervision.spawn_exec_gate(
@@ -243,6 +267,7 @@ class GatedExecTest(unittest.TestCase):
         self.assertEqual(gate.process.wait(timeout=5), 0)
         self.assertEqual(marker.read_text(), "executed")
 
+    @requires_posix_pass_fds
     def test_parent_eof_aborts_without_exec(self):
         marker = self.root / "executed"
         gate = supervision.spawn_exec_gate(
@@ -263,6 +288,7 @@ class AttachAndSignalTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.fixture = CgroupFixture(self.temporary.name)
 
+    @requires_native_dirfd
     def test_attach_opens_pidfd_and_revalidates_before_separate_release(self):
         opened = []
         supervisor = self.fixture.supervisor(
@@ -292,6 +318,7 @@ class AttachAndSignalTest(unittest.TestCase):
         self.assertEqual(opened, [(4100, 0)])
         release.assert_called_once_with(gate)
 
+    @requires_native_dirfd
     def test_attach_refuses_pidfd_that_is_already_exited(self):
         supervisor = self.fixture.supervisor(
             pidfd_open=lambda _pid, _flags: 91,
@@ -311,6 +338,7 @@ class AttachAndSignalTest(unittest.TestCase):
             with self.assertRaisesRegex(RamdiskError, "pidfd.*exited"):
                 supervisor.attach_gate(gate, containment)
 
+    @requires_native_dirfd
     def test_attach_refuses_an_incomplete_cgroup_membership_write(self):
         supervisor = self.fixture.supervisor()
         containment = supervisor.create_leaf("deployment-a", "operation-a")
@@ -335,6 +363,7 @@ class AttachAndSignalTest(unittest.TestCase):
         self.assertEqual(closed, [91])
         self.assertIsNone(gate.pidfd)
 
+    @requires_native_dirfd
     def test_verify_gate_rechecks_retained_pidfd_and_membership(self):
         supervisor = self.fixture.supervisor(
             pidfd_open=lambda _pid, _flags: 91,
@@ -349,6 +378,7 @@ class AttachAndSignalTest(unittest.TestCase):
 
         self.assertTrue(supervisor.verify_gate(gate, containment))
 
+    @requires_native_dirfd
     def test_record_verification_rechecks_membership_after_pidfd_bind(self):
         supervisor = self.fixture.supervisor(
             pidfd_open=lambda _pid, _flags: 91,
@@ -368,6 +398,7 @@ class AttachAndSignalTest(unittest.TestCase):
         self.assertFalse(verified)
         self.assertIn("changed containment", reason)
 
+    @requires_native_dirfd
     def test_signal_pass_opens_and_validates_all_pidfds_before_first_signal(self):
         events = []
         supervisor = self.fixture.supervisor(

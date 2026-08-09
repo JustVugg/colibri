@@ -784,9 +784,10 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["processes"], [])
 
     def test_pre_spawn_log_open_oserror_clears_pending_launch(self):
+        private_path = "/private/state/engines/secret/engine.log"
         manifest, snapshots, popen, _merge, _terminate, _group, caught = (
             self._exercise_prepublication_popen_outcome(
-                log_open_effect=OSError("log open failed")
+                log_open_effect=OSError("cannot open %s" % private_path)
             )
         )
 
@@ -798,6 +799,11 @@ class ManagedLaunchTest(unittest.TestCase):
         self.assertEqual(manifest["state"], "error")
         self.assertEqual(manifest["pending_launches"], [])
         self.assertEqual(manifest["processes"], [])
+        self.assertEqual(
+            manifest["launch_error"],
+            "managed engine launch failed; inspect protected diagnostics",
+        )
+        self.assertNotIn(private_path, json.dumps(manifest))
 
     def test_gated_popen_oserror_proves_no_engine_exec_and_clears_pending(self):
         manifest, snapshots, popen, merge, _terminate, _group, caught = (
@@ -2232,6 +2238,9 @@ class ManagedLaunchTest(unittest.TestCase):
 
     def test_launch_rollback_merges_every_context_when_manifest_saves_fail(self):
         nonce = "b" * 48
+        public_error = (
+            "managed engine failed exact identity attribution during launch"
+        )
 
         class FakeSocket:
             def bind(self, address):
@@ -2250,8 +2259,7 @@ class ManagedLaunchTest(unittest.TestCase):
                 return self.returncode
 
             def wait(self, timeout=None):
-                self.returncode = 0
-                return self.returncode
+                raise OSError("cannot reap /private/contained-engine.log")
 
         with ModelFixture() as fixture, canonical_temporary_directory() as state:
             plan = ramdisk.build_plan(plan_args(fixture.root), hardware=hardware_fixture())
@@ -2298,16 +2306,28 @@ class ManagedLaunchTest(unittest.TestCase):
                     identity if process.poll() is None else None
                 ),
             ), mock.patch.object(
-                ramdisk, "_wait_managed_ready", side_effect=ramdisk.RamdiskError("not ready")
+                ramdisk,
+                "_wait_managed_ready",
+                side_effect=ramdisk.RamdiskError("not ready"),
             ), mock.patch.object(
                 ramdisk, "_terminate_verified_group", return_value=None
             ), mock.patch.object(ramdisk, "_group_alive", return_value=False), mock.patch.object(
                 ramdisk, "_merge_usage"
             ) as merge, mock.patch.object(ramdisk.secrets, "token_hex", return_value=nonce):
-                with self.assertRaisesRegex(ramdisk.RamdiskError, "rollback/reporting errors"):
+                with self.assertRaisesRegex(
+                    ramdisk.RamdiskError,
+                    "rollback/reporting errors",
+                ) as raised:
                     ramdisk.start.__wrapped__(
                         argparse.Namespace(base_port=8200), cli_path=sys.executable
                     )
 
         merge.assert_called_once()
         self.assertNotIn("keep_journal", merge.call_args.kwargs)
+        self.assertEqual(manifest["launch_error"], public_error)
+        self.assertEqual(
+            manifest["cleanup_errors"],
+            ["contained launch rollback requires recovery attention"],
+        )
+        self.assertNotIn("engine.log", raised.exception.public_message)
+        self.assertNotIn("/private/", raised.exception.public_message)

@@ -27,7 +27,9 @@ PUBLIC_SIGNATURES = {
         "cancel_event=None)"
     ),
     "destroy": "(args, expected_manifest_token=None)",
-    "status": "(deep=True)",
+    "start": "(args, cli_path=None, engine_path=None, cancel_event=None, expected_manifest_token=None)",
+    "stop": "(args=None, expected_manifest_token=None)",
+    "status": "(deep=True, runtime=False)",
     "verify": "()",
     "benchmark": "(args, cli_path=None, engine_path=None, cancel_event=None)",
     "dispatch": "(args, cli_path=None, engine_path=None, system=None)",
@@ -35,6 +37,76 @@ PUBLIC_SIGNATURES = {
 
 
 class RamdiskFacadeContractTest(unittest.TestCase):
+    def test_runtime_status_is_lazy_and_snapshot_bound(self):
+        report = {
+            "schema": "colibri.ramdisk.status.v1",
+            "deployment_token": "a" * 64,
+        }
+        with mock.patch.object(
+            ramdisk, "_lifecycle_status", return_value=report
+        ), mock.patch.object(
+            ramdisk,
+            "_runtime_monitor_module",
+            side_effect=AssertionError("default status imported runtime monitor"),
+        ):
+            self.assertIs(ramdisk.status(), report)
+
+        manifest = {"plan": {"hardware": {}}, "deployment_id": "d" * 32}
+        monitor = mock.Mock()
+        monitor.sample.return_value = {"service": {"state": "stopped"}}
+        module = mock.Mock()
+        module.RuntimeMonitor.return_value = monitor
+        with mock.patch.object(
+            ramdisk, "_lifecycle_status", return_value=dict(report)
+        ), mock.patch.object(
+            ramdisk, "_load_manifest", return_value=manifest
+        ), mock.patch.object(
+            ramdisk, "_manifest_confirmation_token", return_value="a" * 64
+        ), mock.patch.object(
+            ramdisk, "_runtime_monitor_module", return_value=module
+        ), mock.patch.object(
+            ramdisk,
+            "_containment_supervisor",
+            side_effect=AssertionError("stopped snapshot discovered cgroup"),
+        ):
+            value = ramdisk.status(runtime=True)
+
+        self.assertEqual(value["runtime"], monitor.sample.return_value)
+        verify_record = module.RuntimeMonitor.call_args.kwargs["verify_record"]
+        self.assertTrue(callable(verify_record))
+
+    def test_runtime_status_rejects_present_absent_snapshot_races(self):
+        present = {"plan": {}, "deployment_id": "d" * 32}
+        cases = (
+            (
+                {"deployment_token": "a" * 64},
+                {},
+                "present-to-absent",
+            ),
+            (
+                {"deployment_token": None},
+                present,
+                "absent-to-present",
+            ),
+        )
+        for report, manifest, label in cases:
+            with self.subTest(case=label), mock.patch.object(
+                ramdisk, "_lifecycle_status", return_value=dict(report)
+            ), mock.patch.object(
+                ramdisk, "_load_manifest", return_value=manifest
+            ), mock.patch.object(
+                ramdisk, "_manifest_confirmation_token", return_value="b" * 64
+            ), mock.patch.object(
+                ramdisk,
+                "_runtime_monitor_module",
+                side_effect=AssertionError("stale snapshot reached monitor"),
+            ) as runtime_module:
+                value = ramdisk.status(runtime=True)
+
+            self.assertTrue(value["runtime"]["stale"])
+            self.assertIn("snapshot changed", value["runtime"]["error"])
+            runtime_module.assert_not_called()
+
     def test_public_exports_and_signatures_are_headless_and_stable(self):
         self.assertTrue(issubclass(ramdisk.RamdiskError, RuntimeError))
         for name, expected_signature in PUBLIC_SIGNATURES.items():
@@ -51,10 +123,6 @@ class RamdiskFacadeContractTest(unittest.TestCase):
         for name in ("launch_tui",):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(ramdisk, name))
-                self.assertNotIn(name, ramdisk.__all__)
-        for name in ("start", "stop"):
-            with self.subTest(name=name):
-                self.assertTrue(callable(getattr(ramdisk, name)))
                 self.assertNotIn(name, ramdisk.__all__)
 
     def test_schema_names_and_versions_remain_stable(self):
@@ -142,7 +210,7 @@ assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
             self.assertIn(name, namespace)
         for name in ("benchmark", "BENCHMARK_SCHEMA", "BENCHMARK_PROMPT"):
             self.assertIn(name, namespace)
-        for name in ("launch_tui", "start", "stop"):
+        for name in ("launch_tui",):
             self.assertNotIn(name, namespace)
 
     def test_historical_urllib_patch_seam_remains_lazy_and_forwarded(self):

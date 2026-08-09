@@ -769,7 +769,11 @@ def _wait_managed_ready(
         if not matches:
             raise RamdiskError(
                 "managed engine PID %s exited before readiness (%s); see %s"
-                % (record["pid"], reason, record["log"])
+                % (record["pid"], reason, record["log"]),
+                public_message=(
+                    "managed engine exited before readiness; inspect status "
+                    "or rerun without --json for protected log details"
+                ),
             )
         try:
             request = urllib.request.Request(
@@ -793,7 +797,11 @@ def _wait_managed_ready(
     raise RamdiskError(
         "managed engine on port %s did not become ready within %.0fs "
         "(%s); see %s"
-        % (record["port"], timeout, last_error, record["log"])
+        % (record["port"], timeout, last_error, record["log"]),
+        public_message=(
+            "managed engine did not become ready; inspect status or rerun "
+            "without --json for protected log details"
+        ),
     )
 
 

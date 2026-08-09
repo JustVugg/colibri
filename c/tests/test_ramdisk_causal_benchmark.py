@@ -20,6 +20,10 @@ C_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(C_DIR))
 
 from ramdisk_support import benchmark  # noqa: E402
+if __package__:
+    from .platform_test_support import requires_linux_operational  # noqa: E402
+else:
+    from platform_test_support import requires_linux_operational  # noqa: E402
 
 
 GIB = 1 << 30
@@ -1529,6 +1533,105 @@ class CausalExecutionTest(unittest.TestCase):
         self.assertIn("scratch unmount failed", " ".join(result["reasons"]))
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0]["record_type"], "workspace-cleanup")
+
+
+class LinuxCausalOperationalTest(unittest.TestCase):
+    @requires_linux_operational
+    def test_real_fresh_process_identity_and_cleanup(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        try:
+            starttime = benchmark._process_starttime(process.pid)
+            self.assertGreater(starttime, 0)
+            self.assertTrue(Path("/proc/%d/status" % process.pid).is_file())
+            os.killpg(process.pid, 15)
+            self.assertIsNotNone(process.wait(timeout=5))
+            with self.assertRaises(OSError):
+                benchmark._process_starttime(process.pid)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+    @requires_linux_operational
+    def test_real_proc_numa_and_physical_read_correctness_gate(self):
+        status = benchmark._read_process_status(os.getpid())
+        self.assertEqual(
+            set(status),
+            {"anonymous_bytes", "file_bytes", "shmem_bytes", "process_swap_bytes"},
+        )
+        numa_text = Path("/proc/self/numa_maps").read_text(encoding="utf-8")
+        numa = benchmark._parse_numa_maps(
+            numa_text,
+            page_size=os.sysconf("SC_PAGE_SIZE"),
+        )
+        self.assertTrue(numa["by_node"])
+
+        protocol = build_protocol()
+        rows = complete_rows(protocol)
+        target = next(
+            row for row in rows
+            if row["treatment_id"] == "tmpfs-rammap-interleaved"
+        )
+        target["process"].update(
+            pid=os.getpid(),
+            starttime=benchmark._process_starttime(os.getpid()),
+        )
+        target["profiler"].update(
+            physical_ssd_valid=True,
+            physical_ssd_bytes=4096,
+        )
+        result = benchmark.evaluate_causal_claim(protocol, rows)
+        self.assertEqual((result["status"], result["claim"]), ("invalid", "neutral"))
+        self.assertIn("physical reads", " ".join(result["reasons"]))
+
+    @requires_linux_operational
+    def test_real_dram_collector_subprocess_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "dram-helper"
+            helper.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                "if '--preflight' in sys.argv:\n"
+                " print(json.dumps({'available': True, 'unit': 'bytes'}))\n"
+                "else:\n"
+                " print(json.dumps({'read_bytes': 10, 'write_bytes': 5}))\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            collector = benchmark.preflight_dram_collector(
+                environ={"COLI_DRAM_COLLECTOR": str(helper)},
+            )
+            self.assertTrue(
+                collector.available,
+                getattr(collector, "reason", None),
+            )
+            handle = collector.start(os.getpid(), {"id": "live"})
+            measured = collector.finish(handle)
+            self.assertEqual(measured["total_bytes"], 0)
+
+    @requires_linux_operational
+    def test_live_verified_dual_workspace_policy(self):
+        configured = os.environ.get("COLI_BENCHMARK_LIVE_WORKSPACE_ROOTS")
+        if not configured:
+            self.skipTest(
+                "set COLI_BENCHMARK_LIVE_WORKSPACE_ROOTS=INTERLEAVED:LOCAL "
+                "to verify delegated tmpfs policies"
+            )
+        paths = [os.path.realpath(item) for item in configured.split(":", 1)]
+        if len(paths) != 2:
+            self.fail("live workspace roots must name exactly two paths")
+        from ramdisk_support import linux_ops
+
+        by_path = {os.path.realpath(row["path"]): row for row in linux_ops._mount_table()}
+        roots = [by_path.get(path) for path in paths]
+        self.assertTrue(all(root and root["filesystem"] == "tmpfs" for root in roots))
+        self.assertNotEqual(roots[0]["mount_id"], roots[1]["mount_id"])
+        options = [set(root["options"] + root["super_options"]) for root in roots]
+        self.assertIn("mpol=interleave:0-1", options[0])
+        self.assertIn("mpol=bind:0", options[1])
 
 
 class CausalClaimTest(unittest.TestCase):

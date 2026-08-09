@@ -68,6 +68,7 @@ FORBIDDEN_PATHS = (
 CORE_MODULES = (
     "__init__.py",
     "accelerator.py",
+    "benchmark.py",
     "cli.py",
     "common.py",
     "contracts.py",
@@ -81,10 +82,12 @@ CORE_MODULES = (
     "presentation.py",
     "presets.py",
     "processes.py",
+    "runtime_monitor.py",
     "state.py",
+    "supervision.py",
     "tokens.py",
 )
-FUTURE_MODULES = ("benchmark.py", "runtime_monitor.py", "supervision.py")
+RUNNER_MODULES = ("benchmark.py", "runtime_monitor.py", "supervision.py")
 ROOT_SUPPORT_MODULES = (
     "resource_plan.py",
     "doctor.py",
@@ -220,8 +223,6 @@ class RamdiskPackagingTest(unittest.TestCase):
                     self.assertIn("c/ramdisk_support/%s" % name, members)
                 for path in FORBIDDEN_PATHS:
                     self.assertNotIn(path, members)
-                for name in FUTURE_MODULES:
-                    self.assertNotIn("c/ramdisk_support/%s" % name, members)
                 if not PIP_AVAILABLE:
                     wheel.extractall(installed)
 
@@ -267,10 +268,10 @@ class RamdiskPackagingTest(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertFalse((ROOT / relative).exists())
 
-    def test_runner_modules_are_deferred_to_pr3(self):
-        for name in FUTURE_MODULES:
+    def test_runner_modules_are_required_in_pr3(self):
+        for name in ("benchmark.py", "runtime_monitor.py", "supervision.py"):
             with self.subTest(module=name):
-                self.assertFalse((C_DIR / "ramdisk_support" / name).exists())
+                self.assertTrue((C_DIR / "ramdisk_support" / name).is_file())
 
     def test_launcher_requires_exact_headless_inventory(self):
         tree = ast.parse((C_DIR / "coli").read_text(encoding="utf-8"))
@@ -298,10 +299,8 @@ class RamdiskPackagingTest(unittest.TestCase):
             assignments["_SUPPORT_PACKAGE_MODULES"],
             CORE_MODULES,
         )
-        for module in FUTURE_MODULES:
-            self.assertNotIn(module, assignments["_SUPPORT_PACKAGE_MODULES"])
 
-    def test_every_packager_carries_core_without_frontend_or_runner(self):
+    def test_every_packager_carries_required_headless_runner(self):
         files = {
             "Makefile": (C_DIR / "Makefile").read_text(encoding="utf-8"),
             "flake.nix": (ROOT / "flake.nix").read_text(encoding="utf-8"),
@@ -320,8 +319,6 @@ class RamdiskPackagingTest(unittest.TestCase):
                 self.assertNotIn("ramdisk_textual.py", text)
                 self.assertNotIn("requirements-tui.txt", text)
                 self.assertNotIn("curses_ui.py", text)
-                for module in FUTURE_MODULES:
-                    self.assertNotIn(module, text)
 
     def test_python_metadata_has_no_frontend_dependency_or_extra(self):
         text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -355,27 +352,29 @@ class RamdiskPackagingTest(unittest.TestCase):
         self.assertNotIn("traceback", (result.stdout + result.stderr).lower())
 
     def test_missing_token_source_launcher_emits_json_only(self):
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(C_DIR / "coli"),
-                "ramdisk",
-                "stage",
-                "--yes",
-                "--json",
-            ],
-            cwd=C_DIR,
-            text=True,
-            capture_output=True,
-            check=False,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr, "")
-        self.assertEqual(
-            json.loads(result.stdout)["schema"],
-            "colibri.ramdisk.error.v1",
-        )
+        for action in ("stage", "start", "stop"):
+            with self.subTest(action=action):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(C_DIR / "coli"),
+                        "ramdisk",
+                        action,
+                        "--yes",
+                        "--json",
+                    ],
+                    cwd=C_DIR,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(
+                    json.loads(result.stdout)["schema"],
+                    "colibri.ramdisk.error.v1",
+                )
 
     def test_make_install_headless_bundle_runs_without_extensions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -411,8 +410,8 @@ class RamdiskPackagingTest(unittest.TestCase):
             for name in ("ramdisk_ui.py", "ramdisk_textual.py", "requirements-tui.txt"):
                 self.assertFalse((libexec / name).exists())
             self.assertFalse((support / "curses_ui.py").exists())
-            for name in FUTURE_MODULES:
-                self.assertFalse((support / name).exists())
+            for name in RUNNER_MODULES:
+                self.assertTrue((support / name).is_file())
 
             result = subprocess.run(
                 [sys.executable, str(prefix / "bin" / "coli"), "ramdisk"],
@@ -425,12 +424,42 @@ class RamdiskPackagingTest(unittest.TestCase):
             self.assertIn("stage", result.stdout)
             self.assertNotIn("traceback", (result.stdout + result.stderr).lower())
 
-    def test_launcher_tolerates_known_future_extension_files(self):
+            state_home = root / "isolated-state"
+            installed_environment = {
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "XDG_STATE_HOME": str(state_home),
+            }
+            for action in ("start", "stop"):
+                with self.subTest(installed_action=action):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(prefix / "bin" / "coli"),
+                            "ramdisk",
+                            action,
+                            "--yes",
+                            "--json",
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=installed_environment,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stderr, "")
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(
+                        payload["schema"], "colibri.ramdisk.error.v1"
+                    )
+                    self.assertFalse(state_home.exists())
+
+    def test_launcher_keeps_required_runner_modules_lazy_for_bare_help(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "c"
             shutil.copytree(C_DIR, source)
-            for module in FUTURE_MODULES:
+            for module in RUNNER_MODULES:
                 (source / "ramdisk_support" / module).write_text(
                     "raise AssertionError('future extension imported eagerly')\n",
                     encoding="utf-8",

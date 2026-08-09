@@ -35,7 +35,10 @@ class HeadlessParserTest(unittest.TestCase):
         )
         self.assertEqual(
             set(actions.choices),
-            {"plan", "stage", "prepare", "verify", "status", "destroy", "benchmark"},
+            {
+                "plan", "stage", "prepare", "verify", "status", "destroy",
+                "benchmark", "start", "stop",
+            },
         )
         for name in ("stage", "prepare"):
             parsed = self.parser.parse_args(
@@ -80,10 +83,18 @@ class HeadlessParserTest(unittest.TestCase):
         self.assertEqual(parsed.raw_evidence, "/evidence/raw.v1.jsonl")
         self.assertTrue(parsed.json)
 
-    def test_managed_runner_actions_are_not_parseable(self):
+    def test_managed_runner_actions_require_review_flags_at_dispatch(self):
         for name in ("start", "stop"):
-            with self.subTest(name=name), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                self.parser.parse_args([name])
+            with self.subTest(name=name):
+                parsed = self.parser.parse_args(
+                    [name, "--deployment-token", "a" * 64, "--yes", "--json"]
+                )
+                self.assertEqual(parsed.ramdisk_action, name)
+                self.assertEqual(parsed.deployment_token, "a" * 64)
+                self.assertTrue(parsed.yes)
+                self.assertTrue(parsed.json)
+                if name == "start":
+                    self.assertIsNone(parsed.base_port)
 
 
 class HeadlessJsonDispatchTest(unittest.TestCase):
@@ -106,6 +117,25 @@ class HeadlessJsonDispatchTest(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertRegex(payload["plan_token"], r"^[0-9a-f]{64}$")
         self.assertNotIn("plan_token", plan)
+
+    def test_json_system_errors_do_not_expose_private_diagnostics(self):
+        private_path = "/private/state/engines/secret/engine.log"
+        args = argparse.Namespace(ramdisk_action="status", json=True)
+        with mock.patch.object(
+            ramdisk,
+            "status",
+            side_effect=OSError("cannot open %s" % private_path),
+        ):
+            code, payload, stderr = self._run(args)
+
+        self.assertEqual((code, stderr), (2, ""))
+        self.assertEqual(payload["schema"], "colibri.ramdisk.error.v1")
+        self.assertEqual(
+            payload["error"],
+            "RAM-disk operation failed; rerun without --json for protected "
+            "diagnostics",
+        )
+        self.assertNotIn(private_path, json.dumps(payload))
 
     def test_stage_json_has_only_versioned_sanitized_projection(self):
         manifest = sample_manifest()
@@ -263,6 +293,97 @@ class HeadlessJsonDispatchTest(unittest.TestCase):
                 argparse.Namespace(ramdisk_action="verify", json=True)
             )
         self.assertEqual((code, payload, stderr), (2, verification, ""))
+
+    def test_status_runtime_is_explicit_and_json_only(self):
+        status = {"schema": "colibri.ramdisk.status.v1", "runtime": {"service": {}}}
+        with mock.patch.object(ramdisk, "status", return_value=status) as render:
+            code, payload, stderr = self._run(
+                argparse.Namespace(
+                    ramdisk_action="status",
+                    json=True,
+                    runtime=True,
+                )
+            )
+        self.assertEqual((code, payload, stderr), (0, status, ""))
+        render.assert_called_once_with(runtime=True)
+
+    def test_start_and_stop_json_are_exact_and_sanitized(self):
+        token = "a" * 64
+        started = sample_manifest()
+        started["state"] = "running"
+        started["processes"][0].update(
+            state_dir="/secret/state",
+            weights_dir="/secret/weights",
+            command=["/secret/engine"],
+            log="/secret/log",
+            containment={"inode": 99},
+        )
+        stopped = sample_manifest()
+        stopped["state"] = "stopped"
+        stopped["processes"][0]["stopped_at"] = "2026-08-08T12:01:00+00:00"
+        for action, result, schema, keys in (
+            (
+                "start",
+                started,
+                "colibri.ramdisk.start.v1",
+                {
+                    "schema", "version", "state", "deployment_id",
+                    "deployment_token", "ports", "endpoints",
+                    "containment_mode", "usage_merge_summary",
+                    "recovery_attention",
+                },
+            ),
+            (
+                "stop",
+                stopped,
+                "colibri.ramdisk.stop.v1",
+                {
+                    "schema", "version", "state", "deployment_id",
+                    "deployment_token", "stopped_count", "containment_mode",
+                    "usage_merge_summary", "recovery_attention",
+                },
+            ),
+        ):
+            args = argparse.Namespace(
+                ramdisk_action=action,
+                deployment_token=token,
+                yes=True,
+                json=True,
+            )
+            with self.subTest(action=action), mock.patch.object(
+                ramdisk, action, return_value=result
+            ) as operation:
+                code, payload, stderr = self._run(args)
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(payload["schema"], schema)
+                self.assertEqual(set(payload), keys)
+                self.assertRegex(payload["deployment_token"], r"^[0-9a-f]{64}$")
+                self.assertEqual(
+                    payload["deployment_token"],
+                    ramdisk._manifest_confirmation_token(result),
+                )
+                serialized = json.dumps(payload)
+                observed_keys = set()
+
+                def collect_keys(value):
+                    if isinstance(value, dict):
+                        observed_keys.update(value)
+                        for child in value.values():
+                            collect_keys(child)
+                    elif isinstance(value, list):
+                        for child in value:
+                            collect_keys(child)
+
+                collect_keys(payload)
+                self.assertFalse(
+                    observed_keys
+                    & {
+                        "nonce", "command", "log", "state_dir", "weights_dir",
+                        "containment", "relative_path", "device", "inode",
+                    }
+                )
+                self.assertNotIn("secret", serialized)
+                operation.assert_called_once()
 
     def test_destroy_json_wraps_only_the_sanitized_result(self):
         result = {

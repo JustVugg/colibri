@@ -229,11 +229,18 @@ class CgroupSupervisor:
         close_fd=None,
         sleep=None,
     ):
-        self.root = os.path.abspath(
+        configured_root = (
             root
             or os.environ.get("COLI_CGROUP_DELEGATED_ROOT")
             or self.discover_root()
         )
+        if not isinstance(configured_root, str) or not os.path.isabs(
+            configured_root
+        ):
+            raise RamdiskError(
+                "cgroup delegated root must be an absolute path"
+            )
+        self.root = os.path.normpath(configured_root)
         self._pidfd_open = pidfd_open or getattr(os, "pidfd_open", None)
         self._pidfd_send_signal = pidfd_send_signal or _pidfd_send
         self._pidfd_exited = pidfd_exited or _pidfd_exited

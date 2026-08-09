@@ -90,7 +90,11 @@ No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
 On Linux, inspect optional NUMA-aware RAM staging with
 `./coli ramdisk plan --model /path/to/model --json`. Save the returned
 `plan_token` and pass it to `stage --plan-token TOKEN --yes --json`; later use
-the `deployment_token` from `status --json` for a reviewed `destroy`. A bare
+the `deployment_token` from `status --json` for reviewed `start`, `stop`, or
+`destroy` actions. Save the fresh token returned by `stage`, `start`, and
+`stop`; destroy removes the deployment and returns no successor token.
+Use `status --runtime --json` only when advisory live telemetry is wanted, and
+run the fixed `benchmark ... --json` protocol while engines are stopped. A bare
 `coli ramdisk` prints the complete headless action list.
 
 For better understanding, from powershell prompt, a complete invocation line 

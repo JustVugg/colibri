@@ -415,8 +415,9 @@ and the optional API gateway.
 #### Headless RAM-workspace lifecycle (Linux)
 
 `coli ramdisk` can stage a reviewed full or profile-selected model namespace
-onto NUMA-aware tmpfs without a terminal frontend. Mutations are bound to the
-exact JSON snapshot an operator reviewed:
+onto NUMA-aware tmpfs without a terminal frontend. Lifecycle mutations
+(`stage`/`prepare`/`start`/`stop`/`destroy`) are bound to the exact JSON
+snapshot an operator reviewed:
 
 ```bash
 # Save the plan_token from this response.
@@ -428,13 +429,27 @@ exact JSON snapshot an operator reviewed:
 ./coli ramdisk status --json
 ./coli ramdisk verify --json
 
+# Stage, start, and stop return a fresh deployment_token for the next command.
+./coli ramdisk start --deployment-token <token-from-status> --yes --json
+./coli ramdisk status --runtime --json
+./coli ramdisk stop --deployment-token <token-from-start> --yes --json
+
+# Run the fixed, append-only causal RAMMAP protocol while engines are stopped.
+./coli ramdisk benchmark --residency-gb 64 --cuda-host-gb 32 \
+  --cuda-expert-gb 48 --json
+
 # Save the deployment_token from status, then destroy that exact deployment.
-./coli ramdisk destroy --deployment-token <64-lowercase-hex> --yes --json
+./coli ramdisk destroy --deployment-token <token-from-stop-or-status> --yes --json
 ```
 
 `prepare` is an exact alias of `stage`. A bare `coli ramdisk` prints the
-headless action help and exits with status 2. Managed engine `start`, `stop`,
-and benchmark actions are not part of this lifecycle layer.
+headless action help and exits with status 2. `start`, `stop`, and `destroy`
+require the token from the immediately preceding reviewed snapshot; successful
+token-bound lifecycle mutations that preserve a deployment return a fresh
+token. Destroy returns a sanitized teardown result after removing the
+deployment. `start --base-port PORT` overrides the prepared
+deployment's persisted base port; omitting it reuses that persisted port.
+Runtime telemetry is opt-in and advisory.
 
 #### The same commands run any of the models
 

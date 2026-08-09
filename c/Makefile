@@ -1112,9 +1112,9 @@ install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepsee
 	fi
 
 RAMDISK_SUPPORT_MODULES = \
-	__init__.py accelerator.py cli.py common.py contracts.py discovery.py \
+	__init__.py accelerator.py benchmark.py cli.py common.py contracts.py discovery.py \
 	lifecycle.py linux_ops.py model.py mounts.py planning.py platform_ops.py \
-	presentation.py presets.py processes.py state.py tokens.py
+	presentation.py presets.py processes.py runtime_monitor.py state.py supervision.py tokens.py
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/coli

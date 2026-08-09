@@ -10,6 +10,10 @@ from pathlib import Path
 
 _LINUX_OPERATIONAL_TESTS = frozenset(
     {
+        "test_ramdisk_causal_benchmark.LinuxCausalOperationalTest.test_live_verified_dual_workspace_policy",
+        "test_ramdisk_causal_benchmark.LinuxCausalOperationalTest.test_real_dram_collector_subprocess_preflight",
+        "test_ramdisk_causal_benchmark.LinuxCausalOperationalTest.test_real_fresh_process_identity_and_cleanup",
+        "test_ramdisk_causal_benchmark.LinuxCausalOperationalTest.test_real_proc_numa_and_physical_read_correctness_gate",
         "test_ramdisk_integration.RealTmpfsLifecycleTest.test_prepare_status_destroy_on_real_tmpfs",
         "test_ramdisk_model_planning.ScanAndPlanTest.test_protected_or_model_overlapping_mount_roots_are_blocked",
         "test_ramdisk_mounts.MountAndCopyTest.test_interrupted_mount_helper_retains_pending_recovery_without_unmount",
@@ -60,12 +64,34 @@ _POSIX_FIFO_TESTS = frozenset(
     }
 )
 
+_POSIX_PASS_FDS_TESTS = frozenset(
+    {
+        "test_ramdisk_supervision.GatedExecTest.test_gate_cannot_exec_before_release_and_keeps_the_same_pid",
+        "test_ramdisk_supervision.GatedExecTest.test_parent_eof_aborts_without_exec",
+    }
+)
+
 _NATIVE_DIRFD_TESTS = frozenset(
     {
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_atomic_temp_creation_stays_inside_bound_parent",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_existing_marker_reproves_canonical_parent_before_journal_unlink",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_managed_usage_merge_rejects_symlink_swap_during_verified_open",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_managed_usage_seed_write_binds_parent_identity",
+        "test_ramdisk_supervision.AttachAndSignalTest.test_attach_opens_pidfd_and_revalidates_before_separate_release",
+        "test_ramdisk_supervision.AttachAndSignalTest.test_attach_refuses_an_incomplete_cgroup_membership_write",
+        "test_ramdisk_supervision.AttachAndSignalTest.test_attach_refuses_pidfd_that_is_already_exited",
+        "test_ramdisk_supervision.AttachAndSignalTest.test_record_verification_rechecks_membership_after_pidfd_bind",
+        "test_ramdisk_supervision.AttachAndSignalTest.test_signal_pass_opens_and_validates_all_pidfds_before_first_signal",
+        "test_ramdisk_supervision.AttachAndSignalTest.test_verify_gate_rechecks_retained_pidfd_and_membership",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_create_leaf_refuses_to_reuse_an_existing_operation",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_create_leaf_returns_canonical_stable_identity",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_delegated_root_rejects_symlinked_ancestor",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_empty_procs_with_populated_one_is_inconclusive",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_membership_is_compared_as_a_kernel_set_not_file_order",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_missing_membership_is_inconclusive_not_absent",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_populated_zero_and_stably_empty_membership_proves_absence",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_reopen_rejects_replaced_leaf",
+        "test_ramdisk_supervision.StableCgroupIdentityTest.test_reopen_rejects_symlink_component",
     }
 )
 
@@ -146,6 +172,13 @@ PLATFORM_SKIP_INVENTORY = {
         "reason": "a POSIX FIFO is required",
         "tests": _POSIX_FIFO_TESTS,
     },
+    "posix_pass_fds": {
+        "supported": (
+            not _TARGET_PLATFORM.startswith("win") and os.name == "posix"
+        ),
+        "reason": "POSIX child descriptor passing is required",
+        "tests": _POSIX_PASS_FDS_TESTS,
+    },
     "native_dirfd": {
         "supported": _native_dirfd_supported(),
         "reason": "native descriptor-relative filesystem operations are unavailable",
@@ -195,6 +228,7 @@ requires_sigterm_handler = _requires("sigterm_handler")
 requires_sigint_handler = _requires("sigint_handler")
 requires_posix_pty = _requires("posix_pty")
 requires_posix_fifo = _requires("posix_fifo")
+requires_posix_pass_fds = _requires("posix_pass_fds")
 requires_native_dirfd = _requires("native_dirfd")
 requires_linux_pidfd = _requires("linux_pidfd")
 requires_linux_stdlib_pidfd = _requires("linux_stdlib_pidfd")
@@ -208,6 +242,7 @@ def assert_platform_skip_inventory():
         "requires_sigint_handler": "sigint_handler",
         "requires_posix_pty": "posix_pty",
         "requires_posix_fifo": "posix_fifo",
+        "requires_posix_pass_fds": "posix_pass_fds",
         "requires_native_dirfd": "native_dirfd",
         "requires_linux_pidfd": "linux_pidfd",
         "requires_linux_stdlib_pidfd": "linux_stdlib_pidfd",
