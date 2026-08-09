@@ -9123,6 +9123,8 @@ int main(int argc, char **argv){
     g_degrade_zero = getenv("DEGRADE_ZERO")?atoi(getenv("DEGRADE_ZERO")):0;
     g_degrade_tau  = getenv("DEGRADE_TAU") ?atof(getenv("DEGRADE_TAU")) :0.03f;
     if(g_degrade_tau<=0.f||g_degrade_tau>1.f) g_degrade_tau=0.03f; /* clamp to sane range */
+    if(g_degrade_zero)
+        fprintf(stderr,"[DEGRADE] zero-fill ON, tau=%.3f (approximate mode: miss slots with per-position gate weight < tau are never loaded)\n",g_degrade_tau);
     g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
 #ifdef _WIN32

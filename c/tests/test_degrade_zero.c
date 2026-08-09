@@ -31,6 +31,8 @@
  *   P7  PREFILL-GUARD    — with S>4 (prefill batch) the block is a no-op; nothing
  *       is dropped even if g_degrade_zero=1 and all experts are below tau.
  *   P8  COUNTER          — g_degrade_dropped accumulates correctly across calls.
+ *   P9  BIT-IDENTICAL    — with flag off, idxs[], ws[], keff[], and uniq[] are
+ *       byte-identical to the input even when sub-tau experts are present.
  */
 
 #include <stdio.h>
@@ -331,6 +333,34 @@ static void test_counter_accumulates(void) {
     CHECK(g_degrade_dropped == 3, "counter=3 after second call (cumulative)");
 }
 
+/* P9: bit-identical when off — idxs[], ws[], keff[], and uniq[] are all
+ *     unchanged when g_degrade_zero=0, including sub-tau experts that would
+ *     be dropped if the flag were on. */
+static void test_bit_identical_when_off(void) {
+    printf("\nP9: bit-identical when off\n");
+    /* S=1, K=3: experts with a mix of weights, some below tau */
+    int idxs[3]  = {10, 20, 30};
+    float ws[3]  = {0.7f, 0.02f, 0.01f};
+    int keff[1]  = {3};
+    int uniq[3]  = {10, 20, 30}; int nu = 3;
+
+    /* take copies to compare against after the call */
+    int   idxs_ref[3]; memcpy(idxs_ref, idxs, sizeof(idxs));
+    float ws_ref[3];   memcpy(ws_ref,   ws,   sizeof(ws));
+    int   keff_ref     = keff[0];
+
+    g_degrade_zero = 0; g_degrade_tau = 0.03f; g_degrade_dropped = 0;
+    nu = degrade_zero_apply(idxs, ws, keff, uniq, nu, 1, 3);
+
+    CHECK(nu == 3,                             "nu unchanged");
+    CHECK(keff[0] == keff_ref,                 "keff unchanged");
+    CHECK(idxs[0]==idxs_ref[0] && idxs[1]==idxs_ref[1] && idxs[2]==idxs_ref[2],
+          "idxs[] byte-identical");
+    CHECK(ws[0]==ws_ref[0] && ws[1]==ws_ref[1] && ws[2]==ws_ref[2],
+          "ws[] byte-identical");
+    CHECK(g_degrade_dropped == 0,              "counter unchanged");
+}
+
 /* ---- main ----------------------------------------------------------------- */
 int main(void) {
     printf("test_degrade_zero: DEGRADE_ZERO miss-slot zero-fill logic\n");
@@ -342,6 +372,7 @@ int main(void) {
     test_rescue_rule();
     test_prefill_guard();
     test_counter_accumulates();
+    test_bit_identical_when_off();
     printf("\n");
     if (g_fails) {
         printf("test_degrade_zero: %d FAILED\n", g_fails);
