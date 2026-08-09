@@ -317,3 +317,25 @@ def _human_status(report):
                 print("    %s: %s" % (name, value))
     if recovery.get("action"):
         print("    action: %s" % recovery["action"])
+
+
+def _human_benchmark_summary(result):
+    """Render only the operator-facing causal result and evidence location."""
+    print(
+        "Causal benchmark: %s / %s"
+        % (result.get("status"), result.get("claim"))
+    )
+    protocol_id = result.get("protocol_id")
+    if protocol_id:
+        print("  protocol: %s" % protocol_id)
+    print(
+        "  %d replicate attempt(s); %d successful"
+        % (
+            int(result.get("attempted_replicates", 0)),
+            int(result.get("successful_replicates", 0)),
+        )
+    )
+    if result.get("raw_evidence_path"):
+        print("  append-only evidence: %s" % result["raw_evidence_path"])
+    for reason in result.get("reasons") or []:
+        print("  neutral: %s" % reason)

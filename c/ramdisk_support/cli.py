@@ -197,6 +197,44 @@ def configure_parser(parser, common_parent=None):
     )
     destroy_parser.add_argument("--yes", action="store_true")
     destroy_parser.add_argument("--json", action="store_true")
+    benchmark_parser = actions.add_parser(
+        "benchmark",
+        parents=[after],
+        help="run the fixed causal RAMMAP evidence protocol",
+    )
+    benchmark_parser.add_argument(
+        "--evidence-profile",
+        default=None,
+        help="frozen usage profile shared by every treatment",
+    )
+    benchmark_parser.add_argument(
+        "--residency-gb",
+        type=float,
+        default=None,
+        help="numeric CPU residency budget; auto/all are forbidden",
+    )
+    benchmark_parser.add_argument("--cuda-host-gb", type=float, default=None)
+    benchmark_parser.add_argument("--cuda-expert-gb", type=float, default=None)
+    benchmark_parser.add_argument(
+        "--replicates",
+        type=int,
+        default=7,
+        help="fresh processes per treatment (minimum 7)",
+    )
+    benchmark_parser.add_argument("--seed", type=int, default=377)
+    benchmark_parser.add_argument(
+        "--practical-threshold",
+        type=float,
+        default=0.05,
+        help="predeclared minimum relative throughput improvement",
+    )
+    benchmark_parser.add_argument("--confidence", type=float, default=0.95)
+    benchmark_parser.add_argument(
+        "--raw-evidence",
+        default=None,
+        help="append-only JSONL destination outside volatile storage",
+    )
+    benchmark_parser.add_argument("--json", action="store_true")
 
 
 def _json_print(value):
@@ -335,11 +373,13 @@ def dispatch(
     status,
     verify,
     destroy,
+    benchmark,
     plan_token,
     deployment_token,
     validate_token,
     human_plan,
     human_status,
+    human_benchmark,
     json_print=None,
     termination_guard=None,
 ):
@@ -427,6 +467,19 @@ def dispatch(
                 emit_json(_destroy_projection(value))
             else:
                 print("RAM-disk destroyed; durable state preserved")
+            return _cli_exit_after_signal(termination, 0)
+        if action == "benchmark":
+            with guard(True) as termination:
+                value = benchmark(
+                    args,
+                    cli_path=cli_path,
+                    engine_path=engine_path,
+                    cancel_event=termination["cancel_event"],
+                )
+            if getattr(args, "json", False):
+                emit_json(value)
+            else:
+                human_benchmark(value)
             return _cli_exit_after_signal(termination, 0)
         raise RamdiskError("choose a ramdisk action; run with --help")
     except (RamdiskError, OSError, subprocess.SubprocessError) as exc:

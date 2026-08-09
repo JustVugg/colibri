@@ -35,7 +35,7 @@ class HeadlessParserTest(unittest.TestCase):
         )
         self.assertEqual(
             set(actions.choices),
-            {"plan", "stage", "prepare", "verify", "status", "destroy"},
+            {"plan", "stage", "prepare", "verify", "status", "destroy", "benchmark"},
         )
         for name in ("stage", "prepare"):
             parsed = self.parser.parse_args(
@@ -52,8 +52,36 @@ class HeadlessParserTest(unittest.TestCase):
         self.assertIsNone(stage.plan_token)
         self.assertIsNone(destroy.deployment_token)
 
-    def test_runner_actions_are_not_parseable(self):
-        for name in ("benchmark", "start", "stop"):
+    def test_benchmark_parser_freezes_causal_protocol_inputs(self):
+        parsed = self.parser.parse_args(
+            [
+                "benchmark",
+                "--evidence-profile", "/profiles/frozen.coli_usage",
+                "--residency-gb", "64",
+                "--cuda-host-gb", "32",
+                "--cuda-expert-gb", "48",
+                "--replicates", "9",
+                "--seed", "820",
+                "--practical-threshold", "0.075",
+                "--confidence", "0.9",
+                "--raw-evidence", "/evidence/raw.v1.jsonl",
+                "--json",
+            ]
+        )
+        self.assertEqual(parsed.ramdisk_action, "benchmark")
+        self.assertEqual(parsed.evidence_profile, "/profiles/frozen.coli_usage")
+        self.assertEqual(parsed.residency_gb, 64.0)
+        self.assertEqual(parsed.cuda_host_gb, 32.0)
+        self.assertEqual(parsed.cuda_expert_gb, 48.0)
+        self.assertEqual(parsed.replicates, 9)
+        self.assertEqual(parsed.seed, 820)
+        self.assertEqual(parsed.practical_threshold, 0.075)
+        self.assertEqual(parsed.confidence, 0.9)
+        self.assertEqual(parsed.raw_evidence, "/evidence/raw.v1.jsonl")
+        self.assertTrue(parsed.json)
+
+    def test_managed_runner_actions_are_not_parseable(self):
+        for name in ("start", "stop"):
             with self.subTest(name=name), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.parser.parse_args([name])
 
@@ -256,6 +284,22 @@ class HeadlessJsonDispatchTest(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(payload["schema"], "colibri.ramdisk.destroy.v1")
         self.assertTrue(payload["destroyed"])
+
+    def test_benchmark_json_is_machine_only_and_cooperatively_cancelable(self):
+        result = {
+            "schema": "colibri.ramdisk.causal-benchmark.v1",
+            "version": 1,
+            "protocol_id": "a" * 64,
+            "status": "incomplete",
+            "claim": "neutral",
+        }
+        args = argparse.Namespace(ramdisk_action="benchmark", json=True)
+        with mock.patch.object(ramdisk, "benchmark", return_value=result) as run:
+            code, payload, stderr = self._run(args)
+
+        self.assertEqual((code, payload, stderr), (0, result, ""))
+        run.assert_called_once()
+        self.assertIsNotNone(run.call_args.kwargs["cancel_event"])
 
 
 if __name__ == "__main__":

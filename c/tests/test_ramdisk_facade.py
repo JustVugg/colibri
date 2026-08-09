@@ -29,6 +29,7 @@ PUBLIC_SIGNATURES = {
     "destroy": "(args, expected_manifest_token=None)",
     "status": "(deep=True)",
     "verify": "()",
+    "benchmark": "(args, cli_path=None, engine_path=None, cancel_event=None)",
     "dispatch": "(args, cli_path=None, engine_path=None, system=None)",
 }
 
@@ -42,12 +43,12 @@ class RamdiskFacadeContractTest(unittest.TestCase):
                 self.assertIn(name, ramdisk.__all__)
                 self.assertEqual(str(inspect.signature(exported)), expected_signature)
 
-        for name in (
-            "benchmark",
-            "launch_tui",
-            "BENCHMARK_SCHEMA",
-            "BENCHMARK_PROMPT",
-        ):
+        self.assertEqual(
+            ramdisk.BENCHMARK_SCHEMA,
+            "colibri.ramdisk.causal-benchmark.v1",
+        )
+        self.assertTrue(ramdisk.BENCHMARK_PROMPT)
+        for name in ("launch_tui",):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(ramdisk, name))
                 self.assertNotIn(name, ramdisk.__all__)
@@ -70,7 +71,6 @@ blocked = {
     "ramdisk_ui",
     "ramdisk_textual",
     "ramdisk_support.curses_ui",
-    "ramdisk_support.benchmark",
     "ramdisk_support.runtime_monitor",
     "ramdisk_support.supervision",
 }
@@ -87,6 +87,7 @@ import ramdisk
 
 assert callable(ramdisk.build_plan)
 assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
+assert "ramdisk_support.benchmark" not in sys.modules
 assert not any(name == "textual" or name.startswith("textual.") for name in sys.modules)
 """
         result = subprocess.run(
@@ -106,6 +107,7 @@ import sys
 blocked = {
     "ramdisk_support.presentation",
     "ramdisk_support.processes",
+    "ramdisk_support.benchmark",
     "ssl",
     "urllib.request",
 }
@@ -132,20 +134,15 @@ assert not (blocked & set(sys.modules)), sorted(blocked & set(sys.modules))
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_star_import_contains_headless_lifecycle_and_no_runner_api(self):
+    def test_star_import_contains_headless_lifecycle_and_benchmark_only(self):
         namespace = {}
         exec("from ramdisk import *", namespace)
 
         for name in PUBLIC_SIGNATURES:
             self.assertIn(name, namespace)
-        for name in (
-            "benchmark",
-            "launch_tui",
-            "BENCHMARK_SCHEMA",
-            "BENCHMARK_PROMPT",
-            "start",
-            "stop",
-        ):
+        for name in ("benchmark", "BENCHMARK_SCHEMA", "BENCHMARK_PROMPT"):
+            self.assertIn(name, namespace)
+        for name in ("launch_tui", "start", "stop"):
             self.assertNotIn(name, namespace)
 
     def test_historical_urllib_patch_seam_remains_lazy_and_forwarded(self):

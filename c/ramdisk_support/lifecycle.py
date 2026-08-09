@@ -2628,8 +2628,14 @@ def stop(
     terminate_verified_group,
     merge_usage,
     bind_usage_transaction,
+    recover_benchmark_workspace=None,
 ):
     manifest = load_manifest(required=True)
+    if (
+        manifest.get("benchmark_workspace") is not None
+        and recover_benchmark_workspace is not None
+    ):
+        recover_benchmark_workspace(manifest)
     pending_preflights, pending_refusals = _preflight_pending_launches(
         manifest,
         discover_managed_launches=discover_managed_launches,
@@ -3064,6 +3070,7 @@ def destroy(
     umount_path,
     durable_unlink,
     manifest_path,
+    recover_benchmark_workspace=None,
 ):
     manifest = load_manifest(required=True)
     if (
@@ -3079,6 +3086,11 @@ def destroy(
         "Stop engines and unmount all volatile RAM-disk weights?",
         bool(getattr(args, "yes", False)),
     )
+    if (
+        manifest.get("benchmark_workspace") is not None
+        and recover_benchmark_workspace is not None
+    ):
+        recover_benchmark_workspace(manifest)
     if (
         manifest.get("processes")
         or _retained_process_recovery(manifest)

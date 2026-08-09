@@ -118,6 +118,27 @@ class PresentationModuleTest(unittest.TestCase):
         self.assertIn("retained mount: /mnt/colibri-ram/shared", rendered)
         self.assertNotIn(secret, rendered)
 
+    def test_human_benchmark_summary_is_headless_and_sanitized(self):
+        output = io.StringIO()
+        result = {
+            "protocol_id": "abcdef0123456789" * 4,
+            "status": "incomplete",
+            "claim": "neutral",
+            "attempted_replicates": 49,
+            "raw_evidence_path": "/var/lib/colibri/raw.v1.jsonl",
+            "reasons": ["DRAM counters unavailable"],
+            "secret": "must-not-render",
+        }
+        with contextlib.redirect_stdout(output):
+            presentation._human_benchmark_summary(result)
+
+        rendered = output.getvalue()
+        self.assertIn("Causal benchmark: incomplete / neutral", rendered)
+        self.assertIn("49 replicate", rendered)
+        self.assertIn("raw.v1.jsonl", rendered)
+        self.assertIn("DRAM counters unavailable", rendered)
+        self.assertNotIn(result["secret"], rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

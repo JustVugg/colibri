@@ -17,6 +17,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -227,6 +228,32 @@ def _processes_module():
     return importlib.import_module("ramdisk_support.processes")
 
 
+def _benchmark_module():
+    return importlib.import_module("ramdisk_support.benchmark")
+
+
+def _benchmark_workspace_manager():
+    """Build the durable PR3 scratch-workspace owner from facade seams."""
+    return _benchmark_module().DurableWorkspaceManager(
+        load_manifest=_load_manifest,
+        save_manifest=_save_manifest,
+        state_root=_state_root,
+        ensure_private_dir=_ensure_private_dir,
+        assert_durable_state_dir=_assert_durable_state_dir,
+        mount_at=_mount_at,
+        mount_table=_mount_table,
+        path_is_below=_path_is_below,
+        busy_mount_references=_busy_mount_references,
+        mount_tmpfs=_mount_tmpfs,
+        validate_mount=_validate_mount,
+        populate_mount=_populate_mount,
+        validate_namespace=_validate_namespace,
+        source_still_matches=_source_still_matches,
+        umount_path=_umount_path,
+        available_for_mount=_available_for_mount,
+    )
+
+
 _LAZY_ATTRIBUTES = {
     "urllib": (_urllib_module, None),
     "_managed_children": (_processes_module, "_managed_children"),
@@ -237,6 +264,19 @@ _LAZY_ATTRIBUTES = {
     "_runtime_admission_requirement": (
         _processes_module,
         "_runtime_admission_requirement",
+    ),
+    "BENCHMARK_SCHEMA": (_benchmark_module, "BENCHMARK_SCHEMA"),
+    "BENCHMARK_PROMPT": (_benchmark_module, "BENCHMARK_PROMPT"),
+    "_benchmark_environment": (_benchmark_module, "_benchmark_environment"),
+    "_benchmark_generate": (_benchmark_module, "_benchmark_generate"),
+    "_cancellable_engine_type": (
+        _benchmark_module,
+        "_cancellable_engine_type",
+    ),
+    "_parse_profiler": (_benchmark_module, "_parse_profiler"),
+    "_source_build_identity": (
+        _benchmark_module,
+        "_source_build_identity",
     ),
 }
 
@@ -975,6 +1015,9 @@ def stop(args=None):
         terminate_verified_group=_terminate_verified_group,
         merge_usage=_merge_usage,
         bind_usage_transaction=_bind_usage_transaction,
+        recover_benchmark_workspace=(
+            _benchmark_workspace_manager().recover
+        ),
     )
 
 
@@ -1018,6 +1061,9 @@ def _destroy_locked(args, expected_manifest_token=None):
         umount_path=_umount_path,
         durable_unlink=_durable_unlink,
         manifest_path=_manifest_path,
+        recover_benchmark_workspace=(
+            _benchmark_workspace_manager().recover
+        ),
     )
 
 
@@ -1179,6 +1225,35 @@ def _manifest_confirmation_token(manifest):
     )
 
 
+@_exclusive_lifecycle(require_process_control=True)
+def benchmark(args, cli_path=None, engine_path=None, cancel_event=None):
+    """Run the append-only causal benchmark without tuning manifest state."""
+    module = _benchmark_module()
+    return module.run_benchmark(
+        args,
+        cli_path=cli_path or os.path.join(os.path.dirname(__file__), "coli"),
+        engine_path=engine_path,
+        cancel_event=cancel_event,
+        load_manifest=_load_manifest,
+        assert_effective_masks_unchanged=_assert_effective_masks_unchanged,
+        assert_ready_mounts=_assert_ready_mounts,
+        resolve_engine_path=_resolve_engine_path,
+        source_build_identity=lambda: module._source_build_identity(
+            __file__,
+            environ=os.environ,
+            which=shutil.which,
+            run=_run,
+        ),
+        fingerprint_file=lambda path: "sha256:" + _sha256_file(path),
+        state_root=_state_root,
+        ensure_private_dir=_ensure_private_dir,
+        assert_durable_state_dir=_assert_durable_state_dir,
+        admit_runtime=_admit_runtime,
+        fresh_user_binary=_fresh_user_binary,
+        workspace_manager=_benchmark_workspace_manager(),
+    )
+
+
 def dispatch(args, cli_path=None, engine_path=None, system=None):
     return _cli_dispatch(
         args,
@@ -1190,11 +1265,13 @@ def dispatch(args, cli_path=None, engine_path=None, system=None):
         status=status,
         verify=verify,
         destroy=destroy,
+        benchmark=benchmark,
         plan_token=_plan_confirmation_token,
         deployment_token=_manifest_confirmation_token,
         validate_token=_validate_token,
         human_plan=_human_plan,
         human_status=_human_status,
+        human_benchmark=_presentation_module()._human_benchmark_summary,
         json_print=_json_print,
         termination_guard=_cli_termination_guard,
     )

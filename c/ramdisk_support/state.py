@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import posixpath
@@ -15,6 +16,7 @@ import threading
 from .common import (
     DEFAULT_MOUNT_ROOT,
     MANIFEST_VERSION,
+    MIB,
     PROFILE_LINE_RE,
     USAGE_MERGE_RE,
     RamdiskError,
@@ -73,6 +75,679 @@ def _valid_utc_timestamp(value):
         and parsed.utcoffset() == datetime.timedelta(0)
     )
 
+
+def _benchmark_workspace_source_fingerprint(plan):
+    selected = set((plan.get("staging") or {}).get("selected_shards") or [])
+    shards = []
+    for item in plan.get("source_shards") or []:
+        if isinstance(item, dict) and item.get("name") in selected:
+            shards.append(
+                {
+                    "name": item.get("name"),
+                    "size_bytes": item.get("size_bytes"),
+                    "header_sha256": item.get("header_sha256"),
+                }
+            )
+    projection = {
+        "model_fingerprint": (plan.get("model") or {}).get("fingerprint"),
+        "selected_shards": sorted(selected),
+        "selected_source_identities": sorted(
+            shards,
+            key=lambda item: item["name"],
+        ),
+        "linked_shards": sorted(
+            (plan.get("staging") or {}).get("linked_shards") or []
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_benchmark_workspace_v2(workspace, *, manifest, state_root):
+    """Validate borrowed-deployment plus one-scratch recovery authority."""
+    allowed_workspace = {
+        "version",
+        "operation_id",
+        "protocol_id",
+        "phase",
+        "operation_path",
+        "source_fingerprint",
+        "size_bytes",
+        "created_at",
+        "roots",
+    }
+    deployment_id = manifest.get("deployment_id")
+    plan = manifest.get("plan") or {}
+    staged_bytes = (plan.get("staging") or {}).get("staged_bytes")
+    expected_size = (
+        max(staged_bytes + max(64 * MIB, staged_bytes // 100), 64 * MIB)
+        if _positive_int(staged_bytes)
+        else None
+    )
+    operation_id = workspace.get("operation_id")
+    protocol_id = workspace.get("protocol_id")
+    if (
+        set(workspace) != allowed_workspace
+        or workspace.get("version") != 2
+        or workspace.get("phase")
+        not in ("pending", "mounted", "staged", "cleanup")
+        or not isinstance(deployment_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None
+        or not isinstance(operation_id, str)
+        or re.fullmatch(r"benchmark:[0-9a-f]{32}", operation_id) is None
+        or not isinstance(protocol_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", protocol_id) is None
+        or not isinstance(workspace.get("source_fingerprint"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", workspace["source_fingerprint"]
+        ) is None
+        or workspace.get("source_fingerprint")
+        != _benchmark_workspace_source_fingerprint(plan)
+        or workspace.get("size_bytes") != expected_size
+        or not _valid_utc_timestamp(workspace.get("created_at"))
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace")
+    operation_path = os.path.join(
+        state_root(),
+        "benchmark-workspaces",
+        deployment_id,
+        operation_id.split(":", 1)[1],
+    )
+    if (
+        workspace.get("operation_path") != operation_path
+        or not os.path.isabs(operation_path)
+        or os.path.normpath(operation_path) != operation_path
+        or not _path_without_symlinks(operation_path)
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace path")
+    roots_list = workspace.get("roots")
+    if not isinstance(roots_list, list) or len(roots_list) != 2:
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace roots")
+    roots = {
+        root.get("name"): root
+        for root in roots_list
+        if isinstance(root, dict)
+    }
+    if set(roots) != {"interleaved", "local"}:
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace roots")
+    deployment_name = (
+        "interleaved" if plan.get("topology") == "interleaved" else "local"
+        if plan.get("topology") == "per-node" else None
+    )
+    if deployment_name is None:
+        raise RamdiskError("RAM-disk manifest has invalid benchmark topology")
+    expected_specs = {
+        "interleaved": ("interleave", [0, 1], None, "interleave=static:0-1"),
+        "local": ("local", [0], 0, "bind=static:0"),
+    }
+    identity_keys = {
+        "mount_id",
+        "parent_id",
+        "device",
+        "root",
+        "path",
+        "options",
+        "optional",
+        "filesystem",
+        "source",
+        "super_options",
+    }
+    identities = []
+    for name in ("interleaved", "local"):
+        root = roots[name]
+        role = "deployment" if name == deployment_name else "scratch"
+        mode, nodes, node, policy = expected_specs[name]
+        common_keys = {
+            "name",
+            "role",
+            "operation_id",
+            "path",
+            "path_preexisting",
+            "mode",
+            "nodes",
+            "node",
+            "policy",
+            "size_bytes",
+            "source_fingerprint",
+            "requested",
+            "ownership",
+            "stage_phase",
+            "effective_thp",
+            "effective_noswap",
+            "identity",
+            "numa_allocation",
+            "staged_at",
+        }
+        scratch_only = {
+            "helper_started_at",
+            "helper_completed_at",
+            "cleanup_authorized_at",
+            "unmounted_at",
+            "removed_at",
+        }
+        if (
+            not set(root).issubset(common_keys | (scratch_only if role == "scratch" else set()))
+            or root.get("name") != name
+            or root.get("role") != role
+            or root.get("mode") != mode
+            or root.get("nodes") != nodes
+            or root.get("node") != node
+            or root.get("policy") != policy
+            or root.get("size_bytes") != expected_size
+            or root.get("source_fingerprint") != workspace["source_fingerprint"]
+        ):
+            raise RamdiskError("RAM-disk manifest has invalid benchmark workspace root")
+        requested = root.get("requested")
+        base_requested = {
+            "filesystem": "tmpfs",
+            "source": "tmpfs",
+            "size_bytes": expected_size,
+            "thp": (plan.get("mount_options") or {}).get("thp"),
+            "noswap": bool((plan.get("mount_options") or {}).get("noswap")),
+            "safety_options": [
+                "noatime", "nodev", "nosuid", "noexec", "mode=0700"
+            ],
+            "policy": policy,
+        }
+        expected_requested = dict(base_requested)
+        for key in ("effective_thp", "effective_noswap"):
+            if key in root:
+                expected_requested[key] = root[key]
+        if requested != expected_requested:
+            raise RamdiskError("RAM-disk manifest has invalid benchmark mount policy")
+        identity = root.get("identity")
+        exact_identity = (
+            isinstance(identity, dict)
+            and set(identity) in (identity_keys, identity_keys | {"all_options"})
+            and _positive_int(identity.get("mount_id"))
+            and _positive_int(identity.get("parent_id"))
+            and isinstance(identity.get("device"), str)
+            and re.fullmatch(r"[0-9]+:[0-9]+", identity["device"]) is not None
+            and identity.get("root") == "/"
+            and identity.get("path") == root.get("path")
+            and identity.get("filesystem") == "tmpfs"
+            and identity.get("source") == "tmpfs"
+            and all(
+                isinstance(identity.get(key), list)
+                for key in ("options", "optional", "super_options")
+            )
+            and (
+                "all_options" not in identity
+                or isinstance(identity.get("all_options"), list)
+            )
+        )
+        if role == "deployment":
+            mount = next(
+                (
+                    item for item in manifest.get("mounts", [])
+                    if isinstance(item, dict) and item.get("path") == root.get("path")
+                ),
+                None,
+            )
+            planned = next(
+                (
+                    item for item in plan.get("mounts", [])
+                    if isinstance(item, dict) and item.get("path") == root.get("path")
+                ),
+                None,
+            )
+            if (
+                mount is None
+                or planned is None
+                or mount.get("ownership", "managed") != "managed"
+                or mount.get("identity") != identity
+                or root.get("operation_id") != mount.get("operation_id")
+                or not isinstance(root.get("operation_id"), str)
+                or re.fullmatch(
+                    re.escape(deployment_id) + r":mount:[0-9]+",
+                    root["operation_id"],
+                ) is None
+                or root.get("path_preexisting") is not True
+                or root.get("ownership") != "managed"
+                or root.get("stage_phase") != "staged"
+                or not exact_identity
+                or not isinstance(root.get("numa_allocation"), dict)
+                or not _valid_utc_timestamp(root.get("staged_at"))
+                or planned.get("node") != node
+                or planned.get("policy") != policy
+                or planned.get("size_bytes") != expected_size
+            ):
+                raise RamdiskError(
+                    "RAM-disk manifest has invalid borrowed deployment root"
+                )
+        else:
+            path = os.path.join(operation_path, name)
+            ownership = root.get("ownership")
+            stage_phase = root.get("stage_phase")
+            if (
+                root.get("operation_id") != operation_id
+                or root.get("path") != path
+                or not _path_without_symlinks(path)
+                or root.get("path_preexisting") is not False
+                or ownership not in ("pending", "identified", "managed")
+                or stage_phase not in ("not-started", "pending", "staged")
+                or (ownership == "pending" and identity is not None)
+                or (ownership != "pending" and not exact_identity)
+                or (stage_phase in ("pending", "staged") and ownership != "managed")
+                or (
+                    stage_phase == "staged"
+                    and (
+                        not isinstance(root.get("numa_allocation"), dict)
+                        or not _valid_utc_timestamp(root.get("staged_at"))
+                    )
+                )
+                or (
+                    stage_phase != "staged"
+                    and (
+                        root.get("numa_allocation") is not None
+                        or root.get("staged_at") is not None
+                    )
+                )
+            ):
+                raise RamdiskError("RAM-disk manifest has invalid scratch transition")
+            if ownership != "pending" and (
+                not _valid_utc_timestamp(root.get("helper_started_at"))
+                or not _valid_utc_timestamp(root.get("helper_completed_at"))
+                or not isinstance(root.get("effective_thp"), str)
+                or not isinstance(root.get("effective_noswap"), bool)
+            ):
+                raise RamdiskError("RAM-disk manifest has invalid scratch helper state")
+            if root.get("helper_completed_at") and not root.get("helper_started_at"):
+                raise RamdiskError("RAM-disk manifest has invalid scratch helper state")
+            for timestamp in (
+                "helper_started_at", "helper_completed_at", "staged_at",
+                "cleanup_authorized_at", "unmounted_at", "removed_at",
+            ):
+                if root.get(timestamp) is not None and not _valid_utc_timestamp(
+                    root[timestamp]
+                ):
+                    raise RamdiskError("RAM-disk manifest has invalid scratch timestamp")
+            if (
+                root.get("unmounted_at") and not root.get("cleanup_authorized_at")
+            ) or (
+                root.get("removed_at") and not root.get("unmounted_at")
+            ) or (
+                any(root.get(key) for key in (
+                    "cleanup_authorized_at", "unmounted_at", "removed_at"
+                )) and workspace["phase"] != "cleanup"
+            ):
+                raise RamdiskError("RAM-disk manifest has invalid scratch cleanup state")
+            ordered = [workspace["created_at"]] + [
+                root[key]
+                for key in (
+                    "helper_started_at", "helper_completed_at", "staged_at",
+                    "cleanup_authorized_at", "unmounted_at", "removed_at",
+                )
+                if root.get(key) is not None
+            ]
+            parsed = [
+                datetime.datetime.fromisoformat(
+                    value[:-1] + "+00:00" if value.endswith("Z") else value
+                )
+                for value in ordered
+            ]
+            if parsed != sorted(parsed):
+                raise RamdiskError("RAM-disk manifest has invalid scratch transition order")
+        if exact_identity:
+            identities.append(identity)
+    if len(identities) == 2 and (
+        identities[0]["mount_id"] == identities[1]["mount_id"]
+        or identities[0]["device"] == identities[1]["device"]
+    ):
+        raise RamdiskError("RAM-disk benchmark roots are not physically distinct")
+    scratch = roots["local" if deployment_name == "interleaved" else "interleaved"]
+    if workspace["phase"] == "pending" and scratch.get("stage_phase") != "not-started":
+        raise RamdiskError("RAM-disk manifest has invalid benchmark pending phase")
+    if workspace["phase"] in ("mounted", "staged") and scratch.get("ownership") != "managed":
+        raise RamdiskError("RAM-disk manifest has invalid benchmark mount phase")
+    if workspace["phase"] == "staged" and scratch.get("stage_phase") != "staged":
+        raise RamdiskError("RAM-disk manifest has invalid benchmark staging phase")
+    return None
+
+
+def _validate_benchmark_workspace_v1_unshipped(
+    workspace, *, manifest, state_root
+):
+    """Historical validator for the unshipped two-scratch draft."""
+    if not isinstance(workspace, dict):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace")
+    allowed_workspace = {
+        "version",
+        "operation_id",
+        "protocol_id",
+        "phase",
+        "operation_path",
+        "source_fingerprint",
+        "size_bytes",
+        "created_at",
+        "roots",
+    }
+    deployment_id = manifest.get("deployment_id")
+    if not isinstance(deployment_id, str) or re.fullmatch(
+        r"[0-9a-f]{32}", deployment_id
+    ) is None:
+        raise RamdiskError(
+            "RAM-disk benchmark workspace requires a deployment identity"
+        )
+    plan = manifest.get("plan") or {}
+    staged_bytes = (plan.get("staging") or {}).get("staged_bytes")
+    expected_size = (
+        max(staged_bytes + max(64 * MIB, staged_bytes // 100), 64 * MIB)
+        if _positive_int(staged_bytes)
+        else None
+    )
+    if (
+        set(workspace) != allowed_workspace
+        or not isinstance(workspace.get("version"), int)
+        or isinstance(workspace.get("version"), bool)
+        or workspace.get("version") != 1
+        or workspace.get("phase")
+        not in ("pending", "mounted", "staged", "cleanup")
+        or not re.fullmatch(
+            r"benchmark:[0-9a-f]{32}",
+            str(workspace.get("operation_id", "")),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(workspace.get("protocol_id", "")),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(workspace.get("source_fingerprint", "")),
+        )
+        or workspace.get("size_bytes") != expected_size
+        or not _valid_utc_timestamp(workspace.get("created_at"))
+        or workspace.get("source_fingerprint")
+        != _benchmark_workspace_source_fingerprint(plan)
+    ):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace")
+    operation_path = workspace.get("operation_path")
+    operation_suffix = workspace["operation_id"].split(":", 1)[1]
+    expected_operation_path = os.path.join(
+        state_root(),
+        "benchmark-workspaces",
+        deployment_id,
+        operation_suffix,
+    )
+    if (
+        not isinstance(operation_path, str)
+        or not os.path.isabs(operation_path)
+        or os.path.normpath(operation_path) != operation_path
+        or operation_path != expected_operation_path
+        or not _path_without_symlinks(operation_path)
+    ):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid benchmark workspace path"
+        )
+    roots = workspace.get("roots")
+    if not isinstance(roots, list) or len(roots) != 2:
+        raise RamdiskError(
+            "RAM-disk manifest has invalid benchmark workspace roots"
+        )
+    expected = {
+        "interleaved": ("interleave", [0, 1], "interleave=static:0-1"),
+        "local": ("local", [0], "bind=static:0"),
+    }
+    seen_paths = set()
+    for root in roots:
+        if not isinstance(root, dict) or root.get("name") not in expected:
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark workspace root"
+            )
+        mode, nodes, policy = expected.pop(root["name"])
+        path = root.get("path")
+        requested = root.get("requested")
+        requested_base_keys = {
+            "filesystem",
+            "source",
+            "size_bytes",
+            "thp",
+            "noswap",
+            "safety_options",
+            "policy",
+        }
+        allowed_root = {
+            "name",
+            "path",
+            "path_preexisting",
+            "mode",
+            "nodes",
+            "node",
+            "policy",
+            "size_bytes",
+            "source_fingerprint",
+            "requested",
+            "ownership",
+            "stage_phase",
+            "helper_started_at",
+            "helper_completed_at",
+            "effective_thp",
+            "effective_noswap",
+            "identity",
+            "numa_allocation",
+            "staged_at",
+            "cleanup_authorized_at",
+            "unmounted_at",
+            "removed_at",
+        }
+        if (
+            not set(root).issubset(allowed_root)
+            or not isinstance(path, str)
+            or not os.path.isabs(path)
+            or os.path.normpath(path) != path
+            or path != os.path.join(operation_path, root["name"])
+            or not _path_without_symlinks(path)
+            or path in seen_paths
+            or root.get("mode") != mode
+            or root.get("nodes") != nodes
+            or root.get("policy") != policy
+            or root.get("size_bytes") != workspace["size_bytes"]
+            or root.get("source_fingerprint")
+            != workspace["source_fingerprint"]
+            or root.get("ownership")
+            not in ("pending", "identified", "managed")
+            or root.get("stage_phase")
+            not in ("not-started", "pending", "staged")
+            or not isinstance(requested, dict)
+            or set(requested)
+            not in (
+                requested_base_keys,
+                requested_base_keys | {"effective_thp", "effective_noswap"},
+            )
+            or requested.get("filesystem") != "tmpfs"
+            or requested.get("source") != "tmpfs"
+            or requested.get("size_bytes") != workspace["size_bytes"]
+            or requested.get("policy") != policy
+            or not isinstance(requested.get("thp"), str)
+            or not isinstance(requested.get("noswap"), bool)
+            or requested.get("safety_options")
+            != ["noatime", "nodev", "nosuid", "noexec", "mode=0700"]
+            or root.get("path_preexisting") is not False
+            or root.get("node") != (None if root["name"] == "interleaved" else 0)
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark workspace root"
+            )
+        seen_paths.add(path)
+        identity = root.get("identity")
+        identity_base_keys = {
+            "mount_id",
+            "parent_id",
+            "device",
+            "root",
+            "path",
+            "options",
+            "optional",
+            "filesystem",
+            "source",
+            "super_options",
+        }
+        exact_identity = (
+            isinstance(identity, dict)
+            and set(identity)
+            in (identity_base_keys, identity_base_keys | {"all_options"})
+            and _positive_int(identity.get("mount_id"))
+            and _positive_int(identity.get("parent_id"))
+            and isinstance(identity.get("device"), str)
+            and re.fullmatch(r"[0-9]+:[0-9]+", identity["device"]) is not None
+            and identity.get("root") == "/"
+            and identity.get("filesystem") == "tmpfs"
+            and identity.get("source") == "tmpfs"
+            and identity.get("path") == path
+            and all(
+                isinstance(identity.get(name), list)
+                for name in ("options", "optional", "super_options")
+            )
+            and (
+                "all_options" not in identity
+                or isinstance(identity["all_options"], list)
+            )
+        )
+        if (
+            root["ownership"] == "pending" and identity is not None
+        ) or (
+            root["ownership"] in ("identified", "managed")
+            and not exact_identity
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark mount identity"
+            )
+        if root["stage_phase"] == "staged" and (
+            root["ownership"] != "managed"
+            or not _valid_utc_timestamp(root.get("staged_at"))
+            or not isinstance(root.get("numa_allocation"), dict)
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark staging state"
+            )
+        if root["stage_phase"] in ("pending", "staged") and (
+            root["ownership"] != "managed"
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark staging state"
+            )
+        if root["stage_phase"] != "staged" and (
+            root.get("staged_at") is not None
+            or root.get("numa_allocation") is not None
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark staging state"
+            )
+        if root["ownership"] in ("identified", "managed") and (
+            not root.get("helper_started_at")
+            or not root.get("helper_completed_at")
+            or not isinstance(root.get("effective_thp"), str)
+            or not isinstance(root.get("effective_noswap"), bool)
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark helper state"
+            )
+        if root["ownership"] in ("identified", "managed") and (
+            requested.get("effective_thp") != root.get("effective_thp")
+            or requested.get("effective_noswap")
+            is not root.get("effective_noswap")
+        ):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark effective policy"
+            )
+        for timestamp in (
+            "helper_started_at",
+            "helper_completed_at",
+            "cleanup_authorized_at",
+            "unmounted_at",
+            "removed_at",
+        ):
+            if root.get(timestamp) is not None and not _valid_utc_timestamp(
+                root[timestamp]
+            ):
+                raise RamdiskError(
+                    "RAM-disk manifest has invalid benchmark recovery time"
+                )
+        if root.get("helper_completed_at") and not root.get("helper_started_at"):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark helper state"
+            )
+        if root.get("unmounted_at") and not root.get("cleanup_authorized_at"):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark cleanup state"
+            )
+        if any(
+            root.get(name)
+            for name in (
+                "cleanup_authorized_at",
+                "unmounted_at",
+                "removed_at",
+            )
+        ) and workspace["phase"] != "cleanup":
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark cleanup state"
+            )
+        if root.get("removed_at") and not root.get("unmounted_at"):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark cleanup state"
+            )
+        ordered_times = [workspace["created_at"]] + [
+            root[name]
+            for name in (
+                "helper_started_at",
+                "helper_completed_at",
+                "staged_at",
+                "cleanup_authorized_at",
+                "unmounted_at",
+                "removed_at",
+            )
+            if root.get(name) is not None
+        ]
+        parsed_times = [
+            datetime.datetime.fromisoformat(
+                value[:-1] + "+00:00" if value.endswith("Z") else value
+            )
+            for value in ordered_times
+        ]
+        if parsed_times != sorted(parsed_times):
+            raise RamdiskError(
+                "RAM-disk manifest has invalid benchmark transition order"
+            )
+    if expected:
+        raise RamdiskError(
+            "RAM-disk manifest has incomplete benchmark workspace roots"
+        )
+    if workspace["phase"] in ("mounted", "staged") and any(
+        root.get("ownership") != "managed" for root in roots
+    ):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid benchmark mount phase"
+        )
+    if workspace["phase"] == "pending" and any(
+        root.get("stage_phase") != "not-started" for root in roots
+    ):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid benchmark pending phase"
+        )
+    if workspace["phase"] == "staged" and any(
+        root.get("stage_phase") != "staged" for root in roots
+    ):
+        raise RamdiskError(
+            "RAM-disk manifest has invalid benchmark staging phase"
+        )
+
+def _validate_benchmark_workspace(workspace, *, manifest, state_root):
+    """Validate the shipped borrowed-root workspace recovery authority."""
+    if not isinstance(workspace, dict):
+        raise RamdiskError("RAM-disk manifest has invalid benchmark workspace")
+    if workspace.get("version") != 2:
+        raise RamdiskError("RAM-disk manifest has unsupported benchmark workspace")
+    return _validate_benchmark_workspace_v2(
+        workspace,
+        manifest=manifest,
+        state_root=state_root,
+    )
 
 def _valid_usage_snapshot(value):
     if not isinstance(value, dict):
@@ -925,6 +1600,12 @@ def _load_manifest(
         or not plan["mounts"]
     ):
         raise RamdiskError("RAM-disk manifest has an invalid model identity")
+    if manifest.get("benchmark_workspace") is not None:
+        _validate_benchmark_workspace(
+            manifest["benchmark_workspace"],
+            manifest=manifest,
+            state_root=state_root,
+        )
     _managed_accelerator_contract(plan)
     mount_root, _ = _manifest_mount_layout(plan)
     planned_paths = {record["path"] for record in plan["mounts"]}
