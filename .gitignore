@@ -40,6 +40,10 @@ c/backend_loader.o
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
+c/coli_dsv4_cuda.dll
+c/coli_dsv4_cuda.lib
+c/coli_dsv4_cuda.exp
+c/backend_loader_dsv4.o
 c/coli_hip.dll
 c/coli_hip.lib
 c/coli_hip.exp
@@ -77,6 +81,9 @@ c/bench/
 *.safetensors
 stats*.txt
 *.log
+
+# documenti progettuali interni (tiering DS4) — tenuti nella workdir, non nel repo
+docs/dsv4-cuda-tiering*.md
 
 # script di ricerca stadio-0 (esperimenti locali, non parte del motore)
 /engine.py

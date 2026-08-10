@@ -65,8 +65,7 @@ V4_OBJS = $(TARGET_OBJS)
 # CUDA_ARCH=sm_86 or portable multi-gencode list target other GPUs.
 CUDA ?= 0
 ifeq ($(CUDA),1)
-CUDA_HOME ?= /usr/local/cuda
-NVCC ?= $(CUDA_HOME)/bin/nvcc
+# --- shared CUDA arch selection (Linux + Windows) ---
 CUDA_ARCH ?= native
 ifeq ($(strip $(CUDA_ARCH)),)
 CUDA_ARCH = native
@@ -80,15 +79,43 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
+CFLAGS += -DCOLI_DSV4_CUDA
+
+ifeq ($(IS_WIN),1)
+# --- Windows: CUDA backend is a runtime DLL, loaded by backend_loader_dsv4.c ---
+# MinGW gcc cannot link the nvcc/MSVC COFF object (MSVC-COFF refs
+# __GSHandlerCheck/__security_cookie). The host therefore links the loader and
+# resolves the dsv4_cuda_* symbols from coli_dsv4_cuda.dll at runtime. Host
+# never links cudart. Run `make ... dsv4-cuda-dll` from a vcvars64 shell.
+CUDA_HOME ?= $(subst \,/,$(CUDA_PATH))
+NVCC ?= $(CUDA_HOME)/bin/nvcc.exe
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
+DSV4_CUDA_OBJ = backend_loader_dsv4.o
+V4_OBJS += $(DSV4_CUDA_OBJ)
+
+$(DSV4_CUDA_OBJ): backend_loader_dsv4.c backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
+
+# Build coli_dsv4_cuda.dll (nvcc + MSVC cl.exe as host compiler). Requires the
+# MSVC environment (vcvars64) so cl.exe is on PATH; CUDA bin dir too for nvcc.
+.PHONY: dsv4-cuda-dll
+dsv4-cuda-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h
+	@"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_DSV4_CUDA_BUILDING_DLL \
+		-L"$(CUDA_HOME)/lib/x64" -lcudart -lcublasLt \
+		backend_cuda_dsv4.cu -o coli_dsv4_cuda.dll
+else
+# --- Linux: link the nvcc-compiled object directly ---
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
 NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE)
 DSV4_CUDA_OBJ = backend_cuda_dsv4.o
 V4_OBJS += $(DSV4_CUDA_OBJ)
-CFLAGS += -DCOLI_DSV4_CUDA
 LDFLAGS += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 \
            -lcudart -lcublasLt -lstdc++
 
 $(DSV4_CUDA_OBJ): backend_cuda_dsv4.cu backend_cuda_dsv4.h
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+endif
 endif
 
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs

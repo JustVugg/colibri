@@ -275,6 +275,33 @@ def ngen_for(a, interactive=False):
     if getattr(a, "ngen", None): return a.ngen
     return 16384 if interactive else 1024
 
+def _chat_arch(model_id):
+    m = (model_id or "").lower()
+    if "deepseek" in m: return "deepseek_v4"
+    if "kimi" in m: return "kimi"
+    if "inkling" in m: return "inkling"
+    if "olmoe" in m: return "olmoe"
+    return "glm"
+
+def chat_ngen(a, arch=None, model_id=None):
+    """Interactive chat max_new, capped to the engine context for DeepSeek V4.
+
+    The interactive default is 16384 but DS4's engine CTX defaults to 4096, so a
+    chat request with max_tokens=16384 alone overruns the context and the engine
+    answers CONTEXT_EXCEEDED -> HTTP 400 ``context_length_exceeded`` (so `coli
+    chat`/`coli serve`/`coli run` on the DS4 branch fail on the very first turn
+    with that max). Cap max_new to the effective context (--ctx, else CTX env,
+    else 4096) minus a small margin for the prompt. Non-DS engines are unchanged
+    (GLM interactive keeps 16384). Accepts arch directly or derived from
+    model_id."""
+    n = ngen_for(a, interactive=True)
+    eff = arch if arch else _chat_arch(model_id)
+    if eff != "deepseek_v4":
+        return n
+    ctx = a.ctx if (a.ctx and a.ctx > 0) else int(os.environ.get("CTX") or "4096")
+    cap = max(1, ctx - 256)          # leave headroom for prompt tokens
+    return min(n, cap)
+
 def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
@@ -318,6 +345,20 @@ def env_for_engine(a, arch):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "deepseek_v4":
         if a.ctx: env["CTX"] = str(a.ctx)
+        # --gpu/--vram reach the DS4 CUDA tier uniformly with the other engines
+        # (GLM's env_for()): --gpu -> COLI_GPUS/COLI_GPU (device), --vram ->
+        # CUDA_EXPERT_GB (VRAM expert budget), --gpu none -> COLI_DSV4_CUDA=0
+        # (pure CPU). One flag set works across engines; no DS4-specific env
+        # needed by the user.
+        if a.gpu is not None:
+            env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
+            if a.gpu == "none":
+                env["COLI_DSV4_CUDA"] = "0"
+                env.pop("CUDA_EXPERT_GB", None)
+            elif a.gpu != "auto":
+                env["COLI_GPUS"] = a.gpu
+        if a.vram and a.gpu != "none":
+            env["CUDA_EXPERT_GB"] = str(a.vram)
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
         # the visible decode. V4_DRAFT=5 remains available for repeated code.
@@ -864,7 +905,7 @@ def cmd_run(a):
                 cmd += ["--prompt-file",prompt_path]
             else:
                 cmd.append(prompt)
-            cmd += ["--max-tokens",str(ngen_for(a,interactive=True))]
+            cmd += ["--max-tokens",str(chat_ngen(a, arch="deepseek_v4"))]
             if a.ram: cmd += ["--memory-gb",str(a.ram)]
             if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
             result=subprocess.call(cmd,env=env_for_engine(a,arch))
@@ -937,7 +978,7 @@ def chat_attached(a, base, model_id):
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         msgs.append({"role":"user","content":msg})
         body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
-                         "max_tokens":ngen_for(a,interactive=True)}).encode()
+                         "max_tokens":chat_ngen(a, model_id=model_id)}).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
@@ -1003,7 +1044,214 @@ def kv_resume_notice(model_dir):
               f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
     except (OSError, struct.error): pass
 
+# ---------------------------------------------------------------------------
+# DeepSeek V4 native chat TUI. Talks the engine's serve protocol directly
+# (like the GLM TUI talks to colibri.c), so the console stays clean: no
+# openai_server / engine status leaks, and the full metrics line
+# (tok · tok/s · hit% · RSS · elapsed) comes from the DONE frame (
+# deepseek_v4.c:8709 emits "DONE <id> STAT <completion> <tps> <hit> <rss> ...").
+# ---------------------------------------------------------------------------
+V4_READY = b"\x01\x01READY\x01\x01\n"
+
+def v4_spawn(a, model_id):
+    arch = "deepseek_v4"
+    engine = engine_for(a.model)
+    e = env_for_engine(a, arch)
+    e["SERVE"] = "1"; e["SNAP"] = str(a.model)
+    e["NGEN"] = str(chat_ngen(a, model_id=model_id))
+    if a.ctx: e["CTX"] = str(a.ctx)
+    errlog = tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
+    p = subprocess.Popen([engine, str(a.cap if a.cap is not None else 0)],
+                         env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, bufsize=0)
+    return p, errlog
+
+def v4_wait_ready(p, errlog):
+    """Block until the engine prints the \\x01\\x01READY\\x01\\x01\\n sentinel, then
+    consume the STAT line. Returns the STAT text, or None if the engine died."""
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if p.poll() is not None:
+            return None
+        try:
+            line = p.stdout.readline()
+        except Exception:
+            return None
+        if not line:
+            if p.poll() is not None:
+                return None
+            continue
+        if b"READY" in line:
+            try:
+                return p.stdout.readline().decode("utf-8", "replace").strip()
+            except Exception:
+                return ""
+    return None
+
+def v4_submit(p, req_id, prompt, max_tokens):
+    pb = prompt.encode("utf-8", "replace")
+    # Wire format matches openai_server.generate() exactly: 6 header fields and a
+    # trailing newline after the payload. Omitting the trailing newline (or using
+    # a 7th extension field) makes the engine never respond on Windows.
+    header = ("SUBMIT %s 0 %d %d 0 1\n" % (req_id, len(pb), max_tokens)).encode()
+    p.stdin.write(header + pb + b"\n")
+    p.stdin.flush()
+
+def v4_cancel(p, req_id):
+    try:
+        p.stdin.write(("CANCEL %s\n" % req_id).encode()); p.stdin.flush()
+    except Exception:
+        pass
+
+def v4_read_turn(p, echo):
+    """Read ACCEPT/DATA/DONE/ERROR frames for one turn. echo(bytes) is called
+    for each decoded token piece. Returns a stats dict (tok/tps/hit/rss) or
+    None if the engine died mid-turn."""
+    stats = {"tok": 0, "tps": 0.0, "hit": 0.0, "rss": 0.0, "error": None}
+    while True:
+        line = p.stdout.readline()
+        if not line:
+            return None if p.poll() is not None else stats
+        line = line.decode("utf-8", "replace").rstrip("\n")
+        if line.startswith("ACCEPT "):
+            continue
+        if line.startswith("DATA "):
+            parts = line.split()
+            try:
+                n = int(parts[2])
+            except Exception:
+                n = 0
+            if n > 0:
+                payload = p.stdout.read(n)
+                p.stdout.read(1)          # trailing newline
+                echo(payload)
+            continue
+        if line.startswith("DONE "):
+            f = line.split()
+            if len(f) >= 7:
+                try:
+                    stats["tok"] = int(f[3]); stats["tps"] = float(f[4])
+                    stats["hit"] = float(f[5]); stats["rss"] = float(f[6])
+                except Exception:
+                    pass
+            break
+        if line.startswith("ERROR "):
+            stats["error"] = line
+            break
+    return stats
+
+def cmd_chat_v4(a):
+    """DeepSeek V4 `coli chat`: native serve-protocol TUI, same look & metrics
+    as the GLM engine TUI (clean console, tok/s · hit% · RSS · elapsed)."""
+    model_id = "deepseek-v4-colibri"
+    banner(f"chat · {model_id}", model=a.model)
+    p, errlog = v4_spawn(a, model_id)
+    sp = Spinner("loading deepseek-v4-colibri…"); sp.start()
+    stat = v4_wait_ready(p, errlog)
+    sp.stop()
+    if stat is None:
+        engine_diag(p, errlog); sys.exit("the engine exited while loading")
+    # clean plan/header line (mirrors GLM's "streaming CPU ram NGB · topp off")
+    bits = []
+    if a.gpu == "none":
+        bits.append("CPU")
+    else:
+        bits.append(f"ram {a.ram or '-'}GB")
+        if a.vram: bits.append(f"vram {a.vram}GB")
+    bits.append(f"context {a.ctx or 4096}")
+    print(f"  {C.dim}{' · '.join(bits)}{C.r}")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · "
+          f":reset starts a new conversation · :q exits{C.r}\n")
+    msgs = []
+    req = 0
+    w = term_w() - 4
+    def user_box(msg):
+        cols = shutil.get_terminal_size((80, 20)).columns
+        used = max(1, (6 + len(msg) + cols - 1) // cols)
+        sys.stdout.write(f"\x1b[{used}A\x1b[0J")
+        inner = w - 3
+        lines = textwrap.wrap(msg, inner) or [""]
+        for i, ln in enumerate(lines):
+            pre = f"{C.teal}{C.b}›{C.r}" if i == 0 else " "
+            print(f"  {C.dgray}│{C.r} {pre} {ln}{' '*(inner-len(ln))}{C.dgray}│{C.r}")
+        print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+    try:
+        while True:
+            if TTY:
+                print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
+                try: msg = input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+                except EOFError: print(); break
+                try: user_box(msg.strip())
+                except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+            else:
+                try: msg = input()
+                except EOFError: break
+            msg = msg.strip()
+            if msg in (":q", ":quit", "exit"): break
+            if not msg: continue
+            if msg == ":reset":
+                try: p.terminate()
+                except Exception: pass
+                p, errlog = v4_spawn(a, model_id)
+                sp = Spinner("loading deepseek-v4-colibri…"); sp.start()
+                stat = v4_wait_ready(p, errlog); sp.stop()
+                if stat is None:
+                    engine_diag(p, errlog); break
+                msgs = []
+                print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+            msgs.append({"role": "user", "content": msg})
+            import openai_server
+            prompt = openai_server.render_chat_v4(msgs)
+            print(f"\n  {C.teal}◆ colibri{C.r}")
+            sp = Spinner("thinking…"); sp.start()
+            req += 1; rid = f"cli{req}"
+            dec = codecs.getincrementaldecoder("utf-8")("replace")
+            state = {"first": True}
+            reply = []
+            def echo(bs):
+                if state["first"]:
+                    sp.stop(); state["first"] = False
+                s = dec.decode(bs)
+                if s:
+                    md.feed(s); reply.append(s)
+            md = MDStream("  ")
+            t0 = time.time()
+            v4_submit(p, rid, prompt, chat_ngen(a, model_id=model_id))
+            try:
+                st = v4_read_turn(p, echo)
+            except KeyboardInterrupt:
+                v4_cancel(p, rid)
+                st = v4_read_turn(p, echo)   # drain so the engine isn't mid-turn
+                sp.stop(); md.close()
+                print(f"  {C.yel}⏹ interrupted{C.r}\n"); continue
+            sp.stop(); md.close()
+            if st is None:
+                engine_diag(p, errlog); break
+            if st.get("error"):
+                print(f"  {C.yel}[{st['error']}]{C.r}\n"); continue
+            el = time.time() - t0
+            if st.get("tok") and reply:
+                msgs.append({"role": "assistant", "content": "".join(reply)})
+            if st.get("tps"):
+                print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · "
+                      f"hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}\n")
+            else:
+                print(f"\r  {C.dgray}└─ {st['tok']} tok · {el:.0f}s{C.r}\n")
+    finally:
+        try: p.stdin.close(); p.terminate()
+        except Exception: pass
+        try: os.unlink(errlog.name)
+        except Exception: pass
+    print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
+
 def cmd_chat(a):
+    # DeepSeek V4 gets the native serve-protocol TUI (clean, full metrics),
+    # not the HTTP REPL over openai_server.
+    try:
+        if model_arch(a.model) == "deepseek_v4":
+            return cmd_chat_v4(a)
+    except Exception:
+        pass
     # ATTACH: a running `coli serve` beats a private engine every time — the load
     # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
     # wins; otherwise probe localhost quietly and use it if it's there. --no-attach
@@ -1032,7 +1280,7 @@ def cmd_chat(a):
         # legacy 8, an explicit value -- 0 included -- passes verbatim).
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
-             "--host","127.0.0.1","--port","8000","--max-tokens",str(ngen_for(a,interactive=True))]
+             "--host","127.0.0.1","--port","8000","--max-tokens",str(chat_ngen(a, model_id=model_id))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -1209,7 +1457,7 @@ def cmd_serve(a):
                             "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,ngen_for(a,interactive=True),engine,env_for_engine(a,arch),a.cors_origin,
+              a.cap,chat_ngen(a, model_id=model_id),engine,env_for_engine(a,arch),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))

@@ -4,6 +4,20 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* COLI_DSV4_CUDA_DLLEXPORT marks functions exported from coli_dsv4_cuda.dll
+ * on Windows. Define COLI_DSV4_CUDA_BUILDING_DLL when compiling the .cu into
+ * the DLL (so the functions are __declspec(dllexport)); the host loader
+ * (backend_loader_dsv4.c) does NOT include this header's declarations — it
+ * resolves the same symbols at runtime via GetProcAddress. Mirrors the GLM
+ * COLI_CUDA_DLLEXPORT pattern. Note: every declaration below therefore keeps
+ * its plain extern "C" prototype on Linux and on the Windows host build. */
+#if defined(_WIN32) && defined(COLI_DSV4_CUDA_BUILDING_DLL)
+#define COLI_DSV4_CUDA_DLLEXPORT __declspec(dllexport)
+#else
+#define COLI_DSV4_CUDA_DLLEXPORT
+#endif
+
 typedef struct Dsv4CudaTensor Dsv4CudaTensor;
 typedef struct Dsv4CudaActivation Dsv4CudaActivation;
 typedef struct Dsv4CudaKvCache Dsv4CudaKvCache;
@@ -13,11 +27,11 @@ typedef struct {
     Dsv4CudaTensor *attn_norm,*q_a,*qkv,*q_norm,*q_b,*wkv,*kv_norm,*sink,*wo_a,*wo_b;
     Dsv4CudaTensor *compress_wkv,*compress_wgate,*compress_ape,*compress_norm;
 } Dsv4CudaAttentionWeights;
-int dsv4_cuda_init(const int *devices,int count);
-void dsv4_cuda_shutdown(void);
+COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_init(const int *devices,int count);
+COLI_DSV4_CUDA_DLLEXPORT void dsv4_cuda_shutdown(void);
 int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
-int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
+COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t *w,int O,int I,int device);
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float *w,int O,int I,int device);
 int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
@@ -28,7 +42,7 @@ int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,
                            int M,int H,float eps,float pre_eps,int *id,float *value);
 int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float *x,int groups);
-int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,
+COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down,const float *weights,int count,
                            float limit,float *y,const float *x);
 int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4CudaTensor *down,
@@ -41,7 +55,7 @@ int dsv4_cuda_qkv(Dsv4CudaTensor *q_a,Dsv4CudaTensor *q_norm,Dsv4CudaTensor *q_b
                   Dsv4CudaTensor *kv,float eps,float *q_out,float *kv_out,const float *x);
 int dsv4_cuda_wo(Dsv4CudaTensor *wo_a,Dsv4CudaTensor *wo_b,int groups,
                  float *out,const float *context);
-void dsv4_cuda_tensor_free(Dsv4CudaTensor *t);
+COLI_DSV4_CUDA_DLLEXPORT void dsv4_cuda_tensor_free(Dsv4CudaTensor *t);
 long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor *t);
 Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements);
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a);
