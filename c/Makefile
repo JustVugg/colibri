@@ -671,7 +671,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_i4g_cuda.cu tests/test_i8_cuda.cu tests/i4g_ref.c
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
@@ -681,8 +681,19 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
 	$(CC) $(CFLAGS) -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
+	# -fopenmp on the link line: the CPU reference objects are built with
+	# $(CFLAGS), which has it, but nvcc does not pass it through and the link
+	# fails on GOMP_parallel.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) -Xcompiler -fopenmp
 	./mxfp4_cuda_test$(EXE)
+	# i4_tiled_f32 (the S>1 path K3_CUDA_DENSE uses) against the same CPU
+	# decoders, for both weight formats it dispatches: fmt=4 grouped int4 and
+	# fmt=1 int8. Same C-reference trick as mxfp4_ref above, same reason.
+	$(CC) $(CFLAGS) -c tests/i4g_ref.c -o tests/i4g_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_i4g_cuda.cu tests/i4g_ref.o -o i4g_cuda_test$(EXE) -Xcompiler -fopenmp
+	./i4g_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_i8_cuda.cu tests/i4g_ref.o -o i8_cuda_test$(EXE) -Xcompiler -fopenmp
+	./i8_cuda_test$(EXE)
 
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:

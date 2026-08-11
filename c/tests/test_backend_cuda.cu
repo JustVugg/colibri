@@ -272,7 +272,14 @@ int main(int argc, char **argv) {
         coli_cuda_stats(-1, &c0, &b0);
         ColiCudaTensor *bad = nullptr;
         if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 4, 2, 9999)) return 1;
-        if (coli_cuda_tensor_upload(&bad, q8, s8, 7, 4, 2, d0)) return 1;
+        /* fmt=7 (MXFP4) used to be rejected here. db0c80f taught row_bytes about
+         * it for Kimi K3's experts, so an upload now legitimately succeeds and
+         * the old negative assertion failed the whole suite. Check the new
+         * contract instead, and free it so the `if (bad)` below still means
+         * "no rejected upload left a tensor behind". */
+        ColiCudaTensor *mx = nullptr;
+        if (!coli_cuda_tensor_upload(&mx, q8, s8, 7, 4, 2, d0)) return 1;
+        coli_cuda_tensor_free(mx);
         if (coli_cuda_tensor_upload(&bad, q8, nullptr, 1, 4, 2, d0)) return 1;
         if (coli_cuda_tensor_upload(&bad, nullptr, s8, 1, 4, 2, d0)) return 1;
         if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 1 << 20, 1 << 24, d0)) return 1; /* ~16 TB */
