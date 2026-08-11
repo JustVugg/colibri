@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
 
         double tg[2];
         for (int mode = 0; mode < 2; mode++) {
-            setenv("COLI_CUDA_TC_W4A16_MIN", mode ? "1" : "1000000", 1);
+            coli_cuda_set_tile_min(mode ? 1 : 0);
             ColiCudaTensor *t = nullptr;
             coli_cuda_matmul(&t, y, x, q4, scale, 4, S, I, O, 0, gs);   /* upload once */
             double s0 = now();

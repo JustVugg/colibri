@@ -1,24 +1,16 @@
-/* w4a16_matmul_g (fmt=4 Tensor Core tiling) vs the CPU decoder in quant.h.
+/* i4_tiled_f32 (fmt=4 grouped int4) vs the CPU decoder in quant.h.
  *
- * Two things are under test, and they are not the same thing:
- *
- *  1. Correctness of the new grouped-scale tile indexing. The GEMV kernel
- *     (quant_matmul) and the tiled kernel read the SAME uploaded weights and
- *     scales, so running both against the CPU on identical inputs isolates the
- *     indexing from everything else. COLI_CUDA_TC_W4A16_MIN selects the path,
- *     so one binary exercises both.
- *
- *  2. The precision cost of the tiling. w4a16 puts A and the dequantized B
- *     through fp16 with fp32 accumulate, where the GEMV path stays in fp32.
- *     The tiled error is therefore EXPECTED to be larger, and the test asserts
- *     a bound rather than equality. The bound is not a quality verdict: K3's
- *     AttnRes mix is documented as sensitive to weight noise, so whether this
- *     is acceptable for generation is a logits question, not a kernel question.
+ * Both GPU paths read the SAME uploaded weights and scales, so running the GEMV
+ * and the tiled kernel against the CPU on identical inputs isolates the tiling
+ * from everything else. coli_cuda_set_tile_min() selects between them, so one
+ * binary exercises both -- and using the API rather than the environment is the
+ * point: the tiled dispatch is opt-in precisely so it cannot reach the GLM
+ * engine, which shares coli_cuda_matmul.
  *
  * Shapes are K3's real dense-trunk projections at K3_BITS=4 (gs=64).
  *
  *   nvcc -O3 -std=c++17 -arch=native backend_cuda.cu tests/test_i4g_cuda.cu \
- *        tests/i4g_ref.o -o test_i4g_cuda -lgomp
+ *        tests/i4g_ref.o -o test_i4g_cuda -Xcompiler -fopenmp
  */
 #include <cstdio>
 #include <cstdlib>
@@ -72,9 +64,9 @@ static void case_(const char *label, int S, int I, int O, int gs, double bound) 
     i4g_ref(want, x, q4, scale, S, I, O, gs);
 
     ColiCudaTensor *t = nullptr;
-    setenv("COLI_CUDA_TC_W4A16_MIN", "1000000", 1);           /* force GEMV */
+    coli_cuda_set_tile_min(0);                                /* force GEMV */
     int ok_g = coli_cuda_matmul(&t, gemv, x, q4, scale, 4, S, I, O, 0, gs);
-    setenv("COLI_CUDA_TC_W4A16_MIN", "1", 1);                 /* force tiles */
+    coli_cuda_set_tile_min(1);                                /* force tiles */
     int ok_t = coli_cuda_matmul(&t, tile, x, q4, scale, 4, S, I, O, 0, gs);
 
     if (!ok_g || !ok_t) {

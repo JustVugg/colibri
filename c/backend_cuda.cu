@@ -1428,7 +1428,11 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
  * engine's CPU fallbacks and host-rematerialization end-to-end without real
  * hardware faults. Uploads/queries are not gated. Unset: no effect. */
 static long g_gpu_calls;
-/* 0 = follow COLI_CUDA_TC_W4A16_MIN; see coli_cuda_set_tile_min. */
+/* 0 = tiled dispatch OFF. Opt-in only, and deliberately not defaulted from
+ * COLI_CUDA_TC_W4A16_MIN: coli_cuda_matmul is shared with the GLM engine
+ * (colibri.c), which passes its own S straight through, so a nonzero default
+ * here would silently reroute another model's prefill onto this kernel. The env
+ * var keeps meaning what it always meant for the expert-group path below. */
 static int g_tile_min = 0;
 extern "C" void coli_cuda_set_tile_min(int n) { g_tile_min = n > 0 ? n : 0; }
 static int fault_injected(void) {
@@ -1462,10 +1466,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
      * threshold, switch to i4_tiled_f32, which reads one weight tile per 32
      * output rows. Same threshold and env var as the expert-group path below, so
      * there is one knob, not two. */
-    int tc16_min = g_tile_min > 0 ? g_tile_min
-                 : (std::getenv("COLI_CUDA_TC_W4A16_MIN")
-                    ? std::atoi(std::getenv("COLI_CUDA_TC_W4A16_MIN")) : 16);
-    if (S >= tc16_min && (fmt == 2 || (fmt == 4 && t->gs > 0))) {
+    if (g_tile_min > 0 && S >= g_tile_min && (fmt == 2 || (fmt == 4 && t->gs > 0))) {
         dim3 tg((unsigned)((O + I4T_TN - 1) / I4T_TN), (unsigned)((S + I4T_TM - 1) / I4T_TM));
         i4_tiled_f32<<<tg, 256>>>(ctx->y, ctx->x, (const uint8_t *)t->weights,
                                   t->scales, S, I, O,
