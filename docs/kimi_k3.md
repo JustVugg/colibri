@@ -161,6 +161,11 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_VK` | 1 | Vulkan tier when built with `make VK=1 kimi_k3` (0 = pure CPU) |
 | `K3_VK_GB` | driver budget | VRAM cap for the Vulkan tier |
 | `K3_VK_UP` | 8 | routed-expert uploads per step (fill-once tier) |
+| `K3_CUDA_DENSE` | 0 | dense trunk resident in VRAM, tiled matmul at prefill (`make CUDA=1 kimi_k3`) |
+| `K3_CUDA_GB` | VRAM − 4 | upload cap for the dense trunk |
+| `K3_CUDA_TILE_S` | 16 | min batch rows for the tiled kernel (below it, the GEMV wins) |
+| `K3_CUDA_DEV` | 0 | device for the dense trunk (forced to 0 when `K3_CUDA=1`) |
+| `K3_CUDA_VERIFY` | 0 | recompute every dense matmul on the CPU, report worst rel-L2 |
 | `K3_DIRECT` | 1 | O_DIRECT expert reads (0 = buffered + WILLNEED) |
 | `K3_IDOT` | 1 | int8-activation expert matmuls (0 = exact-float kernel) |
 | `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
@@ -228,6 +233,62 @@ non-streaming `/v1/chat/completions`; `coli web` uses that same API. Reasoning
 is returned as `reasoning_content`, response text as `content`, and
 `<|end_of_msg|>` remains the model-owned stop token. `STOP` and `CANCEL` are
 honoured between generated tokens.
+
+## CUDA dense trunk (`make CUDA=1 kimi_k3`, `K3_CUDA_DENSE=1`)
+
+Prefill only. The dense trunk — attention projections, latent up/down, the shared
+experts, dense-layer MLP — is uploaded to VRAM once at init (~32 GB at
+`K3_BITS=4`, so it fits one 48 GB card whole) and its matmuls run on
+`i4_tiled_f32`, an fp32 shared-memory tiled GEMM for fmt=2/4.
+
+Why a threshold rather than always-on: `quant_matmul` makes the batch the grid Y
+dimension, so each row re-reads the whole weight matrix from VRAM. That is the
+right shape at S=1 and S copies of the traffic at a prefill chunk. The tiled
+kernel reads one weight tile per 32 output rows, which only pays once the chunk
+is wide enough — measured on one A6000, K3 shapes at S=32, the tiling is 6–13x
+the GEMV, and at S=1 the GEMV wins. `K3_CUDA_TILE_S` is that crossover, and
+decode (S=1) therefore never touches the GPU.
+
+Measured on the 93-layer model, 56-token prompt, ABBA-interleaved on an idle box
+(2x A6000, 16-core Ice Lake):
+
+| | CPU | `K3_CUDA_DENSE=1` |
+|---|---|---|
+| prefill | 146.9 s (2.62 s/tok) | **100.4 s (1.79 s/tok)** |
+| attention projections | 40.0 s | 10.8 s |
+| MoE | 119.9 s | 102.4 s |
+| decode | unchanged | unchanged |
+
+The MoE line barely moves because only its dense parts are resident; the routed
+experts still stream to the CPU. Batching those per chunk needs a gather/scatter
+over each expert's token subset and is not done here.
+
+No Tensor Cores, deliberately. The first version used the fp16 WMMA path and was
+no faster end to end, but see the caveat below.
+
+### This path does not reproduce CPU logits, and cannot
+
+Teacher-forced prefill logits differ from the CPU by ~5e-2 relative L2 on the
+93-layer model, with occasional argmax flips on near-tied positions. That is not
+a kernel defect and is not fixable by precision:
+
+- every dense matmul agrees with the CPU decoder to **6.3e-07** on real weights
+  and activations (`K3_CUDA_VERIFY=1`, worst of 156, zero fallbacks);
+- the divergence is **5.6e-03 at 8 layers** and 5.2e-02 at 93 — roughly 3x
+  amplification per layer;
+- fp16 tiling (kernel error 2.6e-04) and fp32 tiling (1.0e-06) both land at ~5%,
+  so a 260x more accurate kernel buys 12%.
+
+The cause is AttnRes: it replaces the residual stream with a softmax mix whose
+scores sit ~0.02 apart, twice per layer, so a near-tie converts a 1e-07
+perturbation into a shifted mixture weight. Merely changing fp32 summation order
+is enough. Controls: CPU vs CPU is bit-identical, GPU vs GPU is bit-identical,
+and uploading without computing is bit-identical — so the harness can tell a real
+difference from noise.
+
+Judge this path on generated text, not on logit equality with the CPU. Measured
+side by side on the same prompt, both produce fluent, correct output; they word
+it differently.
 
 ## Vulkan tier (`make VK=1 kimi_k3`)
 

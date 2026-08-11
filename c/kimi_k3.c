@@ -112,7 +112,8 @@ typedef struct {
 
 /* ---------- RAM-resident weight, quantized at load ---------- */
 typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
-                 void *vk; /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */ } W;
+                 void *vk; /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */
+                 void *cu; /* ColiCudaTensor* once uploaded (K3_CUDA_DENSE); NULL = CPU */ } W;
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
@@ -294,11 +295,122 @@ static int w_vk_upload(W *w){
         fmt==1?(const void*)w->q8:(const void*)w->q4,w->s,fmt,w->I,w->O,w->gs);
 }
 #endif
+#ifdef COLI_CUDA
+/* K3_CUDA_DENSE: the dense trunk (attention projections, latent up/down, shared
+ * experts, dense-layer MLP) resident in VRAM, computed with the fp32 shared-memory
+ * tiling above K3_CUDA_TILE_S rows.
+ *
+ * Separate from K3_CUDA because it targets the opposite regime. The routed-expert
+ * CUDA path helps decode; this one only pays during PREFILL, where a chunk gives
+ * the tiles enough rows to amortize reading a weight tile (measured standalone on
+ * one A6000, K3 shapes at S=32: 6-13x the GPU GEMV, which is the clean comparison;
+ * at S=1 the GEMV wins and the tiling loses, hence the row threshold rather than
+ * always-on).
+ *
+ * The trunk is ~36 GB at K3_BITS=4, so it fits one 48 GB card whole. Uploads stop
+ * at K3_CUDA_GB (default: leave 4 GB of headroom) and anything not resident
+ * silently stays on the CPU. */
+static int g_k3_cuda_dense=0;
+static double g_cuda_gb=0;               /* K3_CUDA_GB cap (0 = VRAM minus headroom) */
+static int g_cuda_tile_s=16;             /* K3_CUDA_TILE_S: min rows for the tiled path */
+static long g_cuda_res=0, g_cuda_hit=0, g_cuda_skip=0;
+static double g_cuda_bytes=0;
+static int g_cuda_dev=0;                 /* K3_CUDA_DEV: device for the dense trunk */
+static int g_cuda_verify=0;              /* K3_CUDA_VERIFY: CPU-recompute every dense matmul */
+static double g_cuda_worst=0;            /* worst rel-L2 seen under verify */
+static char g_cuda_worst_at[96]="";
+/* Upload one dense W to VRAM, honoring the K3_CUDA_GB cap. Returns 1 if the
+ * tensor is resident afterwards.
+ *
+ * fmt=0 (f32) is refused rather than converted: it appears only under
+ * K3_BITS=32, which exists for validation against tools/k3_ref.py, and quietly
+ * running that comparison on Tensor Cores in fp16 would defeat its purpose. */
+static int w_cuda_upload(W *w){
+    if(w->cu) return 1;
+    if(w->fmt!=1&&w->fmt!=4) return 0;
+    size_t need=(size_t)w->O*(w->fmt==1?(size_t)w->I:((size_t)w->I+1)/2);
+    size_t ng=w->gs>0?((size_t)w->I+w->gs-1)/w->gs:1;
+    need+=(size_t)w->O*ng*sizeof(float);
+    size_t freeb=0,totb=0;
+    if(!coli_cuda_mem_info(g_cuda_dev,&freeb,&totb)) return 0;
+    double cap=g_cuda_gb>0?g_cuda_gb*1e9:(double)totb-4e9;   /* 4 GB headroom */
+    if(g_cuda_bytes+(double)need>cap||(double)need>(double)freeb-1e9) return 0;
+    int ok = w->gs>0
+        ? coli_cuda_tensor_upload_g((ColiCudaTensor**)&w->cu,
+              w->fmt==1?(const void*)w->q8:(const void*)w->q4,w->s,w->fmt,w->I,w->O,g_cuda_dev,w->gs)
+        : coli_cuda_tensor_upload((ColiCudaTensor**)&w->cu,
+              w->fmt==1?(const void*)w->q8:(const void*)w->q4,w->s,w->fmt,w->I,w->O,g_cuda_dev);
+    if(!ok) return 0;
+    g_cuda_bytes+=(double)need; g_cuda_res++;
+    return 1;
+}
+/* Every dense matmul the prefill path reaches. Order matters: the biggest
+ * matrices go first so a budget too small to hold the trunk still buys the
+ * projections where the tiling pays most. */
+static int layer_cuda_upload(Layer *L, const Cfg *c){
+    int n=0;
+    if(L->kda){ Kda *a=&L->a;
+        n+=w_cuda_upload(&a->q)+w_cuda_upload(&a->k)+w_cuda_upload(&a->v)
+          +w_cuda_upload(&a->o)+w_cuda_upload(&a->g);
+    } else { Mla *ml=&L->m;
+        n+=w_cuda_upload(&ml->qa)+w_cuda_upload(&ml->qb)+w_cuda_upload(&ml->kva)
+          +w_cuda_upload(&ml->o)+w_cuda_upload(&ml->g);
+        /* kvb is consumed row-at-a-time by the MLA absorb (w_addrow), never by
+         * w_matmul, so uploading it would occupy VRAM for nothing. */
+    }
+    if(L->sparse){ Moe *o=&L->moe;
+        n+=w_cuda_upload(&o->lat_down)+w_cuda_upload(&o->lat_up)
+          +w_cuda_upload(&o->sh_gate)+w_cuda_upload(&o->sh_up)+w_cuda_upload(&o->sh_down);
+    } else {
+        n+=w_cuda_upload(&L->d_gate)+w_cuda_upload(&L->d_up)+w_cuda_upload(&L->d_down);
+    }
+    (void)c;
+    return n;
+}
+#endif
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_VULKAN
     if(g_k3_vk&&S==1&&w->vk&&
        coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,w->fmt,1,w->I,w->O,w->gs))
         return;
+#endif
+#ifdef COLI_CUDA
+    /* Prefill only. S is the chunk size at every dense call site, so this engages
+     * for prefill chunks and never for decode, where the CPU is faster than a
+     * tiled kernel running on 1 of 16 tile rows. A refused call (VRAM full, fault
+     * injection, unsupported fmt) falls through to the CPU with y untouched. */
+    if(g_k3_cuda_dense&&w->cu&&S>=g_cuda_tile_s){
+        if(coli_cuda_matmul((ColiCudaTensor**)&((W*)w)->cu,y,x,NULL,NULL,
+                            w->fmt,S,w->I,w->O,g_cuda_dev,w->gs)){
+            g_cuda_hit++;
+            /* K3_CUDA_VERIFY=1: recompute on the CPU and report the worst
+             * disagreement seen, per shape. The kernels agree to ~1e-6 on
+             * synthetic data yet the model's logits move by 5e-3, so the
+             * question is what real weights and activations do to them --
+             * which a unit test on uniform random data cannot answer. */
+            if(g_cuda_verify){
+                float *ref=(float*)malloc((size_t)S*w->O*sizeof(float));
+                if(ref){
+                    if(w->fmt==1) matmul_q(ref,x,w->q8,w->s,S,w->I,w->O);
+                    else          matmul_i4_grouped(ref,x,w->q4,w->s,S,w->I,w->O,w->gs);
+                    double num=0,den=0;
+                    for(int64_t i=0;i<(int64_t)S*w->O;i++){
+                        double d=(double)y[i]-(double)ref[i];
+                        num+=d*d; den+=(double)ref[i]*(double)ref[i];
+                    }
+                    double e=den>0?sqrt(num/den):0;
+                    if(e>g_cuda_worst){
+                        g_cuda_worst=e;
+                        snprintf(g_cuda_worst_at,sizeof(g_cuda_worst_at),
+                                 "fmt=%d S=%d I=%d O=%d gs=%d",w->fmt,S,w->I,w->O,w->gs);
+                    }
+                    free(ref);
+                }
+            }
+            return;
+        }
+        g_cuda_skip++;
+    }
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
     else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
@@ -551,12 +663,39 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     g_bits_env = getenv("K3_BITS")!=NULL;
 #ifdef COLI_CUDA
     g_k3_cuda = getenv("K3_CUDA") ? atoi(getenv("K3_CUDA")) : 0;
-    if(g_k3_cuda){
-        int dev0 = 0;
+    g_k3_cuda_dense = getenv("K3_CUDA_DENSE") ? atoi(getenv("K3_CUDA_DENSE")) : 0;
+    if(g_k3_cuda||g_k3_cuda_dense){
+        g_cuda_dev = getenv("K3_CUDA_DEV") ? atoi(getenv("K3_CUDA_DEV")) : 0;
+        /* coli_cuda_matmul_mxfp4 resolves its context with find_ctx(0), so the
+         * routed-expert path only works on device 0. Rather than let it fail
+         * silently back to the CPU, pin the device when both are on. */
+        if(g_k3_cuda && g_cuda_dev != 0){
+            fprintf(stderr,"[K3-CUDA] K3_CUDA=1 requires device 0; ignoring K3_CUDA_DEV=%d\n",
+                    g_cuda_dev);
+            g_cuda_dev = 0;
+        }
+        int dev0 = g_cuda_dev;
         if(!coli_cuda_init(&dev0, 1)){
             fprintf(stderr,"[K3-CUDA] device unavailable -- experts stay on CPU\n");
-            g_k3_cuda = 0;
-        } else fprintf(stderr,"[K3-CUDA] MXFP4 routed experts on device 0 (decode only)\n");
+            g_k3_cuda = 0; g_k3_cuda_dense = 0;
+        } else if(g_k3_cuda) fprintf(stderr,"[K3-CUDA] MXFP4 routed experts on device 0 (decode only)\n");
+    }
+    if(g_k3_cuda_dense){
+        g_cuda_gb = getenv("K3_CUDA_GB") ? atof(getenv("K3_CUDA_GB")) : 0;
+        g_cuda_tile_s = getenv("K3_CUDA_TILE_S") ? atoi(getenv("K3_CUDA_TILE_S")) : 16;
+        g_cuda_verify = getenv("K3_CUDA_VERIFY") ? atoi(getenv("K3_CUDA_VERIFY")) : 0;
+        if(g_cuda_tile_s<1) g_cuda_tile_s=1;
+        /* Keep the engine gate and the backend dispatch on one number. Set it
+         * through the API, not putenv: the backend variable is process-global and
+         * would follow any other engine sharing this process. */
+        coli_cuda_set_tile_min(g_cuda_tile_s);
+        if(g_k3_cuda)
+            fprintf(stderr,"[K3-CUDA] note: K3_CUDA=1 with K3_CUDA_DENSE=1 shares one "
+                           "device; the routed-expert path uploads per call and measured "
+                           "SLOWER than leaving experts on the CPU (8-layer prefill "
+                           "14.9s -> 25.5s). Prefer K3_CUDA=0 unless benchmarking it.\n");
+        /* Uploads happen after the layers load, next to the Vulkan residency
+         * pass -- the weights do not exist yet at this point. */
     }
 #endif
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
@@ -684,6 +823,20 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%d/step, cap %s)\n",
                 nsh,used,budget,g_vk_upcap,g_vk_gb>0?"K3_VK_GB":"driver budget");
       }
+    }
+#endif
+#ifdef COLI_CUDA
+    if(g_k3_cuda_dense){
+        int tried=0;
+        for(int i=0;i<c->n_layers;i++) tried+=layer_cuda_upload(&m->L[i],&m->c);
+        fprintf(stderr,"[K3-CUDA] dense trunk: %ld tensors resident (%.1f GB) on device %d, "
+                       "fp32 tiling at S>=%d\n",
+                g_cuda_res,g_cuda_bytes/1e9,g_cuda_dev,g_cuda_tile_s);
+        (void)tried;
+        if(g_cuda_res==0){
+            fprintf(stderr,"[K3-CUDA] nothing uploaded -- dense stays on CPU\n");
+            g_k3_cuda_dense=0;
+        }
     }
 #endif
     expert_table_init(m);
@@ -1927,6 +2080,17 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     if(g_k3_vk) fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
                         g_vk_res,g_vk_hit);
 #endif
+#ifdef COLI_CUDA
+    /* skip counts refused calls that fell back to the CPU: a nonzero value means
+     * the GPU produced none of those outputs, which is the difference between
+     * "tiling is not helping" and "tiling never ran". */
+    if(g_k3_cuda_dense)
+    {   fprintf(stderr,"[K3-CUDA] dense: %ld tiled matmuls, %ld fell back to CPU\n",
+                g_cuda_hit,g_cuda_skip);
+        if(g_cuda_verify) fprintf(stderr,"[K3-CUDA] verify: worst rel_l2 %.3e at %s\n",
+                                  g_cuda_worst,g_cuda_worst_at);
+    }
+#endif
 }
 
 static void serve_loop(Model *m, Tok *T){
@@ -2140,6 +2304,15 @@ int main(int argc, char **argv){
      * precision (#852 -- two decimals of tok/s is one significant digit at the
      * rates this engine runs at). */
     printf("TUNE decode: %d tokens in %.3fs\n", ntok, dt);
+#ifdef COLI_CUDA
+    if(g_k3_cuda_dense){
+        fprintf(stderr,"[K3-CUDA] dense: %ld GPU matmuls, %ld fell back to CPU\n",
+                g_cuda_hit,g_cuda_skip);
+        if(g_cuda_verify)
+            fprintf(stderr,"[K3-CUDA] verify: worst rel_l2 %.3e at %s\n",
+                    g_cuda_worst,g_cuda_worst_at);
+    }
+#endif
     if(m.trace) fclose(m.trace);
     { const char *sv=getenv("USAGE_SAVE");
       if(!(sv && atoi(sv)==0) && g_k3_usage[0])
