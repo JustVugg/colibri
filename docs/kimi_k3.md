@@ -263,6 +263,18 @@ The MoE line barely moves because only its dense parts are resident; the routed
 experts still stream to the CPU. Batching those per chunk needs a gather/scatter
 over each expert's token subset and is not done here.
 
+Since only prefill moves, the end-to-end win is whatever share of your wall clock
+prefill is. At a balanced mix -- 56-token prompt, 44 generated, sized so prefill
+is ~50% of CPU wall -- the same ABBA measurement gives:
+
+| | prefill | decode | total |
+|---|---|---|---|
+| CPU | 143.8 s | 140.5 s | 284.2 s |
+| `K3_CUDA_DENSE=1` | 100.9 s | 139.7 s | **240.5 s (1.18x)** |
+
+So: ~1.45x on prefill-heavy work (long prompts, RAG, code context), ~1.18x on a
+balanced turn, ~nothing when generating long output from a short prompt.
+
 No Tensor Cores, deliberately. The first version used the fp16 WMMA path and was
 no faster end to end, but see the caveat below.
 
