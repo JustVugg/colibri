@@ -19,6 +19,8 @@ FILES = [
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
+    "i4g_cuda_test", "i4g_cuda_test.exe",
+    "i8_cuda_test", "i8_cuda_test.exe",
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     # hipcc emits an import library, export file and PDB alongside the DLL.

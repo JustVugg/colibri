@@ -31,6 +31,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
+/* Minimum batch rows at which coli_cuda_matmul picks the tiled kernel over the
+ * GEMV. Defaults to COLI_CUDA_TC_W4A16_MIN, or 16. Callers that expose their own
+ * knob should set it here rather than putenv()ing the backend's variable, which
+ * would also reach any other engine sharing the process. n < 1 restores the
+ * environment default. */
+COLI_CUDA_DLLEXPORT void coli_cuda_set_tile_min(int n);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,

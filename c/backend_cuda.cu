@@ -455,6 +455,92 @@ __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
 #endif
 }
 
+/* int4 (fmt=2 per-row scale, fmt=4 per-group) x fp32 activations, tiled in
+ * shared memory, accumulated in fp32. No Tensor Cores -- deliberately.
+ *
+ * The first version of this used the WMMA path (w4a16_matmul's fp16 A and B).
+ * It was 13-30x the CPU on K3's dense shapes and its own relative error was a
+ * harmless-looking 2.6e-04, but measured end to end through the 93-layer stack
+ * the prefill logits came out at 5.9% mean / 33% worst relative L2, and 2 of 56
+ * teacher-forced positions changed argmax -- including the last one, which picks
+ * the first generated token. docs/kimi_k3.md predicts exactly this: the AttnRes
+ * mix logits sit ~0.02 apart, so the mix amplifies weight noise. fp16 weights
+ * are not usable here at any speed.
+ *
+ * What actually made the GPU fast was reuse, not fp16: quant_matmul re-reads the
+ * whole weight matrix per batch row, and this reads each weight tile once per 32
+ * rows. Staying in fp32 keeps the arithmetic within rounding of the CPU decoder
+ * and costs only Tensor Core headroom the workload never needed -- the A6000 has
+ * 38.7 TFLOPS of plain fp32 against the CPU's measured ~41 GFLOP/s on these
+ * shapes.
+ *
+ * Tile: 32 batch rows x 64 output cols x 32 k. 256 threads, 8 accumulators each.
+ * The +1 padding on the shared arrays keeps consecutive output columns on
+ * consecutive banks (stride 33 floats, 33 mod 32 = 1); without it every thread
+ * in a warp would hit the same bank on the ws read.
+ *
+ * gs is unconstrained: each element derives its own group from its own k, so a
+ * k-tile straddling two groups reads two scales and is still correct. */
+#define I4T_TM 32
+#define I4T_TN 64
+#define I4T_TK 32
+__global__ static void i4_tiled_f32(float *y,const float *x,const uint8_t *w,
+                                    const float *scale,int M,int K,int N,
+                                    int gs,int ng){
+    __shared__ float xs[I4T_TM][I4T_TK+1];
+    __shared__ float ws[I4T_TN][I4T_TK+1];
+    int tid=threadIdx.x;
+    int n_local=tid&(I4T_TN-1);          /* 64 output columns per block */
+    int m_grp=tid>>6;                    /* 4 groups, each thread covers 8 rows */
+    int m0=blockIdx.y*I4T_TM, n0=blockIdx.x*I4T_TN;
+    int gn=n0+n_local;
+    size_t rb=(size_t)(K+1)/2;
+    float acc[8];
+    #pragma unroll
+    for(int j=0;j<8;j++) acc[j]=0.f;
+
+    for(int k0=0;k0<K;k0+=I4T_TK){
+        for(int z=tid;z<I4T_TM*I4T_TK;z+=256){
+            int m=z>>5,k=z&31,gm=m0+m,gk=k0+k;
+            xs[m][k]=(gm<M&&gk<K)?x[(size_t)gm*K+gk]:0.f;
+        }
+        for(int z=tid;z<I4T_TN*I4T_TK;z+=256){
+            int n=z>>5,k=z&31,gw=n0+n,gk=k0+k;float v=0.f;
+            if(gw<N&&gk<K){
+                uint8_t q=w[(size_t)gw*rb+(gk>>1)];
+                int a=(gk&1)?(q>>4):(q&15);
+                v=(float)(a&8?a-16:a)*(ng>1?scale[(size_t)gw*ng+gk/gs]:scale[gw]);
+            }
+            ws[n][k]=v;
+        }
+        __syncthreads();
+        /* Partial per k-tile, folded into acc once per tile, instead of one
+         * 7168-long serial chain. The CPU decoder sums hierarchically (8-wide
+         * SIMD -> per-group -> per-row); a flat chain drifts from it far more on
+         * real activations than on the uniform data a kernel unit test uses, and
+         * that drift is what the 93-layer stack amplifies. 32-term partials are
+         * finer than the CPU's 64-wide groups, so this is no worse than what it
+         * is being compared against. */
+        float part[8];
+        #pragma unroll
+        for(int j=0;j<8;j++) part[j]=0.f;
+        #pragma unroll
+        for(int kk=0;kk<I4T_TK;kk++){
+            float wv=ws[n_local][kk];
+            #pragma unroll
+            for(int j=0;j<8;j++) part[j]+=xs[m_grp+j*4][kk]*wv;
+        }
+        #pragma unroll
+        for(int j=0;j<8;j++) acc[j]+=part[j];
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int j=0;j<8;j++){
+        int gm=m0+m_grp+j*4;
+        if(gm<M&&gn<N) y[(size_t)gm*N+gn]=acc[j];
+    }
+}
+
 /* Gate and up use the same input.  Eight warps compute both 16x64 projections
  * while sharing the FP32->FP16 conversion of A. */
 __global__ static void w4a16_gate_up(float *gate,float *up,const float *x,
@@ -1342,6 +1428,9 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
  * engine's CPU fallbacks and host-rematerialization end-to-end without real
  * hardware faults. Uploads/queries are not gated. Unset: no effect. */
 static long g_gpu_calls;
+/* 0 = follow COLI_CUDA_TC_W4A16_MIN; see coli_cuda_set_tile_min. */
+static int g_tile_min = 0;
+extern "C" void coli_cuda_set_tile_min(int n) { g_tile_min = n > 0 ? n : 0; }
 static int fault_injected(void) {
     const char *fa = std::getenv("COLI_GPU_FAIL_AFTER");
     return fa && g_gpu_calls++ >= std::atol(fa);
@@ -1367,8 +1456,24 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    dim3 grid((unsigned)O, (unsigned)S);
-    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    /* quant_matmul makes S the grid Y dimension: every row of the batch re-reads
+     * the whole weight matrix from VRAM. That is the right shape at S=1 (decode),
+     * and S copies of the traffic at a prefill chunk size. Above the tile
+     * threshold, switch to i4_tiled_f32, which reads one weight tile per 32
+     * output rows. Same threshold and env var as the expert-group path below, so
+     * there is one knob, not two. */
+    int tc16_min = g_tile_min > 0 ? g_tile_min
+                 : (std::getenv("COLI_CUDA_TC_W4A16_MIN")
+                    ? std::atoi(std::getenv("COLI_CUDA_TC_W4A16_MIN")) : 16);
+    if (S >= tc16_min && (fmt == 2 || (fmt == 4 && t->gs > 0))) {
+        dim3 tg((unsigned)((O + I4T_TN - 1) / I4T_TN), (unsigned)((S + I4T_TM - 1) / I4T_TM));
+        i4_tiled_f32<<<tg, 256>>>(ctx->y, ctx->x, (const uint8_t *)t->weights,
+                                  t->scales, S, I, O,
+                                  fmt == 4 ? t->gs : 1, fmt == 4 ? t->ng : 1);
+    } else {
+        dim3 grid((unsigned)O, (unsigned)S);
+        quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    }
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
