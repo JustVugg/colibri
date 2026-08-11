@@ -145,6 +145,18 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,
         const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
 
+
+/* Zero-copie sur GPU integre (symetrie de coli_metal_register). Enregistre une
+ * allocation hote alignee page pour que le GPU la lise EN PLACE, et enveloppe
+ * un pointeur interne en tenseur NON PROPRIETAIRE. Refuse sur GPU discret :
+ * l appelant garde alors son chemin actuel. */
+COLI_CUDA_DLLEXPORT int  coli_cuda_device_pageable(int device);
+COLI_CUDA_DLLEXPORT int  coli_cuda_slab_register(void *base, size_t len);
+COLI_CUDA_DLLEXPORT void coli_cuda_slab_unregister(void *base);
+COLI_CUDA_DLLEXPORT int  coli_cuda_tensor_wrap(ColiCudaTensor **tensor, const void *host_weights,
+                                               const float *scales, int fmt, int I, int O,
+                                               int device, int gs);
+COLI_CUDA_DLLEXPORT int  coli_cuda_tensor_owns_weights(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);

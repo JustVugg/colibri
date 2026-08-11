@@ -2492,6 +2492,44 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+#ifdef COLI_CUDA
+        /* Expert STREAME : sur un GPU a memoire pageable partagee (GB10), le
+         * tampon hote est DEJA adressable par le GPU -- pas de copie, pas
+         * d enregistrement, pas de page epinglee. On construit donc une vue et
+         * on rend l expert eligible au calcul GPU.
+         *
+         * Le garde `demand` a ete RETIRE : il excluait les chargements PREDITS
+         * par le pilote (PILOT_REAL, demand=0), qui arrivaient donc en RAM sans
+         * vue ET sans copie device -- donc non cuda_eligible, donc calcules sur
+         * CPU. Mesure GB10 : activer PILOT faisait passer la presence de 82,5 a
+         * 88,1 % et l attente disque de 34 a 24 %, mais ressuscitait 914 lignes
+         * d experts sur le CPU (4,4 s) qui mangeaient tout le gain.
+         *
+         * Ce garde etait un contournement du VRAI defaut, desormais corrige a
+         * la source : coli_cuda_tensor_upload acceptait une vue comme reponse a
+         * une demande de copie, ce qui effondrait la comptabilite du palier
+         * (3795 experts -> 128). Une vue ne peut plus satisfaire une copie, donc
+         * le chemin de placement (pin_load, REPIN) obtient toujours sa vraie
+         * copie et remplace la vue de lui-meme.
+         *
+         * Toujours jamais sur un slot adosse a l arene de pin (s->aslab) : ceux-la
+         * sont traites par la passe dediee a la fin de pin_load, apres placement.
+         *
+         * COLI_ZEROCOPY_PREFETCH=0 restaure l ancien comportement (demand=1
+         * seulement) pour un A/B sans recompilation.
+         *
+         * Sur GPU discret coli_cuda_tensor_wrap refuse : l expert reste sur le
+         * chemin CPU, exactement comme avant. */
+        static int zc_prefetch=-1;
+        if(zc_prefetch<0) zc_prefetch=getenv("COLI_ZEROCOPY_PREFETCH")?atoi(getenv("COLI_ZEROCOPY_PREFETCH")):1;
+        if((demand||zc_prefetch) && !s->aslab){
+            qt_cuda_reset(qt[k]);
+            qt[k]->cuda_eligible=0;
+            if(coli_cuda_tensor_wrap(&qt[k]->cuda, s->slab+pos[k], fp[k],
+                                     qt[k]->fmt, qt[k]->I, qt[k]->O, 0, qt[k]->gs))
+                qt[k]->cuda_eligible=1;
+        }
+#endif
     }
     s->eid=eid; return 0;
 }
@@ -2691,6 +2729,31 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
+#ifdef COLI_CUDA
+        /* TROISIEME chemin de chargement, et le seul qui n avait pas la vue
+         * zero-copie. Sur memoire pageable partagee (GB10) le GPU lit deja ces
+         * octets la ou ils sont : sans la vue l expert n est pas cuda_eligible
+         * et retombe sur le CPU.
+         *
+         * Mesure GB10, URING=1 : 13240 lignes d experts sur CPU (41,9 s) et
+         * p50 1106 ms contre 547 ms, alors que la presence restait a 90,8 %.
+         * Le reglage semblait donc nuisible ; il etait simplement non cable.
+         *
+         * Le commentaire ci-dessus -- "qt_resolve_fmt like the other two expert
+         * paths" -- dit que les trois chemins etaient gardes synchronises sur le
+         * FORMAT ; le cablage GPU, lui, n en couvrait qu un.
+         *
+         * Meme garde que dans expert_load_impl : jamais sur un slot adosse a l
+         * arene de pin, ceux-la sont traites apres placement a la fin de
+         * pin_load. Sur GPU discret coli_cuda_tensor_wrap refuse. */
+        if(!s->aslab){
+            qt_cuda_reset(qt[k]);
+            qt[k]->cuda_eligible=0;
+            if(coli_cuda_tensor_wrap(&qt[k]->cuda, s->slab+l->pos[k], fp[k],
+                                     qt[k]->fmt, qt[k]->I, qt[k]->O, 0, qt[k]->gs))
+                qt[k]->cuda_eligible=1;
+        }
+#endif
     }
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
@@ -8414,6 +8477,21 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 #endif
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
+        /* Les experts epingles que le placement a laisses SANS copie device
+         * calculaient jusqu ici sur CPU. Sur memoire pageable partagee (GB10)
+         * le GPU lit deja ces octets la ou ils sont : une VUE suffit, et elle
+         * ne coute rien.
+         *
+         * On le fait ICI, apres que le placement a tranche, et non pendant le
+         * chargement : sinon qt_cuda_upload verrait un tenseur "deja en place"
+         * et court-circuiterait sa copie, puis expert_host_release libererait
+         * la memoire sous la vue (mesure : logits non finis des la couche 4).
+         *
+         * L arene de pin est STABLE -- jamais recyclee, jamais liberee tant que
+         * l expert reste epingle -- contrairement aux emplacements de streaming.
+         * Et on ne touche QUE les experts : les tenseurs denses et les
+         * projections d attention gardent leur chemin, leurs tampons hotes
+         * pouvant etre reutilises ailleurs. */
         fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,
             g_cuda_expert_auto?safe_total/1e9:budget/1e9,
@@ -8452,6 +8530,48 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     if(warm_b<0.0) warm_b=0.0;
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,warm_b/1e9,now_s()-t0,statspath);
+#ifdef COLI_CUDA
+    /* Experts epingles laisses SANS copie device : sur memoire pageable
+     * partagee (GB10) le GPU lit deja ces octets la ou ils sont, une VUE
+     * suffit et ne coute rien.
+     *
+     * ICI et pas plus haut : les epingles du palier RAM ne sont charges que
+     * par la boucle juste au-dessus. Place avant elle, la passe ne voyait que
+     * des slots vides (mesure : 8 vues sur 3807 candidats).
+     *
+     * Apres le placement et non pendant le chargement : sinon qt_cuda_upload
+     * verrait un tenseur "deja en place", court-circuiterait sa copie, et
+     * expert_host_release libererait la memoire sous la vue (mesure : logits
+     * non finis des la couche 4).
+     *
+     * Uniquement les EXPERTS : les tenseurs denses et les projections
+     * d attention gardent leur chemin, leurs tampons hotes pouvant etre
+     * reutilises ailleurs. */
+    if(g_cuda_enabled && g_cuda_ndev>0 && m->pin && m->npin &&
+       coli_cuda_device_pageable(g_cuda_devices[0])){
+        int vues=0;
+        for(int L=0; L<=m->c.n_layers; L++){
+            for(int j2=0; j2<m->npin[L]; j2++){
+                ESlot *ps=&m->pin[L][j2];
+                if(ps->eid<0 || !ps->slab) continue;
+                if(ps->g.cuda && ps->u.cuda && ps->d.cuda) continue;   /* vraie copie */
+                QT *q3[3]={&ps->g,&ps->u,&ps->d};
+                int tous=1;
+                for(int k=0;k<3;k++)
+                    if(!q3[k]->cuda &&
+                       !coli_cuda_tensor_wrap(&q3[k]->cuda,q3[k]->q4,q3[k]->s,
+                                              q3[k]->fmt,q3[k]->I,q3[k]->O,0,q3[k]->gs))
+                        tous=0;
+                if(tous && ps->g.cuda && ps->u.cuda && ps->d.cuda){
+                    ps->g.cuda_eligible=ps->u.cuda_eligible=ps->d.cuda_eligible=1;
+                    vues++;
+                }
+            }
+        }
+        if(vues) fprintf(stderr,"[CUDA] %d experts epingles rendus calculables par VUE "
+                                "(zero copie, memoire pageable partagee)\n",vues);
+    }
+#endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l); free(slot_of); free(next);
 }
