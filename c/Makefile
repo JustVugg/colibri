@@ -898,6 +898,16 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
+V4_HOT_STORE_TEST_OBJS = \
+	COLI_V4_UNIT_ST.o \
+	COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16.o \
+	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
+
+tests/test_deepseek_v4_hot_store$(EXE): tests/test_deepseek_v4_hot_store.c \
+		deepseek_v4.c deepseek_v4.h Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $(V4_HOT_STORE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_HOT_STORE_TEST_OBJS) -o $@ -pthread $(LDFLAGS)
+
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
 V4_OWNERSHIP_OBJS = \

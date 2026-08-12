@@ -5733,6 +5733,7 @@ typedef struct V4HotPolicy {
     uint64_t *layer_requests;
     int *pins;
     unsigned char *packed;
+    pthread_mutex_t *pack_mutexes;
     uint64_t packed_slots;
     uint64_t history_total;
     int history_seeded;
@@ -6019,16 +6020,23 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
 #endif
 }
 
-/* state->mutex is held and the slot has at least one reference. */
-static int hot_pack_slot_locked(V4HotPolicy *policy,
-                                V4ExpertStoreState *state,
-                                const V4ExpertRecord *record,
-                                V4ExpertSlot *slot) {
+/* The caller holds a lease on slot.  The per-slot mutex keeps other leases
+ * from observing the in-place layout conversion, without serializing them
+ * behind unrelated expert loads. */
+static int hot_prepare_slot(V4HotPolicy *policy,
+                            V4ExpertStoreState *state,
+                            const V4ExpertRecord *record,
+                            V4ExpertSlot *slot, int should_pack) {
 #ifndef COLI_FP4_ROWS16_KERNEL
-    (void)policy; (void)state; (void)record; (void)slot; return -1;
+    (void)policy; (void)state; (void)record; (void)slot; (void)should_pack;
+    return -1;
 #else
     size_t slot_index = hot_slot_index(state, slot);
-    if (policy->packed[slot_index]) return 0;
+    pthread_mutex_lock(&policy->pack_mutexes[slot_index]);
+    if (!should_pack || policy->packed[slot_index]) {
+        pthread_mutex_unlock(&policy->pack_mutexes[slot_index]);
+        return 0;
+    }
     ColiTensorView gate, down, up;
     fill_tensor_view(&gate, record, slot, V4_W1);
     fill_tensor_view(&down, record, slot, V4_W2);
@@ -6046,9 +6054,12 @@ static int hot_pack_slot_locked(V4HotPolicy *policy,
                  hot_pack_matrix(&up, scratch);
     free(scratch);
     if (!result) {
+        pthread_mutex_lock(&state->mutex);
         policy->packed[slot_index] = 1;
         policy->packed_slots++;
+        pthread_mutex_unlock(&state->mutex);
     }
+    pthread_mutex_unlock(&policy->pack_mutexes[slot_index]);
     return result;
 #endif
 }
@@ -6112,8 +6123,13 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             slot = &slots[i]; slot->references++;
             state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
-            if (hot_is_pinned(policy, key.layer, key.expert))
-                hot_pack_slot_locked(policy, state, record, slot);
+            /* Existing row-major leases may still read this slab.  Defer an
+             * in-place conversion until this lookup owns the only lease. */
+            int should_pack = hot_is_pinned(policy, key.layer, key.expert) &&
+                slot->references == 1;
+            pthread_mutex_unlock(&state->mutex);
+            hot_prepare_slot(policy, state, record, slot, should_pack);
+            pthread_mutex_lock(&state->mutex);
             memset(view, 0, sizeof(*view)); view->key = key;
             hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
             hot_fill_view(&view->down, record, slot, V4_W2, policy, state);
@@ -6165,8 +6181,11 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
-    if (hot_is_pinned(policy, key.layer, key.expert))
-        hot_pack_slot_locked(policy, state, record, slot);
+    int should_pack = hot_is_pinned(policy, key.layer, key.expert) &&
+        slot->references == 1;
+    pthread_mutex_unlock(&state->mutex);
+    hot_prepare_slot(policy, state, record, slot, should_pack);
+    pthread_mutex_lock(&state->mutex);
     memset(view, 0, sizeof(*view)); view->key = key;
     hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
     hot_fill_view(&view->down, record, slot, V4_W2, policy, state);
@@ -6182,8 +6201,9 @@ static void destroy_hot(ColiExpertStore *store) {
     V4HotPolicy *policy = *link;
     if (policy) *link = policy->next;
     pthread_mutex_unlock(&hot_policies_mutex);
+    V4ExpertStoreState *state = store ? store->state : NULL;
     if (policy) {
-        hot_usage_save(policy, store ? store->state : NULL);
+        hot_usage_save(policy, state);
         fprintf(stderr, "v4_rows16 packed_slots=%llu\n",
                 (unsigned long long)policy->packed_slots);
         fprintf(stderr,
@@ -6198,6 +6218,12 @@ static void destroy_hot(ColiExpertStore *store) {
                 (unsigned long long)__atomic_load_n(
                     &v4_direct_payload_bytes, __ATOMIC_RELAXED));
         free(policy->history_path);
+        if (policy->pack_mutexes && state) {
+            size_t slots = (size_t)state->layers * state->slots_per_layer;
+            for (size_t i = 0; i < slots; i++)
+                pthread_mutex_destroy(&policy->pack_mutexes[i]);
+        }
+        free(policy->pack_mutexes);
         free(policy->packed); free(policy->pins);
         free(policy->layer_requests); free(policy->usage); free(policy);
     }
@@ -6295,14 +6321,19 @@ int COLI_V4_ROWS16_STORE_OPEN(
         (size_t)state->layers, sizeof(*policy->layer_requests));
     if (policy) policy->pins = malloc(pins * sizeof(*policy->pins));
     if (policy) policy->packed = calloc(slots, sizeof(*policy->packed));
+    if (policy) policy->pack_mutexes = calloc(
+        slots, sizeof(*policy->pack_mutexes));
     if (!policy || !policy->usage || !policy->layer_requests ||
-        !policy->pins || !policy->packed) {
+        !policy->pins || !policy->packed || !policy->pack_mutexes) {
+        free(policy ? policy->pack_mutexes : NULL);
         free(policy ? policy->packed : NULL); free(policy ? policy->pins : NULL);
         free(policy ? policy->layer_requests : NULL);
         free(policy ? policy->usage : NULL); free(policy);
         destroy(*output); *output = NULL;
         return set_error(error, error_size, "out of memory creating hot policy");
     }
+    for (size_t i = 0; i < slots; i++)
+        pthread_mutex_init(&policy->pack_mutexes[i], NULL);
     for (size_t i = 0; i < pins; i++) policy->pins[i] = -1;
     policy->store = *output; policy->pin_count = pin_count;
     policy->history_path = hot_history_path(options->model_dir);
