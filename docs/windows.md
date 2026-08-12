@@ -2,6 +2,63 @@
 
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
+---
+> **2026-08-09: Additional validation with detailed steps for laptop setup** \
+Lenovo Thinkpad P16v (Intel Core i7 ultra (155H 1.4GHz), 64GB RAM, 2Tb NVME drive, Nvidia RTX 2000 Ada generation 8GB (AD107, 2023)).
+Windows 11 pro english.\
+**Software installs:**\
+`- nvidia drivers` from https://www.nvidia.com/en-us/drivers/\
+`- nvidia cuda toolkit` from https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local\
+`- msys2` from https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-x86_64-20260611.exe\
+`- Microsoft Visual Studio 2022 built tools` installer from https://aka.ms/vs/17/release/vs_buildtools.exe then install Desktop Development with C++\
+`- winget install git.git python.python.3.14`\
+\
+`msys2` is installed in `c:\msys64` with its main launchers. (we will use `C:\msys64\mingw64.exe`)\
+Its executables tools `sh`, `bash`, `make`, `sed` etc go in `c:\msys64\usr\bin`. \
+From within `mingw64` we need to install compiler and make. \
+\
+`C:\msys64\mingw64.exe`\
+`pacman -S --needed mingw-w64-x86_64-gcc make`\
+\
+**colibri.exe and coli_cuda.*** build from MS Visual Studio and Nvidia CUDA Toolkit:\
+Microsoft Visual Studio tools includes a `vcvars64.bat` batch file that appropriately sets all the paths. \
+It is in `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`\
+\
+CUDA compilation is to be performed from a CMD shell, where we run `vcvars64` and then the path \
+extension for mingw64 build tools, as required by the make process (mingw64 `make` is used). \
+Open a command prompt shell (`cmd`, not powershell), cd to subfolder `c\` of the cloned repo and run:\
+\
+`%comspec% /k "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`
+`set PATH=%PATH%;C:\msys64\usr\bin`\
+`cd C:\Users\YOUR_USER\COLIBRI_REPO_FOLDER\c`\
+`make cuda-dll CUDA-ARCH=sm_89`\
+`make colibri.exe CUDA_DLL=1 ARCH=native`\
+`make iobench.exe`\
+\
+Replace `sm_89` with your Nvidia GPU architecture according to this table
+
+| Architecture | Example GPUs / Products | Compute Capability | `nvcc` Flag (`-arch=sm_XX`) |
+| :--- | :--- | :--- | :--- |
+| **Blackwell** | B100, B200, RTX 50x0 | 10.0, 12.0 | `sm_100`, `sm_120` |
+| **Hopper** | H100, H200, GH200 | 9.0 | `sm_90` / `sm_90a` |
+| **Ada Lovelace** | RTX 40x0, RTX 2000, L4, L40 | 8.9 | `sm_89` |
+| **Ampere** | A100, RTX 30x0, A10, Orin | 8.0, 8.6, 8.7 | `sm_80`, `sm_86`, `sm_87` |
+| **Turing** | RTX 2080, GTX 1660 Ti, T4 | 7.5 | `sm_75` |
+| **Volta** | V100, Titan V, Xavier | 7.0, 7.2 | `sm_70`, `sm_72` |
+| **Pascal** | P100, GTX 1080 Ti, P40 | 6.0, 6.1, 6.2 | `sm_60`, `sm_61`, `sm_62` |
+| **Maxwell** | M60, GTX 980, GTX TITAN X | 5.0, 5.2, 5.3 | `sm_50`, `sm_52`, `sm_53` |
+
+> The last make links `colibri.exe` with the newly built `coli_cuda.dll`\
+to just build `colibri.exe` with no nvidia CUDA support omit `CUDA_DLL=1`\
+`ARCH=native` ensures that colibri is build with optimizations specific for your CPU.\
+\
+**caveat**: to be sure the correct `make` is used, run `where.exe make` after path extension.\
+after compilation you should have `colibri.exe coli_cuda.lib, coli_cuda.exp, coli_cuda.dll` files.
+---
+
+
+
+
 ## 0. What you need
 
 | Piece | Why | Get it |

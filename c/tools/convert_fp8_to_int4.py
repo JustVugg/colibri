@@ -25,8 +25,33 @@ USO:
   # reale: scarica+converte+cancella shard per shard
   python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /path/to/glm52_i4
 """
-import os, sys, glob, json, shutil, argparse
+import os, sys, glob, json, shutil, argparse, threading
 import numpy as np
+
+
+_positioned_write_lock = threading.Lock()
+
+
+def _positioned_write(fd, data, offset):
+    remaining = memoryview(data)
+    pwrite = getattr(os, "pwrite", None)
+    if pwrite is not None:
+        while remaining:
+            written = pwrite(fd, remaining, offset)
+            if written == 0:
+                raise OSError("pwrite returned zero bytes")
+            remaining = remaining[written:]
+            offset += written
+        return
+
+    with _positioned_write_lock:
+        os.lseek(fd, offset, os.SEEK_SET)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written == 0:
+                raise OSError("write returned zero bytes")
+            remaining = remaining[written:]
+
 
 # ---------- quantizzazione: identica al C (glm.c) ----------
 def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
@@ -805,7 +830,8 @@ def main():
             except Exception: pass
         if not os.path.exists(part):
             with open(part, "wb") as f: f.truncate(expected)   # file sparse / sparse file
-        fd = os.open(part, os.O_WRONLY)
+        flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        fd = os.open(part, flags)
         t0 = _t.time(); nres = [0]; log_lock = threading.Lock(); stopfail = []
         def worker(t):
             s0, s1 = segs[t]
@@ -823,7 +849,7 @@ def main():
                             if not chunk: break
                             rem = (s1 - s0) - done[t]     # mai oltre il segmento / never past the segment
                             if len(chunk) > rem: chunk = chunk[:rem]
-                            os.pwrite(fd, chunk, s0 + done[t])
+                            _positioned_write(fd, chunk, s0 + done[t])
                             done[t] += len(chunk)
                 except KeyboardInterrupt: raise
                 except Exception as ex:

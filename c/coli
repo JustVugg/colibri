@@ -26,17 +26,15 @@ Configuration through environment variables or flags (also valid after the subco
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
 
-# Helper to tolerate test FakeProc objects that don't expose stdout/stderr
-def _ensure_stream(proc, name):
-    s = getattr(proc, name, None)
-    if s is None:
-        class _FakeStream:
-            def read(self, n=-1):
-                return b""
-            def readline(self):
-                return b""
-        return _FakeStream()
-    return s
+# input() only gets line editing and UP/DOWN history once the readline module
+# has been LOADED — without it the terminal's arrow-key escape sequences are
+# echoed raw into the prompt (#922). Guarded: Windows has no readline module
+# and the console provides its own editing; on FreeBSD Python links libedit,
+# which this activates the same way.
+try:
+    import readline  # noqa: F401 — importing it is the activation
+except ImportError:
+    pass
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
@@ -238,6 +236,79 @@ def hline(w): return f"{C.dgray}{'─'*w}{C.r}"
 # ---------- util ----------
 def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 
+def _read_pasted_lines(stream):
+    """Collect complete lines already queued after an interactive paste.
+
+    ``input()`` is line-oriented on libedit (including the FreeBSD build), so a
+    pasted block can return its first line while the remaining lines stay in
+    the terminal input queue.  Read only data that is immediately ready; a
+    normal Enter therefore remains a one-line prompt and typing for the next
+    turn is not blocked here.
+    """
+    lines = []
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            pending = []
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    lines.append("".join(pending))
+                    pending = []
+                elif ch not in ("\x00", "\xe0"):
+                    pending.append(ch)
+            if pending:
+                lines.append("".join(pending))
+            return lines
+        import select
+        while select.select([stream], [], [], 0)[0]:
+            line = stream.readline()
+            if not line:
+                break
+            lines.append(line.rstrip("\r\n"))
+    except (ImportError, OSError, ValueError):
+        # Some stdin implementations (notably embedded consoles) cannot be
+        # polled.  Keeping the first line is safer than blocking the chat loop.
+        pass
+    return lines
+
+def read_prompt(prompt=""):
+    """Read one prompt, retaining additional lines from a pasted block."""
+    first = input(prompt)
+    if not TTY:
+        return first
+    return "\n".join([first, *_read_pasted_lines(sys.stdin)])
+
+def prompt_box_lines(message, width):
+    """Wrap a prompt for the terminal box without losing explicit newlines."""
+    lines = []
+    for logical in message.splitlines() or [""]:
+        lines.extend(textwrap.wrap(logical, width=max(1, width),
+                                   replace_whitespace=False,
+                                   drop_whitespace=False) or [""])
+    return lines
+
+def prompt_input_rows(message, columns):
+    """Return the number of terminal rows occupied by the readline input."""
+    rows = 0
+    for index, logical in enumerate(message.splitlines() or [""]):
+        prefix = 6 if index == 0 else 0  # ``  │ › `` before the first line
+        rows += max(1, (prefix + len(logical) + columns - 1) // columns)
+    return rows
+
+def redraw_prompt_box(message, width):
+    """Replace readline's raw echo with a wrapped, multiline prompt box."""
+    clean = message.strip("\r\n")
+    columns = shutil.get_terminal_size((80,20)).columns
+    used = prompt_input_rows(clean, columns)
+    sys.stdout.write(f"\x1b[{used}A\x1b[0J")
+    inner = width - 3
+    for index, line in enumerate(prompt_box_lines(clean, inner)):
+        prefix = f"{C.teal}{C.b}›{C.r}" if index == 0 else " "
+        print(f"  {C.dgray}│{C.r} {prefix} {line}{' '*(inner-len(line))}{C.dgray}│{C.r}")
+    print(f"  {C.dgray}╰{'─'*width}╯{C.r}")
+    return clean
+
 def model_arch(model):
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
@@ -321,7 +392,10 @@ def env_for_engine(a, arch):
     if arch == "olmoe":
         env["CHAT"] = "1"
         env["MAX_NEW"] = str(ngen_for(a))
-        if a.temp is not None: env["TEMP"] = str(a.temp)
+        # olmoe reads COLI_TEMP like every other engine (line above). Setting the
+        # legacy TEMP alias here also clobbered %TEMP% with "0.7" for every child
+        # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
+        # ONLY working channel was a poisoned system variable (#509's exact shape).
     # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
@@ -948,7 +1022,7 @@ def chat_attached(a, base, model_id):
     its KV slots reuse the conversation prefix, so a continued chat skips
     re-prefill too. The engine byte-protocol stays untouched — this is plain
     OpenAI SSE over localhost, stdlib only."""
-    import urllib.request
+    import urllib.request, urllib.error
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
     msgs=[]
@@ -956,15 +1030,16 @@ def chat_attached(a, base, model_id):
     while True:
         if TTY:
             print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
-            try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            try: msg=read_prompt(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
             except EOFError: print(); break
-            print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+            try: msg=redraw_prompt_box(msg, w)
+            except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
         else:
             try: msg=input()
             except EOFError: break
-        msg=msg.strip()
+        msg=msg.strip("\r\n")
         if msg in (":q",":quit","exit"): break
-        if not msg: continue
+        if not msg.strip(): continue
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         msgs.append({"role":"user","content":msg})
         body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
@@ -992,10 +1067,24 @@ def chat_attached(a, base, model_id):
                         md.feed(txt); reply.append(txt)
         except KeyboardInterrupt:
             interrupted=True                          # il server annulla la richiesta alla disconnessione
+        except urllib.error.HTTPError as e:
+            # HTTPError IS-A OSError: without this arm a 4xx/5xx fell into the
+            # branch below and read as "server unreachable" — hiding the API's
+            # own explanation of what was wrong with the request (#975: a V4
+            # CONTEXT_EXCEEDED 400 took a screenshot to diagnose instead of a
+            # sentence). The body is OpenAI-shaped; show its message.
+            sp.stop()
+            try:
+                detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+            except Exception:
+                detail=""
+            print(f"\n  {C.yel}[the server rejected the request: HTTP {e.code}"
+                  f"{' — '+detail if detail else ''}]{C.r}")
+            msgs.pop(); continue                      # la richiesta non è mai partita: togli il turno e riprova
         except OSError as e:
             sp.stop()
             print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
-        sp.stop(); md.close()
+        md.close(); sp.stop()
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
@@ -1138,32 +1227,20 @@ def cmd_chat(a):
     except Exception: pass
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :more continues · :reset clears memory · :q exits{C.r}\n")
     w=term_w()-4
-    def user_box(msg):
-        """ri-disegna il messaggio dentro una box che si ADATTA su piu' righe:
-        l'input grezzo (che sborda) viene cancellato e sostituito dal testo avvolto."""
-        cols=shutil.get_terminal_size((80,20)).columns
-        used=max(1, (6+len(msg)+cols-1)//cols)          # righe occupate dall'input ("  │ › "+msg)
-        sys.stdout.write(f"\x1b[{used}A\x1b[0J")        # su di N righe e pulisci fino in fondo
-        inner=w-3                                        # spazio utile: "  │ › "+testo+"│" = w+4 colonne
-        lines=textwrap.wrap(msg, inner) or [""]
-        for i,ln in enumerate(lines):
-            pre = f"{C.teal}{C.b}›{C.r}" if i==0 else " "
-            print(f"  {C.dgray}│{C.r} {pre} {ln}{' '*(inner-len(ln))}{C.dgray}│{C.r}")
-        print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
     try:
         while True:
             if TTY:
                 print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
-                try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+                try: msg=read_prompt(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
                 except EOFError: print(); break
-                try: user_box(msg.strip())
+                try: msg=redraw_prompt_box(msg, w)
                 except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
             else:
                 try: msg=input()
                 except EOFError: break
-            msg=msg.strip()
+            msg=msg.strip("\r\n")
             if msg in (":q",":quit","exit"): break
-            if not msg: continue
+            if not msg.strip(): continue
             if msg==":reset":
                 p.stdin.write(b"\x02RESET\n"); p.stdin.flush()
                 stream_turn(p, END, lambda b: None)
@@ -1331,12 +1408,19 @@ def cmd_web(a):
     print(f"dashboard: {url}  (opens automatically when the engine is ready)")
     cmd_serve(a)
 
+def project_python():
+    if sys.platform == "win32":
+        candidate = os.path.join(HERE, "mio_env", "Scripts", "python.exe")
+    else:
+        candidate = os.path.join(HERE, "mio_env", "bin", "python3")
+    return candidate if os.path.exists(candidate) else sys.executable
+
+
 def cmd_bench(a):
     need_model(a.model)
     banner("bench")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    py = venv_py if os.path.exists(venv_py) else sys.executable
+    py = project_python()
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
     missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
@@ -1369,8 +1453,7 @@ def cmd_convert(a):
         sys.exit(f"{C.yel}no output directory given.{C.r}\n"
                  f"  --model <dir> is where the converted model is written")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    py = venv_py if os.path.exists(venv_py) else sys.executable
+    py = project_python()
     base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
           "--group-size", str(a.group_size)]

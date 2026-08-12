@@ -73,6 +73,7 @@ def analyze_model(model):
     per_layer = {layer: int(statistics.median(sizes)) for layer, sizes in layer_sizes.items()}
     per_cap_bytes = sum(per_layer.values())
     typical_expert_bytes = int(statistics.median(per_layer.values())) if per_layer else 0
+    max_expert_bytes = max(per_layer.values(), default=0)
     model_bytes = sum(shard.stat().st_size for shard in shards)
     return {
         "path": str(model),
@@ -83,6 +84,8 @@ def analyze_model(model):
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
         "typical_expert_bytes": typical_expert_bytes,
+        "max_expert_bytes": max_expert_bytes,
+        "expert_bytes_by_layer": per_layer,
         "per_cap_bytes": per_cap_bytes,
         "config": config,
     }
@@ -278,9 +281,12 @@ def _discover_nvidia_gpus():
                 free = memory_available() // (1024 * 1024)
             except (OSError, AttributeError):
                 total = free = 0
-        devices.append({"index": index, "name": fields[1],
+        name = fields[1]
+        unified = any(token in name.lower() for token in ("gb10", "jetson", "grace blackwell"))
+        devices.append({"index": index, "name": name,
                         "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024})
+                        "free_bytes": free * 1024 * 1024,
+                        "unified_memory": unified})
     return devices
 
 
@@ -327,7 +333,8 @@ def _discover_amd_gpus():
         free = max(total - used, 0)
         name = (row.get(name_col) or "").strip() if name_col else ""
         devices.append({"index": index, "name": name or f"AMD GPU {index}",
-                        "total_bytes": total, "free_bytes": free})
+                        "total_bytes": total, "free_bytes": free,
+                        "unified_memory": False})
     return devices
 
 
@@ -377,11 +384,17 @@ def physical_cpu_count():
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
     if sys.platform == "darwin":
-        # macOS has no lscpu. sysctl reports physical cores directly, and on
-        # Apple Silicon hw.physicalcpu counts P+E cores with no SMT sibling to
-        # dedupe. Without this branch the lscpu probe below fails and every run
-        # prints a spurious over-subscription warning on a machine that cannot
-        # over-subscribe.
+        # Apple Silicon's performance cores pace barriered expert matmuls. The
+        # physical count includes efficiency cores, which is not the useful
+        # OpenMP team size for this workload.
+        try:
+            result = subprocess.run(["sysctl", "-n", "hw.perflevel0.logicalcpu"],
+                                    text=True, capture_output=True, check=True, timeout=5)
+            cores = int(result.stdout.strip())
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
         try:
             result = subprocess.run(["sysctl", "-n", "hw.physicalcpu"], text=True,
                                     capture_output=True, check=True, timeout=5)
@@ -553,22 +566,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         wanted = set(gpu_indices)
         gpus = [gpu for gpu in gpus if gpu["index"] in wanted]
 
-    ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
-    if ram_budget < 4 * GB:
-        ram_budget = 8 * GB
+    unified = any(gpu.get("unified_memory", False) for gpu in gpus)
     typical = info["typical_expert_bytes"]
+    max_expert = info["max_expert_bytes"] or typical
     layers = int(cfg.get("num_hidden_layers") or 0) + 1
     kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
                                    int(cfg.get("qk_rope_head_dim") or 0)) * 4
     kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
         int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
-    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
-    cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
+    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert + kv_bytes + kv_buffer)
     per_cap = info["per_cap_bytes"]
     configured_experts = int(cfg.get("n_routed_experts") or 0)
-    cap = int(cache_bytes // per_cap) if per_cap else 0
-    if configured_experts:
-        cap = min(cap, configured_experts)
 
     reserve = 2 * GB
     gpu_plan = []
@@ -578,21 +586,48 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
-    # VRAM-resident experts do not need duplicate RAM backing: the checkpoint is
-    # their recovery source. RAM is therefore an independent warm compute tier.
-    vram_budget = min(requested_vram, safe_vram, info["expert_bytes"])
+    requested_vram_before_clamp = requested_vram
+    unified_pool = max(0, available_memory - info["dense_bytes"] - runtime_bytes)
+    if unified:
+        # Unified devices expose one physical pool to CUDA and the host. Do not
+        # let an expert tier consume pages that the RAM tier also believes are
+        # available. Dense/runtime reservations are shared exactly once below.
+        requested_vram = min(requested_vram, unified_pool)
+    vram_limit = unified_pool if unified else safe_vram
+    vram_budget = min(requested_vram, vram_limit, info["expert_bytes"])
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
+    warnings = []
+    if unified:
+        requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
+        requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)
+        ram_expert_bytes = min(requested_ram_experts,
+                               max(0, unified_pool - vram_budget))
+        ram_budget = info["dense_bytes"] + runtime_bytes + ram_expert_bytes
+        if requested_ram_experts > ram_expert_bytes:
+            warnings.append(
+                f"RAM budget clamped from {format_bytes(requested_ram)} to "
+                f"{format_bytes(ram_budget)} because the GPU shares physical memory")
+    else:
+        ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
+    if ram_budget < 4 * GB:
+        ram_budget = 8 * GB if not unified else max(0, ram_budget)
+    cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
+    cap = int(cache_bytes // per_cap) if per_cap else 0
+    if configured_experts:
+        cap = min(cap, configured_experts)
     warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), cache_bytes)
     cold_bytes = max(0, info["expert_bytes"] - hot_bytes - warm_bytes)
 
-    warnings = []
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
-    if gpus and vram_budget < requested_vram:
-        warnings.append("VRAM tier was clamped by free VRAM or model expert size")
+    if gpus and vram_budget < requested_vram_before_clamp:
+        warnings.append("VRAM tier was clamped by free VRAM, shared memory, or model expert size")
+    if unified:
+        warnings.append(
+            "GPU and RAM share one physical memory pool; budgets were jointly constrained")
     # The plan sizes the hot tier from *free* VRAM, so running it while an engine
     # instance already holds the GPUs silently produces a tiny tier and a
     # pessimistic hit rate that describe nothing. That is exactly when a user
@@ -640,8 +675,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
         "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
-                "sockets": max(1, int(cpu_sockets)),
-                "thread_policy": "physical-cores"},
+                 "sockets": max(1, int(cpu_sockets)),
+                 "thread_policy": "physical-cores"},
+        "memory": {"unified": unified, "available_bytes": available_memory},
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},

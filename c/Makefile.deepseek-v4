@@ -1,6 +1,8 @@
-# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux and Windows/MSYS2 only.
-# Uses GNU ld -Wl,--wrap and gcc -march; do not invoke from macOS/PowerPC
-# `make check` (the parent Makefile gates COLI_V4_SUPPORTED).
+# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux, Windows/MSYS2, and
+# arm64 macOS. (An earlier version of this header claimed GNU-ld --wrap as a
+# hard dependency; nothing here has used --wrap for a while, and macOS
+# portability rides compat.h: posix_fadvise -> F_RDADVISE, O_DIRECT ->
+# F_NOCACHE.) The parent Makefile gates COLI_V4_SUPPORTED.
 
 ifeq ($(OS),Windows_NT)
 IS_WIN := 1
@@ -19,10 +21,14 @@ else ifeq ($(UNAME_S),Linux)
 ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
 COLI_V4_OK := 1
 endif
+else ifeq ($(UNAME_S),Darwin)
+ifneq (,$(filter arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+endif
 endif
 
 ifneq ($(COLI_V4_OK),1)
-$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux and Windows/MSYS2)
+$(error Makefile.deepseek-v4 supports x86-64/aarch64 Linux, Windows/MSYS2, and arm64 macOS)
 endif
 
 ifneq ($(IS_WIN),)
@@ -32,9 +38,33 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
-	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
+else ifeq ($(UNAME_S),Darwin)
+# Apple clang has no bundled OpenMP runtime: use Homebrew libomp when its
+# artifacts are actually present, else build single-threaded (pragmas are
+# ignored). No -march: NEON is baseline on arm64 and the per-feature gates in
+# the sources do the rest. Mirrors the parent Makefile's Darwin block.
+CC = clang
+OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+OMPC = -Xclang -fopenmp -I$(OMPDIR)/include
+OMPL = -L$(OMPDIR)/lib -lomp
+else
+$(warning libomp not found: building deepseek_v4 single-threaded. brew install libomp)
+OMPC =
+OMPL =
+endif
+CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
+	-Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+LDFLAGS = -lm $(OMPL) -pthread
+V4_BINARY := deepseek_v4
 else
 CC = gcc
 ARCH ?= native
@@ -42,7 +72,8 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
-	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
 endif

@@ -70,7 +70,14 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "olmoe")
         self.assertEqual(env["CHAT"], "1")
         self.assertEqual(env["MAX_NEW"], "32")
-        self.assertEqual(env["TEMP"], "0.25")
+        # #509 for olmoe: the engine reads COLI_TEMP like every other arch.
+        # The legacy TEMP channel double-poisoned on Windows: it overrode the
+        # child's %TEMP% directory with "0.25", while a real %TEMP% path read
+        # back as atof("C:\...") == 0.0 and silently forced greedy decoding.
+        # env starts from os.environ, so TEMP may be inherited — the launcher
+        # must simply never write the temperature there.
+        self.assertEqual(env["COLI_TEMP"], "0.25")
+        self.assertNotEqual(env.get("TEMP"), "0.25")
 
     def test_olmoe_run_uses_its_engine_and_writes_one_prompt_line(self):
         directory, root = self.make_model("olmoe")
@@ -208,14 +215,26 @@ class V4CliTest(unittest.TestCase):
             "<\uff5cUser\uff5c>Again<\uff5cAssistant\uff5c><think>",
         )
 
-    def test_openai_renderer_rejects_unwired_tools(self):
+    def test_openai_renderer_scaffolds_v4_tools(self):
         import openai_server
 
-        with self.assertRaises(openai_server.APIError):
-            openai_server.render_chat_v4(
-                [{"role": "user", "content": "hello"}],
-                tools=[{"type": "function"}],
-            )
+        prompt = openai_server.render_chat_v4(
+            [{"role": "user", "content": "hello"}],
+            tools=[{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "current weather",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"}}, "required": ["city"]}}}],
+        )
+        self.assertIn("## Tools", prompt)
+        self.assertIn('"get_weather"', prompt)
+        # Sanity: tool_choice="none" suppresses the declaration.
+        no_tools = openai_server.render_chat_v4(
+            [{"role": "user", "content": "hello"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="none",
+        )
+        self.assertNotIn("## Tools", no_tools)
 
 
 if __name__ == "__main__":

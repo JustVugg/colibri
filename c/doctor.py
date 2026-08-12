@@ -468,20 +468,22 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         selected_gpus = [gpu for gpu in detected_gpus if gpu["index"] in wanted]
 
     if gpu_indices == []:
-        checks.append(_check("accelerator.cuda", "skip", "GPU use was explicitly disabled"))
+        checks.append(_check("accelerator.gpu", "skip", "GPU use was explicitly disabled"))
     elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
-        checks.append(_check("accelerator.cuda", "fail", "one or more requested GPUs were not detected",
+        checks.append(_check("accelerator.gpu", "fail", "one or more requested GPUs were not detected",
                              requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
     elif selected_gpus and linkage.get("missing"):
-        checks.append(_check("accelerator.cuda", "fail", "CUDA runtime library is missing"))
+        checks.append(_check("accelerator.gpu", "fail", "GPU runtime library is missing"))
     elif selected_gpus and linkage.get("linked"):
-        checks.append(_check("accelerator.cuda", "pass", "CUDA engine and devices are available",
-                             devices=[gpu["index"] for gpu in selected_gpus]))
+        checks.append(_check("accelerator.gpu", "pass", "GPU engine and devices are available",
+                             devices=[gpu["index"] for gpu in selected_gpus],
+                             unified=any(gpu.get("unified_memory", False)
+                                         for gpu in selected_gpus)))
     elif selected_gpus:
-        checks.append(_check("accelerator.cuda", "warn", "NVIDIA GPU detected but the engine is CPU-only",
+        checks.append(_check("accelerator.gpu", "warn", "GPU detected but the engine is CPU-only",
                              devices=[gpu["index"] for gpu in selected_gpus]))
     else:
-        checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
+        checks.append(_check("accelerator.gpu", "skip", "no supported GPU detected; CPU path is available"))
 
     try:
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,

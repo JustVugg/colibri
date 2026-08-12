@@ -147,8 +147,11 @@ jobs:
           - os: macos-latest
             name: macos
             shell: bash
-            # No v4: the engine builds on x86-64 Linux/Windows and aarch64 Linux
-            # only (COLI_V4_SUPPORTED in c/Makefile); the target exits 1 here.
+            # arm64 macOS joined COLI_V4_SUPPORTED: compat.h carries the
+            # platform differences (fadvise/F_RDADVISE, O_DIRECT/F_NOCACHE)
+            # and the token-exact tiny oracle below is the acceptance gate.
+            v4: "1"
+
           - os: windows-latest
             name: windows
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
@@ -190,6 +193,29 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+
+      # macOS is the newest COLI_V4_SUPPORTED platform and the only one whose
+      # engine coverage lives solely in this job (Linux has the v4-tiny job in
+      # check.yml, Windows was first exercised at the release tag). The tiny
+      # oracle is the token-exactness gate: it fails on any numerical or I/O
+      # divergence, which is exactly what a platform port can break.
+      #
+      # The check target REGENERATES the fixture (--force) before comparing,
+      # so it needs the same pinned torch/transformers the Linux v4-tiny job
+      # installs -- without them the step dies in generation, not in the
+      # oracle (round 2 of this PR measured exactly that).
+      - uses: actions/setup-python@v5
+        if: matrix.os == 'macos-latest'
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install pinned tiny-fixture dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
+      - name: DeepSeek V4 tiny oracle (macOS)
+        if: matrix.os == 'macos-latest'
+        run: make -C c deepseek-v4-tiny-check
 
       # The Windows backend-DLL loader contract (c/tests/test_backend_loader.py)
       # had no CI anywhere: the `python` job below is Linux-only, where these

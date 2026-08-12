@@ -223,6 +223,29 @@ AUX_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json",
              "special_tokens_map.json", "chat_template.jinja"]
 
 
+def acquire_output_lock(outdir):
+    lock = open(os.path.join(outdir, ".convert.lock"), "w")
+    try:
+        import fcntl
+    except ImportError:
+        try:
+            import msvcrt
+        except ImportError:
+            return lock
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            lock.close()
+            sys.exit("ERROR: another converter is already using this output directory.")
+    else:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            sys.exit("ERROR: another converter is already using this output directory.")
+    return lock
+
+
 def shard_out_name(src):
     m = re.search(r"model-(\d+)-of-\d+\.safetensors$", os.path.basename(src))
     return f"out-{m.group(1)}.safetensors" if m else \
@@ -418,12 +441,7 @@ def main():
     if not a.indir or not a.outdir:
         ap.error("--indir and --outdir required")
     os.makedirs(a.outdir, exist_ok=True)
-    lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
-    import fcntl
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        sys.exit("ERROR: another converter is already using this output directory.")
+    lock = acquire_output_lock(a.outdir)
     convert_dir(a.indir, a.outdir, a.xbits, watch=a.watch, delete_src=a.delete_src)
 
 

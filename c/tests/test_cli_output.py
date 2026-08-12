@@ -63,6 +63,43 @@ class CliOutputLanguageTest(unittest.TestCase):
         self.assertIn("set COLI_MODEL or use --model", result.stderr)
 
 
+class InteractivePromptTest(unittest.TestCase):
+    """Pasted prompts stay intact and render predictably in the TUI box."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_prompt_under_test", str(CLI))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    def test_prompt_box_preserves_newlines_and_indentation(self):
+        lines = self.coli.prompt_box_lines("int main() {\n  return 0;\n}", 20)
+        self.assertEqual(lines, ["int main() {", "  return 0;", "}"])
+
+    def test_prompt_box_wraps_long_lines_without_collapsing_whitespace(self):
+        lines = self.coli.prompt_box_lines("    return a_long_name;", 10)
+        self.assertEqual(lines, ["    return", " a_long_na", "me;"])
+
+    def test_prompt_input_rows_accounts_for_explicit_lines(self):
+        self.assertEqual(self.coli.prompt_input_rows("one\ntwo", 80), 2)
+        self.assertEqual(self.coli.prompt_input_rows("x" * 80, 80), 2)
+
+    def test_read_prompt_collects_lines_already_queued_after_first(self):
+        import io
+        import select
+
+        stream = io.StringIO("second\nthird\n")
+        with mock.patch.object(self.coli, "TTY", True), \
+             mock.patch.object(self.coli.sys, "platform", "freebsd"), \
+             mock.patch("builtins.input", return_value="first"), \
+             mock.patch.object(self.coli.sys, "stdin", stream), \
+             mock.patch.object(select, "select", side_effect=(
+                 ([stream], [], []), ([stream], [], []), ([], [], []),
+             )):
+            self.assertEqual(self.coli.read_prompt(), "first\nsecond\nthird")
+
+
 class ChatCapForwardingTest(unittest.TestCase):
     """#379/#386 r2 (F9): `coli chat` on a non-glm model spawns openai_server
     as its local server. An explicit --cap must ride along on that command

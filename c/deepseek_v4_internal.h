@@ -15,6 +15,13 @@
 #include "native_quant_fp4_rows16.h"
 #include "st.h"
 
+/* Worker count for the persistent expert-loader pool in the block pipeline
+ * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
+ * team around the loaders instead of scheduling compute onto their CPUs. */
+#ifndef COLI_V4_EXPERT_LOADER_COUNT
+#define COLI_V4_EXPERT_LOADER_COUNT 3
+#endif
+
 #define COLI_ST_MAX_RANK ST_MAX_RANK
 #define COLI_ST_BF16 0
 #define COLI_ST_F16 1

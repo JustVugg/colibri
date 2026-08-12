@@ -197,6 +197,33 @@ int main(void){
     CHECK(wide > narrow);                    /* int8 head is wider than int4 rows */
     CHECK(probe == wide);                    /* the probe is the container maximum */
 
+    /* ---- B. PIN_GB buys the ranked prefix at each row's real cost (#885) -- */
+    {
+        PinRec ranked[5]={
+            {FIRST_DENSE,0,500}, {FIRST_DENSE+1,0,400},
+            {FIRST_DENSE+2,0,300}, {FIRST_DENSE+3,0,200},
+            {N_LAYERS,0,100}
+        };
+        double four_narrow=4.0*(double)narrow;
+        int exact=pin_count_for_budget(&m,ranked,0,5,four_narrow);
+        int old=(int)(four_narrow/(double)probe);
+        printf("B. PIN budget %.0f B: row-aware %d experts, widest-divisor %d\n",
+            four_narrow,exact,old);
+        CHECK(exact==4);                       /* all four affordable routed experts */
+        CHECK(old<exact);                      /* #885's under-pinning is reproduced */
+        CHECK(pin_range_bytes(&m,ranked,0,exact)<=four_narrow);
+
+        /* Prefix semantics are intentional: do not skip a hotter wide expert to
+         * admit a colder narrow one, and support a disjoint post-VRAM suffix. */
+        PinRec mixed[3]={
+            {FIRST_DENSE,0,30}, {N_LAYERS,0,20}, {FIRST_DENSE+1,0,10}
+        };
+        CHECK(pin_count_for_budget(&m,mixed,0,3,(double)narrow+(double)wide-1.0)==1);
+        CHECK(pin_count_for_budget(&m,mixed,0,3,(double)narrow+(double)wide)==2);
+        CHECK(pin_count_for_budget(&m,mixed,1,3,(double)wide+(double)narrow)==2);
+        CHECK(pin_count_for_budget(&m,mixed,3,3,1e9)==0);
+    }
+
     /* ---- (1) the divisor is the sum of the REAL widths --------------------- */
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m.L[i].sparse) nsp++;
     double row_b = expert_cache_row_bytes(&m,m.ebits);

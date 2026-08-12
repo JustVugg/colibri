@@ -24,9 +24,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent.parent
@@ -103,6 +106,59 @@ class LauncherDispatchTest(unittest.TestCase):
         """Guards the whole file: if _BANNER_MODELS is ever renamed or emptied,
         the loops above pass vacuously and this suite proves nothing."""
         self.assertGreaterEqual(len(self.cli._BANNER_MODELS), 5)
+
+
+class ProjectPythonTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = load_cli()
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def test_bench_and_convert_use_windows_project_python(self):
+        python = self.root / "mio_env" / "Scripts" / "python.exe"
+        python.parent.mkdir(parents=True)
+        python.write_bytes(b"")
+        data = self.root / "data"
+        data.mkdir()
+        (data / "hellaswag.jsonl").write_text("", encoding="utf-8")
+
+        bench = types.SimpleNamespace(
+            model="model", tasks=["hellaswag"], data=str(data), limit=1, ram=None)
+        convert = types.SimpleNamespace(
+            model="output", repo="repo", ebits=4, io_bits=4,
+            group_size=128, xbits=None, no_mtp=True)
+
+        with mock.patch.object(self.cli, "HERE", str(self.root)), \
+             mock.patch.object(self.cli.sys, "platform", "win32"), \
+             mock.patch.object(self.cli, "need_model"), \
+             mock.patch.object(self.cli, "banner"), \
+             mock.patch.object(self.cli, "env_for", return_value={}), \
+             mock.patch.object(self.cli.subprocess, "call", return_value=0) as call:
+            with self.assertRaisesRegex(SystemExit, "0"):
+                self.cli.cmd_bench(bench)
+            self.assertEqual(call.call_args.args[0][0], str(python))
+
+            call.reset_mock()
+            with self.assertRaisesRegex(SystemExit, "0"):
+                self.cli.cmd_convert(convert)
+            self.assertEqual(call.call_args.args[0][0], str(python))
+
+    def test_posix_project_python_is_unchanged(self):
+        python = self.root / "mio_env" / "bin" / "python3"
+        python.parent.mkdir(parents=True)
+        python.write_bytes(b"")
+        with mock.patch.object(self.cli, "HERE", str(self.root)), \
+             mock.patch.object(self.cli.sys, "platform", "linux"):
+            self.assertEqual(self.cli.project_python(), str(python))
+
+    def test_missing_project_python_falls_back_to_current_interpreter(self):
+        with mock.patch.object(self.cli, "HERE", str(self.root)), \
+             mock.patch.object(self.cli.sys, "platform", "win32"):
+            self.assertEqual(self.cli.project_python(), sys.executable)
 
 
 if __name__ == "__main__":

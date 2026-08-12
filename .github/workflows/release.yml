@@ -21,8 +21,10 @@ jobs:
             name: macos-arm64
             ext: ""
             make_args: ""
-            # No v4: DeepSeek V4 is x86-64 Linux/Windows + aarch64 Linux only
-            # (c/Makefile, COLI_V4_SUPPORTED). Asking for it here fails the build.
+            # arm64 macOS joined COLI_V4_SUPPORTED; the archive verify step
+            # asserts the engine is present and dispatchable like the others.
+            v4: "1"
+
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"

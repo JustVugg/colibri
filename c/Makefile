@@ -340,8 +340,11 @@ CUDA_OBJ  =
 
 # DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
 # tests run everywhere; the engine and token-exact fixture run on x86-64
-# Linux/Windows and aarch64 Linux. SIMD fast paths are gated per-feature
-# inside the sources, so a plain armv8-a build stays correct.
+# Linux/Windows, aarch64 Linux, and arm64 macOS. SIMD fast paths are gated
+# per-feature inside the sources, so a plain armv8-a build stays correct.
+# macOS portability rides compat.h (posix_fadvise -> F_RDADVISE, O_DIRECT ->
+# F_NOCACHE via st.h's direct twins) plus a mach branch for available memory;
+# the token-exact tiny fixture is the acceptance gate on the macos runner.
 COLI_V4_SUPPORTED :=
 ifneq (,$(X86_64))
 ifneq (,$(IS_WIN)$(LINUX))
@@ -349,7 +352,7 @@ COLI_V4_SUPPORTED := 1
 endif
 endif
 ifneq (,$(AARCH64))
-ifneq (,$(LINUX))
+ifneq (,$(LINUX)$(DARWIN))
 COLI_V4_SUPPORTED := 1
 endif
 endif
@@ -801,6 +804,9 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_cfg_topk$(EXE): tests/test_cfg_topk.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
