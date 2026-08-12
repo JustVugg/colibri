@@ -56,6 +56,7 @@ typedef int            (*fn_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
 typedef int            (*fn_device_integrated)(int device);
+typedef void           (*fn_set_tile_min)(int n);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
@@ -143,6 +144,7 @@ static struct {
     fn_device_at       device_at;
     fn_mem_info        mem_info;
     fn_device_integrated device_integrated;
+    fn_set_tile_min      set_tile_min;
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_group_stats_device group_stats_device;
@@ -1386,6 +1388,7 @@ static int coli_cuda_load(void){
      * "not integrated" (0), so the RAM-budget correction simply doesn't apply
      * rather than taking the whole GPU backend down over one missing symbol. */
     RESOLVE_OPT(device_integrated, fn_device_integrated)
+    RESOLVE_OPT(set_tile_min, fn_set_tile_min)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(group_stats_device, fn_group_stats_device)
@@ -1491,6 +1494,13 @@ int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes){
 int coli_cuda_device_integrated(int device){
     if(!g_cuda.available || !g_cuda.device_integrated) return 0;
     return g_cuda.device_integrated(device);
+}
+
+/* Optional: a DLL predating the tiled dispatch simply never engages it, which is
+ * the same state as not opting in. Silently doing nothing is correct here. */
+void coli_cuda_set_tile_min(int n){
+    if(!g_cuda.available || !g_cuda.set_tile_min) return;
+    g_cuda.set_tile_min(n);
 }
 
 void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes){
