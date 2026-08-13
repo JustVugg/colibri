@@ -227,6 +227,20 @@ def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) ->
         ],
         env=dict(os.environ, CTX="768"),
     )
+    # `coli tune` compares candidates from tokens-and-elapsed, and before #898
+    # only the GLM engine emitted a parseable line -- so the tuner ran GLM at
+    # every checkpoint. Assert the line here rather than trusting a one-off
+    # manual check: the first placement of it compiled fine and sat in a branch
+    # text mode never reaches, so it never printed and nothing noticed.
+    tune = re.search(r"TUNE decode: (\d+) tokens in ([0-9.]+)s", result.stdout)
+    if not tune:
+        raise AssertionError(
+            f"target CLI: no TUNE decode line on stdout: {result.stdout!r}"
+        )
+    if int(tune.group(1)) != 1 or not float(tune.group(2)) > 0:
+        raise AssertionError(f"target CLI: implausible TUNE decode line {tune.group(0)!r}")
+    print("PASS target CLI: TUNE decode line is present and parseable")
+
     stats = re.search(r"v4_tokens prompt=(\d+) generated=(\d+)", result.stderr)
     if not stats or tuple(map(int, stats.groups())) != (prompt_tokens, 1):
         raise AssertionError(

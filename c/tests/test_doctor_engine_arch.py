@@ -21,6 +21,7 @@ ARCHES = [
     ("glm-5.2", "colibri"),
     ("inkling", "inkling"),
     ("kimi_k3", "kimi_k3"),
+    ("olmoe", "olmoe"),
 ]
 
 

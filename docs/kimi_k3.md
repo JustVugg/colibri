@@ -94,7 +94,11 @@ load-time algorithm and stored as `U8` + `<name>.qs` f32 scales, the small /
 sensitive tensors (norms, router, conv taps, `dt_bias`, `A_log`, `f_a/f_b`,
 `b_proj`, embeddings) pass through, vision is dropped. Output is spec-valid
 safetensors (`model-XXXXX-of-000094.safetensors`) plus a regenerated index;
-interrupted runs resume per shard. `--verify-full` re-reads every expert byte
+interrupted runs resume per shard. On every run, including disjoint `--shards`
+passes, the index is rebuilt atomically from all completed output shards in the
+destination; its `total_size` therefore includes both new and previously
+converted data. Duplicate tensor names abort the index update instead of
+publishing an ambiguous artifact. `--verify-full` re-reads every expert byte
 and compares against the source.
 
 The engine auto-detects container tensors (dtype U8 + `.qs` sidecar) and skips

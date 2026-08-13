@@ -30,6 +30,7 @@ Classification needs the layer type (o_proj/g_proj exist on BOTH KDA and MLA
 layers) — read from config.json linear_attn_config.
 """
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -81,7 +82,8 @@ def quant_int4_g64(rows):
 
 class Classifier:
     def __init__(self, src):
-        cfg = json.load(open(os.path.join(src, "config.json")))
+        with open(os.path.join(src, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
         tc = cfg.get("text_config", cfg)
         self.kda = set(x - 1 for x in tc["linear_attn_config"]["kda_layers"])
 
@@ -220,6 +222,52 @@ def repack_shard(src_path, dst_path, cls, bits_map, verify_full):
     return oh, written
 
 
+def rebuild_index(dst):
+    """Publish an index covering every completed output shard in dst."""
+    dst = os.fspath(dst)
+    index = {}
+    total = 0
+    shards = sorted(glob.glob(os.path.join(dst, "model-*-of-000094.safetensors")))
+    for path in shards:
+        header, data_start = read_header(path)
+        name = os.path.basename(path)
+        payload_size = os.path.getsize(path) - data_start
+        if payload_size < 0:
+            raise ValueError(f"{name}: header exceeds file size")
+        for tensor, meta in header.items():
+            previous = index.get(tensor)
+            if previous is not None:
+                raise ValueError(f"duplicate tensor {tensor!r} in {previous} and {name}")
+            try:
+                start, end = meta["data_offsets"]
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"{name}: tensor {tensor!r} has invalid data offsets") from None
+            if (isinstance(start, bool) or isinstance(end, bool) or
+                    not isinstance(start, int) or not isinstance(end, int) or
+                    start < 0 or end < start or end > payload_size):
+                raise ValueError(f"{name}: tensor {tensor!r} has invalid data offsets")
+            index[tensor] = name
+            total += end - start
+
+    if not shards:
+        return 0, 0
+    index_path = os.path.join(dst, "model.safetensors.index.json")
+    tmp = index_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"metadata": {"total_size": total}, "weight_map": index}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, index_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return len(shards), total
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -238,10 +286,8 @@ def main():
     cls = Classifier(a.src)
     shard_nums = ([int(x) for x in a.shards.split(",")] if a.shards
                   else list(range(1, 95)))
-    index = {}
     t0 = time.time()
-    total = 0
-    done_any = False
+    written_total = 0
     for i, num in enumerate(shard_nums):
         sp = os.path.join(a.src, f"model-{num:05d}-of-000096.safetensors")
         dname = f"model-{num:05d}-of-000094.safetensors"
@@ -250,29 +296,24 @@ def main():
             print(f"[{num:2d}] SOURCE MISSING — skipped (rerun when downloaded)", flush=True)
             continue
         if os.path.exists(dp):
-            oh, _ = read_header(dp)
-            for name in oh:
-                index[name] = dname
             print(f"[{num:2d}] exists — skipped (resume)", flush=True)
             continue
-        oh, written = repack_shard(sp, dp, cls, bits_map, a.verify_full)
-        for name in oh:
-            index[name] = dname
-        total += written
-        done_any = True
+        _header, written = repack_shard(sp, dp, cls, bits_map, a.verify_full)
+        written_total += written
         el = time.time() - t0
         print(f"[{num:2d}] {os.path.getsize(dp)/1e9:6.2f} GB out "
-              f"({total/1e9:7.1f} GB total, {total/1e9/max(el,1e-9):5.2f} GB/s, {el:6.0f}s)",
+              f"({written_total/1e9:7.1f} GB written, "
+              f"{written_total/1e9/max(el,1e-9):5.2f} GB/s, {el:6.0f}s)",
               flush=True)
-    if done_any or index:
-        with open(os.path.join(a.dst, "model.safetensors.index.json"), "w") as f:
-            json.dump({"metadata": {"total_size": total}, "weight_map": index}, f)
+    indexed_shards, indexed_total = rebuild_index(a.dst)
     for extra in ("config.json", "generation_config.json", "tokenizer.json",
                   "tokenizer_config.json"):
         s = os.path.join(a.src, extra)
         if os.path.exists(s):
             shutil.copy2(s, os.path.join(a.dst, extra))
-    print(f"done: {total/1e9:.1f} GB written in {time.time()-t0:.0f}s -> {a.dst}")
+    print(f"done: {written_total/1e9:.1f} GB written this run; "
+          f"index covers {indexed_total/1e9:.1f} GB in {indexed_shards} shard(s); "
+          f"{time.time()-t0:.0f}s -> {a.dst}")
 
 
 if __name__ == "__main__":

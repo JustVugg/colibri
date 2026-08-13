@@ -15,6 +15,13 @@
 #include "native_quant_fp4_rows16.h"
 #include "st.h"
 
+/* Worker count for the persistent expert-loader pool in the block pipeline
+ * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
+ * team around the loaders instead of scheduling compute onto their CPUs. */
+#ifndef COLI_V4_EXPERT_LOADER_COUNT
+#define COLI_V4_EXPERT_LOADER_COUNT 3
+#endif
+
 #define COLI_ST_MAX_RANK ST_MAX_RANK
 #define COLI_ST_BF16 0
 #define COLI_ST_F16 1
@@ -111,6 +118,17 @@ int coli_v4_rope_precompute(float *cosines, float *sines,
                             int dimension, int sequence_length,
                             int original_sequence_length, float base,
                             float factor, int beta_fast, int beta_slow);
+
+int coli_v4_rope_precompute_range(float *cosines, float *sines,
+                                  int dimension, int start_position,
+                                  int sequence_length,
+                                  int original_sequence_length, float base,
+                                  float factor, int beta_fast, int beta_slow);
+
+int coli_v4_rope_position(float *cosines, float *sines,
+                          int dimension, int position,
+                          int original_sequence_length, float base,
+                          float factor, int beta_fast, int beta_slow);
 
 int coli_v4_rope_apply(float *vectors, int vector_count, int dimension,
                        const float *cosines, const float *sines, int inverse);

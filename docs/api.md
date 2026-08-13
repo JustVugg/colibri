@@ -98,18 +98,27 @@ export ANTHROPIC_MODEL=glm-5.2-colibri
 claude
 ```
 
-Supported: system prompts (string or text blocks), multi-turn `user`/`assistant`
-messages, `text` / `tool_use` / `tool_result` content blocks, tools with
-`input_schema`, every `tool_choice` mode, streaming with the full named-event
+Supported on every served architecture: system prompts (string or text blocks),
+multi-turn `user`/`assistant` messages, streaming with the full named-event
 sequence (`message_start` → `content_block_*` → `message_delta` → `message_stop`,
-plus protocol `ping` keepalives during long prefills), `stop_reason`
-(`end_turn` / `max_tokens` / `tool_use`), Anthropic `usage` field names, and
-`x-api-key` authentication (`Authorization: Bearer` also works). Extended
-thinking is enabled with `{"thinking": {"type": "enabled"}}`.
+plus protocol `ping` keepalives during long prefills), `stop_reason`, Anthropic
+`usage` field names, and `x-api-key` authentication (`Authorization: Bearer`
+also works). The gateway renders each request with the active engine's native
+chat template; GLM, Inkling, Kimi K3, and DeepSeek V4 prompts are not
+interchangeable. Extended thinking is enabled with
+`{"thinking": {"type": "enabled"}}` and is translated to that architecture's
+reasoning protocol.
+
+Tool use (`tool_use` / `tool_result`, `input_schema`, and every `tool_choice`
+mode) is currently GLM-only. Inkling, Kimi K3, and DeepSeek V4 reject tool
+requests explicitly instead of feeding GLM tool markers to an incompatible
+tokenizer.
 
 Not supported, and refused explicitly rather than ignored: `stop_sequences`,
 `top_k`, and non-text content blocks (images, documents). Errors use Anthropic's
-own `{"type":"error","error":{...}}` envelope on this path.
+own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
+features that have not been wired to this protocol are likewise rejected with
+an explicit error.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path

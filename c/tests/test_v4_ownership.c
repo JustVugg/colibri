@@ -284,11 +284,58 @@ static int test_session_tokenizer_freed(void) {
     return 0;
 }
 
+static void restore_setting(const char *name, char *value) {
+    if (value) setenv(name, value, 1);
+    else unsetenv(name);
+    free(value);
+}
+
+static int test_incomplete_full_dspark_profile_not_reserved(void) {
+    char directory[128], error[256];
+    if (make_fixture(directory, sizeof(directory))) return 1;
+
+    const char *draft = getenv("V4_DRAFT");
+    const char *mtp = getenv("V4_MTP");
+    char *saved_draft = draft ? strdup(draft) : NULL;
+    char *saved_mtp = mtp ? strdup(mtp) : NULL;
+    if ((draft && !saved_draft) || (mtp && !saved_mtp) ||
+        setenv("V4_DRAFT", "1", 1) || setenv("V4_MTP", "1", 1)) {
+        restore_setting("V4_DRAFT", saved_draft);
+        restore_setting("V4_MTP", saved_mtp);
+        cleanup_fixture(directory);
+        return 1;
+    }
+
+    coli_v4_test_skip_expert_store_open = 1;
+    ColiV4Engine *engine = NULL;
+    ColiV4EngineOpenOptions options = {.target_model_dir = directory};
+    int result = coli_v4_engine_open(&engine, &options, error, sizeof(error));
+    uint64_t reserved = engine
+        ? engine->runtime.dspark_reserve_bytes : 0;
+    int passed = !result && engine &&
+                 reserved == 0;
+    if (engine) coli_v4_engine_destroy(engine);
+    coli_v4_test_skip_expert_store_open = 0;
+    restore_setting("V4_DRAFT", saved_draft);
+    restore_setting("V4_MTP", saved_mtp);
+    cleanup_fixture(directory);
+    if (!passed) {
+        fprintf(stderr,
+                "incomplete DSpark profile reserved %llu bytes: %s\n",
+                (unsigned long long)reserved,
+                error);
+        return 1;
+    }
+    puts("ownership: incomplete full DSpark profile reserves no cache: ok");
+    return 0;
+}
+
 int main(void) {
     if (test_index_closed_on_expert_fail()) return 1;
     if (test_engine_owns_model_path()) return 1;
     if (test_session_lifetime_accounting()) return 1;
     if (test_session_tokenizer_freed()) return 1;
+    if (test_incomplete_full_dspark_profile_not_reserved()) return 1;
     puts("DeepSeek-V4 ownership tests: ok");
     return 0;
 }

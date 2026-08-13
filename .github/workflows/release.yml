@@ -16,14 +16,20 @@ jobs:
             name: linux-x86_64
             ext: ""
             make_args: "ARCH=x86-64-v3"
+            v4: "1"
           - os: macos-latest
             name: macos-arm64
             ext: ""
             make_args: ""
+            # arm64 macOS joined COLI_V4_SUPPORTED; the archive verify step
+            # asserts the engine is present and dispatchable like the others.
+            v4: "1"
+
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"
             make_args: ""
+            v4: "1"
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
             # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
             shell: "msys2 {0}"
@@ -61,6 +67,23 @@ jobs:
           done
           ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }}
 
+      # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
+      # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
+      # the result: v1.5.0 was titled "DeepSeek V4 Flash" and shipped no
+      # deepseek_v4.exe, so `coli web --model .../DeepSeek-V4-Flash` answered
+      # "deepseek-v4 engine is not built" with the release freshly unzipped.
+      #
+      # Separate step rather than another entry in that loop because the engine
+      # builds on x86-64 Linux/Windows and aarch64 Linux only (COLI_V4_SUPPORTED);
+      # on macos-arm64 the target deliberately exits 1, and folding it in would
+      # turn that into a red release build.
+      - name: Build DeepSeek V4 engine
+        if: matrix.v4 == '1'
+        run: |
+          cd c
+          make deepseek-v4 ${{ matrix.make_args }}
+          ls -lh deepseek_v4${{ matrix.ext }}
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -97,6 +120,12 @@ jobs:
           cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
           cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
           cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+          # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
+          # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
+          # the macos-arm64 archive has no such engine to ship (#858).
+          if [ "${{ matrix.v4 }}" = "1" ]; then
+            cp c/deepseek_v4${{ matrix.ext }} dist/deepseek_v4${{ matrix.ext }}
+          fi
           # Kimi K3 ships tiktoken.model, not tokenizer.json; k3_tokenizer.py synthesizes
           # it. Without this the engine is in the archive but `coli chat` still cannot
           # run it -- the second half of #720.
@@ -137,7 +166,12 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          for e in inkling kimi_k3 olmoe; do
+          SIBLINGS="inkling kimi_k3 olmoe"
+          # deepseek_v4 only where the engine builds (COLI_V4_SUPPORTED); asserting it
+          # unconditionally would fail the macos-arm64 archive for shipping an engine
+          # that platform cannot have.
+          if [ "${{ matrix.v4 }}" = "1" ]; then SIBLINGS="$SIBLINGS deepseek_v4"; fi
+          for e in $SIBLINGS; do
             test -x $e${{ matrix.ext }} || { echo "FAIL: $e missing from archive"; ls -la; exit 1; }
           done
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
@@ -149,14 +183,48 @@ jobs:
           # fine. The check was wrong, not the artifact.
           python3 -c "import ast; ast.parse(open('tools/k3_tokenizer.py', encoding='utf-8').read())" \
             || { echo "FAIL: packaged k3_tokenizer.py does not parse"; exit 1; }
-          python3 - <<'PYCHK'
-          import os, sys
+          # COLI_EXPECT rather than a literal tuple: the list is platform-dependent
+          # now, and one hardcoded list that silently omitted an engine is what #858
+          # was. Keep the expectation in a single place, above.
+          COLI_EXPECT="$SIBLINGS" python3 - <<'PYCHK'
+          import importlib.machinery, importlib.util, json, os, sys, tempfile
           exe = ".exe" if os.name == "nt" else ""
-          missing = [n for n in ("inkling", "kimi_k3", "olmoe")
-                     if not os.path.exists(os.path.join(".", n + exe))]
+          expect = os.environ["COLI_EXPECT"].split()
+
+          # 1. the files are here
+          missing = [n for n in expect if not os.path.exists(os.path.join(".", n + exe))]
           if missing:
-              sys.exit("FAIL: coli would not resolve these next to itself: " + ", ".join(missing))
-          print("OK: every engine is where coli's engine_for() looks for it")
+              sys.exit("FAIL: engines missing from the archive: " + ", ".join(missing))
+
+          # 2. and coli can actually SELECT them.
+          #
+          # This check used to stop at step 1 and was named "coli would not resolve
+          # these next to itself", which reads as a dispatch check and is not one.
+          # It passed for the whole of v1.5.0 while `coli run --model <olmoe>` sent
+          # the request to the GLM engine, because model_arch() had no olmoe branch
+          # (#879). The binary was in the archive and unusable.
+          #
+          # Presence is not dispatch. Load the packaged launcher, hand it a
+          # config.json per family, and assert where the request would go.
+          loader = importlib.machinery.SourceFileLoader("coli_pkg", "coli")
+          spec = importlib.util.spec_from_loader(loader.name, loader)
+          cli = importlib.util.module_from_spec(spec)
+          loader.exec_module(cli)
+
+          bad = []
+          for model_type, label, _ in cli._BANNER_MODELS:
+              with tempfile.TemporaryDirectory() as d:
+                  with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+                      json.dump({"model_type": model_type}, f)
+                  open(os.path.join(d, "tokenizer.json"), "w").close()
+                  engine = os.path.basename(cli.engine_for(d))
+                  arch = cli.model_arch(d)
+              if model_type != "glm" and arch == "glm":
+                  bad.append("%s (%s) -> the GLM engine; the banner names a family "
+                             "the launcher cannot dispatch" % (label, model_type))
+          if bad:
+              sys.exit("FAIL: packaged launcher misroutes:\n  " + "\n  ".join(bad))
+          print("OK: every engine is packaged AND coli dispatches to it:", " ".join(expect))
           PYCHK
           out=$(python3 coli info 2>&1 || true)
           echo "$out"
@@ -210,6 +278,25 @@ jobs:
           if [ -z "$NOTES" ]; then
             NOTES="Release ${TAG}"
           fi
-          gh release create "$TAG" artifacts/* \
-            --title "colibri ${TAG}" \
-            --notes "$NOTES"
+          # Attach to an existing release rather than failing on it.
+          #
+          # `gh release create` errors with "a release with the same tag name
+          # already exists" whenever the release was published by hand before
+          # the tag build finished -- which is how any release with hand-written
+          # notes happens. v1.5.0 hit exactly that: all three platforms built,
+          # the checksums printed, and then the job went red having attached
+          # nothing, so the release had notes and no downloads until the
+          # artifacts were recovered from that run by hand.
+          #
+          # Uploading is the operation that matters and --clobber makes it
+          # idempotent, so upload when the release exists and write notes only
+          # when creating one. Notes a human already published are never
+          # overwritten by the CHANGELOG fallback.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — uploading artifacts to it"
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            gh release create "$TAG" artifacts/* \
+              --title "colibri ${TAG}" \
+              --notes "$NOTES"
+          fi

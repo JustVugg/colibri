@@ -1694,6 +1694,15 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     int gen = len - np;
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). Printed to stdout, which is what autotune captures.
+     * Tokens and seconds, not tok/s: the ratio is derived by the caller at full
+     * precision (#852 -- two decimals of tok/s is one significant digit at the
+     * rates this engine runs at). */
+    printf("TUNE decode: %d tokens in %.3fs\n", gen > 1 ? gen - 1 : gen, dt);
     double wall = now_s() - t0;
 #ifdef COLI_METAL
     if (g_metal) {

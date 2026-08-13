@@ -1,4 +1,8 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.13.0+cpu
+# The +cpu local-version tag exists in the Linux and Windows wheels of the CPU
+# index; macOS wheels are CPU-only by construction and carry the plain
+# version. Same pin either way -- the marker picks the spelling per OS.
+torch==2.13.0+cpu; sys_platform != "darwin"
+torch==2.13.0; sys_platform == "darwin"
 transformers==5.14.1
 safetensors==0.8.0

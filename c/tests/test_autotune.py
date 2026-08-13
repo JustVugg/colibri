@@ -56,6 +56,61 @@ class AutotuneUnitTest(unittest.TestCase):
         self.assertEqual(result["hit_pct"], 92.5)
         self.assertEqual(result["p99_ms"], 80.0)
 
+    def test_parse_replay_uses_elapsed_time_below_point_one_tok_s(self):
+        result = parse_replay(
+            "REPLAY decode: 16 tokens in 355.556s | 0.04 tok/s | expert hit 34.4%\n"
+            "[PROF] decode forwards: 16 | latency p50 4000.0 ms | p90 5000.0 ms | "
+            "p99 60000.0 ms | max 70000.0 ms"
+        )
+        self.assertAlmostEqual(result["tok_s"], 16 / 355.556)
+        self.assertNotEqual(result["tok_s"], 0.04)
+
+    def test_parse_replay_accepts_legacy_speed_without_elapsed_time(self):
+        result = parse_replay(
+            "REPLAY decode: 16 tokens | 0.04 tok/s | expert hit 34.4%\n"
+            "[PROF] decode forwards: 16 | latency p50 4000.0 ms | p90 5000.0 ms | "
+            "p99 60000.0 ms | max 70000.0 ms"
+        )
+        self.assertEqual(result["tok_s"], 0.04)
+
+    def test_parse_replay_falls_back_when_elapsed_time_rounds_to_zero(self):
+        result = parse_replay(
+            "REPLAY decode: 1 tokens in 0.000s | 1234.56 tok/s"
+        )
+        self.assertEqual(result["tok_s"], 1234.56)
+
+    def test_accepts_the_common_TUNE_line_from_the_sibling_engines(self):
+        """#898: only colibri emitted a parseable throughput line, so the tuner
+        was GLM-only. The four sibling engines now print `TUNE decode: N tokens
+        in T.TTTs` at the end of an ordinary greedy run."""
+        result = parse_replay("TUNE decode: 16 tokens in 8.000s\n")
+        self.assertAlmostEqual(result["tok_s"], 2.0)
+
+    def test_refuses_output_with_neither_line(self):
+        """An engine that printed nothing parseable used to raise 'did not emit
+        REPLAY throughput'. It must still refuse rather than score it as zero."""
+        with self.assertRaises(ValueError):
+            parse_replay("no decode line here\n")
+
+    def test_glm_only_knobs_are_not_swept_on_other_engines(self):
+        """PIPE and DIRECT are read by colibri alone -- 3 and 1 occurrences in
+        colibri.c, 0 in each of the other four. Sweeping them elsewhere spends
+        the replay budget proving two identical runs are identical, then reports
+        the 0% difference as a measurement."""
+        plan = {"cpu": {"physical_cores": 8, "sockets": 1},
+                "tiers": {"disk": {"cold_expert_bytes": 1 << 30}, "vram": {"devices": []}}}
+        glm = dict(candidate_steps(plan, {}, "glm"))
+        self.assertIn("direct-on", glm)
+        self.assertIn("io-pipe-on", glm)
+        for arch in ("deepseek_v4", "kimi", "inkling", "olmoe"):
+            with self.subTest(arch=arch):
+                steps = dict(candidate_steps(plan, {}, arch))
+                self.assertNotIn("direct-on", steps)
+                self.assertNotIn("io-pipe-on", steps)
+                # OMP and NUMA are engine-agnostic and must survive, or the
+                # sweep has nothing left to measure on those engines.
+                self.assertTrue(any(name.startswith("omp-") for name in steps), steps)
+
     def test_profile_round_trip_and_explicit_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "engine"
@@ -107,7 +162,7 @@ class AutotuneIntegrationTest(unittest.TestCase):
                 " pipe=os.environ.get('COLI_CUDA_PIPE','0')\n"
                 " speed={'0':10.0,'1':12.0,'2':11.0}[pipe]\n"
                 " if os.environ.get('COLI_CUDA_ASYNC') == '0': speed=9.0\n"
-                " print(f'REPLAY decode: 4 tokens in 1.000s | {speed:.2f} tok/s | expert hit 95.0%')\n"
+                " print(f'REPLAY decode: 4 tokens | {speed:.2f} tok/s | expert hit 95.0%')\n"
                 " print('[PROF] decode forwards: 4 | latency p50 80.0 ms | p90 90.0 ms | p99 100.0 ms | max 100.0 ms')\n",
                 encoding="utf-8",
             )
@@ -139,7 +194,7 @@ class AutotuneIntegrationTest(unittest.TestCase):
                 " except FileNotFoundError: n=0\n"
                 " open(counter,'w').write(str(n+1))\n"
                 " speed=10.0+n\n"
-                " print(f'REPLAY decode: 4 tokens in 1.000s | {speed:.2f} tok/s | expert hit 95.0%')\n"
+                " print(f'REPLAY decode: 4 tokens | {speed:.2f} tok/s | expert hit 95.0%')\n"
                 " print('[PROF] decode forwards: 4 | latency p50 80.0 ms | p90 90.0 ms | p99 100.0 ms | max 100.0 ms')\n",
                 encoding="utf-8",
             )

@@ -165,6 +165,7 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 2 || fmt == 4) return (size_t)(I + 1) / 2;   /* fmt=4: same packed int4 */
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)(I + 1) / 2;   /* grouped int4: nibbles like fmt 2 */
+    if (fmt == 7) return (size_t)(I + 1) / 2;   /* MXFP4: e2m1 nibbles, 2 per byte */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
     if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
     return 0;
@@ -213,6 +214,45 @@ __device__ __forceinline__ void e8_expand_sub_dev(const uint8_t *blk, int ib, fl
             out[l*8+j] = neg ? -mag*db : mag*db;
         }
     }
+}
+
+/* ---- MXFP4 (OCP microscaling FP4), fmt=7 -----------------------------------
+ * Same layout the CPU path decodes in quant.h's matmul_mxfp4, and the same two
+ * tricks, so the two agree bit for bit:
+ *
+ *   packed [O, I/2]  u8 — e2m1 nibbles, LOW nibble = even column, bit3 = sign,
+ *                         bits 0..2 index {0,.5,1,1.5,2,3,4,6}
+ *   scales [O, I/32] u8 — ue8m0 exponent per 32-column group, w = v * 2^(s-127)
+ *
+ * The exponent is decoded as a bit pattern rather than exp2f: (uint32)s << 23
+ * reinterpreted as float IS 2^(s-127) for s in [1,254], and reproduces the CPU
+ * path's documented edge behaviour exactly -- s=0 gives +0 and s=255 gives +inf
+ * on both sides. Using exp2f here would agree for the normal range and diverge
+ * at the ends, which is precisely where a silent mismatch would hide.
+ *
+ * The LUT holds DOUBLED values so every entry is an exact small integer; the
+ * compensating 0.5f rides along in mx4_scale_dev, as it does on the CPU. */
+/* Decoded arithmetically rather than from a __constant__ table: a file-scope
+ * __constant__ array with static linkage is initialised per translation unit,
+ * and this kernel is also compiled into the HIP build and the DLL, where that
+ * silently yields garbage. The magnitude is 2^(exp-1) * 0.5 for exp in 1..3 and
+ * 0 for exp 0, which is exactly the OCP e2m1 table {0,.5,1,1.5,2,3,4,6}. */
+__device__ static inline float mx4_decode(int n) {
+    int mant = n & 1, exp = (n >> 1) & 3;
+    float mag = exp ? ldexpf(1.0f + 0.5f * (float)mant, exp - 1) : 0.5f * (float)mant;
+    return (n & 8) ? -mag : mag;
+}
+
+__device__ static inline float mx4_scale_dev(uint8_t s) {
+    union { uint32_t u; float f; } b;
+    b.u = static_cast<uint32_t>(s) << 23;
+    return b.f;
+}
+
+/* e2m1 nibble at column i of a packed row. */
+__device__ static inline float mx4_weight_at(const uint8_t *q, int i) {
+    uint8_t v = q[i >> 1];
+    return mx4_decode((i & 1) ? (v >> 4) : (v & 15));
 }
 
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
@@ -265,6 +305,18 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
             int off = sb*COLI_E8_SUB, n = I-off < COLI_E8_SUB ? I-off : COLI_E8_SUB;
             for (int k=0;k<n;k++) sum += xs[off+k]*w[k];
         }
+    } else if (fmt == 7) {
+        /* MXFP4: one ue8m0 exponent per 32 columns. Threads stride over columns
+         * and pick up the group exponent as they cross a boundary -- the same
+         * accumulation order as the CPU scalar path, so a mismatch means the
+         * decode is wrong, not the summation. */
+        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
+        const uint8_t *scl = reinterpret_cast<const uint8_t *>(scales) + (size_t)o * ng;
+        for (int i = threadIdx.x; i < I; i += blockDim.x) {
+            int g = i >> 5;
+            if (g >= ng) g = ng - 1;
+            sum += xs[i] * mx4_weight_at(wrow, i) * mx4_scale_dev(scl[g]);
+        }
     } else if (fmt == 4) {
         /* Grouped int4: one f32 scale per gs elements along I (ng groups per row).
          * Scale layout: scales[o*ng + g]. Each thread strides through I, applying
@@ -300,7 +352,13 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         __syncthreads();
     }
     if (!threadIdx.x)
-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 8) ? partial[0] * scales[o] : partial[0];
+        /* fmt 4/6/7/8 already applied their scaling inside the loop: 4 and 7 are
+         * per-group (one scale per gs / per 32 columns), 6 carries it in the
+         * block header, 8 reads a per-128 block scale alongside the weights.
+         * Only the per-row formats get the trailing multiply --
+         * and for fmt=7 `scales` points at ue8m0 BYTES, so reading it as float
+         * here does not merely double-scale, it reads garbage. */
+        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
 }
 
 /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
@@ -1314,6 +1372,47 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
+}
+
+/* MXFP4 matmul, stateless. Separate from coli_cuda_matmul on purpose: that one
+ * takes scales as const float* and caches an uploaded tensor, while MXFP4
+ * scales are ue8m0 BYTES -- passing them through the float* parameter would
+ * compile and silently reinterpret the buffer. Kimi K3's routed experts stream
+ * (a fill-once tier at decode), so there is nothing to cache here anyway; the
+ * weights go up with the call.
+ *
+ * Returns 0 and leaves y untouched on any failure, which is the contract the
+ * engine's GPU paths already use to fall back to CPU. */
+extern "C" int coli_cuda_matmul_mxfp4(float *y, const float *x,
+                                      const uint8_t *q4, const uint8_t *e8s,
+                                      int S, int I, int O) {
+    if (fault_injected()) return 0;
+    if (S < 1 || I < 1 || O < 1 || !y || !x || !q4 || !e8s) return 0;
+    DeviceContext *ctx = find_ctx(0);
+    if (!select_ctx(ctx)) return 0;
+
+    size_t rb = (size_t)(I + 1) / 2, ng = (size_t)(I + 31) / 32;
+    size_t wb = (size_t)O * rb, sb = (size_t)O * ng;
+    size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+
+    uint8_t *dw = nullptr, *ds = nullptr;
+    if (!cuda_ok(cudaMalloc(&dw, wb), "mxfp4 weight alloc")) return 0;
+    if (!cuda_ok(cudaMalloc(&ds, sb), "mxfp4 scale alloc")) { cudaFree(dw); return 0; }
+
+    int ok = reserve(&ctx->x, &ctx->x_cap, xb) && reserve(&ctx->y, &ctx->y_cap, yb) &&
+             cuda_ok(cudaMemcpy(dw, q4, wb, cudaMemcpyHostToDevice), "mxfp4 weight upload") &&
+             cuda_ok(cudaMemcpy(ds, e8s, sb, cudaMemcpyHostToDevice), "mxfp4 scale upload") &&
+             cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "mxfp4 input upload");
+    if (ok) {
+        dim3 grid((unsigned)O, (unsigned)S);
+        quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, dw, reinterpret_cast<const float *>(ds),
+                                    7, S, I, O, rb, 32, (int)ng);
+        ok = cuda_ok(cudaGetLastError(), "mxfp4 launch") &&
+             cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "mxfp4 output download");
+    }
+    cudaFree(dw);
+    cudaFree(ds);
+    return ok;
 }
 
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,

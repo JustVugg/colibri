@@ -19,6 +19,17 @@ c/inkling
 c/kimi_k3
 c/kimi_k3.exe
 c/olmoe.exe
+# deepseek_v4 and the per-unit objects its amalgamated Makefile leaves behind.
+# The same omission as #858, one file over: every engine is listed here except
+# the one added last, so `make deepseek-v4` left 26 untracked .o files in
+# `git status`.
+c/deepseek_v4
+c/deepseek_v4.exe
+c/COLI_V4_UNIT_*.o
+# ...and the ownership-test objects, which the same Makefile puts in a build/
+# subdirectory (V4_OWN_DIR) rather than next to the sources. #868 caught the
+# twelve in c/, not the four in here, so `make check` still left `?? c/build/`.
+c/build/
 c/iobench
 c/iobench.exe
 c/tok_test

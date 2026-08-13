@@ -468,7 +468,22 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
-        if (lru < 0) lru = 0; /* absolute last resort: all in-flight, evict slot 0 */
+        while (lru < 0) {
+            /* EVERY slot is in flight: each buffer is owned by an unlocked pread
+             * in the pilot worker (or a demand load) that will publish into it.
+             * The old last resort (lru=0) stole such a slot mid-load — two writers
+             * racing the same slab, then whichever published last decided the
+             * expert id the resident bytes answered to. Wait for a publish instead
+             * and rescan; in-flight always drains because a load either finishes
+             * or the process is already dead in the water. */
+            pthread_mutex_unlock(&g_pilot_mx);
+            sleep_ms(1);
+            pthread_mutex_lock(&g_pilot_mx);
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue;
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        }
         s = &lc->slots[lru];
         s->pinned = 0;
     }
@@ -1093,6 +1108,183 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
 }
 
+/* ---------- serve mode: openai_server.py engine protocol ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
+ *         CANCEL <id>\n
+ * stdout: READY sentinel once loaded, then per request a stream of
+ *         DATA <id> <size>\n<bytes>\n frames and a final
+ *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
+ * Byte-identical to colibri.c's serve protocol (inkling.c documents it in
+ * full above its own SUBMIT handling) so the shared openai_server.py gateway
+ * drives olmoe unchanged.
+ *
+ * v1 scope, same as Inkling's first serve mode: one request in flight, full
+ * re-prefill every turn, no cross-request KV reuse. The payload arrives
+ * already rendered by openai_server.py's render_chat_olmoe (bos/eos turn
+ * markers and all) -- this engine tokenizes it as-is, the same way run_chat()
+ * feeds fmt_user_turn()'s output to tok_encode() above. Because nothing here
+ * persists state across requests, a fresh prefill at pos_base=0 is enough to
+ * start clean: attention() only ever reads positions [0, kv_len), so the
+ * previous request's leftover K/V contents past the new prompt's length are
+ * never touched, the same invariant CHAT mode's /reset already relies on
+ * (it clears hist_len, not the K/V buffers themselves). */
+
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define SRV_QMAX 16
+static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+
+/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static int serve_read_cmd(const char *cur_id) {
+    char ln[512];
+    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    char cmd[16], id[64];
+    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
+    if (!strcmp(cmd, "SUBMIT")) {
+        int slot, plen, max_tok; float temp, top_p;
+        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
+        if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
+            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        (void)slot;
+        char *pl = malloc((size_t)plen + 1);
+        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        pl[plen] = 0;
+        int nl = fgetc(stdin); (void)nl;
+        if (g_qn < SRV_QMAX) {
+            SReq *q = &g_q[g_qn++];
+            snprintf(q->id, sizeof(q->id), "%s", id);
+            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+            q->payload = pl; q->plen = plen;
+        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    }
+    return 0;
+}
+
+static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    Cfg *c = &m->c;
+    int cap = q->plen + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    if (np + q->max_tok > ctx_cap) {
+        printf("ERROR %s context exceeds CTX (%d + %d > %d)\n", q->id, np, q->max_tok, ctx_cap);
+        fflush(stdout); free(ids); return;
+    }
+    g_temp = q->temp; g_nuc = q->top_p;
+    double t0 = now_s();
+    uint64_t h0 = m->hits, m0 = m->miss;
+    float *logit = step(m, ids, np, 0);
+    int hist_len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        int nt = pick_tok(logit, c->vocab, -1);
+        free(logit); logit = NULL;
+        if (is_stop(nt)) { limited = 0; break; }
+        int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
+        printf("DATA %s %d\n", q->id, nb);
+        fwrite(buf, 1, (size_t)nb, stdout);
+        fputc('\n', stdout); fflush(stdout);
+        gen++; hist_len++;
+        while (coli_stdin_readable()) {
+            int r = serve_read_cmd(q->id);
+            if (r < 0) { free(ids); return; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+        /* Unlike run_chat(), we do not step() the final token just to populate
+         * its KV slot: nothing in serve mode reads past this request's own
+         * reply, so a discarded logit here costs nothing. */
+        if (cancelled || s == q->max_tok - 1 || hist_len >= ctx_cap) break;
+        logit = step(m, &nt, 1, hist_len - 1);
+    }
+    free(logit);
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits - h0 + m->miss - m0);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    /* PROF: per-turn phase timings for the dashboard. olmoe.c does not split
+     * its wall time into fill/expert/shared/attn phases the way glm.c and
+     * inkling.c do, so this reports total time only; a real phase breakdown
+     * is future work, not a protocol requirement. */
+    printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
+    fflush(stdout);
+    free(ids);
+}
+
+/* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
+ * emit for the web dashboard's hardware panel and Brain page. olmoe.c is
+ * CPU-only (no CUDA/Metal backend), so the GPU fields are always empty, and
+ * every layer is a MoE layer (no dense/sparse split like GLM-5.2), so the
+ * tier scan below runs over all n_layers unconditionally. */
+static void serve_hwinfo(Model *m) {
+    (void)m;
+    char cpu[256] = ""; int cores = 0; double rt = 0, ra = 0;
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) { char ln[256];
+        while (fgets(ln, sizeof(ln), ci)) if (!strncmp(ln, "model name", 10)) {
+            char *p = strchr(ln, ':'); if (p) { p++; while (*p == ' ') p++;
+            int n = (int)strlen(p); if (n > 0 && p[n-1] == '\n') p[--n] = 0;
+            snprintf(cpu, sizeof(cpu), "%s", p); } break; }
+        fclose(ci); }
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) { char ln[256]; double v = 0;
+        while (fgets(ln, sizeof(ln), mi)) {
+            if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
+        } fclose(mi); }
+    printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
+    fflush(stdout);
+}
+
+static void serve_tiers_emap(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    int filled = 0;
+    for (int i = 0; i < c->n_layers; i++) filled += m->cache[i].n;
+    int64_t I = c->inter, D = c->hidden;
+    /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
+    int64_t slotb = 3*I*D + (2*I+D)*4;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, c->n_layers*E - filled, filled*(double)slotb/1e9);
+    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
+    char *hex = malloc((size_t)c->n_layers*E*2 + 1); int w = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        for (int e = 0; e < E; e++) {
+            int tier = 0;
+            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e) { tier = 1; break; }
+            uint32_t u = m->freq[i] ? m->freq[i][e] : 0;
+            int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
+            int b = (tier << 6) | heat;
+            hex[w++] = "0123456789abcdef"[b >> 4];
+            hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    printf("EMAP %d %d %s\n", c->n_layers, E, hex);
+    fflush(stdout); free(hex);
+}
+
+static void serve_loop(Model *m, Tok *T, int ctx_cap) {
+    coli_serve_binary_mode();
+    setvbuf(stdin, NULL, _IONBF, 0);
+    int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
+    stops_arm_tok(&m->c, tok_eos, T);
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    serve_hwinfo(m);
+    serve_tiers_emap(m);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        SReq q = g_q[0];
+        memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+        serve_one(m, T, &q, ctx_cap);
+        free(q.payload);
+    }
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -1119,8 +1311,42 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* SERVE=1: openai_server.py drives the engine over stdin/stdout (READY
+     * handshake, SUBMIT/CANCEL, DATA/DONE/PROF frames, HWINFO/TIERS/EMAP for
+     * the dashboard) — same protocol as colibri.c/inkling.c/kimi_k3.c. v1:
+     * one request at a time, full re-prefill every turn (see serve_one()). */
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
+            fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
+            return 1;
+        }
+        Model m; model_init(&m, snap, cap, bits);
+        m.max_t = ctx_cap;
+        m.K = calloc(m.c.n_layers, sizeof(float*)); m.V = calloc(m.c.n_layers, sizeof(float*));
+        for (int i = 0; i < m.c.n_layers; i++) {
+            m.K[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
+            m.V[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
+        }
+        Tok T;
+        char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+        tok_load(&T, tokpath);
+        serve_loop(&m, &T, ctx_cap);
+        { const char *up = getenv("COLI_USAGE");
+          if (up && *up) rt_save(up, 0); }
+        return 0;
+    }
+
     if (getenv("CHAT")) {   /* interactive mode: bypasses the ref.json harness entirely */
-        g_temp = getenv("TEMP")    ? (float)atof(getenv("TEMP"))    : g_temp;
+        /* #509 convention, same as the GLM engine: COLI_TEMP is the primary channel;
+         * TEMP stays a legacy alias ONLY when it is fully numeric — on Windows and under
+         * ROCm stacks %TEMP% names a directory, and atof("C:\...") == 0.0 would silently
+         * force greedy decoding for every olmoe chat on those hosts. */
+        if (getenv("COLI_TEMP")) g_temp = (float)atof(getenv("COLI_TEMP"));
+        else if (getenv("TEMP") && *getenv("TEMP")) {
+            char *tend; double tv = strtod(getenv("TEMP"), &tend);
+            if (tend != getenv("TEMP") && *tend == '\0') g_temp = (float)tv;
+        }
         g_nuc  = getenv("NUCLEUS") ? (float)atof(getenv("NUCLEUS")) : g_nuc;
         int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
         if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
@@ -1206,6 +1432,15 @@ int main(int argc, char **argv) {
     { const char *up = getenv("COLI_USAGE");
       if (up && *up) rt_save(up, 0); }              /* same bytes as every other engine */
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). Printed to stdout, which is what autotune captures.
+     * Tokens and seconds, not tok/s: the ratio is derived by the caller at full
+     * precision (#852 -- two decimals of tok/s is one significant digit at the
+     * rates this engine runs at). */
+    printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
     free(buf); free(arena);
     return 0;
 }

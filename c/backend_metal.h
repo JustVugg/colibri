@@ -80,7 +80,7 @@ int coli_metal_layer_decode(float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
     const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
     const void *o_w, const float *o_s, int o_fmt, int o_gs,
     const void *shg_w, const float *shg_s, int shg_fmt, int shg_gs,
     const void *shu_w, const float *shu_s, int shu_fmt, int shu_gs,
@@ -116,7 +116,7 @@ int coli_metal_attn_decode(const float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
     const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
     const void *o_w, const float *o_s, int o_fmt, int o_gs,
     float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
 
@@ -137,18 +137,16 @@ int coli_metal_resset_stats(double *flush_s);
  *
  *  D           = hidden size, Iinter = moe intermediate size
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
- *  gs/us/ds[e] = pointers to expert e's per-row scales
- *  fmt         = quant format (shared across experts). NOTE: fmt=4 (grouped int4) is
- *                NOT yet supported here -- gates to {1,2} and returns 0 (CPU fallback)
- *                for fmt=4 experts, same as before this stage. Grouped-int4 gained GPU
- *                support in mm_gemv (coli_metal_matmul/coli_metal_gemm/bind_gemv) only;
- *                extending the batched routed-expert path is future work (see PR_BODY.md).
+ *  gs/us/ds[e] = pointers to expert e's per-row (fmt=1/2) or per-group (fmt=4) scales
+ *  fmt         = quant format (shared across experts): 1=int8, 2=int4 per-row, 4=int4
+ *                grouped. qgs is the fmt=4 group size (ignored, pass 0, for fmt!=4).
+ *  qgs         = fmt=4 group size shared across experts in this block (0 for fmt!=4)
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target
  * Returns 1 on success, 0 to signal the caller to fall back to the CPU path.
  */
-int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
+int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
@@ -163,7 +161,7 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
-ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,

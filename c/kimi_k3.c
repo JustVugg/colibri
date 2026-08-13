@@ -77,9 +77,16 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                    /* KV prefix reuse (shared) */
@@ -176,6 +183,47 @@ typedef struct {
 } Model;
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+
+/* How many expert slots per layer fit a budget. PURE -- no globals, no model,
+ * no I/O -- so the arithmetic that #855 got wrong can be tested against the
+ * reported numbers without a 600 GB checkpoint. Returns the cap; writes the
+ * bytes left for experts through `for_experts_out` when non-NULL.
+ *
+ * reserve = page cache + activations + KV, all in GB. `cap_requested` is what
+ * K3_EXPERT_GB asked for: this only ever LOWERS it, never raises it, so an
+ * explicit small cache stays small. */
+static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_gb,
+                          double slot_gb, int nmoe, int cap_requested,
+                          int n_experts, double *for_experts_out){
+    double for_experts = budget_gb - resident_gb - reserve_gb;
+    if(for_experts_out) *for_experts_out = for_experts;
+    if(nmoe < 1) nmoe = 1;
+    if(!(slot_gb > 0.0)) return cap_requested;
+    int fits = for_experts > 0.0 ? (int)(for_experts/(slot_gb*(double)nmoe)) : 0;
+    if(fits > n_experts) fits = n_experts;
+    return fits < cap_requested ? fits : cap_requested;
+}
+
+/* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
+ * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
+ * MemAvailable, Windows ullAvailPhys, macOS free+inactive+purgeable. #855. */
+static double k3_mem_avail(void){
+#ifdef _WIN32
+    double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
+#elif defined(__APPLE__)
+    int64_t pgsz=0; size_t sl=sizeof(pgsz);
+    if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
+    vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
+    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)!=KERN_SUCCESS)
+        return 0;
+    return (double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9;
+#else
+    FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
+    char ln[256]; double kb=0;
+    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
+    fclose(f); return kb/1e6;
+#endif
+}
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #if defined(__APPLE__)
     return r.ru_maxrss/(1024.0*1024.0*1024.0);
@@ -287,6 +335,9 @@ static float w_rowdot(const W *w, int r, const float *x){
 #define QCHUNK 1024                      /* rows per load-quantize pass */
 static int g_bits_env=0;                 /* K3_BITS explicitly set: enables the
                                           * int8-container -> int4 load downcast */
+#ifdef COLI_CUDA
+static int g_k3_cuda=0;                  /* K3_CUDA=1: MXFP4 routed experts on CUDA at decode */
+#endif
 static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
@@ -498,6 +549,16 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         snprintf(m->pfx,sizeof(m->pfx),"language_model.");
     if((c->n_layers+c->res_bs-1)/c->res_bs+1>16){ fprintf(stderr,"attn_res: too many blocks\n"); exit(1); }
     g_bits_env = getenv("K3_BITS")!=NULL;
+#ifdef COLI_CUDA
+    g_k3_cuda = getenv("K3_CUDA") ? atoi(getenv("K3_CUDA")) : 0;
+    if(g_k3_cuda){
+        int dev0 = 0;
+        if(!coli_cuda_init(&dev0, 1)){
+            fprintf(stderr,"[K3-CUDA] device unavailable -- experts stay on CPU\n");
+            g_k3_cuda = 0;
+        } else fprintf(stderr,"[K3-CUDA] MXFP4 routed experts on device 0 (decode only)\n");
+    }
+#endif
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
     g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
     g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
@@ -636,6 +697,94 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * regardless of K3_EXPERT_GB. */
     if(cap<1) cap=1;
     if(cap>c->n_experts) cap=c->n_experts;
+
+    /* ---- RAM budget (#855) --------------------------------------------------
+     * K3_EXPERT_GB used to be the whole story: cap = egb / slot / layers, with
+     * nothing subtracted for what is already resident, no MemAvailable, no
+     * reserve for KV or the page cache, and no guard during the run.
+     *
+     * Reported on a 256 GB box with K3_EXPERT_GB=220:
+     *
+     *     136 slots x 17.5 MB x 93 layers = 216.2 GB   cache, once it fills
+     *                          + 35.2 GB               already resident
+     *                          = 251.4 GB              peak, of 256
+     *
+     * The cache is EMPTY when the init line prints and fills as the session
+     * runs, so the first request answers and a later one dies -- which is what
+     * "colibri engine exited unexpectedly" was.
+     *
+     * And --ram was inert here. `grep -c RAM_GB kimi_k3.c` returned 0 against 10
+     * in colibri.c: the one flag a user would reach for to prevent exactly this
+     * reached the environment and was never read. Same defect shape as #805 and
+     * #858 -- a mechanism that lands in one engine and not its siblings.
+     *
+     * Unlike colibri.c's cap_for_ram this runs AFTER the dense weights are in,
+     * so the resident set is MEASURED rather than projected. rss_gb() is the
+     * truth here, not a model of it, which makes this budget the simpler of the
+     * two rather than the more elaborate. */
+    {
+        double resident = rss_gb();
+        double avail_now = k3_mem_avail();
+        double ram_env = getenv("RAM_GB") ? atof(getenv("RAM_GB")) : 0.0;
+        /* Explicit --ram is a ceiling on the WHOLE process. Absent, take 88% of
+         * what the OS still offers and add what we already hold -- the same
+         * fraction colibri.c uses, and for the same reason: overshooting means
+         * an OOM kill mid-generation, which is far worse than a smaller cache. */
+        double budget = ram_env > 0 ? ram_env : resident + avail_now*0.88;
+
+        /* KV is allocated later, at the first request, so it has to be projected
+         * here. n_layers x max_t x (kv_lora + qk_rope) x 4, skipping KDA layers,
+         * with the same K3_MAXT default the serve path uses. */
+        int max_t = getenv("K3_MAXT") ? atoi(getenv("K3_MAXT")) : 8192;
+        if(max_t < 1) max_t = 8192;
+        int nkv = 0; for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda) nkv++;
+        double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
+        /* 2.5 GB page cache -- measured on Linux 2026-07-06: strangling it drops
+         * buffered pread from ~800 to ~180 MB/s and the last GB of LRU costs
+         * more in lost bandwidth than it returns. 1.2 GB activations/logits. */
+        double reserve = 2.5 + 1.2 + kv_gb;
+        double for_experts = 0.0;
+
+        double slot_gb = (double)m->e_slot/1e9;
+        int cap_fit = k3_cap_for_ram(budget, resident, reserve, slot_gb,
+                                     nmoe, cap, c->n_experts, &for_experts);
+
+        if(cap_fit < cap){
+            /* Name every term. The user's number is not being ignored, it is
+             * being clamped, and they cannot check the clamp without the parts. */
+            fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
+                "(page cache 2.5, activations 1.2, KV %dx%d %.1f) -> %.1f GB for experts; "
+                "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
+                budget, ram_env>0?"":" auto", resident, reserve, nkv, max_t, kv_gb,
+                for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
+                slot_gb*1000.0, nmoe,
+                resident + reserve + (double)(cap_fit>0?cap_fit:1)*slot_gb*nmoe);
+            if(getenv("K3_EXPERT_GB"))
+                fprintf(stderr,"[K3] K3_EXPERT_GB=%.0f does not fit alongside the "
+                    "%.1f GB already resident. It is a request, not a reservation.\n",
+                    egb, resident);
+            cap = cap_fit;
+        }
+
+        if(cap < 1){
+            /* Not even one slot per layer. Saying cap=1 and continuing turns
+             * "does not fit" into "overruns", which is the OOM kill this exists
+             * to avoid -- and the kernel kills with SIGKILL, so the engine dies
+             * with no error and no log at all. Refuse, unless told otherwise. */
+            cap = 1;
+            double peak = resident + reserve + slot_gb*nmoe;
+            fprintf(stderr,"[K3] WARNING: cap=1 is the floor and the projected peak is "
+                "%.1f GB, %.1f GB over the budget.\n", peak, peak-budget);
+            if(avail_now > 0 && peak > resident + avail_now &&
+               !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
+                fprintf(stderr,"[K3] refusing to start: that peak also exceeds the %.1f GB "
+                    "this machine actually has left, so the kernel would kill this run "
+                    "mid-generation.\n[K3] lower K3_MAXT, raise --ram if the box really has "
+                    "it, or set COLI_RAM_OVERCOMMIT=1 to override.\n", resident + avail_now);
+                exit(2);
+            }
+        }
+    }
     { int ncl=c->n_layers>0?c->n_layers:1;
       m->ecache=calloc((size_t)ncl,sizeof(LCache)); }
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
@@ -866,6 +1015,34 @@ static inline float situf_(float g, float u, float b1, float b2){
     return b1*tanhf(g/b1)*sigmoidf_(g) * b2*tanhf(u/b2);
 }
 
+#ifdef COLI_CUDA
+/* CUDA apply for one expert, decode only (S==1).
+ *
+ * Same shape as the Vulkan path below and the CPU expert_apply above -- w1/w3,
+ * SiTU-GLU on the host, then w2 down -- but stateless: the routed tier streams,
+ * so there is nothing resident to keep a device handle for. Weights ride up
+ * with the call.
+ *
+ * Returns 0 with u untouched on ANY failure, so the caller falls through to the
+ * disk+CPU path exactly as it does when Vulkan declines. That is the contract
+ * vLLM's MXFP4 backends use too -- FlashInfer/AITER when they can, an emulation
+ * path when they cannot -- and it is what makes the fast path safe to attempt
+ * unconditionally. */
+static int cuda_expert_apply(Model *m, const uint8_t *w1p, const uint8_t *w1s,
+                             const uint8_t *w2p, const uint8_t *w2s,
+                             const uint8_t *w3p, const uint8_t *w3s,
+                             const float *z, float wk,
+                             float *u, float *gate, float *up, float *hz){
+    Cfg *c=&m->c;
+    if(!coli_cuda_matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter)) return 0;
+    if(!coli_cuda_matmul_mxfp4(up,  z,w3p,w3s,1,c->latent,c->moe_inter)) return 0;
+    for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
+    if(!coli_cuda_matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent)) return 0;
+    for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
+    return 1;
+}
+#endif
+
 /* u += wk * E(z) for one loaded expert slot (SiTU-GLU in the latent).
  * gate/up are [moe_inter] scratch, hz is [latent] scratch. */
 static void expert_apply(Model *m, Slot *s, const float *z, float wk,
@@ -873,6 +1050,11 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     Cfg *c=&m->c;
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+#ifdef COLI_CUDA
+    /* Opt-in (K3_CUDA=1), decode only: at S>1 the CPU kernels amortise across
+     * the batch and the per-call upload would not pay for itself. */
+    if(g_k3_cuda && cuda_expert_apply(m,w1p,w1s,w2p,w2s,w3p,w3s,z,wk,u,gate,up,hz)) return;
+#endif
     void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)
         = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4;
     mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
@@ -1030,7 +1212,16 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 m->t_eload+=now_s()-t0;
             }
 #ifdef COLI_VULKAN
-            if(g_k3_vk&&qof[j]>=0) vk_expert_try_upload(m,li,uids[base+j],use[j]);
+            /* #848: offer EVERY expert used this layer, not only the ones that just
+             * came off disk. qof[j]>=0 means "this was a RAM-cache miss", which is the
+             * right gate for the readiness wait above and the wrong one here: it made
+             * the VRAM tier reachable only through disk reads, so the fill stopped the
+             * moment the RAM cache went warm and never resumed. K3_VK_GB was then a cap
+             * that could not be reached rather than the thing that stopped the fill.
+             * Re-offering a resident expert is nearly free -- vk_expert_try_upload
+             * returns on `v->w1` before it touches the per-step quota -- and it reads
+             * only s->buf, which an LRU slot and a ws[] slot populate identically. */
+            if(g_k3_vk) vk_expert_try_upload(m,li,uids[base+j],use[j]);
 #endif
             int f=pfirst[base+j];
             for(int p2=0;p2<pcnt[base+j];p2++){
@@ -1569,6 +1760,18 @@ static void model_state_reset(Model *m){
     m->Lc=NULL; m->Rc=NULL; m->max_t=0;
 }
 
+/* Decide reuse before changing the state it describes. A miss discards the
+ * old recurrent/KV state first and allocates a fresh target; a hit grows the
+ * existing target while preserving its prefix. The old order allocated first,
+ * then reset on the inevitable first-request miss, leaving Lc/Rc NULL when
+ * MLA prefill immediately indexed them (#855). */
+static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
+    int reuse=kv_prefix_reuse(&m->kvp,ids,np);
+    if(!reuse) model_state_reset(m);
+    kv_alloc(m,max_t);
+    return reuse;
+}
+
 static int serve_stdin_readable(void){
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
      * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
@@ -1639,13 +1842,12 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
      * the conversation, and every replayed position pulled its experts off
      * disk again. When this prompt begins with the sequence the state already
      * holds, that state IS the state at that position: keep it and prefill
-     * only the tail. This is why kv_alloc above must run FIRST and must keep
-     * its buffers: growing them discards the positions fed[] describes.
+     * only the tail. The reuse decision must happen BEFORE a miss resets that
+     * state; allocation then either starts fresh or grows the preserved state.
      * At least one new token is required, since the state cannot be rewound.
      * Either the reused positions are token-identical or nothing is reused;
      * the emitted tokens are unchanged in both cases. */
-    kv_alloc(m,np+q->max_tok+8);
-    int reuse=kv_prefix_reuse(&m->kvp, ids, np);
+    int reuse=prepare_request_state(m,ids,np,np+q->max_tok+8);
     if(getenv("K3_PREFIX_LOG")){
         /* Report the decision either way, with the state behind a "no".
          * "It did not get faster" is otherwise the same observation as
@@ -1659,7 +1861,6 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
                     (m->kvp.len>0 && m->kvp.len<np) ? " (diverged)" : "");
         fflush(stderr);
     }
-    if(!reuse) model_state_reset(m);
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
@@ -1930,6 +2131,15 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). Printed to stdout, which is what autotune captures.
+     * Tokens and seconds, not tok/s: the ratio is derived by the caller at full
+     * precision (#852 -- two decimals of tok/s is one significant digit at the
+     * rates this engine runs at). */
+    printf("TUNE decode: %d tokens in %.3fs\n", ntok, dt);
     if(m.trace) fclose(m.trace);
     { const char *sv=getenv("USAGE_SAVE");
       if(!(sv && atoi(sv)==0) && g_k3_usage[0])

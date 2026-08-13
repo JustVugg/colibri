@@ -4,6 +4,9 @@ These scripts support model preparation and offline engineering work. They are
 not runtime dependencies of the C engine.
 
 - `convert_fp8_to_int4.py`, `download_glm52.py`: model preparation
+- `convert_fmt4_to_fmt2.py`: fmt=4 (grouped int4) -> fmt=2 (per-row int4)
+  re-quant of a GLM-5.2 container, for Metal-backend compatibility
+  (see `docs/METAL-M1ULTRA-FMT2-REPORT.md`)
 - `repack_fp8_passthrough.py`: fmt=8 repack (byte-preserved FP8, resident kinds only;
   see the module docstring -- synthetic-fixture-tested only, no real-shard runs yet)
 - `make_glm_oracle.py`, `make_glm_bench_model.py`: deterministic fixtures

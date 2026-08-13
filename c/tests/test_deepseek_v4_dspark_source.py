@@ -27,6 +27,28 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
         self.assertIn("load=lazy verification=exact-target", self.engine)
         self.assertIn("double total_gb = coli_v4_dspark_cache_gb()", self.drafter)
 
+    def test_full_drafter_does_not_reserve_for_other_mtp_profiles(self):
+        requested = self.engine.index("requested_full_dspark =")
+        supported = self.engine.index(
+            "v4_dspark_full_profile_present(", requested
+        )
+        reserve = self.engine.index(
+            "engine->runtime.dspark_reserve_bytes =", supported
+        )
+        warning = self.engine.index(
+            'warning=unsupported-checkpoint', requested
+        )
+        self.assertLess(requested, supported)
+        self.assertLess(supported, warning)
+        self.assertLess(warning, reserve)
+        self.assertIn("num_nextn_predict_layers", self.engine)
+        self.assertIn("expected_full_profile=3stage", self.engine)
+        self.assertIn("dspark_block_size", self.engine)
+        self.assertIn("mtp.0.main_proj.weight", self.engine)
+        self.assertIn("mtp.1.attn.wq_a.weight", self.engine)
+        self.assertIn("mtp.2.attn.wq_a.weight", self.engine)
+        self.assertIn("mtp.2.markov_head.markov_w1.weight", self.engine)
+
     def test_exact_target_hidden_precedes_full_mtp(self):
         self.assertIn("int full_mtp_ready = 0;", self.engine)
         target = self.engine.index("if (target_token(engine, &state, &next")

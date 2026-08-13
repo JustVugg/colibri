@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -467,6 +468,14 @@ static int close_enough(float left, float right, float tolerance) {
     return fabsf(left - right) <= tolerance;
 }
 
+static int rope_matches_fixed(const float *actual, const float *expected,
+                              size_t count, float tolerance) {
+    for (size_t index = 0; index < count; index++)
+        if (!close_enough(actual[index], expected[index], tolerance))
+            return 0;
+    return 1;
+}
+
 static int test_math(void) {
     enum { HC = 4, DIMENSION = 3, MIXES = (2 + HC) * HC };
     float input[HC * DIMENSION] = {
@@ -536,8 +545,76 @@ static int test_math(void) {
         return 1;
     for (int index = 0; index < 8; index++)
         if (!close_enough(rope_values[index], rope_original[index], 1e-5f)) return 1;
+
+    static const float reference_cos[] = {
+        -0.989992499f, 0.999887526f,
+        -0.653643608f, 0.999800026f,
+    };
+    static const float reference_sin[] = {
+        0.141120002f, 0.0149994371f,
+        -0.756802499f, 0.0199986659f,
+    };
+    if (!rope_matches_fixed(rope_cos + 3 * 2, reference_cos,
+                            sizeof(reference_cos) / sizeof(*reference_cos),
+                            2e-6f) ||
+        !rope_matches_fixed(rope_sin + 3 * 2, reference_sin,
+                            sizeof(reference_sin) / sizeof(*reference_sin),
+                            2e-6f))
+        return 1;
+
+    float rope_row_cos[2], rope_row_sin[2];
+    if (coli_v4_rope_position(rope_row_cos, rope_row_sin, 4, 3, 4,
+                              10000.0f, 2.0f, 32, 1) != 0 ||
+        !rope_matches_fixed(rope_row_cos, reference_cos, 2, 2e-6f) ||
+        !rope_matches_fixed(rope_row_sin, reference_sin, 2, 2e-6f))
+        return 1;
+
+    float rope_range_cos[4], rope_range_sin[4];
+    if (coli_v4_rope_precompute_range(
+            rope_range_cos, rope_range_sin, 4, 3, 2, 4,
+            10000.0f, 2.0f, 32, 1) != 0)
+        return 1;
+    if (!rope_matches_fixed(rope_range_cos, reference_cos,
+                            sizeof(reference_cos) / sizeof(*reference_cos),
+                            2e-6f) ||
+        !rope_matches_fixed(rope_range_sin, reference_sin,
+                            sizeof(reference_sin) / sizeof(*reference_sin),
+                            2e-6f))
+        return 1;
+
+    static const float yarn_reference_cos[] = {
+        0.987353623f, 0.979488254f, 0.966957450f, -0.587573767f,
+        -0.521824539f, 0.726297259f, -0.576302052f, 0.954964221f,
+        -0.988605082f, -0.159120470f, -0.972486019f, -0.394434780f,
+        -0.924126625f, -0.807510197f, 0.966177464f, -0.478773415f,
+        -0.893718898f, -0.100252181f, 0.523291290f, 0.823492348f,
+        0.942630887f, 0.970277667f, 0.984636068f, 0.992067456f,
+        0.995906770f, 0.997888565f, 0.998911023f, 0.999438405f,
+        0.999710381f, 0.999850631f, 0.999922991f, 0.999960303f,
+    };
+    static const float yarn_reference_sin[] = {
+        -0.158533379f, 0.201501235f, 0.254937738f, 0.809170604f,
+        0.853052855f, 0.687380731f, 0.817236781f, 0.296720892f,
+        -0.150532320f, 0.987259150f, -0.232961148f, -0.918923914f,
+        0.382086396f, -0.589853585f, 0.257878065f, -0.877938509f,
+        0.448627412f, 0.994962037f, 0.852153838f, 0.567327321f,
+        0.333836794f, 0.241994366f, 0.174619019f, 0.125706837f,
+        0.0903861374f, 0.0649493411f, 0.0466561131f, 0.0335097015f,
+        0.0240655378f, 0.0172822978f, 0.0124107366f, 0.00891227461f,
+    };
+    float yarn_cos[32], yarn_sin[32];
+    if (coli_v4_rope_position(yarn_cos, yarn_sin, 64, 1024, 4096,
+                              40000.0f, 4.0f, 32, 1) != 0 ||
+        !rope_matches_fixed(yarn_cos, yarn_reference_cos, 32, 3e-6f) ||
+        !rope_matches_fixed(yarn_sin, yarn_reference_sin, 32, 3e-6f))
+        return 1;
+
     if (coli_v4_rope_precompute(rope_cos, rope_sin, 3, 6, 0,
                                 10000.0f, 1.0f, 32, 1) == 0)
+        return 1;
+    if (coli_v4_rope_precompute_range(
+            rope_cos, rope_sin, 4, INT_MAX, 2, 0,
+            10000.0f, 1.0f, 32, 1) == 0)
         return 1;
 
     float hidden[2] = {0.5f, -1.0f};

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì — tiny engine, immense model">
 </p>
 
 <p align="center">

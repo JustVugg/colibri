@@ -668,12 +668,30 @@ static int multiply_u64(uint64_t a, uint64_t b, uint64_t *output) {
     return 0;
 }
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
 uint64_t coli_v4_os_available_memory(void) {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
     memset(&status, 0, sizeof(status));
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
+#elif defined(__APPLE__)
+    /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
+     * kernel could hand out without swapping: free + inactive pages -- the
+     * same approximation Activity Monitor reports, and the closest analogue
+     * of Linux's MemAvailable (which also counts reclaimable cache). */
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    vm_size_t page = 0;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) == KERN_SUCCESS &&
+        host_page_size(mach_host_self(), &page) == KERN_SUCCESS && page)
+        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count) *
+               (uint64_t)page;
+    return 0;
 #else
     FILE *stream = fopen("/proc/meminfo", "r");
     if (stream) {
@@ -1077,6 +1095,7 @@ int coli_v4_expert_store_open_planned(
 /* ######## deepseek_v4_math.c ######## */
 #include "deepseek_v4_internal.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 
@@ -1232,15 +1251,11 @@ int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
     return 0;
 }
 
-int coli_v4_rope_precompute(float *cosines, float *sines,
-                            int dimension, int sequence_length,
-                            int original_sequence_length, float base,
-                            float factor, int beta_fast, int beta_slow) {
-    if (!cosines || !sines || dimension < 2 || (dimension & 1) ||
-        sequence_length < 1 || !(base > 1.0f) || !(factor > 0.0f))
-        return -1;
-    int pairs = dimension / 2;
-    int low = 0, high = -1;
+static void rope_yarn_bounds(int dimension, int original_sequence_length,
+                             float base, int beta_fast, int beta_slow,
+                             int *low, int *high) {
+    *low = 0;
+    *high = -1;
     if (original_sequence_length > 0) {
         const float two_pi = 6.2831853071795864769f;
         float denominator = 2.0f * logf(base);
@@ -1248,27 +1263,82 @@ int coli_v4_rope_precompute(float *cosines, float *sines,
             original_sequence_length / (beta_fast * two_pi)) / denominator;
         float high_value = dimension * logf(
             original_sequence_length / (beta_slow * two_pi)) / denominator;
-        low = (int)floorf(low_value);
-        high = (int)ceilf(high_value);
-        if (low < 0) low = 0;
-        if (high > dimension - 1) high = dimension - 1;
+        *low = (int)floorf(low_value);
+        *high = (int)ceilf(high_value);
+        if (*low < 0) *low = 0;
+        if (*high > dimension - 1) *high = dimension - 1;
     }
+}
+
+static float rope_frequency(int pair, int dimension,
+                            int original_sequence_length, float base,
+                            float factor, int low, int high) {
+    float frequency = 1.0f / powf(base, (float)(2 * pair) / dimension);
+    if (original_sequence_length > 0) {
+        float width = high == low ? 0.001f : (float)(high - low);
+        float ramp = (pair - low) / width;
+        if (ramp < 0.0f) ramp = 0.0f;
+        if (ramp > 1.0f) ramp = 1.0f;
+        float smooth = 1.0f - ramp;
+        frequency = frequency / factor * (1.0f - smooth) + frequency * smooth;
+    }
+    return frequency;
+}
+
+int coli_v4_rope_precompute_range(
+    float *cosines, float *sines, int dimension, int start_position,
+    int sequence_length, int original_sequence_length, float base,
+    float factor, int beta_fast, int beta_slow) {
+    if (!cosines || !sines || dimension < 2 || (dimension & 1) ||
+        start_position < 0 || sequence_length < 1 ||
+        !(base > 1.0f) || !(factor > 0.0f))
+        return -1;
+    if (start_position > INT_MAX - (sequence_length - 1)) return -1;
+    int pairs = dimension / 2;
+    int low = 0, high = -1;
+    rope_yarn_bounds(dimension, original_sequence_length, base,
+                     beta_fast, beta_slow, &low, &high);
     for (int pair = 0; pair < pairs; pair++) {
-        float frequency = 1.0f / powf(base, (float)(2 * pair) / dimension);
-        if (original_sequence_length > 0) {
-            float width = high == low ? 0.001f : (float)(high - low);
-            float ramp = (pair - low) / width;
-            if (ramp < 0.0f) ramp = 0.0f;
-            if (ramp > 1.0f) ramp = 1.0f;
-            float smooth = 1.0f - ramp;
-            frequency = frequency / factor * (1.0f - smooth) + frequency * smooth;
-        }
-        for (int position = 0; position < sequence_length; position++) {
-            size_t index = (size_t)position * pairs + pair;
-            float angle = position * frequency;
+        float frequency = rope_frequency(pair, dimension,
+                                         original_sequence_length, base,
+                                         factor, low, high);
+        for (int item = 0; item < sequence_length; item++) {
+            size_t index = (size_t)item * pairs + pair;
+            float angle = (start_position + item) * frequency;
             cosines[index] = cosf(angle);
             sines[index] = sinf(angle);
         }
+    }
+    return 0;
+}
+
+int coli_v4_rope_precompute(float *cosines, float *sines,
+                            int dimension, int sequence_length,
+                            int original_sequence_length, float base,
+                            float factor, int beta_fast, int beta_slow) {
+    return coli_v4_rope_precompute_range(
+        cosines, sines, dimension, 0, sequence_length,
+        original_sequence_length, base, factor, beta_fast, beta_slow);
+}
+
+int coli_v4_rope_position(float *cosines, float *sines,
+                          int dimension, int position,
+                          int original_sequence_length, float base,
+                          float factor, int beta_fast, int beta_slow) {
+    if (!cosines || !sines || dimension < 2 || (dimension & 1) ||
+        position < 0 || !(base > 1.0f) || !(factor > 0.0f))
+        return -1;
+    int pairs = dimension / 2;
+    int low = 0, high = -1;
+    rope_yarn_bounds(dimension, original_sequence_length, base,
+                     beta_fast, beta_slow, &low, &high);
+    for (int pair = 0; pair < pairs; pair++) {
+        float frequency = rope_frequency(pair, dimension,
+                                         original_sequence_length, base,
+                                         factor, low, high);
+        float angle = position * frequency;
+        cosines[pair] = cosf(angle);
+        sines[pair] = sinf(angle);
     }
     return 0;
 }
@@ -1626,22 +1696,13 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
-        float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
-        float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
-        if (!all_cos || !all_sin || coli_v4_rope_precompute(
-                all_cos, all_sin, rope_dim, position + 1,
+        if (coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
                 compressed ? config->original_max_position_embeddings : 0,
                 compressed ? config->compress_rope_theta : config->rope_theta,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
-        if (!result) {
-            memcpy(cosines, all_cos + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*cosines));
-            memcpy(sines, all_sin + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*sines));
-        }
-        free(all_sin); free(all_cos);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
@@ -2024,22 +2085,13 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
-        float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
-        float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
-        if (!all_cos || !all_sin || coli_v4_rope_precompute(
-                all_cos, all_sin, rope_dim, position + 1,
+        if (coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
                 compressed ? config->original_max_position_embeddings : 0,
                 compressed ? config->compress_rope_theta : config->rope_theta,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
-        if (!result) {
-            memcpy(cosines, all_cos + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*cosines));
-            memcpy(sines, all_sin + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*sines));
-        }
-        free(all_sin); free(all_cos);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
@@ -2211,10 +2263,11 @@ int coli_v4_attention_window_batch_ref(
     int *compressed_counts = calloc((size_t)batch, sizeof(*compressed_counts));
     int *compressed_indices = malloc((size_t)batch * config->index_topk *
                                      sizeof(*compressed_indices));
-    int end_position = start_position + batch;
     size_t rope_pairs = (size_t)rope_dim / 2;
-    float *cosines = malloc((size_t)end_position * rope_pairs * sizeof(*cosines));
-    float *sines = malloc((size_t)end_position * rope_pairs * sizeof(*sines));
+    /* The batch consumes only its own positions.  A table from position zero
+     * made long-context prefill scale with history that is never read here. */
+    float *cosines = malloc((size_t)batch * rope_pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)batch * rope_pairs * sizeof(*sines));
     if (!qa || !q || !kv || !attended || !oa || !norm || !selected_counts ||
         !compressed_counts || !compressed_indices || !cosines || !sines) {
         free(sines); free(cosines); free(compressed_indices);
@@ -2287,15 +2340,14 @@ int coli_v4_attention_window_batch_ref(
     }
 
     int compressed = weights->plan.compression_ratio != 0;
-    if (!result) result = coli_v4_rope_precompute(
-        cosines, sines, rope_dim, end_position,
+    if (!result) result = coli_v4_rope_precompute_range(
+        cosines, sines, rope_dim, start_position, batch,
         compressed ? config->original_max_position_embeddings : 0,
         compressed ? config->compress_rope_theta : config->rope_theta,
         config->rope_factor, config->rope_beta_fast, config->rope_beta_slow);
     for (int item = 0; !result && item < batch; item++) {
-        int position = start_position + item;
-        const float *item_cos = cosines + (size_t)position * rope_pairs;
-        const float *item_sin = sines + (size_t)position * rope_pairs;
+        const float *item_cos = cosines + (size_t)item * rope_pairs;
+        const float *item_sin = sines + (size_t)item * rope_pairs;
         float *item_q = q + (size_t)item * q_width;
         float *item_kv = kv + (size_t)item * head_dim;
         for (int head = 0; head < heads; head++) {
@@ -2363,8 +2415,8 @@ int coli_v4_attention_window_batch_ref(
                 kv_count, topk, 1.0f / sqrtf((float)head_dim));
         }
         free(all_kv); free(indices);
-        const float *item_cos = cosines + (size_t)position * rope_pairs;
-        const float *item_sin = sines + (size_t)position * rope_pairs;
+        const float *item_cos = cosines + (size_t)item * rope_pairs;
+        const float *item_sin = sines + (size_t)item * rope_pairs;
         for (int head = 0; !result && head < heads; head++) {
             float *rope = item_attended + (size_t)head * head_dim +
                           head_dim - rope_dim;
@@ -2406,7 +2458,8 @@ int coli_v4_attention_window_batch_ref(
     if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
 
-    free(group_outputs); free(group_inputs); free(sines); free(cosines);
+    free(group_outputs); free(group_inputs);
+    free(sines); free(cosines);
     free(compressed_indices); free(compressed_counts); free(selected_counts);
     free(norm); free(oa); free(attended); free(kv); free(q); free(qa);
     return result ? set_error(error, error_size, "batched attention failed") : 0;
@@ -2622,11 +2675,10 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 
     int rope_position = position + 1 - state->ratio;
     int pairs = state->rope_dim / 2;
-    size_t table_count = (size_t)(rope_position + 1) * pairs;
-    float *cosines = malloc(table_count * sizeof(*cosines));
-    float *sines = malloc(table_count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, state->rope_dim, rope_position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, state->rope_dim, rope_position,
             state->config->original_max_position_embeddings,
             state->config->compress_rope_theta, state->config->rope_factor,
             state->config->rope_beta_fast, state->config->rope_beta_slow)) {
@@ -2634,9 +2686,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "cannot create compressor RoPE table");
     }
     float *rope = output + dimension - state->rope_dim;
-    coli_v4_rope_apply(rope, 1, state->rope_dim,
-                       cosines + (size_t)rope_position * pairs,
-                       sines + (size_t)rope_position * pairs, 0);
+    coli_v4_rope_apply(rope, 1, state->rope_dim, cosines, sines, 0);
     coli_bf16_round_array(rope, (size_t)state->rope_dim);
     free(sines); free(cosines);
 
@@ -2803,11 +2853,10 @@ static int apply_position_rope(float *queries,
                                int position) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     int rope_dim = config->qk_rope_head_dim, pairs = rope_dim / 2;
-    size_t count = (size_t)(position + 1) * pairs;
-    float *cosines = malloc(count * sizeof(*cosines));
-    float *sines = malloc(count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, rope_dim, position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, rope_dim, position,
             config->original_max_position_embeddings,
             config->compress_rope_theta, config->rope_factor,
             config->rope_beta_fast, config->rope_beta_slow)) {
@@ -2816,8 +2865,7 @@ static int apply_position_rope(float *queries,
     for (int head = 0; head < heads; head++) {
         float *query = queries + (size_t)head * dimension;
         coli_v4_rope_apply(query + dimension - rope_dim, 1, rope_dim,
-                           cosines + (size_t)position * pairs,
-                           sines + (size_t)position * pairs, 0);
+                           cosines, sines, 0);
         coli_bf16_round_array(query + dimension - rope_dim, (size_t)rope_dim);
     }
     free(sines); free(cosines);
@@ -3271,10 +3319,37 @@ typedef struct {
 } ExpertLoadHandle;
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-#ifndef COLI_V4_EXPERT_LOADER_COUNT
-#define COLI_V4_EXPERT_LOADER_COUNT 3
-#endif
+/* COLI_V4_EXPERT_LOADER_COUNT defaults in deepseek_v4_internal.h so the CLI
+ * sees the same worker count when sizing the OpenMP team.
+ *
+ * The COUNT is only the DEFAULT lane count now: V4_LOADER_LANES=<1..16>
+ * raises or lowers it at runtime.  Measured on a 12-core streaming the real
+ * V4-Flash checkpoint from a VHDX: one 13.4 MB cold expert read costs ~48 ms
+ * with 3 lanes and ~29.6 ms with 10, because the disk scales almost linearly
+ * with queue depth (86 MB/s at QD1, 696 MB/s aggregate at QD8, measured with
+ * O_DIRECT dd on the same shards) while a lane spends its life blocked in
+ * pread.  Decode moved 6.2 -> 4.9 s/token on the same box.
+ *
+ * v4_omp_reserve_loader_cpus() deliberately keeps subtracting the COMPILE
+ * default, not the env value: lanes block in pread and do not need whole
+ * CPUs, and subtracting 10 from a 12-CPU box would leave the compute team
+ * at 2 threads -- the reservation and the pool depth are two consumers of
+ * this constant with OPPOSITE correctness directions, so the env knob moves
+ * only the pool. */
 enum { DUAL_EXPERT_LOADER_COUNT = COLI_V4_EXPERT_LOADER_COUNT };
+enum { DUAL_EXPERT_LOADER_MAX = 16 };
+
+static int dual_loader_lanes(void) {
+    static int lanes;
+    if (!lanes) {
+        const char *value = getenv("V4_LOADER_LANES");
+        int n = value ? atoi(value) : DUAL_EXPERT_LOADER_COUNT;
+        if (n < 1) n = DUAL_EXPERT_LOADER_COUNT;
+        if (n > DUAL_EXPERT_LOADER_MAX) n = DUAL_EXPERT_LOADER_MAX;
+        lanes = n;
+    }
+    return lanes;
+}
 
 typedef struct {
     pthread_t thread;
@@ -3290,7 +3365,7 @@ typedef struct {
     pthread_cond_t ready;
     pthread_cond_t complete;
     pthread_cond_t idle;
-    DualExpertLoaderSlot slots[DUAL_EXPERT_LOADER_COUNT];
+    DualExpertLoaderSlot slots[DUAL_EXPERT_LOADER_MAX];
 } DualExpertLoaderPool;
 
 static DualExpertLoaderPool dual_loader_pool = {
@@ -3323,11 +3398,11 @@ static void *dual_expert_loader_worker(void *argument) {
 
 static void dual_expert_loader_shutdown(void) {
     pthread_mutex_lock(&dual_loader_pool.mutex);
-    for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++)
+    for (int i = 0; i < dual_loader_lanes(); i++)
         dual_loader_pool.slots[i].stopping = 1;
     pthread_cond_broadcast(&dual_loader_pool.ready);
     pthread_mutex_unlock(&dual_loader_pool.mutex);
-    for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++)
+    for (int i = 0; i < dual_loader_lanes(); i++)
         if (dual_loader_pool.slots[i].available) {
             pthread_join(dual_loader_pool.slots[i].thread, NULL);
             dual_loader_pool.slots[i].available = 0;
@@ -3336,7 +3411,7 @@ static void dual_expert_loader_shutdown(void) {
 
 static void dual_expert_loader_init(void) {
     int available = 0;
-    for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++) {
+    for (int i = 0; i < dual_loader_lanes(); i++) {
         DualExpertLoaderSlot *slot = &dual_loader_pool.slots[i];
         if (!pthread_create(&slot->thread, NULL,
                             dual_expert_loader_worker, slot)) {
@@ -3354,14 +3429,14 @@ static int dual_expert_load_start(ExpertLoadHandle *handle,
     int selected = -1;
     while (selected < 0) {
         int available = 0;
-        for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++) {
+        for (int i = 0; i < dual_loader_lanes(); i++) {
             DualExpertLoaderSlot *slot = &dual_loader_pool.slots[i];
             if (!slot->available) continue;
             available++;
             if (!slot->job && !slot->pending) { selected = i; break; }
         }
         if (!available ||
-            (selected < 0 && available < DUAL_EXPERT_LOADER_COUNT)) {
+            (selected < 0 && available < dual_loader_lanes())) {
             pthread_mutex_unlock(&dual_loader_pool.mutex);
             return -1;
         }
@@ -3382,7 +3457,7 @@ static int dual_expert_load_start(ExpertLoadHandle *handle,
 
 static int dual_expert_load_finish(ExpertLoadHandle *handle) {
     if (!handle->active || handle->loader_slot < 0 ||
-        handle->loader_slot >= DUAL_EXPERT_LOADER_COUNT) return -1;
+        handle->loader_slot >= dual_loader_lanes()) return -1;
     pthread_mutex_lock(&dual_loader_pool.mutex);
     DualExpertLoaderSlot *slot =
         &dual_loader_pool.slots[handle->loader_slot];
@@ -3644,12 +3719,12 @@ static int moe_token_pipeline(float *output,
 
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    ExpertLoadJob jobs[DUAL_EXPERT_LOADER_COUNT] = {{0}};
-    ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_COUNT] = {{0}};
-    int loader_active[DUAL_EXPERT_LOADER_COUNT] = {0};
+    ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
     if (!result) {
-        int preload = selected < DUAL_EXPERT_LOADER_COUNT
-            ? selected : DUAL_EXPERT_LOADER_COUNT;
+        int preload = selected < dual_loader_lanes()
+            ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
             jobs[i].store = store;
             jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
@@ -3686,7 +3761,7 @@ static int moe_token_pipeline(float *output,
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     for (int current = 0; !result && current < selected; current++) {
-        int slot = current % DUAL_EXPERT_LOADER_COUNT;
+        int slot = current % dual_loader_lanes();
         if (!loader_active[slot] ||
             profiled_expert_load_finish(&loaders[slot]) != 0) {
             result = -1; break;
@@ -3695,7 +3770,7 @@ static int moe_token_pipeline(float *output,
         if (jobs[slot].result) { result = -1; break; }
         ColiExpertView expert = jobs[slot].view;
 
-        int next = current + DUAL_EXPERT_LOADER_COUNT;
+        int next = current + dual_loader_lanes();
         if (next < selected) {
             memset(&jobs[slot], 0, sizeof(jobs[slot]));
             jobs[slot].store = store;
@@ -3715,7 +3790,7 @@ static int moe_token_pipeline(float *output,
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
     }
-    for (int slot = 0; slot < DUAL_EXPERT_LOADER_COUNT; slot++)
+    for (int slot = 0; slot < dual_loader_lanes(); slot++)
         if (loader_active[slot]) {
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result)
@@ -3839,6 +3914,211 @@ int coli_v4_block_window_token_ref(
 #include "deepseek_v4_internal.h"
 #include "deepseek_v4_internal.h"
 
+/* ================ expert-major batch MoE: the prefill union ==============
+ *
+ * The batched block below used to run the FFN position by position, so a
+ * chunk of 64 prompt positions issued up to 64 x topk expert lookups per
+ * layer even when many positions selected the same expert.  Measured on the
+ * real V4-Flash checkpoint (113-token prompt, issue #905): 4.37 disk reads
+ * per DISTINCT expert, 29,154 lookups where 7,777 suffice -- 42% of prefill
+ * bytes were re-reads of experts already read moments earlier.
+ *
+ * This routine routes the complete batch first, then walks the UNION of
+ * selected experts in ascending id order, leasing each expert once and
+ * applying it to every (position, rank) that selected it before moving on.
+ *
+ * Exactness: moe_token_pipeline() sorts a position's experts into ascending
+ * expert-id order before accumulating, and emits one term per MATCHING RANK
+ * (a router handing a position the same expert at two ranks contributes it
+ * twice).  The union preserves both properties -- ascending experts outer,
+ * ascending (item, rank) inner -- so each position's accumulation order is
+ * identical to the token path's and the result is token-exact, verified on
+ * the real checkpoint via --record-oracle/--oracle (26/26 teacher-forced
+ * positions, 8/8 greedy, identical near-tie logits).
+ *
+ * V4_EXPERT_UNION=0 restores the per-position path for A/B timing.
+ * ========================================================================= */
+static int v4_moe_batch_union(
+    float *outputs, const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+    const float *inputs, const int *tokens, int batch) {
+    int d = config->hidden_size;
+    int n = config->n_routed_experts;
+    int topk = config->num_experts_per_tok;
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    float *gate = NULL;
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+    int missing_gate = !raw_gate;
+#else
+    size_t gate_count = (size_t)n * d;
+    float *gate = malloc(gate_count * sizeof(*gate));
+    int missing_gate = !gate;
+#endif
+    float *route_weights = malloc((size_t)batch * topk * sizeof(*route_weights));
+    int *indices = malloc((size_t)batch * topk * sizeof(*indices));
+    float *shared = malloc((size_t)batch * d * sizeof(*shared));
+    float *expert_output = malloc((size_t)d * sizeof(*expert_output));
+    unsigned char *used = calloc((size_t)n, 1);
+    ColiExpertKey *keys = malloc((size_t)n * sizeof(*keys));
+    if (missing_gate || !route_weights || !indices || !shared ||
+        !expert_output || !used || !keys) {
+        free(keys); free(used); free(expert_output); free(shared);
+        free(indices); free(route_weights); free(gate);
+        return -1;
+    }
+#ifdef COLI_V4_DISABLE_BF16_ROUTE
+    decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
+#endif
+    const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
+    const float *bias = value(weights, "ffn.gate.bias", NULL);
+    int result = weights->plan.uses_hash_router && !table ? -1 : 0;
+    for (int item = 0; !result && item < batch; item++) {
+        int *item_indices = indices + (size_t)item * topk;
+        float *item_weights = route_weights + (size_t)item * topk;
+        if (weights->plan.uses_hash_router)
+            for (int rank = 0; rank < topk; rank++)
+                item_indices[rank] =
+                    (int)table[(size_t)tokens[item] * topk + rank];
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+        result = coli_v4_route_bf16(
+            item_weights, item_indices, inputs + (size_t)item * d,
+            raw_gate, bias,
+            weights->plan.uses_hash_router ? item_indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+#else
+        result = coli_v4_route(
+            item_weights, item_indices, inputs + (size_t)item * d,
+            gate, bias,
+            weights->plan.uses_hash_router ? item_indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+#endif
+        if (!result)
+            for (int rank = 0; rank < topk; rank++) {
+                if (item_indices[rank] >= 0 && item_indices[rank] < n)
+                    used[item_indices[rank]] = 1;
+                else
+                    result = -1;
+            }
+    }
+
+    ColiTensorView w1, w2, w3;
+    if (!result &&
+        (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
+         fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
+         fp8_view(&w3, weights, "ffn.shared_experts.w3")))
+        result = -1;
+    for (int item = 0; !result && item < batch; item++)
+        result = coli_v4_shared_expert_forward_ref(
+            shared + (size_t)item * d, &w1, &w2, &w3,
+            inputs + (size_t)item * d, config->swiglu_limit);
+    if (!result)
+        memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
+
+    int key_count = 0;
+    for (int expert = 0; expert < n; expert++)
+        if (used[expert])
+            keys[key_count++] = (ColiExpertKey){weights->plan.layer, expert};
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    /* The union is also the loader pool's issue queue: keep lanes-many reads
+     * in flight, launch the replacement before computing the completed
+     * expert, and disk N+lanes overlaps CPU expert N. */
+    ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    int active[DUAL_EXPERT_LOADER_MAX] = {0};
+    int preload = key_count < dual_loader_lanes()
+        ? key_count : dual_loader_lanes();
+    for (int current = 0; !result && current < preload; current++) {
+        jobs[current].store = store;
+        jobs[current].key = keys[current];
+        jobs[current].result = -1;
+        if (profiled_expert_load_start(&loaders[current], &jobs[current]))
+            result = -1;
+        else
+            active[current] = 1;
+    }
+    for (int current = 0; !result && current < key_count; current++) {
+        int slot = current % dual_loader_lanes();
+        if (!active[slot] || profiled_expert_load_finish(&loaders[slot]) ||
+            jobs[slot].result) {
+            result = -1;
+            break;
+        }
+        active[slot] = 0;
+        ColiExpertView view = jobs[slot].view;
+        int next = current + dual_loader_lanes();
+        if (next < key_count) {
+            memset(&jobs[slot], 0, sizeof(jobs[slot]));
+            jobs[slot].store = store;
+            jobs[slot].key = keys[next];
+            jobs[slot].result = -1;
+            if (profiled_expert_load_start(&loaders[slot], &jobs[slot]))
+                result = -1;
+            else
+                active[slot] = 1;
+        }
+        int expert = view.key.expert;
+        for (int item = 0; !result && item < batch; item++)
+            for (int rank = 0; !result && rank < topk; rank++) {
+                if (indices[(size_t)item * topk + rank] != expert) continue;
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &view, inputs + (size_t)item * d,
+                    route_weights[(size_t)item * topk + rank],
+                    config->swiglu_limit);
+                if (!result)
+                    for (int column = 0; column < d; column++)
+                        outputs[(size_t)item * d + column] +=
+                            expert_output[column];
+            }
+        coli_expert_release(store, &view);
+    }
+    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+        if (active[slot]) {
+            profiled_expert_load_finish(&loaders[slot]);
+            if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
+        }
+#else
+    for (int current = 0; !result && current < key_count; current++) {
+        ColiExpertView view;
+        if (coli_expert_lookup(store, keys[current], &view)) {
+            result = -1;
+            break;
+        }
+        int expert = keys[current].expert;
+        for (int item = 0; !result && item < batch; item++)
+            for (int rank = 0; !result && rank < topk; rank++) {
+                if (indices[(size_t)item * topk + rank] != expert) continue;
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &view, inputs + (size_t)item * d,
+                    route_weights[(size_t)item * topk + rank],
+                    config->swiglu_limit);
+                if (!result)
+                    for (int column = 0; column < d; column++)
+                        outputs[(size_t)item * d + column] +=
+                            expert_output[column];
+            }
+        coli_expert_release(store, &view);
+    }
+#endif
+    for (int item = 0; !result && item < batch; item++)
+        for (int column = 0; column < d; column++)
+            outputs[(size_t)item * d + column] = coli_bf16_round(
+                outputs[(size_t)item * d + column] +
+                shared[(size_t)item * d + column]);
+
+    free(keys); free(used); free(expert_output); free(shared);
+    free(indices); free(route_weights); free(gate);
+    return result ? -1 : 0;
+}
+
+static int v4_expert_union_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value_text = getenv("V4_EXPERT_UNION");
+        enabled = !value_text || atoi(value_text) != 0;
+    }
+    return enabled;
+}
+
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
     const ColiDeepSeekV4LayerWeights *weights,
@@ -3855,10 +4135,12 @@ int coli_v4_block_window_batch_ref(
     float *posts = malloc((size_t)batch * hc * sizeof(*posts));
     float *combs = malloc((size_t)batch * hc * hc * sizeof(*combs));
     float *reduced = malloc((size_t)d * sizeof(*reduced));
-    float *ffn_normalized = malloc((size_t)d * sizeof(*ffn_normalized));
-    float *ffn_branch = malloc((size_t)d * sizeof(*ffn_branch));
-    float *ffn_post = malloc((size_t)hc * sizeof(*ffn_post));
-    float *ffn_comb = malloc((size_t)hc * hc * sizeof(*ffn_comb));
+    /* FFN buffers are batch-sized so the MoE can run expert-major over the
+     * whole chunk (v4_moe_batch_union) instead of position by position. */
+    float *ffn_normalized = malloc((size_t)batch * d * sizeof(*ffn_normalized));
+    float *ffn_branch = malloc((size_t)batch * d * sizeof(*ffn_branch));
+    float *ffn_post = malloc((size_t)batch * hc * sizeof(*ffn_post));
+    float *ffn_comb = malloc((size_t)batch * hc * hc * sizeof(*ffn_comb));
     if (!states || !normalized || !branches || !posts || !combs || !reduced ||
         !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
         free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
@@ -3889,15 +4171,29 @@ int coli_v4_block_window_batch_ref(
         if (!result) coli_bf16_round_array(state, hd);
         if (!result) phase = "FFN hyper-connection";
         if (!result) result = normalized_hc_pre(
-            reduced, ffn_post, ffn_comb, ffn_normalized, state,
+            reduced, ffn_post + (size_t)item * hc,
+            ffn_comb + (size_t)item * hc * hc,
+            ffn_normalized + (size_t)item * d, state,
             weights, config, "ffn", "ffn_norm.weight");
-        if (!result) phase = "MoE";
-        if (!result) result = moe_token_pipeline(
+    }
+    if (!result) phase = "MoE";
+    if (!result && batch > 1 && v4_expert_union_enabled())
+        result = v4_moe_batch_union(
             ffn_branch, weights, config, experts,
-            ffn_normalized, tokens[item]);
-        if (!result) result = coli_v4_hc_post(
-            outputs_hc + (size_t)item * hd, ffn_branch, state,
-            ffn_post, ffn_comb, hc, d);
+            ffn_normalized, tokens, batch);
+    else
+        for (int item = 0; !result && item < batch; item++)
+            result = moe_token_pipeline(
+                ffn_branch + (size_t)item * d, weights, config, experts,
+                ffn_normalized + (size_t)item * d, tokens[item]);
+    if (!result) phase = "FFN hyper-connection post";
+    for (int item = 0; !result && item < batch; item++) {
+        result = coli_v4_hc_post(
+            outputs_hc + (size_t)item * hd,
+            ffn_branch + (size_t)item * d,
+            states + (size_t)item * hd,
+            ffn_post + (size_t)item * hc,
+            ffn_comb + (size_t)item * hc * hc, hc, d);
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
     }
@@ -4126,11 +4422,10 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 
     int rope_position = position + 1 - state->ratio;
     int pairs = state->rope_dim / 2;
-    size_t table_count = (size_t)(rope_position + 1) * pairs;
-    float *cosines = malloc(table_count * sizeof(*cosines));
-    float *sines = malloc(table_count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, state->rope_dim, rope_position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, state->rope_dim, rope_position,
             state->config->original_max_position_embeddings,
             state->config->compress_rope_theta, state->config->rope_factor,
             state->config->rope_beta_fast, state->config->rope_beta_slow)) {
@@ -4138,9 +4433,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "cannot create compressor RoPE table");
     }
     float *rope = output + dimension - state->rope_dim;
-    coli_v4_rope_apply(rope, 1, state->rope_dim,
-                       cosines + (size_t)rope_position * pairs,
-                       sines + (size_t)rope_position * pairs, 0);
+    coli_v4_rope_apply(rope, 1, state->rope_dim, cosines, sines, 0);
     coli_bf16_round_array(rope, (size_t)state->rope_dim);
     free(sines); free(cosines);
 
@@ -4366,11 +4659,10 @@ static int apply_position_rope(float *queries,
                                int position) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     int rope_dim = config->qk_rope_head_dim, pairs = rope_dim / 2;
-    size_t count = (size_t)(position + 1) * pairs;
-    float *cosines = malloc(count * sizeof(*cosines));
-    float *sines = malloc(count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, rope_dim, position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, rope_dim, position,
             config->original_max_position_embeddings,
             config->compress_rope_theta, config->rope_factor,
             config->rope_beta_fast, config->rope_beta_slow)) {
@@ -4379,8 +4671,7 @@ static int apply_position_rope(float *queries,
     for (int head = 0; head < heads; head++) {
         float *query = queries + (size_t)head * dimension;
         coli_v4_rope_apply(query + dimension - rope_dim, 1, rope_dim,
-                           cosines + (size_t)position * pairs,
-                           sines + (size_t)position * pairs, 0);
+                           cosines, sines, 0);
         coli_bf16_round_array(query + dimension - rope_dim, (size_t)rope_dim);
     }
     free(sines); free(cosines);
@@ -4798,22 +5089,13 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
-        float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
-        float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
-        if (!all_cos || !all_sin || coli_v4_rope_precompute(
-                all_cos, all_sin, rope_dim, position + 1,
+        if (coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
                 compressed ? config->original_max_position_embeddings : 0,
                 compressed ? config->compress_rope_theta : config->rope_theta,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
-        if (!result) {
-            memcpy(cosines, all_cos + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*cosines));
-            memcpy(sines, all_sin + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*sines));
-        }
-        free(all_sin); free(all_cos);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
@@ -6303,6 +6585,45 @@ static int v4_dspark_full_wanted(
     return mtp && atoi(mtp) != 0 && draft && atoi(draft) > 0;
 }
 
+/* The native full drafter is a three-stage DSpark profile.  The ordinary
+ * Flash checkpoint exposes only the standard MTP tensors, while the official
+ * DSpark supplement keeps num_nextn_predict_layers=1 and adds these markers.
+ * The full loader remains the authority for detailed dtype/shape validation;
+ * this cheap probe only decides whether its cache should enter the plan. */
+enum {
+    V4_DSPARK_PROFILE_BLOCK = 5,
+    V4_DSPARK_PROFILE_RANK = 256,
+};
+
+static int v4_dspark_full_profile_present(
+    const ColiSafetensorsIndex *index,
+    const ColiDeepSeekV4Config *config) {
+    if (!index || !config) return 0;
+
+    /* Converted checkpoints may omit these optional fields, but an explicit
+     * incompatible profile must not reserve memory for this fixed loader. */
+    if ((config->dspark_block_size > 0 &&
+         config->dspark_block_size != V4_DSPARK_PROFILE_BLOCK) ||
+        (config->dspark_markov_rank > 0 &&
+         config->dspark_markov_rank != V4_DSPARK_PROFILE_RANK))
+        return 0;
+
+    /* Cover the entry projection, middle and final stages, and the distinctive
+     * output heads. v4_ds_load_all() performs the complete validation later. */
+    static const char *profile_tensors[] = {
+        "mtp.0.main_proj.weight", "mtp.0.main_proj.scale",
+        "mtp.1.attn.wq_a.weight", "mtp.1.attn.wq_a.scale",
+        "mtp.2.attn.wq_a.weight", "mtp.2.attn.wq_a.scale",
+        "mtp.2.confidence_head.proj.weight",
+        "mtp.2.markov_head.markov_w1.weight",
+        "mtp.2.markov_head.markov_w2.weight",
+    };
+    for (size_t item = 0;
+         item < sizeof(profile_tensors) / sizeof(profile_tensors[0]); item++)
+        if (!coli_st_find(index, profile_tensors[item])) return 0;
+    return 1;
+}
+
 static uint64_t v4_dspark_full_reserve_bytes(void) {
     double cache = coli_v4_dspark_cache_gb() * 1e9;
     /* The released Flash checkpoint has ~0.56 GiB of resident MTP dense,
@@ -6517,7 +6838,16 @@ int coli_v4_engine_open(ColiV4Engine **output,
         goto fail;
     engine->owns_index = 1;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
-    int want_full_dspark = v4_dspark_full_wanted(options);
+    int requested_full_dspark = v4_dspark_full_wanted(options);
+    int want_full_dspark = requested_full_dspark &&
+                           v4_dspark_full_profile_present(
+                               engine->target_index, &engine->config);
+    if (requested_full_dspark && !want_full_dspark)
+        fprintf(stderr,
+                "v4_dspark warning=unsupported-checkpoint "
+                "expected_full_profile=3stage actual_mtp_layers=%d; "
+                "continuing-target-only\n",
+                engine->config.num_nextn_predict_layers);
     int want_dspark = !want_full_dspark && v4_dspark_markov_wanted(options);
     if (want_dspark && v4_dspark_markov_probe(engine, &dspark_w1,
                                                &dspark_w2)) {
@@ -6655,6 +6985,9 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>                         /* getrusage/RUSAGE_SELF for v4_serve_rss_gb;
                                                    * on Windows compat.h supplies the shim. */
+#endif
+#ifdef _OPENMP
+#include <omp.h>                                  /* team sizing around the expert loaders */
 #endif
 
 #define main coli_v4_first_token_legacy_main
@@ -7054,6 +7387,7 @@ int main(int argc, char **argv) {
            text_mode ? generated_count : token_count,
            (unsigned long long)stats.misses,
            (unsigned long long)stats.bytes_read);
+
     if (text_mode) {
         size_t text_capacity = (size_t)generated_count * 256 + 1;
         char *text = malloc(text_capacity);
@@ -7174,9 +7508,22 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
         int result = 0;
-        for (int offset = 0; !result && offset < batch; offset += 64) {
+        /* Chunk width caps every batch-scaled buffer in the block AND bounds
+         * the expert union: each chunk boundary re-reads the experts it
+         * shares with the previous chunk.  64 is the batch kernels' contract
+         * (coli_fp8/fp4_matmul_batch_ref and both window batch entries
+         * validate batch > 64 and return -1 -- measured: a 256 chunk dies in
+         * seconds at layer 0), so V4_PREFILL_CHUNK clamps to [1, 64]. */
+        static int chunk_width;
+        if (!chunk_width) {
+            const char *chunk_env = getenv("V4_PREFILL_CHUNK");
+            chunk_width = chunk_env ? atoi(chunk_env) : 64;
+            if (chunk_width < 1 || chunk_width > 64) chunk_width = 64;
+        }
+        for (int offset = 0; !result && offset < batch;
+             offset += chunk_width) {
             int chunk = batch - offset;
-            if (chunk > 64) chunk = 64;
+            if (chunk > chunk_width) chunk = chunk_width;
             result = coli_v4_block_window_batch_ref(
                 next + (size_t)offset * hd, attention[layer_id],
                 &layer, config, experts, state + (size_t)offset * hd,
@@ -7323,7 +7670,8 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --oracle FILE        validate against an oracle JSON fixture\n"
         "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
         "  --greedy N           oracle: compare N greedy continuation tokens\n"
-        "  --record-oracle FILE write greedy tokens + tf_pred to JSON\n",
+        "  --record-oracle FILE write greedy tokens + tf_pred to JSON\n"
+        "  CTX=N (environment)  context window in tokens (default: 4096)\n",
         program, program, program);
 }
 
@@ -8394,13 +8742,37 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                                   session->max_prompt_tokens + 16);
     int context = engine->runtime.context_tokens;
     if (prompt_count < 1 || prompt_count > session->max_prompt_tokens ||
-        prompt_count + request->max_tokens > context) {
+        prompt_count + 1 > context) {
+        /* The PROMPT does not fit (or leaves no room for a single generated
+         * token) -- that is the only honest CONTEXT_EXCEEDED.
+         *
+         * Format contract: the gateway parses `CONTEXT_EXCEEDED <used>
+         * <limit>` as bare positional numbers (openai_server.py, matching
+         * the GLM engine's emission). The previous key=value fields were
+         * interpolated verbatim into the client-facing message, which told
+         * #975's reporter his "maximum context length is requested=16384"
+         * -- the request, not the capacity, which never appeared at all. */
+        int prompt_capacity = session->max_prompt_tokens < context - 1
+                                  ? session->max_prompt_tokens
+                                  : context - 1;
         char message[256];
-        snprintf(message, sizeof(message),
-                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-                 prompt_count, request->max_tokens, context);
+        snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
+                 prompt_count, prompt_capacity);
         v4_serve_error(request->id, message);
         return;
+    }
+    /* max_tokens is a CEILING, not a target (#260/#382): generation ends at
+     * EOS either way, so an oversized budget is clamped to what the context
+     * can hold -- the same semantics the GLM serve path has had since #260.
+     * Rejecting instead made `coli chat`'s interactive default (16384) a
+     * guaranteed 400 on every first message of a fresh V4 chat (#975). */
+    if (request->max_tokens > context - prompt_count) {
+        fprintf(stderr,
+                "[V4] max_tokens %d clamped to %d (context %d - prompt %d); "
+                "raise CTX for longer answers\n",
+                request->max_tokens, context - prompt_count, context,
+                prompt_count);
+        request->max_tokens = context - prompt_count;
     }
     printf("ACCEPT %s %d\n", request->id, prompt_count);
     fflush(stdout);
@@ -8509,7 +8881,35 @@ static int v4_serve_main(void) {
 
 
 #ifndef COLI_V4_SKIP_GENERATE_MAIN
+#ifdef _OPENMP
+/* Size the OpenMP team so the block pipeline's persistent expert-loader
+ * workers keep whole CPUs. The OpenMP default team spans every logical CPU,
+ * which schedules compute threads onto the CPUs the loaders need -- and on a
+ * disk-bound decode the loaders are doing the rate-limiting work (the same
+ * rationale omp_tune.h records for the spin-wait half of the GLM tuning: a
+ * busy team steals cores from the I/O pool). An explicit OMP_NUM_THREADS or
+ * COLI_NO_OMP_TUNE=1 wins, exactly like the other engines' tuning. */
+static int v4_omp_reserve_loader_cpus(void) {
+    if (getenv("COLI_NO_OMP_TUNE")) return 0; /* family-wide kill-switch */
+    if (getenv("OMP_NUM_THREADS")) return 0;  /* the user already chose */
+    int logical = omp_get_max_threads();
+    int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
+    if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
+    omp_set_num_threads(team);
+    fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
+                    "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
+                    "overrides, COLI_NO_OMP_TUNE=1 disables\n",
+            team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+    return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _OPENMP
+    if (!v4_omp_reserve_loader_cpus())
+        fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",
+                omp_get_max_threads());
+#endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
         return v4_serve_main();
     double process_started = spec_now();
@@ -8553,6 +8953,9 @@ int main(int argc, char **argv) {
             .target_model_dir = cli.model_dir,
             .no_dspark = cli.no_dspark,
             .pin_slots_per_layer = -1,
+            /* Same contract as v4_serve_main: CTX sets the session plan;
+             * unset or invalid falls back to the engine default (4096). */
+            .context_tokens = getenv("CTX") ? atoi(getenv("CTX")) : 0,
         };
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =
@@ -8695,6 +9098,10 @@ int main(int argc, char **argv) {
     };
     ColiV4SessionGenerateStats gen_stats;
     memset(&gen_stats, 0, sizeof(gen_stats));
+    /* clock_gettime inline rather than a helper: the amalgamated build compiles
+     * this file once per COLI_V4_UNIT_*, and hot_now() is static to another one. */
+    struct timespec tune_a, tune_b;
+    clock_gettime(CLOCK_MONOTONIC, &tune_a);
     if (coli_v4_session_generate(session, prompt, prompt_length, &gen_opts,
                                  NULL, NULL, &gen_stats, error,
                                  sizeof(error))) {
@@ -8720,6 +9127,18 @@ int main(int argc, char **argv) {
            (unsigned long long)stats_end.hits,
            (unsigned long long)stats_end.misses, stats_hit_rate(stats_end),
            (unsigned long long)stats_end.bytes_read, target_only);
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). stdout, which is what autotune captures -- the v4_* diagnostics
+     * above go to stderr. Tokens and seconds rather than tok/s: the ratio is
+     * derived by the caller at full precision (#852). */
+    clock_gettime(CLOCK_MONOTONIC, &tune_b);
+    printf("TUNE decode: %d tokens in %.3fs\n", gen_stats.generated_tokens,
+           (double)(tune_b.tv_sec - tune_a.tv_sec) +
+           (tune_b.tv_nsec - tune_a.tv_nsec) * 1e-9);
+    fflush(stdout);
     fprintf(stderr, "generated_text=");
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",

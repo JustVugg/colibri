@@ -43,13 +43,47 @@ static int64_t expert_bytes_layer(Model *m, int layer){
  *   118 GB. The projection's shape was right; only this constant was wrong.
  *
  * nsp += 2 in cap_for_ram() already nods at the MTP row costing double, but that
- * corrects one row out of nsp; the slabs grow on all of them. */
+ * corrects one row out of nsp; the slabs grow on all of them.
+ *
+ * #856 SCOPE: this is the right width for the ws[64] working set, whose slots ARE
+ * shared across rows, and for nothing else. Sizing the per-row LRU caches with it
+ * is what expert_cache_row_bytes() below replaces. */
 static int64_t expert_bytes_probe(Model *m, int ebits){
     Cfg *c=&m->c;
     int64_t eb=expert_bytes_layer(m,c->first_dense);
     if(m->has_mtp){ int64_t mtp=expert_bytes_layer(m,c->n_layers); if(mtp>eb) eb=mtp; }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
     return eb;
+}
+
+/* Width of the experts ONE row actually holds; same fallback as the probe above.
+ *
+ * Every row has its own ecache[layer] and its own pin arena, so a row costs the
+ * width IT holds. Charging all of them the container's widest halved the cache on
+ * GLM-5.2 shipped as int4 routed + int8 MTP: 154 -> 77 slots per row, with the
+ * 5,852 experts that left RAM reappearing one-for-one on disk (#856). Diagnosis by
+ * @terrizoaguimor from @brad-evony's dashboard screenshots. */
+static int64_t expert_bytes_row(Model *m, int layer, int ebits){
+    Cfg *c=&m->c;
+    int64_t eb=expert_bytes_layer(m,layer);
+    if(eb>0) return eb;
+    eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
+    /* Header unreadable. For the MTP row keep the old "counts double" approximation
+     * (nsp+=2 in cap_for_ram) rather than assume it is as narrow as a routed row:
+     * under-reserving is the direction that ends in an OOM-kill. */
+    return layer==c->n_layers ? eb*2 : eb;
+}
+
+/* What ONE slot per row costs across EVERY row -- the divisor of the expert budget.
+ * Stateless on purpose: st_find is a hash lookup, so this is ~6 probes per layer
+ * and a few hundred for a 78-layer model, called a handful of times at startup.
+ * A memo keyed on anything less than (model, ebits) is a staleness bug waiting for
+ * whoever next changes has_mtp or the layer map. */
+static double expert_cache_row_bytes(Model *m, int ebits){
+    Cfg *c=&m->c; double sum=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) sum+=(double)expert_bytes_row(m,i,ebits);
+    if(m->has_mtp) sum+=(double)expert_bytes_row(m,c->n_layers,ebits);
+    return sum;
 }
 
 /* BRAIN MAP: per-turn expert hit bitmap for the dashboard. */
@@ -148,8 +182,20 @@ static void tiers_emit(Model *m){
 #endif
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
-    double eb=(double)expert_bytes_probe(m,m->ebits);
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
+    /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
+     * box where Windows still showed 140 GB free, because every resident expert was
+     * being priced as an int8 MTP one (#856). A tier figure that disagrees with the
+     * operating system teaches people to distrust the panel. */
+    double ram_b=0;
+    for(int i=0;i<=c->n_layers;i++){
+        int64_t w=expert_bytes_row(m,i,m->ebits);
+        ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
+    }
+    if(vram>0){                       /* the VRAM tier's host copies are not RAM-tier bytes */
+        double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;
+        ram_b -= avg*(double)vram; if(ram_b<0) ram_b=0;
+    }
+    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_b/1e9);
     fflush(stdout);
 }
 
