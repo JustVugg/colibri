@@ -3,7 +3,10 @@
 differences are implementation bugs, not quantization), teacher-forces a fixed
 token sequence with the pinned M3 conventions, and writes the engine's REF gate:
   ref_m3.json  {prompt_ids, full_ids, tf_pred}   +   oracle_logits.npy [T,V]
-Validate:  REF=ref_m3.json TF=1 COLI_MODEL=<container> ./colibri 8   (expect T/T)
+Validate:  SNAP=<container> REF=ref_m3.json TF=1 TF_DECODE=1 ./colibri 8
+(expect T/T on both gates; run with IDOT=0 — the exact f32 kernels match this
+oracle to ~1e-6, while the int8-activation IDOT default can flip an argmax at
+a borderline position, which is quantization, not a port bug)
 
 Conventions (transformers modeling_minimax_m3_vl, pinned 2026-07-22):
   Gemma RMSNorm x/rms*(1+w) in f32; per-head QK-norm BEFORE partial NEOX RoPE
