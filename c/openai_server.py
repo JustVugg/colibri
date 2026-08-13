@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 import uuid
+
+import v4_dsml                      # DeepSeek V4 DSML tool-call encoding (vendored)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -308,6 +310,13 @@ def _unclosed_tail(reply, tools):
     declared = {(t.get("function", t) if isinstance(t, dict) else {}).get("name")
                 for t in (tools or []) if isinstance(t, dict)}
     return inner if inner.strip() in declared else None
+
+
+def parse_tool_calls_any(reply, tools):
+    """Route reply parsing to the active engine's tool-call format."""
+    if ARCH == "deepseek_v4":
+        return v4_dsml.parse_completion_text(reply)
+    return parse_tool_calls(reply, tools)
 
 
 def parse_tool_calls(reply, tools=None):
@@ -670,9 +679,16 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for DeepSeek V4 yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice == "none":
+        tools = None
+    elif tool_choice not in (None, "auto"):
+        raise APIError(400, "`tool_choice` values other than auto/none are not wired up "
+                            "for DeepSeek V4 yet.", "tool_choice", "unsupported_parameter")
+    history_has_tools = any(isinstance(m, dict) and
+                            (m.get("role") == "tool" or m.get("tool_calls"))
+                            for m in messages)
+    if tools or history_has_tools:
+        return render_chat_v4_tools(messages, enable_thinking, reasoning_effort, tools)
     bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
     user = "<\uff5cUser\uff5c>"
     assistant = "<\uff5cAssistant\uff5c>"
@@ -703,6 +719,51 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
             parts.extend((text, eos))
     parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
     return "".join(parts)
+
+
+def render_chat_v4_tools(messages, enable_thinking=False, reasoning_effort=None,
+                         tools=None):
+    """Tool-calling V4 prompt in the checkpoint's own DSML encoding.
+
+    Vendored from the DeepSeek-V4-Flash reference (v4_dsml.py): tool schemas are
+    declared in the system turn, assistant tool_calls render as <dsml>invoke
+    blocks, and "tool" role results merge into user turns as <tool_result>
+    blocks -- the native format the model was trained on.
+    """
+    clean = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        msg = {"role": role, "content": text}
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            if reasoning:
+                msg["reasoning_content"] = reasoning
+            if message.get("tool_calls"):
+                msg["tool_calls"] = message["tool_calls"]
+        elif role == "tool":
+            msg["tool_call_id"] = message.get("tool_call_id", "")
+        clean.append(msg)
+    if tools:
+        for msg in clean:
+            if msg["role"] in ("system", "developer"):
+                msg["tools"] = tools
+                break
+        else:
+            clean.insert(0, {"role": "system", "content": "", "tools": tools})
+    effort = {"minimal": "low", "low": "low", "medium": "low",
+              "high": "high", "xhigh": "max"}.get(reasoning_effort, "low")
+    return v4_dsml.encode_messages(
+        clean, thinking_mode="thinking" if enable_thinking else "chat",
+        reasoning_effort=effort)
 
 
 def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -2345,7 +2406,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    content, calls = parse_tool_calls_any(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -2469,15 +2530,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # <tool_call> split across engine chunks is still caught.
+                tc_marker = (v4_dsml.TOOL_CALLS_OPEN if ARCH == "deepseek_v4"
+                             else BOX_START)
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                hold = len(tc_marker) - 1
                 raw = []
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = sp["buf"].find(tc_marker)
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
@@ -2507,7 +2570,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                _content, calls = parse_tool_calls_any("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -2668,7 +2731,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_tool_calls(text, tools)
+                text, calls = parse_tool_calls_any(text, tools)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
