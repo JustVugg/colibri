@@ -20,11 +20,31 @@ SAFETENSORS_DTYPES = {
     "F32": 4,
     "U8": 1,
     "I8": 1,
+    # Native fp8 checkpoints (DeepSeek-V4, GLM-5.2-FP8 unrepacked) and the I64/U64
+    # routing-table tensors DeepSeek-V4 ships (e.g. layers.N.ffn.gate.tid2eid) --
+    # mirrors the dtype table already fixed on the C engine side (c/st.h), which
+    # doctor.py's own copy was never updated to match. Byte sizes match st.h's
+    # st_dtype_esz(): fp8 variants are 1 byte, I64/U64 are 8 bytes.
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "float8_e4m3fn": 1,
+    "F8_E8M0": 1,
+    "F8_E8M0FNU": 1,
+    "I64": 8,
+    "U64": 8,
 }
+# Each entry is a tuple of known-equivalent names for one conceptual tensor
+# (embedding / final norm / output head) across the families colibri supports.
+# DeepSeek-V4 checkpoints use short top-level names (embed.weight / norm.weight
+# / head.weight) instead of the model.*/lm_head.* convention every other
+# supported family uses; a flat exact-name tuple flagged a valid DeepSeek-V4
+# checkpoint as missing all three core tensors. Alias groups fix this without
+# needing arch detection: any family already passing (name present in its own
+# group) keeps passing, DeepSeek-V4's real names now also satisfy the check.
 REQUIRED_CORE_TENSORS = (
-    "model.embed_tokens.weight",
-    "model.norm.weight",
-    "lm_head.weight",
+    ("model.embed_tokens.weight", "embed.weight"),
+    ("model.norm.weight", "norm.weight"),
+    ("lm_head.weight", "head.weight"),
 )
 
 
@@ -270,7 +290,12 @@ def deep_container_report(model, mirror_dir=None):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             index = {"status": "fail", "summary": f"model index is invalid: {error}"}
 
-    missing_core = [name for name in REQUIRED_CORE_TENSORS if name not in tensor_sources]
+    # Report the canonical (first) name of an unsatisfied group -- the alias
+    # list is an input-matching detail, not something to leak into the message.
+    missing_core = [
+        aliases[0] for aliases in REQUIRED_CORE_TENSORS
+        if not any(name in tensor_sources for name in aliases)
+    ]
     required = {
         "status": "fail" if missing_core else "pass",
         "summary": (
@@ -485,10 +510,18 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     else:
         checks.append(_check("accelerator.gpu", "skip", "no supported GPU detected; CPU path is available"))
 
+    # linkage was already computed above (drives the accelerator.gpu check) but
+    # never reached the planner: build_plan() got the raw detected-GPU list
+    # regardless, so a CPU-only engine build (no libcudart/libamdhip64 linkage --
+    # true for deepseek_v4 as of this writing, it has no CUDA target at all)
+    # still had its "VRAM hot tier" sized against real GPU memory the engine
+    # can never touch, starving the RAM tier of the pool space that tier was
+    # phantom-reserving. Pass only GPUs the engine can actually use.
+    usable_gpus = detected_gpus if linkage.get("linked") else []
     try:
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus)
+                          gpus=usable_gpus)
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))

@@ -12,7 +12,16 @@ from pathlib import Path
 
 
 GB = 1_000_000_000
-EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+# Two naming conventions, both matched: the original Llama/Mixtral-style
+# model.layers.N.mlp.experts.M. (kept for whatever family already relies on
+# it) and DeepSeek-V4's layers.N.ffn.experts.M. -- no model. prefix, ffn
+# not mlp. Before this fix every DeepSeek-V4 Flash expert tensor (70932 of
+# them, ~150GB) silently fell through to the dense_bytes accumulator below
+# instead of expert_groups, so the planner budgeted the entire model as
+# permanently-resident dense weight instead of disk-streamable experts --
+# doctor reported a 170GB RAM requirement for a model documented elsewhere in
+# this repo as needing ~16-22GB via streaming.
+EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\.")
 
 
 def _tensor_sizes(path):
