@@ -223,6 +223,56 @@ BOX_START, BOX_END = "<tool_call>", "</tool_call>"
 TR_OPEN,  TR_CLOSE = "<tool_response>", "</tool_response>"
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 
+# DeepSeek V4 DSML tool-call markers. Authoritative in the checkpoint's
+# encoding/encoding_dsv4.py (dsml_token="｜DSML｜"): a call block is
+# "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"X\">\n<｜DSML｜parameter
+# name=\"k\" string=\"true|false\">v</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+# and a tool result is "<tool_result>{content}</tool_result>" merged into the
+# user turn. DS4 renders/parses these; GLM keeps the <tool_call> XML above.
+DSML = "｜DSML｜"
+DSML_BLOCK_OPEN = "<" + DSML + "tool_calls>"
+DSML_BLOCK_CLOSE = "</" + DSML + "tool_calls>"
+DSML_INVOKE_OPEN = "<" + DSML + "invoke name=\""
+DSML_INVOKE_CLOSE = "</" + DSML + "invoke>"
+DSML_PARAM_OPEN = "<" + DSML + "parameter name=\""
+DSML_PARAM_CLOSE = "</" + DSML + "parameter>"
+DSML_TOOL_RESULT_OPEN = "<tool_result>"
+DSML_TOOL_RESULT_CLOSE = "</tool_result>"
+
+_RE_DSML_BLOCK = re.compile(re.escape(DSML_BLOCK_OPEN) + r"(.*?)" + re.escape(DSML_BLOCK_CLOSE),
+                            re.DOTALL)
+_RE_DSML_INVOKE = re.compile(re.escape(DSML_INVOKE_OPEN) + r"(.*?)" + re.escape(DSML_INVOKE_CLOSE),
+                             re.DOTALL)
+_RE_DSML_PARAM = re.compile(re.escape(DSML_PARAM_OPEN) + r"(.*?)\" string=\"(true|false)\">(.*?)"
+                            + re.escape(DSML_PARAM_CLOSE), re.DOTALL)
+
+# Byte-level port of TOOLS_TEMPLATE in encoding_dsv4.py (the tools block the
+# model was trained on). {dsml} = the DSML token, {schemas} = JSON schemas
+# one per line. No literal braces appear in the template text.
+_DSML_TOOLS_TEMPLATE = (
+    "## Tools\n\n"
+    "You have access to a set of tools to help answer the user's question. "
+    "You can invoke tools by writing a \"<{dsml}tool_calls>\" block like the following:\n\n"
+    "<{dsml}tool_calls>\n"
+    "<{dsml}invoke name=\"$TOOL_NAME\">\n"
+    "<{dsml}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE"
+    "</{dsml}parameter>\n"
+    "...\n"
+    "</{dsml}invoke>\n"
+    "<{dsml}invoke name=\"$TOOL_NAME2\">\n"
+    "...\n"
+    "</{dsml}invoke>\n"
+    "</{dsml}tool_calls>\n\n"
+    "String parameters should be specified as is and set `string=\"true\"`. For all other "
+    "types (numbers, booleans, arrays, objects), pass the value in JSON format and set "
+    "`string=\"false\"`.\n\n"
+    "If thinking_mode is enabled (triggered by <think>), you MUST output your complete "
+    "reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+    "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+    "### Available Tool Schemas\n\n{schemas}\n\n"
+    "You MUST strictly follow the above defined tool name and parameter schemas to invoke "
+    "tool calls.\n")
+
 _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.DOTALL)
 _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL)
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
@@ -310,9 +360,168 @@ def _unclosed_tail(reply, tools):
     return inner if inner.strip() in declared else None
 
 
+def _dsml_arguments_to_params(arguments):
+    """OpenAI-format tool_call arguments (JSON string) -> DSML <parameter> lines.
+
+    Port of the checkpoint's encode_arguments_to_dsml (encoding_dsv4.py): each
+    argument becomes <｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter>,
+    with `string` marking string values so the model types them correctly.
+    """
+    if isinstance(arguments, str):
+        try:
+            args = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            args = {"arguments": arguments}
+    else:
+        args = arguments or {}
+    lines = []
+    for key, value in args.items():
+        is_str = isinstance(value, str)
+        text = value if is_str else json.dumps(value, ensure_ascii=False)
+        lines.append('<%sparameter name="%s" string="%s">%s</%sparameter>'
+                     % (DSML, key, "true" if is_str else "false", text, DSML))
+    return "\n".join(lines)
+
+
+def _dsml_tool_calls_block(tool_calls):
+    """OpenAI-format tool_calls -> DSML block for the assistant history turn."""
+    invokes = []
+    for tc in tool_calls or []:
+        fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        params = _dsml_arguments_to_params(fn.get("arguments", "{}"))
+        invokes.append('<%sinvoke name="%s">\n%s\n</%sinvoke>' % (DSML, name, params, DSML))
+    if not invokes:
+        return ""
+    return "\n\n<%stool_calls>\n%s\n</%stool_calls>" % (DSML, "\n".join(invokes), DSML)
+
+
+def _dsml_tools_block(tools):
+    """Tool schemas -> the checkpoint's authoritative "## Tools" system block.
+
+    Byte-level port of TOOLS_TEMPLATE in encoding_dsv4.py (the block the model
+    was trained on): JSON schemas one per line under "### Available Tool
+    Schemas", DSML invocation instructions above. A made-up preamble would make
+    the model hallucinate other frameworks' syntax, exactly like GLM's # Tools.
+    """
+    schemas = []
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        schemas.append(json.dumps(clean, ensure_ascii=False))
+    return _DSML_TOOLS_TEMPLATE.format(dsml=DSML, schemas="\n".join(schemas))
+
+
+def _dsml_merge_tool_messages(messages):
+    """Port of the checkpoint's merge_tool_messages: DS4 has no standalone "tool"
+    role, so results are merged into user turns as <tool_result> blocks, and the
+    text of the following user message joins the same turn."""
+    merged = []
+    for message in messages:
+        message = dict(message)
+        role = message.get("role")
+        if role == "tool":
+            block = {"type": "tool_result",
+                     "content": content_text(message.get("content"), "messages.tool")}
+            if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1]:
+                merged[-1]["content_blocks"].append(block)
+            else:
+                merged.append({"role": "user", "content_blocks": [block]})
+        elif role == "user":
+            text = content_text(message.get("content"), "messages.user")
+            block = {"type": "text", "text": text}
+            if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1]:
+                merged[-1]["content_blocks"].append(block)
+            else:
+                message["content_blocks"] = [block]
+                merged.append(message)
+        else:
+            merged.append(message)
+    return merged
+
+
+def _dsml_invoke_name(segment):
+    match = re.search(r'name="(.*?)"', segment, re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def _dsml_parse_params(inner, declared_types):
+    """Parse <｜DSML｜parameter> pairs into typed arguments. `string="true"` (or a
+    string-typed schema declaration) keeps the value verbatim; anything else is
+    JSON-parsed when it parses, mirroring _coerce_arg's policy."""
+    args = {}
+    for param in _RE_DSML_PARAM.finditer(inner):
+        key, is_str, value = param.group(1), param.group(2), param.group(3)
+        if key in args:
+            continue
+        if is_str == "true" or declared_types.get(key) == "string":
+            args[key] = value
+        else:
+            try:
+                args[key] = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                args[key] = value
+    return args
+
+
+def _dsml_parse_invokes(block, tools, allow_unclosed):
+    """Parse <｜DSML｜invoke> segments inside a tool_calls block. With allow_unclosed,
+    a trailing invoke the model never closed is recovered only when unambiguous
+    (a complete parameter pair, or the bare name of a declared tool)."""
+    calls = []
+    declared = {(t.get("function", t) if isinstance(t, dict) else {}).get("name")
+                for t in (tools or []) if isinstance(t, dict)}
+    param_types = _tool_param_types(tools)
+    last_end = 0
+    for match in _RE_DSML_INVOKE.finditer(block):
+        name = _dsml_invoke_name(match.group(0))
+        args = _dsml_parse_params(match.group(1), param_types.get(name, {}))
+        if name:
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name,
+                                       "arguments": json.dumps(args, ensure_ascii=False)}})
+        last_end = match.end()
+    if allow_unclosed:
+        tail = block[last_end:]
+        if DSML_INVOKE_OPEN in tail and DSML_INVOKE_CLOSE not in tail:
+            name = _dsml_invoke_name(tail)
+            params = _dsml_parse_params(tail, param_types.get(name, {}))
+            if name and (params or name in declared):
+                calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                              "function": {"name": name,
+                                           "arguments": json.dumps(params, ensure_ascii=False)}})
+    return calls
+
+
+def parse_dsml_tool_calls(reply, tools=None):
+    """Return (content, tool_calls) for DeepSeek V4 DSML output.
+
+    Tolerant parser for the checkpoint's native format. Content before the block
+    is preserved (DS4 models often emit a sentence before the call, e.g. "I'll
+    get the weather for you."); a block the model opened but never closed (EOS /
+    budget cut) is recovered only when its invokes are parseable.
+    """
+    match = _RE_DSML_BLOCK.search(reply)
+    if match is None:
+        start = reply.find(DSML_BLOCK_OPEN)
+        if start >= 0 and reply.rfind(DSML_BLOCK_CLOSE) < start:
+            text = reply[:start].strip()
+            calls = _dsml_parse_invokes(reply[start + len(DSML_BLOCK_OPEN):], tools,
+                                        allow_unclosed=True)
+            return text, calls
+        return reply.strip(), []
+    text = reply[:match.start()].strip()
+    calls = _dsml_parse_invokes(match.group(1), tools, allow_unclosed=True)
+    return text, calls
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
+    if ARCH == "deepseek_v4":
+        return parse_dsml_tool_calls(reply, tools)
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
@@ -662,22 +871,54 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
 
 def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                    tool_choice=None):
-    """DeepSeek V4's native multi-turn chat template.
+    """DeepSeek V4's native multi-turn chat template, with DSML tool support.
 
     The target engine receives this as a raw prompt. Prior assistant turns end
     with the checkpoint's EOS marker; the final assistant marker selects the
     thinking or direct-answer prefix for the new turn.
+
+    Tools follow the checkpoint's authoritative DSML format (encoding_dsv4.py):
+    declarations in a "## Tools" system block (render_tools), calls rendered as
+    <｜DSML｜tool_calls> blocks, and results merged into user turns as
+    <tool_result> blocks (merge_tool_messages). This is the format the model
+    was trained on -- NOT the GLM <tool_call> XML.
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for DeepSeek V4 yet.",
-                       "tools", "unsupported_parameter")
-    bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
-    user = "<\uff5cUser\uff5c>"
-    assistant = "<\uff5cAssistant\uff5c>"
-    eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+    # tool_choice mirrors render_chat: "none" hides the tools entirely, a forced
+    # function name keeps only that tool, "required" keeps them all.
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None
+    # DS4 has no standalone "tool" role: merge results into user turns first.
+    messages = _dsml_merge_tool_messages(messages)
+    bos = "<｜begin▁of▁sentence｜>"
+    user = "<｜User｜>"
+    assistant = "<｜Assistant｜>"
+    eos = "<｜end▁of▁sentence｜>"
     parts = [bos]
+    if tools:
+        # The declaration rides on the leading system segment (checkpoint
+        # render_message appends "\n\n" + render_tools to the system message);
+        # without a system message it becomes a standalone leading segment.
+        first = messages[0] if messages else None
+        if first and first.get("role") in ("system", "developer"):
+            text = content_text(first.get("content"), "messages.0.content") or ""
+            first = dict(first, content=text + ("\n\n" + _dsml_tools_block(tools) if text
+                                                else _dsml_tools_block(tools)))
+            messages = [first] + messages[1:]
+        else:
+            parts.append(_dsml_tools_block(tools))
+        if forced:
+            parts.append(f"\n\nYou must call the function `{forced}` now. Do not answer directly.")
+        elif tool_choice == "required":
+            parts.append("\n\nYou must call one of the functions above. Do not answer directly.")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
@@ -689,7 +930,28 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         if role in ("system", "developer"):
             parts.append(text)
         elif role == "user":
-            parts.extend((user, text))
+            parts.append(user)
+            blocks = message.get("content_blocks")
+            if blocks:
+                rendered = []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_result":
+                        result = block.get("content", "")
+                        if isinstance(result, list):      # multimodal result parts
+                            result = "\n\n".join(
+                                (b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
+                                 else f"[Unsupported {b.get('type')}]" if isinstance(b, dict)
+                                 else str(b)) for b in result)
+                        rendered.append(DSML_TOOL_RESULT_OPEN + result + DSML_TOOL_RESULT_CLOSE)
+                    elif block.get("type") == "text":
+                        rendered.append(block.get("text", ""))
+                    else:
+                        rendered.append(str(block.get("text", "")))
+                parts.append("\n\n".join(rendered) if rendered else text)
+            else:
+                parts.append(text)
         else:
             reasoning = message.get("reasoning_content")
             if reasoning is not None and not isinstance(reasoning, str):
@@ -700,7 +962,12 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
                 parts.extend(("<think>", reasoning, "</think>"))
             else:
                 parts.append("</think>")
-            parts.extend((text, eos))
+            if text:
+                parts.append(text)
+            tc_block = _dsml_tool_calls_block(message.get("tool_calls"))
+            if tc_block:
+                parts.append(tc_block)
+            parts.append(eos)
     parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
     return "".join(parts)
 
@@ -2453,17 +2720,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 ka_thread[0].start()
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
-                # calls from the FULL reply after generation. Hold back a marker-length tail so a
-                # <tool_call> split across engine chunks is still caught.
+                # calls from the FULL reply after generation. The marker is GLM's <tool_call> or
+                # DeepSeek V4's <｜DSML｜tool_calls>; hold back a marker-length tail so a block
+                # split across engine chunks is still caught.
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                marker = DSML_BLOCK_OPEN if ARCH == "deepseek_v4" else BOX_START
+                hold = len(marker) - 1
                 raw = []
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = sp["buf"].find(marker)
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
