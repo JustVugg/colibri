@@ -73,6 +73,8 @@ _POSIX_PASS_FDS_TESTS = frozenset(
 
 _NATIVE_DIRFD_TESTS = frozenset(
     {
+        "test_ramdisk_causal_benchmark.RawEvidenceTest.test_bound_store_rejects_private_hardlinked_evidence",
+        "test_ramdisk_causal_benchmark.RawEvidenceTest.test_bound_store_rejects_raw_protocol_and_parent_replacement",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_atomic_temp_creation_stays_inside_bound_parent",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_existing_marker_reproves_canonical_parent_before_journal_unlink",
         "test_ramdisk_state_lifecycle.StateAndSafetyTest.test_managed_usage_merge_rejects_symlink_swap_during_verified_open",

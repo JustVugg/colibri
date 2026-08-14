@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 C_DIR = Path(__file__).resolve().parents[1]
@@ -17,6 +18,11 @@ sys.path.insert(0, str(C_DIR))
 from ramdisk_support import benchmark  # noqa: E402
 from ramdisk_support import state as state_support  # noqa: E402
 from ramdisk_support.common import RamdiskError  # noqa: E402
+
+if __package__:
+    from .ramdisk_test_support import canonical_temporary_directory  # noqa: E402
+else:
+    from ramdisk_test_support import canonical_temporary_directory  # noqa: E402
 
 
 class WorkspaceFixture:
@@ -384,7 +390,8 @@ class DurableWorkspaceTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.fixture = WorkspaceFixture(self.temporary.name)
+        self.temporary_root = str(Path(self.temporary.name).resolve())
+        self.fixture = WorkspaceFixture(self.temporary_root)
 
     def test_open_journals_every_irreversible_transition_and_cleans(self):
         manager = self.fixture.manager()
@@ -711,7 +718,8 @@ class BenchmarkProcessSupervisionTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.fixture = WorkspaceFixture(self.temporary.name)
+        self.temporary_root = str(Path(self.temporary.name).resolve())
+        self.fixture = WorkspaceFixture(self.temporary_root)
         self.supervisor = FakeProcessSupervisor(self.fixture)
 
     def _starttime(self, pid):
@@ -957,7 +965,7 @@ class BenchmarkProcessSupervisionTest(unittest.TestCase):
 
         # A fresh operation with the deterministic leaf already created may be
         # adopted only after proving that it has no members.
-        adopt_root = Path(self.temporary.name) / "adopt"
+        adopt_root = Path(self.temporary_root) / "adopt"
         adopt_root.mkdir()
         self.fixture = WorkspaceFixture(str(adopt_root))
         self.supervisor = FakeProcessSupervisor(self.fixture)
@@ -1112,7 +1120,10 @@ class BenchmarkProcessSupervisionTest(unittest.TestCase):
                     gate=None,
                 )
 
-    def test_pending_process_state_rejects_spliced_or_mistyped_authority(self):
+    @mock.patch.object(state_support, "current_uid", return_value=1000)
+    def test_pending_process_state_rejects_spliced_or_mistyped_authority(
+        self, _current_uid
+    ):
         manager = self.fixture.manager(
             process_supervisor=self.supervisor,
             process_starttime=self._starttime,
@@ -1242,7 +1253,7 @@ class BenchmarkProcessSupervisionTest(unittest.TestCase):
     def test_removed_marker_requires_the_exact_leaf_path_to_be_absent(self):
         for replacement in (False, True):
             with self.subTest(replacement=replacement):
-                root = Path(self.temporary.name) / (
+                root = Path(self.temporary_root) / (
                     "replacement" if replacement else "leaked"
                 )
                 root.mkdir()
@@ -1315,7 +1326,7 @@ class BenchmarkProcessSupervisionTest(unittest.TestCase):
 
 class WorkspaceBindingTest(unittest.TestCase):
     def test_workspace_binding_preserves_identity_and_rejects_alias_mounts(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             first = Path(directory) / "first"
             second = Path(directory) / "second"
             first.mkdir()

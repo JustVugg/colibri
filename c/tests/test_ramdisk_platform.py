@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import posixpath
 import signal
 import stat
 import subprocess
@@ -44,6 +45,18 @@ def _proc_stat_record(pid, pgid, session, starttime, state="S"):
     fields[17] = "1"
     fields.append(str(starttime))
     return "%d (managed worker) %s\n" % (pid, " ".join(fields))
+
+
+class _LinuxTestOS:
+    """Use host OS calls with POSIX syntax for simulated Linux paths."""
+
+    def __init__(self, host_os):
+        self._host_os = host_os
+        self.path = posixpath
+        self.sep = "/"
+
+    def __getattr__(self, name):
+        return getattr(self._host_os, name)
 
 
 class RamdiskPlatformTest(unittest.TestCase):
@@ -553,7 +566,7 @@ import ramdisk
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["native_dirfd"]["tests"]),
-            19,
+            21,
         )
         self.assertEqual(
             len(PLATFORM_SKIP_INVENTORY["linux_pidfd"]["tests"]),
@@ -585,6 +598,11 @@ import ramdisk
 
 
 class LinuxOperationalReadContractTest(unittest.TestCase):
+    def setUp(self):
+        linux_os = mock.patch.object(linux_ops, "os", new=_LinuxTestOS(os))
+        linux_os.start()
+        self.addCleanup(linux_os.stop)
+
     @requires_linux_pidfd
     def test_real_pidfd_group_signal_targets_each_exact_member(self):
         nonce = "d" * 48
@@ -776,7 +794,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         with mock.patch.object(
             linux_ops, "_require_linux"
         ), mock.patch.object(
-            linux_ops.os, "sysconf", return_value=250
+            linux_ops.os, "sysconf", return_value=250, create=True
         ), mock.patch(
             "builtins.open",
             return_value=io.StringIO("123.456 99.0\n"),
@@ -808,6 +826,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
                 linux_ops.os,
                 "sysconf",
                 return_value=ticks_per_second,
+                create=True,
             ), mock.patch(
                 "builtins.open", side_effect=open_uptime
             ):
@@ -909,7 +928,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         with mock.patch.object(
             linux_ops, "_require_linux"
         ), mock.patch.object(
-            linux_ops.os, "getpgid", return_value=731
+            linux_ops.os, "getpgid", return_value=731, create=True
         ), mock.patch.object(
             linux_ops.os,
             "stat",
@@ -948,7 +967,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         with mock.patch.object(
             linux_ops, "_require_linux"
         ), mock.patch.object(
-            linux_ops.os, "getpgid", return_value=731
+            linux_ops.os, "getpgid", return_value=731, create=True
         ), mock.patch(
             "builtins.open", side_effect=open_proc
         ):
@@ -981,7 +1000,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
             "_strict_proc_stat_identity",
             side_effect=[before, after],
         ), mock.patch.object(
-            linux_ops.os, "getpgid", return_value=731
+            linux_ops.os, "getpgid", return_value=731, create=True
         ), mock.patch.object(
             linux_ops.os,
             "stat",
@@ -1010,6 +1029,8 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
             return_value=mock.Mock(st_uid=1000),
         ), mock.patch.object(
             linux_ops.os, "listdir", return_value=["732"]
+        ), mock.patch.object(
+            linux_ops.os, "getpgid", return_value=731, create=True
         ), mock.patch("builtins.open", side_effect=open_proc):
             identity = linux_ops._process_identity(732)
 
@@ -1907,7 +1928,7 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         with mock.patch.object(
             linux_ops, "_require_linux"
         ), mock.patch.object(
-            linux_ops.os, "killpg"
+            linux_ops.os, "killpg", create=True
         ) as killpg, mock.patch.object(
             linux_ops,
             "_process_group_member_pids",
@@ -3236,7 +3257,8 @@ class LinuxOperationalReadContractTest(unittest.TestCase):
         ), mock.patch.object(
             linux_ops.os, "readlink", return_value="/"
         ), mock.patch(
-            "builtins.open", return_value=io.StringIO(maps)
+            "builtins.open",
+            side_effect=lambda *args, **kwargs: io.StringIO(maps),
         ):
             self.assertEqual(
                 linux_ops._busy_mount_references_proc(mount_root),

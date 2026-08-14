@@ -63,7 +63,8 @@ class StableCgroupIdentityTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.fixture = CgroupFixture(self.temporary.name)
+        self.temporary_root = str(Path(self.temporary.name).resolve())
+        self.fixture = CgroupFixture(self.temporary_root)
         self.supervisor = self.fixture.supervisor()
 
     @requires_native_dirfd
@@ -236,7 +237,7 @@ class GatedExecTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
 
     def _command(self, marker):
         return [
@@ -286,7 +287,8 @@ class AttachAndSignalTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.fixture = CgroupFixture(self.temporary.name)
+        self.temporary_root = str(Path(self.temporary.name).resolve())
+        self.fixture = CgroupFixture(self.temporary_root)
 
     @requires_native_dirfd
     def test_attach_opens_pidfd_and_revalidates_before_separate_release(self):
@@ -458,6 +460,11 @@ class AttachAndSignalTest(unittest.TestCase):
             "prove_absence",
             side_effect=(supervision.ContainmentInconclusive("live"),) * 2
             + (True,),
+        ), mock.patch.object(
+            supervision.signal,
+            "SIGKILL",
+            9,
+            create=True,
         ):
             supervisor.terminate(containment, term_seconds=1, kill_seconds=1)
 

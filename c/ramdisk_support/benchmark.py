@@ -2473,6 +2473,13 @@ def _numeric_node_map(value, label):
     return result
 
 
+def _workspace_evidence_path_identity(path):
+    """Return the canonical live identity of one recorded workspace path."""
+    if not isinstance(path, str) or not _path_without_symlinks(path):
+        return None
+    return os.path.realpath(path)
+
+
 def _validate_workspace_attempt(value):
     if not isinstance(value, dict) or set(value) != {"operation_id", "roots"}:
         raise RamdiskError("raw evidence workspace attempt is malformed")
@@ -2494,19 +2501,22 @@ def _validate_workspace_attempt(value):
         "source_fingerprint",
         "identity",
     }
+    path_identities = {}
     for name, expected_mode, expected_nodes, expected_node in (
         ("interleaved", "interleave", [0, 1], None),
         ("local", "local", [0], 0),
     ):
         root = roots[name]
         identity = root.get("identity") if isinstance(root, dict) else None
+        path_identity = _workspace_evidence_path_identity(
+            root.get("path") if isinstance(root, dict) else None
+        )
         if (
             not isinstance(root, dict)
             or set(root) != expected_keys
             or root.get("role") not in ("deployment", "scratch")
             or not isinstance(root.get("path"), str)
-            or not os.path.isabs(root["path"])
-            or not _path_without_symlinks(root["path"])
+            or path_identity is None
             or root.get("mode") != expected_mode
             or not isinstance(root.get("nodes"), list)
             or any(
@@ -2537,11 +2547,10 @@ def _validate_workspace_attempt(value):
             or re.fullmatch(r"[0-9]+:[0-9]+", identity["device"]) is None
         ):
             raise RamdiskError("raw evidence workspace root is malformed")
+        path_identities[name] = path_identity
     if {root["role"] for root in roots.values()} != {"deployment", "scratch"}:
         raise RamdiskError("raw evidence workspace roles are malformed")
-    if os.path.realpath(roots["interleaved"]["path"]) == os.path.realpath(
-        roots["local"]["path"]
-    ):
+    if path_identities["interleaved"] == path_identities["local"]:
         raise RamdiskError("raw evidence workspace paths alias")
     identities = [roots[name]["identity"] for name in ("interleaved", "local")]
     if (

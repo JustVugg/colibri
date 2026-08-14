@@ -10,6 +10,8 @@ from unittest import mock
 
 from resource_plan import (
     GB,
+    _darwin_memory_available,
+    _parse_vm_stat,
     analyze_model,
     build_plan,
     cpu_socket_count,
@@ -71,6 +73,8 @@ class ResourcePlanTest(unittest.TestCase):
         # Regression: on native Windows CPython, /proc/meminfo does not exist,
         # so the Linux-only path returned 0 and the expert cache was sized to
         # 0 slots/layer. The value must be a sane positive number of bytes.
+        if sys.platform == "darwin":
+            self.skipTest("macOS has a separate native probe smoke")
         self.assertGreater(memory_available(), 0)
 
     def test_cpu_socket_count_is_positive(self):
@@ -539,6 +543,96 @@ class PhysicalCpuCountTest(unittest.TestCase):
         with mock.patch("resource_plan.subprocess.run", side_effect=sysctl), \
              mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(physical_cpu_count(), 8)
+
+
+class DarwinMemoryProbeTest(unittest.TestCase):
+    """Hermetic coverage for the macOS command protocol and parser."""
+
+    VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               100.
+Pages active:                             999.
+Pages inactive:                           200.
+Pages speculative:                         30.
+Pages throttled:                            7.
+Pages purgeable:                           40.
+"""
+
+    @staticmethod
+    def _runner(results, calls):
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            result = results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return subprocess.CompletedProcess(command, *result)
+
+        return run
+
+    def test_parse_vm_stat_sums_only_reclaimable_pages(self):
+        self.assertEqual(
+            _parse_vm_stat(self.VM_STAT, fallback_page_size=4096),
+            (100 + 200 + 30 + 40) * 16384,
+        )
+
+    def test_parse_vm_stat_uses_injected_fallback_page_size(self):
+        output = "Pages free: 2.\nPages inactive: 3.\n"
+        self.assertEqual(
+            _parse_vm_stat(output, fallback_page_size=4096),
+            5 * 4096,
+        )
+
+    def test_darwin_probe_prefers_vm_stat_without_calling_sysctl(self):
+        calls = []
+        run = self._runner([(0, self.VM_STAT, "")], calls)
+        self.assertEqual(
+            _darwin_memory_available(run=run, fallback_page_size=4096),
+            (100 + 200 + 30 + 40) * 16384,
+        )
+        self.assertEqual([call[0] for call in calls], [["/usr/bin/vm_stat"]])
+
+    def test_darwin_probe_uses_checked_absolute_sysctl_fallback(self):
+        calls = []
+        run = self._runner(
+            [(1, "", "vm_stat unavailable"), (0, "68719476736\n", "")],
+            calls,
+        )
+        self.assertEqual(
+            _darwin_memory_available(run=run, fallback_page_size=4096),
+            68_719_476_736,
+        )
+        self.assertEqual(
+            [call[0] for call in calls],
+            [
+                ["/usr/bin/vm_stat"],
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+            ],
+        )
+
+    def test_darwin_probe_returns_zero_when_commands_or_output_fail(self):
+        cases = [
+            [FileNotFoundError(), FileNotFoundError()],
+            [(0, "not vm_stat", ""), (0, "not-an-integer\n", "")],
+            [(0, "Pages free: 0.\n", ""), (1, "68719476736\n", "denied")],
+            [(1, self.VM_STAT, "denied"), (0, "-1\n", "")],
+        ]
+        for results in cases:
+            with self.subTest(results=results):
+                self.assertEqual(
+                    _darwin_memory_available(
+                        run=self._runner(list(results), []),
+                        fallback_page_size=4096,
+                    ),
+                    0,
+                )
+
+    def test_native_probe_smoke(self):
+        if sys.platform != "darwin":
+            self.skipTest("native macOS only")
+        if os.environ.get("NIX_BUILD_TOP"):
+            self.skipTest(
+                "native macOS memory probing is unavailable in a Nix build sandbox"
+            )
+        self.assertGreater(memory_available(), 0)
 
 
 if __name__ == "__main__":

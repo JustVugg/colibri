@@ -13,6 +13,26 @@ from ramdisk_support import state as state_support
 
 class ManagedLaunchTest(unittest.TestCase):
     def setUp(self):
+        self.portable_seams = contextlib.ExitStack()
+        self.addCleanup(self.portable_seams.close)
+        if not state_support._supports_native_dirfd():
+            self.portable_seams.enter_context(portable_descriptor_seam())
+        if os.path.__name__ != "posixpath":
+            self.portable_seams.enter_context(portable_linux_manifest_paths())
+        self.portable_seams.enter_context(
+            mock.patch.object(
+                ramdisk,
+                "_current_process_identity",
+                return_value=deterministic_process_identity(),
+            )
+        )
+        self.portable_seams.enter_context(
+            mock.patch.object(
+                ramdisk,
+                "_process_start_boundary",
+                return_value=100,
+            )
+        )
         self.containment_supervisor = UnitCgroupSupervisor()
         self.containment_patch = mock.patch.object(
             lifecycle_support,
@@ -2122,6 +2142,13 @@ class ManagedLaunchTest(unittest.TestCase):
     def test_clean_start_cancellation_restores_retryable_manifest(self):
         cancel = threading.Event()
         nonce = "c" * 48
+        group_members_patch = mock.patch.object(
+            ramdisk,
+            "_process_group_members",
+            return_value=([], []),
+        )
+        group_members_patch.start()
+        self.addCleanup(group_members_patch.stop)
 
         class FakeSocket:
             def bind(self, address):

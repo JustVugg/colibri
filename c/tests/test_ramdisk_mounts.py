@@ -32,6 +32,7 @@ class MountAndCopyTest(unittest.TestCase):
             plan = ramdisk.build_plan(
                 plan_args(fixture.root), hardware=hardware_fixture()
             )
+            plan["blockers"] = []
 
         unavailable = ramdisk.RamdiskError(
             "install the psmisc package and retry"
@@ -310,6 +311,7 @@ class MountAndCopyTest(unittest.TestCase):
             plan = ramdisk.build_plan(
                 plan_args(fixture.root), hardware=hardware_fixture()
             )
+            plan["blockers"] = []
 
         def save(manifest):
             snapshots.append(json.loads(json.dumps(manifest)))
@@ -1100,10 +1102,14 @@ class MountAndCopyTest(unittest.TestCase):
         payload = b"safetensors-prefix\x1asafetensors-suffix"
         opened = []
         real_open = mounts_support.os.open
+        host_binary_flag = getattr(mounts_support.os, "O_BINARY", 0)
 
         def recording_open(path, flags, mode=0o777):
             opened.append((path, flags))
-            return real_open(path, flags & ~binary_flag, mode)
+            host_flags = flags & ~binary_flag
+            if host_binary_flag:
+                host_flags |= host_binary_flag
+            return real_open(path, host_flags, mode)
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.bin"

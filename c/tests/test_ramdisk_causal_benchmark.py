@@ -7,9 +7,9 @@ import io
 import json
 import math
 import os
+import posixpath
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -21,9 +21,19 @@ sys.path.insert(0, str(C_DIR))
 
 from ramdisk_support import benchmark  # noqa: E402
 if __package__:
-    from .platform_test_support import requires_linux_operational  # noqa: E402
+    from .platform_test_support import (  # noqa: E402
+        PLATFORM_SKIP_INVENTORY,
+        requires_linux_operational,
+        requires_native_dirfd,
+    )
+    from .ramdisk_test_support import canonical_temporary_directory  # noqa: E402
 else:
-    from platform_test_support import requires_linux_operational  # noqa: E402
+    from platform_test_support import (  # noqa: E402
+        PLATFORM_SKIP_INVENTORY,
+        requires_linux_operational,
+        requires_native_dirfd,
+    )
+    from ramdisk_test_support import canonical_temporary_directory  # noqa: E402
 
 
 GIB = 1 << 30
@@ -37,6 +47,135 @@ TREATMENT_IDS = (
     "cuda-fixed-budget-validation",
 )
 FIXTURE_COLLECTOR_ID = "b" * 64
+_REAL_DURABLE_EVIDENCE_STORE = benchmark.DurableEvidenceStore
+_REAL_FSTAT = os.fstat
+_REAL_LSTAT = os.lstat
+
+
+def _private_mode_stat(function, *args, **kwargs):
+    """Give Windows fixtures the private POSIX mode their ACL cannot express."""
+    info = function(*args, **kwargs)
+    fields = list(info)
+    fields[0] &= ~0o077
+    return os.stat_result(fields)
+
+
+class _PortableEvidenceStore:
+    """Path-based test double for hosts without descriptor-relative opens."""
+
+    def __init__(self, raw_path, protocol_path, *, assert_durable=None):
+        self.raw_path, self.protocol_path = benchmark._validate_evidence_paths(
+            raw_path,
+            protocol_path,
+        )
+        self.parent = benchmark._safe_parent(self.raw_path)
+        self.assert_durable = assert_durable
+        self.parent_identity = self._identity(self.parent)
+        self.protocol_identity = None
+        self.raw_identity = None
+        self.protocol_payload = None
+
+    @staticmethod
+    def _identity(path):
+        info = os.stat(path, follow_symlinks=False)
+        return (int(info.st_dev), int(info.st_ino))
+
+    def _revalidate(self):
+        if (
+            not benchmark._path_without_symlinks(self.parent)
+            or self._identity(self.parent) != self.parent_identity
+        ):
+            raise benchmark.RamdiskError("causal evidence parent identity changed")
+        if callable(self.assert_durable):
+            self.assert_durable(self.parent)
+        for path, identity, label in (
+            (self.protocol_path, self.protocol_identity, "persisted causal protocol"),
+            (self.raw_path, self.raw_identity, "raw evidence"),
+        ):
+            if identity is not None and (
+                not os.path.exists(path) or self._identity(path) != identity
+            ):
+                raise benchmark.RamdiskError("%s path identity changed" % label)
+        if (
+            self.protocol_payload is not None
+            and Path(self.protocol_path).read_bytes() != self.protocol_payload
+        ):
+            raise benchmark.RamdiskError(
+                "persisted causal protocol content changed"
+            )
+
+    def bind_protocol(self, protocol):
+        current = benchmark.persist_causal_protocol(self.protocol_path, protocol)
+        Path(self.raw_path).touch(mode=0o600, exist_ok=True)
+        self.protocol_identity = self._identity(self.protocol_path)
+        self.raw_identity = self._identity(self.raw_path)
+        self.protocol_payload = Path(self.protocol_path).read_bytes()
+        self._revalidate()
+        return current
+
+    def read_rows(self):
+        self._revalidate()
+        rows = _REAL_DURABLE_EVIDENCE_STORE._parse_rows(
+            Path(self.raw_path).read_bytes()
+        )
+        self._revalidate()
+        return rows
+
+    def append(self, row):
+        benchmark.validate_raw_evidence_row(row)
+        self._revalidate()
+        with open(self.raw_path, "ab") as stream:
+            stream.write(benchmark._canonical_json(row) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._revalidate()
+        return row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _kind, _value, _traceback):
+        return False
+
+
+@contextlib.contextmanager
+def portable_evidence_fixture_seam():
+    """Preserve causal semantics where Windows lacks POSIX modes and dirfd."""
+    if PLATFORM_SKIP_INVENTORY["native_dirfd"]["supported"]:
+        yield
+        return
+    with mock.patch.object(
+        benchmark.os,
+        "lstat",
+        side_effect=lambda *args, **kwargs: _private_mode_stat(
+            _REAL_LSTAT, *args, **kwargs
+        ),
+    ), mock.patch.object(
+        benchmark.os,
+        "fstat",
+        side_effect=lambda *args, **kwargs: _private_mode_stat(
+            _REAL_FSTAT, *args, **kwargs
+        ),
+    ), mock.patch.object(
+        benchmark,
+        "_workspace_evidence_path_identity",
+        new=lambda path: (
+            posixpath.normpath(path)
+            if isinstance(path, str)
+            and posixpath.isabs(path)
+            and posixpath.normpath(path) == path
+            else None
+        ),
+    ), mock.patch.object(
+        benchmark,
+        "_fsync_parent",
+        new=lambda path: None,
+    ), mock.patch.object(
+        benchmark,
+        "DurableEvidenceStore",
+        new=_PortableEvidenceStore,
+    ):
+        yield
 
 
 def sample_manifest(profile_path="/profiles/frozen.coli_usage"):
@@ -251,6 +390,20 @@ def complete_rows(protocol, pin=100.0, rammap=120.0):
 
 
 class CausalProtocolTest(unittest.TestCase):
+    def test_workspace_evidence_paths_retain_live_no_symlink_gate(self):
+        no_follow = mock.Mock(return_value=False)
+        with mock.patch.object(
+            benchmark,
+            "_path_without_symlinks",
+            new=no_follow,
+        ):
+            self.assertIsNone(
+                benchmark._workspace_evidence_path_identity(
+                    "/mnt/colibri-ram/model"
+                )
+            )
+        no_follow.assert_called_once_with("/mnt/colibri-ram/model")
+
     def test_fixed_treatments_controls_and_numeric_budgets(self):
         protocol = build_protocol()
 
@@ -382,11 +535,16 @@ class CausalProtocolTest(unittest.TestCase):
 
 
 class RawEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.evidence_seam = portable_evidence_fixture_seam()
+        self.evidence_seam.__enter__()
+        self.addCleanup(self.evidence_seam.__exit__, None, None, None)
+
     def test_protocol_is_immutable_and_rows_are_append_only(self):
         protocol = build_protocol()
         row0 = raw_row(protocol, TREATMENT_IDS[0], 0)
         row1 = raw_row(protocol, TREATMENT_IDS[1], 0)
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             raw_path = Path(directory) / "raw.v1.jsonl"
             protocol_path = Path(directory) / "protocol.v1.json"
 
@@ -490,7 +648,7 @@ class RawEvidenceTest(unittest.TestCase):
     def test_protocol_and_raw_reads_reject_symlink_substitution(self):
         protocol = build_protocol()
         row = raw_row(protocol, TREATMENT_IDS[0], 0)
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             root = Path(directory)
             real_protocol = root / "real-protocol.json"
             protocol_link = root / "protocol.json"
@@ -509,7 +667,7 @@ class RawEvidenceTest(unittest.TestCase):
                 benchmark.read_raw_evidence(raw_link)
 
     def test_evidence_paths_reject_reserved_hardlinks_and_aliases(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             root = Path(directory)
             reserved = root / "benchmarks.json"
             reserved.write_text("{}\n", encoding="utf-8")
@@ -545,10 +703,13 @@ class RawEvidenceTest(unittest.TestCase):
                     evidence_root,
                 )
 
+    @requires_native_dirfd
     def test_bound_store_rejects_raw_protocol_and_parent_replacement(self):
         protocol = build_protocol()
         for replacement in ("raw", "protocol", "parent"):
-            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(
+                replacement=replacement
+            ), canonical_temporary_directory() as directory:
                 parent = Path(directory) / "evidence"
                 parent.mkdir(mode=0o700)
                 raw_path = parent / "raw.jsonl"
@@ -589,9 +750,10 @@ class RawEvidenceTest(unittest.TestCase):
                         assert_durable=lambda _path: None,
                     )
 
+    @requires_native_dirfd
     def test_bound_store_rejects_private_hardlinked_evidence(self):
         protocol = build_protocol()
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             parent = Path(directory)
             raw_path = parent / "raw.jsonl"
             raw_path.write_text("", encoding="utf-8")
@@ -610,8 +772,13 @@ class RawEvidenceTest(unittest.TestCase):
 
 
 class CausalExecutionTest(unittest.TestCase):
+    def setUp(self):
+        self.evidence_seam = portable_evidence_fixture_seam()
+        self.evidence_seam.__enter__()
+        self.addCleanup(self.evidence_seam.__exit__, None, None, None)
+
     def test_full_shard_payload_is_rehashed_at_spawn_boundary(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             root = Path(directory)
             model = root / "model"
             model.mkdir()
@@ -685,7 +852,7 @@ class CausalExecutionTest(unittest.TestCase):
             def kill(self):
                 self.returncode = -9
 
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             model = Path(directory)
             (model / "config.json").write_text(
                 json.dumps({"model_type": "deepseek_v4"}),
@@ -747,7 +914,8 @@ class CausalExecutionTest(unittest.TestCase):
     def test_dram_metadata_and_runtime_counter_loss_are_unavailable(self):
         result = mock.Mock(returncode=0, stdout="[]", stderr="")
         collector = benchmark.preflight_dram_collector(
-            environ={"COLI_DRAM_COLLECTOR": "/collector"},
+            environ={"COLI_DRAM_COLLECTOR": "collector"},
+            which=lambda name: "/collector" if name == "collector" else None,
             run=lambda *_args, **_kwargs: result,
             fingerprint_file=lambda _path: "sha256:" + "a" * 64,
         )
@@ -1071,7 +1239,7 @@ class CausalExecutionTest(unittest.TestCase):
         self.assertEqual(appended[0]["status"], "error")
 
     def test_high_level_runner_prestages_and_uses_unique_retry_state(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             root = Path(directory)
             canonical = root / "canonical"
             staged = root / "staged"
@@ -1214,7 +1382,7 @@ class CausalExecutionTest(unittest.TestCase):
         self.assertTrue(all(Path(path).is_absolute() for path in state_dirs))
 
     def test_high_level_two_invocation_resume_uses_stable_logical_protocol(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             root = Path(directory)
             canonical = root / "canonical"
             prepared = root / "prepared"
@@ -1406,7 +1574,7 @@ class CausalExecutionTest(unittest.TestCase):
         self.assertEqual(len(workspace_attempts), 2)
 
     def test_workspace_cleanup_failure_is_persisted_as_neutral_incomplete(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             root = Path(directory)
             canonical = root / "canonical"
             interleaved = root / "interleaved"
@@ -1589,7 +1757,7 @@ class LinuxCausalOperationalTest(unittest.TestCase):
 
     @requires_linux_operational
     def test_real_dram_collector_subprocess_preflight(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with canonical_temporary_directory() as directory:
             helper = Path(directory) / "dram-helper"
             helper.write_text(
                 f"#!{sys.executable}\n"
