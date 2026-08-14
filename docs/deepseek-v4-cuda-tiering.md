@@ -20,10 +20,15 @@ builds on Linux and Windows with different commands; the engine
   merged into user turns) — including streaming, multi-turn tool results,
   `tool_choice` none/auto/required/forced, and the Anthropic `/v1/messages`
   translation. Python-only (`openai_server.py`), engine untouched.
+- **Cross-session KV persistence (`.coli_kv`)**: the conversation's attention
+  state (window + compressed + recurrent compressor/indexer state) is
+  snapshotted to `<model_dir>/.coli_kv` after every turn (temp+rename, atomic)
+  and resumed at the next serve start — the first request skips re-prefilling
+  the history (`[KV] resumed conversation from disk: N tokens`). `KVSAVE=0`
+  disables saving/resume; delete the file to start clean.
 
-**Not wired up (yet):** on-disk KV persistence (`.coli_kv`), DSpark/MTP
-speculation (`V4_MTP=0` default), non-greedy sampling and more than one KV
-slot in serve mode.
+**Not wired up (yet):** DSpark/MTP speculation (`V4_MTP=0` default),
+non-greedy sampling and more than one KV slot in serve mode.
 
 ## Download
 
