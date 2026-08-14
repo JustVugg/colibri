@@ -14,11 +14,16 @@ builds on Linux and Windows with different commands; the engine
 - Dense layers (43, ~6.27 GiB fp8) and attention stay on **CPU/RAM**, like the
   target-only build. Only routed experts are GPU-eligible.
 - Numerics are identical to the CPU path (verified A/B on real checkpoints).
-- Dish `coli_dsv4_cuda.dll` (Windows) → silent CPU fallback, no error.
+- Missing `coli_dsv4_cuda.dll` (Windows) → silent CPU fallback, no error.
+- **Tool use / function calling**: OpenAI `tools` are supported with the
+  checkpoint's native DSML format (`｜DSML｜tool_calls` blocks, `<tool_result>`
+  merged into user turns) — including streaming, multi-turn tool results,
+  `tool_choice` none/auto/required/forced, and the Anthropic `/v1/messages`
+  translation. Python-only (`openai_server.py`), engine untouched.
 
-**Not wired up (yet):** tool use / function calling (OpenAI `tools` → 400),
-on-disk KV persistence (`.coli_kv`), DSpark/MTP speculation (`V4_MTP=0` default),
-non-greedy sampling and more than one KV slot in serve mode.
+**Not wired up (yet):** on-disk KV persistence (`.coli_kv`), DSpark/MTP
+speculation (`V4_MTP=0` default), non-greedy sampling and more than one KV
+slot in serve mode.
 
 ## Download
 
