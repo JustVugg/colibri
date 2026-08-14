@@ -1014,13 +1014,13 @@ def chat_attached(a, base, model_id):
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
-    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load): a chat
-    started today continues a conversation from days ago, with `first=0` so the
-    turn is appended WITHOUT the [gMASK]<sop> prefix. The engine does announce it
-    on stderr — but nothing here ever shows that: the drain thread's
-    p.stderr.read() blocks until EOF, so on a healthy start errlog is still empty
-    when the status lines are printed. The warning only appeared once the engine
-    DIED, which is exactly when it no longer mattered.
+    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load /
+    deepseek_v4.c v4_kv_load): a chat started today continues a conversation
+    from days ago. The engine does announce it on stderr — but nothing here
+    ever shows that: the drain thread's p.stderr.read() blocks until EOF, so
+    on a healthy start errlog is still empty when the status lines are printed.
+    The warning only appeared once the engine DIED, which is exactly when it
+    no longer mattered.
 
     Measured cost of the silence: a chat inherited 670 tokens of an old Italian
     session ("il mio numero preferito e 7, ricordalo!"). Every later reply came
@@ -1029,18 +1029,22 @@ def kv_resume_notice(model_dir):
     it read as a quantization bug for a day.
 
     So say it here, in Python, from the file itself: no pipe, no thread, no
-    Windows deadlock risk (see the stderr comment below)."""
+    Windows deadlock risk (see the stderr comment below). Two magics: COLIKV1\0
+    (GLM MLA records) and COLIDV41\0 (DS4 full-snapshot); the header layout is
+    the same (nrec at int32 index 6)."""
     p=os.path.join(model_dir, ".coli_kv")
     try:
         with open(p,"rb") as f:
-            if f.read(8)!=b"COLIKV1\0": return
+            magic=f.read(8)
+            if magic not in (b"COLIKV1\0", b"COLIDV41\0"): return
             h=struct.unpack("<8i", f.read(32))
         n=h[6]
         if n<1: return
         age=time.time()-os.path.getmtime(p)
         when=f"{age/86400:.0f}d ago" if age>86400 else f"{age/3600:.0f}h ago" if age>3600 else "just now"
+        reset_hint=":reset clears it · " if magic==b"COLIKV1\0" else ""
         print(f"  {C.yel}↺ resuming a saved conversation: {n} tokens, last written {when}{C.r}")
-        print(f"  {C.dgray}  it steers tone, language and topic. :reset clears it · "
+        print(f"  {C.dgray}  it steers tone, language and topic. {reset_hint}"
               f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
     except (OSError, struct.error): pass
 
@@ -1145,6 +1149,7 @@ def cmd_chat_v4(a):
     as the GLM engine TUI (clean console, tok/s · hit% · RSS · elapsed)."""
     model_id = "deepseek-v4-colibri"
     banner(f"chat · {model_id}", model=a.model)
+    kv_resume_notice(a.model)
     p, errlog = v4_spawn(a, model_id)
     sp = Spinner("loading deepseek-v4-colibri…"); sp.start()
     stat = v4_wait_ready(p, errlog)
@@ -1190,6 +1195,10 @@ def cmd_chat_v4(a):
             if msg in (":q", ":quit", "exit"): break
             if not msg: continue
             if msg == ":reset":
+                # DS4 .coli_kv resume would otherwise reopen the same
+                # conversation in the fresh engine: delete it first.
+                try: os.unlink(os.path.join(a.model, ".coli_kv"))
+                except OSError: pass
                 try: p.terminate()
                 except Exception: pass
                 p, errlog = v4_spawn(a, model_id)
@@ -1272,6 +1281,7 @@ def cmd_chat(a):
                   "inkling-colibri" if arch=="inkling" else
                   "olmoe-colibri" if arch=="olmoe" else "deepseek-v4-colibri")
         banner(f"chat · {model_id} · local server", model=a.model)
+        kv_resume_notice(a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
         # engine (it was silently eaten for years -- disclosed behavior
@@ -1455,6 +1465,7 @@ def cmd_serve(a):
                             "deepseek-v4-colibri" if arch=="deepseek_v4" else
                             "olmoe-colibri" if arch=="olmoe" else
                             "glm-5.2-colibri")
+    kv_resume_notice(a.model)
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
               a.cap,chat_ngen(a, model_id=model_id),engine,env_for_engine(a,arch),a.cors_origin,

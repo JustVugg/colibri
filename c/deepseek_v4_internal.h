@@ -7,6 +7,8 @@
  */
 #include "deepseek_v4.h"
 
+#include <stdio.h>
+
 #include "tensor.h"
 #include "expert_store.h"
 #include "native_quant.h"
@@ -412,6 +414,11 @@ int coli_v4_compressor_snapshot_restore(
     ColiDeepSeekV4CompressorState *state,
     const ColiV4CompressorSnapshot *snapshot);
 void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot);
+/* Serialize a compressor snapshot to an open FILE (kv_persist_dsv4.h layout:
+ * int32 count, then count kv_state + count score_state floats). 0 or -1. */
+int coli_v4_compressor_snapshot_write(const ColiV4CompressorSnapshot *snapshot, FILE *f);
+/* Read one back; the caller owns the result (destroy it). 0 or -1. */
+int coli_v4_compressor_snapshot_read(FILE *f, ColiV4CompressorSnapshot **output);
 /* ==== end deepseek_v4_compressor_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_indexer.h ==== */
@@ -430,6 +437,10 @@ int coli_v4_indexer_create(ColiDeepSeekV4Indexer **state,
 int coli_v4_indexer_bind_weights(ColiDeepSeekV4Indexer *state,
                                  const ColiDeepSeekV4LayerWeights *weights,
                                  char *error, size_t error_size);
+/* Grow the indexer's compressed buffer to hold at least min_count slots
+ * (kv_persist_dsv4.h load path; mirrors indexer_step's doubling). */
+int coli_v4_indexer_grow(ColiDeepSeekV4Indexer *state, int min_count,
+                         char *error, size_t error_size);
 void coli_v4_indexer_reset(ColiDeepSeekV4Indexer *state);
 void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state);
 
@@ -455,6 +466,15 @@ int coli_v4_indexer_snapshot_create(const ColiDeepSeekV4Indexer *state,
 int coli_v4_indexer_snapshot_restore(ColiDeepSeekV4Indexer *state,
                                      const ColiV4IndexerSnapshot *snapshot);
 void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot);
+/* Serialize an indexer snapshot to an open FILE (kv_persist_dsv4.h layout:
+ * int32 count, count × head_dim compressed floats, then the sub-compressor
+ * snapshot). 0 or -1. */
+int coli_v4_indexer_snapshot_write(const ColiV4IndexerSnapshot *snapshot, FILE *f);
+/* Read one back (head_dim from the caller's config); caller owns the result.
+ * count_out (may be NULL) receives the slot count so the caller can size the
+ * live state's buffer before restore. */
+int coli_v4_indexer_snapshot_read(FILE *f, int head_dim, ColiV4IndexerSnapshot **output,
+                                  int *count_out);
 /* ==== end deepseek_v4_indexer_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_expert.h ==== */

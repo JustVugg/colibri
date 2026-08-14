@@ -2817,6 +2817,23 @@ int coli_v4_indexer_bind_weights(ColiDeepSeekV4Indexer *state,
     return coli_v4_compressor_bind_weights(state->compressor, weights,
                                             error, error_size);
 }
+int coli_v4_indexer_grow(ColiDeepSeekV4Indexer *state, int min_count,
+                         char *error, size_t error_size) {
+    if (!state || min_count <= state->capacity) return 0;
+    int dimension = state->config->index_head_dim;
+    while (state->capacity < min_count) {
+        int next_capacity = state->capacity * 2;
+        float *grown = realloc(state->compressed,
+            (size_t)next_capacity * dimension * sizeof(*grown));
+        if (!grown) return set_error(error, error_size, "cannot grow indexer cache");
+        memset(grown + (size_t)state->capacity * dimension, 0,
+               (size_t)(next_capacity - state->capacity) * dimension * sizeof(*grown));
+        state->compressed = grown;
+        state->capacity = next_capacity;
+    }
+    return 0;
+}
+
 
 void coli_v4_indexer_reset(ColiDeepSeekV4Indexer *state) {
     if (!state) return;
@@ -4252,6 +4269,39 @@ void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot) {
     if (!snapshot) return;
     free(snapshot->score_state); free(snapshot->kv_state); free(snapshot);
 }
+
+/* ---- kv_persist_dsv4.h serialization hooks ---- */
+int coli_v4_compressor_snapshot_write(const ColiV4CompressorSnapshot *snapshot, FILE *f) {
+    if (!snapshot || !f) return -1;
+    int32_t count = (int32_t)snapshot->count;
+    if (fwrite(&count, 4, 1, f) != 1 ||
+        (snapshot->count > 0 &&
+         (fwrite(snapshot->kv_state, sizeof(float), snapshot->count, f) != snapshot->count ||
+          fwrite(snapshot->score_state, sizeof(float), snapshot->count, f) != snapshot->count)))
+        return -1;
+    return 0;
+}
+
+int coli_v4_compressor_snapshot_read(FILE *f, ColiV4CompressorSnapshot **output) {
+    if (!f || !output) return -1;
+    *output = NULL;
+    int32_t count = 0;
+    if (fread(&count, 4, 1, f) != 1 || count < 0 || count > (1 << 26)) return -1;
+    ColiV4CompressorSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return -1;
+    snapshot->count = (size_t)count;
+    snapshot->kv_state = malloc((size_t)count * sizeof(float));
+    snapshot->score_state = malloc((size_t)count * sizeof(float));
+    if (!snapshot->kv_state || !snapshot->score_state ||
+        (count > 0 &&
+         (fread(snapshot->kv_state, sizeof(float), (size_t)count, f) != (size_t)count ||
+          fread(snapshot->score_state, sizeof(float), (size_t)count, f) != (size_t)count))) {
+        coli_v4_compressor_snapshot_destroy(snapshot);
+        return -1;
+    }
+    *output = snapshot;
+    return 0;
+}
 #endif /* COLI_V4_UNIT_COMPRESSOR_SNAPSHOT */
 
 #ifdef COLI_V4_UNIT_INDEXER_SNAPSHOT
@@ -4569,6 +4619,47 @@ void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot) {
     if (!snapshot) return;
     coli_v4_compressor_snapshot_destroy(snapshot->compressor);
     free(snapshot->compressed); free(snapshot);
+}
+
+/* ---- kv_persist_dsv4.h serialization hooks ---- */
+int coli_v4_indexer_snapshot_write(const ColiV4IndexerSnapshot *snapshot, FILE *f) {
+    if (!snapshot || !f) return -1;
+    int32_t count = snapshot->count;
+    if (fwrite(&count, 4, 1, f) != 1 ||
+        (snapshot->count > 0 &&
+         fwrite(snapshot->compressed, sizeof(float),
+                (size_t)snapshot->count * snapshot->head_dim, f) !=
+             (size_t)snapshot->count * snapshot->head_dim) ||
+        coli_v4_compressor_snapshot_write(snapshot->compressor, f))
+        return -1;
+    return 0;
+}
+
+int coli_v4_indexer_snapshot_read(FILE *f, int head_dim, ColiV4IndexerSnapshot **output,
+                                  int *count_out) {
+    if (!f || !output || head_dim < 1) return -1;
+    *output = NULL;
+    int32_t count = 0;
+    if (fread(&count, 4, 1, f) != 1 || count < 0 || count > (1 << 26)) return -1;
+    ColiV4IndexerSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return -1;
+    snapshot->count = count;
+    snapshot->head_dim = head_dim;
+    if (count > 0) {
+        snapshot->compressed = malloc((size_t)count * head_dim * sizeof(float));
+        if (!snapshot->compressed ||
+            fread(snapshot->compressed, sizeof(float), (size_t)count * head_dim, f) !=
+                (size_t)count * head_dim) {
+            coli_v4_indexer_snapshot_destroy(snapshot);
+            return -1;
+        }
+    }
+    if (coli_v4_compressor_snapshot_read(f, &snapshot->compressor)) {
+        coli_v4_indexer_snapshot_destroy(snapshot);
+        return -1;
+    }
+    *output = snapshot;
+    return 0;
 }
 #endif /* COLI_V4_UNIT_INDEXER_SNAPSHOT */
 
@@ -5034,6 +5125,10 @@ void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot) {
     coli_v4_compressor_snapshot_destroy(snapshot->compressor);
     free(snapshot->compressed); free(snapshot->kv); free(snapshot);
 }
+
+/* On-disk .coli_kv persistence (serve mode): full-snapshot save after every
+ * turn, resume at startup. See kv_persist_dsv4.h. */
+#include "kv_persist_dsv4.h"
 #endif /* COLI_V4_UNIT_ATTENTION_TRANSACTION */
 
 #ifdef COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16
@@ -8542,6 +8637,11 @@ typedef struct {
     int cancelled;
 } V4ServeStream;
 
+/* On-disk .coli_kv persistence hooks, implemented in the ATTENTION_TRANSACTION
+ * object (kv_persist_dsv4.h): load at startup, save after every turn. */
+extern int v4_kv_save(ColiV4Session *session, const char *path);
+extern int v4_kv_load(ColiV4Engine *engine, ColiV4Session *session, const char *path);
+
 static double v4_serve_rss_gb(void) {
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage)) return 0.0;
@@ -8712,6 +8812,16 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
            hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
            session->prefix_reused);
     fflush(stdout);
+    /* Persist the conversation (KVSAVE=0 disables): full snapshot, temp+rename. */
+    {
+        const char *model_dir = getenv("SNAP");
+        if (model_dir) {
+            char kv_path[4608];
+            if (snprintf(kv_path, sizeof(kv_path), "%s/.coli_kv", model_dir) <
+                (int)sizeof(kv_path))
+                v4_kv_save(session, kv_path);
+        }
+    }
 }
 
 static int v4_serve_main(void) {
@@ -8752,6 +8862,16 @@ static int v4_serve_main(void) {
         fprintf(stderr, "%s\n", error);
         coli_v4_engine_destroy(engine);
         return 1;
+    }
+
+    /* Resume the saved conversation (.coli_kv, KVSAVE=0 disables): restores
+     * per-layer attention state + token ids so the first request skips
+     * re-prefilling the history (prefix reuse). */
+    {
+        char kv_path[4608];
+        if (snprintf(kv_path, sizeof(kv_path), "%s/.coli_kv", model_dir) <
+            (int)sizeof(kv_path))
+            v4_kv_load(engine, session, kv_path);
     }
 
     coli_serve_binary_mode();
