@@ -529,7 +529,158 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
+    if ARCH == "minimax_m3":
+        return parse_tool_calls_m3(reply, tools)
     return parse_tool_calls(reply, tools)
+
+
+# ---- MiniMax-M3 tool calling (chat_template.jinja) ----------------------------------------
+# MiniMax-M3 uses a namespaced XML dialect, not GLM's <tool_call>{name}<arg_key>… form:
+#   ]<]minimax[>[<tool_call>
+#   ]<]minimax[>[<invoke name="foo">]<]minimax[>[<k>v]<]minimax[>[</k>]<]minimax[>[</invoke>
+#   ]<]minimax[>[</tool_call>
+# Tool results render as ]~b]tool\n<response>…</response>. Tools are declared in the developer
+# message as <tools><tool>{json}</tool>…</tools>. Rendered + parsed here so the MiniMax-M3
+# template can serve tools end-to-end (previously the dispatcher returned 400 for `tools`).
+MM_NS = "]<]minimax[>["
+MM_TC_BEGIN = MM_NS + "<tool_call>"
+MM_TC_END = MM_NS + "</tool_call>"
+_MM_TC_BLOCK_RE = re.compile(re.escape(MM_TC_BEGIN) + r"\s*(.*?)\s*" + re.escape(MM_TC_END), re.DOTALL)
+_MM_INVOKE_RE = re.compile(re.escape(MM_NS) + r'<invoke name="([^"]*)">(.*?)' + re.escape(MM_NS) + r"</invoke>", re.DOTALL)
+
+
+def _m3_to_xml(value):
+    """Recursive MiniMax-M3 tool-argument XML (mirrors chat_template.jinja `to_xml`)."""
+    if isinstance(value, dict):
+        return "\n".join(f"{MM_NS}<{k}>{_m3_to_xml(v)}{MM_NS}</{k}>"
+                         for k, v in value.items() if v is not None)
+    if isinstance(value, (list, tuple)):
+        return "\n".join(f"{MM_NS}<item>{_m3_to_xml(i)}{MM_NS}</item>" for i in value)
+    if isinstance(value, bool):
+        return json.dumps(value)
+    return "" if value is None else str(value)
+
+
+def _m3_tool_call_block(tool_calls):
+    """Render an assistant message's tool_calls in MiniMax-M3 invoke syntax."""
+    parts = [MM_TC_BEGIN + "\n"]
+    for tc in (tool_calls or []):
+        fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+        name = fn.get("name") or ""
+        parts.append(f'{MM_NS}<invoke name="{name}">\n')
+        args = fn.get("arguments", "{}")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        for k, v in (args or {}).items():
+            if v is None:
+                continue
+            parts.append(f"{MM_NS}<{k}>{_m3_to_xml(v)}{MM_NS}</{k}>\n")
+        parts.append(MM_NS + "</invoke>\n")
+    parts.append(MM_TC_END)
+    return "".join(parts)
+
+
+def _m3_tools_block(tools, tool_choice=None):
+    """Render the MiniMax-M3 developer-side tool declaration block."""
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        tools = [t for t in (tools or [])
+                 if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    out = ["\n\n# Tools\nYou may call one or more tools to assist with the user query.\n"
+           "Here are the tools available in JSONSchema format:\n\n<tools>\n"]
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        out.append("<tool>" + json.dumps(clean, ensure_ascii=False) + "</tool>\n")
+    out.append("</tools>\n\nTo call tools, wrap all invocations in a single "
+               + MM_TC_BEGIN + MM_TC_END + " block. Parameter values containing nested "
+               "objects or arrays are recursively expanded into XML elements. Example:\n\n"
+               + MM_TC_BEGIN + "\n"
+               + MM_NS + '<invoke name="tool-name-1">' + MM_NS + "<param-1>value-1" + MM_NS + "</param-1>\n"
+               + MM_NS + "</invoke>\n" + MM_TC_END)
+    if forced:
+        out.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+    elif tool_choice == "required":
+        out.append("\n\nYou must call one of the functions above. Do not answer directly.")
+    return "".join(out)
+
+
+def _m3_children(text):
+    """Split a run of MM_NS<tag>…MM_NS</tag> blocks into (tag, inner) pairs (depth 0)."""
+    out = []
+    i, n = 0, len(text)
+    ns = len(MM_NS)
+    while i < n:
+        if text.startswith(MM_NS + "<", i):
+            j = text.find(">", i + ns)
+            if j < 0:
+                break
+            tag = text[i + ns + 1:j]
+            open_tag, close_tag = MM_NS + "<" + tag + ">", MM_NS + "</" + tag + ">"
+            start, depth, k = j + 1, 1, j + 1
+            while k < n:
+                if text.startswith(open_tag, k):
+                    depth += 1
+                    k += len(open_tag)
+                elif text.startswith(close_tag, k):
+                    depth -= 1
+                    if depth == 0:
+                        out.append((tag, text[start:k]))
+                        i = k + len(close_tag)
+                        break
+                    k += len(close_tag)
+                else:
+                    k += 1
+            else:
+                break
+        else:
+            i += 1
+    return out
+
+
+def _m3_parse_value(text):
+    """Parse a MiniMax-M3 XML value back into Python (mirror of _m3_to_xml)."""
+    text = text.strip()
+    if not text:
+        return ""
+    if text.startswith(MM_NS + "<"):
+        children = _m3_children(text)
+        if not children:
+            return text
+        if children[0][0] == "item":
+            return [_m3_parse_value(inner) for _, inner in children]
+        return {tag: _m3_parse_value(inner) for tag, inner in children}
+    return _coerce_arg(text, None)
+
+
+def _m3_parse_args(body, types):
+    """Parse the top-level <k>…</k> argument pairs of one invoke, type-coerced."""
+    args = {}
+    for key, raw in _m3_children(body):
+        raw = raw.strip()
+        args[key] = (_coerce_arg(raw, types.get(key)) if (MM_NS + "<") not in raw
+                     else _m3_parse_value(raw))
+    return args
+
+
+def parse_tool_calls_m3(reply, tools=None):
+    """Return (content, tool_calls) for the MiniMax-M3 invoke dialect."""
+    param_types = _tool_param_types(tools)
+    calls = []
+    for block in _MM_TC_BLOCK_RE.finditer(reply):
+        for inv in _MM_INVOKE_RE.finditer(block.group(1)):
+            name = inv.group(1)
+            args = _m3_parse_args(inv.group(2), param_types.get(name, {}))
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name,
+                                       "arguments": json.dumps(args, ensure_ascii=False)}})
+    text = _MM_TC_BLOCK_RE.sub("", reply)
+    return text.strip(), calls
+
 
 
 def _tool_stream_markers():
@@ -1277,14 +1428,17 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
 def render_chat_m3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                    tool_choice=None):
     """Text-only subset of the MiniMax-M3 chat template (chat_template.jinja):
-    ]~!b[ once, then ]~b]<role>\n<content>[e~[\n blocks. A client "system" message
+    ]~!b[ once, then ]~b]<role>\\n<content>[e~[\\n blocks. A client "system" message
     maps to the `developer` role (the official template reserves `system` for the
     auto-injected model-identity block, which we do not fabricate here). History
     assistant turns carry the </mm:think> prefix; the open ai turn does too unless
-    thinking is enabled. Tool calls: not yet rendered for this family."""
-    if tools:
-        raise APIError(400, "tools are not yet supported for the MiniMax-M3 template.", "tools")
+    thinking is enabled. Tool calls use the ]<]minimax[>[<invoke name=…> XML
+    dialect; tool results come back as ]~b]tool\\n<response>…</response>."""
+    if tool_choice == "none":
+        tools = None
     prompt = ["]~!b["]
+    dev_done = False
+    prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
@@ -1292,14 +1446,29 @@ def render_chat_m3(messages, enable_thinking=False, reasoning_effort=None, tools
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
         if role in ("system", "developer"):
-            prompt.append(f"]~b]developer\n{text}[e~[\n")
+            block = f"]~b]developer\n{text}"
+            if tools and not dev_done:
+                block += _m3_tools_block(tools, tool_choice)
+                dev_done = True
+            prompt.append(block + "[e~[\n")
         elif role == "user":
             prompt.append(f"]~b]user\n{text}[e~[\n")
         elif role == "assistant":
-            prompt.append(f"]~b]ai\n</mm:think>{text.strip()}[e~[\n")
+            tc_block = (_m3_tool_call_block(message.get("tool_calls"))
+                        if message.get("tool_calls") else "")
+            prompt.append(f"]~b]ai\n</mm:think>{text.strip()}{tc_block}[e~[\n")
+        elif role == "tool":
+            if not prev_tool:
+                prompt.append("]~b]tool")
+            prompt.append(f"\n<response>{text}</response>")
+            if index == len(messages) - 1 or messages[index + 1].get("role") != "tool":
+                prompt.append("[e~[\n")
         else:
             raise APIError(400, f"Unsupported message role for MiniMax-M3: {role!r}.",
                            f"messages.{index}.role", "unsupported_role")
+        prev_tool = (role == "tool")
+    if tools and not dev_done:
+        prompt.insert(1, f"]~b]developer\n{_m3_tools_block(tools, tool_choice)}[e~[\n")
     prompt.append("]~b]ai\n" + ("" if enable_thinking else "</mm:think>"))
     return "".join(prompt)
 

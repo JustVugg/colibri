@@ -2435,6 +2435,13 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(!st_has(&m->S,inm)){ c->msa=0; for(int i=0;i<c->n_layers;i++) c->idx_type[i]=0;
             fprintf(stderr,"[MSA] indexer weights absent — full causal attention "
                            "(add them with: convert --arch m3 --indexer for block-sparse long context)\n"); } }
+    /* COLI_MSA=0: force full causal attention even when the indexer weights ARE present.
+     * A/B switch for measuring MSA's long-context effect; mirrors the auto-detect fallback
+     * above (same two lines), so it rides the already-tested full-attention path. */
+    if(c->msa && getenv("COLI_MSA") && atoi(getenv("COLI_MSA"))==0){
+        c->msa=0; for(int i=0;i<c->n_layers;i++) c->idx_type[i]=0;
+        fprintf(stderr,"[MSA] COLI_MSA=0 — full causal attention (MSA disabled for A/B)\n");
+    }
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=layer_begin;i<layer_end;i++){
@@ -8394,8 +8401,12 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         fprintf(f,"[PROF] verdict: compute-bound in expert matmuls (%.0f%%) — more cores/threads help; keep IDOT=1, or move hot experts to a GPU tier (COLI_CUDA / COLI_METAL).%s\n",
             100*f_emm, g_mmap?" Note: with COLI_MMAP=1 page-fault I/O is accounted inside matmul.":"");
     } else if(f_attn>=0.35){
-        fprintf(f,"[PROF] verdict: attention-bound (%.0f%%) — context length is the cost (DSA %s). A lower CTX helps if the workload allows.\n",
-            100*f_attn, m->has_dsa?"on":"not available for this model");
+        { int is_m3 = (m->c.arch==ARCH_M3);
+          const char *sp_name = is_m3 ? "MSA" : "DSA";
+          const char *sp_on = is_m3 ? (m->c.msa?"on":"not available for this model")
+                                    : (m->has_dsa?"on":"not available for this model");
+          fprintf(f,"[PROF] verdict: attention-bound (%.0f%%) — context length is the cost (%s %s). A lower CTX helps if the workload allows.\n",
+              100*f_attn, sp_name, sp_on); }
     } else {
         fprintf(f,"[PROF] verdict: balanced — no phase dominates (I/O %.0f%%, matmul %.0f%%, attention %.0f%%); this config is a reasonable fit for this machine.\n",
             100*f_io,100*f_emm,100*f_attn);
@@ -11425,7 +11436,18 @@ int main(int argc, char **argv){
      * the stored weight format: a fmt=4 grouped-int4 container still computes at
      * 8-bit here. Label it as compute so the banner is not misread as a storage
      * claim (#1183). */
-    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | compute experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
+    /* Name the actual architecture. The engine identity prints before model_init, so
+     * the arch is not known yet -- peek at config.json's model_type (cheap, safe). */
+    { const char *engine_name = "GLM C engine (glm_moe_dsa)";
+      char cf[2100]; snprintf(cf,sizeof(cf),"%s/config.json",snap);
+      FILE *cfh=fopen(cf,"rb");
+      if(cfh){ fseek(cfh,0,SEEK_END); long cn=ftell(cfh); fseek(cfh,0,SEEK_SET);
+               char *cb=(cn>0 && cn<=(1<<20))?malloc((size_t)cn+1):NULL;
+               if(cb){ size_t cc=fread(cb,1,(size_t)cn,cfh); cb[cc]=0;
+                       if(strstr(cb,"minimax")) engine_name="MiniMax-M3 C engine (minimax_m3 MSA)";
+                       free(cb); }
+               fclose(cfh); }
+      printf("== %s, cache=%d experts/layer | compute experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", engine_name, cap, ebits, dbits); }
     g_mem_avail_boot = mem_available_gb();
 #if !defined(_WIN32)
     if(getenv("CLUSTER_WORKERS") && *getenv("CLUSTER_WORKERS")){

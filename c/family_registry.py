@@ -653,7 +653,7 @@ FAMILIES = (
         # resolves itself -- the legacy 8 belongs to the sister engines.
         # One KV slot: batched serve is not validated for M3 in this PR.
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 0, "CTX"),
-        capabilities=FamilyCapabilities(False, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="]~!b[]~b]user\n{prompt}[e~[\n]~b]ai\n</mm:think>",
