@@ -1451,15 +1451,19 @@ def _stop_process_facts(pid, port=None):
     try:
         proc=f"/proc/{int(pid)}"
         if os.stat(proc).st_uid != os.geteuid(): return None
-        raw=open(f"{proc}/stat").read()
+        with open(f"{proc}/stat") as stream:
+            raw=stream.read()
         close=raw.rfind(")")
         fields=raw[close+2:].split()
         if close<0 or len(fields)<20: return None
         starttime=int(fields[19])
-        cmdline=open(f"{proc}/cmdline","rb").read()
+        with open(f"{proc}/cmdline","rb") as stream:
+            cmdline=stream.read()
         argv=[item.decode("utf-8","replace") for item in cmdline.split(b"\0") if item]
-        comm=open(f"{proc}/comm").read().strip()
-        environ_raw=open(f"{proc}/environ","rb").read()
+        with open(f"{proc}/comm") as stream:
+            comm=stream.read().strip()
+        with open(f"{proc}/environ","rb") as stream:
+            environ_raw=stream.read()
         environ=set(environ_raw.split(b"\0"))
     except (OSError,ValueError,IndexError,PermissionError):
         return None
@@ -1576,7 +1580,8 @@ def cmd_stop(a, platform_name=None):
     targets={}  # pid -> immutable start-time/signature identity (+ optional pidfd)
     pf=serve_pidfile(a.port)
     try:
-        pid=int(open(pf).read().split()[0])
+        with open(pf) as stream:
+            pid=int(stream.read().split()[0])
         target=_open_stop_target(pid,f"coli serve (pidfile, port {a.port})",a.port)
         if target: targets[pid]=target
     except (OSError,ValueError,IndexError): pass

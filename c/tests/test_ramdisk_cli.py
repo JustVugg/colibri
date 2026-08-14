@@ -116,6 +116,7 @@ class HeadlessJsonDispatchTest(unittest.TestCase):
             destination.mkdir()
             plan["mount_root"] = str(destination.parent)
             plan["mounts"][0]["path"] = str(destination)
+            plan["blockers"] = []
 
             args = plan_args(fixture.root, yes=True)
             args.ramdisk_action = "stage"

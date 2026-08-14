@@ -12,6 +12,30 @@ from ramdisk_support import state as state_support
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def setUp(self):
+        self.portable_seams = contextlib.ExitStack()
+        self.addCleanup(self.portable_seams.close)
+        if not state_support._supports_native_dirfd():
+            self.portable_seams.enter_context(portable_descriptor_seam())
+        if os.path.__name__ != "posixpath":
+            self.portable_seams.enter_context(
+                portable_linux_manifest_paths()
+            )
+        self.portable_seams.enter_context(
+            mock.patch.object(
+                ramdisk,
+                "_current_process_identity",
+                return_value=deterministic_process_identity(),
+            )
+        )
+        self.portable_seams.enter_context(
+            mock.patch.object(
+                ramdisk,
+                "_process_start_boundary",
+                return_value=100,
+            )
+        )
+
     def _exercise_launch_line_interrupt(
         self,
         source_fragment,
@@ -2212,8 +2236,10 @@ class ManagedLaunchTest(unittest.TestCase):
                 ramdisk, "_wait_managed_ready", side_effect=cancel_ready
             ), mock.patch.object(
                 ramdisk, "_terminate_verified_group", return_value=None
-            ), mock.patch.object(
-                ramdisk, "_group_alive", return_value=False
+            ), mock.patch.multiple(
+                ramdisk,
+                _group_alive=mock.Mock(return_value=False),
+                _process_group_members=mock.Mock(return_value=([], [])),
             ), mock.patch.object(ramdisk, "_merge_usage"), mock.patch.object(
                 ramdisk.secrets, "token_hex", return_value=nonce
             ):

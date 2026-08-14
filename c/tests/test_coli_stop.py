@@ -43,6 +43,7 @@ class ColiStopIdentityTest(unittest.TestCase):
         rejected.assert_called_once_with(
             4242,
             "coli serve (pidfile, port 8000)",
+            8000,
         )
         signal_target.assert_not_called()
         self.assertIn("nothing running", output.getvalue())

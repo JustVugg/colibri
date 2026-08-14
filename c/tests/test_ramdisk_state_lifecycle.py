@@ -17,30 +17,6 @@ _REAL_BOUND_PARENT_DESCRIPTOR = state_support._bound_parent_descriptor
 _REAL_FSYNC_DIRECTORY = state_support._fsync_directory
 
 
-@contextlib.contextmanager
-def _portable_descriptor_seam():
-    """Exercise descriptor-gated state logic without weakening production."""
-
-    def allow_portable_binding(*args, **kwargs):
-        kwargs["require_native"] = False
-        return _REAL_BOUND_PARENT_DESCRIPTOR(*args, **kwargs)
-
-    with mock.patch.object(
-        state_support,
-        "_bound_parent_descriptor",
-        new=allow_portable_binding,
-    ), mock.patch.object(
-        state_support,
-        "_fsync_bound_directory",
-        new=lambda descriptor: None,
-    ), mock.patch.object(
-        state_support,
-        "_fsync_directory",
-        new=lambda path: None,
-    ):
-        yield
-
-
 class StateAndSafetyTest(unittest.TestCase):
     FINGERPRINT = "sha256:" + ("a" * 64)
     GLM_ENGINE_ID = 3815245270
@@ -50,7 +26,11 @@ class StateAndSafetyTest(unittest.TestCase):
         self.descriptor_seam = contextlib.ExitStack()
         self.addCleanup(self.descriptor_seam.close)
         if not state_support._supports_native_dirfd():
-            self.descriptor_seam.enter_context(_portable_descriptor_seam())
+            self.descriptor_seam.enter_context(portable_descriptor_seam())
+        if os.path.__name__ != "posixpath":
+            self.descriptor_seam.enter_context(
+                portable_linux_manifest_paths()
+            )
         self.temp = tempfile.TemporaryDirectory()
         self.root = str(Path(self.temp.name).resolve())
         self.env = mock.patch.dict(
@@ -1081,23 +1061,34 @@ class StateAndSafetyTest(unittest.TestCase):
         stream.__enter__.return_value = stream
         stream.__exit__.side_effect = OSError("secondary stream close")
         stream.close.side_effect = OSError("secondary stream close")
-        with mock.patch.object(
-            state_support.os,
-            "fdopen",
-            return_value=stream,
-        ), mock.patch.object(
-            state_support.json,
-            "dump",
-            side_effect=ValueError("primary JSON serialization"),
-        ):
-            with self.assertRaisesRegex(
-                ValueError,
-                "primary JSON serialization",
+        opened_descriptor = []
+
+        def fdopen(descriptor, *args, **kwargs):
+            del args, kwargs
+            opened_descriptor.append(descriptor)
+            return stream
+
+        try:
+            with mock.patch.object(
+                state_support.os,
+                "fdopen",
+                side_effect=fdopen,
+            ), mock.patch.object(
+                state_support.json,
+                "dump",
+                side_effect=ValueError("primary JSON serialization"),
             ):
-                state_support._atomic_json(
-                    os.path.join(self.root, "atomic.json"),
-                    {"unsafe": object()},
-                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "primary JSON serialization",
+                ):
+                    state_support._atomic_json(
+                        os.path.join(self.root, "atomic.json"),
+                        {"unsafe": object()},
+                    )
+        finally:
+            for descriptor in opened_descriptor:
+                os.close(descriptor)
 
     @requires_native_dirfd
     def test_atomic_temp_creation_stays_inside_bound_parent(self):
@@ -1148,14 +1139,25 @@ class StateAndSafetyTest(unittest.TestCase):
         stream.__exit__.side_effect = OSError("secondary stream close")
         stream.close.side_effect = OSError("secondary stream close")
         path = os.path.join(self.root, ".coli_usage")
-        with mock.patch.object(
-            state_support.os,
-            "fdopen",
-            return_value=stream,
-        ):
-            stream.write.side_effect = ValueError("primary usage write")
-            with self.assertRaisesRegex(ValueError, "primary usage write"):
-                state_support._usage_write(path, {"0:1": 1})
+        opened_descriptor = []
+
+        def fdopen(descriptor, *args, **kwargs):
+            del args, kwargs
+            opened_descriptor.append(descriptor)
+            return stream
+
+        try:
+            with mock.patch.object(
+                state_support.os,
+                "fdopen",
+                side_effect=fdopen,
+            ):
+                stream.write.side_effect = ValueError("primary usage write")
+                with self.assertRaisesRegex(ValueError, "primary usage write"):
+                    state_support._usage_write(path, {"0:1": 1})
+        finally:
+            for descriptor in opened_descriptor:
+                os.close(descriptor)
 
     def test_managed_usage_close_cannot_mask_parse_error(self):
         state_usage = os.path.join(self.root, ".coli_usage")
@@ -1722,7 +1724,7 @@ class StateAndSafetyTest(unittest.TestCase):
         ) as terminate, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
         terminate.assert_not_called()
         self.assertEqual(discover.call_count, 2)
         merge.assert_called_once()
@@ -1791,7 +1793,7 @@ class StateAndSafetyTest(unittest.TestCase):
         ) as terminate_group, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
 
         terminate_group.assert_called_once()
         merge.assert_called_once()
@@ -1896,7 +1898,7 @@ class StateAndSafetyTest(unittest.TestCase):
         ) as terminate_group, mock.patch.object(
             ramdisk, "_merge_usage"
         ) as merge:
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
 
         terminate_group.assert_called_once()
         merge.assert_called_once()
@@ -2134,7 +2136,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "multiple process groups",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -2152,7 +2154,7 @@ class StateAndSafetyTest(unittest.TestCase):
             "_managed_launch_processes",
             side_effect=[[], []],
         ), mock.patch.object(ramdisk, "_merge_usage"):
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
         self.assertEqual(stopped["state"], "stopped")
         self.assertNotIn("cleanup_errors", stopped)
 
@@ -2291,7 +2293,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "pending authority could not be removed",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         after_failure = ramdisk._load_manifest(required=True)
         self.assertEqual(len(after_failure["pending_launches"]), 1)
@@ -2304,7 +2306,7 @@ class StateAndSafetyTest(unittest.TestCase):
             "_managed_launch_processes",
             side_effect=[[], []],
         ), mock.patch.object(ramdisk, "_merge_usage", merge):
-            stopped = ramdisk.stop()
+            stopped = ramdisk.stop.__wrapped__()
 
         self.assertEqual(merge.call_count, 2)
         self.assertEqual(applications, [pending["usage_merge_id"]])
@@ -2372,7 +2374,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "unpublished.*unproven",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -2933,16 +2935,21 @@ class StateAndSafetyTest(unittest.TestCase):
         }
         ramdisk._atomic_json(ramdisk._manifest_path(), manifest)
 
+        direct_stop = ramdisk.stop.__wrapped__
         with mock.patch.object(
             ramdisk, "_group_alive", return_value=True
         ), mock.patch.object(ramdisk, "_umount_path") as unmount, mock.patch.object(
             ramdisk, "_durable_unlink"
-        ) as unlink:
+        ) as unlink, mock.patch.object(
+            ramdisk, "stop", new=direct_stop
+        ):
             with self.assertRaisesRegex(
                 ramdisk.RamdiskError,
                 "unpublished.*unproven",
             ):
-                ramdisk.destroy(argparse.Namespace(yes=True))
+                ramdisk._destroy_locked.__wrapped__(
+                    argparse.Namespace(yes=True)
+                )
 
         unmount.assert_not_called()
         unlink.assert_not_called()
@@ -2988,7 +2995,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "unverified.*procfs enumeration unreadable",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         terminate.assert_not_called()
         merge.assert_not_called()
@@ -3029,7 +3036,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "termination revalidation unreadable",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
 
         merge.assert_not_called()
         persisted = ramdisk._load_manifest(required=True)
@@ -3058,7 +3065,7 @@ class StateAndSafetyTest(unittest.TestCase):
                         ramdisk.RamdiskError,
                         "non-managed mount ownership",
                     ):
-                        ramdisk.stop()
+                        ramdisk.stop.__wrapped__()
 
                 terminate.assert_not_called()
                 merge.assert_not_called()
@@ -4050,7 +4057,9 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "mount helper outcome is unknown.*pending",
             ):
-                ramdisk.destroy(argparse.Namespace(yes=True))
+                ramdisk._destroy_locked.__wrapped__(
+                    argparse.Namespace(yes=True)
+                )
 
         mount_table.assert_not_called()
         mount_at.assert_not_called()
@@ -4178,7 +4187,9 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "foreign or replaced mount",
             ):
-                ramdisk.destroy(argparse.Namespace(yes=True))
+                ramdisk._destroy_locked.__wrapped__(
+                    argparse.Namespace(yes=True)
+                )
 
         unmount.assert_not_called()
         persisted = ramdisk._load_manifest(required=True)
@@ -4233,7 +4244,9 @@ class StateAndSafetyTest(unittest.TestCase):
                         ramdisk.RamdiskError,
                         "remains or was replaced",
                     ):
-                        ramdisk.destroy(argparse.Namespace(yes=True))
+                        ramdisk._destroy_locked.__wrapped__(
+                            argparse.Namespace(yes=True)
+                        )
 
                 unmount.assert_called_once()
                 unlink.assert_not_called()
@@ -4284,7 +4297,9 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "after busy scan",
             ):
-                ramdisk.destroy(argparse.Namespace(yes=True))
+                ramdisk._destroy_locked.__wrapped__(
+                    argparse.Namespace(yes=True)
+                )
 
         unmount.assert_not_called()
         persisted = ramdisk._load_manifest(required=True)
@@ -4690,7 +4705,7 @@ class StateAndSafetyTest(unittest.TestCase):
                 ramdisk.RamdiskError,
                 "stopped-record-process-group-live",
             ):
-                ramdisk.stop()
+                ramdisk.stop.__wrapped__()
             report = ramdisk.status(deep=False)
 
         popen.assert_not_called()

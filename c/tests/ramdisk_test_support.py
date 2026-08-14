@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import posixpath
 import signal
 import shutil
 import subprocess
@@ -20,6 +21,58 @@ from unittest import mock
 C_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(C_DIR))
 import ramdisk  # noqa: E402
+from ramdisk_support import state as state_support  # noqa: E402
+
+
+_REAL_BOUND_PARENT_DESCRIPTOR = state_support._bound_parent_descriptor
+_REAL_PATH_WITHOUT_SYMLINKS = state_support._path_without_symlinks
+
+
+@contextlib.contextmanager
+def portable_descriptor_seam():
+    """Exercise descriptor-gated state logic without weakening production."""
+
+    def allow_portable_binding(*args, **kwargs):
+        kwargs["require_native"] = False
+        return _REAL_BOUND_PARENT_DESCRIPTOR(*args, **kwargs)
+
+    with mock.patch.object(
+        state_support,
+        "_bound_parent_descriptor",
+        new=allow_portable_binding,
+    ), mock.patch.object(
+        state_support,
+        "_fsync_bound_directory",
+        new=lambda descriptor: None,
+    ), mock.patch.object(
+        state_support,
+        "_fsync_directory",
+        new=lambda path: None,
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def portable_linux_manifest_paths():
+    """Treat persisted ``/mnt`` records as Linux paths on non-Linux hosts."""
+
+    def path_without_symlinks(path):
+        if isinstance(path, str) and (
+            path == "/mnt" or path.startswith("/mnt/")
+        ):
+            return (
+                posixpath.isabs(path)
+                and posixpath.normpath(path) == path
+            )
+        return _REAL_PATH_WITHOUT_SYMLINKS(path)
+
+    with mock.patch.object(
+        state_support,
+        "_path_without_symlinks",
+        new=path_without_symlinks,
+    ):
+        yield
+
 
 try:
     from .platform_test_support import (
@@ -91,6 +144,16 @@ def host_uid():
     """Return a stable test UID on hosts where Python has no POSIX getuid()."""
     getuid = getattr(os, "getuid", None)
     return getuid() if getuid is not None else 1000
+
+
+def deterministic_process_identity(uid=None):
+    """Return a complete Linux-shaped launcher identity for synthetic starts."""
+    return {
+        "pid": 700,
+        "uid": host_uid() if uid is None else uid,
+        "starttime": 90,
+        "cmdline": ["coli", "ramdisk", "start"],
+    }
 
 
 def write_safetensors(path, tensors):
@@ -262,6 +325,8 @@ __all__ = [
     "optional_module_available",
     "os",
     "plan_args",
+    "portable_descriptor_seam",
+    "portable_linux_manifest_paths",
     "ramdisk",
     "assert_platform_skip_inventory",
     "requires_benchmark",
@@ -283,4 +348,5 @@ __all__ = [
     "threading",
     "unittest",
     "write_safetensors",
+    "deterministic_process_identity",
 ]
