@@ -35,7 +35,7 @@ static float fr(void){ return (float)(int32_t)xr()/2147483648.0f; }
 /* write a synthetic coli-sft-v1 split: NSAMP samples, vocab-bounded ids,
  * fake prompt/completion mask, one deliberately-too-short sample (skipped) */
 static void write_dataset(const char *dir, int vocab){
-    char p[1024]; mkdir(dir,0755);
+    char p[1024]; LORA_MKDIR(dir);   /* portable: Windows CRT mkdir has no mode arg */
     int lens[NSAMP]; int64_t tot=0;
     for(int i=0;i<NSAMP;i++){ lens[i]=(i==5)?1:(int)(6+xr()%40); tot+=lens[i]; }
     uint32_t *tok=malloc(tot*4); uint8_t *msk=malloc(tot);
