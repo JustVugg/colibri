@@ -552,10 +552,10 @@ _MM_INVOKE_RE = re.compile(re.escape(MM_NS) + r'<invoke name="([^"]*)">(.*?)' + 
 def _m3_to_xml(value):
     """Recursive MiniMax-M3 tool-argument XML (mirrors chat_template.jinja `to_xml`)."""
     if isinstance(value, dict):
-        return "\n".join(f"{MM_NS}<{k}>{_m3_to_xml(v)}{MM_NS}</{k}>"
-                         for k, v in value.items() if v is not None)
+        return "".join(f"{MM_NS}<{k}>{_m3_to_xml(v)}{MM_NS}</{k}>"
+                       for k, v in value.items() if v is not None)
     if isinstance(value, (list, tuple)):
-        return "\n".join(f"{MM_NS}<item>{_m3_to_xml(i)}{MM_NS}</item>" for i in value)
+        return "".join(f"{MM_NS}<item>{_m3_to_xml(i)}{MM_NS}</item>" for i in value)
     if isinstance(value, bool):
         return json.dumps(value)
     return "" if value is None else str(value)
@@ -567,7 +567,7 @@ def _m3_tool_call_block(tool_calls):
     for tc in (tool_calls or []):
         fn = tc.get("function", tc) if isinstance(tc, dict) else {}
         name = fn.get("name") or ""
-        parts.append(f'{MM_NS}<invoke name="{name}">\n')
+        parts.append(f'{MM_NS}<invoke name="{name}">')
         args = fn.get("arguments", "{}")
         if isinstance(args, str):
             try:
@@ -577,7 +577,7 @@ def _m3_tool_call_block(tool_calls):
         for k, v in (args or {}).items():
             if v is None:
                 continue
-            parts.append(f"{MM_NS}<{k}>{_m3_to_xml(v)}{MM_NS}</{k}>\n")
+            parts.append(f"{MM_NS}<{k}>{_m3_to_xml(v)}{MM_NS}</{k}>")
         parts.append(MM_NS + "</invoke>\n")
     parts.append(MM_TC_END)
     return "".join(parts)
@@ -600,7 +600,17 @@ def _m3_tools_block(tools, tool_choice=None):
                + MM_TC_BEGIN + MM_TC_END + " block. Parameter values containing nested "
                "objects or arrays are recursively expanded into XML elements. Example:\n\n"
                + MM_TC_BEGIN + "\n"
-               + MM_NS + '<invoke name="tool-name-1">' + MM_NS + "<param-1>value-1" + MM_NS + "</param-1>\n"
+               + MM_NS + '<invoke name="tool-name-1">'
+               + MM_NS + "<param-1>value-1" + MM_NS + "</param-1>"
+               + MM_NS + "<param-2>"
+               + MM_NS + "<item>"
+               + MM_NS + "<key-a>val-a" + MM_NS + "</key-a>"
+               + MM_NS + "<key-b>val-b" + MM_NS + "</key-b>"
+               + MM_NS + "</item>"
+               + MM_NS + "</param-2>"
+               + MM_NS + "</invoke>\n"
+               + MM_NS + '<invoke name="tool-name-2">'
+               + MM_NS + "<param-1>value-1" + MM_NS + "</param-1>"
                + MM_NS + "</invoke>\n" + MM_TC_END)
     if forced:
         out.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
@@ -689,6 +699,8 @@ def _tool_stream_markers():
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
+    if ARCH == "minimax_m3":
+        return (MM_TC_BEGIN,)
     return (BOX_START,)
 
 
