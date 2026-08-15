@@ -405,11 +405,51 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mi
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
 ./coli web  --model /nvme/glm52_i4        # API + dashboard, and opens a browser
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
+./coli ramdisk plan --model /nvme/glm52_i4 --json  # review Linux RAM staging
 ```
 
 On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
+
+#### Headless RAM-workspace lifecycle (Linux)
+
+`coli ramdisk` can stage a reviewed full or profile-selected model namespace
+onto NUMA-aware tmpfs without a terminal frontend. Lifecycle mutations
+(`stage`/`prepare`/`start`/`stop`/`destroy`) are bound to the exact JSON
+snapshot an operator reviewed:
+
+```bash
+# Save the plan_token from this response.
+./coli ramdisk plan --model /nvme/glm52_i4 --json
+
+./coli ramdisk stage --model /nvme/glm52_i4 \
+  --plan-token <64-lowercase-hex> --yes --json
+
+./coli ramdisk status --json
+./coli ramdisk verify --json
+
+# Stage, start, and stop return a fresh deployment_token for the next command.
+./coli ramdisk start --deployment-token <token-from-status> --yes --json
+./coli ramdisk status --runtime --json
+./coli ramdisk stop --deployment-token <token-from-start> --yes --json
+
+# Run the fixed, append-only causal RAMMAP protocol while engines are stopped.
+./coli ramdisk benchmark --residency-gb 64 --cuda-host-gb 32 \
+  --cuda-expert-gb 48 --json
+
+# Save the deployment_token from status, then destroy that exact deployment.
+./coli ramdisk destroy --deployment-token <token-from-stop-or-status> --yes --json
+```
+
+`prepare` is an exact alias of `stage`. A bare `coli ramdisk` prints the
+headless action help and exits with status 2. `start`, `stop`, and `destroy`
+require the token from the immediately preceding reviewed snapshot; successful
+token-bound lifecycle mutations that preserve a deployment return a fresh
+token. Destroy returns a sanitized teardown result after removing the
+deployment. `start --base-port PORT` overrides the prepared
+deployment's persisted base port; omitting it reuses that persisted port.
+Runtime telemetry is opt-in and advisory.
 
 #### The same commands run any of the models
 
@@ -459,6 +499,7 @@ Two things that differ per model, both documented in the per-model page:
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| Headless RAM-workspace CLI and tokens | [docs/SETTINGS.md#ramdisk-linux-only](docs/SETTINGS.md#ramdisk-linux-only) |
 
 ## DeepSeek V4
 

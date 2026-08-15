@@ -138,6 +138,29 @@ jobs:
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp c/autotune.py dist/
+          cp c/ramdisk.py dist/
+          mkdir -p dist/ramdisk_support
+          cp c/ramdisk_support/__init__.py \
+             c/ramdisk_support/accelerator.py \
+             c/ramdisk_support/benchmark.py \
+             c/ramdisk_support/cli.py \
+             c/ramdisk_support/common.py \
+             c/ramdisk_support/contracts.py \
+             c/ramdisk_support/discovery.py \
+             c/ramdisk_support/lifecycle.py \
+             c/ramdisk_support/linux_ops.py \
+             c/ramdisk_support/model.py \
+             c/ramdisk_support/mounts.py \
+             c/ramdisk_support/planning.py \
+             c/ramdisk_support/platform_ops.py \
+             c/ramdisk_support/presentation.py \
+             c/ramdisk_support/presets.py \
+             c/ramdisk_support/processes.py \
+             c/ramdisk_support/runtime_monitor.py \
+             c/ramdisk_support/state.py \
+             c/ramdisk_support/supervision.py \
+             c/ramdisk_support/tokens.py \
+             dist/ramdisk_support/
           cp LICENSE dist/
           # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
           # probe that layout as well as the source checkout's one-level-up form.
@@ -227,7 +250,7 @@ jobs:
               sys.exit("FAIL: packaged launcher misroutes:\n  " + "\n  ".join(bad))
           print("OK: every engine is packaged AND coli dispatches to it:", " ".join(expect))
           PYCHK
-          out=$(python3 coli info 2>&1 || true)
+          out=$(python3 coli info --model . 2>&1)
           echo "$out"
           case "$out" in
             *"engine is not built"*) echo "FAIL: coli cannot find the packaged engine"; exit 1 ;;
@@ -242,6 +265,17 @@ jobs:
           test -f web/dist/index.html   || { echo "FAIL: dashboard missing from archive"; exit 1; }
           test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
           python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
+          echo "$out" | grep -Fq "ready ✓" || { echo "FAIL: coli cannot find the packaged engine"; exit 1; }
+          python3 coli ramdisk --help > ramdisk-help.txt
+          grep -Fq "interleaved = one shared model copy" ramdisk-help.txt || {
+            echo "FAIL: packaged headless RAM-disk control plane did not load"; exit 1;
+          }
+          test -z "$(find ramdisk_support -type f ! -name '*.py' -print -quit)" || {
+            echo "FAIL: packaged RAM-disk support contains generated artifacts"; exit 1;
+          }
+          python3 -m compileall -q ramdisk.py ramdisk_support
+          PYTHONPATH=. python3 -c "import pkgutil, ramdisk_support; [__import__(item.name) for item in pkgutil.walk_packages(ramdisk_support.__path__, ramdisk_support.__name__ + '.')]"
+          echo "OK: packaged engine and headless RAM-disk control plane load from one archive"
 
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
       # (the engine was versioned, so it did not match); now that the engine is plainly named,

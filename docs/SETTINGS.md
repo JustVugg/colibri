@@ -26,6 +26,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
+| `ramdisk` | Run the headless Linux NUMA-aware RAM-workspace lifecycle. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
@@ -73,6 +74,60 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--io-bits` | `8` | Resident (attention/dense/embed) bit width. |
 | `--xbits` | `0` | Extra/override bit width. |
 | `--no-mtp` | off | Skip the MTP speculative-draft head. |
+
+### `ramdisk` (Linux only)
+
+The RAM-workspace control plane exposes exactly these actions:
+
+| Action | Contract |
+|---|---|
+| `plan --json` | Emit the exact staging/reserve plan plus its `plan_token`; returns 2 when the plan has blockers. |
+| `stage --plan-token TOKEN --yes --json` | Mount, stage, and validate only the reviewed plan; returns `colibri.ramdisk.stage.v1`. |
+| `prepare ...` | Exact alias of `stage`, including token enforcement and JSON schema. |
+| `verify --json` | Deeply revalidate source identity, mounts, namespaces, and processes; returns 2 when absent or unverified. |
+| `status --json` | Observational status; includes a `deployment_token` when a manifest is present. |
+| `status --runtime --json` | Add advisory serving/GPU telemetry after revalidating the same deployment snapshot. |
+| `start [--base-port PORT] --deployment-token TOKEN --yes --json` | Start contained managed engines; omission of `--base-port` reuses the prepared deployment's persisted port. Returns `colibri.ramdisk.start.v1` and a fresh token. |
+| `stop --deployment-token TOKEN --yes --json` | Stop contained engines and merge exact usage transactions; returns `colibri.ramdisk.stop.v1` and a fresh token. |
+| `benchmark ... --json` | Run the fixed causal RAMMAP protocol with append-only evidence while managed engines are stopped. |
+| `destroy --deployment-token TOKEN --yes --json` | Stop internal recovery work as needed and unmount only the reviewed deployment; returns `colibri.ramdisk.destroy.v1`. |
+
+Tokens are lowercase 64-character SHA-256 identities. Missing, malformed, or
+preflight-stale tokens fail before creating lifecycle state. If a reviewed plan
+changes after preflight, the serialized under-lock check still refuses it
+before mounts, processes, or manifest writes; the deliberately durable
+lifecycle lock may remain as synchronization metadata. `prepare`/`stage` bind
+model identity, hardware-mask provenance, placement, selected shards,
+reserves, mounts, runtime knobs, accelerator policy, and preset. Deployment
+tokens used by `start`, `stop`, and `destroy` additionally bind the deployment,
+mount identities, process identities, state, and persisted endpoint.
+
+The `start.v1` success object has exactly `schema`, `version`, `state`,
+`deployment_id`, `deployment_token`, `ports`, `endpoints`,
+`containment_mode`, `usage_merge_summary`, and `recovery_attention`.
+The `stop.v1` object replaces `ports` and `endpoints` with `stopped_count`.
+Usage-merge fields are counts for that invocation, not lifetime totals.
+`containment_mode` is either `cgroup-v2` or `legacy-process-group`.
+
+```sh
+coli ramdisk plan --model /models/glm --memory-nodes 0,2 \
+  --cpu-list 0-31,64-95 --json
+coli ramdisk stage --model /models/glm \
+  --plan-token <token-from-plan> --yes --json
+coli ramdisk verify --json
+coli ramdisk status --json
+coli ramdisk start --deployment-token <token-from-status> --yes --json
+coli ramdisk stop --deployment-token <token-from-start> --yes --json
+coli ramdisk destroy --deployment-token <token-from-stop-or-status> --yes --json
+```
+
+Common planning flags are `--mode full|partial`,
+`--topology interleaved|per-node`, `--memory-nodes`, `--cpu-list`,
+`--capacity-gb`, `--profile`, `--mount-root`, `--allow-swappable`, `--thp`,
+`--prefault`, `--parallel`, `--ctx`, `--gpu`, and `--gpu-layout`. Planning,
+status, and verification are unprivileged. Staging and destruction use only
+the narrowly reviewed mount/unmount privilege path. A bare `coli ramdisk`
+prints this headless command surface and exits 2.
 
 **`bench`**: `[tasks...]` (positional), `--limit 40`, `--data <bench dir>`.
 **`plan` / `doctor`**: `--json`.

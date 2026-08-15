@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ description = "Tiny engine, immense model — run GLM-5.2 (744B MoE) locally"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
+dependencies = []
 authors = [
     {name = "JustVugg"},
 ]
@@ -50,4 +51,16 @@ version = {attr = "colibri._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["colibri*"]
+include = ["colibri*", "c", "c.tools", "c.ramdisk_support*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+c = [
+    "coli",
+]
+"c.tools" = [
+    "*.json",
+    "*.md",
+    "*.sh",
+    "*.txt",
+]

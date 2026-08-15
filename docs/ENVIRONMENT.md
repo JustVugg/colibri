@@ -388,6 +388,35 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 
 > **Debugging an OpenCode session:** `COLI_DEBUG=1` watches the model's output stream; `COLI_DEBUG=2` shows both sides (prompt + output) as a transcript. Add `COLI_TOOL_SALVAGE=1` on int4 to catch mangled tool calls.
 
+### Headless RAM-workspace control plane
+
+These variables configure durable state for the Linux `coli ramdisk`
+plan/stage/prepare/verify/status/destroy/benchmark/start/stop lifecycle:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `XDG_STATE_HOME` | `~/.local/state` | Durable state base. RAM-workspace state lives below `colibri/ramdisk`; the value must expand to an absolute, non-volatile path. |
+| `COLI_RAMDISK_MANIFEST` | `$XDG_STATE_HOME/colibri/ramdisk/manifest.json` | Absolute durable override for the managed deployment manifest. |
+| `COLI_CGROUP_DELEGATED_ROOT` | Current delegated cgroup-v2 directory | Absolute delegated cgroup-v2 root used for managed engine containment. Relative paths are rejected. |
+| `COLI_DRAM_COLLECTOR` | unset | Absolute command (or reviewed PATH command) implementing the benchmark `--preflight/--snapshot --json` byte-counter protocol. Missing or failed counters make the causal claim incomplete and neutral. |
+| `COLI_RAMDISK_START_TIMEOUT` | `7200` | Managed-engine readiness timeout in seconds; must be numeric and between 1 and 86400. |
+
+The staging namespace is volatile, but the manifest, lifecycle lock, and
+recovery record are deliberately durable. Do not point either variable at the
+managed tmpfs mount root.
+
+Managed start/stop requires a writable delegated cgroup-v2 subtree. Set
+`COLI_CGROUP_DELEGATED_ROOT` only to an absolute delegation granted to the
+calling user and reserved exclusively for one cooperating Colibri durable-state
+root. Do not share or mutate that subtree from another service or a second
+independent `XDG_STATE_HOME`; Colibri serializes its own writers with the
+durable lifecycle lock, while Linux provides no inode-conditional cgroup
+directory-removal syscall. Tests that create live cgroups require an explicit
+delegated test root and never write to the host cgroup root. Causal benchmark
+protocol and raw evidence are append-only below the durable state root.
+Collector loss leaves evidence intact but forces an incomplete/neutral claim,
+and benchmarking never updates legacy tuning history.
+
 ## Set by the CLI (don't usually set by hand)
 
 `coli` / `openai_server.py` set these internally to select a run mode or pass through a flag:
