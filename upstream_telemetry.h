@@ -1,4 +1,4 @@
-/* telemetry.h â€” dashboard protocol lines, stats/usage persistence, hardware probe.
+/* telemetry.h ÔÇö dashboard protocol lines, stats/usage persistence, hardware probe.
  * Include after Model/Cfg/QT/ESlot/shards and st.h are defined; requires
  * qt_bytes(), now_s(), rss_gb(), edisk_s(), and the g_cuda_* globals (ifdef). */
 #ifndef TELEMETRY_H
@@ -10,80 +10,20 @@ static int64_t tbytes(int O,int I,int bits){
     return (int64_t)O*((I+1)/2) + (int64_t)O*4;
 }
 
-/* Container bytes of expert 0 of one layer (weights + .qs scales); 0 if absent. */
-static int64_t expert_bytes_layer(Model *m, int layer){
-    int64_t eb=0; char nm[256];
-    const char *suf[3]={"gate_proj","up_proj","down_proj"};
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",layer);
-    if(st_nbytes(&m->S,nm)<=0) return 0;
-    for(int k=0;k<3;k++){
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",layer,suf[k]);
-        eb+=st_nbytes(&m->S,nm);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",layer,suf[k]);
-        int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
-    }
-    return eb;
-}
-
-/* MAX over the widths the container actually holds, not the first MoE layer.
- * ws[] slots and the per-layer LRU slabs are reused ACROSS layers, and slab_cap
- * grows to the largest expert a slot has ever held and is never shrunk (see the
- * ESlot comment). So on a container that MIXES widths -- int4 routed layers with
- * an int8 MTP head, which is how GLM-5.2 ships -- every slot ends up costing the
- * widest one, while probing only c->first_dense reports the narrowest.
- *
- * cap_for_ram() divides by this, so the error goes straight into the cap. #766,
- * measured on 4x A6000 / 251 GiB:
- *
- *     layer 3  (int4 routed) 21.23 MB   <- what this used to return
- *     layer 78 (int8 MTP)    37.79 MB   <- what a slot actually costs
- *
- *   --auto-tier -> cap 113 -> 257 GB RSS -> OOM-kill
- *   113 * 21.23/37.79 = 63.5, and cap 64 is the measured point that survives at
- *   118 GB. The projection's shape was right; only this constant was wrong.
- *
- * nsp += 2 in cap_for_ram() already nods at the MTP row costing double, but that
- * corrects one row out of nsp; the slabs grow on all of them.
- *
- * #856 SCOPE: this is the right width for the ws[64] working set, whose slots ARE
- * shared across rows, and for nothing else. Sizing the per-row LRU caches with it
- * is what expert_cache_row_bytes() below replaces. */
 static int64_t expert_bytes_probe(Model *m, int ebits){
-    Cfg *c=&m->c;
-    int64_t eb=expert_bytes_layer(m,c->first_dense);
-    if(m->has_mtp){ int64_t mtp=expert_bytes_layer(m,c->n_layers); if(mtp>eb) eb=mtp; }
+    Cfg *c=&m->c; int64_t eb=0; char nm[256];
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",c->first_dense);
+    if(st_nbytes(&m->S,nm)>0){
+        const char *suf[3]={"gate_proj","up_proj","down_proj"};
+        for(int k=0;k<3;k++){
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",c->first_dense,suf[k]);
+            eb+=st_nbytes(&m->S,nm);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
+            int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
+        }
+    }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
     return eb;
-}
-
-/* Width of the experts ONE row actually holds; same fallback as the probe above.
- *
- * Every row has its own ecache[layer] and its own pin arena, so a row costs the
- * width IT holds. Charging all of them the container's widest halved the cache on
- * GLM-5.2 shipped as int4 routed + int8 MTP: 154 -> 77 slots per row, with the
- * 5,852 experts that left RAM reappearing one-for-one on disk (#856). Diagnosis by
- * @terrizoaguimor from @brad-evony's dashboard screenshots. */
-static int64_t expert_bytes_row(Model *m, int layer, int ebits){
-    Cfg *c=&m->c;
-    int64_t eb=expert_bytes_layer(m,layer);
-    if(eb>0) return eb;
-    eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
-    /* Header unreadable. For the MTP row keep the old "counts double" approximation
-     * (nsp+=2 in cap_for_ram) rather than assume it is as narrow as a routed row:
-     * under-reserving is the direction that ends in an OOM-kill. */
-    return layer==c->n_layers ? eb*2 : eb;
-}
-
-/* What ONE slot per row costs across EVERY row -- the divisor of the expert budget.
- * Stateless on purpose: st_find is a hash lookup, so this is ~6 probes per layer
- * and a few hundred for a 78-layer model, called a handful of times at startup.
- * A memo keyed on anything less than (model, ebits) is a staleness bug waiting for
- * whoever next changes has_mtp or the layer map. */
-static double expert_cache_row_bytes(Model *m, int ebits){
-    Cfg *c=&m->c; double sum=0;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) sum+=(double)expert_bytes_row(m,i,ebits);
-    if(m->has_mtp) sum+=(double)expert_bytes_row(m,c->n_layers,ebits);
-    return sum;
 }
 
 /* BRAIN MAP: per-turn expert hit bitmap for the dashboard. */
@@ -182,20 +122,8 @@ static void tiers_emit(Model *m){
 #endif
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
-    /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
-     * box where Windows still showed 140 GB free, because every resident expert was
-     * being priced as an int8 MTP one (#856). A tier figure that disagrees with the
-     * operating system teaches people to distrust the panel. */
-    double ram_b=0;
-    for(int i=0;i<=c->n_layers;i++){
-        int64_t w=expert_bytes_row(m,i,m->ebits);
-        ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
-    }
-    if(vram>0){                       /* the VRAM tier's host copies are not RAM-tier bytes */
-        double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;
-        ram_b -= avg*(double)vram; if(ram_b<0) ram_b=0;
-    }
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_b/1e9);
+    double eb=(double)expert_bytes_probe(m,m->ebits);
+    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
     fflush(stdout);
 }
 
@@ -252,27 +180,26 @@ static void hits_emit(Model *m){
     printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
 }
 
-/* The history format lives in route_trace.h so every engine writes the same bytes;
- * these keep the Model-shaped call sites unchanged. */
-static void stats_dump_q(Model *m, const char *path, int quiet){ (void)m; rt_save(path,quiet); }
+static void stats_dump_q(Model *m, const char *path, int quiet){
+    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
+    Cfg *c=&m->c; int64_t tot=0, nz=0;
+    for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
+        for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
+    fclose(f); rename(tmp,path);
+    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,path);
+}
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
 static char g_usage_path[2100]="";
-static int colibri_persist_enabled(void){
-    const char *v=getenv("COLI_PERSIST");
-    if(!v || !*v) return 1;
-    if(!strcmp(v,"0") || !strcmp(v,"false") || !strcmp(v,"False") ||
-       !strcmp(v,"off") || !strcmp(v,"OFF")) return 0;
-    return 1;
-}
 static int64_t usage_load(Model *m, const char *path){
-    (void)m;
-    if(!colibri_persist_enabled()) return 0;
-    return rt_load(path);
+    FILE *f=fopen(path,"r"); if(!f) return 0;
+    Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
+    while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
+        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
+    fclose(f); return tot;
 }
-static void usage_save(Model *m){
-    if(!colibri_persist_enabled()) return;
-    if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1);
-}
+static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
 
 #endif /* TELEMETRY_H */
+

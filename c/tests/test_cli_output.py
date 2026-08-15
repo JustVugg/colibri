@@ -141,7 +141,7 @@ class ChatCapForwardingTest(unittest.TestCase):
                 pass
 
         model = tempfile.mkdtemp()
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", model], check=False))
+        self.addCleanup(lambda: shutil.rmtree(model, ignore_errors=True))
         (Path(model) / "config.json").write_text(json.dumps({"model_type": "inkling"}))
         args = types.SimpleNamespace(model=model, cap=cap, ngen=256, api_key=None,
                                      no_attach=True, attach=None)
