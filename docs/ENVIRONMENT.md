@@ -388,6 +388,20 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 
 > **Debugging an OpenCode session:** `COLI_DEBUG=1` watches the model's output stream; `COLI_DEBUG=2` shows both sides (prompt + output) as a transcript. Add `COLI_TOOL_SALVAGE=1` on int4 to catch mangled tool calls.
 
+### Headless RAM-workspace control plane
+
+These variables configure durable state for the Linux `coli ramdisk`
+plan/stage/verify/status/destroy lifecycle:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `XDG_STATE_HOME` | `~/.local/state` | Durable state base. RAM-workspace state lives below `colibri/ramdisk`; the value must expand to an absolute, non-volatile path. |
+| `COLI_RAMDISK_MANIFEST` | `$XDG_STATE_HOME/colibri/ramdisk/manifest.json` | Absolute durable override for the managed deployment manifest. |
+
+The staging namespace is volatile, but the manifest, lifecycle lock, and
+recovery record are deliberately durable. Do not point either variable at the
+managed tmpfs mount root.
+
 ## Set by the CLI (don't usually set by hand)
 
 `coli` / `openai_server.py` set these internally to select a run mode or pass through a flag:

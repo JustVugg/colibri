@@ -23,8 +23,7 @@ MODEL_ID = "glm-5.2-colibri"
 
 # Mock engine: replies are keyed on the prompt so one process covers every case.
 # Prompts received are appended to MOCK_LOG for assertions on the rendering.
-MOCK_ENGINE = r'''#!/usr/bin/env python3
-import sys, os
+MOCK_ENGINE = r'''import sys, os
 out, inp = sys.stdout.buffer, sys.stdin.buffer
 out.write(b"\x01\x01READY\x01\x01\n" + b"STAT 0 0 0 0 0\n"); out.flush()
 
@@ -81,7 +80,7 @@ class ToolCallingE2E(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         mock = Path(cls.tmp.name) / "mock_engine.py"
-        mock.write_text(MOCK_ENGINE)
+        mock.write_text("#!%s\n%s" % (sys.executable, MOCK_ENGINE))
         mock.chmod(0o755)
         cls.mock_log = Path(cls.tmp.name) / "prompts.log"
         cls.mock_log.touch()

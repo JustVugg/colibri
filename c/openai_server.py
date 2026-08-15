@@ -43,6 +43,7 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
+ENGINE_READY_TIMEOUT = 7200.0
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -1686,20 +1687,76 @@ def tune_child_env(env, arch):
 
 
 class Engine:
+    def _spawn_process(self, command, *, child_env, stderr):
+        return subprocess.Popen(
+            command, env=child_env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=stderr, bufsize=0,
+        )
+
+    @staticmethod
+    def _terminate_process(process):
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    @classmethod
+    def _wait_until_ready(cls, process, timeout):
+        outcome = queue.Queue(maxsize=1)
+
+        def read_ready():
+            try:
+                read_engine_turn(process.stdout, READY, lambda _: None)
+            except BaseException as error:
+                outcome.put(error)
+            else:
+                outcome.put(None)
+
+        reader = threading.Thread(target=read_ready, name="colibri-ready", daemon=True)
+        reader.start()
+        try:
+            try:
+                error = outcome.get(timeout=timeout)
+            except queue.Empty:
+                raise RuntimeError(
+                    "colibri engine did not become ready within %.3g seconds" % timeout
+                )
+            if error is not None:
+                raise error
+        except BaseException:
+            cls._terminate_process(process)
+            reader.join(timeout=5)
+            raise
+        reader.join()
+
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
     # coli_resolve_cap, #379), non-glm arches get the legacy 8, via
     # cap_for_arch above. Same convention as the --cap flags in coli and
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
-    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
+    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1,
+                 command_prefix=None, stderr=None):
         arch = model_arch(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
-        self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+        try:
+            ready_timeout = float(child_env.get("COLI_ENGINE_READY_TIMEOUT",
+                                                ENGINE_READY_TIMEOUT))
+        except (TypeError, ValueError):
+            raise ValueError("COLI_ENGINE_READY_TIMEOUT must be numeric")
+        if not math.isfinite(ready_timeout) or not 0 < ready_timeout <= 86400:
+            raise ValueError("COLI_ENGINE_READY_TIMEOUT must be between 0 and 86400 seconds")
+        command = list(command_prefix or ()) + [
+            str(executable), str(cap_for_arch(arch, cap))
+        ]
+        self.process = self._spawn_process(
+            command, child_env=child_env, stderr=stderr,
         )
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
@@ -1710,12 +1767,16 @@ class Engine:
         self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
+        self.gpus = []
+        self.gpus_seq = 0
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
+        self._pending_profile = None
+        self._pending_done_profile = None
+        self._wait_until_ready(self.process, ready_timeout)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -1732,6 +1793,16 @@ class Engine:
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
         }
+
+    def _publish_profile(self, profile, stats):
+        profile.update({
+            "tokens_per_second": stats["tokens_per_second"],
+            "cache_hit_percent": stats["cache_hit_percent"],
+            "rss_gb": stats["rss_gb"],
+            "length_limited": stats["length_limited"],
+        })
+        self.profile.append(profile)
+        self.profile_seq += 1
 
     def _fail_pending(self, error):
         with self.pending_lock:
@@ -1785,6 +1856,17 @@ class Engine:
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    profile = self._pending_profile
+                    self._pending_profile = None
+                    if profile is not None:
+                        self._pending_done_profile = None
+                        self._publish_profile(profile, stats)
+                    else:
+                        # Inkling emits DONE immediately before PROF, while
+                        # the mux engine emits PROF immediately before DONE.
+                        # Retain one adjacent DONE snapshot so both producers
+                        # publish the same /profile schema.
+                        self._pending_done_profile = dict(stats)
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -1801,33 +1883,169 @@ class Engine:
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
-                elif kind == "PROF" and len(fields) >= 10:
-                    # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
-                        "wall_s": float(fields[1]),
+                elif kind == "PROF" and len(fields) in {10, 17, 18}:
+                    # PROF has no request id. The mux engine emits it immediately
+                    # before DONE and Inkling emits it immediately after DONE.
+                    # Only the legacy ten-field frame and its seventeen- and
+                    # eighteen-field extensions are well-formed; any other field
+                    # count is a protocol error (caught by the known-kind guard
+                    # below). Every float field must be finite — nan/inf would
+                    # poison the /profile scorecards. See docs/serve_protocol.md
+                    # for the normative contract.
+                    wall_s = float(fields[1])
+                    expert_disk_s = float(fields[4])
+                    expert_wait_s = float(fields[5])
+                    expert_matmul_s = float(fields[6])
+                    attention_s = float(fields[7])
+                    lm_head_s = float(fields[8])
+                    if not all(math.isfinite(value) for value in (
+                            wall_s, expert_disk_s, expert_wait_s,
+                            expert_matmul_s, attention_s, lm_head_s)):
+                        raise RuntimeError(f"invalid engine PROF: {' '.join(fields)}")
+                    profile = {
+                        "wall_s": wall_s,
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
-                        "expert_disk_s": float(fields[4]),
-                        "expert_wait_s": float(fields[5]),
-                        "expert_matmul_s": float(fields[6]),
-                        "attention_s": float(fields[7]),
-                        "lm_head_s": float(fields[8]),
+                        "expert_disk_s": expert_disk_s,
+                        "expert_wait_s": expert_wait_s,
+                        "expert_matmul_s": expert_matmul_s,
+                        "attention_s": attention_s,
+                        "lm_head_s": lm_head_s,
                         "forwards": int(fields[9]),
-                    })
-                    self.profile_seq += 1
+                    }
+                    if len(fields) >= 17:
+                        forward_p50_ms = float(fields[10])
+                        forward_p99_ms = float(fields[11])
+                        physical_bytes = int(fields[12])
+                        ttft_ms = float(fields[15])
+                        prefault_seconds = float(fields[16])
+                        if not all(math.isfinite(value) for value in (
+                                forward_p50_ms, forward_p99_ms,
+                                ttft_ms, prefault_seconds)):
+                            raise RuntimeError(f"invalid engine PROF: {' '.join(fields)}")
+                        if len(fields) >= 18:
+                            # Only the literal token "1" attests to a real SSD
+                            # measurement; "0" and any other value mean the
+                            # accounting is unverified, so clients expose the
+                            # bytes as null. This is a validity rule, not a
+                            # protocol error — the frame is still well-formed.
+                            physical_valid = fields[17] == "1"
+                        else:
+                            # Legacy producers used zero both for a measured
+                            # zero and for unsupported accounting. A positive
+                            # legacy count is known-valid; zero is unknown.
+                            physical_valid = True if physical_bytes > 0 else None
+                        profile.update({
+                            "forward_p50_ms": None if forward_p50_ms < 0 else forward_p50_ms,
+                            "forward_p99_ms": None if forward_p99_ms < 0 else forward_p99_ms,
+                            "physical_ssd_bytes": physical_bytes if physical_valid else None,
+                            "physical_ssd_valid": physical_valid,
+                            "rammap_experts": int(fields[13]),
+                            "rammap_bytes": int(fields[14]),
+                            "ttft_ms": ttft_ms,
+                            "prefault_seconds": prefault_seconds,
+                        })
+                    stats = self._pending_done_profile
+                    self._pending_done_profile = None
+                    if stats is not None:
+                        self._pending_profile = None
+                        self._publish_profile(profile, stats)
+                    else:
+                        self._pending_profile = profile
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5])}
+                elif kind == "GPUS" and len(fields) >= 2:
+                    # Legacy advisory telemetry: triples are card-wide used/total
+                    # decimal GB and Colibri resident expert count.  Preserve it
+                    # for older engines while GPUDETAIL supplies byte-exact data.
+                    count = int(fields[1])
+                    if count < 0 or len(fields) != 2 + count * 3:
+                        raise RuntimeError(f"invalid engine GPUS: {' '.join(fields)}")
+                    devices = []
+                    for index in range(count):
+                        offset = 2 + index * 3
+                        used_gb = float(fields[offset])
+                        total_gb = float(fields[offset + 1])
+                        expert_count = int(fields[offset + 2])
+                        if (not math.isfinite(used_gb) or not math.isfinite(total_gb) or
+                                used_gb < 0 or total_gb < 0 or expert_count < 0):
+                            raise RuntimeError(f"invalid engine GPUS: {' '.join(fields)}")
+                        devices.append({
+                            "device": index,
+                            "identity": None,
+                            "used_gb": used_gb,
+                            "total_gb": total_gb,
+                            "expert_count": expert_count,
+                        })
+                    self.gpus = devices
+                    self.gpus_seq += 1
+                elif kind == "GPUDETAIL" and len(fields) >= 3:
+                    version = int(fields[1])
+                    count = int(fields[2])
+                    if count < 0:
+                        raise RuntimeError(f"invalid engine GPUDETAIL: {' '.join(fields)}")
+                    if version != 1:
+                        # A newer advisory schema is not protocol corruption.  Its
+                        # versioned body is deliberately opaque to this server.
+                        continue
+                    if len(fields) != 3 + count * 8:
+                        raise RuntimeError(f"invalid engine GPUDETAIL: {' '.join(fields)}")
+                    devices = []
+                    seen_devices = set()
+                    for index in range(count):
+                        offset = 3 + index * 8
+                        values = [int(value) for value in fields[offset + 2:offset + 8]]
+                        if any(value < 0 for value in values):
+                            raise RuntimeError(
+                                f"invalid engine GPUDETAIL: {' '.join(fields)}"
+                            )
+                        total_bytes, free_bytes, model_bytes, expert_bytes, \
+                            nonexpert_bytes, expert_count = values
+                        device = int(fields[offset])
+                        if (
+                            device < 0
+                            or device in seen_devices
+                            or free_bytes > total_bytes
+                            or model_bytes > total_bytes
+                            or expert_bytes + nonexpert_bytes != model_bytes
+                        ):
+                            raise RuntimeError(
+                                f"invalid engine GPUDETAIL: {' '.join(fields)}"
+                            )
+                        seen_devices.add(device)
+                        devices.append({
+                            "device": device,
+                            "identity": None if fields[offset + 1] == "-" else fields[offset + 1],
+                            "total_bytes": total_bytes,
+                            "free_bytes": free_bytes,
+                            "used_bytes": max(0, total_bytes - free_bytes),
+                            "model_bytes": model_bytes,
+                            "expert_bytes": expert_bytes,
+                            "nonexpert_bytes": nonexpert_bytes,
+                            "expert_count": expert_count,
+                        })
+                    self.gpus = devices
+                    self.gpus_seq += 1
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    self._pending_profile = None
+                    self._pending_done_profile = None
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
                         events.put(("error", _engine_error(fields[2:], message)))
-                else:
+                elif kind in {
+                    "DATA", "ACCEPT", "DONE", "HWINFO", "EMAP", "HITS",
+                    "PROF", "TIERS", "GPUS", "GPUDETAIL", "ERROR",
+                }:
+                    # Unknown advisory kinds are intentionally ignored, but a
+                    # malformed frame of a kind this server understands is fatal.
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
+                else:
+                    continue
         except Exception as error:
             if not self.closed:
                 self.dispatcher_error = error
@@ -1948,19 +2166,38 @@ class Engine:
                 return
             self.closed = True
         self._fail_pending(RuntimeError("colibri engine is shutting down"))
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+        self._terminate_process(self.process)
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 
 
 def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
+
+
+def _engine_health_error(engine):
+    """Return a stable public reason when the serving engine is unavailable."""
+    if engine is None:
+        return "engine-unavailable"
+    if getattr(engine, "dispatcher_error", None) is not None:
+        return "dispatcher-error"
+    if getattr(engine, "closed", False):
+        return "engine-closed"
+    sentinel = object()
+    process = getattr(engine, "process", sentinel)
+    if process is sentinel:
+        # Lightweight in-process engines used by embedders/tests do not have a
+        # subprocess. Their generate() implementation is the serving engine.
+        return None
+    if process is None or not callable(getattr(process, "poll", None)):
+        return "process-status-unavailable"
+    try:
+        returncode = process.poll()
+    except (OSError, subprocess.SubprocessError):
+        return "process-status-unavailable"
+    if returncode is not None:
+        return "process-exited"
+    return None
 
 
 def _positive_env(name, default):
@@ -2354,6 +2591,15 @@ class APIHandler(BaseHTTPRequestHandler):
             self._check_host()
             path = urlsplit(self.path).path
             if path == "/health":
+                engine = self.server.engine
+                engine_error = _engine_health_error(engine)
+                if engine_error is not None:
+                    self.send_json(
+                        503,
+                        {"status": "error", "reason": engine_error},
+                        request_id,
+                    )
+                    return
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
@@ -2361,10 +2607,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
-                    tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                    tiers = getattr(engine, "tiers", None) if engine else None
                     if tiers: payload["tiers"] = tiers
-                    hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                    hwinfo = getattr(engine, "hwinfo", None) if engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    payload["gpus"] = list(getattr(engine, "gpus", ()) or ()) if engine else []
+                    payload["gpus_seq"] = getattr(engine, "gpus_seq", 0) if engine else 0
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
