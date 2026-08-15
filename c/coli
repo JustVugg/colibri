@@ -442,14 +442,14 @@ def env_for_engine(a, arch):
         # CUDA_EXPERT_GB (VRAM expert budget), --gpu none -> COLI_DSV4_CUDA=0
         # (pure CPU). One flag set works across engines; no DS4-specific env
         # needed by the user.
-        if a.gpu is not None:
+        if getattr(a, "gpu", None) is not None:
             env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
             if a.gpu == "none":
                 env["COLI_DSV4_CUDA"] = "0"
                 env.pop("CUDA_EXPERT_GB", None)
             elif a.gpu != "auto":
                 env["COLI_GPUS"] = a.gpu
-        if a.vram and a.gpu != "none":
+        if getattr(a, "vram", None) and getattr(a, "gpu", None) != "none":
             env["CUDA_EXPERT_GB"] = str(a.vram)
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
