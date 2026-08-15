@@ -76,6 +76,11 @@ make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86 LTO=0
 
 - Runtime PATH: add `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64`
   (CUDA 13.x keeps the runtime DLLs in `bin\x64`, not `bin`).
+- Runtime alternative (no PATH change): copy ALL THREE runtime DLLs next to the
+  binary — `cublasLt64_13.dll` (the DLL's direct dependency), `cublas64_13.dll`
+  and `cudart64_13.dll`. A partial copy (e.g. cudart alone) still falls back to
+  CPU silently; only the complete set works. Verified 2026-08-15 (clean run,
+  PATH without CUDA).
 - Expected: `coli_dsv4_cuda.dll` with exactly the 5 engine-facing exports
   (`dsv4_cuda_init`, `dsv4_cuda_shutdown`, `dsv4_cuda_tensor_free`,
   `dsv4_cuda_upload_fp4`, `dsv4_cuda_expert_group`); `deepseek_v4.exe` runs
