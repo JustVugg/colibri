@@ -85,20 +85,106 @@ make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86 LTO=0
 
 ## Use
 
-```bash
-# interactive chat (native TUI, same look as GLM: tok/s · hit% · RSS · elapsed)
-python coli chat --model /path/to/DeepSeek-V4-Flash --gpu 0 --vram 8 --ram 50
+All commands go through the `c/coli` dispatcher (the same one GLM uses); the
+raw engine is one-shot or serve-protocol only. Run `python coli --help` from
+the repo `c/` dir for the full flag list.
 
-# OpenAI-compatible server (persistent, multi-turn)
-python coli serve --model /path/to/DeepSeek-V4-Flash --gpu 0 --vram 8 --ram 50 \
+### Baseline — CPU only (no GPU required)
+
+```bash
+python coli chat --model /path/to/DeepSeek-V4-Flash --gpu none --ram <N>
+```
+
+- `--gpu none` maps to `COLI_DSV4_CUDA=0`: pure CPU, works on any machine
+  (no CUDA build needed). The engine streams cold experts from disk.
+- `--ram N` is the RAM budget for the pinned expert cache (the single most
+  impactful knob). **Rule of thumb: `N ≈ total RAM − 12 GB`** (12 GB covers
+  the OS, the resident dense layers ~6.3 GiB and the head). Examples: 16 GB
+  RAM → `--ram 4` (slow, disk-bound, but it runs); 64 GB → `--ram 52`;
+  128 GB → `--ram 116`.
+
+### Baseline — CPU + CUDA (NVIDIA GPU with the CUDA build)
+
+```bash
+python coli chat --model /path/to/DeepSeek-V4-Flash --gpu 0 --vram <V> --ram <N>
+```
+
+```bash
+# OpenAI-compatible server (persistent, multi-turn, KV-resume)
+python coli serve --model /path/to/DeepSeek-V4-Flash --gpu 0 --vram <V> --ram <N> \
   --host 0.0.0.0 --allowed-host <LAN-IP> --cors-origin <ORIGIN>
 ```
 
-- `--gpu`/`--vram`/`--ram` map to `COLI_GPUS`/`CUDA_EXPERT_GB`/`RAM_GB`
-  (same flags as GLM). Keep `--vram` below your free VRAM.
+- `--gpu 0` / `--vram V` / `--ram N` map to `COLI_GPUS` / `CUDA_EXPERT_GB` /
+  `RAM_GB` (same flags as GLM). Without the CUDA DLL/link the engine silently
+  falls back to CPU.
+- `--vram V` is the VRAM budget for the expert tier. **Rule of thumb:
+  `V ≈ 50% of your GPU's VRAM`, rounded down** — the rest is needed for the KV
+  context, temporary allocations and the desktop. Never fill the card: the
+  speedup is not proportional to the budget (see measured results below).
 - Windows: identical commands (run `coli` from `c\`, CUDA `bin\x64` on PATH).
-- All other flags/env vars: see the colibri docs (`README`, `SETTINGS.md`,
-  `deepseek-v4.md` for the CPU engine, `windows.md` for the GLM GPU walkthrough).
+- First run on a fresh model dir creates `.coli_usage` (usage history used by
+  the pinning); each run appends to it, and `.coli_kv` persists the
+  conversation across restarts.
+
+## Performance tuning
+
+The knobs below are ordered by measured impact (see the reference-hardware
+results section). Defaults are sane; change one knob at a time and re-measure
+on your own hardware.
+
+| Flag / env | What it does | How to set it |
+|---|---|---|
+| `--ram N` / `RAM_GB` | RAM budget for pinned experts → hit rate → disk read volume | `N ≈ total RAM − 12 GB`. The #1 lever. |
+| `COLI_V4_PREWARM=1` | Pin the usage-history experts **before** READY instead of interleaved with the first prefill | Slightly faster decode + hit; the time-to-first-token is unchanged (the pin cost moves into the startup). Harmless to enable. |
+| `--vram V` / `CUDA_EXPERT_GB` | VRAM budget for the hottest experts | `V ≈ 50%` of VRAM, never above ~75% (KV/context margin). Above the safe point the gain is small and OOM risk grows. |
+| `--gpu none` / `COLI_DSV4_CUDA=0` | Disable the CUDA tier (pure CPU) | CPU-only machines. |
+| `--gpu N` / `COLI_GPUS` | Select the CUDA device(s) | `0`, or `0,1` for multi-GPU. |
+| `--ctx N` / `CTX` | Context window (default 4096) | Raise only if you need long context; the KV lives in RAM. |
+| `OMP_NUM_THREADS` | OpenMP threads (default = physical cores) | **Leave it**: extra threads (SMT oversubscription) do not help this engine. |
+| `KVSAVE` | `.coli_kv` cross-session persistence (default on) | `KVSAVE=0` disables save+resume. |
+| `COLI_V4_AUTOPIN` / `COLI_V4_SAVE_USAGE` | Usage-history learning + saving (default on) | Leave it: the pinning learns your usage pattern run over run. |
+| `COLI_V4_DIRECT` | Expert reads O_DIRECT (default: autodetected) | **Do not set `0`**: buffered reads measured *slower* (page-cache pressure with a large pin set). |
+| `V4_MTP` / `V4_DRAFT` / `V4_NGRAM` / `COLI_V4_MARKOV_*` | Speculative decoding (default off) | Experimental; measured net-negative on this engine. Not recommended. |
+
+## Reference measurements (2026-08, dev hardware)
+
+Benchmarked with the raw serve protocol (same prompt, 167 tokens, 200
+generated, greedy, `OMP_NUM_THREADS=12`, `KVSAVE=0`; each row = mean of 2-4
+runs, σ ≈ 0.01 tok/s). These are **reference numbers for one machine**, not
+guarantees — they show the *direction and rough magnitude* of each knob.
+
+Hardware: Ryzen 9 5900X (12c/24t), 64 GB RAM, RTX 3080 10.7 GB (sm_86),
+NVMe Kingston KC3000 (~2-3 GB/s random read), Windows 11 native build.
+
+| Config | decode tok/s | TTFT (167-tok prompt) | hit | disk read volume |
+|---|---|---|---|---|
+| `--ram 40 --vram 4` (defaults) | 0.91 | 147 s | 77% | 272 GB / 200 tok |
+| `--ram 52 --vram 4` | 0.97 (+7%) | 139 s | 83% | 208 GB (−23%) |
+| `--ram 52 --vram 4` + `COLI_V4_PREWARM=1` | **1.01 (+11%)** | 134 s* | 84% | 208 GB |
+| `--vram 8.6` (on top of ram 40) | 0.96 | 136 s | 77% | 286 GB |
+| buffered (`COLI_V4_DIRECT=0`) | 0.82 (−10%) | 156 s | 77% | n/a (page cache) |
+| CPU-only (`--gpu none`) | 0.87 | 149 s | 78% | 267 GB |
+| GLM-5.2 788B IQ3 (same harness) | 0.41 | 234 s | 47% | ~0 (resident RAM) |
+
+\* time-to-first-token unchanged: pre-READY grows by ~5 s, TTFT shrinks by ~5 s.
+
+Takeaways:
+
+- **RAM is the lever**: 40→52 GB = +7% decode, −23% disk volume. The engine is
+  disk-bound (≈1 GB of expert reads per generated token); every GB of pinned
+  RAM buys hit rate.
+- **VRAM is not the bottleneck**: 4→8.6 GB VRAM budget = only +6% (and 97%
+  VRAM usage, 2× upload/drop churn, OOM risk). The expert matmul is not the
+  cost; the disk transfer is.
+- **GPU vs CPU-only**: +4-5% for the CUDA tier. The tier helps, but the wall
+  is the disk.
+- **Buffered reads are slower** on this hardware: with 40-52 GB pinned, the
+  page cache has ~10 GB left for a 92 GB prefill → thrash + extra copy.
+  O_DIRECT stays the default for a reason.
+- The path to 2-3 tok/s on this class of hardware is reducing the *disk read
+  volume* (mmap-style page-cache reuse of expert weights, or smarter
+  prefetch), not more VRAM or more threads.
 
 ## Validation
 
