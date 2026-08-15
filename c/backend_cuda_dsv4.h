@@ -1,5 +1,10 @@
 #ifndef COLIBRI_BACKEND_CUDA_DSV4_H
 #define COLIBRI_BACKEND_CUDA_DSV4_H
+/*
+ * Ported from ZacharyZcR/colibri (branch feat/deepseek-v4-long-context,
+ * PRs #772/#773), adapted from the all-resident expert layout to the
+ * streaming/offload tier used by this engine. Apache-2.0, same as colibri.
+ */
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {

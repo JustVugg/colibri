@@ -1,5 +1,10 @@
 #ifndef DSV4_MHC_H
 #define DSV4_MHC_H
+/*
+ * Ported from ZacharyZcR/colibri (branch feat/deepseek-v4-long-context,
+ * PRs #772/#773), adapted from the all-resident expert layout to the
+ * streaming/offload tier used by this engine. Apache-2.0, same as colibri.
+ */
 #include <math.h>
 #include <stdint.h>
 #include <string.h>

@@ -1,4 +1,9 @@
 #include "backend_cuda_dsv4.h"
+/*
+ * Ported from ZacharyZcR/colibri (branch feat/deepseek-v4-long-context,
+ * PRs #772/#773), adapted from the all-resident expert layout to the
+ * streaming/offload tier used by this engine. Apache-2.0, same as colibri.
+ */
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
