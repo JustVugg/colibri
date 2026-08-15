@@ -4,7 +4,7 @@ Usage: python download_fp8.py
        python download_fp8.py --parallel 4
        python download_fp8.py --source hf  (force HuggingFace)
 """
-import os, sys, time, threading, argparse, subprocess
+import os, time, threading, argparse, subprocess
 
 REPO_MS = "ZhipuAI/GLM-5.2-FP8"        # ModelScope
 REPO_HF = "zai-org/GLM-5.2-FP8"        # HuggingFace
@@ -78,6 +78,10 @@ def download_file_curl(fn, base_url, expected_size):
         return True
     return False
 
+def shard_complete(path, expected_size):
+    return (os.path.exists(path)
+            and (expected_size <= 0 or os.path.getsize(path) == expected_size))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--parallel", type=int, default=3)
@@ -100,12 +104,20 @@ def main():
         except Exception as e:
             print(f"{C.yel}failed ({e}){C.r}")
             if args.source == "ms":
-                print("ModelScope failed and --source ms was set. Exiting."); return
+                print("ModelScope failed and --source ms was set. Exiting."); return 1
+
+    if not shards and args.source == "ms":
+        print(f"{C.yel}No checkpoint shards found on ModelScope. Exiting.{C.r}")
+        return 1
 
     if not shards:
+        use_ms = False
         print(f"{C.dim}Using HuggingFace...{C.r}", end=" ", flush=True)
         shards, sizes = get_shard_list_hf()
         print(f"{C.grn}✓{C.r} {len(shards)} shards found")
+    if not shards:
+        print(f"{C.yel}No checkpoint shards found. Exiting.{C.r}")
+        return 1
 
     total = len(shards)
     total_bytes = sum(sizes.values())
@@ -121,13 +133,15 @@ def main():
                 if use_ms: download_file_ms(fn)
                 else: download_file_hf(fn)
             except Exception: pass
+    missing_meta = [fn for fn in meta_files
+                    if not os.path.isfile(os.path.join(DEST, fn))]
 
     # Build work queue
     todo = []
     done_set = set()
     for fn in shards:
         outpath = os.path.join(DEST, fn)
-        if os.path.exists(outpath) and os.path.getsize(outpath) == sizes.get(fn, 0):
+        if shard_complete(outpath, sizes.get(fn, 0)):
             done_set.add(fn)
         else:
             todo.append(fn)
@@ -142,7 +156,10 @@ def main():
     print()
 
     if not todo:
-        print(f"{C.grn}✓ All shards already downloaded!{C.r}\n"); return
+        if missing_meta:
+            print(f"{C.yel}Missing metadata: {', '.join(missing_meta)}{C.r}")
+            return 1
+        print(f"{C.grn}✓ All shards already downloaded!{C.r}\n"); return 0
 
     lock = threading.Lock()
     completed = list(done_set)
@@ -215,17 +232,21 @@ def main():
     for t in threads: t.join()
 
     print()
-    final = sum(1 for fn in shards
-                if os.path.exists(os.path.join(DEST, fn))
-                and os.path.getsize(os.path.join(DEST, fn)) == sizes.get(fn, 0))
-    if final == total:
+    final = sum(1 for fn in shards if shard_complete(
+        os.path.join(DEST, fn), sizes.get(fn, 0)))
+    if final == total and not missing_meta:
         print(f"{C.grn}{'='*50}")
         print(f"  ✓ All {total} shards downloaded!{C.r}\n")
+        return 0
     else:
         print(f"{C.yel}  {final}/{total} complete, {total-final} remaining{C.r}")
-        print(f"  Re-run to resume.\n")
+        if missing_meta:
+            print(f"  Missing metadata: {', '.join(missing_meta)}")
+        print("  Re-run to resume.\n")
+        return 1
 
 if __name__ == "__main__":
-    try: main()
+    try: raise SystemExit(main())
     except KeyboardInterrupt:
         print(f"\n\n{C.yel}Interrupted. Re-run to resume — no data lost.{C.r}\n")
+        raise SystemExit(130)

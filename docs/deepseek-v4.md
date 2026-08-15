@@ -71,6 +71,10 @@ python ./coli serve --model /path/to/DeepSeek-V4-Flash --ram 32
 python ./coli web --model /path/to/DeepSeek-V4-Flash --ram 32
 ```
 
+Generation length: `--ngen` is a ceiling, not a target — answers end at EOS.
+If the ceiling exceeds what the context window can hold, the engine clamps it
+and says so on stderr; raise `CTX` for genuinely longer answers.
+
 V4 chat uses native model markers. Native serving currently supports greedy
 generation and one active KV slot; tools and grammar are rejected. Requests
 re-prefill their context, while the process, weights, dense tensors, head, and

@@ -33,6 +33,10 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #ifdef COLI_CUDA
@@ -798,6 +802,21 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * sidecar dropped in the snapshot dir (st_init indexes every *.safetensors).
      * Absent tensors = text-only engine, exactly as before. */
     if (st_has(&m->S, "model.audio.encoder.weight")) {
+        /* SEC (GHSA-w696): mel_bins/mel_vocab come straight from config.json with
+         * no bounds. audio_embed_row indexes the table at (b*mel_vocab+v)*D with
+         * b<mel_bins, v<mel_vocab — so the table must have exactly
+         * mel_bins*mel_vocab rows or that index runs off the heap (bidirectional
+         * OOB read, config-controlled). Reconcile the real element count against
+         * the geometry before using it. */
+        st_tensor *aet = st_find(&m->S, "model.audio.encoder.weight");
+        if (c->mel_bins < 1 || c->mel_vocab < 1 || D < 1 ||
+            (int64_t)c->mel_bins * c->mel_vocab > INT64_MAX / D ||
+            !aet || aet->numel != (int64_t)c->mel_bins * c->mel_vocab * D) {
+            fprintf(stderr, "[audio] rejected: encoder table has %lld elements, "
+                    "config geometry is %d bins x %d levels x D=%d\n",
+                    aet ? (long long)aet->numel : -1, c->mel_bins, c->mel_vocab, D);
+            exit(1);
+        }
         m->audio_enc  = load_w(m, "model.audio.encoder.weight", 0);
         m->audio_norm = load_t(m, "model.audio.final_norm.weight");
         fprintf(stderr, "[audio] DMel encoder loaded (%d bins x %d levels -> D=%d)\n",
@@ -2058,6 +2077,7 @@ int main(int argc, char **argv) {
 #endif
     }
 #endif  /* !COLI_CUDA && !__APPLE__ */
+    coli_omp_tune_threads("inkling");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;

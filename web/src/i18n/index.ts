@@ -4,12 +4,14 @@ import en from "./en"
 import zhCN from "./zh-CN"
 import zhTW from "./zh-TW"
 import it from "./it"
+import de from "./de"
 
 const LOCALES = [
   { code: "en", label: "English" },
   { code: "zh-CN", label: "简体中文" },
   { code: "zh-TW", label: "繁體中文" },
   { code: "it", label: "Italiano" },
+  { code: "de", label: "Deutsch" },
 ] as const
 
 const DICTS: Record<string, Record<string, string>> = {
@@ -17,6 +19,7 @@ const DICTS: Record<string, Record<string, string>> = {
   "zh-CN": zhCN,
   "zh-TW": zhTW,
   "it": it,
+  "de": de,
 }
 
 const STORAGE_KEY = "colibri-locale"

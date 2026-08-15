@@ -345,12 +345,13 @@ static int i3_avx512_selftest(void){
 /* Dequant-on-use with PER-GROUP scale. Exact f32 path only (no IDOT in v1: int8
  * activations don't compose with per-group accumulation without a kernel
  * restructure — follow-up). NEON: low plane = matmul_i2's unpack, high plane
- * expanded via vtst on bit masks. AVX-512(F+BW): same unpack at 128-bit, high
- * plane loaded as a __mmask64 (bit k = value k) driving a masked +4; one full
- * group per iteration (dot_i3g64_avx512; I3_AVX512=0 falls back to scalar).
- * Other x86 stays scalar (follow-up). Both vector arms reorder fma WITHIN a
- * group only; the per-group partial is scaled by scale[g] and added to the
- * row accumulator in scalar order, exactly like the scalar loop. */
+ * expanded via vtst on bit masks. AVX2: same unpack, high plane via bit-test
+ * against per-lane masks. AVX-512(F+BW): same unpack at 128-bit, high plane
+ * loaded as a __mmask64 (bit k = value k) driving a masked +4; one full group
+ * per iteration (dot_i3g64_avx512; I3_AVX512=0 falls back to scalar). All
+ * vector arms reorder fma WITHIN a group only; the per-group partial is
+ * scaled by scale[g] and added to the row accumulator in scalar order,
+ * exactly like the scalar loop. */
 static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *scale, int S, int I, int O){
     int64_t ng=i3_groups(I), rb=i3_rowbytes(I);
     #pragma omp parallel for schedule(static)
@@ -389,6 +390,30 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
                         ac1=vfmaq_f32(ac1, vld1q_f32(xs+base+k+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1))));
                     }
                     a=vaddvq_f32(vaddq_f32(ac0,ac1));
+                }
+#elif defined(__AVX2__)
+                if(n==I3_GROUP){
+                    const __m128i m2=_mm_set1_epi8(0x03);
+                    const __m128i bsel=_mm_set_epi8(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0);
+                    const __m128i bitm=_mm_set_epi8((char)128,64,32,16,8,4,2,1,(char)128,64,32,16,8,4,2,1);
+                    const __m128i four8=_mm_set1_epi8(4);
+                    const __m256i b4=_mm256_set1_epi32(4);
+                    __m256 ac0=_mm256_setzero_ps(), ac1=_mm256_setzero_ps();
+                    for(;k+16<=I3_GROUP;k+=16){
+                        __m128i by=_mm_cvtsi32_si128(*(const int*)(lo+(k>>2)));  /* 4 bytes = 16 low-plane values */
+                        __m128i p0=_mm_and_si128(by,m2), p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+                        __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+                        __m128i l01=_mm_unpacklo_epi8(p0,p1), h23=_mm_unpacklo_epi8(p2,p3);
+                        __m128i lov=_mm_unpacklo_epi16(l01,h23);                  /* 16 vals in order */
+                        __m128i hv=_mm_shuffle_epi8(_mm_cvtsi32_si128(hi[k>>3]|(hi[(k>>3)+1]<<8)),bsel);
+                        __m128i hb=_mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(hv,bitm),bitm),four8); /* 4 where high bit set */
+                        __m128i u=_mm_add_epi8(lov,hb);                           /* [0,7] stored v+4 */
+                        __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(u),b4));
+                        __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(u,8)),b4));
+                        ac0=_mm256_fmadd_ps(_mm256_loadu_ps(xs+base+k),  w0,ac0);
+                        ac1=_mm256_fmadd_ps(_mm256_loadu_ps(xs+base+k+8),w1,ac1);
+                    }
+                    a=hsum256(_mm256_add_ps(ac0,ac1));
                 }
 #endif
                 for(;k<n;k++){

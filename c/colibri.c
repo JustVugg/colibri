@@ -360,11 +360,26 @@ typedef struct {
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used;
+                 unsigned in_flight; /* async GPU readers borrowing this slot */
                  /* pin-arena backing (#419): when set, slab/fslab are interior
                   * slices of a per-layer arena and must never be free()d —
                   * expert_host_release detaches them, expert_host_ensure
                   * re-attaches. NULL for every individually-allocated slot. */
                  uint8_t *aslab; float *afslab; } ESlot;
+
+static void eslot_acquire(ESlot *s){ __atomic_add_fetch(&s->in_flight,1,__ATOMIC_ACQ_REL); }
+static void eslot_release(ESlot *s){
+    unsigned old=__atomic_fetch_sub(&s->in_flight,1,__ATOMIC_ACQ_REL);
+    if(!old){ fprintf(stderr,"[CUDA] ESlot reference underflow\n"); abort(); }
+}
+static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
+static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
+static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
+static int eslot_lru_victim(ESlot *slots,int n){
+    int lru=-1;
+    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||slots[i].used<slots[lru].used)) lru=i;
+    return lru;
+}
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -1338,6 +1353,9 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
+    if(c->topk>c->n_experts){
+        fprintf(stderr,"config: num_experts_per_tok=%d exceeds n_routed_experts=%d\n",
+                c->topk,c->n_experts); exit(1); }
     #undef CKR
     free(ar);
 }
@@ -3055,6 +3073,8 @@ static int g_pres_home=-1;                /* home device, -1 = path off        *
 static const float *g_pres_xsrc;          /* nrm_d on the home device          */
 static float *g_pres_slots;               /* [ndev][D] partial slots on home   */
 static int g_pres_used[COLI_CUDA_MAX_DEVICES], g_pres_nused;
+static ESlot *g_pres_refs[COLI_CUDA_MAX_DEVICES*64];
+static int g_pres_nrefs;
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
 static int cmp_fdesc(const void *a,const void *b){
@@ -4500,9 +4520,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     }
                     double tg0=now_s();
                     int all=1, issued[COLI_CUDA_MAX_DEVICES]={0};
-                    for(int di=0;di<g_cuda_ndev && all;di++) if(pd_nc[di])
+                    for(int di=0;di<g_cuda_ndev && all;di++) if(pd_nc[di]){
+                        ESlot *refs[64]; for(int q=0;q<pd_nc[di];q++) refs[q]=pg_e[pd_which[di][q]];
+                        eslots_acquire(refs,pd_nc[di]);
                         all=issued[di]=coli_cuda_expert_group_issue(pd_g[di],pd_u[di],pd_d[di],
                                 pd_rows[di],pd_nc[di],group_x+(int64_t)pd_off[di]*D);
+                        if(!issued[di]) eslots_release(refs,pd_nc[di]);
+                    }
                     g_ovl_issue+=now_s()-tg0;
                     if(all){
                         static int announced2;
@@ -4520,8 +4544,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                             m->gpu_expert_calls++;
                         }
                     } else {
-                        for(int di=0;di<g_cuda_ndev;di++)
-                            if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
+                        for(int di=0;di<g_cuda_ndev;di++) if(issued[di]){
+                            coli_cuda_expert_group_take(g_cuda_devices[di]);
+                            for(int q=0;q<pd_nc[di];q++) eslot_release(pg_e[pd_which[di][q]]);
+                        }
                     }
                 }
             }
@@ -4790,6 +4816,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             g_ovl_cpu+=tg1-g_ovl_mark;               /* CPU-row window between issue and take */
             for(int di=0;di<g_cuda_ndev;di++) if(dev_nc0[di]){
                 const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
+                for(int q=0;q<dev_nc0[di];q++) eslot_release(eg_e[dev_which0[di][q]]);
                 int cur=0;
                 for(int q=0;q<dev_nc0[di];q++){
                     int gi=dev_which0[di][q], nr=eg_n[gi];
@@ -4845,22 +4872,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_group_async<0) g_group_async=getenv("COLI_GROUP_ASYNC")?atoi(getenv("COLI_GROUP_ASYNC")):0;
         if(g_group_async && S<=4 && g_cuda_ndev>0){
             int issued[COLI_CUDA_MAX_DEVICES]={0}, all=1;
-            for(int di=0;di<g_cuda_ndev && all;di++) if(dev_nc[di])
+            for(int di=0;di<g_cuda_ndev && all;di++) if(dev_nc[di]){
+                ESlot *refs[64]; for(int q=0;q<dev_nc[di];q++) refs[q]=group_e[dev_which[di][q]];
+                eslots_acquire(refs,dev_nc[di]);
                 all=issued[di]=coli_cuda_expert_group_issue(dev_g[di],dev_u[di],dev_d[di],
                         dev_rows[di],dev_nc[di],group_x+(int64_t)dev_off[di]*D);
+                if(!issued[di]) eslots_release(refs,dev_nc[di]);
+            }
             if(all){
                 static int announced;
                 if(!announced){ announced=1; fprintf(stderr,"[CUDA] expert group async path active\n"); }
                 async_done=1;
                 for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
                     const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
+                    for(int q=0;q<dev_nc[di];q++) eslot_release(group_e[dev_which[di][q]]);
                     if(hy){ dev_ok[di]=1;
                         memcpy(group_y+(int64_t)dev_off[di]*D,hy,(size_t)dev_total[di]*D*sizeof(float)); }
                     else dev_ok[di]=0;      /* per-device sync failure: CPU fallback below */
                 }
                 if(g_prof) m->t_egpu+=now_s()-tg;
-            } else for(int di=0;di<g_cuda_ndev;di++)
-                if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
+            } else for(int di=0;di<g_cuda_ndev;di++) if(issued[di]){
+                coli_cuda_expert_group_take(g_cuda_devices[di]);
+                for(int q=0;q<dev_nc[di];q++) eslot_release(group_e[dev_which[di][q]]);
+            }
         }
         if(!async_done){
             /* resident path (#431 PR-C0): issue the group on its device with the input
@@ -4872,11 +4906,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
                     float wbuf[64];
                     for(int q=0;q<dev_nc[di];q++) wbuf[q]=group_weight[(int64_t)dev_which[di][q]*S];
+                    ESlot *refs[64]; for(int q=0;q<dev_nc[di];q++) refs[q]=group_e[dev_which[di][q]];
+                    eslots_acquire(refs,dev_nc[di]);
                     if(coli_cuda_expert_group_resident_issue(dev_g[di],dev_u[di],dev_d[di],wbuf,dev_nc[di],
                             g_pres_home,g_pres_xsrc,g_pres_slots+(int64_t)g_pres_nused*D)){
                         g_pres_used[g_pres_nused++]=g_cuda_devices[di];
+                        for(int q=0;q<dev_nc[di];q++) g_pres_refs[g_pres_nrefs++]=refs[q];
                         dev_ok[di]=2;                       /* handled on device: skip host collection */
-                    }
+                    } else eslots_release(refs,dev_nc[di]);
                 }
             }
         }
@@ -4930,7 +4967,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
+              else { int lru=eslot_lru_victim(Sl,*nn);
+                     if(lru<0){ static int warned;
+                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
+                         continue; }
+                     dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
@@ -5119,6 +5160,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     else {
         slot=-1;
         for(int z=0;z<nn;z++){
+            if(eslot_busy(&Sl[z])) continue;             /* borrowed by an async GPU read */
             if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
             if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
             if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
@@ -5154,7 +5196,14 @@ static void pilot_realload(Model *m, int layer, int eid){
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        dst->eid=-1;                                    /* load fallito: libera la prenotazione (slot resta in ecn ma nascosto, riusabile) */
+        /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
+         * la prenotazione lo aveva marcato used=(uint64_t)-1 ("in carica", mai vittima),
+         * e lasciarlo cosi' lo rendeva invisibile agli hit ma ULTIMO in ogni scan LRU —
+         * mai evictable: ogni speculazione fallita (disco lento, errore I/O transitorio)
+         * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
+         * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
+        dst->eid=-1;
+        dst->used=0;
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
@@ -5191,6 +5240,7 @@ static void pilot_uring_batch(Model *m){
         else{
             slot=-1;
             for(int z=0;z<nn;z++){
+                if(eslot_busy(&Sl[z])) continue;      /* borrowed by an async GPU read */
                 if(Sl[z].eid==-1){ slot=z; break; }
                 if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
                 if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
@@ -5565,7 +5615,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(g_cuda_resid && S==1){
         g_pres_slots=coli_cuda_pipe_scratch(dev,25,(size_t)g_cuda_ndev*D*sizeof(float));
         res_acc     =coli_cuda_pipe_scratch(dev,26,(size_t)D*sizeof(float));
-        if(g_pres_slots && res_acc){ g_pres_home=dev; g_pres_xsrc=nrm_d; g_pres_nused=0; }
+        if(g_pres_slots && res_acc){ g_pres_home=dev; g_pres_xsrc=nrm_d; g_pres_nused=0; g_pres_nrefs=0; }
         else { g_pres_slots=NULL; res_acc=NULL; }
     }
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
@@ -5577,8 +5627,9 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
              * stream behind every issue event and reduces in issue order. A
              * failure here would silently drop routed experts — that is a wrong
              * answer, not a slow one, so it is fatal by design. */
-            if(!coli_cuda_expert_group_resident_take(dev,g_pres_used,nused,g_pres_slots,res_acc,D)||
-               !coli_cuda_pipe_add(dev,x_dev,res_acc,(size_t)D)){
+            int take_ok=coli_cuda_expert_group_resident_take(dev,g_pres_used,nused,g_pres_slots,res_acc,D);
+            eslots_release(g_pres_refs,g_pres_nrefs); g_pres_nrefs=0;
+            if(!take_ok || !coli_cuda_pipe_add(dev,x_dev,res_acc,(size_t)D)){
                 fprintf(stderr,"[CUDA] resident expert take failed — refusing to drop routed experts\n");
                 exit(1);
             }
@@ -6987,7 +7038,7 @@ static void rss_guard(Model *m){
             int nn=m->ecn[l], lru=-1;
             for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
                 ESlot *cand=&m->ecache[l][z];
-                if(cand->eid<0 || !cand->slab) continue;
+                if(cand->eid<0 || !cand->slab || eslot_busy(cand)) continue;
                 if(lru<0 || cand->used<m->ecache[l][lru].used) lru=z;
             }
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
@@ -8128,6 +8179,33 @@ static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
 
+/* A pin budget buys a popularity-ranked PREFIX, but mixed-width containers do
+ * not have one honest bytes-per-expert divisor.  GLM-5.2's routed rows are int4
+ * while its MTP row is int8: pricing every candidate at the widest row made a
+ * 51.1 GB budget buy the same 1,352 experts in both g64 and E8 containers even
+ * though their routed experts cost only 21.2 and 14.6 MB (#885).
+ *
+ * Keep the ranking semantics -- never skip a hot wide candidate to admit a
+ * colder narrow one -- and stop immediately before the first candidate that
+ * would cross the byte ceiling.  `from` lets CUDA_RELEASE_HOST exclude the
+ * transient VRAM prefix before spending the disjoint RAM budget. */
+static double pin_range_bytes(Model *m, const PinRec *r, int from, int to){
+    double used=0.0;
+    for(int a=from;a<to;a++) used+=(double)expert_bytes_row(m,r[a].l,m->ebits);
+    return used;
+}
+static int pin_count_for_budget(Model *m, const PinRec *r, int from, int n,
+                                double budget_b){
+    double used=0.0; int count=0;
+    if(budget_b<=0.0 || from>=n) return 0;
+    for(int a=from;a<n;a++){
+        double need=(double)expert_bytes_row(m,r[a].l,m->ebits);
+        if(need<=0.0 || used+need>budget_b) break;
+        used+=need; count++;
+    }
+    return count;
+}
+
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
  * per slab. Per-slab policies cost ~2 unmergeable VMAs each; a PIN_GB=all load
@@ -8214,20 +8292,21 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     }
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
-    int64_t eb=expert_bytes_probe(m,m->ebits);
     /* PIN_GB=all (#80): NON "tutti" alla lettera. Pinnare l'intero set ignora il
      * budget --ram e fa OOM-kill del kernel a meta' generazione (#229: host 92 GB
      * ucciso con --ram 78, anon-rss 89 GB). Clampa a quanti expert entrano nel
      * budget RAM, come AUTOPIN; il pin aggiorna resident_bytes, quindi cap_for_ram
      * dopo restringe la LRU di conseguenza (nessun doppio conteggio). */
-    int npin;
+    double pin_budget_b;
     if(gb<0){
         double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
         int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
         double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
-        npin=avail>0?(int)(avail/eb):0;
-    } else npin=(int)(gb*1e9/eb);
+        pin_budget_b=avail>0?avail:0.0;
+    } else pin_budget_b=gb*1e9;
+    int cpu_from=0;
 #ifdef COLI_CUDA
+    int64_t eb=expert_bytes_probe(m,m->ebits);  /* shared ws / CUDA staging ceiling */
     /* The VRAM budget must be known BEFORE npin is finalized: with
      * CUDA_RELEASE_HOST the VRAM-ranked prefix's host slabs are freed right
      * after upload, so those slots must NOT consume the RAM pin budget.
@@ -8262,9 +8341,11 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
             prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
         }
 #endif
-        npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
+        if(prefix_est>n) prefix_est=n;
+        cpu_from=prefix_est;                    /* prefix RAM is returned after upload */
     }
 #endif
+    int npin=cpu_from+pin_count_for_budget(m,r,cpu_from,n,pin_budget_b);
     if(npin>n) npin=n;
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
@@ -8273,7 +8354,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     int *slot_of=malloc((size_t)npin*sizeof(int)), *next=calloc(c->n_layers+1,sizeof(int));
     for(int a=0;a<npin;a++) slot_of[a]=next[r[a].l]++;
     for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
-    double t0=now_s();
+    double t0=now_s(), pin_host_released=0.0;
 #ifdef COLI_CUDA
     if(prefix_est>0){ gpu_prefix=prefix_est; if(gpu_prefix>npin) gpu_prefix=npin; }
 #else
@@ -8322,7 +8403,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=base;a<hi;a++)
         expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-    m->resident_bytes+=(int64_t)(hi-base)*eb;
+    m->resident_bytes+=(int64_t)pin_range_bytes(m,r,base,hi);
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
         for(int a=base;a<hi && m->gpu_expert_bytes<budget;a++){
@@ -8366,7 +8447,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
                         placed_w[best]+=(double)r[a].c;
-                        if(g_cuda_release_host) expert_host_release(m,s);
+                        if(g_cuda_release_host){ expert_host_release(m,s); pin_host_released+=(double)need; }
                         placed=1;
                     } else {
                         qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
@@ -8416,10 +8497,12 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
         #pragma omp parallel for schedule(dynamic,1)
         for(int a=gpu_prefix;a<npin;a++)
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-        m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
+        m->resident_bytes+=(int64_t)pin_range_bytes(m,r,gpu_prefix,npin);
     }
+    double warm_b=pin_range_bytes(m,r,0,npin)-pin_host_released;
+    if(warm_b<0.0) warm_b=0.0;
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
-        m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
+        m->gpu_expert_count,npin-m->gpu_expert_count,warm_b/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l); free(slot_of); free(next);
 }
@@ -9069,9 +9152,21 @@ int main(int argc, char **argv){
      * misurato (#707). */
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
        !coli_env_on("COLI_CUDA") && !coli_env_on("COLI_METAL")){
+        /* #707: the spin-wait knobs are measured HARMFUL on macOS / Apple
+         * Silicon with LLVM libomp. Reporter (M1 Max, 32 GB, GLM-5.2 int4):
+         * OMP_WAIT_POLICY=active alone +122% decode, KMP_BLOCKTIME=200 alone
+         * +115%. Reproduced on an M3 16 GB with the OLMoE engine (same libomp
+         * behaviour, smaller scale): wait-only 2.23 tok/s vs ~3.4 baseline
+         * (-34%), block-only 2.54 (-25%). The Linux/FreeBSD re-exec below
+         * never runs on Darwin (libomp's constructor already read the
+         * environment), so these setenvs are inert today -- but keep them OFF
+         * explicitly so a future Darwin exec path cannot apply a measured
+         * regression. The OMP_PROC_BIND/OMP_DYNAMIC pair is noise-level and
+         * stays for all platforms. */
+#ifndef __APPLE__
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
-        /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
+        /* LLVM libomp (clang builds: FreeBSD cc, some Linux setups) does not
          * read GOMP_*: with OMP_WAIT_POLICY=active it sets KMP_BLOCKTIME=infinite,
          * so the idle team SPINS FOREVER once generation ends — a serve-mode engine
          * parked on stdin burns ~100% x nthreads (#341, measured 3000% on FreeBSD).
@@ -9079,6 +9174,10 @@ int main(int argc, char **argv){
          * and lets it sleep at the prompt. libgomp ignores KMP_*; overwrite=0 keeps
          * the user's own setting authoritative. */
         setenv("KMP_BLOCKTIME","200",0);
+#else
+        fprintf(stderr,"[OMP] hot-thread tuning skipped on macOS (#707): spin-wait knobs "
+                       "measured slower on Apple Silicon (COLI_NO_OMP_TUNE=1 to skip)\n");
+#endif
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);

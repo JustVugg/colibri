@@ -520,6 +520,24 @@ docker run --rm -p 5000:5000 -v /nvme/glm52_i4:/model colibri \
     serve --host 0.0.0.0 --model-id glm-5.2 --ram 24
 ```
 
+**Reaching it from another machine (or `coli web`).** Binding `--host 0.0.0.0`
+is not enough: the server has a DNS-rebinding guard that only trusts the Host
+header for loopback and its own bind address, so a browser pointed at
+`http://<server-ip>:<port>` gets `403 Host header not allowed`. Behind Docker's
+port mapping the container cannot know the address the browser will send, so
+tell it what to accept — the exact name/IP, or `*` when the bind is already
+deliberately public:
+
+```bash
+docker run --rm -p 36873:8000 -e COLI_ALLOW_INSECURE_BIND=1 \
+    -v /nvme/glm52_i4:/model colibri \
+    web --host 0.0.0.0 --allowed-host '*'
+```
+
+`--allowed-host '*'` disables the guard (it warns at startup); prefer an
+explicit `--allowed-host my-server.lan` when you know the name. This is a
+LAN-exposure decision, hence opt-in alongside `COLI_ALLOW_INSECURE_BIND=1`.
+
 The entrypoint is `coli`, so the first argument is the subcommand (`info`,
 `chat`, `serve`, `run`, `plan`, `doctor`) — no `./coli` prefix. The container
 runs as UID 1000, so the model directory must be readable by that user

@@ -252,9 +252,9 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
  *    experts enter from freshly-read RAM slots (K3_VK_UP per step) until the
  *    VRAM budget (K3_VK_GB) is reached; resident experts then skip BOTH the
  *    disk read and the CPU matmuls at decode (C==1). */
-static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
 static VkExp *g_vkexp; static int64_t g_vkexp_n;
 static int g_vk_upcap=8, g_vk_up_left=0, g_vk_full=0;
@@ -1786,7 +1786,11 @@ static int serve_read_req(ServeReq *q, const char *active){
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5||
-       plen<0||plen>(1<<24)||max_tok<1){
+       plen<0||plen>(1<<24)||max_tok<1||max_tok>(1<<20)){
+        /* SEC (GHSA-gf38): max_tok needs an upper bound too. INT_MAX wrapped the
+         * signed np+max_tok context check below and made the kv_alloc size
+         * negative, so kv_alloc's early-return kept the previous request's small
+         * KV buffers and the generation loop wrote past them (heap OOB write). */
         printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
     }
     (void)slot;
@@ -1830,7 +1834,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         np+=tok_encode(T,q->payload,q->plen,ids+np,cap-np);
     }
     int max_ctx=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):8192;
-    if(np<1||np+q->max_tok>max_ctx){
+    if(np<1||(int64_t)np+q->max_tok>max_ctx){ /* SEC (GHSA-gf38): int64 so np+max_tok can't wrap negative */
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
                q->id,np,q->max_tok,max_ctx);
         fflush(stdout); free(ids); return;

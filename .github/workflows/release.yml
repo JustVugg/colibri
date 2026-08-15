@@ -21,8 +21,10 @@ jobs:
             name: macos-arm64
             ext: ""
             make_args: ""
-            # No v4: DeepSeek V4 is x86-64 Linux/Windows + aarch64 Linux only
-            # (c/Makefile, COLI_V4_SUPPORTED). Asking for it here fails the build.
+            # arm64 macOS joined COLI_V4_SUPPORTED; the archive verify step
+            # asserts the engine is present and dispatchable like the others.
+            v4: "1"
+
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"
@@ -132,6 +134,7 @@ jobs:
           cp c/coli dist/
           cp c/version.py dist/
           cp c/openai_server.py dist/
+          cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp c/autotune.py dist/

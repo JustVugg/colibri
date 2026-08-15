@@ -188,12 +188,24 @@ static int v4_ds_load_fp8_suffix(const ColiSafetensorsIndex *index, int stage,
     return v4_ds_load_fp8(index, wn, sn, weight, scale);
 }
 
+/* SEC (GHSA-9gjf): every F32 sidecar loaded here is later indexed linearly by
+ * config-derived dimensions, but coli_tensor_load_f32 does no shape accounting —
+ * an undersized snapshot tensor became a heap OOB read. `expected` is the numel
+ * the consumer will index; require at least that many (-1 = skip). `<` (not `!=`)
+ * so a legitimately padded checkpoint is never false-rejected. */
 static int v4_ds_load_f32_suffix(ColiFloatTensor *output,
                                  const ColiSafetensorsIndex *index, int stage,
-                                 const char *suffix) {
+                                 const char *suffix, int64_t expected) {
     char name[160], error[256];
     if (v4_ds_name(name, sizeof(name), stage, suffix)) return -1;
-    return coli_tensor_load_f32(output, index, name, error, sizeof(error));
+    if (coli_tensor_load_f32(output, index, name, error, sizeof(error))) return -1;
+    if (expected >= 0 && (int64_t)output->count < expected) {
+        fprintf(stderr, "[MTP] shape mismatch: %s (numel %llu, need >= %lld)\n",
+                name, (unsigned long long)output->count, (long long)expected);
+        coli_float_tensor_free(output);
+        return -1;
+    }
+    return 0;
 }
 
 static void v4_ds_fp8_view(ColiTensorView *view,
@@ -256,17 +268,20 @@ static int v4_ds_core_load(const ColiSafetensorsIndex *index,
                        &g_v4ds_core.main_proj_w,
                        &g_v4ds_core.main_proj_s) ||
         v4_ds_load_f32_suffix(&g_v4ds_core.main_norm, index, 0,
-                              "main_norm.weight") ||
+                              "main_norm.weight", config->hidden_size) ||
         v4_ds_load_f32_suffix(&g_v4ds_core.head_fn, index, 2,
-                              "hc_head_fn") ||
+                              "hc_head_fn",
+                              (int64_t)config->hc_mult * config->hc_mult *
+                              config->hidden_size) ||
         v4_ds_load_f32_suffix(&g_v4ds_core.head_base, index, 2,
-                              "hc_head_base") ||
+                              "hc_head_base", config->hc_mult) ||
         v4_ds_load_f32_suffix(&g_v4ds_core.head_scale, index, 2,
-                              "hc_head_scale") ||
+                              "hc_head_scale", 1) ||
         v4_ds_load_f32_suffix(&g_v4ds_core.norm, index, 2,
-                              "norm.weight") ||
+                              "norm.weight", config->hidden_size) ||
         v4_ds_load_f32_suffix(&g_v4ds_core.confidence_proj, index, 2,
-                              "confidence_head.proj.weight") ||
+                              "confidence_head.proj.weight",
+                              (int64_t)config->hidden_size + V4_DSPARK_RANK) ||
         v4_ds_read_raw(index, "mtp.2.markov_head.markov_w1.weight",
                        COLI_ST_BF16, (void **)&g_v4ds_core.markov_w1,
                        &g_v4ds_core.markov_w1_bytes) ||
@@ -320,27 +335,39 @@ static int v4_ds_stage_load(const ColiSafetensorsIndex *index,
     V4_DS_LOAD_FP8(sh3,  "ffn.shared_experts.w3");
 #undef V4_DS_LOAD_FP8
 
-#define V4_DS_LOAD_F32(field, suffix) \
-    do { if (v4_ds_load_f32_suffix(&stage->field, index, stage_id, suffix)) \
+#define V4_DS_LOAD_F32(field, suffix, expected) \
+    do { if (v4_ds_load_f32_suffix(&stage->field, index, stage_id, suffix, \
+                                   expected)) \
              return 0; } while (0)
-    V4_DS_LOAD_F32(q_norm,       "attn.q_norm.weight");
-    V4_DS_LOAD_F32(kv_norm,      "attn.kv_norm.weight");
-    V4_DS_LOAD_F32(attn_norm,    "attn_norm.weight");
-    V4_DS_LOAD_F32(ffn_norm,     "ffn_norm.weight");
-    V4_DS_LOAD_F32(attn_sink,    "attn.attn_sink");
-    V4_DS_LOAD_F32(hc_attn_fn,   "hc_attn_fn");
-    V4_DS_LOAD_F32(hc_attn_base, "hc_attn_base");
-    V4_DS_LOAD_F32(hc_attn_scale,"hc_attn_scale");
-    V4_DS_LOAD_F32(hc_ffn_fn,    "hc_ffn_fn");
-    V4_DS_LOAD_F32(hc_ffn_base,  "hc_ffn_base");
-    V4_DS_LOAD_F32(hc_ffn_scale, "hc_ffn_scale");
-    V4_DS_LOAD_F32(gate_w,       "ffn.gate.weight");
-    V4_DS_LOAD_F32(gate_b,       "ffn.gate.bias");
+    {   int64_t mixes = (int64_t)(2 + config->hc_mult) * config->hc_mult;
+        int64_t flat = (int64_t)config->hc_mult * config->hidden_size;
+        V4_DS_LOAD_F32(q_norm,       "attn.q_norm.weight", config->q_lora_rank);
+        V4_DS_LOAD_F32(kv_norm,      "attn.kv_norm.weight", config->head_dim);
+        V4_DS_LOAD_F32(attn_norm,    "attn_norm.weight", config->hidden_size);
+        V4_DS_LOAD_F32(ffn_norm,     "ffn_norm.weight", config->hidden_size);
+        V4_DS_LOAD_F32(attn_sink,    "attn.attn_sink", config->num_attention_heads);
+        V4_DS_LOAD_F32(hc_attn_fn,   "hc_attn_fn", mixes * flat);
+        V4_DS_LOAD_F32(hc_attn_base, "hc_attn_base", mixes);
+        V4_DS_LOAD_F32(hc_attn_scale,"hc_attn_scale", 3);
+        V4_DS_LOAD_F32(hc_ffn_fn,    "hc_ffn_fn", mixes * flat);
+        V4_DS_LOAD_F32(hc_ffn_base,  "hc_ffn_base", mixes);
+        V4_DS_LOAD_F32(hc_ffn_scale, "hc_ffn_scale", 3);
+        V4_DS_LOAD_F32(gate_w,       "ffn.gate.weight",
+                       (int64_t)config->n_routed_experts * config->hidden_size);
+        V4_DS_LOAD_F32(gate_b,       "ffn.gate.bias", config->n_routed_experts);
+    }
 #undef V4_DS_LOAD_F32
 
     static const char *matrices[3] = {"w1", "w2", "w3"};
+    /* SEC (GHSA-8p69): slab_bytes must cover the LARGEST expert, not expert 0.
+     * Each slot later copies whichever expert is routed to it, using that
+     * expert's own declared nbytes — so sizing from expert 0 alone let a crafted
+     * checkpoint (expert 0 tiny, another expert large) overflow the slab with
+     * file-controlled bytes (heap OOB write). Real MTP checkpoints have uniform
+     * expert shapes, so max == expert 0 and behaviour is unchanged. */
     stage->slab_bytes = 0;
     for (int expert = 0; expert < config->n_routed_experts; expert++) {
+        int64_t expert_bytes = 0;
         for (int matrix = 0; matrix < 3; matrix++) {
             char name[192];
             snprintf(name, sizeof(name), "mtp.%d.ffn.experts.%d.%s.weight",
@@ -351,11 +378,12 @@ static int v4_ds_stage_load(const ColiSafetensorsIndex *index,
             stage->es[expert][matrix] = coli_st_find(index, name);
             if (!stage->ew[expert][matrix] || !stage->es[expert][matrix])
                 return 0;
-            if (!expert)
-                stage->slab_bytes += stage->ew[expert][matrix]->nbytes +
-                                     stage->es[expert][matrix]->nbytes;
+            expert_bytes += stage->ew[expert][matrix]->nbytes +
+                            stage->es[expert][matrix]->nbytes;
         }
+        if (expert_bytes > stage->slab_bytes) stage->slab_bytes = expert_bytes;
     }
+    if (stage->slab_bytes < 1) return 0;
 
     /* V4_MTP_GB is intentionally total, not per stage. */
     double total_gb = coli_v4_dspark_cache_gb();
@@ -413,12 +441,21 @@ static int v4_ds_expert(const ColiSafetensorsIndex *index,
         }
         stage->slots[slot].id = -1;
         uint8_t *cursor = stage->slots[slot].slab;
+        uint8_t *slab_end = cursor + stage->slab_bytes;
         for (int matrix = 0; matrix < 3; matrix++) {
             const ColiSafetensorsTensor *scale = stage->es[expert][matrix];
             const ColiSafetensorsTensor *weight = stage->ew[expert][matrix];
+            /* SEC (GHSA-8p69): defence in depth — never write past the slab even
+             * if the max-sizing above is ever defeated (shape drift within a
+             * stage). Fail closed rather than overflow. */
+            if (scale->nbytes < 0 || weight->nbytes < 0 ||
+                (size_t)(slab_end - cursor) < (size_t)scale->nbytes)
+                return 0;
             if (coli_st_read_tensor(index, scale, cursor))
                 return 0;
             cursor += scale->nbytes;
+            if ((size_t)(slab_end - cursor) < (size_t)weight->nbytes)
+                return 0;
             int shard = coli_st_tensor_shard(index, weight);
             if (shard < 0 || weight->off < 0 ||
                 coli_st_read_at_streaming(

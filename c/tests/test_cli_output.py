@@ -63,6 +63,43 @@ class CliOutputLanguageTest(unittest.TestCase):
         self.assertIn("set COLI_MODEL or use --model", result.stderr)
 
 
+class InteractivePromptTest(unittest.TestCase):
+    """Pasted prompts stay intact and render predictably in the TUI box."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_prompt_under_test", str(CLI))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    def test_prompt_box_preserves_newlines_and_indentation(self):
+        lines = self.coli.prompt_box_lines("int main() {\n  return 0;\n}", 20)
+        self.assertEqual(lines, ["int main() {", "  return 0;", "}"])
+
+    def test_prompt_box_wraps_long_lines_without_collapsing_whitespace(self):
+        lines = self.coli.prompt_box_lines("    return a_long_name;", 10)
+        self.assertEqual(lines, ["    return", " a_long_na", "me;"])
+
+    def test_prompt_input_rows_accounts_for_explicit_lines(self):
+        self.assertEqual(self.coli.prompt_input_rows("one\ntwo", 80), 2)
+        self.assertEqual(self.coli.prompt_input_rows("x" * 80, 80), 2)
+
+    def test_read_prompt_collects_lines_already_queued_after_first(self):
+        import io
+        import select
+
+        stream = io.StringIO("second\nthird\n")
+        with mock.patch.object(self.coli, "TTY", True), \
+             mock.patch.object(self.coli.sys, "platform", "freebsd"), \
+             mock.patch("builtins.input", return_value="first"), \
+             mock.patch.object(self.coli.sys, "stdin", stream), \
+             mock.patch.object(select, "select", side_effect=(
+                 ([stream], [], []), ([stream], [], []), ([], [], []),
+             )):
+            self.assertEqual(self.coli.read_prompt(), "first\nsecond\nthird")
+
+
 class ChatCapForwardingTest(unittest.TestCase):
     """#379/#386 r2 (F9): `coli chat` on a non-glm model spawns openai_server
     as its local server. An explicit --cap must ride along on that command
@@ -228,12 +265,11 @@ class BannerModelLineTest(unittest.TestCase):
 
 
 class OmpThreadsForEveryEngineTest(unittest.TestCase):
-    """#805 set OMP_NUM_THREADS from physical cores -- for glm only.
+    """Launchers size shared engines; V4 delegates to its loader-aware runtime.
 
-    env_for_engine() forwarded to env_for() when arch was "glm" and built its
-    own environment otherwise, so inkling, kimi_k3, olmoe and deepseek_v4 kept
-    libgomp's nproc default: logical cores, a 2x over-subscription of a
-    memory-bound int4 GEMV on any SMT host.
+    #805's physical-core default still covers the memory-bound sister engines.
+    DeepSeek V4 instead reserves logical CPUs for its expert-loader workers in
+    v4_omp_reserve_loader_cpus(), unless the operator overrides or disables it.
     """
 
     @classmethod
@@ -247,33 +283,43 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         return types.SimpleNamespace(model="/x", ram=None, ctx=None, ngen=None,
                                      temp=None, cap=None)
 
-    def test_every_engine_gets_physical_cores(self):
+    def test_other_engines_get_physical_cores(self):
         with mock.patch("resource_plan.physical_cpu_count", return_value=6):
-            for arch in ("inkling", "kimi", "olmoe", "deepseek_v4"):
+            for arch in ("inkling", "kimi", "olmoe"):
                 with self.subTest(arch=arch):
                     env = self.coli.env_for_engine(self.args(), arch)
                     self.assertEqual(env.get("OMP_NUM_THREADS"), "6")
 
+    def test_v4_delegates_thread_team_to_runtime(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("resource_plan.physical_cpu_count",
+                        side_effect=AssertionError("V4 launcher sized the team")):
+            env = self.coli.env_for_engine(self.args(), "deepseek_v4")
+        self.assertNotIn("OMP_NUM_THREADS", env)
+
     def test_v4_gets_memory_bound_affinity_defaults(self):
-        with mock.patch.object(self.coli.sys, "platform", "linux"), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=6):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "linux"):
             env = self.coli.env_for_engine(self.args(), "deepseek_v4")
         self.assertEqual(env.get("OMP_PROC_BIND"), "close")
         self.assertEqual(env.get("OMP_PLACES"), "cores")
         self.assertEqual(env.get("OMP_WAIT_POLICY"), "active")
+        self.assertEqual(env.get("GOMP_SPINCOUNT"), "200000")
         self.assertEqual(env.get("OMP_DYNAMIC"), "FALSE")
 
     def test_explicit_setting_still_wins(self):
-        with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "3"}), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=6):
+        with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "3"}, clear=True), \
+             mock.patch("resource_plan.physical_cpu_count",
+                        side_effect=AssertionError("V4 launcher sized the team")):
             env = self.coli.env_for_engine(self.args(), "deepseek_v4")
         self.assertEqual(env["OMP_NUM_THREADS"], "3")
 
     def test_kill_switch_is_honoured(self):
-        with mock.patch.dict(os.environ, {"COLI_NO_OMP_TUNE": "1"}, clear=False):
-            os.environ.pop("OMP_NUM_THREADS", None)
+        with mock.patch.dict(os.environ, {"COLI_NO_OMP_TUNE": "1"}, clear=True):
             env = self.coli.env_for_engine(self.args(), "deepseek_v4")
-        self.assertNotIn("OMP_NUM_THREADS", env)
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+                    "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
+            self.assertNotIn(key, env)
 
 
 if __name__ == "__main__":

@@ -52,11 +52,16 @@ gcc -O2 -fopenmp iobench.c -o iobench
 # 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
 COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
-# 3) record expert usage, then pin the hottest experts in your spare RAM:
+# 3) full automated datapoint — machine info + cold/warm decode + disk, one command:
+python tools/datapoint.py --snap /path/to/model --shard /path/to/container/model-00000.safetensors
+# (stdlib-only; evicts the page cache before the cold run, caps decode at --max-new
+#  tokens so tok/s is exact, and prints a ready-to-paste datapoint block)
+
+# 4) record expert usage, then pin the hottest experts in your spare RAM:
 STATS=stats.txt ./coli chat
 PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 
-# 4) quality benchmarks (MMLU/HellaSwag/ARC):
+# 5) quality benchmarks (MMLU/HellaSwag/ARC):
 ./coli bench
 ```
 
@@ -89,6 +94,7 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | 〃 · 46.9 GB pin (2.94M-selection history) · `--ram 110`, 1024-token run ([#103](https://github.com/JustVugg/colibri/issues/103)) | 〃 | Metal on (experts + attention) · MTP off | **2.06 tok/s** · hit 72.5% · coherent output |
 | Apple M1 Ultra (20C, 48-core GPU) · Mac Studio · macOS · 128 GB unified · internal SSD · **Metal backend** · fmt=2 per-row container ([report](METAL-M1ULTRA-FMT2-REPORT.md)) | 6.89 GB/s F_NOCACHE · 8.93 GB/s buffered | Metal on (fmt=2) · `--ram 125` · `--cap 33` · 46.9 GB frozen pin · `NO_OMP`+`PIPE` · MTP off · 1024-token run | **1.50 tok/s** · hit 78.7% · RSS 104.8 GB · disk wait 57% of decode, SSD at ~93% of its iobench ceiling (1.31 at default flags, `--ram 110`) |
 | Mac Mini M4 Pro · macOS · **48 GB** unified · **Metal backend** ([#107](https://github.com/JustVugg/colibri/issues/107)) | 6.59 GB/s F_NOCACHE (fresh shard) | Metal on · `--ram 38` | **0.30 tok/s** (vs 0.18 CPU-only) |
+| Apple M3 (base, 4P+4E) · macOS · **16 GB unified** · internal Apple SSD ([#949](https://github.com/JustVugg/colibri/issues/949)) | 3.18 GB/s cold F_NOCACHE (post-eviction) · 7.27 GB/s buffered — no O_DIRECT on macOS, caveat #86 | **OLMoE int8** · cap 16 · TEMP=0 · CPU-only | **3.69 tok/s cold → 4.18 tok/s warm** · RSS 1.5–1.81 GB · load 0.7 s |
 | Epyc 9654 ES · Linux · 4x16GB DDR5-4800-rdimm · Samsung PCIe Gen3 x4 NVME SSD | — | `MTP=1 DIRECT=1` | 0.31 tok/s · expert hit 35% · RSS 21.52 GB |
 | Ryzen AI 9 HX 370 (Framework 13) · Arch Linux · 128 GB · WD SN850X, BTRFS zstd ([#12](https://github.com/JustVugg/colibri/issues/12)) | — | int8 MTP head · `--cap 32` · 46.7 GB auto-learned PIN | **0.37 tok/s** · expert hit 66% · MTP acceptance 52% (2.59 tok/fw) · RSS 105 GB |
 | Ryzen 9 9950X (32 threads) · Linux · 123 GB · Crucial P3 QLC Gen3 ([#31](https://github.com/JustVugg/colibri/issues/31)) | 1.51 GB/s buffered | default, 2 runs from cold | 0.10 tok/s · hit 53% · profile 66% disk |

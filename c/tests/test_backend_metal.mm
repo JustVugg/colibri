@@ -4,6 +4,7 @@
 // reference (cpu_ref_grouped) and harness (run_grouped) below -- unlike fmt 1-3 the
 // group scale is per-GROUP, not per-row, so it can't share cpu_ref's [O] scale layout.
 #include "../backend_metal.h"
+#include <Metal/Metal.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -650,6 +651,17 @@ static int run_attn_grouped(int S, int pos_base, int gs, const char* name){
 
 int main(void) {
   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
+  /* GitHub Actions Apple Silicon runners expose Metal through the Apple
+   * Paravirtual device, where Metal submissions never complete (hangs -- the
+   * #947 CI observation). The shader compile above (coli_metal_init) still
+   * runs, keeping this suite's compile coverage -- the class of bug #940
+   * shipped -- while GPU execution is honestly skipped here. (#947 review) */
+  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+  if (dev && [[dev name] containsString:@"Apple Paravirtual device"]) {
+    printf("SKIPPED: paravirtual device (%s) -- compile-only\n",
+           [[dev name] UTF8String]);
+    return 0;
+  }
   printf("Metal backend kernel tests:\n");
   int fail=0;
   fail |= run(I8, 2048,6144,1, "int8 gate/up S=1");

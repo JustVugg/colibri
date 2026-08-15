@@ -218,6 +218,14 @@ ifneq ($(IS_WIN),)
 NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
 else
 NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+# glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
+# with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
+# under C++17 (noexcept is part of the function type since C++17). Force-include
+# a compat header that strips __THROW from the host pass; see
+# glibc_c23_math_compat.h. MSVC never sees glibc headers, so Linux-only.
+ifneq ($(LINUX),)
+NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
+endif
 endif
 # HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
@@ -325,6 +333,9 @@ endif
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
+# tests/mxfp4_ref.c is compiled by $(CC) with OpenMP. Its object therefore
+# needs the host OpenMP runtime when the GPU compiler performs the final link.
+GPU_OMP_LINK = -Xcompiler=-fopenmp
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
 # triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
@@ -340,8 +351,11 @@ CUDA_OBJ  =
 
 # DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
 # tests run everywhere; the engine and token-exact fixture run on x86-64
-# Linux/Windows and aarch64 Linux. SIMD fast paths are gated per-feature
-# inside the sources, so a plain armv8-a build stays correct.
+# Linux/Windows, aarch64 Linux, and arm64 macOS. SIMD fast paths are gated
+# per-feature inside the sources, so a plain armv8-a build stays correct.
+# macOS portability rides compat.h (posix_fadvise -> F_RDADVISE, O_DIRECT ->
+# F_NOCACHE via st.h's direct twins) plus a mach branch for available memory;
+# the token-exact tiny fixture is the acceptance gate on the macos runner.
 COLI_V4_SUPPORTED :=
 ifneq (,$(X86_64))
 ifneq (,$(IS_WIN)$(LINUX))
@@ -349,7 +363,7 @@ COLI_V4_SUPPORTED := 1
 endif
 endif
 ifneq (,$(AARCH64))
-ifneq (,$(LINUX))
+ifneq (,$(LINUX)$(DARWIN))
 COLI_V4_SUPPORTED := 1
 endif
 endif
@@ -432,6 +446,7 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
+GPU_OMP_LINK = -fopenmp
 # rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
 # headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
 # let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
@@ -680,7 +695,7 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
 	$(CC) $(CFLAGS) -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
 	./mxfp4_cuda_test$(EXE)
 
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
@@ -803,6 +818,9 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_cfg_topk$(EXE): tests/test_cfg_topk.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
@@ -937,6 +955,9 @@ tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h urin
 tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_eslot_inflight$(EXE): tests/test_eslot_inflight.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -948,6 +969,12 @@ tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h js
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
 tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
+# frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
+# Build on demand: make tests/bench_gemv_stream ARCH=native
+tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),

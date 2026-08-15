@@ -468,7 +468,22 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
-        if (lru < 0) lru = 0; /* absolute last resort: all in-flight, evict slot 0 */
+        while (lru < 0) {
+            /* EVERY slot is in flight: each buffer is owned by an unlocked pread
+             * in the pilot worker (or a demand load) that will publish into it.
+             * The old last resort (lru=0) stole such a slot mid-load — two writers
+             * racing the same slab, then whichever published last decided the
+             * expert id the resident bytes answered to. Wait for a publish instead
+             * and rescan; in-flight always drains because a load either finishes
+             * or the process is already dead in the water. */
+            pthread_mutex_unlock(&g_pilot_mx);
+            sleep_ms(1);
+            pthread_mutex_lock(&g_pilot_mx);
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue;
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        }
         s = &lc->slots[lru];
         s->pinned = 0;
     }
@@ -1323,7 +1338,15 @@ int main(int argc, char **argv) {
     }
 
     if (getenv("CHAT")) {   /* interactive mode: bypasses the ref.json harness entirely */
-        g_temp = getenv("TEMP")    ? (float)atof(getenv("TEMP"))    : g_temp;
+        /* #509 convention, same as the GLM engine: COLI_TEMP is the primary channel;
+         * TEMP stays a legacy alias ONLY when it is fully numeric — on Windows and under
+         * ROCm stacks %TEMP% names a directory, and atof("C:\...") == 0.0 would silently
+         * force greedy decoding for every olmoe chat on those hosts. */
+        if (getenv("COLI_TEMP")) g_temp = (float)atof(getenv("COLI_TEMP"));
+        else if (getenv("TEMP") && *getenv("TEMP")) {
+            char *tend; double tv = strtod(getenv("TEMP"), &tend);
+            if (tend != getenv("TEMP") && *tend == '\0') g_temp = (float)tv;
+        }
         g_nuc  = getenv("NUCLEUS") ? (float)atof(getenv("NUCLEUS")) : g_nuc;
         int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
         if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */

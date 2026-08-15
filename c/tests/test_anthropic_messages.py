@@ -169,7 +169,7 @@ class MessagesHTTPTest(unittest.TestCase):
 
     def test_non_glm_architectures_reject_tools_before_generation(self):
         body = self.base_body(tools=[{"name": "f", "input_schema": {"type": "object"}}])
-        for arch in ("inkling", "kimi", "deepseek_v4"):
+        for arch in ("inkling", "kimi"):
             with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
                 before = len(self.engine.prompts)
                 with self.assertRaises(HTTPError) as caught:
@@ -177,6 +177,17 @@ class MessagesHTTPTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 400)
                 self.assertIn("tool", json.load(caught.exception)["error"]["message"].lower())
                 self.assertEqual(len(self.engine.prompts), before)
+
+    def test_deepseek_v4_renders_tools_as_dsml_block(self):
+        body = self.base_body(tools=[{"name": "f", "input_schema": {
+            "type": "object", "properties": {"x": {"type": "string"}}}}])
+        with patch("openai_server.ARCH", "deepseek_v4"):
+            with self.post(body) as response:
+                self.assertEqual(response.status, 200)
+        prompt = self.engine.prompts[-1]
+        self.assertIn("## Tools", prompt)
+        self.assertIn('"name": "f"', prompt)
+        self.assertIn("｜DSML｜", prompt)
 
     def test_x_api_key_and_bearer_both_authenticate(self):
         with self.post(self.base_body(), {"x-api-key": "secret"}) as response:
