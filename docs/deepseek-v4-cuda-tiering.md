@@ -53,6 +53,15 @@ make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86
 - `CUDA_HOME` defaults to `/usr/local/cuda` (else set it).
 - Expected: `deepseek_v4` links `libcudart`/`libcublasLt`; first run prints
   `[DSV4 CUDA] device 0: <GPU> ... sm_XX` and `v4_cuda_tier ...`.
+- cuBLASLt < 12.8 (e.g. Jetson JetPack with CUDA 12.6) lacks the MXFP8
+  block-scaling APIs used by the optional `DSV4_CUDA_TC` tensor-core path
+  (default off). Build with `NVCCFLAGS=" -DCOLI_DSV4_NO_TC"` to compile it
+  out; the custom FP4 expert path always builds, unchanged:
+
+```bash
+make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_87 \
+  NVCCFLAGS="-O3 -std=c++17 -arch=sm_87 -DCOLI_DSV4_NO_TC" -j$(nproc)
+```
 
 ## Build — Windows
 
