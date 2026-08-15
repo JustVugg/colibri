@@ -153,6 +153,9 @@ Benchmarked with the raw serve protocol (same prompt, 167 tokens, 200
 generated, greedy, `OMP_NUM_THREADS=12`, `KVSAVE=0`; each row = mean of 2-4
 runs, σ ≈ 0.01 tok/s). These are **reference numbers for one machine**, not
 guarantees — they show the *direction and rough magnitude* of each knob.
+Benchmarked code: `feat/ds4-cuda-tier` @ `0d17c77` (pre-sync with
+`upstream/dev`; post-sync smoke runs measure 1.1-1.2 tok/s on the same
+config, in line with these numbers).
 
 Hardware: Ryzen 9 5900X (12c/24t), 64 GB RAM, RTX 3080 10.7 GB (sm_86),
 NVMe Kingston KC3000 (~2-3 GB/s random read), Windows 11 native build.
