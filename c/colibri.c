@@ -7442,7 +7442,9 @@ static void kv_alloc(Model *m, int max_t){
         k->Lc8=k->Rc8=NULL; k->Lsc=k->Rsc=NULL; }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
     if(m->has_dsa || c->msa){                        /* index-key cache: GLM DSA or M3 MSA */
-        k->Ic=calloc(c->n_layers,sizeof(float*));
+        /* (unsigned): n_layers is config-validated positive; the cast gives VRP a
+         * provable bound so -Walloc-size-larger-than stays quiet on inlined paths. */
+        k->Ic=calloc((unsigned)c->n_layers,sizeof(float*));
         for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) k->Ic[i]=falloc((int64_t)max_t*c->index_hd);
     }
     k->max_t=max_t;
