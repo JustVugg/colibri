@@ -405,11 +405,23 @@ def _minimax_geometry(config, context, _model_dir):
 
         state = (layers + 1) * context * 2 * kv_heads * head_dim * 4
 
+    The MSA Lightning Indexer adds one index-key row per token, but only on
+    the sparse layers and without the MTP row (kv_alloc allocates Ic over
+    n_layers and skips !idx_type layers). The engine derives sparsity from
+    moe_layer_freq -- M3's sparse attention layers ARE its MoE layers, so
+    idx_type[i] = (i >= first_dense) where first_dense is the index of the
+    first non-zero entry, else 0 (colibri.c load_cfg, ARCH_M3 branch):
+
+        state += (layers - first_dense) * context * sparse_index_dim * 4
+
     Workspace mirrors attention_gqa()'s scratch set with S == context at
     prefill: q and ctx are heads-wide, k and v are kv_heads-wide, plus the
-    per-row score buffer (heads * window, window <= context).
+    per-row score buffer (heads * window, window <= context). On sparse
+    layers the indexer adds its own projections, index_heads * index_dim
+    wide for the query side and index_dim for the key side.
 
         ws = context * ((2 * heads + 2 * kv_heads) * head_dim + heads) * 4
+             + context * (index_heads + 1) * sparse_index_dim * 4
 
     Experts: configured_experts = num_local_experts (M3's spelling of
     n_routed_experts).
@@ -422,6 +434,19 @@ def _minimax_geometry(config, context, _model_dir):
 
     state = (layers + 1) * context * 2 * kv_heads * head_dim * 4
     workspace = context * ((2 * heads + 2 * kv_heads) * head_dim + heads) * 4
+
+    sparse = config.get("sparse_attention_config")
+    if isinstance(sparse, dict) and sparse.get("use_sparse_attention"):
+        index_dim = _required_int(sparse, "sparse_index_dim", "minimax_m3")
+        index_heads = _optional_int(sparse, "sparse_num_index_heads", 1, 1)
+        freq = config.get("moe_layer_freq")
+        first_dense = 0
+        if isinstance(freq, list):
+            first_dense = next((i for i, value in enumerate(freq) if value), len(freq))
+        first_dense = min(first_dense, layers)
+        state += (layers - first_dense) * context * index_dim * 4
+        workspace += context * (index_heads + 1) * index_dim * 4
+
     return PlannerGeometry(state, 0, workspace, experts)
 
 

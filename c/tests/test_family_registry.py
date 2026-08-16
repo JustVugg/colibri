@@ -129,6 +129,11 @@ class FamilyRegistryTest(unittest.TestCase):
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
             "moe_layer_freq": [0, 1],
+            "sparse_attention_config": {
+                "use_sparse_attention": True,
+                "sparse_index_dim": 8,
+                "sparse_attention_freq": [0, 1],
+            },
         }
         # minimax_m3 is a registered family now, so the fixture this test
         # landed with would collide on its id. Assert against the production
@@ -144,9 +149,12 @@ class FamilyRegistryTest(unittest.TestCase):
                                    "model_dir": "."})()
         geometry = planner_geometry(resolved, 32)
         self.assertEqual(geometry.configured_experts, 4)
-        # 3 rows (2 layers + the MTP row) x 32 tokens x (K + V) x 2 kv heads
-        # x 8 head_dim x 4 bytes. No latent compression: GQA caches full rows.
-        self.assertEqual(geometry.context_state_bytes, 12_288)
+        # 12_288: 3 rows (2 layers + the MTP row) x 32 tokens x (K + V) x 2 kv
+        # heads x 8 head_dim x 4 bytes -- no latent compression, GQA caches
+        # full rows. Plus 1_024 for the MSA index keys, which exist on the one
+        # sparse layer only (moe_layer_freq [0, 1] -> first_dense 1) and get no
+        # MTP row: 1 x 32 x 8 x 4.
+        self.assertEqual(geometry.context_state_bytes, 13_312)
 
     def test_olmoe_fixture_models_conventional_fp32_kv_cache(self):
         # OLMoE keeps a full K and V cache per layer, sized at num_attention_heads
