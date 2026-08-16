@@ -496,8 +496,38 @@ extern "C" {
 int coli_v4_expert_forward_tiered(float *output, const ColiExpertView *expert,
                                   const float *input, float route_weight,
                                   float swiglu_limit);
+
+/* ---- dense-only GPU tier (COLI_DSV4_DENSE_CUDA=1, placement-GLM experiment) ----
+ * v4_dense_cuda_preload_layer uploads the five native FP8 attention tensors of
+ * one layer into VRAM (called from the layer-load site, once per layer).
+ * v4_dense_cuda_matvec runs ONE dense matvec on GPU: it quantizes the
+ * activation exactly like coli_fp8_matvec_ref (coli_fp8_activation_qdq_ref,
+ * block 128) then dispatches dsv4_cuda_matvec(_grouped). Returns 1 on GPU
+ * success, 0 on ANY failure so the caller falls back to the CPU matvec. */
+int v4_dense_cuda_preload_layer(const ColiSafetensorsIndex *index,
+                                const ColiDeepSeekV4Config *config, int layer,
+                                char *error, size_t error_size);
+int v4_dense_cuda_matvec(float *y, int layer, int which, const float *x,
+                         int O, int I, int groups);
+int v4_dense_cuda_active(void);
+int v4_cuda_ensure_initialized(void);
+#define V4_DENSE_WQ_A 0
+#define V4_DENSE_WQ_B 1
+#define V4_DENSE_WKV  2
+#define V4_DENSE_WO_A 3
+#define V4_DENSE_WO_B 4
+#define V4_DENSE_TENSORS 5
 #else
 #define coli_v4_expert_forward_tiered coli_v4_expert_forward_ref
+#define v4_dense_cuda_preload_layer(index, config, layer, error, esize) 0
+#define v4_dense_cuda_matvec(y, layer, which, x, O, I, groups) 0
+#define v4_dense_cuda_active() 0
+#define V4_DENSE_WQ_A 0
+#define V4_DENSE_WQ_B 1
+#define V4_DENSE_WKV  2
+#define V4_DENSE_WO_A 3
+#define V4_DENSE_WO_B 4
+#define V4_DENSE_TENSORS 5
 #endif
 
 int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,

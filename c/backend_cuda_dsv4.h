@@ -34,19 +34,19 @@ typedef struct {
 } Dsv4CudaAttentionWeights;
 COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_init(const int *devices,int count);
 COLI_DSV4_CUDA_DLLEXPORT void dsv4_cuda_shutdown(void);
-int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
+COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t *w,int O,int I,int device);
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float *w,int O,int I,int device);
-int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
+COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
 int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t,const Dsv4CudaActivation *input,
                            int tokens,Dsv4CudaActivation *output);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,
                            int M,int H,float eps,float pre_eps,int *id,float *value);
-int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float *x,int groups);
+COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float *x,int groups);
 COLI_DSV4_CUDA_DLLEXPORT int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down,const float *weights,int count,
                            float limit,float *y,const float *x);

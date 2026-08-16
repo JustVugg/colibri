@@ -11,8 +11,12 @@ builds on Linux and Windows with different commands; the engine
   usage history) stay resident in VRAM via `coli_dsv4_cuda.dll` / the Linux CUDA
   link; the rest comes from the RAM cache (LRU + usage pinning, `.coli_usage`
   history in the model dir) and cold streaming from disk (O_DIRECT).
-- Dense layers (43, ~6.27 GiB fp8) and attention stay on **CPU/RAM**, like the
-  target-only build. Only routed experts are GPU-eligible.
+- Dense layers (43, ~6.27 GiB fp8) and attention stay on **CPU/RAM** by
+  default, like the target-only build. With `COLI_DSV4_DENSE_CUDA=1` the five
+  dense matmuls per layer (wq_a/wq_b/wkv/wo_a/wo_b, native fp8 weights) move
+  to the GPU with identical numerics — measured **+18% decode** on the
+  reference hardware (see the dense-on-GPU section below). Only routed
+  experts are GPU-eligible by default.
 - Numerics are identical to the CPU path (verified A/B on real checkpoints).
 - Missing `coli_dsv4_cuda.dll` (Windows) → silent CPU fallback, no error.
 - **Tool use / function calling**: OpenAI `tools` are supported with the
@@ -152,6 +156,8 @@ on your own hardware.
 | `--ram N` / `RAM_GB` | RAM budget for pinned experts → hit rate → disk read volume | `N ≈ total RAM − 12 GB`. The #1 lever. |
 | `COLI_V4_PREWARM=1` | Pin the usage-history experts **before** READY instead of interleaved with the first prefill | Slightly faster decode + hit; the time-to-first-token is unchanged (the pin cost moves into the startup). Harmless to enable. |
 | `--vram V` / `CUDA_EXPERT_GB` | VRAM budget for the hottest experts | `V ≈ 50%` of VRAM, never above ~75% (KV/context margin). Above the safe point the gain is small and OOM risk grows. |
+| `COLI_DSV4_DENSE_CUDA=1` | Move the dense layers (5 matmuls/layer, ~6.27 GiB fp8) to the GPU; the expert tier stays unchanged | Measured **+18% decode** and −1.6 CPU cores, at the cost of ~9.6 GB VRAM (dense + experts) and ~+10 s TTFT (H2D preload at startup). **Default off**: enable for long sessions, keep off for short one-shots. |
+| `COLI_V4_DENSE_DEBUG=1` | Log every dense-GPU call (`v4_dense_dbg ... after ok=1/0`) to count CPU fallbacks | Diagnostic only, leave off. With the tier active expect `ok=1` on every call and 0 fallbacks. |
 | `--gpu none` / `COLI_DSV4_CUDA=0` | Disable the CUDA tier (pure CPU) | CPU-only machines. |
 | `--gpu N` / `COLI_GPUS` | Select the CUDA device(s) | `0`, or `0,1` for multi-GPU. |
 | `--ctx N` / `CTX` | Context window (default 4096) | Raise only if you need long context; the KV lives in RAM. |
@@ -186,6 +192,35 @@ NVMe Kingston KC3000 (~2-3 GB/s random read), Windows 11 native build.
 
 \* time-to-first-token unchanged: pre-READY grows by ~5 s, TTFT shrinks by ~5 s.
 
+### Dense-on-GPU tier (2026-08-16, same hardware)
+
+A/B of `COLI_DSV4_DENSE_CUDA` with the same raw-serve harness, same prompt
+(124 tokens — different from the 167-token table above, so compare rows
+within this section only), `--ram 52 --vram 4`, `OMP_NUM_THREADS=12`,
+`KVSAVE=0`; `.coli_usage` restored to the identical backup before each run.
+
+| Config | decode tok/s | TTFT | hit | CPU cores (decode) | GPU util (decode) | disk (decode) | VRAM peak |
+|---|---|---|---|---|---|---|---|
+| dense CPU (`=0`) | 0.955 | 95 s | 72% | 5.54 | 5.6% | 622 MB/s | 5.3 GB |
+| **dense GPU (`=1`)** | **1.126 (+18%)** | 105 s | 73% | **3.97** | **10.0%** | 681 MB/s | **9.7 GB** |
+
+- The dense matmuls were previously estimated "not the bottleneck" (~15 ms /
+  token); the A/B shows they cost **~1.6 CPU cores** in decode and moving them
+  to the GPU is worth **+18% tok/s** — a real lever, not a rounding error.
+- Verified integrity: 42,785 dense-GPU calls `ok=1`, **0 CPU fallbacks** over
+  the 200-token run (43 layers × 5 matmuls × ~199 tokens); numerics identical
+  to the CPU path (token-identical outputs).
+- Cost: ~9.6 GB VRAM (6.27 GiB dense + expert tier) on a 10.7 GB card — check
+  your KV margin — and ~+10 s TTFT (H2D preload of the 43 layers at startup).
+  Amortized on long sessions; a short one-shot pays it back only partially.
+- GLM comparison, same harness: GLM reads **~7× more disk per token** than DS4
+  (4.6 vs 0.65 GB/token) because it routes 2.4× more (78 layers × 8 top-k vs
+  43 × 6) with a ~44% hit rate (its RAM tier holds only ~692 of ~20k experts),
+  yet its tok/s is unchanged by I/O — GLM's bottleneck is per-token pipeline
+  latency, not disk (it measured 0.38-0.42 tok/s with both ~0 and ~1.7 GB/s of
+  disk I/O). `CUDA_EXPERT_GB` 3 vs 5 does not change the GLM VRAM tier (0/692
+  experts both ways: the dense+KV already fill the card).
+
 Takeaways:
 
 - **RAM is the lever**: 40→52 GB = +7% decode, −23% disk volume. The engine is
@@ -194,8 +229,9 @@ Takeaways:
 - **VRAM is not the bottleneck**: 4→8.6 GB VRAM budget = only +6% (and 97%
   VRAM usage, 2× upload/drop churn, OOM risk). The expert matmul is not the
   cost; the disk transfer is.
-- **GPU vs CPU-only**: +4-5% for the CUDA tier. The tier helps, but the wall
-  is the disk.
+- **GPU vs CPU-only**: +4-5% for the expert CUDA tier alone (the wall is the
+  disk). Moving the **dense** layers to the GPU as well (`COLI_DSV4_DENSE_CUDA=1`)
+  adds another +18% on top — the dense matmuls were a hidden CPU cost.
 - **Buffered reads are slower** on this hardware: with 40-52 GB pinned, the
   page cache has ~10 GB left for a 92 GB prefill → thrash + extra copy.
   O_DIRECT stays the default for a reason.

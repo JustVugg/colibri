@@ -39,6 +39,11 @@ typedef int  (*fn_dsv4_init)(const int *devices, int count);
 typedef void (*fn_dsv4_shutdown)(void);
 typedef int  (*fn_dsv4_upload_fp4)(Dsv4CudaTensor **t, const uint8_t *w,
                                    const uint8_t *scale, int O, int I, int device);
+typedef int  (*fn_dsv4_upload_fp8)(Dsv4CudaTensor **t, const uint8_t *w,
+                                   const uint8_t *scale, int O, int I, int device);
+typedef int  (*fn_dsv4_matvec)(Dsv4CudaTensor *t, float *y, const float *x);
+typedef int  (*fn_dsv4_matvec_grouped)(Dsv4CudaTensor *t, float *y,
+                                       const float *x, int groups);
 typedef int  (*fn_dsv4_expert_group)(Dsv4CudaTensor *const *gate,
                                      Dsv4CudaTensor *const *up,
                                      Dsv4CudaTensor *const *down,
@@ -54,6 +59,9 @@ static struct {
     fn_dsv4_init             init;
     fn_dsv4_shutdown         shutdown;
     fn_dsv4_upload_fp4       upload_fp4;
+    fn_dsv4_upload_fp8       upload_fp8;
+    fn_dsv4_matvec           matvec;
+    fn_dsv4_matvec_grouped   matvec_grouped;
     fn_dsv4_expert_group     expert_group;
     fn_dsv4_tensor_free      tensor_free;
 } g_dsv4;
@@ -96,6 +104,9 @@ static int dsv4_cuda_load(void){
     DSV4_RESOLVE(init,          fn_dsv4_init);
     DSV4_RESOLVE(shutdown,      fn_dsv4_shutdown);
     DSV4_RESOLVE(upload_fp4,    fn_dsv4_upload_fp4);
+    DSV4_RESOLVE(upload_fp8,    fn_dsv4_upload_fp8);
+    DSV4_RESOLVE(matvec,        fn_dsv4_matvec);
+    DSV4_RESOLVE(matvec_grouped,fn_dsv4_matvec_grouped);
     DSV4_RESOLVE(expert_group,  fn_dsv4_expert_group);
     DSV4_RESOLVE(tensor_free,   fn_dsv4_tensor_free);
 #undef DSV4_RESOLVE
@@ -117,6 +128,17 @@ void dsv4_cuda_shutdown(void){
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                          const uint8_t *scale, int O, int I, int device){
     return dsv4_cuda_load() ? g_dsv4.upload_fp4(t, w, scale, O, I, device) : 0;
+}
+int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t, const uint8_t *w,
+                         const uint8_t *scale, int O, int I, int device){
+    return dsv4_cuda_load() ? g_dsv4.upload_fp8(t, w, scale, O, I, device) : 0;
+}
+int dsv4_cuda_matvec(Dsv4CudaTensor *t, float *y, const float *x){
+    return dsv4_cuda_load() ? g_dsv4.matvec(t, y, x) : 0;
+}
+int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t, float *y, const float *x,
+                             int groups){
+    return dsv4_cuda_load() ? g_dsv4.matvec_grouped(t, y, x, groups) : 0;
 }
 int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate, Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down, const float *weights,
