@@ -1431,8 +1431,19 @@ def cmd_stop(a):
         try: os.kill(pid, signal.SIGTERM)
         except OSError: pass
     time.sleep(2.0)
+    # signal.SIGKILL does not exist on Windows, and AttributeError is not OSError:
+    # referencing it here would escape the handler and abort the command after it
+    # had already SIGTERMed its targets. os.kill() maps every signal to
+    # TerminateProcess there, so SIGTERM is the equivalent forced kill.
+    #
+    # The SIGKILL exit-code check earlier in this file also uses getattr but falls
+    # back to -1; that is deliberate and different. There the value is a sentinel
+    # compared against an exit code, where -1 correctly never matches. Here it is
+    # *sent*, and Windows uses the signal number as the terminated process's exit
+    # code -- so -1 would record 0xFFFFFFFF where SIGTERM records 15.
+    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     for pid in targets:
-        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
+        try: os.kill(pid, _sigkill); print(f"  {pid}: forced ({_sigkill.name})")
         except OSError: pass       # gia' morto: bene
     try: os.unlink(pf)
     except OSError: pass
