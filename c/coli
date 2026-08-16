@@ -1315,6 +1315,30 @@ def cmd_chat(a):
 
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
 
+def _pid_alive(pid):
+    """True if `pid` is a live process. os.kill(pid, 0) is the POSIX idiom, but on
+    Windows os.kill() has no signal semantics: for a pid this process did not spawn
+    it raises OSError [WinError 87] ("The parameter is incorrect") rather than
+    reporting liveness. cmd_stop's pidfile probe swallowed that as "not running",
+    so a live serve on a listening port reported "nothing running" and was left up.
+    Query the OS directly there instead: OpenProcess + GetExitCodeProcess, which
+    needs only PROCESS_QUERY_LIMITED_INFORMATION."""
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h: return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0); return True
+    except OSError:
+        return False
+
 def _serve_cmdline_matches_port(raw, port):
     argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
     try: coli_i=next(i for i,arg in enumerate(argv) if os.path.basename(arg)=="coli")
@@ -1382,7 +1406,7 @@ def cmd_stop(a):
     pf=serve_pidfile(a.port)
     try:
         with open(pf) as f: pid=int(f.read().split()[0])
-        os.kill(pid,0); targets[pid]=f"coli serve (pidfile, port {a.port})"
+        if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
     try: proc_entries=os.listdir("/proc")
     except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
