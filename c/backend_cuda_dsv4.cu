@@ -1284,9 +1284,15 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
 #endif /* COLI_DSV4_TC */
 extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,float limit,float *y,const float *x){
-    if(count<1||count>16||!gate||!up||!down)return 0;Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
-    if(!c||t->fmt!=4||!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
-    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4||gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H)return 0;
+    if(count<1||count>16||!gate||!up||!down){fprintf(stderr,"[DSV4 CUDA] expert-group bad args (count=%d)\n",count);return 0;}Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
+    if(!c||t->fmt!=4){fprintf(stderr,"[DSV4 CUDA] expert-group invalid tensor (fmt=%d)\n",t?t->fmt:-1);return 0;}
+    if(!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
+    for(int e=0;e<count;e++){
+        if(!gate[e]||!up[e]||!down[e]){fprintf(stderr,"[DSV4 CUDA] expert-group null tensor at e=%d\n",e);return 0;}
+        if(gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device){fprintf(stderr,"[DSV4 CUDA] expert-group device mismatch at e=%d\n",e);return 0;}
+        if(gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4){fprintf(stderr,"[DSV4 CUDA] expert-group fmt mismatch at e=%d (g=%d u=%d d=%d)\n",e,gate[e]->fmt,up[e]->fmt,down[e]->fmt);return 0;}
+        if(gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H){fprintf(stderr,"[DSV4 CUDA] expert-group shape mismatch at e=%d (H=%d I=%d gI=%d gO=%d uI=%d uO=%d dI=%d dO=%d)\n",e,H,I,gate[e]->I,gate[e]->O,up[e]->I,up[e]->O,down[e]->I,down[e]->O);return 0;}
+    }
     size_t xb=(size_t)H*4,ib=(size_t)count*I*4,hb=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,(size_t)H*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||

@@ -6500,6 +6500,9 @@ int coli_v4_expert_forward_tiered(float *output, const ColiExpertView *expert,
             if (dsv4_cuda_expert_group(&g, &u, &d, &w, 1, swiglu_limit,
                                        output, input))
                 return 0;   /* output = w * expert(x), written by the kernel */
+            fprintf(stderr, "[DSV4 CUDA] expert dispatch failed "
+                    "(layer=%d expert=%d); falling back to CPU\n",
+                    expert->key.layer, expert->key.expert);
         }
     }
     return coli_v4_expert_forward_ref(output, expert, input, route_weight,
