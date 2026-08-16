@@ -1081,6 +1081,9 @@ tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h 
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c backend_xdna.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

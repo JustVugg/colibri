@@ -254,3 +254,61 @@ Covered: helper absent, good helper, wrong ABI generation, missing required
 entry point, present-but-unloadable helper (a deleted dependency), repeated
 probes, the three shutdown orders, and a dependency inspection asserting the
 ordinary `colibri` binary imports neither XRT nor the helper.
+
+### Artifact registry (engine-owned)
+
+Colibri decides which artifact answers which operation, and whether that artifact
+can be trusted. The helper decides neither, and never sees a choice it did not
+receive.
+
+A registry row records what the research programme established about one
+artifact: its semantic family, the exact M bucket it was compiled for, K and N,
+the activation/prepared-weight/output dtypes, the target device family, logical
+filenames for the `.xclbin` and its instruction stream, the SHA256 of each, and
+four independent qualification facts.
+
+**Lookup requires an explicit semantic family.** Two operations with identical
+M/K/N are still different operations, and one may never inherit the other's
+qualification. Shape alone is not eligibility.
+
+**Buckets are exact.** A row describes the M the program was compiled and
+qualified for. Nothing interpolates between qualified buckets.
+
+**Integrity is byte identity.** Both files must exist and both SHA256 values must
+match before an artifact is usable. Presence and integrity are separate verdicts:
+a missing file means this build does not ship that artifact, a hash mismatch
+means the bytes are not the bytes that were qualified.
+
+**Compiling is not qualifying.** Four research facts are required — runtime
+weight, correctness, userptr and structural — and they are checked *before* the
+filesystem, so a row that was never correctness-qualified declines whether or not
+its bytes are present and intact. This matters: research measured a design that
+compiled, loaded, dispatched to completion, returned finite numbers and was
+numerically wrong. A successful dispatch is not evidence of a correct one.
+
+SHA256 is implemented in `backend_xdna.c` rather than taken from a system
+library, so the registry stays portable and the host acquires no new link
+dependency. It is covered by the standard NIST vectors.
+
+### What STATIC_ARTIFACT_QUALIFIED means
+
+It means Colibri knows this operation, holds a matching qualified artifact
+definition, and the bytes on disk are the bytes that were qualified.
+
+It does **not** mean a device exists, a context can be created, a weight has been
+prepared, a pointer is aligned, memory is available, or that running on the NPU
+would be preferable. Those gates do not exist yet. Helper availability, artifact
+qualification, device readiness, prepared-weight validity and economic preference
+are five independent concepts and are not collapsed into one flag.
+
+### Artifacts are not shipped
+
+The registry names the qualified artifacts for the first family; the build does
+not contain them. Where they should live is a packaging decision that has not
+been made. An absent artifact yields `ARTIFACT_UNAVAILABLE` and the operation
+continues on its current path — that is the intended state, not an error, and no
+startup path can fail because of it.
+
+Logical filenames resolve under a caller-supplied root. There is no PATH search,
+no current-directory fallback, and a name that tries to escape its root is
+rejected during registry validation, before it can reach the filesystem.
