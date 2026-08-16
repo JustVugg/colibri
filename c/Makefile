@@ -713,6 +713,18 @@ shaders/%.spv: shaders/%.comp
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 	$(CC) $(CFLAGS) -c backend_loader.c -o $@
 
+# Optional XDNA2 (Ryzen AI NPU) lane, host side only. This object resolves an
+# optional coli_xdna.dll at runtime and links nothing: it needs no XRT header,
+# no XRT import library and no NPU, exactly like backend_loader.o needs no CUDA
+# SDK. colibri$(EXE) does NOT link it yet -- there is no caller until the
+# operation seam lands -- so the default build stays byte-for-byte what it was.
+# The rule exists so an ordinary `make xdna-obj` (and the loader tests, which
+# compile the same source in place) catch a break in the C side early.
+.PHONY: xdna-obj
+xdna-obj: backend_xdna.o
+backend_xdna.o: backend_xdna.c backend_xdna.h .build-config
+	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
+
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a

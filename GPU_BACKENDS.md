@@ -185,3 +185,72 @@ on real hardware is for (matrix below).
   `PIN=auto` + `PIN_FILL` + `CUDA_RELEASE_HOST`, which achieve the same
   capacity extension with deeper engine integration; this branch's safety
   and validation work now targets that mechanism.
+
+## Optional XDNA2 (Ryzen AI NPU) lane
+
+Status: **binding foundation only.** There is no NPU compute path yet.
+
+XDNA2 is an *optional compute lane*, not an engine and not a GPU. Colibri keeps
+model semantics, routing, expert identity, weight ownership, scheduling and
+fallback; the lane would only ever execute one already-selected, already
+qualified operation. Nothing about it is required to build or run Colibri.
+
+### What is optional, and how
+
+| concern | answer |
+|---|---|
+| does ordinary Colibri need XRT? | **no** — no header, no import library, no DLL import |
+| does the default build need an XDNA SDK? | **no** |
+| does a machine need an NPU? | **no** — absence is a normal machine, not an error |
+| where does XRT live? | only inside an optional native helper, `coli_xdna.dll` |
+| how is the helper reached? | resolved at runtime, exactly like `coli_cuda.dll` / `coli_hip.dll` in `backend_loader.c` |
+
+`c/backend_xdna.h` and `c/backend_xdna.c` are the host-side owners. They never
+include or link XRT. `colibri` does not link them yet either: there is no caller
+until an operation seam lands, so the default binary is byte-for-byte what it
+was. `make xdna-obj` compiles the host side on its own.
+
+### What this slice implements
+
+- a versioned C ABI boundary (`COLI_XDNA_ABI_VERSION`) to an optional helper
+- runtime discovery and binding of `coli_xdna.dll`, looked up by absolute path
+  beside the executable — no PATH search, no current-directory search
+- **all-or-nothing binding**: a helper is usable only when it loads, reports the
+  expected ABI generation, and exports every entry point this host requires. Any
+  failure leaves nothing callable behind
+- a sticky verdict, so a machine without a helper pays one lookup, not one per
+  operation
+- safe shutdown: before probing, after a failed probe, after a good bind, and
+  repeatedly
+
+A successful bind means `HELPER_ABI_AVAILABLE` and nothing more.
+
+### What this slice does NOT implement
+
+Device discovery, XRT initialization, artifact registry, `.xclbin` loading,
+weight preparation, buffer wrapping, dispatch, matmul interception, scheduling
+policy, and any user-facing switch. There is deliberately no `--xdna` flag and
+no `COLI_XDNA*` environment variable: the lane has no operation to offer yet, so
+advertising a control would be premature.
+
+**No real XRT-linked helper is built by this slice.** The XRT-owning helper
+source is not compiled here, because binding is fully qualified without it (see
+below) and dead XRT-linked code would contaminate the build for no gain.
+
+### Validation (no NPU, no XRT, no hardware)
+
+The whole binding contract is qualified against *synthetic* helper DLLs built by
+the tests with the same MinGW gcc the loader tests already require. Those
+fixtures contain no XRT and do no accelerator work; the contract under test is
+the loader's verdict, which is reached long before any real runtime would be.
+
+```
+python -m unittest test_backend_loader.XdnaLoaderOwnerTest \
+                   test_backend_loader.XdnaOptionalBindingTest \
+                   test_backend_loader.XdnaDefaultBuildIndependenceTest
+```
+
+Covered: helper absent, good helper, wrong ABI generation, missing required
+entry point, present-but-unloadable helper (a deleted dependency), repeated
+probes, the three shutdown orders, and a dependency inspection asserting the
+ordinary `colibri` binary imports neither XRT nor the helper.

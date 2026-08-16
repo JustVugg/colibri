@@ -2415,5 +2415,350 @@ class LoaderBackendSelectionTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
 
 
+
+
+# ---------------------------------------------------------------------------
+# W2-N7-I1: the optional XDNA helper binding contract.
+#
+# c/backend_xdna.c is the C-side loader for an OPTIONAL native helper DLL. It
+# must never require XRT: the helper owns XRT, the host owns only the binding.
+# These tests compile the production loader in place from c/ (never a copy) and
+# drive it against synthetic helpers built with the same MinGW gcc the loader
+# tests already require. Nothing here needs XRT, an NPU, or coli_xdna.dll.
+#
+# The contract under test is the BINDING, not the device: a successful bind
+# means HELPER_ABI_AVAILABLE and nothing more.
+# ---------------------------------------------------------------------------
+
+_XDNA_HELPER_BASENAME = "coli_xdna.dll"
+
+# Synthetic helper. Never links XRT; -D switches select the defect under test.
+_XDNA_FAKE_HELPER_C = r'''
+#include <windows.h>
+
+#ifndef FAKE_ABI_VERSION
+#define FAKE_ABI_VERSION 1u
+#endif
+
+__declspec(dllexport) unsigned int coli_xdna_helper_abi_version(void){
+    return (unsigned int)FAKE_ABI_VERSION;
+}
+
+#ifndef FAKE_OMIT_SHUTDOWN
+__declspec(dllexport) void coli_xdna_helper_shutdown(void){ }
+#endif
+
+#ifdef FAKE_NEEDS_MISSING_DEP
+/* Pulls in a dependency the test deletes, so LoadLibrary fails with 126
+ * (ERROR_MOD_NOT_FOUND) instead of the file being absent outright. */
+__declspec(dllimport) int coli_xdna_fake_dep_probe(void);
+__declspec(dllexport) int coli_xdna_helper_touch_dep(void){
+    return coli_xdna_fake_dep_probe();
+}
+#endif
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved){
+    (void)h; (void)reason; (void)reserved; return TRUE;
+}
+'''
+
+_XDNA_FAKE_DEP_C = r'''
+#include <windows.h>
+__declspec(dllexport) int coli_xdna_fake_dep_probe(void){ return 7; }
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved){
+    (void)h; (void)reason; (void)reserved; return TRUE;
+}
+'''
+
+# Harness: compiles the REAL c/backend_xdna.c and drives its test seams.
+_XDNA_HARNESS_C = r'''
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "backend_xdna.c"
+
+static void report(const char *tag){
+    ColiXdnaBinding s = coli_xdna_binding();
+    printf("%s=%s attempts=%d\n", tag, coli_xdna_binding_text(s),
+           coli_xdna_test_load_attempts());
+}
+
+int main(int argc, char **argv){
+    const char *mode = argc > 1 ? argv[1] : "";
+    const char *path = argc > 2 ? argv[2] : NULL;
+
+    if(path && *path) coli_xdna_test_set_helper_path(path);
+
+    if(!strcmp(mode, "probe")){
+        report("state");
+        return 0;
+    }
+    if(!strcmp(mode, "repeat")){
+        int n = argc > 3 ? atoi(argv[3]) : 5;
+        for(int i = 0; i < n; i++) (void)coli_xdna_binding();
+        report("state");
+        return 0;
+    }
+    if(!strcmp(mode, "shutdown_after_probe")){
+        report("before");
+        coli_xdna_shutdown();
+        printf("shutdown_ok=1\n");
+        coli_xdna_shutdown();          /* repeated shutdown must be safe */
+        printf("second_shutdown_ok=1\n");
+        return 0;
+    }
+    if(!strcmp(mode, "shutdown_without_probe")){
+        coli_xdna_shutdown();
+        printf("shutdown_ok=1\n");
+        printf("state=%s\n", coli_xdna_binding_text(coli_xdna_test_state()));
+        return 0;
+    }
+    if(!strcmp(mode, "callable")){
+        /* A rejected helper must leave NO callable entry point behind. */
+        report("state");
+        printf("callable=%d\n", coli_xdna_test_entry_points_bound());
+        return 0;
+    }
+    fprintf(stderr, "unknown_mode=%s\n", mode);
+    return 2;
+}
+'''
+
+
+class XdnaLoaderOwnerTest(unittest.TestCase):
+    """The optional XDNA loader must exist and declare its binding contract.
+
+    This owner needs no toolchain: it is the contract that c/backend_xdna.{c,h}
+    are the C-side owners of the optional helper boundary, and that the boundary
+    is versioned and all-or-nothing.
+    """
+
+    def test_loader_owner_files_exist(self):
+        for name in ("backend_xdna.h", "backend_xdna.c"):
+            with self.subTest(source=name):
+                self.assertTrue((HERE / name).is_file(),
+                                "c/%s is the C-side XDNA owner and must exist" % name)
+
+    def test_header_declares_the_binding_contract(self):
+        hdr = (HERE / "backend_xdna.h").read_text(encoding="utf-8", errors="replace")
+        for token in ("COLI_XDNA_ABI_VERSION", "ColiXdnaBinding",
+                      "COLI_XDNA_UNPROBED", "COLI_XDNA_AVAILABLE",
+                      "COLI_XDNA_ABSENT", "COLI_XDNA_LOAD_FAILED",
+                      "COLI_XDNA_ABI_INCOMPATIBLE", "COLI_XDNA_SYMBOL_INCOMPLETE",
+                      "coli_xdna_binding", "coli_xdna_shutdown"):
+            with self.subTest(token=token):
+                self.assertIn(token, hdr)
+
+
+class XdnaOptionalBindingTest(unittest.TestCase):
+    """Does the optional XDNA helper bind all-or-nothing, and stay optional?
+
+    Every case runs the production c/backend_xdna.c. The helper under test is a
+    synthetic DLL with no XRT in it; the point is the loader's verdict, which is
+    reached long before any real runtime would be.
+    """
+
+    tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+        cls.tmp = tempfile.TemporaryDirectory(prefix="coli xdna bind ")
+        root = Path(cls.tmp.name)
+        cls.root = root
+
+        def gcc(args, what):
+            cmd = ["gcc"] + args
+            proc = subprocess.run(cmd, text=True, errors="replace",
+                                  capture_output=True, timeout=300)
+            if proc.returncode != 0:
+                raise FixtureBuildError(
+                    "%s failed (rc=%d)\ncommand: %s\nstdout:\n%s\nstderr:\n%s"
+                    % (what, proc.returncode, " ".join(cmd), proc.stdout, proc.stderr))
+            return proc
+
+        cls._gcc = staticmethod(gcc)
+
+        helper_src = root / "fake_helper.c"
+        helper_src.write_text(_XDNA_FAKE_HELPER_C, encoding="ascii")
+        dep_src = root / "fake_dep.c"
+        dep_src.write_text(_XDNA_FAKE_DEP_C, encoding="ascii")
+        harness_src = root / "xdna_harness.c"
+        harness_src.write_text(_XDNA_HARNESS_C, encoding="ascii")
+
+        # Good helper: current ABI, complete entry points.
+        cls.good = root / "good" / _XDNA_HELPER_BASENAME
+        cls.good.parent.mkdir(parents=True, exist_ok=True)
+        gcc(["-O0", "-shared", str(helper_src), "-o", str(cls.good)],
+            "building the good synthetic helper")
+
+        # Wrong ABI version.
+        cls.bad_abi = root / "bad_abi" / _XDNA_HELPER_BASENAME
+        cls.bad_abi.parent.mkdir(parents=True, exist_ok=True)
+        gcc(["-O0", "-shared", "-DFAKE_ABI_VERSION=999u", str(helper_src),
+             "-o", str(cls.bad_abi)], "building the wrong-ABI synthetic helper")
+
+        # Missing a required entry point.
+        cls.incomplete = root / "incomplete" / _XDNA_HELPER_BASENAME
+        cls.incomplete.parent.mkdir(parents=True, exist_ok=True)
+        gcc(["-O0", "-shared", "-DFAKE_OMIT_SHUTDOWN", str(helper_src),
+             "-o", str(cls.incomplete)], "building the incomplete synthetic helper")
+
+        # Present but unloadable: imports a dependency that is then deleted.
+        cls.unloadable = root / "unloadable" / _XDNA_HELPER_BASENAME
+        cls.unloadable.parent.mkdir(parents=True, exist_ok=True)
+        dep_dll = cls.unloadable.parent / "coli_xdna_fake_dep.dll"
+        gcc(["-O0", "-shared", str(dep_src), "-o", str(dep_dll)],
+            "building the synthetic helper dependency")
+        gcc(["-O0", "-shared", "-DFAKE_NEEDS_MISSING_DEP", str(helper_src),
+             "-o", str(cls.unloadable), str(dep_dll)],
+            "building the dependency-bound synthetic helper")
+        dep_dll.unlink()          # now the helper cannot load
+
+        cls.absent = root / "empty" / _XDNA_HELPER_BASENAME   # never created
+        cls.absent.parent.mkdir(parents=True, exist_ok=True)
+
+        cls.harness = root / "xdna_harness.exe"
+        gcc(["-O0", "-I", str(HERE), str(harness_src), "-o", str(cls.harness)],
+            "building the XDNA loader harness")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.tmp is not None:
+            cls.tmp.cleanup()
+            cls.tmp = None
+
+    def _run(self, mode, path, *extra):
+        cmd = [str(self.harness), mode, str(path)] + [str(a) for a in extra]
+        proc = subprocess.run(cmd, text=True, errors="replace",
+                              capture_output=True, timeout=120)
+        self.assertEqual(proc.returncode, 0,
+                         "harness failed: %s\n%s\n%s"
+                         % (" ".join(cmd), proc.stdout, proc.stderr))
+        return proc.stdout
+
+    def _state(self, out, key="state"):
+        for line in out.splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].split(" ")[0]
+        self.fail("no %s= line in harness output:\n%s" % (key, out))
+
+    # -- the load-bearing case: absence is not a failure --------------------
+    def test_absent_helper_is_not_fatal(self):
+        out = self._run("probe", self.absent)
+        self.assertEqual(self._state(out), "ABSENT")
+
+    def test_good_helper_binds(self):
+        out = self._run("probe", self.good)
+        self.assertEqual(self._state(out), "AVAILABLE")
+
+    def test_wrong_abi_is_rejected(self):
+        out = self._run("probe", self.bad_abi)
+        self.assertEqual(self._state(out), "ABI_INCOMPATIBLE")
+
+    def test_missing_required_entry_point_is_rejected(self):
+        out = self._run("probe", self.incomplete)
+        self.assertEqual(self._state(out), "SYMBOL_INCOMPLETE")
+
+    def test_unloadable_helper_is_rejected_not_fatal(self):
+        out = self._run("probe", self.unloadable)
+        self.assertEqual(self._state(out), "LOAD_FAILED")
+
+    # -- all-or-nothing ----------------------------------------------------
+    def test_rejected_helper_leaves_nothing_callable(self):
+        for name, path in (("bad_abi", self.bad_abi),
+                           ("incomplete", self.incomplete),
+                           ("unloadable", self.unloadable),
+                           ("absent", self.absent)):
+            with self.subTest(helper=name):
+                out = self._run("callable", path)
+                self.assertEqual(self._state(out, "callable"), "0")
+
+    def test_bound_helper_reports_its_entry_points(self):
+        out = self._run("callable", self.good)
+        self.assertEqual(self._state(out, "callable"), "1")
+
+    # -- sticky verdict ----------------------------------------------------
+    def test_repeated_probe_loads_at_most_once(self):
+        for name, path in (("good", self.good), ("absent", self.absent),
+                           ("bad_abi", self.bad_abi)):
+            with self.subTest(helper=name):
+                out = self._run("repeat", path, 8)
+                # attempts is reported on the same line as state=
+                line = [l for l in out.splitlines() if l.startswith("state=")][0]
+                attempts = int(line.split("attempts=")[1])
+                self.assertLessEqual(attempts, 1,
+                                     "loader re-probed %d times: %s" % (attempts, out))
+
+    # -- lifetime ----------------------------------------------------------
+    def test_shutdown_after_bind_is_safe_and_repeatable(self):
+        out = self._run("shutdown_after_probe", self.good)
+        self.assertEqual(self._state(out, "before"), "AVAILABLE")
+        self.assertIn("shutdown_ok=1", out)
+        self.assertIn("second_shutdown_ok=1", out)
+
+    def test_shutdown_without_probe_is_safe(self):
+        out = self._run("shutdown_without_probe", self.absent)
+        self.assertIn("shutdown_ok=1", out)
+        self.assertEqual(self._state(out), "UNPROBED")
+
+    def test_shutdown_after_failed_bind_is_safe(self):
+        out = self._run("shutdown_after_probe", self.bad_abi)
+        self.assertEqual(self._state(out, "before"), "ABI_INCOMPATIBLE")
+        self.assertIn("second_shutdown_ok=1", out)
+
+
+class XdnaDefaultBuildIndependenceTest(unittest.TestCase):
+    """Does the ordinary host stay free of XRT and of the helper?
+
+    c/backend_xdna.c is the only C-side XDNA owner and it must compile with no
+    XRT header available. The default host must import neither XRT nor the
+    optional helper.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+
+    def test_loader_source_names_no_xrt_header(self):
+        src = (HERE / "backend_xdna.c").read_text(encoding="utf-8", errors="replace")
+        hdr = (HERE / "backend_xdna.h").read_text(encoding="utf-8", errors="replace")
+        for name, text in (("backend_xdna.c", src), ("backend_xdna.h", hdr)):
+            with self.subTest(source=name):
+                self.assertNotIn("xrt/", text,
+                                 "%s must not include any XRT header" % name)
+                self.assertNotIn("xrt_", text.replace("coli_xdna_", ""),
+                                 "%s must not name an XRT symbol" % name)
+
+    def test_loader_compiles_without_any_xrt_include_path(self):
+        with tempfile.TemporaryDirectory(prefix="coli xdna nodep ") as tmp:
+            obj = Path(tmp) / "backend_xdna.o"
+            cmd = ["gcc", "-O0", "-c", str(HERE / "backend_xdna.c"), "-o", str(obj)]
+            proc = subprocess.run(cmd, text=True, errors="replace",
+                                  capture_output=True, timeout=300)
+            self.assertEqual(proc.returncode, 0,
+                             "the C-side loader must compile with no XRT present:\n%s\n%s"
+                             % (proc.stdout, proc.stderr))
+            self.assertTrue(obj.is_file())
+
+    def test_default_host_imports_neither_xrt_nor_helper(self):
+        exe = HERE / "colibri.exe"
+        if not exe.is_file():
+            raise unittest.SkipTest("c/colibri.exe not built here")
+        proc = subprocess.run(["objdump", "-p", str(exe)], text=True,
+                              errors="replace", capture_output=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        imports = [l.split()[-1].lower() for l in proc.stdout.splitlines()
+                   if "DLL Name:" in l]
+        for bad in ("xrt_coreutil.dll", "xrt_core.dll", "xrt_coreutil_static.dll",
+                    _XDNA_HELPER_BASENAME):
+            self.assertNotIn(bad, imports,
+                             "default host must not import %s (imports: %s)"
+                             % (bad, imports))
+
 if __name__ == "__main__":
     unittest.main()
