@@ -8443,12 +8443,23 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #endif
 }
 
+/* EOS for EVERY generation entry point (run_text / run_serve / run_serve_mux):
+ * GLM's <|endoftext|> first, then MiniMax-M3's [e~[. One helper on purpose — a -1
+ * EOS is not benign downstream: sample.h's batched-serve stop filter (#401) is
+ * gated on tok_eos>=0, so an unresolved EOS arms EVERY tokenizer special token as
+ * a hard stop and the first M3 tool-call marker would end the turn. */
+static int tok_eos_resolve(Tok *T){
+    int eos=tok_id_of(T,"<|endoftext|>");
+    if(eos<0) eos=tok_id_of(T,"[e~[");          /* MiniMax-M3 end-of-sequence */
+    return eos;
+}
+
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
+    int eos=tok_eos_resolve(&T);
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
@@ -9228,7 +9239,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
+    Tok T; tok_load(&T,tkp); int eos=tok_eos_resolve(&T); stops_arm_tok(&m->c,eos,&T);
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
@@ -9412,8 +9423,7 @@ static void run_serve(Model *m, const char *snap){
     double t_serve0=now_s();             /* PROF: wall base for the exit-time profile_print */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
-    if(eos<0) eos=tok_id_of(&T,"[e~[");          /* MiniMax-M3 end-of-sequence */
+    int eos=tok_eos_resolve(&T);
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
