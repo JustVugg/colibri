@@ -19,6 +19,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+/* posix_memalign / compat_aligned_free. compat.h already maps these onto
+ * _aligned_malloc/_aligned_free on Windows and carries the warning that the
+ * two MUST be paired -- reusing it avoids a second aligned-allocation
+ * convention in the same tree. */
+#include "compat.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -518,7 +526,173 @@ void coli_xdna_test_set_registry(const ColiXdnaArtifact *rows, int count){
     else                 { g_rows = g_xdna_production_rows;  g_nrows = g_xdna_production_count; }
 }
 
-/* This slice opens no device and calls no helper entry point. The counters make
- * that assertable rather than merely stated. */
+/* ======================================================================
+ * Prepared host state
+ *
+ * Engine-owned, derived from the authoritative fmt=4 tensor and never a
+ * replacement for it. The helper neither allocates nor frees any of this.
+ * ====================================================================== */
+
+struct ColiXdnaPrepared {
+    ColiXdnaPrepState state;
+    void            *base;      /* 4096-aligned, from posix_memalign */
+    size_t           bytes;     /* logical payload: k*n*sizeof(bf16) */
+    size_t           capacity;  /* what base can actually hold */
+    unsigned         k, n;
+};
+
+/* Engine-side host accounting. Deliberately counts LOGICAL payload bytes: the
+ * allocator's own bookkeeping overhead is real but not knowable from here, and
+ * reporting a number we cannot substantiate would be worse than reporting the
+ * one we can. */
+static size_t g_xdna_prepared_bytes;
+static int    g_xdna_prepared_objects;
+
+const char *coli_xdna_prep_text(ColiXdnaPrepState s){
+    switch(s){
+        case COLI_XDNA_PREP_UNPREPARED: return "UNPREPARED";
+        case COLI_XDNA_PREP_PREPARING:  return "PREPARING";
+        case COLI_XDNA_PREP_VALID:      return "PREPARED_VALID";
+        case COLI_XDNA_PREP_INVALID:    return "PREPARED_INVALID";
+    }
+    return "UNKNOWN";
+}
+
+int coli_xdna_pointer_alignment_ok(const void *p){
+    if(!p) return 0;
+    return ((uintptr_t)p % (uintptr_t)COLI_XDNA_PREPARED_ALIGNMENT) == 0;
+}
+
+ColiXdnaPrepared *coli_xdna_prepared_create(void){
+    ColiXdnaPrepared *p = (ColiXdnaPrepared *)calloc(1, sizeof *p);
+    if(!p) return NULL;
+    p->state = COLI_XDNA_PREP_UNPREPARED;
+    g_xdna_prepared_objects++;
+    return p;
+}
+
+/* Drop capacity only. Validity and allocation lifetime are separate concerns,
+ * so they get separate operations. */
+void coli_xdna_prepared_free_buffer(ColiXdnaPrepared *p){
+    if(!p) return;
+    if(p->base){
+        compat_aligned_free(p->base);       /* MUST pair with posix_memalign */
+        p->base = NULL;
+    }
+    if(g_xdna_prepared_bytes >= p->bytes) g_xdna_prepared_bytes -= p->bytes;
+    else                                  g_xdna_prepared_bytes = 0;
+    p->bytes = 0; p->capacity = 0; p->k = 0; p->n = 0;
+    p->state = COLI_XDNA_PREP_UNPREPARED;
+}
+
+void coli_xdna_prepared_release(ColiXdnaPrepared **pp){
+    if(!pp || !*pp) return;
+    coli_xdna_prepared_free_buffer(*pp);
+    free(*pp);
+    *pp = NULL;                              /* repeated release is a no-op */
+    if(g_xdna_prepared_objects > 0) g_xdna_prepared_objects--;
+}
+
+/* k*n*2 with checked arithmetic. An unchecked product would wrap and reach the
+ * allocator as a small, plausible number, which is the worst possible outcome:
+ * a successful allocation far too small for what the caller will write. */
+static int coli_xdna_payload_bytes(unsigned k, unsigned n, ColiXdnaDtype dt, size_t *out){
+    if(k == 0 || n == 0) return 0;
+    if(dt != COLI_XDNA_DT_BF16) return 0;    /* only the qualified prepared dtype */
+    size_t kk = (size_t)k, nn = (size_t)n;
+    if(kk > SIZE_MAX / nn) return 0;
+    size_t elems = kk * nn;
+    if(elems > SIZE_MAX / 2u) return 0;
+    *out = elems * 2u;                       /* sizeof(bf16) */
+    return 1;
+}
+
+int coli_xdna_prepare_begin(ColiXdnaPrepared *p, unsigned k, unsigned n,
+                            ColiXdnaDtype prepared_dtype){
+    if(!p) return 0;
+    size_t need = 0;
+    if(!coli_xdna_payload_bytes(k, n, prepared_dtype, &need)) return 0;
+
+    /* Reuse retained capacity when it is genuinely large enough. The old bytes
+     * stay physically present and are NOT semantically valid: the state is
+     * PREPARING until a producer publishes success over them. */
+    if(!p->base || p->capacity < need){
+        void *fresh = NULL;
+        if(p->base){
+            compat_aligned_free(p->base);
+            p->base = NULL;
+            if(g_xdna_prepared_bytes >= p->bytes) g_xdna_prepared_bytes -= p->bytes;
+            else                                  g_xdna_prepared_bytes = 0;
+            p->bytes = 0; p->capacity = 0;
+        }
+        if(posix_memalign(&fresh, COLI_XDNA_PREPARED_ALIGNMENT, need) != 0 || !fresh){
+            p->state = COLI_XDNA_PREP_UNPREPARED;
+            return 0;
+        }
+        /* The allocator is contracted to align, but the contract is re-checked:
+         * an unaligned buffer must never travel further than this line. */
+        if(!coli_xdna_pointer_alignment_ok(fresh)){
+            compat_aligned_free(fresh);
+            p->state = COLI_XDNA_PREP_UNPREPARED;
+            return 0;
+        }
+        p->base = fresh;
+        p->capacity = need;
+    } else {
+        if(g_xdna_prepared_bytes >= p->bytes) g_xdna_prepared_bytes -= p->bytes;
+        else                                  g_xdna_prepared_bytes = 0;
+    }
+
+    p->bytes = need;                         /* logical payload, never rounded */
+    p->k = k; p->n = n;
+    g_xdna_prepared_bytes += need;
+    p->state = COLI_XDNA_PREP_PREPARING;
+    return 1;
+}
+
+void *coli_xdna_prepare_dest(ColiXdnaPrepared *p){
+    /* Only a producer inside an open cycle may write. A published image is not
+     * writable, so it cannot be corrupted while something believes it valid. */
+    if(!p || p->state != COLI_XDNA_PREP_PREPARING) return NULL;
+    return p->base;
+}
+
+int coli_xdna_prepare_publish_success(ColiXdnaPrepared *p){
+    if(!p) return 0;
+    if(p->state != COLI_XDNA_PREP_PREPARING) return 0;   /* no shortcut to VALID */
+    if(!p->base || !coli_xdna_pointer_alignment_ok(p->base)) return 0;
+    if(p->bytes == 0 || p->capacity < p->bytes) return 0;
+    p->state = COLI_XDNA_PREP_VALID;
+    return 1;
+}
+
+void coli_xdna_prepare_publish_failure(ColiXdnaPrepared *p){
+    if(!p) return;
+    if(p->state != COLI_XDNA_PREP_PREPARING) return;
+    /* Capacity is retained and still accounted; only the contents are revoked. */
+    p->state = COLI_XDNA_PREP_INVALID;
+}
+
+int coli_xdna_prepared_invalidate(ColiXdnaPrepared *p){
+    if(!p) return 0;
+    if(p->state != COLI_XDNA_PREP_VALID) return 0;
+    p->state = COLI_XDNA_PREP_INVALID;
+    return 1;
+}
+
+ColiXdnaPrepState coli_xdna_prepared_state(const ColiXdnaPrepared *p){
+    return p ? p->state : COLI_XDNA_PREP_UNPREPARED;
+}
+size_t   coli_xdna_prepared_bytes(const ColiXdnaPrepared *p){ return p ? p->bytes : 0; }
+unsigned coli_xdna_prepared_k(const ColiXdnaPrepared *p){ return p ? p->k : 0u; }
+unsigned coli_xdna_prepared_n(const ColiXdnaPrepared *p){ return p ? p->n : 0u; }
+
+size_t coli_xdna_prepared_total_bytes(void){ return g_xdna_prepared_bytes; }
+int    coli_xdna_prepared_live_objects(void){ return g_xdna_prepared_objects; }
+
+/* This slice opens no device, calls no helper entry point, wraps no pointer and
+ * converts nothing. The counters make that assertable rather than merely stated. */
 int coli_xdna_test_device_opens(void){ return 0; }
 int coli_xdna_test_helper_calls(void){ return 0; }
+int coli_xdna_test_userptr_wraps(void){ return 0; }
+int coli_xdna_test_conversions(void){ return 0; }

@@ -1081,6 +1081,13 @@ tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h 
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Compiles the engine with -DCOLI_XDNA so the QT side pointer, its reset helper
+# and the expert-slot wiring are exercised as the engine actually builds them.
+tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_xdna.c backend_xdna.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c backend_xdna.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

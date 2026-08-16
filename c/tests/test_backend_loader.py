@@ -2621,7 +2621,11 @@ class XdnaOptionalBindingTest(unittest.TestCase):
         cls.absent.parent.mkdir(parents=True, exist_ok=True)
 
         cls.harness = root / "xdna_harness.exe"
-        gcc(["-O0", "-I", str(HERE), str(harness_src), "-o", str(cls.harness)],
+        # c/compat.h:80 makes -D_FILE_OFFSET_BITS=64 mandatory on Windows, and the
+        # project CFLAGS always carry it. Compiling the loader the way the build
+        # actually compiles it keeps this owner honest rather than lenient.
+        gcc(["-O0", "-D_FILE_OFFSET_BITS=64", "-I", str(HERE), str(harness_src),
+             "-o", str(cls.harness)],
             "building the XDNA loader harness")
 
     @classmethod
@@ -2737,7 +2741,8 @@ class XdnaDefaultBuildIndependenceTest(unittest.TestCase):
     def test_loader_compiles_without_any_xrt_include_path(self):
         with tempfile.TemporaryDirectory(prefix="coli xdna nodep ") as tmp:
             obj = Path(tmp) / "backend_xdna.o"
-            cmd = ["gcc", "-O0", "-c", str(HERE / "backend_xdna.c"), "-o", str(obj)]
+            cmd = ["gcc", "-O0", "-D_FILE_OFFSET_BITS=64",
+                   "-c", str(HERE / "backend_xdna.c"), "-o", str(obj)]
             proc = subprocess.run(cmd, text=True, errors="replace",
                                   capture_output=True, timeout=300)
             self.assertEqual(proc.returncode, 0,

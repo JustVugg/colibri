@@ -312,3 +312,65 @@ startup path can fail because of it.
 Logical filenames resolve under a caller-supplied root. There is no PATH search,
 no current-directory fallback, and a name that tries to escape its root is
 rejected during registry validation, before it can reach the filesystem.
+
+### Prepared host state (engine-owned)
+
+The prepared BF16 image is **derived, disposable host state**. The stored fmt=4
+tensor stays authoritative and is never replaced, mutated or freed by anything in
+the prepared-state path.
+
+Three properties vary independently and are never collapsed into one flag:
+
+| property | question |
+|---|---|
+| allocation | is a buffer held? |
+| validity | are its contents usable? |
+| consumption | how many host bytes does it cost? |
+
+An invalid buffer still costs memory, and no amount of successful allocation
+makes contents valid.
+
+```
+UNPREPARED ──begin──> PREPARING ──publish success──> PREPARED_VALID
+                          │                                │
+                          └──publish failure──> PREPARED_INVALID <──invalidate──┘
+```
+
+`PREPARED_VALID` is reachable **only** through an explicit success publication
+after `PREPARING`. An `INVALID` image can never shortcut back to valid: it must
+go through a complete new cycle. A writable destination exists only while
+`PREPARING`, so a published image cannot be rewritten behind its own back.
+
+Allocation is 4096-byte aligned, reusing the repository's existing
+`posix_memalign` / `compat_aligned_free` pair from `c/compat.h`. The **payload
+size need not be a page multiple** and is never rounded up behind the caller: a
+30-byte payload reports 30 bytes and still gets an aligned pointer. Sizes are
+computed with checked arithmetic, so a product that would exceed `SIZE_MAX`
+is refused rather than wrapping into a small, plausible and far-too-small
+allocation.
+
+A defensive alignment validator exists alongside the allocator guarantee,
+because a buffer that arrives from a pool or at an offset does not carry that
+guarantee — and a misaligned pointer fails at the XRT boundary with a message
+about video memory, which points at entirely the wrong subsystem.
+
+Bytes are **host memory**. They are not VRAM, not NPU memory and not an XRT
+device allocation, and they are not reported to any GPU accounting.
+
+### What PREPARED_VALID does not mean
+
+It means the derived host image was published successfully by its producer. It
+does **not** mean a device exists, a pointer has been wrapped, an artifact is
+loaded, or an operation can run. No XRT call, no helper call and no device open
+is involved anywhere in this path — the whole contract is exercised with the
+helper absent.
+
+Prepared state attaches to a tensor as a single opaque pointer that starts
+`NULL`. Loading a model allocates none of it; a registry query allocates none of
+it; only an explicit preparation request does. When an expert slot is reused for
+a different expert the derived image is dropped, exactly as the GPU tiers drop
+theirs — a stale prepared image would be a silently wrong weight rather than a
+missing one.
+
+There is still **no fmt4 → BF16 conversion**: filling the destination is the next
+slice's work.

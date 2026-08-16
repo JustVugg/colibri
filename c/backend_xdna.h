@@ -36,6 +36,11 @@ extern "C" {
  * never collide with the host-side coli_xdna_ names in this header. */
 #define COLI_XDNA_HELPER_DLL "coli_xdna.dll"
 
+/* Prepared-host pointer alignment required by the qualified Windows XRT
+ * userptr path. Scoped to that path deliberately: it is not a claim about
+ * every XRT implementation. The payload SIZE need not be a page multiple. */
+#define COLI_XDNA_PREPARED_ALIGNMENT 4096u
+
 /* Loader verdict. This describes the HELPER BINDING and nothing else.
  *
  * COLI_XDNA_AVAILABLE means HELPER_ABI_AVAILABLE: a compatible helper is loaded
@@ -198,11 +203,92 @@ void coli_xdna_sha256(const void *data, size_t len, unsigned char out[32]);
 /* 1 on success, 0 when the file cannot be read. */
 int  coli_xdna_sha256_file(const char *path, unsigned char out[32]);
 
+/* -- prepared host state --------------------------------------------------
+ *
+ * The prepared BF16 image is DERIVED, DISPOSABLE, accelerator-specific HOST
+ * state. The stored fmt=4 tensor remains authoritative and is never touched,
+ * replaced or freed by anything here.
+ *
+ * Three properties vary independently and must never be collapsed into one
+ * flag: whether memory is ALLOCATED, whether its contents are VALID, and how
+ * many host bytes are consumed. An invalid buffer still costs memory, and no
+ * amount of successful allocation makes contents valid. */
+
+typedef enum {
+    COLI_XDNA_PREP_UNPREPARED = 0,  /* no contents; may or may not hold capacity */
+    COLI_XDNA_PREP_PREPARING,       /* a producer owns the destination */
+    COLI_XDNA_PREP_VALID,           /* a producer published complete success */
+    COLI_XDNA_PREP_INVALID          /* preparation failed, or contents revoked */
+    /* A future IN_FLIGHT / PINNED value belongs here; the state is a field
+     * rather than a boolean precisely so it can be added. */
+} ColiXdnaPrepState;
+
+/* Opaque: the layout is an implementation detail of backend_xdna.c, so callers
+ * cannot reach past the transition helpers and set a state directly. */
+typedef struct ColiXdnaPrepared ColiXdnaPrepared;
+
+const char *coli_xdna_prep_text(ColiXdnaPrepState state);
+
+/* Create an empty object. Allocates no payload: creation is not preparation. */
+ColiXdnaPrepared *coli_xdna_prepared_create(void);
+
+/* Free payload and object, clear the caller's handle. Safe on NULL, on a
+ * never-allocated object, mid-PREPARING, on INVALID, on VALID, and repeatedly. */
+void coli_xdna_prepared_release(ColiXdnaPrepared **p);
+
+/* Begin a complete preparation cycle for a BF16 B[K,N] image. Allocates or
+ * reuses capacity, guarantees 4096-byte pointer alignment, and moves to
+ * PREPARING. Returns 0 without changing state on a rejected request.
+ *
+ * Beginning is the ONLY way to reach PREPARING, and publication is the only way
+ * out, so a caller cannot arrive at VALID by allocating. */
+int coli_xdna_prepare_begin(ColiXdnaPrepared *p, unsigned k, unsigned n,
+                            ColiXdnaDtype prepared_dtype);
+
+/* The writable destination, and only while PREPARING. NULL in every other
+ * state, so a published image cannot be rewritten behind its own back. */
+void *coli_xdna_prepare_dest(ColiXdnaPrepared *p);
+
+/* PREPARING -> VALID. Refused from any other state: an INVALID image can never
+ * shortcut to VALID, it must go through a complete new cycle. */
+int coli_xdna_prepare_publish_success(ColiXdnaPrepared *p);
+
+/* PREPARING -> INVALID. Capacity is retained; the bytes stay accounted. */
+void coli_xdna_prepare_publish_failure(ColiXdnaPrepared *p);
+
+/* VALID -> INVALID, keeping capacity. For a later weight replacement, format
+ * change or eviction; this slice implements no trigger for it. */
+int coli_xdna_prepared_invalidate(ColiXdnaPrepared *p);
+
+/* Drop retained capacity, returning the object to UNPREPARED with zero bytes.
+ * Validity and allocation lifetime are separate, so this is separate too. */
+void coli_xdna_prepared_free_buffer(ColiXdnaPrepared *p);
+
+ColiXdnaPrepState coli_xdna_prepared_state(const ColiXdnaPrepared *p);
+/* Logical payload bytes currently allocated: K*N*sizeof(bf16), not a rounded
+ * allocator reservation. Non-zero for a retained INVALID buffer. */
+size_t   coli_xdna_prepared_bytes(const ColiXdnaPrepared *p);
+unsigned coli_xdna_prepared_k(const ColiXdnaPrepared *p);
+unsigned coli_xdna_prepared_n(const ColiXdnaPrepared *p);
+
+/* Defensive validator. The allocator guarantees alignment, but a buffer that
+ * arrives from elsewhere, from a pool, or at an offset does not -- and a
+ * misaligned pointer fails at the XRT boundary with a message about video
+ * memory, which points at entirely the wrong subsystem. */
+int coli_xdna_pointer_alignment_ok(const void *p);
+
+/* Engine-side host accounting. These are HOST bytes: not VRAM, not NPU memory,
+ * not an XRT device allocation. */
+size_t coli_xdna_prepared_total_bytes(void);
+int    coli_xdna_prepared_live_objects(void);
+
 /* Install a registry for tests; NULL restores the production table. */
 void coli_xdna_test_set_registry(const ColiXdnaArtifact *rows, int count);
-/* Both must stay 0 for the whole of this slice. */
+/* All four must stay 0 for the whole of this slice. */
 int coli_xdna_test_device_opens(void);
 int coli_xdna_test_helper_calls(void);
+int coli_xdna_test_userptr_wraps(void);
+int coli_xdna_test_conversions(void);
 
 #ifdef __cplusplus
 }

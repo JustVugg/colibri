@@ -100,6 +100,11 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
+#ifdef COLI_XDNA
+/* Optional AMD XDNA2 lane. This header pulls in no XRT: the engine owns the
+ * prepared-host state, and XRT lives only behind an optional helper DLL. */
+#include "backend_xdna.h"
+#endif
 /* Declared unconditionally (not just under COLI_METAL): on a non-Metal build they just sit
  * at 0 forever, which is the correct value there (no Metal backend => never enabled, and
  * COLI_METAL_MOE_EXACT is only parsed under COLI_METAL). Kept outside the #ifdef so
@@ -250,6 +255,14 @@ typedef struct {
 #endif
 #ifdef COLI_VULKAN
     ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
+#endif
+#ifdef COLI_XDNA
+    /* Derived, disposable BF16 host image for the XDNA lane. NULL for an
+     * ordinary tensor and created only when preparation is actually requested:
+     * loading a model allocates nothing here. Deliberately a single opaque
+     * pointer rather than an *_eligible flag -- allocation, validity and byte
+     * consumption vary independently and live inside the object. */
+    ColiXdnaPrepared *xdna;
 #endif
     int cuda_eligible, cuda_device;   /* resident tensor, never a reused expert slot */
     /* #767: the row count of the smallest call that has failed on this tensor, or 0 if
@@ -671,6 +684,18 @@ static void cuda_disabled_note(void){
 }
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 static int g_cuda_fp8_ready;  /* e4m3 LUT published to the devices (see cuda_boot) */
+#endif
+#ifdef COLI_XDNA
+/* Drop a QT's derived XDNA host image. The authoritative fmt=4 weight (q4, s)
+ * is untouched: only the derived state goes. Used when an expert slot is reused
+ * for a DIFFERENT expert, where a stale prepared image would otherwise be a
+ * silently wrong weight rather than a missing one.
+ *
+ * Deliberately outside the COLI_VULKAN guard: the XDNA lane is independent of
+ * whether Vulkan is compiled in. */
+static void qt_xdna_reset(QT *t){
+    if(t->xdna) coli_xdna_prepared_release(&t->xdna);
+}
 #endif
 #ifdef COLI_VULKAN
 /* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
@@ -2709,6 +2734,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
      * Keep its tier assignment, but invalidate the old device weights. */
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
+#ifdef COLI_XDNA
+    /* Same reuse hazard as the GPU tiers: a stale prepared BF16 image belongs to
+     * the OLD expert's weights, so reusing the slot without dropping it would
+     * compute a wrong answer rather than fail. */
+    if(s->eid!=eid){ qt_xdna_reset(&s->g); qt_xdna_reset(&s->u); qt_xdna_reset(&s->d); }
+#endif
 #ifdef COLI_VULKAN
     /* Slot reused for a different expert: free the stale VK-resident weights so the new
      * expert re-uploads instead of computing with the old expert's tensors. */
@@ -3267,6 +3298,12 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
 #ifdef COLI_CUDA
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+#ifdef COLI_XDNA
+    /* Same reuse hazard as the GPU tiers: a stale prepared BF16 image belongs to
+     * the OLD expert's weights, so reusing the slot without dropping it would
+     * compute a wrong answer rather than fail. */
+    if(s->eid!=eid){ qt_xdna_reset(&s->g); qt_xdna_reset(&s->u); qt_xdna_reset(&s->d); }
 #endif
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
