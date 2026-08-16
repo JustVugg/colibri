@@ -189,13 +189,14 @@ _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
 
 # ---------- classificazione dei tensori ----------
 def layer_idx(name):
-    # find "layers.<N>" anywhere: handles both "model.layers.N..." (mapped) and the raw
-    # "language_model.model.layers.N..." (MiniMax-M3 VL prefix) forms.
+    # ANCHORED match: "model.layers.N..." (mapped) or the raw MiniMax-M3 VL prefix
+    # "language_model.model.layers.N..." -- NOT "layers.<N>" anywhere, which would
+    # change classification for every arch on names this converter never vetted.
     p = name.split(".")
-    for i in range(len(p) - 1):
-        if p[i] == "layers":
-            try: return int(p[i + 1])
-            except ValueError: return -1
+    if len(p) > 1 and p[0] == "language_model" and p[1] == "model": p = p[1:]
+    if len(p) > 2 and p[0] == "model" and p[1] == "layers":
+        try: return int(p[2])
+        except ValueError: return -1
     return -1
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
@@ -399,10 +400,14 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                 # otherwise fall back to the classic ebits/xbits/io_bits scheme.
                 if bits_map and kind in bits_map:
                     bits = bits_map[kind]
+                elif kind == "idx":
+                    # MSA scoring indexer (M3 self_attn.index_*): block selection is
+                    # DISCRETE top-k, so noise flips choices -- int8 default, not ebits.
+                    bits = 8
                 else:
                     bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
                 # Any unknown kind that fell through classify as "q"
-                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
+                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp", "idx"):
                     bits = ebits
                 # Per-projection override for routed experts, applied on top of the type-level bits.
                 if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
@@ -607,7 +612,10 @@ def main():
     if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
     if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
-    bits_map["idx"] = a.idx_bits             # always set: default 8 (see --idx-bits)
+    # "idx" is recorded only when overridden: the int8 default lives at the consumer
+    # in convert_shard, so default runs keep the params manifest byte-identical to
+    # pre-M3 converters and in-progress GLM/DeepSeek outdirs stay resumable.
+    if a.idx_bits != 8: bits_map["idx"] = a.idx_bits
     if bits_map:
         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
 
@@ -772,7 +780,8 @@ def main():
         # EN: outdir are refused instead of mixing containers (the #355 failure mode).
         params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
                   "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
-                  "proj_bits": dict(PROJ_BITS), "arch": a.arch}
+                  "proj_bits": dict(PROJ_BITS)}
+        if a.arch != "glm": params["arch"] = a.arch   # default omitted: pre-M3 manifests stay resumable
         prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
         prog = {}
         if os.path.exists(prog_path):
@@ -1137,7 +1146,8 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True); print("[IDX] DONE."); return
     params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
               "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
-              "proj_bits": dict(PROJ_BITS), "arch": a.arch}
+              "proj_bits": dict(PROJ_BITS)}
+    if a.arch != "glm": params["arch"] = a.arch   # default omitted: pre-M3 manifests stay resumable
     if not check_or_record_params(a.outdir, "out-", params): return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
