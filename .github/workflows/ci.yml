@@ -17,6 +17,27 @@ jobs:
       - name: C test suite
         run: cd c && make test-c
 
+  # MiniMax-M3 rides the colibri binary (ARCH_M3 auto-detect), so a GLM-side
+  # refactor of the shared hot paths (rmsnorm/act_glu/expert_ffn/MSA) can break
+  # M3 while every GLM test stays green. This gate is the only thing that
+  # notices: tiny random M3 checkpoint -> converter -> numpy oracle -> the
+  # engine's teacher-forcing gate, token-exact on every position (#601).
+  m3-tiny:
+    name: MiniMax-M3 (generated tiny oracle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-m3-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-m3-tiny.txt
+      - name: Generate fixture and run the M3 oracle gate
+        run: make -C c m3-tiny-check
+
   # Every engine, on every platform a release archive is built for. Before this,
   # CI built colibri + inkling on Linux only and kimi_k3 on nothing -- so the fact
   # that inkling and kimi_k3 did not compile under msys2/UCRT64 at all was invisible

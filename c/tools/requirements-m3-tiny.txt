@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+# Same torch/safetensors pins as requirements-deepseek-v4-tiny.txt (the tiny
+# M3 fixture chain is torch to generate, numpy+safetensors to convert and to
+# run the oracle). numpy is pinned explicitly: torch no longer depends on it.
+torch==2.13.0+cpu; sys_platform != "darwin"
+torch==2.13.0; sys_platform == "darwin"
+safetensors==0.8.0
+numpy==2.3.2

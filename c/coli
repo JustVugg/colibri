@@ -313,10 +313,22 @@ def redraw_prompt_box(message, width):
 def model_arch(model):
     return resolve_model(model).descriptor.id
 
+def colibri_core(family):
+    """Is this family served by the colibri binary itself, rather than by a
+    sister engine?
+
+    engine_group is the registry's statement that two families share an engine
+    implementation, so they also share that engine's env contract, its CAP
+    channel and its byte-protocol REPL. Keyed on the group rather than on
+    id == "glm" so a future third family on this binary inherits the same
+    handling by declaring the group, not by being added to a tuple here."""
+    if isinstance(family, str): family = family_by_id(family)
+    return family.engine_group == family_by_id("glm").engine_group
+
 def engine_for(model):
     family = resolve_model(model).descriptor
     if os.environ.get("COLI_ENGINE"):
-        if (family.id != "glm" and
+        if (not colibri_core(family) and
                 os.environ.get("COLI_DOCKER_GLM_ONLY") == "1"):
             raise UnknownFamilyError(
                 f"this image contains only the GLM engine; {family.display_name} "
@@ -396,7 +408,7 @@ def cap_for_launch(explicit_cap, env, fallback):
 def operator_cap(a, arch):
     """Return a real operator cap, including GLM's documented CAP channel."""
     cap=getattr(a,"cap",None)
-    if cap is not None or arch!="glm":
+    if cap is not None or not colibri_core(arch):
         return cap
     try:
         cap=int(os.environ.get("CAP","0"))
@@ -405,7 +417,7 @@ def operator_cap(a, arch):
     return cap if cap else None
 
 def env_for_engine(a, arch, plan=None):
-    if arch == "glm":
+    if colibri_core(arch):
         return env_for(a)
     explicit_env = set(os.environ)
     env = os.environ.copy()
@@ -1404,7 +1416,7 @@ def cmd_chat(a):
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
-    if arch!="glm":
+    if not colibri_core(family):
         engine=engine_for(a.model)
         need_model(a.model,engine)
         model_id=family.default_model_id
