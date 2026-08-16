@@ -89,6 +89,12 @@ make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86 LTO=0
 
 - Runtime PATH: add `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64`
   (CUDA 13.x keeps the runtime DLLs in `bin\x64`, not `bin`).
+- **Silent-fallback detection**: with the PATH missing (or a partial DLL copy)
+  the engine runs CPU-only with NO error — `coli chat` hides the engine stderr,
+  so the only symptom is VRAM stuck at ~1 GB while generating. To check the
+  tier: run `coli serve` in the foreground and look for the `[DSV4 CUDA] device
+  0: ... sm_XX` banner (a `could not be loaded (126)` line means the PATH is
+  still missing); or watch VRAM in Task Manager during a prompt.
 - Runtime alternative (no PATH change): copy ALL THREE runtime DLLs next to the
   binary — `cublasLt64_13.dll` (the DLL's direct dependency), `cublas64_13.dll`
   and `cudart64_13.dll`. A partial copy (e.g. cudart alone) still falls back to
@@ -140,7 +146,8 @@ python coli serve --model /path/to/DeepSeek-V4-Flash --gpu 0 --vram <V> --ram <N
   `V ≈ 50% of your GPU's VRAM`, rounded down** — the rest is needed for the KV
   context, temporary allocations and the desktop. Never fill the card: the
   speedup is not proportional to the budget (see measured results below).
-- Windows: identical commands (run `coli` from `c\`, CUDA `bin\x64` on PATH).
+- Windows: identical commands (run `coli` from `c\`; CUDA `bin\x64` on PATH —
+  one-time setup in the Windows build section above).
 - First run on a fresh model dir creates `.coli_usage` (usage history used by
   the pinning); each run appends to it, and `.coli_kv` persists the
   conversation across restarts.
