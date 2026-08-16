@@ -6856,26 +6856,36 @@ int COLI_V4_ROWS16_STORE_OPEN(
  *
  * The serve unit (COLI_V4_UNIT_GENERATE_STATS) calls these at turn
  * boundaries; the per-expert state lives here, so the store emits them.
- * V4 is CPU-only, so the VRAM tier is always 0 and "ram" means "resident in
- * the expert-store cache slots". Heat is the cumulative routing-selection
- * count (capped at 63, matching the GLM map's low-6-bit field).
+ * Residency semantics match the GLM engine (telemetry.h): "vram" counts the
+ * experts whose FP4 weights currently live in VRAM (slot cu[] handles alive),
+ * "ram" counts the resident RAM slots minus the VRAM-resident ones (their
+ * host copies are not RAM-tier bytes), "disk" is the remainder -- so
+ * vram+ram+disk is always the expert total. Heat is the cumulative
+ * routing-selection count (capped at 63, matching the GLM map's low-6-bit
+ * field).
  * ---------------------------------------------------------------------- */
 
 void coli_v4_expert_store_emit_tiers(ColiExpertStore *store) {
     V4ExpertStoreState *state;
     if (!store || !store->state) return;
     state = store->state;
-    int resident = 0;
+    int resident = 0, vram = 0;
     pthread_mutex_lock(&state->mutex);
     for (int i = 0; i < state->layers * state->slots_per_layer; i++)
-        if (state->slots[i].slab && state->slots[i].expert >= 0) resident++;
+        if (state->slots[i].slab && state->slots[i].expert >= 0) {
+            resident++;
+            if (state->slots[i].cu[V4_W1] &&
+                state->slots[i].cu_expert == state->slots[i].expert)
+                vram++;
+        }
     pthread_mutex_unlock(&state->mutex);
     int total = state->layers * state->experts_per_layer;
-    int ram = resident, disk = total - ram;
+    int ram = resident - vram, disk = total - vram - ram;
     if (ram < 0) ram = 0;
     if (disk < 0) disk = 0;
-    printf("TIERS 0 %d %d 0.00 %.2f\n", ram, disk,
-           (double)resident * state->record_bytes / 1e9);
+    printf("TIERS %d %d %d %.2f %.2f\n", vram, ram, disk,
+           (double)vram * state->record_bytes / 1e9,
+           (double)ram * state->record_bytes / 1e9);
     fflush(stdout);
 }
 
@@ -6894,7 +6904,11 @@ void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
         V4ExpertSlot *slots = state->slots +
             (size_t)layer * state->slots_per_layer;
         for (int z = 0; z < state->slots_per_layer; z++)
-            if (slots[z].slab && slots[z].expert == expert) { tier = 1; break; }
+            if (slots[z].slab && slots[z].expert == expert) {
+                tier = (slots[z].cu[V4_W1] &&
+                        slots[z].cu_expert == expert) ? 2 : 1;
+                break;
+            }
         int heat = state->eheat ? state->eheat[i] : 0;
         if (heat > 63) heat = 63;
         int b = (tier << 6) | heat;
@@ -7620,6 +7634,12 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #define spec_print spec_print_diagnostic_legacy
 /* Target-only generation helpers. */
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>                         /* getrusage/RUSAGE_SELF for v4_serve_rss_gb;
                                                    * on Windows compat.h supplies the shim. */
@@ -9316,6 +9336,36 @@ static void v4_hwinfo_emit(void) {
     char cpu[256] = "";
     int cores = 0;
     double ram_total = 0.0, ram_avail = 0.0;
+#ifdef _WIN32
+    /* Windows: the /proc probes below do not exist. Same sources the GLM
+     * engine uses (telemetry.h hw_probe): CPUID brand string, GetSystemInfo
+     * processor count, GlobalMemoryStatusEx RAM. */
+#if defined(__x86_64__) || defined(__i386__)
+    {
+        unsigned int r[12] = {0};
+        unsigned int *w = r;
+        for (unsigned int f = 0x80000002u; f <= 0x80000004u; f++, w += 4)
+            __get_cpuid(f, &w[0], &w[1], &w[2], &w[3]);
+        char *b = (char *)r;
+        b[47] = 0;
+        while (*b == ' ') b++;
+        snprintf(cpu, sizeof(cpu), "%s", b);
+    }
+#endif
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        cores = (int)si.dwNumberOfProcessors;
+    }
+    {
+        MEMORYSTATUSEX msx = {0};
+        msx.dwLength = sizeof(msx);
+        if (GlobalMemoryStatusEx(&msx)) {
+            ram_total = (double)msx.ullTotalPhys / 1e9;
+            ram_avail = (double)msx.ullAvailPhys / 1e9;
+        }
+    }
+#else
 #ifdef _SC_NPROCESSORS_ONLN
     cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
 #endif
@@ -9346,6 +9396,7 @@ static void v4_hwinfo_emit(void) {
         }
         fclose(mi);
     }
+#endif
     printf("HWINFO %d %.1f %.1f 0 0.0 %s|v4-cpu\n", cores, ram_total,
            ram_avail, cpu[0] ? cpu : "unknown");
     fflush(stdout);
@@ -9356,7 +9407,10 @@ static void v4_hwinfo_emit(void) {
  * (expert-forward compute) are the two phases the runtime tracks per turn
  * (#890); the frontend folds the remainder — attention, head, framing — into
  * "other". Before this the matmul field was hardcoded 0 and every turn read as
- * 100% other whenever the model sat warm in page cache. */
+ * 100% other whenever the model sat warm in page cache.
+ * expert_wait_s/attention_s/lm_head_s/forwards are emitted 0 BY DESIGN (not
+ * measured): the GLM engine measures them (m->t_ewait/t_attn/t_head/n_fw,
+ * colibri.c mux_done) — full PROF parity for DS4 is a future item. */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
                          double expert_disk_s, double expert_matmul_s) {
     printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
