@@ -338,7 +338,325 @@ static void test_no_runtime_readiness(void){
     ck(!strcmp(coli_xdna_prep_text(COLI_XDNA_PREP_VALID), "PREPARED_VALID"),
        "the label says PREPARED, not READY");
     ck(coli_xdna_test_userptr_wraps() == 0, "no userptr wrap exists");
-    ck(coli_xdna_test_conversions() == 0, "no fmt4 conversion was performed");
+    /* Conversions DO happen from I4 onward -- the counter now reports real work
+     * rather than being pinned at zero. What must stay zero is device work. */
+    ck(coli_xdna_test_conversions() > 0, "conversions were performed and counted");
+    ck(coli_xdna_test_device_opens() == 0, "still no device opened");
+}
+
+
+/* ---- fmt4 -> BF16 conversion ------------------------------------------- */
+
+/* Independent reference. Deliberately written from the fmt=4 contract rather
+ * than by calling the production converter, so an indexing or layout mistake in
+ * the converter cannot hide by being reproduced here. */
+static unsigned short ref_f2b(float f){
+    unsigned int u; memcpy(&u, &f, 4);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+static void ref_convert(unsigned short *dst, const unsigned char *q4,
+                        const float *scale, int I, int O, int gs){
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    for(int o = 0; o < O; o++){
+        const unsigned char *w = q4 + (size_t)o * rb;
+        const float *scl = scale + (size_t)o * ng;
+        for(int i = 0; i < I; i++){
+            unsigned char byte = w[i >> 1];
+            int nib = (i & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
+            dst[(size_t)i * O + o] = ref_f2b((float)(nib - 8) * scl[i / gs]);
+        }
+    }
+}
+
+static void fill_src(unsigned char *q4, float *scale, int I, int O, int gs, unsigned seed){
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    unsigned s = seed ? seed : 1u;
+    for(size_t k = 0; k < (size_t)O * rb; k++){ s = s*1664525u+1013904223u; q4[k] = (unsigned char)(s >> 24); }
+    for(size_t k = 0; k < (size_t)O * ng; k++){ s = s*1664525u+1013904223u;
+        scale[k] = 0.25f * (float)(1 + ((s >> 26) & 3)); }
+}
+
+static void test_bf16_rounding(void){
+    printf("BF16 rounding\n");
+    /* The sealed contract is round-to-nearest-even on the 16-bit boundary, not
+     * truncation. These are the cases where the two differ. */
+    union { unsigned int u; float f; } v;
+
+    v.u = 0x00000000u; ck(ref_f2b(v.f) == 0x0000, "+0 -> 0x0000");
+    v.u = 0x80000000u; ck(ref_f2b(v.f) == 0x8000, "-0 -> 0x8000 (sign preserved)");
+    ck(ref_f2b(1.0f) == 0x3F80, "1.0 -> 0x3F80");
+    ck(ref_f2b(-1.0f) == 0xBF80, "-1.0 -> 0xBF80");
+    ck(ref_f2b(2.0f) == 0x4000, "2.0 -> 0x4000");
+
+    /* Exactly halfway: 0x3F808000 rounds to even -> 0x3F80, not up. */
+    v.u = 0x3F808000u; ck(ref_f2b(v.f) == 0x3F80, "tie rounds to even (down)");
+    /* Halfway with an odd LSB rounds up. */
+    v.u = 0x3F818000u; ck(ref_f2b(v.f) == 0x3F82, "tie with odd LSB rounds up");
+    /* Just above halfway always rounds up. */
+    v.u = 0x3F808001u; ck(ref_f2b(v.f) == 0x3F81, "above tie rounds up");
+    /* Truncation would give 0x3F80 for all three; it does not here. */
+
+    /* Every value this converter can actually produce is (nib-8)*scale with
+     * nib-8 in [-8,7] and a positive scale, so it is exactly representable and
+     * rounding never fires in practice -- but the rule must still be correct. */
+    ck(ref_f2b(-8.0f * 0.25f) == ref_f2b(-2.0f), "representative decoded value");
+}
+
+static void test_conversion_matches_reference(void){
+    printf("conversion vs independent reference\n");
+    struct { int I, O, gs; const char *what; } cases[] = {
+        {  64,   4, 64, "one full group, 4 rows" },
+        {  63,   3, 64, "odd I, partial group" },
+        {  65,   2, 64, "I just past a group boundary" },
+        { 128,   5, 64, "two full groups" },
+        {   1,   1, 64, "single element" },
+        {   7,   3, 64, "odd I, several rows" },
+        { 130,   3, 64, "partial trailing group" },
+    };
+    for(size_t c = 0; c < sizeof cases / sizeof cases[0]; c++){
+        int I = cases[c].I, O = cases[c].O, gs = cases[c].gs;
+        int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+        unsigned char *q4 = (unsigned char*)malloc((size_t)O * rb);
+        float *scale = (float*)malloc((size_t)O * ng * sizeof(float));
+        fill_src(q4, scale, I, O, gs, 1000u + (unsigned)c);
+
+        unsigned short *want = (unsigned short*)malloc((size_t)I * O * 2);
+        ref_convert(want, q4, scale, I, O, gs);
+
+        ColiXdnaPrepared *p = coli_xdna_prepared_create();
+        ColiXdnaPrepResult r = coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs);
+
+        int ok = (r == COLI_XDNA_PREP_OK)
+              && coli_xdna_prepared_state(p) == COLI_XDNA_PREP_VALID
+              && coli_xdna_prepared_bytes(p) == (size_t)I * O * 2
+              && coli_xdna_prepared_k(p) == (unsigned)I
+              && coli_xdna_prepared_n(p) == (unsigned)O;
+        size_t mism = 0;
+        if(ok){
+            const unsigned short *got = (const unsigned short*)coli_xdna_prepared_image(p);
+            for(size_t e = 0; e < (size_t)I * O; e++) if(got[e] != want[e]) mism++;
+        }
+        char msg[128];
+        snprintf(msg, sizeof msg, "%s (I=%d O=%d)", cases[c].what, I, O);
+        ck(ok && mism == 0, msg);
+
+        coli_xdna_prepared_release(&p);
+        free(q4); free(scale); free(want);
+    }
+}
+
+static void test_layout_transpose(void){
+    printf("layout transformation\n");
+    /* A hand-checkable 2x3: source is [O][I], destination must be [I][O]. */
+    int I = 2, O = 3, gs = 64;
+    unsigned char q4[3];        /* rb = 1 byte per row */
+    float scale[3];
+    /* row o: low nibble = element i=0, high nibble = element i=1 */
+    q4[0] = (unsigned char)((10u << 4) | 9u);   /* o=0: i0 nib 9, i1 nib 10 */
+    q4[1] = (unsigned char)(( 8u << 4) | 7u);   /* o=1: i0 nib 7, i1 nib 8  */
+    q4[2] = (unsigned char)(( 0u << 4) | 15u);  /* o=2: i0 nib 15, i1 nib 0 */
+    scale[0] = 1.0f; scale[1] = 2.0f; scale[2] = 0.5f;
+
+    ColiXdnaPrepared *p = coli_xdna_prepared_create();
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_OK, "convert");
+    const unsigned short *b = (const unsigned short*)coli_xdna_prepared_image(p);
+
+    /* dst[i*O + o] */
+    ck(b[0*O + 0] == ref_f2b((9.0f  - 8.0f) * 1.0f), "B[0][0] = (nib 9  - 8) * 1.0");
+    ck(b[0*O + 1] == ref_f2b((7.0f  - 8.0f) * 2.0f), "B[0][1] = (nib 7  - 8) * 2.0");
+    ck(b[0*O + 2] == ref_f2b((15.0f - 8.0f) * 0.5f), "B[0][2] = (nib 15 - 8) * 0.5");
+    ck(b[1*O + 0] == ref_f2b((10.0f - 8.0f) * 1.0f), "B[1][0] = (nib 10 - 8) * 1.0");
+    ck(b[1*O + 1] == ref_f2b(( 8.0f - 8.0f) * 2.0f), "B[1][1] = (nib 8  - 8) * 2.0 = +0");
+    ck(b[1*O + 2] == ref_f2b(( 0.0f - 8.0f) * 0.5f), "B[1][2] = (nib 0  - 8) * 0.5");
+    coli_xdna_prepared_release(&p);
+}
+
+static void test_scale_group_boundary(void){
+    printf("scale group indexing\n");
+    /* gs=64 with I=130: groups are [0,64), [64,128), [128,130). Element 63 must
+     * use scale 0, element 64 scale 1, element 128 scale 2. */
+    int I = 130, O = 1, gs = 64;
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    unsigned char *q4 = (unsigned char*)calloc(1, (size_t)O * rb);
+    float scale[3] = { 1.0f, 4.0f, 16.0f };
+    ck(ng == 3, "three groups for I=130, gs=64");
+    for(int k = 0; k < rb; k++) q4[k] = 0x99;    /* every nibble = 9 -> value +1 */
+
+    ColiXdnaPrepared *p = coli_xdna_prepared_create();
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_OK, "convert");
+    const unsigned short *b = (const unsigned short*)coli_xdna_prepared_image(p);
+    ck(b[63]  == ref_f2b(1.0f),  "element 63 uses group 0 scale");
+    ck(b[64]  == ref_f2b(4.0f),  "element 64 uses group 1 scale");
+    ck(b[127] == ref_f2b(4.0f),  "element 127 still group 1");
+    ck(b[128] == ref_f2b(16.0f), "element 128 uses group 2 scale");
+    ck(b[129] == ref_f2b(16.0f), "element 129 in the short trailing group");
+    coli_xdna_prepared_release(&p);
+    free(q4);
+}
+
+static void test_source_rejection(void){
+    printf("source validation\n");
+    int I = 64, O = 2, gs = 64;
+    unsigned char q4[64]; float scale[2];
+    fill_src(q4, scale, I, O, gs, 7u);
+    ColiXdnaPrepared *p = coli_xdna_prepared_create();
+
+    ck(coli_xdna_prepare_from_fmt4(p, 2, q4, scale, I, O, gs)
+       == COLI_XDNA_PREP_ERR_UNSUPPORTED_FORMAT, "fmt=2 rejected");
+    ck(coli_xdna_prepare_from_fmt4(p, 4, NULL, scale, I, O, gs)
+       == COLI_XDNA_PREP_ERR_INVALID_SOURCE, "missing q4 rejected");
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, NULL, I, O, gs)
+       == COLI_XDNA_PREP_ERR_INVALID_SOURCE, "missing scales rejected");
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, 0, O, gs)
+       == COLI_XDNA_PREP_ERR_INVALID_SOURCE, "I=0 rejected");
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, 0, gs)
+       == COLI_XDNA_PREP_ERR_INVALID_SOURCE, "O=0 rejected");
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, 0)
+       == COLI_XDNA_PREP_ERR_INVALID_SOURCE, "gs=0 rejected");
+    ck(coli_xdna_prepare_from_fmt4(NULL, 4, q4, scale, I, O, gs)
+       == COLI_XDNA_PREP_ERR_STATE, "NULL prepared object rejected");
+    /* Dimensions are int, so on a 64-bit host the largest reachable product is
+     * about 4.6e18 elements -- below SIZE_MAX/2. A genuine size_t overflow is
+     * therefore UNREACHABLE through this API here, and the ERR_SIZE guard is
+     * defence for platforms with a narrower size_t. What is reachable is an
+     * enormous but representable request, and that must fail as an allocation
+     * failure rather than be misreported as an arithmetic one. */
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, 0x40000000, 0x40000000, gs)
+       == COLI_XDNA_PREP_ERR_ALLOC, "unsatisfiable request fails as ALLOC, not SIZE");
+
+    ck(coli_xdna_prepared_state(p) == COLI_XDNA_PREP_UNPREPARED,
+       "every rejection leaves the object UNPREPARED");
+    ck(coli_xdna_prepared_bytes(p) == 0, "and accounts no bytes");
+    coli_xdna_prepared_release(&p);
+}
+
+/* ---- mid-conversion failure -------------------------------------------- */
+#define POISON16 0xDEADu
+
+static void test_injected_failure(void){
+    printf("mid-conversion failure\n");
+    int I = 128, O = 8, gs = 64;
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    unsigned char *q4 = (unsigned char*)malloc((size_t)O * rb);
+    float *scale = (float*)malloc((size_t)O * ng * sizeof(float));
+    fill_src(q4, scale, I, O, gs, 31u);
+    size_t total = (size_t)I * O;
+
+    /* The gold image, and proof the poison value cannot occur in it. */
+    unsigned short *gold = (unsigned short*)malloc(total * 2);
+    ref_convert(gold, q4, scale, I, O, gs);
+    size_t collide = 0;
+    for(size_t e = 0; e < total; e++) if(gold[e] == POISON16) collide++;
+    ck(collide == 0, "poison value cannot occur in a valid image");
+
+    unsigned char q4_before[4096]; float sc_before[64];
+    memcpy(q4_before, q4, (size_t)O * rb);
+    memcpy(sc_before, scale, (size_t)O * ng * sizeof(float));
+
+    const int pct[3] = { 25, 50, 75 };
+    for(int c = 0; c < 3; c++){
+        ColiXdnaPrepared *p = coli_xdna_prepared_create();
+        /* Allocate first so the destination can be poisoned before conversion. */
+        ck(coli_xdna_prepare_begin(p, (unsigned)I, (unsigned)O, COLI_XDNA_DT_BF16) == 1, "begin");
+        unsigned short *d = (unsigned short*)coli_xdna_prepare_dest(p);
+        for(size_t e = 0; e < total; e++) d[e] = POISON16;
+        coli_xdna_prepare_publish_failure(p);      /* park it INVALID with capacity */
+
+        coli_xdna_test_set_convert_fail_pct(pct[c]);
+        ColiXdnaPrepResult r = coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs);
+        coli_xdna_test_set_convert_fail_pct(0);
+
+        char m[96];
+        snprintf(m, sizeof m, "%d%%: converter reports failure", pct[c]);
+        ck(r == COLI_XDNA_PREP_ERR_FAILED, m);
+        snprintf(m, sizeof m, "%d%%: state is PREPARED_INVALID", pct[c]);
+        ck(coli_xdna_prepared_state(p) == COLI_XDNA_PREP_INVALID, m);
+
+        /* The destination is inspected through the test-only accessor: an
+         * INVALID image exposes no writable destination by contract. */
+        const unsigned short *b = (const unsigned short*)coli_xdna_prepared_image_unchecked(p);
+        size_t written = 0, poison = 0;
+        for(size_t e = 0; e < total; e++){
+            if(b[e] == POISON16) poison++;
+            else if(b[e] == gold[e]) written++;
+        }
+        snprintf(m, sizeof m, "%d%%: %zu converted, %zu poison remain", pct[c], written, poison);
+        ck(written > 0 && poison > 0, m);
+
+        snprintf(m, sizeof m, "%d%%: INVALID cannot publish VALID", pct[c]);
+        ck(coli_xdna_prepare_publish_success(p) == 0, m);
+
+        snprintf(m, sizeof m, "%d%%: fmt4 source unchanged", pct[c]);
+        ck(memcmp(q4, q4_before, (size_t)O * rb) == 0
+           && memcmp(scale, sc_before, (size_t)O * ng * sizeof(float)) == 0, m);
+
+        /* Complete re-preparation over the same allocation. */
+        ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_OK,
+           "  complete reprepare succeeds");
+        ck(coli_xdna_prepared_state(p) == COLI_XDNA_PREP_VALID, "  state VALID again");
+        const unsigned short *g2 = (const unsigned short*)coli_xdna_prepared_image(p);
+        size_t bad = 0, left = 0;
+        for(size_t e = 0; e < total; e++){ if(g2[e] != gold[e]) bad++; if(g2[e] == POISON16) left++; }
+        ck(bad == 0 && left == 0, "  reprepared image bit-exact, no residual poison");
+
+        coli_xdna_prepared_release(&p);
+    }
+    free(q4); free(scale); free(gold);
+}
+
+static void test_success_failure_success(void){
+    printf("success -> failure -> success\n");
+    int I = 64, O = 4, gs = 64;
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    unsigned char *q4 = (unsigned char*)malloc((size_t)O * rb);
+    float *scale = (float*)malloc((size_t)O * ng * sizeof(float));
+    fill_src(q4, scale, I, O, gs, 77u);
+    size_t total = (size_t)I * O;
+    unsigned short *gold = (unsigned short*)malloc(total * 2);
+    ref_convert(gold, q4, scale, I, O, gs);
+
+    ColiXdnaPrepared *p = coli_xdna_prepared_create();
+
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_OK, "first prepare");
+    ck(memcmp(coli_xdna_prepared_image(p), gold, total * 2) == 0, "first image bit-exact");
+
+    coli_xdna_test_set_convert_fail_pct(50);
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_ERR_FAILED,
+       "injected failure on the second attempt");
+    coli_xdna_test_set_convert_fail_pct(0);
+    ck(coli_xdna_prepared_state(p) == COLI_XDNA_PREP_INVALID, "state INVALID");
+    ck(coli_xdna_prepared_image(p) == NULL, "an INVALID image is not readable as prepared");
+
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_OK, "third prepare");
+    ck(coli_xdna_prepared_state(p) == COLI_XDNA_PREP_VALID, "state VALID");
+    ck(memcmp(coli_xdna_prepared_image(p), gold, total * 2) == 0,
+       "third image bit-exact, identical to the first");
+
+    coli_xdna_prepared_release(&p);
+    free(q4); free(scale); free(gold);
+}
+
+static void test_no_fp32_image(void){
+    printf("no full FP32 intermediate\n");
+    /* The only allocation a conversion may make is the BF16 destination itself.
+     * Engine-side accounting reports exactly that and nothing more. */
+    int I = 256, O = 16, gs = 64;
+    int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+    unsigned char *q4 = (unsigned char*)malloc((size_t)O * rb);
+    float *scale = (float*)malloc((size_t)O * ng * sizeof(float));
+    fill_src(q4, scale, I, O, gs, 5u);
+
+    ColiXdnaPrepared *p = coli_xdna_prepared_create();
+    ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, I, O, gs) == COLI_XDNA_PREP_OK, "convert");
+    ck(coli_xdna_prepared_total_bytes() == (size_t)I * O * 2,
+       "accounted bytes are exactly the BF16 destination");
+    ck(coli_xdna_prepared_bytes(p) == (size_t)I * O * 2, "and nothing else was retained");
+    ck(coli_xdna_pointer_alignment_ok(coli_xdna_prepared_image(p)) == 1,
+       "destination still 4096-aligned after conversion");
+    coli_xdna_prepared_release(&p);
+    ck(coli_xdna_prepared_total_bytes() == 0, "released cleanly");
+    free(q4); free(scale);
 }
 
 int main(void){
@@ -354,6 +672,14 @@ int main(void){
     test_stress();
     test_fmt4_immutability();
     test_independence();
+    test_bf16_rounding();
+    test_conversion_matches_reference();
+    test_layout_transpose();
+    test_scale_group_boundary();
+    test_source_rejection();
+    test_injected_failure();
+    test_success_failure_success();
+    test_no_fp32_image();
     test_no_runtime_readiness();
 
     printf("test_xdna_prepared_state: %s\n", g_fail ? "FAIL" : "ok");

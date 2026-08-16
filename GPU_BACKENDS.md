@@ -374,3 +374,62 @@ missing one.
 
 There is still **no fmt4 → BF16 conversion**: filling the destination is the next
 slice's work.
+
+### fmt4 to BF16 preparation
+
+The converter turns the authoritative fmt=4 grouped-int4 weight into the prepared
+BF16 image, writing straight into the aligned destination. The source is read and
+never modified.
+
+Semantics are taken from the production kernel (`quant.h`, `matmul_i4_grouped`),
+not from a description of it:
+
+```
+rb    = (I+1)/2                       bytes per output row
+ng    = (I+gs-1)/gs                   groups per output row
+row   = q4    + o*rb                  weights are stored [O][I]
+scl   = scale + o*ng
+byte  = row[i>>1]
+nib   = (i&1) ? byte>>4 : byte&0x0F   even i low nibble, odd i high nibble
+value = (nib - 8) * scl[i/gs]
+```
+
+The destination is BF16 `B[K,N]` with `K = I` and `N = O`, so each value is
+written to `dst[i*O + o]`. The `[O,I]` to `[I,O]` transform is inherent in that
+addressing and needs no intermediate matrix: values pass through a single float
+scalar, so **no full-sized FP32 image is ever allocated**. The only allocation a
+conversion makes is the BF16 destination itself.
+
+Float to BF16 uses round-to-nearest-even, not truncation. The two differ on
+exact ties, and the qualified image rounds.
+
+### Publication and failure
+
+```
+validate source -> begin -> PREPARING -> convert -> publish success -> PREPARED_VALID
+                                              \
+                                               -> publish failure -> PREPARED_INVALID
+```
+
+Everything that can be rejected is rejected *before* the cycle opens, so a bad
+source never strands an object in `PREPARING`, and no path returns while still
+`PREPARING`.
+
+A mid-conversion failure leaves genuinely partial bytes — some elements
+converted, the rest whatever they held — and forces `PREPARED_INVALID`. Those
+bytes carry no authority: state decides validity, not contents, and the partial
+image cannot be published. The authoritative fmt=4 weight is untouched by any of
+this.
+
+A failed buffer keeps its capacity and can be reused, but only through a
+**complete** re-preparation: `INVALID -> PREPARING -> VALID`, never a shortcut.
+A re-prepared image is bit-identical to one prepared from scratch.
+
+The conversion is currently serial. The frozen contract permits parallelisation
+but does not require it, and correctness and publication semantics come first; a
+6144x2048 weight converts in well under a tenth of a second.
+
+Conversion needs no helper, no artifact, no XRT and no device — it is engine
+representation logic, and the helper knows nothing about nibble packing or group
+scales. **There is still no XDNA execution**: connecting a real operation to the
+device is the next slice's work.

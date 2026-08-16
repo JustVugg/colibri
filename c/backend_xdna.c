@@ -690,9 +690,128 @@ unsigned coli_xdna_prepared_n(const ColiXdnaPrepared *p){ return p ? p->n : 0u; 
 size_t coli_xdna_prepared_total_bytes(void){ return g_xdna_prepared_bytes; }
 int    coli_xdna_prepared_live_objects(void){ return g_xdna_prepared_objects; }
 
-/* This slice opens no device, calls no helper entry point, wraps no pointer and
- * converts nothing. The counters make that assertable rather than merely stated. */
+const void *coli_xdna_prepared_image(const ColiXdnaPrepared *p){
+    /* Only a published image is readable. An unpublished or revoked one returns
+     * NULL rather than a pointer to bytes with no authority. */
+    if(!p || p->state != COLI_XDNA_PREP_VALID) return NULL;
+    return p->base;
+}
+const void *coli_xdna_prepared_image_unchecked(const ColiXdnaPrepared *p){
+    return p ? p->base : NULL;
+}
+
+/* ======================================================================
+ * fmt=4 grouped int4  ->  BF16 B[K,N]
+ *
+ * Semantics are taken from the production kernel (quant.h matmul_i4_grouped),
+ * not from a specification of it:
+ *
+ *   rb = (I+1)/2                 bytes per output row
+ *   ng = (I+gs-1)/gs             groups per output row
+ *   row   = q4    + o*rb         weights are stored [O][I]
+ *   scl   = scale + o*ng
+ *   byte  = row[i>>1]
+ *   nib   = (i&1) ? byte>>4 : byte&0x0F      even i low, odd i high
+ *   value = (nib - 8) * scl[i/gs]
+ *
+ * The destination is BF16 B[K,N] with K=I and N=O, so the write is
+ * dst[i*O + o] -- the [O,I] -> [I,O] transform is inherent in the addressing
+ * and needs no intermediate matrix. Values are converted one at a time through
+ * a float scalar, so no full-sized FP32 image is ever allocated.
+ * ====================================================================== */
+
+/* Test-only. Production never sets this; there is no env var or flag for it. */
+static int g_xdna_convert_fail_pct;
+/* How many conversions have been performed. I1-I3 pinned this at zero because
+ * no converter existed; from I4 it counts real work, which is what makes
+ * "conversion happened" and "device work happened" separately assertable. */
+static int g_xdna_conversions;
+void coli_xdna_test_set_convert_fail_pct(int pct){
+    g_xdna_convert_fail_pct = (pct > 0 && pct < 100) ? pct : 0;
+}
+
+const char *coli_xdna_prep_result_text(ColiXdnaPrepResult r){
+    switch(r){
+        case COLI_XDNA_PREP_OK:                    return "OK";
+        case COLI_XDNA_PREP_ERR_UNSUPPORTED_FORMAT:return "UNSUPPORTED_SOURCE_FORMAT";
+        case COLI_XDNA_PREP_ERR_INVALID_SOURCE:    return "INVALID_SOURCE";
+        case COLI_XDNA_PREP_ERR_SIZE:              return "SIZE_OVERFLOW";
+        case COLI_XDNA_PREP_ERR_ALLOC:             return "ALLOCATION_FAILED";
+        case COLI_XDNA_PREP_ERR_FAILED:            return "PREPARATION_FAILED";
+        case COLI_XDNA_PREP_ERR_STATE:             return "STATE_ERROR";
+    }
+    return "UNKNOWN";
+}
+
+/* float -> bfloat16, round to nearest even. Truncation would be a different
+ * function and a different image; the qualified oracle rounds. */
+static unsigned short coli_xdna_f2b(float f){
+    unsigned int u;
+    memcpy(&u, &f, sizeof u);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+
+ColiXdnaPrepResult coli_xdna_prepare_from_fmt4(ColiXdnaPrepared *p,
+                                               int fmt,
+                                               const unsigned char *q4,
+                                               const float *scale,
+                                               int I, int O, int gs){
+    if(!p) return COLI_XDNA_PREP_ERR_STATE;
+
+    /* Everything that can be rejected is rejected BEFORE the cycle opens, so a
+     * bad source never leaves an object stranded in PREPARING or INVALID. */
+    if(fmt != 4) return COLI_XDNA_PREP_ERR_UNSUPPORTED_FORMAT;
+    if(!q4 || !scale) return COLI_XDNA_PREP_ERR_INVALID_SOURCE;
+    if(I <= 0 || O <= 0 || gs <= 0) return COLI_XDNA_PREP_ERR_INVALID_SOURCE;
+
+    size_t need = 0;
+    if(!coli_xdna_payload_bytes((unsigned)I, (unsigned)O, COLI_XDNA_DT_BF16, &need))
+        return COLI_XDNA_PREP_ERR_SIZE;
+
+    if(!coli_xdna_prepare_begin(p, (unsigned)I, (unsigned)O, COLI_XDNA_DT_BF16))
+        return COLI_XDNA_PREP_ERR_ALLOC;
+
+    unsigned short *dst = (unsigned short *)coli_xdna_prepare_dest(p);
+    if(!dst){                                    /* cannot happen; never leave PREPARING */
+        coli_xdna_prepare_publish_failure(p);
+        return COLI_XDNA_PREP_ERR_STATE;
+    }
+
+    const size_t rb = ((size_t)I + 1u) / 2u;
+    const size_t ng = ((size_t)I + (size_t)gs - 1u) / (size_t)gs;
+    const int fail_after = g_xdna_convert_fail_pct
+                         ? (int)(((long)O * g_xdna_convert_fail_pct) / 100) : -1;
+
+    for(int o = 0; o < O; o++){
+        if(fail_after >= 0 && o == fail_after){
+            /* Deterministic mid-conversion failure: rows before this one are
+             * genuinely converted, the rest keep whatever they held. */
+            coli_xdna_prepare_publish_failure(p);
+            return COLI_XDNA_PREP_ERR_FAILED;
+        }
+        const unsigned char *row = q4 + (size_t)o * rb;
+        const float *scl = scale + (size_t)o * ng;
+        for(int i = 0; i < I; i++){
+            unsigned char byte = row[(size_t)i >> 1];
+            int nib = (i & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
+            dst[(size_t)i * (size_t)O + (size_t)o] =
+                coli_xdna_f2b((float)(nib - 8) * scl[(size_t)i / (size_t)gs]);
+        }
+    }
+
+    if(!coli_xdna_prepare_publish_success(p)){
+        coli_xdna_prepare_publish_failure(p);
+        return COLI_XDNA_PREP_ERR_STATE;
+    }
+    g_xdna_conversions++;
+    return COLI_XDNA_PREP_OK;
+}
+
+/* This slice opens no device, calls no helper entry point and wraps no pointer.
+ * The counters make that assertable rather than merely stated. Conversion is now
+ * implemented, so its counter is no longer pinned at zero. */
 int coli_xdna_test_device_opens(void){ return 0; }
 int coli_xdna_test_helper_calls(void){ return 0; }
 int coli_xdna_test_userptr_wraps(void){ return 0; }
-int coli_xdna_test_conversions(void){ return 0; }
+int coli_xdna_test_conversions(void){ return g_xdna_conversions; }

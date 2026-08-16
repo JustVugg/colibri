@@ -89,6 +89,48 @@ int main(void){
     qt_xdna_reset(&plain);
     ck(plain.xdna == NULL, "reset of a tensor with no derived state is safe");
 
+
+    /* ---- cross-check against the PRODUCTION decode kernel ----------------
+     * The strongest oracle available: quant.h's matmul_i4_grouped is the code
+     * the engine actually computes with. Feeding it a one-hot activation makes
+     * y[o] equal the decoded weight at (o, i), so the prepared image can be
+     * checked against the real kernel rather than against a second copy of my
+     * own reading of the format. */
+    printf("cross-check vs production matmul_i4_grouped\n");
+    {
+        const int I = 70, O = 5, gs = 64;          /* odd-ish I, partial 2nd group */
+        const int rb = (I + 1) / 2, ng = (I + gs - 1) / gs;
+        unsigned char *pq4 = (unsigned char*)malloc((size_t)O * rb);
+        float *psc = (float*)malloc((size_t)O * ng * sizeof(float));
+        unsigned st = 4242u;
+        for(size_t k = 0; k < (size_t)O * rb; k++){ st = st*1664525u+1013904223u; pq4[k] = (unsigned char)(st >> 24); }
+        for(size_t k = 0; k < (size_t)O * ng; k++){ st = st*1664525u+1013904223u;
+            psc[k] = 0.25f * (float)(1 + ((st >> 26) & 3)); }
+
+        ColiXdnaPrepared *pp = coli_xdna_prepared_create();
+        ck(coli_xdna_prepare_from_fmt4(pp, 4, pq4, psc, I, O, gs) == COLI_XDNA_PREP_OK,
+           "prepare from fmt4");
+        const unsigned short *img = (const unsigned short*)coli_xdna_prepared_image(pp);
+
+        float *x = (float*)calloc((size_t)I, sizeof(float));
+        float *y = (float*)malloc((size_t)O * sizeof(float));
+        size_t mism = 0;
+        for(int i = 0; i < I; i++){
+            memset(x, 0, (size_t)I * sizeof(float));
+            x[i] = 1.0f;                            /* one-hot: y[o] = W[o][i] */
+            matmul_i4_grouped(y, x, pq4, psc, 1, I, O, gs);
+            for(int o = 0; o < O; o++){
+                unsigned int u; memcpy(&u, &y[o], 4);
+                u += 0x7FFFu + ((u >> 16) & 1u);
+                unsigned short want = (unsigned short)(u >> 16);
+                if(img[(size_t)i * O + o] != want) mism++;
+            }
+        }
+        ck(mism == 0, "prepared image matches the production kernel decode exactly");
+        free(x); free(y); free(pq4); free(psc);
+        coli_xdna_prepared_release(&pp);
+    }
+
     ck(coli_xdna_prepared_live_objects() == 0, "no object leaked");
     ck(coli_xdna_prepared_total_bytes() == 0, "no bytes leaked");
 

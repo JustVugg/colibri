@@ -264,6 +264,44 @@ int coli_xdna_prepared_invalidate(ColiXdnaPrepared *p);
  * Validity and allocation lifetime are separate, so this is separate too. */
 void coli_xdna_prepared_free_buffer(ColiXdnaPrepared *p);
 
+/* -- fmt4 -> BF16 preparation ---------------------------------------------
+ *
+ * Turns the authoritative fmt=4 grouped-int4 weight into the prepared BF16
+ * B[K,N] image, writing straight into the aligned destination above. The source
+ * is read and never modified.
+ *
+ * This is engine representation logic and stays on the C side: the helper knows
+ * nothing about nibble packing, group scales or tensor semantics. */
+
+typedef enum {
+    COLI_XDNA_PREP_OK = 0,
+    COLI_XDNA_PREP_ERR_UNSUPPORTED_FORMAT,  /* not fmt=4 */
+    COLI_XDNA_PREP_ERR_INVALID_SOURCE,      /* NULL pointers, zero dims, bad gs */
+    COLI_XDNA_PREP_ERR_SIZE,                /* dimensions not representable */
+    COLI_XDNA_PREP_ERR_ALLOC,               /* destination could not be obtained */
+    COLI_XDNA_PREP_ERR_FAILED,              /* conversion failed after it began */
+    COLI_XDNA_PREP_ERR_STATE                /* no object, or it cannot begin */
+} ColiXdnaPrepResult;
+
+const char *coli_xdna_prep_result_text(ColiXdnaPrepResult r);
+
+/* Prepared dimensions derive from the tensor: K = I, N = O. They are not
+ * caller-supplied, so they cannot silently disagree with the source.
+ *
+ * Publishes VALID only after the whole conversion succeeds. Any failure after
+ * the cycle opens leaves PREPARED_INVALID with whatever partial bytes were
+ * written -- which carry no authority, because state decides validity, not
+ * contents. Never returns while still PREPARING. */
+ColiXdnaPrepResult coli_xdna_prepare_from_fmt4(ColiXdnaPrepared *p,
+                                               int fmt,
+                                               const unsigned char *q4,
+                                               const float *scale,
+                                               int I, int O, int gs);
+
+/* The prepared image, readable only when the state is VALID. NULL otherwise, so
+ * an unpublished or revoked image cannot be consumed by accident. */
+const void *coli_xdna_prepared_image(const ColiXdnaPrepared *p);
+
 ColiXdnaPrepState coli_xdna_prepared_state(const ColiXdnaPrepared *p);
 /* Logical payload bytes currently allocated: K*N*sizeof(bf16), not a rounded
  * allocator reservation. Non-zero for a retained INVALID buffer. */
@@ -284,6 +322,17 @@ int    coli_xdna_prepared_live_objects(void);
 
 /* Install a registry for tests; NULL restores the production table. */
 void coli_xdna_test_set_registry(const ColiXdnaArtifact *rows, int count);
+
+/* Deterministic mid-conversion fault injection, for tests only. 0 disables it;
+ * 1..99 fails after approximately that percentage of the conversion's rows.
+ * Named coli_xdna_test_* like every other seam here, and never referenced by
+ * production paths -- there is no environment variable or CLI flag that can
+ * reach it. */
+void coli_xdna_test_set_convert_fail_pct(int pct);
+/* The destination regardless of state, so a test can inspect the partial bytes
+ * a failed conversion left behind. Production code uses
+ * coli_xdna_prepared_image(), which returns NULL unless the image is VALID. */
+const void *coli_xdna_prepared_image_unchecked(const ColiXdnaPrepared *p);
 /* All four must stay 0 for the whole of this slice. */
 int coli_xdna_test_device_opens(void);
 int coli_xdna_test_helper_calls(void);
