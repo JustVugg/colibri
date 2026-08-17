@@ -68,6 +68,9 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         _version = "unknown"
 
+from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
+                             family_by_id, resolve_model)
+
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
 # tools/ all live next to this script — unchanged from before.
@@ -156,13 +159,8 @@ def sprite_lines():
 # Parameter counts are the roster's, i.e. the README's, so the two cannot drift
 # apart quietly. A model_type absent from this table is NOT forced into a name
 # here -- it prints its own model_type and its measured geometry instead.
-_BANNER_MODELS = (
-    ("deepseek_v4", "DeepSeek V4 Flash", "284B"),   # before "deepseek": V4 is its own engine
-    ("inkling",     "Inkling",           "975B"),
-    ("kimi",        "Kimi K3",           "2.8T"),
-    ("olmoe",       "OLMoE",             "7B"),
-    ("glm",         "GLM-5.2",           "744B"),
-)
+_BANNER_MODELS = tuple((family.model_types[0], family.display_name, family.display_scale)
+                       for family in all_families())
 
 def model_banner_line(model):
     """Third banner line: what is actually loaded, or the generic tagline.
@@ -180,15 +178,13 @@ def model_banner_line(model):
     except (OSError, ValueError, TypeError):
         return generic
     kind = (cfg.get("model_type") or "").lower()
-
-    name, scale = "", ""
-    for key, display, params in _BANNER_MODELS:
-        if key in kind:
-            name, scale = display, params
-            break
-    if not name:
+    try:
+        family = resolve_model(model).descriptor
+        name, scale = family.display_name, family.display_scale
+    except (FamilyConfigError, UnknownFamilyError):
         # Unknown checkpoint: say so with its own words rather than guess.
         name = kind or "unknown model"
+        scale = ""
 
     bits = [name]
     if scale:
@@ -310,27 +306,20 @@ def redraw_prompt_box(message, width):
     return clean
 
 def model_arch(model):
-    try:
-        with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
-            model_type = (json.load(f).get("model_type") or "").lower()
-    except (OSError, ValueError, TypeError):
-        return "glm"
-    if "inkling" in model_type:
-        return "inkling"
-    if "kimi" in model_type:
-        return "kimi"
-    if "olmoe" in model_type:
-        return "olmoe"
-    if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
-        return "deepseek_v4"
-    return "glm"
+    return resolve_model(model).descriptor.id
 
 def engine_for(model):
-    arch = model_arch(model)
-    if arch == "glm" or os.environ.get("COLI_ENGINE"):
+    family = resolve_model(model).descriptor
+    if os.environ.get("COLI_ENGINE"):
+        if (family.id != "glm" and
+                os.environ.get("COLI_DOCKER_GLM_ONLY") == "1"):
+            raise UnknownFamilyError(
+                f"this image contains only the GLM engine; {family.display_name} "
+                "needs a full release archive or source build")
         return GLM
-    name = {"inkling": "inkling", "kimi": "kimi_k3", "olmoe": "olmoe",
-            "deepseek_v4": "deepseek_v4"}[arch]
+    if family.id == "glm":
+        return GLM
+    name = family.engine_artifact
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
 
@@ -343,10 +332,7 @@ def need_model(model, engine=None):
         sys.exit(f"{C.yel}tokenizer.json is missing from {model}{C.r}")
     engine = engine or engine_for(model)
     if not os.path.exists(engine):
-        arch = model_arch(model)
-        target = ("kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else
-                  "olmoe" if arch == "olmoe" else
-                  "deepseek-v4" if arch == "deepseek_v4" else "colibri")
+        target = resolve_model(model).descriptor.build_target
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
 # One-shot runs keep the historic 1024. Interactive sessions get 16384, because
@@ -354,15 +340,19 @@ def need_model(model, engine=None):
 # --ngen as a hard ceiling it clamps to (#260) -- so a low ceiling makes the
 # user's own control inert instead of merely cautious. Still a ceiling, not a
 # target: generation ends at EOS either way.
-def ngen_for(a, interactive=False):
+def ngen_for(a, interactive=False, family=None):
     if getattr(a, "ngen", None): return a.ngen
+    if family is not None:
+        if isinstance(family, str): family = family_by_id(family)
+        limits = family.limits
+        return limits.interactive_max_output if interactive else limits.default_max_output
     return 16384 if interactive else 1024
 
 def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
     env = os.environ.copy()
-    # OMP_NUM_THREADS for the sister engines too.
+    # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
     # #805 set this from physical cores "on every platform" -- but only inside
     # env_for(), which this function calls only for glm. inkling, kimi_k3,
@@ -375,23 +365,29 @@ def env_for_engine(a, arch):
     # Same defect shape as the one #805 fixed, one level out: a mechanism that
     # reaches one engine and not its siblings.
     #
-    # setdefault, so an explicit OMP_NUM_THREADS still wins -- which is also
-    # how to A/B it: OMP_NUM_THREADS=12 reproduces the old behaviour.
+    # DeepSeek V4 is now the exception: its C runtime sizes the team from
+    # logical CPUs minus its expert-loader reservation. Setting the physical
+    # count here makes that runtime mistake a launcher default for a user
+    # override and bypass its loader-aware policy. The other engines still
+    # need the physical-core default below.
+    #
+    # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
-        if arch == "deepseek_v4":
+        if arch != "deepseek_v4":
+            from resource_plan import physical_cpu_count
+            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
             env.setdefault("OMP_DYNAMIC", "FALSE")
             if sys.platform != "win32":
                 env.setdefault("OMP_PROC_BIND", "close")
                 env.setdefault("OMP_PLACES", "cores")
-    env["NGEN"] = str(ngen_for(a))          # ngen_for keeps the historic 1024 here
+    env["NGEN"] = str(ngen_for(a, family=arch))
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
     if arch == "olmoe":
         env["CHAT"] = "1"
-        env["MAX_NEW"] = str(ngen_for(a))
+        env["MAX_NEW"] = str(ngen_for(a, family=arch))
         # olmoe reads COLI_TEMP like every other engine (line above). Setting the
         # legacy TEMP alias here also clobbered %TEMP% with "0.7" for every child
         # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
@@ -402,8 +398,9 @@ def env_for_engine(a, arch):
     # user's session ran itself out of memory with the flag apparently set.
     if arch in ("deepseek_v4", "kimi"):
         if a.ram: env["RAM_GB"] = str(a.ram)
+    if a.ctx:
+        env[family_by_id(arch).limits.context_env] = str(a.ctx)
     if arch == "deepseek_v4":
-        if a.ctx: env["CTX"] = str(a.ctx)
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
         # the visible decode. V4_DRAFT=5 remains available for repeated code.
@@ -418,7 +415,45 @@ def env_for_engine(a, arch):
         env.setdefault("V4_MTP_MISS", "96")
         env.setdefault("V4_MTP_MIN", "3")
         env.setdefault("V4_MTP_CONF", "0.55")
+        # GPU mirroring of the MTP draft experts stays opt-in: the CUDA kernels
+        # accumulate fp32 differently from the CPU refs and speculative
+        # acceptance needs a bit-exact draft. V4_MTP_GPU=1 mirrors GLM's
+        # COLI_CUDA_MTP switch for CUDA-driven speculative decoding.
+        env.setdefault("V4_MTP_GPU", "0")
+    # getattr: tests build partial Namespaces for env_for_engine.
+    gpu = getattr(a, "gpu", None)
+    vram = getattr(a, "vram", None)
+    if gpu is not None:
+        env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
+        if gpu == "none":
+            env["COLI_CUDA"] = "0"
+            env.pop("CUDA_EXPERT_GB", None); env.pop("CUDA_DENSE", None)
+        else:
+            if arch == "deepseek_v4":
+                if not dsv4_cuda_available(a.model):
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+            elif not cuda_binary():
+                sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
+            env["COLI_CUDA"] = "1"
+            if gpu != "auto":
+                env["COLI_GPUS"] = gpu
+            env.setdefault("CUDA_DENSE", "1")
+    if vram and gpu != "none":
+        if arch == "deepseek_v4":
+            if not dsv4_cuda_available(a.model):
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+        elif not cuda_binary():
+            sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
+        env["COLI_CUDA"] = "1"
+        env["CUDA_EXPERT_GB"] = str(vram)
     return env
+
+def dsv4_cuda_available(model=None):
+    if sys.platform != "win32":
+        return False
+    eng = engine_for(model) if model else GLM
+    dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
+    return os.path.exists(dll)
 
 def cuda_binary():
     if not os.path.exists(GLM): return False
@@ -442,7 +477,11 @@ def cuda_binary():
     return False
 
 def resource_request(a, env):
-    ctx=a.ctx or int(env.get("CTX",4096))
+    family=resolve_model(a.model).descriptor if getattr(a,"model",None) else family_by_id("glm")
+    ctx=a.ctx or int(env.get(family.limits.context_env,family.limits.default_context))
+    if ctx<1 or ctx>family.limits.max_context:
+        raise ValueError(f"--ctx must be between 1 and {family.limits.max_context} "
+                         f"for {family.display_name}")
     def num(v):
         try: return float(v)
         except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
@@ -454,6 +493,12 @@ def resource_request(a, env):
     devices=None if gpu=="auto" else ([] if gpu=="none" else
         [int(value) for value in gpu.split(",")])
     return ram,ctx,devices,vram
+
+
+def requested_kv_slots(a, env):
+    value=getattr(a,"kv_slots",None)
+    if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
+    return value
 
 def env_for(a):
     explicit_env = set(os.environ)
@@ -531,7 +576,8 @@ def env_for(a):
         if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                            kv_slots=requested_kv_slots(a,e))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -565,8 +611,15 @@ def env_for(a):
         if (sys.platform == "win32" and a.gpu is None and not a.vram
                 and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
-                from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
-                gpus = discover_gpus()
+                from resource_plan import (discover_gpus, plans_placement, build_plan,
+                                           environment_for_plan, format_bytes)
+                # Auto-enable is an automatic placement decision, so it may only
+                # be made from devices whose free memory is a qualified budget.
+                # A discovered-but-unqualified device (free_bytes None: a Windows
+                # AMD part found through hipInfo) reaches the engine env here
+                # WITHOUT passing through environment_for_plan, so the planner's
+                # own gate cannot cover this path -- filter at the source.
+                gpus = [g for g in discover_gpus() if plans_placement(g)]
                 if gpus:
                     e["COLI_CUDA"]="1"
                     e.setdefault("COLI_GPUS", ",".join(str(g["index"]) for g in gpus))
@@ -575,7 +628,8 @@ def env_for(a):
                     # as --auto-tier, just without requiring the user to pass it.
                     ram,ctx,devices,vram_req = resource_request(a, e)
                     try:
-                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy,
+                                        kv_slots=requested_kv_slots(a,e))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
                         names=",".join(g["name"].strip() for g in gpus)
@@ -786,9 +840,8 @@ def cmd_build(a):
     if not os.path.exists(os.path.join(HERE, "Makefile")):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
-    arch=model_arch(a.model) if a.model else "glm"
-    target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3","olmoe":"olmoe",
-            "deepseek_v4":"deepseek-v4"}[arch]
+    family=resolve_model(a.model).descriptor if a.model else family_by_id("glm")
+    target=family.build_target
     sys.exit(subprocess.call(["make","-C",HERE,target]))
 
 def cmd_info(a):
@@ -796,6 +849,12 @@ def cmd_info(a):
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     cfgp=os.path.join(a.model,"config.json")
+    try:
+        family=resolve_model(a.model).descriptor
+    except (FamilyConfigError,UnknownFamilyError) as error:
+        if os.path.exists(cfgp):
+            sys.exit(f"{C.yel}unsupported model:{C.r} {error}")
+        family=None
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
@@ -818,7 +877,8 @@ def cmd_info(a):
         row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
         row("disk", "? GB (unavailable)")
-    row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
+    engine=engine_for(a.model) if family else GLM
+    row("engine", "ready ✓" if os.path.exists(engine) else "not built (coli build)")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -834,7 +894,8 @@ def cmd_plan(a):
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                        kv_slots=requested_kv_slots(a,os.environ))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -846,10 +907,16 @@ def cmd_plan(a):
 
 def cmd_doctor(a):
     from doctor import exit_code, format_doctor, run_doctor
+    if not a.model:
+        report={"schema_version":1,"status":"error","model":None,
+                "mode":"deep" if a.deep else "standard",
+                "checks":[{"id":"config.arguments","status":"fail",
+                           "summary":f"no model directory given: {NO_MODEL_HINT}"}],
+                "plan":None}
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report)); return 2
     try:
         # doctor reports rather than exits, so a missing model is a failed check and not
         # a sys.exit like everywhere else — it is exactly the thing doctor exists to say.
-        if not a.model: raise ValueError(f"no model directory given: {NO_MODEL_HINT}")
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if ram<0: raise ValueError("--ram cannot be negative")
@@ -861,12 +928,20 @@ def cmd_doctor(a):
                 "plan":None}
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
+    engine_error=None
+    try:
+        engine=engine_for(a.model)
+    except (FamilyConfigError,UnknownFamilyError) as error:
+        engine=GLM
+        engine_error=error
     report=run_doctor(
         # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
         # no matter which model it was pointed at: a built kimi_k3/inkling was
         # reported "engine is not built", and a stale colibri would have been
         # reported ready for a model that never runs on it (#783).
-        a.model, ram, ctx, devices, vram, engine_path=engine_for(a.model), deep=a.deep,
+        a.model, ram, ctx, devices, vram, engine_path=engine, deep=a.deep,
+        kv_slots=requested_kv_slots(a,os.environ),
+        engine_error=engine_error,
         mirror_dir=os.environ.get("COLI_MODEL_MIRROR"),
     )
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
@@ -885,7 +960,8 @@ def cmd_tune(a):
     from resource_plan import build_plan
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                        kv_slots=requested_kv_slots(a,os.environ))
     except (OSError,ValueError,json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create tuning plan:{C.r} {error}")
     a.auto_tier=True
@@ -895,7 +971,10 @@ def cmd_tune(a):
     # launched the GLM engine, which died on "this engine requires n_group=1"
     # (#898). Same shape as #879, one command over -- the launcher naming a
     # family it then mis-dispatched.
-    arch=model_arch(a.model)
+    family=resolve_model(a.model).descriptor
+    arch=family.id
+    if family.gateway_adapter not in ("glm","inkling","kimi","olmoe","deepseek_v4"):
+        sys.exit(f"{family.display_name}: gateway adapter {family.gateway_adapter!r} is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
     base_env=env_for_engine(a,arch) if arch!="glm" else env_for(a)
@@ -932,11 +1011,16 @@ def cmd_tune(a):
     print(f"  profile: {path}\n")
 
 def cmd_run(a):
-    arch=model_arch(a.model)
+    need_model(a.model)
+    family=resolve_model(a.model).descriptor
+    arch=family.id
     engine=engine_for(a.model)
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run", model=a.model)
+    if family.cli_adapter not in ("glm","deepseek_v4","olmoe"):
+        sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
+                 f"use coli chat or coli serve")
     if arch=="deepseek_v4":
         prompt_path=None
         try:
@@ -950,7 +1034,7 @@ def cmd_run(a):
                 cmd += ["--prompt-file",prompt_path]
             else:
                 cmd.append(prompt)
-            cmd += ["--max-tokens",str(ngen_for(a,interactive=True))]
+            cmd += ["--max-tokens",str(ngen_for(a,interactive=True,family=family))]
             if a.ram: cmd += ["--memory-gb",str(a.ram)]
             if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
             result=subprocess.call(cmd,env=env_for_engine(a,arch))
@@ -1141,13 +1225,15 @@ def cmd_chat(a):
             chat_attached(a, base, mid); return
         if getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
-    arch=model_arch(a.model)
+    need_model(a.model)
+    family=resolve_model(a.model).descriptor
+    arch=family.id
+    if family.gateway_adapter not in ("glm","inkling","kimi","olmoe","deepseek_v4"):
+        sys.exit(f"{family.display_name}: gateway adapter {family.gateway_adapter!r} is not wired")
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id=("kimi-k3-colibri" if arch=="kimi" else
-                  "inkling-colibri" if arch=="inkling" else
-                  "olmoe-colibri" if arch=="olmoe" else "deepseek-v4-colibri")
+        model_id=family.default_model_id
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -1157,7 +1243,8 @@ def cmd_chat(a):
         # legacy 8, an explicit value -- 0 included -- passes verbatim).
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
-             "--host","127.0.0.1","--port","8000","--max-tokens",str(ngen_for(a,interactive=True))]
+             "--host","127.0.0.1","--port","8000","--max-tokens",
+             str(ngen_for(a,interactive=True,family=family))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -1331,11 +1418,15 @@ def _serve_engine_env(a, arch):
     return env
 
 def cmd_serve(a):
-    arch=model_arch(a.model)
+    need_model(a.model)
+    family=resolve_model(a.model).descriptor
+    arch=family.id
+    if family.gateway_adapter not in ("glm","inkling","kimi","olmoe","deepseek_v4"):
+        sys.exit(f"{family.display_name}: gateway adapter {family.gateway_adapter!r} is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
-    if arch!="glm" and a.kv_slots!=1:
-        sys.exit(f"{arch} currently supports exactly one KV slot")
+    if a.kv_slots>family.limits.max_kv_slots:
+        sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
     try:
@@ -1343,19 +1434,47 @@ def cmd_serve(a):
     except OSError: pass
     import openai_server
     openai_server.ARCH=arch
-    model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
-                            "inkling-colibri" if arch=="inkling" else
-                            "deepseek-v4-colibri" if arch=="deepseek_v4" else
-                            "olmoe-colibri" if arch=="olmoe" else
-                            "glm-5.2-colibri")
+    model_id=a.model_id or family.default_model_id
     try:
         if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,ngen_for(a,interactive=True),engine,_serve_engine_env(a,arch),a.cors_origin,
-              a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
+              a.cap,ngen_for(a,interactive=True,family=family),engine,
+              _serve_engine_env(a,arch),a.cors_origin,
+              a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host,
+              family=family)
     finally:
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
+
+def _pid_alive(pid):
+    """Is `pid` a live process?
+
+    `os.kill(pid, 0)` is the POSIX idiom, but on Windows os.kill() has no signal
+    semantics: for a pid this process did not spawn it raises
+    OSError [WinError 87] "The parameter is incorrect" instead of reporting
+    liveness. cmd_stop caught that as "not running", so `coli stop` printed
+    "nothing running" while the port was still LISTENING and ~5 GB of engines
+    were resident (#1049, reported with a reproduction on Windows 11 native).
+    On win32 ask the OS directly instead."""
+    if sys.platform != "win32":
+        try: os.kill(pid, 0); return True
+        except OSError: return False
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle: return False
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)): return False
+        # STILL_ACTIVE is also a legal exit code; a process that exited with 259
+        # reads as alive here. SIGTERM on a dead pid is harmless, so the failure
+        # mode is a redundant kill, never a missed one.
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
 
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
@@ -1369,7 +1488,7 @@ def cmd_stop(a):
     pf=serve_pidfile(a.port)
     try:
         with open(pf) as f: pid=int(f.read().split()[0])
-        os.kill(pid,0); targets[pid]=f"coli serve (pidfile, port {a.port})"
+        if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
     try: proc_entries=os.listdir("/proc")
     except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
@@ -1381,7 +1500,9 @@ def cmd_stop(a):
             if pid!=os.getpid() and _serve_cmdline_matches_port(cmd,a.port):
                 targets.setdefault(pid,f"coli serve (cmdline, port {a.port})")
             with open(f"/proc/{pd}/comm") as f: comm=f.read().strip()
-            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4"):
+            process_names={"exe"}
+            for family in all_families(): process_names.update(family.process_names)
+            if comm in process_names:
                 with open(f"/proc/{pd}/environ","rb") as f: env=f.read()
                 if _serve_environ_matches_port(env,a.port):
                     targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
@@ -1395,7 +1516,11 @@ def cmd_stop(a):
         except OSError: pass
     time.sleep(2.0)
     for pid in targets:
-        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
+        # signal.SIGKILL does not exist on win32 and AttributeError is not OSError,
+        # so the bare `except OSError` let it escape and abort the command AFTER
+        # the SIGTERMs above (#1049). Line 752 in this file already uses the
+        # getattr form; os.kill(SIGTERM) is TerminateProcess on Windows anyway.
+        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); print(f"  {pid}: forced")
         except OSError: pass       # gia' morto: bene
     try: os.unlink(pf)
     except OSError: pass
@@ -1633,7 +1758,11 @@ def main():
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
-    if handler: sys.exit(handler(a) or 0)
+    if handler:
+        try:
+            sys.exit(handler(a) or 0)
+        except (FamilyConfigError,UnknownFamilyError) as error:
+            sys.exit(f"{C.yel}unsupported model:{C.r} {error}")
     banner(); print(__doc__)
 
 if __name__=="__main__":

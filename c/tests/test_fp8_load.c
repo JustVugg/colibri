@@ -745,8 +745,14 @@ static void test_metal_fused_allowlist(void){
     }
     CHECK(!metal_fused_fmt_ok(100));   /* private-block ordinals stay out too */
     /* (2) grep-pin: run_tests.py runs us with cwd=c/ (Part B's fixtures rely
-     * on the same fact). 11 per-tensor call sites = 4 (attention_rows:
-     * q_a/q_b/kv_a/o) + 7 (layer_forward_rows: those + sh_gate/sh_up/sh_down). */
+     * on the same fact). The per-tensor calls live in ONE place now --
+     * metal_fused_layer_fmt_miss(), the shared per-layer predicate both gates
+     * and metal_fmt_gate_notice consume -- so the pin is: exactly 7
+     * metal_fused_fmt_ok(l->...) call sites (q_a/q_b/kv_a/o +
+     * sh_gate/sh_up/sh_down, each once, inside the helper; kv_b uses its own
+     * two-format+mode term there, not the allowlist), and BOTH gate sites
+     * consult the helper against the mask of tensors their kernel binds.
+     * (test_kvb_notice.c pins the helper's own truth table.) */
     FILE *f = fopen("colibri.c", "r");
     if(!f){ printf("FAIL Part F grep-pin: cannot open colibri.c (cwd not c/?)\n"); CHECK(0); return; }
     static char src[16*1024*1024];
@@ -754,8 +760,14 @@ static void test_metal_fused_allowlist(void){
     CHECK(n > 100000);                      /* sanity: we read the real file */
     int calls=0; const char *p=src;
     while((p=strstr(p,"metal_fused_fmt_ok(l->"))!=NULL){ calls++; p++; }
-    if(calls!=11) printf("FAIL Part F grep-pin: %d metal_fused_fmt_ok(l->...) call sites, want 11\n", calls);
-    CHECK(calls==11);
+    if(calls!=7) printf("FAIL Part F grep-pin: %d metal_fused_fmt_ok(l->...) call sites, want 7\n", calls);
+    CHECK(calls==7);
+    int attn=0; p=src;
+    while((p=strstr(p,"metal_fused_layer_fmt_miss(l) & METAL_FUSED_ATTN_TENSORS"))!=NULL){ attn++; p++; }
+    CHECK(attn==1);                    /* attention_rows' gate consults the shared predicate */
+    int lay=0; p=src;
+    while((p=strstr(p,"metal_fused_layer_fmt_miss(l) & METAL_FUSED_LAYER_TENSORS"))!=NULL){ lay++; p++; }
+    CHECK(lay==1);                     /* layer_forward_rows' gate consults the shared predicate */
     /* the old fail-open idiom must be gone from the gate sites (the CUDA
      * eligibility guard's `w->fmt!=8` is a different site and untouched). */
     CHECK(strstr(src,"l->q_a.fmt!=8")==NULL);

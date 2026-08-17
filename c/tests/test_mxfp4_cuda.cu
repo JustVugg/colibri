@@ -53,6 +53,38 @@ static uint32_t rnd(void) {
     return (uint32_t)(rng_state >> 32);
 }
 
+/* CPU-vs-GPU compare shared by every case: NaN only agrees with NaN, inf must
+ * agree in sign, finite values to 1e-4 relative. */
+static void compare_case(const char *what, const float *y_cpu, const float *y_gpu,
+                         int S, int I, int O) {
+    double worst = 0.0;
+    int bad = 0;
+    for (int i = 0; i < S * O; i++) {
+        float a = y_cpu[i], b = y_gpu[i];
+        if (std::isnan(a) || std::isnan(b)) { /* NaN only agrees with NaN: without this,
+                                                 NaN against anything falls through the
+                                                 relative compare (NaN > tol is false)
+                                                 and silently counts as a pass */
+            if (std::isnan(a) != std::isnan(b)) bad++;
+            continue;
+        }
+        if (isinf(a) || isinf(b)) {           /* exponent 255: both must agree it is inf */
+            if (isinf(a) != isinf(b) || (isinf(a) && ((a > 0) != (b > 0)))) bad++;
+            continue;
+        }
+        double den = fabs(a) > 1e-6 ? fabs(a) : 1e-6;
+        double rel = fabs((double)a - (double)b) / den;
+        if (rel > worst) worst = rel;
+        if (rel > 1e-4) bad++;
+    }
+    if (bad) {
+        printf("  FAIL %-28s %d/%d elements differ, worst rel %.3e\n", what, bad, S * O, worst);
+        fails++;
+    } else {
+        printf("  ok   %-28s S=%-3d I=%-5d O=%-4d worst rel %.2e\n", what, S, I, O, worst);
+    }
+}
+
 /* One case: random MXFP4 weights, random activations, CPU vs CUDA. */
 static void one_case(const char *what, int S, int I, int O, int fixed_exp) {
     int rb = (I + 1) / 2, ng = (I + 31) / 32;
@@ -78,29 +110,65 @@ static void one_case(const char *what, int S, int I, int O, int fixed_exp) {
         goto done;
     }
 
-    {
-        double worst = 0.0;
-        int bad = 0;
-        for (int i = 0; i < S * O; i++) {
-            float a = y_cpu[i], b = y_gpu[i];
-            if (isinf(a) || isinf(b)) {           /* exponent 255: both must agree it is inf */
-                if (isinf(a) != isinf(b) || (isinf(a) && ((a > 0) != (b > 0)))) bad++;
-                continue;
-            }
-            double den = fabs(a) > 1e-6 ? fabs(a) : 1e-6;
-            double rel = fabs((double)a - (double)b) / den;
-            if (rel > worst) worst = rel;
-            if (rel > 1e-4) bad++;
-        }
-        if (bad) {
-            printf("  FAIL %-28s %d/%d elements differ, worst rel %.3e\n", what, bad, S * O, worst);
-            fails++;
-        } else {
-            printf("  ok   %-28s S=%-3d I=%-5d O=%-4d worst rel %.2e\n", what, S, I, O, worst);
-        }
-    }
+    compare_case(what, y_cpu, y_gpu, S, I, O);
 done:
     free(q4); free(e8); free(x); free(y_cpu); free(y_gpu);
+}
+
+/* exp-255 on mixed rows and groups, I % 32 != 0 on purpose: quant.h's AVX2
+ * path (which only runs when I % 32 == 0) applies the group scale per 8-lane
+ * FMA and NaNs where the scalar path gives the group-sign inf at s=255, so an
+ * odd width pins the scalar reference on every host. Odd output rows carry
+ * the 255 byte in group 1 -- NOT group 0 -- so a decoder that only classifies
+ * a row by its first group misses it; even rows stay in the normal range and
+ * must be unaffected by their neighbours. */
+static void mixed_rows_255(void) {
+    const int S = 1, I = 97, O = 16, rb = (97 + 1) / 2, ng = (97 + 31) / 32;
+    uint8_t q4[16 * 49], e8[16 * 4];
+    float x[97], y_cpu[16] = {0}, y_gpu[16] = {0};
+    for (int i = 0; i < O * rb; i++) q4[i] = (uint8_t)(rnd() & 0xFF);
+    for (int o = 0; o < O; o++)
+        for (int g = 0; g < ng; g++)
+            e8[o * ng + g] = ((o & 1) && g == 1) ? 255 : (uint8_t)(110 + (rnd() % 30));
+    for (int i = 0; i < S * I; i++) x[i] = ((float)(rnd() % 2001) - 1000.0f) / 1000.0f;
+
+    mxfp4_ref(y_cpu, x, q4, e8, S, I, O);
+    if (!coli_cuda_matmul_mxfp4(y_gpu, x, q4, e8, S, I, O)) {
+        printf("  FAIL exp-255 mixed rows          CUDA path refused the call\n");
+        fails++;
+        return;
+    }
+    compare_case("exp-255 mixed rows/groups", y_cpu, y_gpu, S, I, O);
+}
+
+/* A 254 group and a 255 group in the same row, I % 32 != 0 (scalar reference,
+ * as above). Weights and activations are pinned so the 254 group's subtotal
+ * is +-1.6 * 2^127 -- large but finite, sign alternating by row -- and the
+ * 255 group's is 1.6 * inf = +inf: every row must come out +inf on both
+ * sides. A decoder that applies a group scale twice turns the odd rows' 254
+ * subtotal into -inf and the row into NaN. */
+static void mixed_254_255(void) {
+    const int S = 1, I = 97, O = 8, rb = 49, ng = 4;
+    uint8_t q4[8 * 49], e8[8 * 4];
+    float x[97], y_cpu[8] = {0}, y_gpu[8] = {0};
+    memset(q4, 0x22, sizeof q4);                    /* every weight +1.0 */
+    for (int o = 0; o < O; o++) {
+        if (o & 1)                                  /* group 1 weights -1.0 on odd rows */
+            memset(q4 + o * rb + 16, 0xAA, 16);
+        e8[o * ng + 0] = 127;                       /* cols  0..31: scale 1    */
+        e8[o * ng + 1] = 254;                       /* cols 32..63: scale 2^127 */
+        e8[o * ng + 2] = 255;                       /* cols 64..95: scale +inf  */
+        e8[o * ng + 3] = 127;                       /* col  96 (tail): scale 1  */
+    }
+    for (int i = 0; i < S * I; i++) x[i] = 0.05f;
+
+    mxfp4_ref(y_cpu, x, q4, e8, S, I, O);
+    if (!coli_cuda_matmul_mxfp4(y_gpu, x, q4, e8, S, I, O)) {
+        printf("  FAIL exp-254+255 mixed groups    CUDA path refused the call\n");
+        fails++;
+        return;
+    }
+    compare_case("exp-254+255 mixed groups", y_cpu, y_gpu, S, I, O);
 }
 
 /* Every e2m1 code, decoded in isolation: one column set to code c, x = 1.0,
@@ -150,7 +218,12 @@ int main(void) {
     one_case("non-multiple-of-32 columns", 1,   96,    8, -1);   /* 3 groups exactly */
     one_case("tail group (I%32 != 0)",     1,   80,    8, -1);   /* 2.5 groups */
     one_case("exponent 0 -> +0",           1,   64,   16,  0);
-    one_case("exponent 255 -> inf",        1,   64,   16, 255);
+    /* I % 32 != 0: pins the scalar CPU reference on every host -- quant.h's
+     * AVX2 path disagrees with its scalar path at s=255 (NaN vs group-sign
+     * inf) and only dispatches when I % 32 == 0. */
+    one_case("exponent 255 -> inf",        1,   65,   16, 255);
+    mixed_rows_255();
+    mixed_254_255();
     one_case("exponent 127 -> unit scale", 1,   64,   16, 127);
 
     printf(fails ? "test_mxfp4_cuda: %d failure(s)\n" : "test_mxfp4_cuda: ok\n", fails);

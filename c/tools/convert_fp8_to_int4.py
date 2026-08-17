@@ -32,6 +32,23 @@ import numpy as np
 _positioned_write_lock = threading.Lock()
 
 
+def _save_file_atomic(save_file, tensors, destination, **kwargs):
+    destination = os.fspath(destination)
+    temporary = destination + ".tmp"
+    try:
+        os.remove(temporary)
+    except FileNotFoundError:
+        pass
+    try:
+        save_file(tensors, temporary, **kwargs)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
 def _positioned_write(fd, data, offset):
     remaining = memoryview(data)
     pwrite = getattr(os, "pwrite", None)
@@ -716,7 +733,7 @@ def main():
                 done[key] = ""
             else:
                 name = f"{prefix}{n:05d}.safetensors"
-                save_file(out, os.path.join(a.outdir, name))
+                _save_file_atomic(save_file, out, os.path.join(a.outdir, name))
                 done[key] = name; n += 1; fresh += 1
             tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
             with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
@@ -986,7 +1003,7 @@ def main():
             print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map)
-            save_file(out, outp)
+            _save_file_atomic(save_file, out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
@@ -1010,7 +1027,7 @@ def main():
             print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
-            if out: save_file(out, outp)
+            if out: _save_file_atomic(save_file, out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
@@ -1028,7 +1045,7 @@ def main():
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
-        save_file(out, outp)
+        _save_file_atomic(save_file, out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
             if os.path.isfile(blob): os.remove(blob)

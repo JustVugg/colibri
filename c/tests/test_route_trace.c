@@ -124,6 +124,10 @@ int main(void){
         check(rt_engine_of(rt_hash("kimi_k3")) != NULL, "the writer can be named");
         check(strcmp(rt_engine_of(rt_hash("kimi_k3")), "kimi_k3") == 0, "named correctly");
         check(rt_engine_of(12345u) == NULL, "an unknown id has no name");
+        /* deepseek_v4 writes through this same header (its private writer is gone,
+         * #700 completed), so its id must resolve to a name like every sibling's */
+        check(strcmp(rt_engine_of(rt_hash("deepseek_v4")), "deepseek_v4") == 0,
+              "the deepseek_v4 writer can be named");
     }
 
     /* 7. inkling's IKU1 layout is refused by any engine that is not inkling */

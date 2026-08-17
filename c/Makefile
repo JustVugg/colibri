@@ -174,6 +174,8 @@ CUDA      ?= 0
 CUDA_DLL  ?= 0
 COLI_ANS  ?= 0
 DIETGPU_ROOT ?=
+DEEPGEMM  ?= 0
+NCCL      ?= 0
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
 # GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
@@ -198,6 +200,10 @@ endif
 # For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
 # newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
 # plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
+# sm_121 (GB10 Spark) needs CUDA >= 12.9, so its gencode joins only when the
+# detected toolkit supports it — the portable floor stays 12.8. The version
+# probe fails closed: no or unparsable nvcc means no compute_121 (the
+# compute_120 PTX still JITs on sm_121).
 CUDA_ARCH ?= native
 ifeq ($(CUDA_ARCH),portable)
 CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
@@ -206,18 +212,35 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_90,code=sm_90 \
                -gencode arch=compute_120,code=sm_120 \
                -gencode arch=compute_120,code=compute_120
+NVCC_RELEASE := $(shell "$(NVCC)" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+# The empty-check makes the fail-closed promise real: with no parsable
+# version the sort below would compare 12.9 against itself and pass.
+ifneq ($(strip $(NVCC_RELEASE)),)
+ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1),12.9)
+CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
+endif
+endif
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
+# NVCC_STD is a variable so an optional backend can raise the standard without
+# rewriting the whole flag line: DEEPGEMM=1 needs C++20, and replacing
+# NVCCFLAGS wholesale to get it would also discard $(CUDA_GENCODE) and any
+# -ccbin the user set above.
+NVCC_STD ?= c++17
 ifneq ($(IS_WIN),)
 # nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
 # -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-W3
 else
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+# -ftz=false is nvcc's default, pinned explicitly: the fmt=8 kernels are
+# cross-tier parity instruments and a flushed scale*subnormal contribution
+# silently diverges from the CPU reference (backend_cuda.cu also #errors on
+# fast-math builds, but -ftz alone defines no macro to guard on).
+NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
 # glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
 # with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
 # under C++17 (noexcept is part of the function type since C++17). Force-include
@@ -421,7 +444,7 @@ ifeq ($(HIP),1)
 $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
-LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
 CUDA_OBJ  = backend_cuda.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
@@ -433,6 +456,36 @@ GPUFLAGS += -DCOLI_ANS -I$(DIETGPU_ROOT) -I$(DIETGPU_ROOT)/build/third_party/glo
 ANS_LIBS  = -L$(DIETGPU_ROOT)/build/lib -Wl,-rpath,$(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
 ANS_NVCC_LIBS = -L$(DIETGPU_ROOT)/build/lib -Xlinker -rpath -Xlinker $(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
 LDFLAGS  += $(ANS_LIBS)
+endif
+
+# --- DeepSeek V4 CUDA kernels -------------------------------------------
+# The GPU tier for the DeepSeek V4 engine in Makefile.deepseek-v4. These
+# objects are self-contained: backend_cuda_dsv4.* include only their own header
+# and the CUDA runtime, so they build and their tests run without the engine.
+#
+# DEEPGEMM is unsupported: CI cannot compile it without an external checkout,
+# and its kernels require Blackwell to run. It gates nothing and blocks nothing;
+# the default build is the supported configuration.
+DSV4_CUDA_OBJ = backend_cuda_dsv4.o
+ifeq ($(DEEPGEMM),1)
+ifndef DEEPGEMM_HOME
+$(error DEEPGEMM_HOME must point to a DeepGEMM include tree)
+endif
+CFLAGS += -DCOLI_DSV4_DEEPGEMM
+# Append, never replace. This was `:=` and discarded the whole inherited flag
+# set: $(CUDA_GENCODE), so any CUDA_ARCH the user chose was silently swapped for
+# a hardcoded sm_120f -- making DEEPGEMM=1 a Blackwell-only path by accident
+# rather than by design -- and the -ccbin above, which is how a host whose
+# default g++ is too new for CUDA names a supported host compiler. DeepGEMM
+# needs C++20 and the relaxed-constexpr/extended-lambda pair, not its own arch.
+override NVCC_STD  := c++20
+override NVCCFLAGS += --expt-relaxed-constexpr --expt-extended-lambda -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)" -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
+LDFLAGS += -lcuda
+endif
+ifeq ($(NCCL),1)
+CFLAGS += -DCOLI_DSV4_NCCL
+override NVCCFLAGS += -DCOLI_DSV4_NCCL
+LDFLAGS += -lnccl
 endif
 endif
 
@@ -639,6 +692,49 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
+
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+# Windows DeepSeek V4 CUDA DLLs: the sibling of cuda-dll for the DeepSeek V4
+# engine. deepseek-v4.exe is built with MinGW gcc and cannot link MSVC/nvcc
+# objects, so backend_cuda_dsv4.cu compiles into its own DLL (nvcc + MSVC
+# cl.exe as host) whose symbols are exported via dsv4.def; the engine resolves
+# them at runtime through backend_loader_dsv4.c, mirroring the
+# backend_loader.c / coli_cuda.dll split. Run from a vcvars64 shell, like
+# cuda-dll. Two flavours ship side by side and the loader picks at runtime by
+# compute capability: coli_cuda_dsv4.dll is the GENERIC build (plain CUDA
+# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary) and
+# coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
+# needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
+# patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
+cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
+		-Xlinker /DEF:dsv4.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
+
+DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
+cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
+	@test -n "$(DEEPGEMM_HOME)" || { echo "DEEPGEMM_HOME must point to the sm120 DeepGEMM checkout" >&2; exit 1; }
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
+		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
+		$(DEEPGEMM_INC) -shared \
+		-Xlinker /DEF:dsv4.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
+
+# Windows: the decode-path kernels validated through the runtime DLL loader.
+# deepseek-v4.exe is MinGW gcc; backend_loader_dsv4.c resolves the MSVC/nvcc
+# built coli_cuda_dsv4*.dll and this test proves that ABI boundary.
+dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
+	./dsv4_decode_loader_test$(EXE)
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -683,12 +779,19 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
 	./ragged_attention_test$(EXE)
+	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
+	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
+	# itself (kernel-level oracle), so only the test file is compiled.
+	# Runs BEFORE the MXFP4 test: that one has a pre-existing exponent-255
+	# failure on some hosts and would otherwise abort the recipe first.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
+	./fp8_warp_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
@@ -696,6 +799,24 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
 	./mxfp4_cuda_test$(EXE)
 
+
+# The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
+# against the CPU reference in each test. Needs a GPU, so CI compiles it via
+# gpu-compile rather than running it.
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_attention_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_moe_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_moe_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_moe_cuda_test$(EXE)
+
+# Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
+tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c dsv4_mhc.h
+	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)
+
+tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c dsv4_quant.h
+	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
 	$(MAKE) cuda-test HIP=1
@@ -705,11 +826,21 @@ hip-test:
 gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
+
+# fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
+# expert shapes, JSON on stdout (kernel time only). The build is a separate
+# file target so tools/run_f8_bench.sh can keep stdout pure JSON.
+fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_fp8_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_fp8_cuda.cu -o fp8_bench$(EXE) $(ANS_NVCC_LIBS)
+fp8-bench: fp8_bench$(EXE)
+	./fp8_bench$(EXE)
 
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
@@ -775,10 +906,16 @@ tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unico
 tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
+tests/test_st_map$(EXE): tests/test_st_map.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -808,6 +945,12 @@ tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c st.
 
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
+# ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
+# the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
+tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -902,12 +1045,21 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
 	COLI_V4_UNIT_NATIVE_QUANT.o
+# Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
+# is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
+# native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
+# without a DLL next to the test binary.
+ifneq ($(IS_WIN),)
+V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
 		Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
-		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		$(V4_TEST_EXTRA_TARGETS)
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
 V4_OWN_DIR = build/ownership
@@ -1084,17 +1236,21 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
+install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) \
+	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
+	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
+	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
-	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
+		openai_server.py v4_dsml.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
@@ -1117,12 +1273,13 @@ bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
 .PHONY: test-asan
+.PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

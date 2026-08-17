@@ -20,6 +20,15 @@
  */
 #ifdef _WIN32
 
+/* FILE_ID_INFO / FileIdInfo (coli_win32_loader_probe, below) are gated behind
+ * _WIN32_WINNT >= _WIN32_WINNT_WIN8 in mingw-w64's winbase.h. MSVC exposes
+ * them unconditionally, so this only bites the MinGW build -- and only where
+ * the file-identity block is actually compiled, i.e. under COLI_HIP_DLL or
+ * COLI_LOADER_TEST_API. Set the floor before <windows.h> is pulled in. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602   /* Windows 8 */
+#endif
+
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>

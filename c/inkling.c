@@ -145,7 +145,7 @@ typedef struct {
     uint64_t clock, hits, miss;
     uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
-    float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
+    float **K, **V; int kv_len, max_t;    /* per-layer [kv][kv_ring_rows][hd]; sliding layers are a t%window ring */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
     /* KV prefix reuse: what the current K/V and conv states were built from.
@@ -802,6 +802,21 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * sidecar dropped in the snapshot dir (st_init indexes every *.safetensors).
      * Absent tensors = text-only engine, exactly as before. */
     if (st_has(&m->S, "model.audio.encoder.weight")) {
+        /* SEC (GHSA-w696): mel_bins/mel_vocab come straight from config.json with
+         * no bounds. audio_embed_row indexes the table at (b*mel_vocab+v)*D with
+         * b<mel_bins, v<mel_vocab — so the table must have exactly
+         * mel_bins*mel_vocab rows or that index runs off the heap (bidirectional
+         * OOB read, config-controlled). Reconcile the real element count against
+         * the geometry before using it. */
+        st_tensor *aet = st_find(&m->S, "model.audio.encoder.weight");
+        if (c->mel_bins < 1 || c->mel_vocab < 1 || D < 1 ||
+            (int64_t)c->mel_bins * c->mel_vocab > INT64_MAX / D ||
+            !aet || aet->numel != (int64_t)c->mel_bins * c->mel_vocab * D) {
+            fprintf(stderr, "[audio] rejected: encoder table has %lld elements, "
+                    "config geometry is %d bins x %d levels x D=%d\n",
+                    aet ? (long long)aet->numel : -1, c->mel_bins, c->mel_vocab, D);
+            exit(1);
+        }
         m->audio_enc  = load_w(m, "model.audio.encoder.weight", 0);
         m->audio_norm = load_t(m, "model.audio.final_norm.weight");
         fprintf(stderr, "[audio] DMel encoder loaded (%d bins x %d levels -> D=%d)\n",
@@ -1093,11 +1108,23 @@ static int usage_save(Model *m, const char *snap) {
     return rt_save(up, 1);
 }
 
+/* KV rows actually kept per layer: sliding layers only ever attend to the last
+ * `window` positions (t0 clamp in attention), so their cache is a ring of
+ * `window` rows instead of max_t — at 32k context that is a ~64x cut on the
+ * 5-of-6 sliding layers. Global layers keep the full max_t. Must be computed
+ * from the SAME max_t the buffers were allocated with (m->max_t). */
+static inline int kv_ring_rows(const Cfg *c, int li, int max_t) {
+    return (c->local[li] && c->window > 0 && c->window < max_t) ? c->window : max_t;
+}
+
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
 static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, H = L_HEADS(c,li), KV = L_KV(c,li), hd = L_HD(c,li), ext = L_EXT(c,li);
     int local = c->local[li];
+    /* the ring made an over-run silent (t%win wraps instead of writing OOB), so
+     * fail fast here: every caller sizes the cache via kv_alloc before stepping */
+    if (pos0 + S > m->max_t) { fprintf(stderr, "attention: pos %d+%d exceeds kv alloc %d\n", pos0, S, m->max_t); exit(1); }
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
     float *q  = falloc((int64_t)S*qdim);
     float *k  = falloc((int64_t)S*kvdim);
@@ -1115,12 +1142,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         for (int h = 0; h < H;  h++) rmsnorm_row(q + (int64_t)s*qdim  + h*hd, q + (int64_t)s*qdim  + h*hd, l->qn, hd, c->eps);
         for (int h = 0; h < KV; h++) rmsnorm_row(k + (int64_t)s*kvdim + h*hd, k + (int64_t)s*kvdim + h*hd, l->kn, hd, c->eps);
     }
-    /* append K,V to the cache */
-    for (int s = 0; s < S; s++) for (int h = 0; h < KV; h++) {
-        int t = pos0 + s;
-        memcpy(m->K[li] + ((int64_t)h*m->max_t + t)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-        memcpy(m->V[li] + ((int64_t)h*m->max_t + t)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-    }
+    /* Rows for positions inside this batch are read from the k/vv scratch, not
+     * the cache: with a ring, appending the whole batch up front could overwrite
+     * history rows that earlier queries in the batch still need. The scratch
+     * holds exactly what the cache would (post-sconv, post-rmsnorm), so the
+     * arithmetic is unchanged; the cache is appended after scoring. */
+    int win = kv_ring_rows(c, li, m->max_t);
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
     #pragma omp parallel
@@ -1132,6 +1159,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
             for (int s = 0; s < S; s++) {
                 int qpos = pos0 + s;
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
+                int tb = pos0 > t0 ? pos0 : t0;   /* first row served by the scratch */
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
                 for (int e = 0; e < ext; e++) {
@@ -1146,9 +1174,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
                 const float *qv = q + (int64_t)s*qdim + h*hd;
-                const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                const float *Kh = m->K[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Kb = k  + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
-                    const float *kv = Kh + (int64_t)t*hd;
+                    const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
+                                             : Kb + (int64_t)(t - pos0)*kvdim;
                     float acc = 0.f;
                     for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
                     int dist = qpos - t;
@@ -1158,15 +1188,25 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 softmax_row(sc, n);
                 float *cx = ctx + (int64_t)s*qdim + h*hd;
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                const float *Vh = m->V[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Vb = vv + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = Vh + (int64_t)t*hd;
+                    const float *vrow = t < tb ? Vh + (int64_t)(t % win)*hd
+                                               : Vb + (int64_t)(t - pos0)*kvdim;
                     float a = sc[t - t0];
                     for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
                 }
             }
         }
         free(rl); free(sc);
+    }
+    /* append K,V to the cache (ring on sliding layers); rows the ring would
+     * overwrite within this same batch are skipped, they can never be read */
+    int s0 = S - win > 0 ? S - win : 0;
+    for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
+        int t = pos0 + s;
+        memcpy(m->K[li] + ((int64_t)h*win + t % win)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        memcpy(m->V[li] + ((int64_t)h*win + t % win)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(ctx);
@@ -1612,29 +1652,52 @@ static void kv_alloc(Model *m, int max_t) {
      * for a larger max_t every turn, so the state was thrown away just before
      * the point of using it.
      *
-     * K/V are laid out [kv_head][max_t][hd], so a larger max_t changes the
-     * stride: the old contents cannot be realloc'd, they have to be re-laid-out
-     * head by head. That copy costs a memcpy of what is already computed, which
-     * is nothing beside re-running the prefill that produced it. */
+     * K/V are laid out [kv_head][rows][hd] with rows = kv_ring_rows(), so a
+     * larger max_t changes the stride wherever rows follows max_t: those
+     * contents cannot be realloc'd, they have to be re-laid-out head by head.
+     * That copy costs a memcpy of what is already computed, which is nothing
+     * beside re-running the prefill that produced it.
+     *
+     * Sliding layers whose ring is already window rows are the exception in
+     * BOTH directions: their size does not depend on max_t (nothing to grow),
+     * and a ring that has wrapped is not linear (position t lives at row
+     * t % window), so the linear copy below would silently rotate it. Steal
+     * the buffer instead — the slot map is unchanged, so it stays valid.
+     * Every layer that does reach the copy IS linear: rows != old_rows only
+     * happens when old_rows == old_max (a wrapped ring keeps rows == window
+     * forever), and keep <= old_max <= rows there, so the copy fits. */
     float **oldK = m->K, **oldV = m->V;
     int old_max = m->max_t;
     int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
 
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    int64_t ring = 0, full = 0;
     for (int i = 0; i < c->n_layers; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
-        m->K[i] = falloc((int64_t)kv * max_t * hd);
-        m->V[i] = falloc((int64_t)kv * max_t * hd);
-        for (int h = 0; h < kv && keep; h++) {
-            memcpy(m->K[i] + (int64_t)h * max_t * hd,
-                   oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
-            memcpy(m->V[i] + (int64_t)h * max_t * hd,
-                   oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+        int64_t rows     = kv_ring_rows(c, i, max_t);
+        int64_t old_rows = oldK ? kv_ring_rows(c, i, old_max) : 0;
+        if (oldK && rows == old_rows) {
+            m->K[i] = oldK[i]; m->V[i] = oldV[i];
+            oldK[i] = NULL;    oldV[i] = NULL;
+        } else {
+            m->K[i] = falloc((int64_t)kv * rows * hd);
+            m->V[i] = falloc((int64_t)kv * rows * hd);
+            for (int h = 0; h < kv && keep; h++) {
+                memcpy(m->K[i] + (int64_t)h * rows * hd,
+                       oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+                memcpy(m->V[i] + (int64_t)h * rows * hd,
+                       oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+            }
         }
+        ring += 2 * (int64_t)kv * rows  * hd * (int64_t)sizeof(float);
+        full += 2 * (int64_t)kv * max_t * hd * (int64_t)sizeof(float);
     }
     if (oldK) for (int i = 0; i < c->n_layers; i++) { free(oldK[i]); free(oldV[i]); }
     free(oldK); free(oldV);
+    if (ring < full)
+        fprintf(stderr, "[kv] %.1f MiB (ring buffers on sliding layers; full cache would be %.1f MiB)\n",
+                ring/1048576.0, full/1048576.0);
 
     /* the record describes those same positions, so it survives with them --
      * unless its own allocation fails, in which case reuse simply stops. */

@@ -18,10 +18,11 @@ HERE = Path(__file__).resolve().parent.parent
 CLI = HERE / "coli"
 
 ARCHES = [
-    ("glm-5.2", "colibri"),
+    ("glm_moe_dsa", "colibri"),
     ("inkling", "inkling"),
     ("kimi_k3", "kimi_k3"),
     ("olmoe", "olmoe"),
+    ("deepseek_v4", "deepseek_v4"),
 ]
 
 

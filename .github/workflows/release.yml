@@ -134,6 +134,8 @@ jobs:
           cp c/coli dist/
           cp c/version.py dist/
           cp c/openai_server.py dist/
+          cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import
+          cp c/family_registry.py dist/ # authoritative model-family dispatch/capability registry
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp c/autotune.py dist/
@@ -183,11 +185,9 @@ jobs:
           # fine. The check was wrong, not the artifact.
           python3 -c "import ast; ast.parse(open('tools/k3_tokenizer.py', encoding='utf-8').read())" \
             || { echo "FAIL: packaged k3_tokenizer.py does not parse"; exit 1; }
-          # COLI_EXPECT rather than a literal tuple: the list is platform-dependent
-          # now, and one hardcoded list that silently omitted an engine is what #858
-          # was. Keep the expectation in a single place, above.
           COLI_EXPECT="$SIBLINGS" python3 - <<'PYCHK'
           import importlib.machinery, importlib.util, json, os, sys, tempfile
+          from family_registry import all_families
           exe = ".exe" if os.name == "nt" else ""
           expect = os.environ["COLI_EXPECT"].split()
 
@@ -212,16 +212,25 @@ jobs:
           loader.exec_module(cli)
 
           bad = []
-          for model_type, label, _ in cli._BANNER_MODELS:
-              with tempfile.TemporaryDirectory() as d:
+          for family in all_families():
+            if family.id == "deepseek_v4" and "deepseek_v4" not in expect:
+              continue
+            model_type = family.model_types[0]
+            label = family.display_name
+            with tempfile.TemporaryDirectory() as d:
                   with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
                       json.dump({"model_type": model_type}, f)
                   open(os.path.join(d, "tokenizer.json"), "w").close()
                   engine = os.path.basename(cli.engine_for(d))
                   arch = cli.model_arch(d)
-              if model_type != "glm" and arch == "glm":
-                  bad.append("%s (%s) -> the GLM engine; the banner names a family "
-                             "the launcher cannot dispatch" % (label, model_type))
+            expected_file = family.engine_artifact + exe
+            if not os.path.exists(expected_file):
+              bad.append("%s: expected artifact %s is absent" %
+                         (label, expected_file))
+            elif arch != family.id or engine != expected_file:
+              bad.append("%s (%s) -> %s/%s, expected %s/%s" %
+                         (label, model_type, arch, engine,
+                          family.id, expected_file))
           if bad:
               sys.exit("FAIL: packaged launcher misroutes:\n  " + "\n  ".join(bad))
           print("OK: every engine is packaged AND coli dispatches to it:", " ".join(expect))

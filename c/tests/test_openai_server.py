@@ -562,7 +562,7 @@ class EngineStartupTest(unittest.TestCase):
             "OMP_WAIT_POLICY": "active", "GOMP_SPINCOUNT": "200000",
             "OMP_DYNAMIC": "FALSE", "OMP_PROC_BIND": "close",
             "OMP_PLACES": "cores", "V4_DRAFT": "0", "V4_MTP": "0",
-            "V4_MTP_DRAFT": "3", "V4_MTP_GB": "0.45",
+            "V4_MTP_DRAFT": "3", "V4_MTP_GB": "0.45", "V4_MTP_GPU": "0",
             "V4_MTP_MISS": "96", "V4_MTP_MIN": "3",
             "V4_MTP_CONF": "0.7",
         })
@@ -1168,14 +1168,14 @@ class CapSentinelShimTest(unittest.TestCase):
                     [executable, want],
                     f"arch={model_type} exe={executable} kwargs={kwargs}")
 
-    def test_missing_or_unreadable_config_is_glm(self):
-        # historic default: anything that cannot be classified is glm
+    def test_synthetic_engine_without_config_uses_explicit_arch(self):
         self.assertEqual(self._spawn_argv("engine", "/nonexistent/model"),
                          ["engine", "0"])
         model = Path(self.tmp.name) / "model-broken"
         model.mkdir()
         (model / "config.json").write_text("{not json")
-        self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
+        with self.assertRaisesRegex(ValueError, "invalid config.json"):
+            self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
         self.assertEqual(cap_for_arch("glm", None), 0)
@@ -1193,20 +1193,35 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
-        self.assertEqual(model_arch("/nonexistent"), "glm")
+        with self.assertRaisesRegex(ValueError, "cannot read config.json"):
+            model_arch("/nonexistent")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}
-        with patch("resource_plan.physical_cpu_count", return_value=6), \
+        with patch("resource_plan.physical_cpu_count",
+                   side_effect=AssertionError("V4 server sized the team")), \
              patch("openai_server.sys.platform", "linux"):
             tune_child_env(env, "deepseek_v4")
-        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertNotIn("OMP_NUM_THREADS", env)
         self.assertEqual(env["OMP_PROC_BIND"], "close")
         self.assertEqual(env["V4_DRAFT"], "0")
         self.assertEqual(env["V4_MTP"], "0")
         self.assertEqual(env["V4_MTP_DRAFT"], "3")
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+        self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
+
+    def test_direct_v4_server_preserves_explicit_omp_threads(self):
+        env = {"OMP_NUM_THREADS": "3"}
+        tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+
+    def test_direct_v4_server_honours_omp_kill_switch(self):
+        env = {"COLI_NO_OMP_TUNE": "1"}
+        tune_child_env(env, "deepseek_v4")
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+                    "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
+            self.assertNotIn(key, env)
 
 
 class HTTPTest(unittest.TestCase):

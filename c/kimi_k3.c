@@ -39,6 +39,8 @@
  *   K3_BITS=4|8|32       load-time quant of KDA/latent/shared/dense (default 4)
  *   K3_MLA_BITS=8|4|32   MLA projections (default 8)
  *   K3_HEAD_BITS=8|4|32  lm_head (default 8)
+ *   K3_MMAP=0|1          map prepared U8 + F32 tensors read-only instead of
+ *                        copying them to private heap (default 0; CPU-only)
  *   K3_EXPERT_GB=N       routed-expert LRU cache budget (default 8)
  *   K3_VK=0|1            Vulkan tier (build with `make VK=1 kimi_k3`; default
  *                        1 when built): shared experts VRAM-resident + a
@@ -110,9 +112,11 @@ typedef struct {
     int bos, eos[8], n_eos;
 } Cfg;
 
-/* ---------- RAM-resident weight, quantized at load ---------- */
+/* ---------- RAM-resident or read-only mapped weight ---------- */
 typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
-                 void *vk; /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */ } W;
+                 void *vk; /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */
+                 st_mapped_raw data_map, scale_map;
+                 int mapped; } W;
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
@@ -335,6 +339,8 @@ static float w_rowdot(const W *w, int r, const float *x){
 #define QCHUNK 1024                      /* rows per load-quantize pass */
 static int g_bits_env=0;                 /* K3_BITS explicitly set: enables the
                                           * int8-container -> int4 load downcast */
+static int g_k3_mmap=0;                  /* prepared U8/F32 tensors stay file-backed */
+static uint64_t g_k3_mmap_bytes=0, g_k3_mmap_views=0;
 #ifdef COLI_CUDA
 static int g_k3_cuda=0;                  /* K3_CUDA=1: MXFP4 routed experts on CUDA at decode */
 #endif
@@ -342,6 +348,41 @@ static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
 static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
+
+static int k3_mmap_backend_allowed(int mmap_enabled, int vk_enabled, int cuda_enabled){
+    return !mmap_enabled || (!vk_enabled && !cuda_enabled);
+}
+
+static void w_map_prepared(Model *m, W *w, const char *name, const char *scale_name,
+                           st_tensor *t, st_tensor *ts){
+    if(ts->dtype!=2){
+        fprintf(stderr,"K3_MMAP=1 requires F32 scale sidecars; %s is %s -- refusing\n",
+                scale_name,st_dtype_name(ts->dtype)); exit(1);
+    }
+    if(st_map_raw(&m->S,name,&w->data_map)!=0){
+        fprintf(stderr,"K3_MMAP=1 could not map %s: %s -- refusing\n",name,strerror(errno)); exit(1);
+    }
+    if(st_map_raw(&m->S,scale_name,&w->scale_map)!=0){
+        int saved=errno; st_unmap_raw(&w->data_map);
+        fprintf(stderr,"K3_MMAP=1 could not map %s: %s -- refusing\n",scale_name,strerror(saved)); exit(1);
+    }
+    if(((uintptr_t)w->scale_map.data%_Alignof(float))!=0){
+        st_unmap_raw(&w->scale_map); st_unmap_raw(&w->data_map);
+        fprintf(stderr,"K3_MMAP=1 scale sidecar %s is not float-aligned -- refusing\n",scale_name); exit(1);
+    }
+    w->mapped=1;
+    w->s=(float*)w->scale_map.data;
+    g_k3_mmap_bytes+=(uint64_t)t->nbytes+(uint64_t)ts->nbytes;
+    g_k3_mmap_views+=2;
+}
+
+static void w_release_host(W *w){
+    if(!w) return;
+    if(w->mapped){ st_unmap_raw(&w->scale_map); st_unmap_raw(&w->data_map); }
+    else { free(w->f); free(w->q8); free(w->q4); free(w->s); }
+    memset(w,0,sizeof(*w));
+}
+
 static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     char nm[512]; snprintf(nm,sizeof(nm),"%s%s",m->pfx,name);
     st_tensor *t=st_find(&m->S,nm);
@@ -356,6 +397,10 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
         if(!ts){ fprintf(stderr,"%s: quantized (U8) but no %s scale sidecar\n",nm,qn); exit(1); }
         if(t->nbytes==(int64_t)O*I && ts->numel==O){                  /* int8 per-row */
             if(g_bits_env && bits==4 && I%64==0){
+                if(g_k3_mmap){
+                    fprintf(stderr,"K3_MMAP=1 cannot combine with load-time int8-to-int4 conversion for %s; use a prepared int4 container or unset K3_BITS -- refusing\n",nm);
+                    exit(1);
+                }
                 /* EXPLICIT K3_BITS=4 on an int8 container: downcast to int4-g64
                  * at load. Halves resident RAM (the 62 GB box cannot hold the
                  * 93-layer non-expert set at int8 next to a desktop session);
@@ -382,12 +427,21 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
                 free(q8); free(s8);
                 return;
             }
-            w->fmt=1; w->q8=malloc((size_t)O*I);
+            w->fmt=1;
+            if(g_k3_mmap){
+                w_map_prepared(m,w,nm,qn,t,ts); w->q8=(int8_t*)w->data_map.data;
+                return;
+            }
+            w->q8=malloc((size_t)O*I);
             if(!w->q8){fprintf(stderr,"OOM int8 %s\n",nm);exit(1);}
             st_read_raw(&m->S,nm,w->q8,1);
             w->s=falloc(O); st_read_f32(&m->S,qn,w->s,0);
         } else if(I%64==0 && t->nbytes==(int64_t)O*(I/2) && ts->numel==(int64_t)O*(I/64)){
             w->fmt=4; w->gs=64;                                       /* int4-g64 */
+            if(g_k3_mmap){
+                w_map_prepared(m,w,nm,qn,t,ts); w->q4=(uint8_t*)w->data_map.data;
+                return;
+            }
             w->q4=malloc((size_t)O*(I/2));
             if(!w->q4){fprintf(stderr,"OOM int4 %s\n",nm);exit(1);}
             st_read_raw(&m->S,nm,w->q4,1);
@@ -397,6 +451,10 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
                     nm,(long long)t->nbytes,(long long)ts->numel,O,I); exit(1);
         }
         return;
+    }
+    if(g_k3_mmap){
+        fprintf(stderr,"K3_MMAP=1 requires a fully prepared U8 + F32-sidecar container; %s is %s and would need load-time conversion -- refusing\n",
+                nm,st_dtype_name(t->dtype)); exit(1);
     }
     if(t->numel!=(int64_t)O*I){ fprintf(stderr,"%s: numel %lld != %dx%d\n",nm,(long long)t->numel,O,I); exit(1); }
     if(bits>=32){ w->fmt=0; w->f=falloc((int64_t)O*I); st_read_f32(&m->S,nm,w->f,0); return; }
@@ -549,6 +607,21 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         snprintf(m->pfx,sizeof(m->pfx),"language_model.");
     if((c->n_layers+c->res_bs-1)/c->res_bs+1>16){ fprintf(stderr,"attn_res: too many blocks\n"); exit(1); }
     g_bits_env = getenv("K3_BITS")!=NULL;
+    g_k3_mmap = getenv("K3_MMAP")?atoi(getenv("K3_MMAP")):0;
+    if(g_k3_mmap){
+        int vk_requested=0, cuda_requested=0;
+#ifdef COLI_VULKAN
+        { const char *ev=getenv("K3_VK"); vk_requested=!ev||atoi(ev); }
+#endif
+#ifdef COLI_CUDA
+        cuda_requested=getenv("K3_CUDA")&&atoi(getenv("K3_CUDA"));
+#endif
+        if(!k3_mmap_backend_allowed(1,vk_requested,cuda_requested)){
+            fprintf(stderr,"K3_MMAP=1 is CPU-only; set K3_VK=0 and K3_CUDA=0 -- refusing before model load\n");
+            exit(1);
+        }
+        fprintf(stderr,"[K3-MMAP] prepared tensor mapping enabled (CPU-only, no conversion fallback)\n");
+    }
 #ifdef COLI_CUDA
     g_k3_cuda = getenv("K3_CUDA") ? atoi(getenv("K3_CUDA")) : 0;
     if(g_k3_cuda){
@@ -657,6 +730,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
           free(rn); free(rp); }
         w_load(m,&m->lm_head,"lm_head.weight",c->vocab,c->hidden,hbits);
     } else fprintf(stderr,"[K3] final norm/lm_head not present — trace-only mode\n");
+    if(g_k3_mmap)
+        fprintf(stderr,"[K3-MMAP] %llu views, %.1f GB prepared weights/scales file-backed\n",
+                (unsigned long long)g_k3_mmap_views,g_k3_mmap_bytes/1e9);
 #ifdef COLI_VULKAN
     { const char *ev=getenv("K3_VK");
       if(!ev||atoi(ev)){
@@ -1786,7 +1862,11 @@ static int serve_read_req(ServeReq *q, const char *active){
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5||
-       plen<0||plen>(1<<24)||max_tok<1){
+       plen<0||plen>(1<<24)||max_tok<1||max_tok>(1<<20)){
+        /* SEC (GHSA-gf38): max_tok needs an upper bound too. INT_MAX wrapped the
+         * signed np+max_tok context check below and made the kv_alloc size
+         * negative, so kv_alloc's early-return kept the previous request's small
+         * KV buffers and the generation loop wrote past them (heap OOB write). */
         printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
     }
     (void)slot;
@@ -1830,7 +1910,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         np+=tok_encode(T,q->payload,q->plen,ids+np,cap-np);
     }
     int max_ctx=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):8192;
-    if(np<1||np+q->max_tok>max_ctx){
+    if(np<1||(int64_t)np+q->max_tok>max_ctx){ /* SEC (GHSA-gf38): int64 so np+max_tok can't wrap negative */
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
                q->id,np,q->max_tok,max_ctx);
         fflush(stdout); free(ids); return;

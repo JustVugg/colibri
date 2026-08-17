@@ -83,12 +83,15 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
-/* Declared unconditionally (not just under COLI_METAL): on a non-Metal build it just sits
- * at 0 forever, which is the correct value there (no Metal backend => never enabled). Kept
- * outside the #ifdef so portable code — e.g. kvb_fmt_gate_notice below — can read "is Metal
- * active" without needing COLI_METAL (and the backend_metal.h / Metal framework link it
- * would drag in) on every platform's test build. */
+/* Declared unconditionally (not just under COLI_METAL): on a non-Metal build they just sit
+ * at 0 forever, which is the correct value there (no Metal backend => never enabled, and
+ * COLI_METAL_MOE_EXACT is only parsed under COLI_METAL). Kept outside the #ifdef so
+ * portable code — the shared fused-path format predicate metal_fused_layer_fmt_miss and
+ * metal_fmt_gate_notice below — can read "is Metal active" and the MOE-exact mode without
+ * needing COLI_METAL (and the backend_metal.h / Metal framework link it would drag in) on
+ * every platform's test build. */
 static int g_metal_enabled;
+static int g_moe_exact=0;     /* COLI_METAL_MOE_EXACT: exact (ungrouped) MoE kernels only */
 /* COLI_SLAB_SHRINK=0 disables the #856 slab shrink at runtime.
  *
  * The shrink stops a wide slab migrating into a narrow row through the
@@ -116,7 +119,9 @@ static int g_slab_shrink = 1;
  * read it; the duplicate that used to sit here was a tentative definition the
  * linker merged, hence no warning and no symptom. */
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
-static int g_moe_exact=0;
+/* g_moe_exact moved next to g_metal_enabled above, outside the #ifdef: the shared
+ * fused-path format predicate (metal_fused_layer_fmt_miss) consumes it and must
+ * compile on every platform's test build. */
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
 static const float *g_pre_sh;
 #endif
@@ -958,7 +963,9 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                     accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0u, accu);
                     accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1u, accu);
                 }
-                ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
+                /* Same pinning as matmul_i4_grouped in quant.h: contraction
+                 * here is the compiler's choice, so the result was too. */
+                ag=fmaf(hsum256(accg),scg,ag); au=fmaf(hsum256(accu),scu,au);
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
@@ -1613,6 +1620,27 @@ static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
+/* FFN di un expert MoE (routed): gate+up -> silu(gate)*up -> down. Un solo helper per
+ * i ~6 siti inline di moe() e (piu' avanti) il worker distribuito, che la chiama con i
+ * propri buffer e i tensori dell'expert — nessun locale di moe(). xg arriva GIA' ruotata
+ * (Q^T x) dal chiamante via E8_XE (#452: una copia ruotata per chiamata, MAI per expert).
+ * La rotazione dell'input del down e' per-expert e vive qui: `d->fmt==6` la applica
+ * SEMPRE — e' la forma CANONICA, pura funzione del fmt del down-tensor. Perche' resta
+ * byte-identica al vecchio inline: (a) i fallback device-lost Vulkan ricaricano solo
+ * expert che erano in registry (vk_reg_at), e vk_registry_fill ammette solo fmt 2/4/5 —
+ * li' d->fmt!=6 e la rotazione e' un no-op; (b) l'oracolo e ogni modello single-format
+ * (l'output di una conversione normale) non hanno mai un expert fmt=6 accanto a fmt 2/4/5.
+ * Le DUE copie che saltavano la rotazione e potevano davvero vedere fmt=6 — la CPU-share
+ * del blocco Vulkan e il fallback CUDA — ora seguono il canonico: su un container
+ * mixed-format (fmt per-tensor da qt_resolve_fmt, nessuna uniformita' tra expert, vedi il
+ * commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
+static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, QT *u, QT *d, int nr, int I){
+    expert_gate_up(gg,uu,xg,g,u,nr);
+    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+    if(d->fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
+    matmul_qt(hh, gg, d, nr);
+}
+
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
     int half = c->qk_rope/2;
@@ -2235,27 +2263,94 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 }
 #endif
 
-/* KV_B FMT-GATE NOTICE (#kvb): kernel contract — the fused Metal attention kernels
- * (attention_rows' coli_metal_attn_decode and layer_forward_rows' coli_metal_layer_decode,
- * both gated on `l->kv_b.fmt==2||l->kv_b.fmt==4`) only run against kv_b_proj stored INT4,
- * either per-row (fmt=2) or grouped (fmt=4, since #587's kv_b grouped-int4 addition); any
- * OTHER format silently falls through to the CPU absorb path for decode attention on that
- * layer. v1-class mixed-precision containers can mint kv_b_proj at a format outside that
- * pair, so this is a real trap, not a hypothetical: print it once (called from model_init,
- * after all layer tensors are resolved) so it isn't silent. NOTICE ONLY — no gate/behavior
- * change here. */
-static void kvb_fmt_gate_notice(Model *m){
+/* One bit per weight tensor the fused Metal decode kernels bind, as reported by
+ * metal_fused_layer_fmt_miss() (defined next to metal_fused_fmt_ok below — the single
+ * per-layer format predicate both fused gates AND metal_fmt_gate_notice consume). The
+ * two masks name exactly which of the 8 each fused entry binds. */
+enum {
+    METAL_FUSED_KV_B    = 1<<0,   /* the gates' own kv_b term: fmt==2, or fmt==4 with g_moe_exact off */
+    METAL_FUSED_Q_A     = 1<<1,   /* the rest: metal_fused_fmt_ok() allowlist */
+    METAL_FUSED_Q_B     = 1<<2,
+    METAL_FUSED_KV_A    = 1<<3,
+    METAL_FUSED_O       = 1<<4,
+    METAL_FUSED_SH_GATE = 1<<5,   /* sh_*: checked on sparse layers only — dense layers */
+    METAL_FUSED_SH_UP   = 1<<6,   /* never load them (fmt stays 0) and never reach the */
+    METAL_FUSED_SH_DOWN = 1<<7,   /* fused layer CB, so a miss there would be noise */
+};
+#define METAL_FUSED_ATTN_TENSORS  (METAL_FUSED_KV_B|METAL_FUSED_Q_A|METAL_FUSED_Q_B|METAL_FUSED_KV_A|METAL_FUSED_O)
+#define METAL_FUSED_LAYER_TENSORS (METAL_FUSED_ATTN_TENSORS|METAL_FUSED_SH_GATE|METAL_FUSED_SH_UP|METAL_FUSED_SH_DOWN)
+static unsigned metal_fused_layer_fmt_miss(const Layer *l);
+
+/* FUSED-METAL FORMAT-GATE NOTICE (#kvb, widened): kernel contract — both fused Metal
+ * decode entries (attention_rows' coli_metal_attn_decode and layer_forward_rows'
+ * coli_metal_layer_decode) gate per layer on metal_fused_layer_fmt_miss() over the weight
+ * tensors they bind: kv_b_proj on the gates' own two-format+mode term (int4 per-row
+ * fmt==2 always; grouped fmt==4 only while g_moe_exact is off — #587's grouped-int4 kv_b
+ * is mode-gated), the rest on the metal_fused_fmt_ok() allowlist (fmt 1/2/3/4). Any miss
+ * silently drops that layer off the fused path onto the CPU implementation, with no
+ * signal anywhere. v1-class mixed-precision containers can mint any of these tensors at
+ * an off-allowlist format, so print it once per offending tensor KIND (never per layer —
+ * bounded at 8 lines) from model_init, after all layer tensors are resolved. The
+ * condition is the gates' own predicate, so notice and gates cannot drift apart again
+ * (the kv_b-only notice this replaces re-typed the gate condition and had already gone
+ * stale: it missed the `!g_moe_exact` term, staying silent on fmt=4 kv_b under
+ * COLI_METAL_MOE_EXACT=1 while both gates closed). NOTICE ONLY — no gate/behavior change
+ * here. Main layers only (m->L): the MTP head (m->mtpL) is deliberately excluded by
+ * ratified decision — common containers ship it at INT8 by design, so its kv_b closes
+ * the fused attention gate on the MTP row on every ordinary load (the gate DOES evaluate
+ * the MTP head; that CPU fallback is carried, correct behavior) and a line about it here
+ * would be noise on every load, not signal.
+ * FORMAT-ONLY SEMANTICS: a line here names a FORMAT (or format-mode) obstacle and
+ * nothing else — it does not claim the fused path would otherwise engage. The gates
+ * carry further runtime preconditions (GLM-5.2 dims, batch shape/S, ragged-mux guard,
+ * expert config) that this notice deliberately does not duplicate: those are properties
+ * of the call, not of the container, and re-stating them here would recreate exactly the
+ * duplicated-condition drift the shared predicate exists to kill. On a container/arch
+ * the fused path could never serve anyway, an off-allowlist tensor still gets its line —
+ * the format is still worth curing before it bites on a config that DOES reach the
+ * gates. sh_* lines count over the SPARSE-layer population (the only layers that load
+ * them); every other kind counts over all main layers. */
+static void metal_fmt_gate_notice(Model *m){
     Cfg *c=&m->c;
     if(!g_metal_enabled) return;
-    int bad=0, first_fmt=-1;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].kv_b.fmt!=2 && m->L[i].kv_b.fmt!=4){
-        bad++; if(first_fmt<0) first_fmt=m->L[i].kv_b.fmt; }
-    if(bad) fprintf(stderr,
-        "[METAL] kv_b_proj is fmt=%d (not int4) on %d/%d layer%s: the fused Metal "
-        "attention path requires kv_b in int4, per-row (fmt=2) or grouped (fmt=4), so "
-        "those layers run decode attention on the CPU absorb path instead. Requantize "
-        "kv_b to int4 (per-row --kvb-bits 4, or grouped) to re-enable the fused path.\n",
-        first_fmt, bad, c->n_layers, bad==1?"":"s");
+    enum { NK=8 };
+    int nbad[NK]={0}, ffmt[NK]={-1,-1,-1,-1,-1,-1,-1,-1}, nsparse=0;
+    for(int i=0;i<c->n_layers;i++){
+        Layer *l=&m->L[i];
+        if(l->sparse) nsparse++;
+        unsigned miss=metal_fused_layer_fmt_miss(l);
+        if(!miss) continue;
+        const int f[NK]={ l->kv_b.fmt, l->q_a.fmt, l->q_b.fmt, l->kv_a.fmt,
+                          l->o.fmt, l->sh_gate.fmt, l->sh_up.fmt, l->sh_down.fmt };
+        for(int k=0;k<NK;k++) if(miss>>k & 1u){ nbad[k]++; if(ffmt[k]<0) ffmt[k]=f[k]; }
+    }
+    /* The remedy is MODE-AWARE because the plain suggestion is circular under MOE-exact:
+     * the converter's --group-size defaults to 64 (community-validated, see
+     * c/tools/convert_fp8_to_int4.py), so `--kvb-bits 4` alone mints GROUPED int4 =
+     * fmt=4 — which is exactly what g_moe_exact keeps off the fused path. Under the
+     * mode, point at the two real cures: an ungrouped requant (--group-size 0 -> fmt=2)
+     * or, for a kv_b that is already fmt=4, unsetting COLI_METAL_MOE_EXACT. */
+    if(nbad[0]) fprintf(stderr,
+        "[METAL] kv_b_proj is fmt=%d on %d/%d layer%s: the fused Metal attention path "
+        "serves kv_b only as int4, per-row (fmt=2) or grouped (fmt=4; grouped is served "
+        "only while COLI_METAL_MOE_EXACT is off), so those layers run decode attention "
+        "on the CPU absorb path instead. %s\n",
+        ffmt[0], nbad[0], c->n_layers, nbad[0]==1?"":"s",
+        g_moe_exact
+          ? "Requantize kv_b to ungrouped int4 (--kvb-bits 4 --group-size 0) to re-enable "
+            "the fused path; for a grouped-int4 (fmt=4) kv_b, unsetting COLI_METAL_MOE_EXACT "
+            "also re-enables it without requantizing."
+          : "Requantize kv_b to int4 (--kvb-bits 4) to re-enable the fused path.");
+    static const char *const kind_name[NK]={ "kv_b_proj" /* [0] has its own line above */,
+        "q_a_proj","q_b_proj","kv_a_proj_with_mqa","o_proj",
+        "shared_experts.gate_proj","shared_experts.up_proj","shared_experts.down_proj" };
+    for(int k=1;k<NK;k++) if(nbad[k]) fprintf(stderr,
+        "[METAL] %s is fmt=%d on %d/%d %slayer%s: outside the fused-path allowlist "
+        "(fmt 1/2/3/4), so the fused Metal decode kernels that bind this tensor skip "
+        "those layers and they run on the CPU path instead.\n",
+        kind_name[k], ffmt[k], nbad[k],
+        k>=5?nsparse:c->n_layers,        /* sh_* (k>=5): only sparse layers load them */
+        k>=5?"sparse ":"", nbad[k]==1?"":"s");
 }
 
 static void model_init(Model *m, const char *snap, const char *weights_dir,
@@ -2337,7 +2432,7 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
         }
         #undef P
     }
-    kvb_fmt_gate_notice(m);                       /* once per load, after all layer kv_b resolved */
+    metal_fmt_gate_notice(m);                     /* once per load, after all layer tensors resolved */
     /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
     {
         /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
@@ -3879,6 +3974,36 @@ static int attn_pipe_prefix(Model *m,Layer *l,const float *x,int S,float *QR,flo
  * can unit-test the truth table (tests/test_fp8_load.c Part F). */
 static inline int metal_fused_fmt_ok(int fmt){ return fmt==1 || fmt==2 || fmt==3 || fmt==4; }
 
+/* Per-layer companion to metal_fused_fmt_ok: ONE predicate over all the weight tensors
+ * the fused decode kernels bind, returning a bitmask of offending tensors
+ * (METAL_FUSED_*, 0 == fully fused-eligible). Both fused gates test it against the mask
+ * of tensors their kernel actually binds (METAL_FUSED_ATTN_TENSORS /
+ * METAL_FUSED_LAYER_TENSORS), and metal_fmt_gate_notice (model_init) reports every set
+ * bit — the notice consumes the gates' own condition, so the two can never drift apart
+ * again (the previous kv_b-only notice re-typed the gate condition and was already
+ * stale: it omitted the `!g_moe_exact` term below). kv_b's term is the gates' own:
+ * fmt==2 (int4 per-row, its absorb kernel's native format) always serves; fmt==4
+ * (grouped int4, #587) serves only while g_moe_exact is off — COLI_METAL_MOE_EXACT=1
+ * keeps grouped kv_b off the fused path. sh_gate/sh_up/sh_down are checked on sparse
+ * layers only: dense layers never load them (fmt stays 0) and layer_forward_rows' fused
+ * path already requires l->sparse, so flagging them there would be pure false positive.
+ * Reads only the layer's fmt/sparse fields and the g_moe_exact mode flag — no side
+ * effects. */
+static unsigned metal_fused_layer_fmt_miss(const Layer *l){
+    unsigned miss=0;
+    if(!(l->kv_b.fmt==2 || (l->kv_b.fmt==4 && !g_moe_exact))) miss|=METAL_FUSED_KV_B;
+    if(!metal_fused_fmt_ok(l->q_a.fmt))     miss|=METAL_FUSED_Q_A;
+    if(!metal_fused_fmt_ok(l->q_b.fmt))     miss|=METAL_FUSED_Q_B;
+    if(!metal_fused_fmt_ok(l->kv_a.fmt))    miss|=METAL_FUSED_KV_A;
+    if(!metal_fused_fmt_ok(l->o.fmt))       miss|=METAL_FUSED_O;
+    if(l->sparse){
+        if(!metal_fused_fmt_ok(l->sh_gate.fmt)) miss|=METAL_FUSED_SH_GATE;
+        if(!metal_fused_fmt_ok(l->sh_up.fmt))   miss|=METAL_FUSED_SH_UP;
+        if(!metal_fused_fmt_ok(l->sh_down.fmt)) miss|=METAL_FUSED_SH_DOWN;
+    }
+    return miss;
+}
+
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -3893,28 +4018,30 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
      * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s].
-     * metal_fused_fmt_ok(q_a/q_b/kv_a/o): POSITIVE allowlist (fmt 1/2/4, see the
-     * predicate's own comment above attention_rows). Previously these were
-     * negative fmt!=8 guards -- fail-OPEN for everything they didn't name: for
-     * fmt=8 specifically the WP_() macro two lines below picks q8 only for
-     * fmt==1, else q4 -- and q4 is NULL/unallocated for fmt=8 (same convention
-     * as fmt=1, see the QT struct comment), so an fmt=8 tensor reaching
-     * coli_metal_attn_decode would hand the kernel a NULL weight pointer; for
-     * fmt=5/6 the hazard is WORSE -- their real weight bytes live in q4, so
-     * WP_() hands the shader a valid pointer and mm_gemv's terminal f32
-     * fallback branch silently misreads them as f32 garbage. The allowlist
-     * fails CLOSED to the CPU path below for all of them (matmul_qt_ex there
-     * dispatches every format correctly, incl. fmt=8 via matmul_fp8); wiring
-     * fmt=8 through bind_gemv/coli_metal_attn_decode stays a deferred
-     * follow-up (see this PR's GPU-path note). kv_b is already pinned to
-     * fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
-     * these four checks are the same discipline extended to the tensors that
-     * flow through the shared per-fmt shader. */
+     * metal_fused_layer_fmt_miss & METAL_FUSED_ATTN_TENSORS: kv_b on its
+     * two-format+mode term (fmt==2, or fmt==4 with g_moe_exact off) plus the
+     * POSITIVE allowlist (fmt 1/2/3/4) over q_a/q_b/kv_a/o -- see the shared
+     * predicate's own comment above attention_rows. The allowlist checks were
+     * previously negative fmt!=8 guards -- fail-OPEN for everything they
+     * didn't name: for fmt=8 specifically the WP_() macro two lines below
+     * picks q8 only for fmt==1, else q4 -- and q4 is NULL/unallocated for
+     * fmt=8 (same convention as fmt=1, see the QT struct comment), so an
+     * fmt=8 tensor reaching coli_metal_attn_decode would hand the kernel a
+     * NULL weight pointer; for fmt=5/6 the hazard is WORSE -- their real
+     * weight bytes live in q4, so WP_() hands the shader a valid pointer and
+     * mm_gemv's terminal f32 fallback branch silently misreads them as f32
+     * garbage. The allowlist fails CLOSED to the CPU path below for all of
+     * them (matmul_qt_ex there dispatches every format correctly, incl. fmt=8
+     * via matmul_fp8); wiring fmt=8 through bind_gemv/coli_metal_attn_decode
+     * stays a deferred follow-up (see this PR's GPU-path note). kv_b's
+     * stricter term lives inside the same predicate for an unrelated reason
+     * (its absorb kernel is int4-only, grouped served only outside MOE-exact
+     * mode); the four allowlist checks are the same discipline extended to
+     * the tensors that flow through the shared per-fmt shader. */
     if(g_metal_enabled && !kvs && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
-       && c->qk_rope==64 && vh==256 && (l->kv_b.fmt==2||(l->kv_b.fmt==4&&!g_moe_exact))
-       && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
-       && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)){
+       && c->qk_rope==64 && vh==256
+       && !(metal_fused_layer_fmt_miss(l) & METAL_FUSED_ATTN_TENSORS)){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index keys for future selection */
@@ -5284,9 +5411,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(!expert_host_ready(e)) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                     double te0=now_s();
-                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                    matmul_qt(hh, gg, &e->d, nr);
+                    expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                     if(g_prof){ m->t_ecpu+=now_s()-te0;
@@ -5305,9 +5430,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     ESlot *e=&m->ws[nmiss<63?nmiss:63];
                     if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1,0);   /* device-lost recovery: DISK-CLASS leaves it unclassified */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
-                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                    matmul_qt(hh, gg, &e->d, nr);
+                    expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
@@ -5325,9 +5448,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     ESlot *e=&m->ws[nmiss<63?nmiss:63];
                     if(e->eid!=veid2[c2] || !e->slab) expert_load(m,layer,veid2[c2],e,1,0);
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap2[c2*S+r]*D, D*sizeof(float));
-                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                    matmul_qt(hh, gg, &e->d, nr);
+                    expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
@@ -5383,10 +5504,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
-            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
-            matmul_qt(hh, gg, &e->d, nr);
+            expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
@@ -5414,9 +5532,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         ESlot *e=eg_e[gi];
                         for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)eg_row[gi][r]*D,D*sizeof(float));
                         expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        matmul_qt(hh,gg,&e->d,nr);
+                        expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                         for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
                             for(int d=0;d<D;d++) os[d]+=wgt*hh[(int64_t)r*D+d]; }
                     }
@@ -5527,10 +5643,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     double tc=g_prof?now_s():0;
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input, as on the main CPU path */
-                        matmul_qt(hh,gg,&e->d,nr);
+                        expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
                             m->cpu_expert_rows+=(uint64_t)nr;}
                     }
@@ -6258,8 +6371,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
      * single Lc/Rc + pos_base contract — see the matching guard in attention_rows.
-     * metal_fused_fmt_ok(q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down): POSITIVE allowlist
-     * (fmt 1/2/4), same fail-closed discipline as attention_rows, extended to the
+     * metal_fused_layer_fmt_miss & METAL_FUSED_LAYER_TENSORS: kv_b on its
+     * two-format+mode term (fmt==2, or fmt==4 with g_moe_exact off) plus the
+     * POSITIVE allowlist (fmt 1/2/3/4) over q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down,
+     * same fail-closed discipline as attention_rows, extended to the
      * shared-expert MLP this fused kernel also covers. The mm_gemv shader these
      * bind_gemv calls dispatch through has a real fmt==8 branch (this PR's own
      * Metal kernel commit), but the WP_() macro below picks q8 only for fmt==1
@@ -6274,12 +6389,9 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
-       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && (l->kv_b.fmt==2||(l->kv_b.fmt==4&&!g_moe_exact))
+       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256
        && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
-       && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
-       && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)
-       && metal_fused_fmt_ok(l->sh_gate.fmt) && metal_fused_fmt_ok(l->sh_up.fmt)
-       && metal_fused_fmt_ok(l->sh_down.fmt)){
+       && !(metal_fused_layer_fmt_miss(l) & METAL_FUSED_LAYER_TENSORS)){
         int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;

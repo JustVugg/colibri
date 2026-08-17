@@ -389,6 +389,90 @@ not been validated on hardware here.
 **CUDA is unaffected.** A `CUDA_DLL=1` host ignores `COLI_HIP_RUNTIME_DIR`
 entirely and keeps its existing `coli_cuda.dll` search behaviour unchanged.
 
+### How `coli plan` and `coli doctor` see an AMD GPU here
+
+`rocm-smi` is a Linux tool. Neither the Windows HIP SDK installer nor a source
+build ships it, so the ROCm discovery path used everywhere else finds nothing on
+Windows and every AMD host planned as if it had no GPU at all.
+
+**Windows AMD discovery therefore goes through `hipInfo.exe`**, which both
+shipped SDKs do provide, in the same directory as `amdhip64_7.dll`. It comes
+from the HIP environment you already installed to build the backend — no extra
+Python package, no third-party dependency.
+
+Colibri looks for it in this order, and stops at the first hit:
+
+1. **`COLI_HIP_RUNTIME_DIR`** — the directory you already point at the HIP
+   runtime. `hipInfo.exe` sits beside `amdhip64_7.dll` there, so its answer
+   describes *the runtime the engine will actually bind*.
+2. **`%HIP_PATH%\bin`** — the SDK root the HIP SDK installer sets, and the same
+   variable the Makefile derives `HIP_SDK_ROOT` from.
+3. **`PATH`**.
+
+The order matters if you have more than one HIP install, which is common: a
+stale machine-wide `HIP_PATH` should not describe your hardware through a
+runtime the engine is not going to load. No install location is hardcoded.
+
+If `hipInfo.exe` cannot be found, or fails, or prints a device block missing a
+name or a memory total, discovery reports **no device**. It never invents one,
+and never completes a partial block with zeros — a zero would read as a
+measurement.
+
+#### Reported, but not planned against — and why
+
+`hipInfo` reports the device name, `gcnArchName`, `isIntegrated`, and **both**
+`memInfo.total` and `memInfo.free`. Colibri records the identity, marks
+`isIntegrated: 1` as unified memory, and takes the total.
+
+It deliberately does **not** use `memInfo.free` as a placement budget, because
+on this hardware that figure has not been qualified as one.
+
+The Armoury Crate firmware setting on the validated host exposes a
+*shared-memory allocation* limit. Four controlled observations, each in its own
+rebooted session with everything else held constant, gave:
+
+| Armoury shared-memory limit | `memInfo.total` | `memInfo.free` | Windows visible |
+|---|---|---|---|
+| ~6 GB (UI minimum) | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~32 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~64 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~123 GB (UI maximum) | 93.00 GiB | 92.84 GiB | 127.15 GiB |
+
+Three settings spanning a twentyfold range produced the same reading; only the
+maximum differed. At the ~6 GB minimum the reported total was roughly **12.8×
+the configured limit**. Windows-visible physical memory was unchanged in all
+four runs, as was the 0.50 GiB dedicated frame buffer the driver reports.
+
+So the reported figure is not a simple function of the setting, and no
+slider-to-HIP-memory mapping is assumed here. Nor is it dedicated VRAM: on an
+integrated part the GPU and the host draw on one physical pool, and how much of
+what HIP advertises can actually be spent — and at what cost to the host — has
+not been measured. Sizing an expert tier from it would be a guess.
+
+Such a device is therefore carried as **identity only**: free memory is
+*unknown for planning*, which is not the same claim as "zero bytes are free".
+`coli plan`
+shows it, marked `(identity only)`, with a warning naming it, and:
+
+- the VRAM tier stays at 0
+- no `CUDA_EXPERT_GB`, `PIN_GB`, `COLI_GPU` or `COLI_CUDA` is recommended
+- `COLI_CUDA_PIPE` is not switched on
+- the bottleneck is classified exactly as it would be on a CPU-only host
+
+No system-RAM figure is substituted for the missing value either; nothing is
+fabricated in place of a measurement.
+
+None of this prevents you from running on the GPU. Every environment variable
+in this document still works exactly as documented — this governs only what
+Colibri will turn on *by itself*. Qualifying a safe automatic budget on shared
+memory needs allocation measurements on real hardware, and that is deliberately
+left to a later change rather than guessed at here.
+
+A discrete Windows AMD card is marked `unified_memory: false` from
+`isIntegrated: 0`, but is also carried as identity-only for now: there is no
+discrete Windows AMD host in this validation set, and the same guess would be
+just as unqualified there.
+
 ### Putting model tensors on the GPU — and checking that it happened
 
 `COLI_CUDA=1` initialises the backend. It does **not**, on its own, put a single

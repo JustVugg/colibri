@@ -249,6 +249,70 @@ def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) ->
     print("PASS target CLI: prompt beyond the old 512-token cap")
 
 
+def check_mtp_draft(
+    binary: Path,
+    model: Path,
+    case: dict[str, object],
+    temporary: Path,
+    gpu: bool,
+) -> None:
+    record = temporary / f"mtp-draft-gpu{gpu}.json"
+    prompt = token_prompt(case["prompt_ids"])
+    env = dict(
+        os.environ,
+        V4_MTP="1",
+        V4_DRAFT="3",
+        V4_NGRAM="0",
+        V4_MTP_CONF="0",
+    )
+    if gpu:
+        env.update(V4_MTP_GPU="1", V4_MTP_GPU_MIRRORS="8")
+    result = run(
+        f"mtp draft gpu={gpu}",
+        [
+            binary.as_posix(),
+            model.as_posix(),
+            prompt,
+            "--raw-prompt",
+            "--max-tokens",
+            str(case["max_new_tokens"]),
+            "--record-oracle",
+            record.as_posix(),
+        ],
+        env=env,
+    )
+    expected_full = case["greedy_full_ids"]
+    actual = json.loads(record.read_text(encoding="utf-8"))
+    if actual.get("full_ids") != expected_full:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: drafting changed greedy output: "
+            f"expected {expected_full}, got {actual.get('full_ids')}"
+        )
+    if "v4_dspark warning=unsupported-checkpoint" in result.stderr:
+        # The generated fixture has a single MTP layer; the DSpark drafter
+        # needs the full 3-stage profile and runs target-only. Greedy identity
+        # above is still checked; the draft/acceptance path needs a real
+        # checkpoint (see docs/deepseek-v4.md, Validation).
+        print(f"SKIP mtp draft gpu={gpu}: fixture has no 3-stage MTP profile")
+        return
+    if "v4_dspark attempts=" not in result.stderr:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: no speculative attempt was made: {result.stderr}"
+        )
+    attempts = re.search(r"v4_dspark attempts=(\d+)", result.stderr)
+    if not attempts or int(attempts.group(1)) < 1:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: expected at least one draft attempt"
+        )
+    if "[MTP] rounds=" not in result.stderr:
+        raise AssertionError(f"mtp draft gpu={gpu}: no MTP round was reported")
+    if gpu and "v4_gpu dspark-mirrors" not in result.stderr:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: GPU mirror cache was not attached"
+        )
+    print(f"PASS mtp draft gpu={gpu}: token-exact and {attempts.group(1)} attempt(s)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -282,6 +346,8 @@ def main() -> int:
         # The 72-token case crosses the 64-token target prefill chunk boundary.
         check_session(binary, fixture, "long", cases["long"], temporary)
         check_cli_uses_engine_context(binary, fixture, temporary)
+        check_mtp_draft(binary, fixture, cases["short"], temporary, gpu=False)
+        check_mtp_draft(binary, fixture, cases["short"], temporary, gpu=True)
         check_serve(binary, fixture, cases["short"])
 
     print("PASS tiny DeepSeek V4 target oracle: all checks completed")

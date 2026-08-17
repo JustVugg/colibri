@@ -166,7 +166,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
  * Su ARM: attivazione quantizzata Q8_0 (scala per blocco di 16) + dot int8
  * NEON (sdot dove c'e' dotprod) — stessa famiglia IDOT di glm.c, IDOT=0 per
- * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5. */
+ * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5.
+ *
+ * NB: la quantizzazione delle ATTIVAZIONI rende questo percorso non
+ * equivalente alla via scalare (issue #1044). Vale per NEON come per AVX2:
+ * IDOT e' opt-in (IDOT=1), non piu' attivo di default. */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
@@ -187,8 +191,14 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
  * the only fast path was ARM, so x86 boxes silently used the scalar
  * fallback even when AVX2 was available).
  * Sign-extend both int8 vectors to int16 (exact, no precision loss) then
- * madd+horizontal-sum in int32: pure integer arithmetic, so this is
- * bit-for-bit identical to the scalar dot product, just vectorized. */
+ * madd+horizontal-sum in int32: pure integer arithmetic, so THIS DOT is
+ * bit-for-bit identical to a scalar int8 dot, just vectorized.
+ *
+ * That exactness does NOT extend to the branch that calls it. matmul_q's IDOT
+ * path quantizes the ACTIVATIONS to Q8_0 per 16-block before calling this,
+ * which the scalar fallback does not do -- so the two paths differ. This
+ * comment previously read as if it covered the whole path, which is how
+ * issue #1044 stayed invisible. See the note at the idot default below. */
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     __m256i va16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
     __m256i vb16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
@@ -202,10 +212,36 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
 }
 #define HAVE_FAST_DOT_I8 1
 #endif
+/* Test-only hook, compiled out of the shipping binary.
+ *
+ * matmul_q reads IDOT once into a static, so a test cannot exercise both paths
+ * in one process without it. Guarded by OLMOE_TESTING so production builds have
+ * neither the global nor the branch: tests/test_olmoe_matmul_q.c defines it. */
+#ifdef OLMOE_TESTING
+int matmul_q_idot_force = -1;
+static inline void matmul_q_reset_for_test(void) { matmul_q_idot_force = -1; }
+#endif
+
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(HAVE_FAST_DOT_I8)
+    /* IDOT is OPT-IN. It quantizes the ACTIVATIONS to Q8_0 per 16-block (below),
+     * which the scalar fallback never does, so the two paths are not numerically
+     * equivalent: measured 5/12 vs 12/12 matching tokens against a reference
+     * (issue #1044). Before 2c4e9de x86 had no fast dot at all, so IDOT=1 fell
+     * through to the exact scalar path and x86 was token-exact by accident; that
+     * commit silently made every AVX2 box lossy by default. Defaulting to off
+     * restores the behaviour users actually had.
+     *
+     * Cost of turning it on: ~+5.8e-4 relative error per dot from the activation
+     * quantization (colibri.c:910-915 measures the same mechanism at ~+0.117
+     * nats/token on GLM, which is why GLM keeps q/k/v off IDOT). On AVX2-only
+     * hardware it is also not faster: 11.01 vs 10.67 tok/s measured on an
+     * i5-9600K, n=4 interleaved. Set IDOT=1 to opt in knowingly. */
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && *e == '1'); }
+#ifdef OLMOE_TESTING
+    if (matmul_q_idot_force >= 0) idot = matmul_q_idot_force;
+#endif
     if (idot && I % 16 == 0 && I <= 4096) {
         int nb = I / 16; int8_t xi[4096]; float xs[256];
         for (int b = 0; b < nb; b++) {

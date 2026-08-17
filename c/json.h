@@ -53,7 +53,11 @@ static jval *j_new(jtype t) {
 static jval *j_parse_val(jparser *p);
 
 static char *j_parse_str_raw(jparser *p) {
-    /* assume *p->s == '"' */
+    /* SEC (GHSA-2qrj): fail closed if not actually at a quote. The old comment
+     * "assume *p->s == '\"'" was violated on the object-key path, and the
+     * unconditional p->s++ would step past the buffer's NUL terminator and scan
+     * adjacent heap (OOB read leaking into tensor names). */
+    if (*p->s != '"') return j_dup(p, "", 0);
     p->s++;
     /* buffer su heap che CRESCE: niente troncamento silenzioso a 64KB (le stringhe
      * lunghe di tokenizer.json/config venivano tagliate) e niente 64KB di stack. */
@@ -108,6 +112,7 @@ static jval *j_parse_val(jparser *p) {
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
             j_ws(p);
+            if (*p->s != '"') break;   /* SEC (GHSA-2qrj): object key must be a quoted string; stop on malformed input */
             char *key = j_parse_str_raw(p);
             j_ws(p); if (*p->s == ':') p->s++;
             jval *val = j_parse_val(p);

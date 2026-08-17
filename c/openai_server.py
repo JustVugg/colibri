@@ -21,6 +21,8 @@ import time
 import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
+from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
+                             family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -29,16 +31,16 @@ from urllib.parse import unquote, urlsplit
 HERE = Path(__file__).resolve().parent
 
 
-def default_engine():
-    """The engine next to this file. Since #391 it is built as `colibri`; `glm` stays as a
-    fallback so an old tree (or an old hand-built binary) still starts. Reported by
-    @RDouglasSharp in #488: the default still said `glm`, so `python3 openai_server.py`
-    on a clean checkout looked for a file the build no longer produces."""
-    for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+def default_engine(family=None):
+    """Resolve the registered family's engine next to this file."""
+    family = family or family_by_id("glm")
+    names = (family.engine_artifact, *family.engine_aliases)
+    candidates = tuple(name + suffix for name in names for suffix in ("", ".exe"))
+    for name in candidates:
         candidate = HERE / name
         if candidate.exists():
             return candidate
-    return HERE / "colibri"
+    return HERE / family.engine_artifact
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
@@ -1612,23 +1614,8 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 def model_arch(model):
-    """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi"/"olmoe" substring, everything
-    else (including an unreadable config) is glm."""
-    try:
-        with open(Path(model) / "config.json", encoding="utf-8") as fh:
-            model_type = (json.load(fh).get("model_type") or "").lower()
-    except (OSError, ValueError, TypeError):
-        return "glm"
-    if "inkling" in model_type:
-        return "inkling"
-    if "kimi" in model_type:
-        return "kimi"
-    if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
-        return "deepseek_v4"
-    if "olmoe" in model_type:
-        return "olmoe"
-    return "glm"
+    """Compatibility wrapper over the mandatory family registry."""
+    return resolve_model(model).descriptor.id
 
 
 def cap_for_arch(arch, cap):
@@ -1653,7 +1640,7 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
-    return 0 if arch == "glm" else 8
+    return family_by_id(arch).limits.implicit_cap
 
 
 def tune_child_env(env, arch):
@@ -1665,8 +1652,9 @@ def tune_child_env(env, arch):
     if arch != "deepseek_v4":
         return env
     if not env.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        # The V4 runtime owns OMP_NUM_THREADS: it reserves logical CPUs for its
+        # expert-loader workers. Supplying a physical-core default here makes
+        # that runtime policy treat the launcher value as a user override.
         env.setdefault("OMP_WAIT_POLICY", "active")
         env.setdefault("GOMP_SPINCOUNT", "200000")
         env.setdefault("OMP_DYNAMIC", "FALSE")
@@ -1682,7 +1670,92 @@ def tune_child_env(env, arch):
     env.setdefault("V4_MTP_MISS", "96")
     env.setdefault("V4_MTP_MIN", "3")
     env.setdefault("V4_MTP_CONF", "0.55")
+    # CUDA-driven MTP drafting stays opt-in (mirrors GLM's COLI_CUDA_MTP): the
+    # GPU fp4 kernels accumulate fp32 differently from the CPU refs, and a
+    # speculative draft must match the target bit-for-bit to be accepted.
+    env.setdefault("V4_MTP_GPU", "0")
     return env
+
+
+def _win_kill_on_close_job(pid):
+    """Tie an engine process to this server's lifetime, on Windows.
+
+    The engine re-execs itself for OMP tuning, and the re-exec's parent exits
+    immediately -- so the surviving engine is orphaned at birth. It is not a
+    descendant of anything the launcher can walk to, and it is not the pid the
+    server recorded, so neither the pidfile nor a parent-child scan can reach
+    it. #1049 measured the consequence on Windows 11: 2,617 MB still resident
+    after a shutdown that reported success, accumulating one ghost per
+    serve/stop cycle. (Same failure that OOM'd a box on 2026-07-16 with two
+    17+5 GB ghosts, where `pkill -x glm` matched nothing because the re-exec
+    renames itself.)
+
+    A Job Object with KILL_ON_JOB_CLOSE fixes it at the OS level rather than by
+    guessing pids: job membership is INHERITED by child processes, so the
+    re-exec stays inside the job, and when the last handle closes -- normal
+    exit, TerminateProcess, or a crash of this server -- Windows terminates
+    everything in it. Returns the handle, which the caller must keep alive for
+    as long as the engine should live; returns None on any failure, which
+    simply restores today's behaviour.
+    """
+    if sys.platform != "win32" or not pid:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong)]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                        ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE = 0x0100, 0x0001
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                           ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job); return None
+        handle = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not handle:
+            k32.CloseHandle(job); return None
+        ok = k32.AssignProcessToJobObject(job, handle)
+        k32.CloseHandle(handle)
+        if not ok:
+            k32.CloseHandle(job); return None
+        return job
+    except Exception:
+        return None   # never let process bookkeeping break starting the engine
 
 
 class Engine:
@@ -1739,8 +1812,15 @@ class Engine:
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1,
-                 command_prefix=None, stderr=None):
-        arch = model_arch(model)
+                 family=None, command_prefix=None, stderr=None):
+        if family is None:
+            # Protocol unit tests and embedders may use a synthetic model name.
+            # Real launcher/server entry points resolve strictly before this
+            # constructor; never reinterpret an existing invalid config.
+            config = Path(model) / "config.json"
+            family = (resolve_model(model).descriptor if config.exists()
+                      else family_by_id(ARCH))
+        arch = family.id
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
@@ -1757,6 +1837,14 @@ class Engine:
         self.process = self._spawn_process(
             command, child_env=child_env, stderr=stderr,
         )
+        # Keep the job handle on the instance: KILL_ON_JOB_CLOSE fires when the
+        # LAST handle closes, so this reference is what ties the engine (and the
+        # OMP re-exec that orphans itself) to the server's lifetime (#1049).
+        # Guarded so the non-Windows path never touches .pid -- the test suite
+        # drives this class with a fake process object that has none.
+        self._win_job = None
+        if sys.platform == "win32":
+            self._win_job = _win_kill_on_close_job(getattr(self.process, "pid", None))
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
         self.pending = {}
@@ -2085,9 +2173,25 @@ class Engine:
             self.next_request_id += 1
             self.pending[request_id] = events
         xpayload = gpayload or apayload
+        # DeepSeek V4 prefix hint (optional 8th header field): the byte length of
+        # the rendered prompt up to the first user/assistant turn marker — the
+        # stable system prefix. The engine snapshots its attention state at that
+        # token boundary during the prefill, so the FIRST request of the first
+        # conversation already seeds the shared-prefix checkpoint that every later
+        # conversation (opencode session) restores in seconds; without the hint
+        # the engine only discovers the boundary on the second fresh prompt.
+        # Older engines parse six or seven fields and ignore the eighth.
+        prefix_field = ""
+        if ARCH == "deepseek_v4":
+            cut = min((i for i in (prompt.find("<\uff5cUser\uff5c>"),
+                                   prompt.find("<\uff5cAssistant\uff5c>")) if i > 0),
+                      default=0)
+            if cut > 0:
+                prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
-                  + (f" {len(xpayload)}" if xpayload else "") + "\n").encode()
+                  + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
+                  + "\n").encode()
         try:
             with self.write_lock:
                 if self.process.poll() is not None:
@@ -2124,6 +2228,13 @@ class Engine:
                 # out, the turn ran to its token limit, and this thread stayed
                 # blocked until the engine emitted something. Poll the callback
                 # while idle so a pre-first-frame disconnect cancels too.
+                #
+                # Do NOT raise here: this thread holds the scheduler admission,
+                # and releasing it before the engine confirms the cancel lets
+                # the next request SUBMIT into a pipe the busy engine is not
+                # reading — every later request then hangs silently behind the
+                # orphaned generation. Wait for the engine's ERROR CANCELLED /
+                # DONE frame; ClientCancelled is raised when it arrives.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
                     with self.write_lock:
@@ -2144,12 +2255,21 @@ class Engine:
                             self.process.stdin.write(f"STOP {request_id}\n".encode())
                             self.process.stdin.flush()
                     elif cancelled and cancelled():
+                        # Same admission-holding rule as the idle branch above:
+                        # send CANCEL, then keep consuming frames until the
+                        # engine acknowledges with ERROR CANCELLED or DONE.
                         cancel_sent = True
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
+                if cancel_sent:
+                    # The engine finished the turn before seeing the CANCEL
+                    # (or honored it at a token boundary and still framed a
+                    # DONE). Either way the client is gone: the ack is what
+                    # mattered, the output is not deliverable.
+                    raise ClientCancelled()
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
@@ -2724,7 +2844,8 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
+        family = family_by_id(ARCH)
+        if grammar is not None and not family.capabilities.grammar_payload:
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -2935,7 +3056,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 if think:
@@ -2964,7 +3085,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 if content_split:
@@ -3303,11 +3424,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
+def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
-    if engine is None:
-        engine = default_engine()
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -3318,8 +3437,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
-        raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
+    pending_family = family
+    pending_model_id = model_id
+    pending_engine = engine
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
         # a compute-heavy API to the network. Refuse unless explicitly overridden.
@@ -3341,11 +3461,23 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        family = pending_family or resolve_model(model).descriptor
+        global ARCH
+        ARCH = family.id
+        engine = pending_engine or default_engine(family)
+        model_id = pending_model_id or family.default_model_id
+        server.model_id = model_id
+        if kv_slots > family.limits.max_kv_slots:
+            raise ValueError(f"{family.id} engine supports at most "
+                             f"{family.limits.max_kv_slots} KV slot(s)")
+        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
@@ -3357,8 +3489,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe"), default="auto",
+    parser.add_argument("--engine")
+    parser.add_argument("--arch", choices=("auto", *family_ids()), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -3381,20 +3513,23 @@ def main():
              "(reverse proxy / MagicDNS in front of the loopback bind); repeat as needed, "
              "or set COLI_ALLOWED_HOSTS as a comma-separated list")
     args = parser.parse_args()
+    try:
+        resolved = resolve_model(args.model)
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        parser.error(str(error))
+    family = resolved.descriptor
+    if args.arch != "auto" and args.arch != family.id:
+        parser.error(f"--arch {args.arch} conflicts with model family {family.id}")
     global ARCH
-    ARCH = args.arch
-    if ARCH == "auto":
-        ARCH = model_arch(args.model)
+    ARCH = family.id
+    if args.engine is None:
+        args.engine = str(default_engine(family))
     if args.model_id is None:
-        args.model_id = ("inkling-colibri" if ARCH == "inkling" else
-                         "kimi-k3-colibri" if ARCH == "kimi" else
-                         "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
-                         "olmoe-colibri" if ARCH == "olmoe" else
-                         "glm-5.2-colibri")
+        args.model_id = family.default_model_id
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
-          allowed_hosts=args.allowed_host)
+          allowed_hosts=args.allowed_host,family=family)
 
 
 if __name__ == "__main__":

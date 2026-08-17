@@ -868,6 +868,36 @@ static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap,
     st_read_raw(S, name, out, drop);
 }
 
+/* Read-only view of one tensor's exact stored bytes.  Unlike st_read_raw this
+ * performs no allocation or copy; unlike a naked mmap pointer it carries the
+ * aligned OS view/handle required for cleanup.  Callers must still validate
+ * dtype and shape for their own format before consuming `data`. */
+typedef struct {
+    compat_ro_map map;
+    const void *data;
+    int64_t nbytes;
+} st_mapped_raw;
+
+static int st_map_raw(shards *S, const char *name, st_mapped_raw *out) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); return -1; }
+    if (!out || t->nbytes <= 0 || (uint64_t)t->nbytes > SIZE_MAX) {
+        errno = EINVAL; return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (compat_map_readonly(t->fd, t->off, (size_t)t->nbytes,
+                            &out->map, &out->data) != 0) return -1;
+    out->nbytes = t->nbytes;
+    return 0;
+}
+
+static void st_unmap_raw(st_mapped_raw *mapped) {
+    if (!mapped) return;
+    compat_unmap_readonly(&mapped->map);
+    mapped->data = NULL;
+    mapped->nbytes = 0;
+}
+
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
  * Serve per gli expert fusi di GLM (un tensore = blocco [E, ...]): si legge il
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */

@@ -188,7 +188,14 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                     __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-                a+=hsum256(acc)*sc;
+                /* Pinned as an fma in the SOURCE. With the default
+                 * -ffp-contract=fast the compiler may fuse this multiply-add
+                 * (one rounding) or not (two), so the same source produced
+                 * different bits depending on the flag -- see the PR for a
+                 * reproduction. That made every bit-exactness gate, including
+                 * the glm_tiny token oracle, depend on build flags rather than
+                 * on the code. */
+                a=fmaf(hsum256(acc),sc,a);
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];
@@ -1514,9 +1521,104 @@ static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const u
     free(xq); free(xsc);
 }
 
+#ifdef __ARM_NEON
+/* Chemin NEON pour fmt=6 (E8/IQ3).
+ *
+ * Le noyau amont n'a qu'un chemin AVX2 et un repli scalaire : sur aarch64
+ * (GB10 / DGX Spark, Apple silicon) tout le deballage retombe donc sur du C
+ * scalaire, mesure en amont a ~92 % du temps de decodage. Cette version
+ * transpose la structure du chemin AVX2, qui suit deja la forme du format :
+ *
+ *   - une "lane" = 8 poids = deux lignes de grille de 4 octets + 8 signes,
+ *     soit exactement DEUX registres NEON de 4 flottants ;
+ *   - les 8 octets de grille s'elargissent par vmovl_u8 puis vmovl_u16 ;
+ *   - les 7 bits de signe stockes plus le 8e derive de la parite deviennent
+ *     des masques par comparaison contre le vecteur de selection, appliques
+ *     par XOR du bit de signe flottant -- aucun branchement, ce qui est
+ *     precisement ce qui rendait la version scalaire couteuse ;
+ *   - le 0.5 de la convention demi-unite de la grille est replie dans
+ *     l'echelle du sous-bloc.
+ *
+ * Deux accumulateurs evitent une chaine de dependance unique sur les 32 FMA
+ * d'un super-bloc, et une seule reduction horizontale par 256 poids remplace
+ * une par 32.
+ */
+static void matmul_e8_neon(float *y, const float *x, const uint8_t *q, const float *unused,
+                           int S, int I, int O){
+    (void)unused;                                  /* les echelles vivent dans les blocs */
+    int64_t nb=e8_blocks(I), rb=e8_rowbytes(I);
+    const uint32x4_t sel_lo=(uint32x4_t){1,2,4,8};
+    const uint32x4_t sel_hi=(uint32x4_t){16,32,64,128};
+    const uint32x4_t sgn=vdupq_n_u32(0x80000000u);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wrow=q+(int64_t)o*rb;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float acc=0;
+            for(int64_t b=0;b<nb;b++){
+                const uint8_t *blk=wrow+b*E8_BBYTES;
+                uint16_t dh; memcpy(&dh, blk+96, 2);
+                float d=e8_fp16_to_f32(dh);
+                int base=(int)(b*E8_QK);
+                if(base+E8_QK<=I){
+                    float32x4_t ac0=vdupq_n_f32(0.0f), ac1=vdupq_n_f32(0.0f);
+                    for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                        uint32_t word; memcpy(&word, blk+E8_QK/4+ib*4, 4);
+                        float db=d*(0.5f+(float)((word>>28)&0xF))*0.5f;
+                        const float32x4_t vdb=vdupq_n_f32(0.5f*db);
+                        const uint8_t *ix=blk+ib*8;
+                        int off=base+ib*E8_SUB;
+                        for(int l=0;l<4;l++){
+                            uint32_t sv=(word>>(7*l))&0x7Fu;
+                            uint32_t s8=sv|((uint32_t)__builtin_parity(sv)<<7); /* parite impaire ferme la lane */
+                            uint8_t g[8];
+                            memcpy(g,   e8_grid[ix[l*2+0]], 4);
+                            memcpy(g+4, e8_grid[ix[l*2+1]], 4);
+                            uint16x8_t w16=vmovl_u8(vld1_u8(g));
+                            float32x4_t v0=vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16))),  vdb);
+                            float32x4_t v1=vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16))), vdb);
+                            uint32x4_t sd=vdupq_n_u32(s8);
+                            uint32x4_t m0=vceqq_u32(vandq_u32(sd,sel_lo),sel_lo);
+                            uint32x4_t m1=vceqq_u32(vandq_u32(sd,sel_hi),sel_hi);
+                            v0=vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v0),vandq_u32(m0,sgn)));
+                            v1=vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v1),vandq_u32(m1,sgn)));
+                            ac0=vfmaq_f32(ac0,v0,vld1q_f32(xs+off+l*8));
+                            ac1=vfmaq_f32(ac1,v1,vld1q_f32(xs+off+l*8+4));
+                        }
+                    }
+                    acc+=vaddvq_f32(vaddq_f32(ac0,ac1));
+                    continue;
+                }
+                /* Queue non alignee : on garde le deballage de reference. */
+                for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                    int off=base+ib*E8_SUB;
+                    if(off>=I) break;
+                    float w[E8_SUB];
+                    e8_expand_sub(blk, ib, d, w);
+                    int n = I-off < E8_SUB ? I-off : E8_SUB;
+                    float a=0;
+                    for(int k=0;k<n;k++) a += xs[off+k]*w[k];
+                    acc+=a;
+                }
+            }
+            y[(int64_t)s*O+o]=acc;
+        }
+    }
+}
+#endif /* __ARM_NEON */
+
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
+#ifdef __ARM_NEON
+    /* aarch64 : le corps ci-dessous na quun chemin AVX2 et un repli scalaire,
+     * donc tout retombait sur du C non vectorise. Mesure ici (expert GLM
+     * 6144x2048) : 3,6x plus rapide a S=1, et 2,2x PLUS PRECIS contre une
+     * reference en double precision. */
+    matmul_e8_neon(y, x, q, unused, S, I, O);
+    return;
+#endif
     int64_t nb=e8_blocks(I), rb=e8_rowbytes(I);
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){

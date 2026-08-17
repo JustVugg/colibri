@@ -39,6 +39,19 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input);
 
+/* Optional CUDA tier (Windows engine build only, COLI_V4_GPU_TIER). The
+ * engine-side wrappers in deepseek_v4.c resolve coli_cuda_dsv4.dll through
+ * backend_loader_dsv4.c; the matvec_ref implementations dispatch to them when
+ * the resident weight mirror (ColiTensorView.gpu) is non-NULL. */
+#ifdef COLI_V4_GPU_TIER
+int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
+                           const float *input);
+int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
+                               const float *input, int groups);
+int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
+                                 const float *inputs, int batch);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

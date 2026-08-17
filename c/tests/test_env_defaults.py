@@ -9,7 +9,9 @@ Carica `coli` come modulo (ha la guardia __main__) e verifica il contratto:
 import importlib.machinery
 import importlib.util
 import os
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -23,9 +25,14 @@ _spec = importlib.util.spec_from_loader("coli_cli", _loader)
 coli = importlib.util.module_from_spec(_spec)
 _loader.exec_module(coli)
 
+_MODEL_DIR = tempfile.TemporaryDirectory()
+_MODEL = Path(_MODEL_DIR.name)
+(_MODEL / "config.json").write_text(
+    json.dumps({"model_type": "glm_moe_dsa"}), encoding="utf-8")
+
 
 def args(**over):
-    base = dict(model="X", policy="quality", ram=0, ngen=0, topp=0, topk=0,
+    base = dict(model=str(_MODEL), policy="quality", ram=0, ngen=0, topp=0, topk=0,
                 temp=None, repin=0, ctx=0, auto_tier=False, gpu=None, vram=0)
     base.update(over)
     return types.SimpleNamespace(**base)
@@ -128,6 +135,20 @@ class CudaAutoEnableTest(unittest.TestCase):
         # coli_cuda.dll present (cuda=True) but nvidia-smi absent (no GPUs found)
         # -> warn + CPU-only, never crash, never set COLI_CUDA.
         e = self._env_for("win32", cuda=True, gpus=[])
+        self.assertNotIn("COLI_CUDA", e)
+        self.assertNotIn("COLI_GPUS", e)
+        self.assertNotIn("CUDA_EXPERT_GB", e)
+
+    def test_win32_does_not_auto_enable_an_unqualified_gpu(self):
+        # A device whose free memory is not qualified as a placement budget
+        # (free_bytes is None -- a Windows AMD part found through hipInfo) is
+        # discovered and worth reporting, but auto-enable is an automatic
+        # placement decision and must not be made from it. Bare `coli chat`
+        # stays on the CPU path, exactly as if nothing had been found.
+        identity_only = {"index": 0, "name": "AMD Radeon(TM) 8060S Graphics",
+                         "arch": "gfx1151", "total_bytes": 78 * 1024 ** 3,
+                         "free_bytes": None, "unified_memory": True}
+        e = self._env_for("win32", cuda=True, gpus=[identity_only])
         self.assertNotIn("COLI_CUDA", e)
         self.assertNotIn("COLI_GPUS", e)
         self.assertNotIn("CUDA_EXPERT_GB", e)

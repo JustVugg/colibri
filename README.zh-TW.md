@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -300,7 +300,7 @@ colibrì 最初是由一人使用 12 核心、25 GB RAM 的筆電開發；
 
 - ⭐ 為儲存庫加星並分享；
 - 🐛 以 issue 提交你的硬體 benchmark 數據——實測資料比任何其他事都更能推動專案；
-- 💬 加入 [Discord 社群](https://discord.gg/fpQxKnRb)，討論實驗、硬體數據與研究方向；
+- 💬 加入 [Discord 社群](https://discord.gg/MAaKtQRc)，討論實驗、硬體數據與研究方向；
 - 💬 若想贊助開發或捐贈硬體，請透過 GitHub issues 聯絡。
 
 ## 儲存庫結構

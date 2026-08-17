@@ -60,7 +60,7 @@
 #define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
 
 /* engines that write this format; the table exists so a mismatch names both sides */
-static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", NULL };
+static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", NULL };
 
 static uint32_t rt_hash(const char *s){        /* FNV-1a 32, stable across builds */
     uint32_t h = 2166136261u;

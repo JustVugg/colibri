@@ -8,6 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from family_registry import (FamilyConfigError, PlannerUnsupportedError, UnknownFamilyError,
+                             public_metadata, resolve_model)
 from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
                            memory_available)
 
@@ -20,6 +22,15 @@ SAFETENSORS_DTYPES = {
     "F32": 4,
     "U8": 1,
     "I8": 1,
+    # dtypes st.h's st_dtype_code accepts beyond the classic set (DeepSeek V4 /
+    # Kimi-style checkpoints); sizes mirror st_dtype_esz exactly.
+    "I64": 8,
+    "U64": 8,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "float8_e4m3fn": 1,
+    "F8_E8M0": 1,
+    "F8_E8M0FNU": 1,
 }
 REQUIRED_CORE_TENSORS = (
     "model.embed_tokens.weight",
@@ -351,7 +362,13 @@ def cuda_linkage(engine_path):
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
-    if os.name == "posix":
+    # `sys.platform` alone selects the branch, so a test can exercise the
+    # Windows probe on a POSIX host by faking it. Faking `os.name` instead
+    # would repoint pathlib at Windows semantics and turn the POSIX fixture
+    # path into a WindowsPath that no longer resolves, so `is_file()` above
+    # would return early. On every real host the two agree and this reads
+    # exactly as `os.name == "posix"` did.
+    if os.name == "posix" and sys.platform != "win32":
         try:
             result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
                                     timeout=3, check=False)
@@ -365,18 +382,37 @@ def cuda_linkage(engine_path):
         return {"linked": any("not found" not in line for line in lines),
                 "missing": any("not found" in line for line in lines)}
     if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        # Windows DLL-split builds never link the GPU runtime directly: the host
+        # LoadLibrary's its backend at runtime (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the GPU build via a
+        # marker string baked into the engine's #ifdef COLI_CUDA block, then
+        # require the backend artifact to sit next to the executable.
+        #
+        # WHICH artifact is not a guess. backend_loader.c compiles exactly one
+        # basename into the host -- COLI_BACKEND_DLL is "coli_hip.dll" under
+        # COLI_HIP_DLL and "coli_cuda.dll" otherwise -- so the binary states
+        # what it will load and we check for that. Asking for coli_cuda.dll
+        # unconditionally failed a working HIP host (a hard error, not a
+        # warning), and accepting either name would have passed a HIP host that
+        # only had a stray CUDA backend beside it.
         try:
-            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+            image = engine.read_bytes()
         except OSError:
             return {"linked": False, "missing": False}
-        if not built:
+        # The DeepSeek V4 engine has its own loader (backend_loader_dsv4.c):
+        # it tries coli_cuda_dsv4_dg.dll then coli_cuda_dsv4.dll, so either
+        # next to the engine means the tier can start.
+        if b"[DSV4 CUDA]" in image:
+            present = any((engine.parent / name).is_file()
+                          for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
+            return {"linked": present, "missing": not present}
+        if b"[CUDA] mode: routed experts" not in image:
             return {"linked": False, "missing": False}
-        dll_present = (engine.parent / "coli_cuda.dll").is_file()
+        expected = next((name for name in ("coli_hip.dll", "coli_cuda.dll")
+                         if name.encode() in image), None)
+        if expected is None:
+            return {"linked": False, "missing": False}
+        dll_present = (engine.parent / expected).is_file()
         return {"linked": dll_present, "missing": not dll_present}
     return {"linked": False, "missing": False}
 
@@ -405,11 +441,13 @@ def missing_shared_libraries(engine_path):
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                engine_path, available_memory=None, available_disk=None, gpus=None,
-               linkage=None, deep=False, mirror_dir=None):
+               linkage=None, deep=False, mirror_dir=None, kv_slots=1,
+               engine_error=None):
     """Collect a complete report. No model payload, engine, or CUDA context is loaded."""
     model = Path(model).expanduser().resolve()
     checks = []
     plan = None
+    resolved = None
 
     if model.is_dir() and os.access(model, os.R_OK):
         checks.append(_check("model.path", "pass", "model directory is readable", path=str(model)))
@@ -425,6 +463,18 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
                          "config.json is valid" if valid_config else "config.json is missing or invalid"))
+    if valid_config:
+        try:
+            resolved = resolve_model(model)
+            checks.append(_check("model.family", "pass",
+                                 f"{resolved.descriptor.display_name} family is registered",
+                                 family_id=resolved.descriptor.id,
+                                 model_type=resolved.model_type,
+                                 descriptor=public_metadata(resolved.descriptor)))
+        except (FamilyConfigError, UnknownFamilyError) as error:
+            checks.append(_check("model.family", "fail", str(error)))
+    else:
+        checks.append(_check("model.family", "skip", "family detection requires a valid config"))
     tokenizer = model / "tokenizer.json"
     checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
                          "tokenizer.json found" if tokenizer.is_file() else "tokenizer.json is missing"))
@@ -445,7 +495,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         engine_ok = engine.is_file()
     else:
         engine_ok = engine.is_file() and os.access(engine, os.X_OK)
-    if engine_ok:
+    if engine_error:
+        checks.append(_check("engine.binary", "fail", str(engine_error), path=str(engine)))
+    elif engine_ok:
         unresolved = missing_shared_libraries(engine)
         if unresolved:
             checks.append(_check("engine.binary", "fail",
@@ -486,9 +538,11 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("accelerator.gpu", "skip", "no supported GPU detected; CPU path is available"))
 
     try:
+        if resolved is None:
+            raise ValueError("placement requires a registered model family")
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus)
+                          gpus=detected_gpus, kv_slots=kv_slots)
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
@@ -529,6 +583,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         else:
             checks.append(_check("storage.ssd_probe", "skip",
                                  "no cached probe yet; measured on the first Metal+darwin engine start"))
+    except PlannerUnsupportedError as error:
+        checks.append(_check("model.shards", "pass", "safetensors headers are readable",
+                             shards=len(list(model.glob("*.safetensors")))))
+        checks.append(_check("storage.disk", "skip",
+                             "storage projection requires a family planner"))
+        checks.append(_check("memory.ram", "skip",
+                             "RAM projection requires a family planner"))
+        checks.append(_check("placement.plan", "skip", str(error)))
+        checks.append(_check("storage.ssd_probe", "skip",
+                             "probe surfacing requires a family planner"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   <a href="README.md">English</a> · 简体中文 · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -318,7 +318,7 @@ colibrì 最初由一人使用 12 核心、25 GB RAM 的笔记本开发；
 
 - ⭐ 为仓库加星并分享；
 - 🐛 以 issue 提交你的硬件 benchmark 数据——实测数据比任何其他事都更能推动项目；
-- 💬 加入 [Discord 社区](https://discord.gg/fpQxKnRb)，讨论实验、硬件数据与研究方向；
+- 💬 加入 [Discord 社区](https://discord.gg/MAaKtQRc)，讨论实验、硬件数据与研究方向；
 - 💬 若想赞助开发或捐赠硬件，请通过 GitHub issues 联系。
 
 ## 仓库结构

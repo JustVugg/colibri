@@ -71,6 +71,10 @@ typedef struct {
 struct ColiExpertStore {
     const ColiExpertStoreOps *ops;
     void *state;
+    /* Optional CUDA-tier mirror cache owned by the GPU translation unit
+     * (deepseek_v4.c COLI_V4_UNIT_GPU). NULL when the tier is inactive; the
+     * CPU lease path ignores it entirely. */
+    void *gpu;
 };
 
 static inline int coli_expert_lookup(ColiExpertStore *store,
