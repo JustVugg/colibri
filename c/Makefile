@@ -1091,6 +1091,31 @@ tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_x
 tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c backend_xdna.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Synthetic ABI-2 helpers for the execution tests. Plain C, no XRT, no device:
+# they let the whole execution control flow be qualified on a machine with no
+# NPU. Three variants so the all-or-nothing binding contract is testable.
+XDNA_FAKE_HELPERS = tests/xdna_fake_helper.dll \
+                    tests/xdna_fake_helper_abi1.dll \
+                    tests/xdna_fake_helper_partial.dll
+tests/xdna_fake_helper.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -shared $< -o $@
+tests/xdna_fake_helper_abi1.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_ABI1 -shared $< -o $@
+tests/xdna_fake_helper_partial.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_PARTIAL -shared $< -o $@
+
+tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c backend_xdna.h compat.h $(XDNA_FAKE_HELPERS)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
+# the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
+# XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact
+# bytes, none of which a build machine may assume. Build and run it explicitly:
+#   make tests/xdna_physical_probe$(EXE)
+#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll>
+tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

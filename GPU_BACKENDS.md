@@ -431,5 +431,100 @@ but does not require it, and correctness and publication semantics come first; a
 
 Conversion needs no helper, no artifact, no XRT and no device — it is engine
 representation logic, and the helper knows nothing about nibble packing or group
-scales. **There is still no XDNA execution**: connecting a real operation to the
-device is the next slice's work.
+scales. 
+### Native execution: the GLM shared gate/up lane
+
+Colibri can now execute one real operation on the NPU: the **MoE shared-expert
+gate and up projections**, and nothing else. This is the whole supported surface,
+and the constraints below are hard gates rather than guidance.
+
+```
+family        MoE shared-expert gate / up  (sh_gate, sh_up)
+K             6144
+N             2048
+stored format fmt=4 grouped int4, group size 64
+logical M     1..64, zero-padded to the artifact's M=64
+execution     blocking, one operation at a time
+```
+
+`sh_down` is deliberately **not** accelerated: its orientation is `I=2048,
+O=6144`, which is not what the qualified artifact computes. Nor is the generic
+`matmul_qt` intercepted. The semantic family is passed explicitly by the call
+site and never inferred from a shape, so an unrelated operation that happens to
+be 6144x2048 cannot inherit this one's qualification.
+
+Row padding is legitimate because `C = A x B` is row-independent: output row *i*
+depends only on input row *i* and on B. Only the logical rows are copied out;
+padded rows never reach anything downstream. Logical M above 64 declines to the
+current path — row tiling is a qualified strategy but is not implemented here.
+
+**There is no automatic selection.** No `--xdna` flag, no `COLI_XDNA`
+environment variable and no economic policy exists. An ordinary build with a
+helper, a device and valid artifacts present still runs exactly the path it runs
+today; the lane is reachable only from an internal test control. Deciding *when*
+XDNA is preferable is a separate concern with a separate owner.
+
+Hard eligibility is evaluated in this order, cheapest and most semantic first,
+and no later gate can excuse an earlier refusal:
+
+```
+family -> logical M -> K/N -> fmt -> group size -> registry row
+       -> artifact qualification -> artifact present -> artifact SHA256
+       -> helper ABI -> prepared weight VALID -> 4096-byte alignment
+       -> device/runtime -> artifact runtime object -> userptr wrap -> execute
+```
+
+Any refusal, and any helper failure at any stage, returns "not handled" and the
+caller runs its current `matmul_qt` path. The candidate never calls `matmul_qt`
+itself, so there is no recursion and no double dispatch, and the caller's output
+buffer is written only after the helper reports successful completion — a
+failure cannot leave a half-written result behind.
+
+### Building the optional helper
+
+The helper is the only component that links XRT, and it is **opt-in**: an
+ordinary build compiles without XRT headers, links without XRT, imports no XRT
+DLL, and does not require `coli_xdna.dll` to exist.
+
+Tested provenance:
+
+```
+compiler     MSVC 14.44.35207 (Visual Studio 2022), Windows SDK 10.0.26100
+XRT SDK      2.21.75 -- headers + xrt_coreutil.lib
+XRT runtime  2.21.0  -- installed xrt_coreutil.dll
+device       AMD XDNA2 (Ryzen AI), driver 32.0.20102.3930
+```
+
+```
+cl /nologo /LD /EHsc /std:c++17 /Zc:__cplusplus /O2 /MD /W3 ^
+   /I <XRT_SDK>\include c\backend_xdna_helper.cpp ^
+   /Fe:coli_xdna.dll /link <XRT_SDK>\lib\xrt_coreutil.lib
+```
+
+`/Zc:__cplusplus` is required: without it MSVC reports `__cplusplus` as
+`199711L`, `xrt/detail/any.h` takes its Boost branch, and the build fails on a
+header Colibri does not use.
+
+The host looks for `coli_xdna.dll` **beside the executable, by absolute path
+only** — no PATH search, no current directory, no application-directory
+fallback. A helper that is not there is simply absent, which is a normal state.
+
+The helper ABI is generation **2**. Generation 1 is refused outright rather than
+partially bound: it exports two of the seven entry points generation 2 requires
+and cannot execute anything, so binding it would produce a helper that reports
+availability and then fails. Binding is all-or-nothing.
+
+### Artifacts are not shipped
+
+The qualified `.xclbin` and instruction-stream bytes are **not** distributed with
+Colibri, and how they eventually should be is still an open question. The
+registry carries their SHA256, and a missing, unreadable or hash-mismatched
+artifact fails closed before the device is opened or any byte reaches the
+helper. With no artifact root configured — the default, and the only production
+value — every request declines.
+
+### What is not claimed
+
+No full-model acceleration, no token-throughput figure, no general XDNA backend,
+no routed-expert support, no concurrency with the GPU, and no scheduler. One
+family, one shape, one bucket, one dispatch at a time.

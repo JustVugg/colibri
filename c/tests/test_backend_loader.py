@@ -2437,12 +2437,30 @@ _XDNA_FAKE_HELPER_C = r'''
 #include <windows.h>
 
 #ifndef FAKE_ABI_VERSION
-#define FAKE_ABI_VERSION 1u
+#define FAKE_ABI_VERSION 2u
 #endif
 
 __declspec(dllexport) unsigned int coli_xdna_helper_abi_version(void){
     return (unsigned int)FAKE_ABI_VERSION;
 }
+
+/* ABI generation 2 requires the whole execution set, not just a handshake. None
+ * of these does anything: the contract under test is the BINDING. */
+__declspec(dllexport) int coli_xdna_helper_open(const char *x, const char *i,
+                                                unsigned m, unsigned k, unsigned n){
+    (void)x;(void)i;(void)m;(void)k;(void)n; return 0;
+}
+__declspec(dllexport) int coli_xdna_helper_wrap_weight(void *p, unsigned long long b){
+    (void)p;(void)b; return 0;
+}
+#ifndef FAKE_OMIT_EXECUTE
+__declspec(dllexport) int coli_xdna_helper_execute(const void *a, unsigned long long ab,
+                                                   void *c, unsigned long long cb){
+    (void)a;(void)ab;(void)c;(void)cb; return 0;
+}
+#endif
+__declspec(dllexport) int coli_xdna_helper_release_weight(void){ return 0; }
+__declspec(dllexport) const char *coli_xdna_helper_last_error(void){ return ""; }
 
 #ifndef FAKE_OMIT_SHUTDOWN
 __declspec(dllexport) void coli_xdna_helper_shutdown(void){ }
@@ -2479,8 +2497,8 @@ _XDNA_HARNESS_C = r'''
 
 static void report(const char *tag){
     ColiXdnaBinding s = coli_xdna_binding();
-    printf("%s=%s attempts=%d\n", tag, coli_xdna_binding_text(s),
-           coli_xdna_test_load_attempts());
+    printf("%s=%s attempts=%d bound=%d\n", tag, coli_xdna_binding_text(s),
+           coli_xdna_test_load_attempts(), coli_xdna_test_entry_points_bound());
 }
 
 int main(int argc, char **argv){
@@ -2600,11 +2618,27 @@ class XdnaOptionalBindingTest(unittest.TestCase):
         gcc(["-O0", "-shared", "-DFAKE_ABI_VERSION=999u", str(helper_src),
              "-o", str(cls.bad_abi)], "building the wrong-ABI synthetic helper")
 
+        # The previous ABI generation. W2-N7-I5 bumped the host to generation 2,
+        # which is a deliberate compatibility break: a generation-1 helper
+        # exports two of the seven entry points now required and cannot execute
+        # anything, so it must be refused outright rather than partially bound.
+        cls.abi1 = root / "abi1" / _XDNA_HELPER_BASENAME
+        cls.abi1.parent.mkdir(parents=True, exist_ok=True)
+        gcc(["-O0", "-shared", "-DFAKE_ABI_VERSION=1u", str(helper_src),
+             "-o", str(cls.abi1)], "building the previous-generation synthetic helper")
+
         # Missing a required entry point.
         cls.incomplete = root / "incomplete" / _XDNA_HELPER_BASENAME
         cls.incomplete.parent.mkdir(parents=True, exist_ok=True)
         gcc(["-O0", "-shared", "-DFAKE_OMIT_SHUTDOWN", str(helper_src),
              "-o", str(cls.incomplete)], "building the incomplete synthetic helper")
+
+        # Missing one of the entry points ABI 2 introduced. Binding is
+        # all-or-nothing across the WHOLE set, not just the parts it inherited.
+        cls.no_execute = root / "no_execute" / _XDNA_HELPER_BASENAME
+        cls.no_execute.parent.mkdir(parents=True, exist_ok=True)
+        gcc(["-O0", "-shared", "-DFAKE_OMIT_EXECUTE", str(helper_src),
+             "-o", str(cls.no_execute)], "building the execute-less synthetic helper")
 
         # Present but unloadable: imports a dependency that is then deleted.
         cls.unloadable = root / "unloadable" / _XDNA_HELPER_BASENAME
@@ -2662,6 +2696,21 @@ class XdnaOptionalBindingTest(unittest.TestCase):
         out = self._run("probe", self.bad_abi)
         self.assertEqual(self._state(out), "ABI_INCOMPATIBLE")
 
+    def test_previous_abi_generation_is_rejected(self):
+        # The I1 -> I5 generation bump is a compatibility break by design. A
+        # stale generation-1 helper must never become callable under the
+        # generation-2 contract, however many symbol names it happens to share.
+        out = self._run("probe", self.abi1)
+        self.assertEqual(self._state(out), "ABI_INCOMPATIBLE")
+        self.assertIn("bound=0", out)
+
+    def test_missing_execute_entry_point_is_rejected(self):
+        # All-or-nothing applies to the entry points ABI 2 added, not only to
+        # the ones it inherited from ABI 1.
+        out = self._run("probe", self.no_execute)
+        self.assertEqual(self._state(out), "SYMBOL_INCOMPLETE")
+        self.assertIn("bound=0", out)
+
     def test_missing_required_entry_point_is_rejected(self):
         out = self._run("probe", self.incomplete)
         self.assertEqual(self._state(out), "SYMBOL_INCOMPLETE")
@@ -2692,7 +2741,7 @@ class XdnaOptionalBindingTest(unittest.TestCase):
                 out = self._run("repeat", path, 8)
                 # attempts is reported on the same line as state=
                 line = [l for l in out.splitlines() if l.startswith("state=")][0]
-                attempts = int(line.split("attempts=")[1])
+                attempts = int(line.split("attempts=")[1].split(" ")[0])
                 self.assertLessEqual(attempts, 1,
                                      "loader re-probed %d times: %s" % (attempts, out))
 

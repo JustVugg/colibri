@@ -6243,10 +6243,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!shared_cuda){
 #endif
         sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
+        /* Optional XDNA2 lane, gate/up only. Same idiom as vk_matmul_qt: 0 means
+         * "not handled, run the current path", and the candidate never calls
+         * matmul_qt itself, so there is no recursion and no double dispatch.
+         * The semantic family is passed EXPLICITLY -- it is never inferred from
+         * M/K/N, so an unrelated operation of the same shape cannot inherit this
+         * one's qualification. sh_down is deliberately absent below: its
+         * orientation (I=sI, O=D) is not what the qualified F3 artifact
+         * computes. Inert without the internal test control; there is no public
+         * switch and no automatic policy in this slice. */
+#ifdef COLI_XDNA
+        if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_gate.xdna,
+                                 l->sh_gate.fmt, l->sh_gate.q4, l->sh_gate.s,
+                                 l->sh_gate.I, l->sh_gate.O, l->sh_gate.gs, sg, x, S))
+#endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
 #endif
         matmul_qt(sg, x, &l->sh_gate, S);
+#ifdef COLI_XDNA
+        if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_up.xdna,
+                                 l->sh_up.fmt, l->sh_up.q4, l->sh_up.s,
+                                 l->sh_up.I, l->sh_up.O, l->sh_up.gs, su, x, S))
+#endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_up, su, x, S))
 #endif

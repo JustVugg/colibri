@@ -46,3 +46,6 @@ tests/test_inkling_serve_framing
 *.dll
 cublasLt64*.dll
 cudart64*.dll
+# Optional XDNA test scaffolding that the *.o / *.dll globs above do not cover.
+tests/xdna_exec_fixtures/
+tests/xdna_physical_probe

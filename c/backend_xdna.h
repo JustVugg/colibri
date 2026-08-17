@@ -29,8 +29,15 @@ extern "C" {
 /* Host-side ABI generation. A helper reporting a different value is refused
  * outright: there is no partial acceptance and no speculative forward
  * compatibility, because neither could be tested here. Bump this when the
- * required entry-point set or any signature changes. */
-#define COLI_XDNA_ABI_VERSION 1u
+ * required entry-point set or any signature changes.
+ *
+ * Generation 2 (W2-N7-I5) is a DELIBERATE COMPATIBILITY BREAK. Generation 1
+ * required two entry points and could only answer "a helper exists"; generation
+ * 2 requires seven and can open a device, wrap a weight and execute. A
+ * generation-1 helper is refused outright rather than partially used: it cannot
+ * perform any of the new work, and silently binding it would produce a helper
+ * that reports availability and then cannot execute. */
+#define COLI_XDNA_ABI_VERSION 2u
 
 /* Symbols the helper must export, all prefixed coli_xdna_helper_ so they can
  * never collide with the host-side coli_xdna_ names in this header. */
@@ -320,8 +327,137 @@ int coli_xdna_pointer_alignment_ok(const void *p);
 size_t coli_xdna_prepared_total_bytes(void);
 int    coli_xdna_prepared_live_objects(void);
 
+/* -- full hard eligibility and native execution ---------------------------
+ *
+ * I2 could only answer STATIC_ARTIFACT_QUALIFIED: does a trustworthy artifact
+ * exist? This is the first slice that can answer the whole question:
+ *
+ *     CAN this operation safely run on XDNA, right now, on this machine?
+ *
+ * It still does NOT answer "should it". Hard eligibility and economic
+ * preference are separate decisions with separate owners, and nothing here
+ * consults, computes or caches a cost. Automatic selection belongs to a later
+ * slice; this one executes only when an internal test control asks it to. */
+
+typedef enum {
+    COLI_XDNA_HARD_ELIGIBLE = 0,
+    /* engine-side semantic gates, evaluated before anything is opened */
+    COLI_XDNA_HARD_FAMILY_UNSUPPORTED,
+    COLI_XDNA_HARD_M_OUT_OF_RANGE,
+    COLI_XDNA_HARD_SHAPE_UNSUPPORTED,
+    COLI_XDNA_HARD_FORMAT_UNSUPPORTED,      /* stored tensor is not fmt=4 */
+    COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED,  /* fmt=4 but gs is not the qualified 64 */
+    /* artifact gates */
+    COLI_XDNA_HARD_ARTIFACT_NOT_QUALIFIED,  /* any non-QUALIFIED static verdict */
+    /* representation gates */
+    COLI_XDNA_HARD_PREPARED_INVALID,
+    COLI_XDNA_HARD_ALIGNMENT_INVALID,
+    /* runtime gates */
+    COLI_XDNA_HARD_HELPER_UNAVAILABLE,
+    COLI_XDNA_HARD_DEVICE_UNAVAILABLE,
+    COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE,
+    COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE
+} ColiXdnaHard;
+
+const char *coli_xdna_hard_text(ColiXdnaHard h);
+
+/* The qualified source group size. I4's converter accepts any gs>0 as a generic
+ * representation transform; that breadth is a property of the CONVERTER, not a
+ * statement about what the device was qualified on. A PREPARED_VALID image
+ * built from another gs is a perfectly good host image and is still refused
+ * here, because no artifact was ever correctness-qualified against one. */
+#define COLI_XDNA_QUALIFIED_GROUP_SIZE 64
+
+/* The logical-M range this slice implements, against the F3 M64 artifact.
+ *
+ * Row padding is legitimate because C = A x B is row-independent: output row i
+ * depends only on input row i and on B. N6-A2-A1A qualified the strategy
+ * physically -- 13 logical M values against an unmodified fixed-M artifact, all
+ * bit-exact, with zeros written into every padded row. That argument is a
+ * property of PURE GEMM and must never be extended to attention, normalisation
+ * or routing.
+ *
+ * Row TILING (logical M above the bucket) is equally qualified as a strategy
+ * and deliberately NOT implemented here: the smallest first seam is one
+ * dispatch. Anything above the range declines to the current path. */
+#define COLI_XDNA_I5_LOGICAL_M_MIN 1
+#define COLI_XDNA_I5_LOGICAL_M_MAX 64
+
+typedef enum {
+    COLI_XDNA_EXEC_OK = 0,
+    COLI_XDNA_EXEC_DECLINED,             /* not hard-eligible; not an error */
+    COLI_XDNA_EXEC_DEVICE_INIT_FAILED,
+    COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED,
+    COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED,
+    COLI_XDNA_EXEC_WEIGHT_WRAP_FAILED,
+    COLI_XDNA_EXEC_ACTIVATION_FAILED,
+    COLI_XDNA_EXEC_EXECUTE_FAILED,       /* dispatch refused or threw */
+    COLI_XDNA_EXEC_COMPLETION_FAILED     /* dispatched, did not complete cleanly */
+} ColiXdnaExec;
+
+const char *coli_xdna_exec_text(ColiXdnaExec e);
+
+/* The production candidate, called from the GLM shared gate/up sites and
+ * nowhere else. Deliberately shaped like the existing optional-lane idiom
+ * (vk_matmul_qt): returns 1 when it has fully written y, 0 when the caller must
+ * run its current path.
+ *
+ *     if(!coli_xdna_try_matmul(...)) matmul_qt(y, x, w, S);
+ *
+ * It NEVER calls matmul_qt itself, so there is no recursion, no double dispatch
+ * and no path on which a failure here suppresses the current path.
+ *
+ * `family` is passed explicitly by the call site. It is never inferred from the
+ * shape: two operations with identical M/K/N are different operations, and one
+ * may not inherit the other's qualification.
+ *
+ * `slot` is the engine-owned prepared-state handle (QT::xdna), created lazily on
+ * first use. The tensor's authoritative fmt=4 bytes are read and never modified.
+ *
+ * y is written ONLY after the helper reports successful completion, so a failure
+ * at any stage leaves the caller's output buffer untouched for matmul_qt to
+ * overwrite. */
+int coli_xdna_try_matmul(ColiXdnaFamily family,
+                         ColiXdnaPrepared **slot,
+                         int fmt, const unsigned char *q4, const float *scale,
+                         int I, int O, int gs,
+                         float *y, const float *x, int S);
+
+/* Release helper-owned runtime state and the transient staging buffers. Safe
+ * when nothing was ever initialised, and safe to repeat. */
+void coli_xdna_execution_shutdown(void);
+
 /* Install a registry for tests; NULL restores the production table. */
 void coli_xdna_test_set_registry(const ColiXdnaArtifact *rows, int count);
+
+/* -- internal execution controls ------------------------------------------
+ *
+ * These are the ONLY way to reach the native path, and they are deliberately
+ * test seams rather than user-facing controls: there is no --xdna flag, no
+ * COLI_XDNA environment variable and no automatic policy anywhere in this
+ * slice, so an ordinary build with a helper, a device and valid artifacts
+ * present still runs exactly the path it runs today.
+ *
+ * Forcing bypasses ECONOMIC preference only -- which does not exist yet, so
+ * today it bypasses nothing at all. It cannot bypass any hard gate: family,
+ * format, group size, shape, bucket, artifact integrity, qualification,
+ * prepared validity, alignment, helper ABI or device availability. */
+void coli_xdna_test_set_force_execution(int on);
+/* Where logical artifact names resolve. NULL (the default, and the only
+ * production value) means no artifact is reachable and every request declines.
+ * Artifact distribution is an open question this slice does not close. */
+void coli_xdna_test_set_artifact_root(const char *root);
+
+/* The last hard-eligibility verdict, for tests and diagnostics. */
+ColiXdnaHard coli_xdna_test_last_hard(void);
+/* The last execution verdict. */
+ColiXdnaExec coli_xdna_test_last_exec(void);
+int coli_xdna_test_dispatches(void);      /* successful helper executions */
+int coli_xdna_test_completions(void);     /* of those, cleanly completed */
+int coli_xdna_test_artifact_opens(void);
+int coli_xdna_test_activation_preparations(void);
+int coli_xdna_test_padded_operations(void);
+int coli_xdna_test_fallbacks(void);       /* candidate returned 0 */
 
 /* Deterministic mid-conversion fault injection, for tests only. 0 disables it;
  * 1..99 fails after approximately that percentage of the conversion's rows.
@@ -333,7 +469,9 @@ void coli_xdna_test_set_convert_fail_pct(int pct);
  * a failed conversion left behind. Production code uses
  * coli_xdna_prepared_image(), which returns NULL unless the image is VALID. */
 const void *coli_xdna_prepared_image_unchecked(const ColiXdnaPrepared *p);
-/* All four must stay 0 for the whole of this slice. */
+/* Device opens, helper calls and userptr wraps became reachable in W2-N7-I5 and
+ * are 0 only on paths that never reach the native lane. Conversions became
+ * reachable in I4. */
 int coli_xdna_test_device_opens(void);
 int coli_xdna_test_helper_calls(void);
 int coli_xdna_test_userptr_wraps(void);
