@@ -1287,6 +1287,18 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
  * GB10, Jetson, integrated GPUs). On these the expert tier and the RAM cache draw
  * from the same pool, so the RAM budget must account for the tier; on a discrete GPU
  * VRAM is a separate pool and this returns 0. */
+/* Le GPU peut-il lire de la memoire pageable (malloc ordinaire) sans aucun
+ * enregistrement ? Vrai sur Grace-Blackwell / GB10, ou CPU et GPU partagent les
+ * tables de pages. Quand c est le cas, cudaHostRegister est non seulement
+ * inutile mais NUISIBLE : il epingle les pages, les rend non evincables, et
+ * fait exploser le budget memoire d un moteur qui recycle ses tampons
+ * (mesure : OOM-kill a 85 Go de RSS). */
+extern "C" int coli_cuda_device_pageable(int device) {
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0;
+    return prop.pageableMemoryAccess ? 1 : 0;
+}
+
 extern "C" int coli_cuda_device_integrated(int device) {
     cudaDeviceProp prop{};
     if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
@@ -1335,6 +1347,20 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
     if (!tensor) return 0;
+    /* A VIEW must never satisfy a request for a COPY. coli_cuda_tensor_wrap
+     * builds NON-OWNING views onto host slabs (integrated / pageable-shared
+     * memory such as GB10). A view matches on fmt/I/O/device/gs, so the cached
+     * copy check below would accept one and return success WITHOUT allocating
+     * anything: the caller then believes the slot holds a device copy while it
+     * holds a borrowed host pointer. Because a view declares weight_bytes=0,
+     * the expert-tier accounting silently collapses -- measured on GB10, the
+     * tier fell from 3795 experts to 128 and decode from 0.54 to 0.48 tok/s,
+     * which is why wiring the zero-copy path had to be reverted twice.
+     * Dropping a view never touches the host bytes it borrowed. */
+    if (*tensor && !(*tensor)->weights_owned) {
+        coli_cuda_tensor_free(*tensor);
+        *tensor = nullptr;
+    }
     if (*tensor) {
         /* Cached device copy: usable even when the caller's host pointers are
          * gone. CUDA_RELEASE_HOST slots null their host pointers after upload,
@@ -2275,6 +2301,126 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
     return cuda_ok(cudaGetLastError(),"ragged attention launch")&&
            cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"ragged output download")&&
            cuda_ok(cudaStreamSynchronize(dc->stream),"ragged attention synchronize");
+}
+
+/* ---------------------------------------------------------------------------
+ * Zero-copie sur GPU a memoire unifiee (symetrie de la branche Metal).
+ *
+ * La branche Metal enveloppe deja les slabs d'experts streames dans un
+ * MTLBuffer via newBufferWithBytesNoCopy et resout tout pointeur interne en
+ * adresse GPU : sur Apple Silicon, le GPU lit le tampon de streaming EN PLACE.
+ * Rien d'equivalent n'existait cote CUDA parce que, jusqu'aux GPU integres
+ * (Jetson, GB10), "CUDA" impliquait une VRAM separee ou le zero-copie n'a
+ * aucun sens -- il faudrait de toute facon traverser le PCIe.
+ *
+ * Difference de conception avec Metal, et elle est essentielle : Metal se
+ * decide a la COMPILATION (un Mac est toujours unifie), CUDA doit se decider a
+ * l'EXECUTION, car le meme binaire sert des cartes discretes et des puces
+ * integrees. La bascule est donc prop.integrated, deja expose par
+ * coli_cuda_device_integrated(). Sur GPU discret, l'enregistrement est refuse
+ * et l'appelant garde exactement son chemin actuel.
+ * ------------------------------------------------------------------------- */
+
+struct RegisteredSlab { void *base; size_t len; void *dev; };
+static std::vector<RegisteredSlab> g_reg_slabs;
+static std::mutex g_reg_mtx;          /* appele depuis les threads expert_load paralleles */
+
+extern "C" int coli_cuda_slab_register(void *base, size_t len) {
+    if (!base || !len) return 0;
+    if (g_nctx < 1) return 0;
+    if (!coli_cuda_device_integrated(g_ctx[0].device)) return 0;
+    if (!select_ctx(&g_ctx[0])) return 0;
+
+    /* cudaHostRegisterMapped : la page reste celle de l'appelant, on ne fait
+     * qu'en publier une adresse device. Aucune copie, aucune allocation. */
+    if (!cuda_ok(cudaHostRegister(base, len, cudaHostRegisterMapped), "slab register"))
+        return 0;
+    void *dev = nullptr;
+    if (!cuda_ok(cudaHostGetDevicePointer(&dev, base, 0), "slab device pointer")) {
+        cudaHostUnregister(base);
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    for (auto &s : g_reg_slabs)
+        if (s.base == base) { s.len = len; s.dev = dev; return 1; }   /* re-enregistrement */
+    g_reg_slabs.push_back({base, len, dev});
+    return 1;
+}
+
+extern "C" void coli_cuda_slab_unregister(void *base) {
+    if (!base) return;
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mtx);
+        for (size_t i = 0; i < g_reg_slabs.size(); i++)
+            if (g_reg_slabs[i].base == base) {
+                g_reg_slabs.erase(g_reg_slabs.begin() + i);
+                break;
+            }
+    }
+    /* Hors du verrou : aucun appel CUDA sous le mutex du registre, meme
+     * discipline que la branche Metal. */
+    cudaHostUnregister(base);
+}
+
+/* Resout un pointeur QUELCONQUE a l'interieur d'un slab enregistre en adresse
+ * device, offset compris. Rend nullptr si le pointeur n'appartient a aucun
+ * slab -- l'appelant retombe alors sur le chemin CPU. */
+static void *slab_resolve(const void *p) {
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    const uint8_t *q = (const uint8_t*)p;
+    for (auto &s : g_reg_slabs) {
+        const uint8_t *b = (const uint8_t*)s.base;
+        if (q >= b && q < b + s.len)
+            return (uint8_t*)s.dev + (q - b);
+    }
+    return nullptr;
+}
+
+/* Construit une VUE : un ColiCudaTensor qui pointe sur la memoire enregistree
+ * sans la posseder. weights_owned=0 existait deja dans la structure et etait
+ * verifie a la liberation -- c'etait le point d'accroche manquant. Liberer
+ * cette vue ne doit JAMAIS toucher au tampon du moteur. */
+extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor, const void *host_weights,
+                                     const float *scales, int fmt, int I, int O,
+                                     int device, int gs) {
+    if (!tensor || !host_weights || I < 1 || O < 1) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!coli_cuda_device_integrated(device)) return 0;   /* discret : rien a faire ici */
+
+    /* Chemin GB10 : le pointeur hote est deja adressable par le GPU, on le
+     * prend tel quel. Aucun enregistrement, donc aucune page epinglee.
+     * Sinon on retombe sur le registre (cudaHostRegister), utile aux GPU
+     * integres plus anciens qui exigent un mapping explicite. */
+    void *dev = coli_cuda_device_pageable(device)
+                  ? (void*)host_weights
+                  : slab_resolve(host_weights);
+    if (!dev) return 0;                                    /* ni pageable, ni enregistre */
+
+    ColiCudaTensor *t = new (std::nothrow) ColiCudaTensor();
+    if (!t) return 0;
+    t->weights = dev;
+    t->weights_owned = 0;                                  /* VUE : ne pas liberer */
+    t->scales = nullptr;
+    if (scales) {
+        void *ds = coli_cuda_device_pageable(device)
+                     ? (void*)scales
+                     : slab_resolve(scales);
+        if (!ds) { delete t; return 0; }
+        t->scales = (float*)ds;
+    }
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->gs = gs;
+    t->ng = (gs > 0) ? (I + gs - 1) / gs : 0;
+    t->scale_count = (gs > 0) ? (size_t)O * t->ng : (size_t)O;
+    t->weight_bytes = 0;                                   /* pas notre allocation */
+    t->tracked = 0;                                        /* hors comptabilite VRAM */
+    t->ragged_count = 0;
+    *tensor = t;
+    return 1;
+}
+
+extern "C" int coli_cuda_tensor_owns_weights(const ColiCudaTensor *t) {
+    return t ? t->weights_owned : 0;
 }
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
