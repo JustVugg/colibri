@@ -2,7 +2,9 @@ import json
 import re
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from family_registry import (
     FAMILIES,
@@ -11,6 +13,7 @@ from family_registry import (
     FamilyDescriptor,
     FamilyLimits,
     PlannerGeometry,
+    RegistryError,
     UnknownFamilyError,
     PlannerUnsupportedError,
     _build_registry,
@@ -18,6 +21,7 @@ from family_registry import (
     planner_geometry,
     public_metadata,
     resolve_model,
+    tuning_replay_prompt,
 )
 
 
@@ -45,17 +49,49 @@ def minimax_geometry(config, context, _model_dir):
 
 TEST_INVENTORY = lambda _name, _size, _config: ()
 QWEN36_FIXTURE = FamilyDescriptor(
-    "qwen36", ("qwen3_5_moe_text",), "Qwen3.6", "", "qwen36", (), "qwen36",
-    "qwen36", "qwen36", ("qwen36",), "qwen3.6-colibri", "qwen36", "qwen36",
-    "qwen36_hybrid", qwen_geometry, "", TEST_INVENTORY, "root",
-    FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
-    FamilyCapabilities(False, False, False, True))
+    id="qwen36",
+    model_types=("qwen3_5_moe_text",),
+    display_name="Qwen3.6",
+    display_scale="",
+    engine_artifact="qwen36",
+    engine_aliases=(),
+    engine_group="qwen36",
+    internal_arch="qwen36",
+    build_target="qwen36",
+    process_names=("qwen36",),
+    default_model_id="qwen3.6-colibri",
+    cli_adapter="qwen36",
+    gateway_adapter="qwen36",
+    planner_id="qwen36_hybrid",
+    planner_geometry=qwen_geometry,
+    planner_unsupported_reason="",
+    expert_inventory=TEST_INVENTORY,
+    config_section="root",
+    limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
+    capabilities=FamilyCapabilities(False, False, False, True),
+)
 MINIMAX_M3_FIXTURE = FamilyDescriptor(
-    "minimax_m3", ("minimax_m3",), "MiniMax M3", "", "colibri", (),
-    "colibri-core", "minimax_m3", "colibri", ("colibri",), "minimax-m3-colibri",
-    "minimax_m3", "minimax_m3", "minimax_m3_gqa", minimax_geometry, "",
-    TEST_INVENTORY, "root", FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "CTX"),
-    FamilyCapabilities(True, False, False, True))
+    id="minimax_m3",
+    model_types=("minimax_m3",),
+    display_name="MiniMax M3",
+    display_scale="",
+    engine_artifact="colibri",
+    engine_aliases=(),
+    engine_group="colibri-core",
+    internal_arch="minimax_m3",
+    build_target="colibri",
+    process_names=("colibri",),
+    default_model_id="minimax-m3-colibri",
+    cli_adapter="minimax_m3",
+    gateway_adapter="minimax_m3",
+    planner_id="minimax_m3_gqa",
+    planner_geometry=minimax_geometry,
+    planner_unsupported_reason="",
+    expert_inventory=TEST_INVENTORY,
+    config_section="root",
+    limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "CTX"),
+    capabilities=FamilyCapabilities(True, False, False, True),
+)
 
 
 class FamilyRegistryTest(unittest.TestCase):
@@ -147,7 +183,7 @@ class FamilyRegistryTest(unittest.TestCase):
                  self.assertRaises(PlannerUnsupportedError):
                 planner_geometry(resolved, 32)
 
-    def test_cli_and_gateway_adapter_sets_equal_the_registry(self):
+    def test_cli_and_gateway_dispatch_follow_the_registry(self):
         import openai_server
         from importlib.machinery import SourceFileLoader
         import importlib.util
@@ -158,15 +194,52 @@ class FamilyRegistryTest(unittest.TestCase):
         cli = importlib.util.module_from_spec(spec)
         loader.exec_module(cli)
 
-        cli_adapters = {"glm", "inkling", "kimi", "olmoe", "deepseek_v4"}
-        gateway_adapters = {"glm", "inkling", "kimi", "olmoe", "deepseek_v4"}
-        self.assertEqual({family.cli_adapter for family in FAMILIES}, cli_adapters)
-        self.assertEqual({family.gateway_adapter for family in FAMILIES},
-                         gateway_adapters)
+        source = cli_path.read_text(encoding="utf-8")
+        self.assertNotRegex(source, r"family\.(?:cli|gateway)_adapter\s+not in")
+        self.assertNotIn("K3CHAT1", source)
+        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 3)
+        self.assertEqual(source.count("if not family.has_cli_adapter:"), 1)
         self.assertEqual(set(openai_server.family_ids()),
                          {family.id for family in FAMILIES})
         self.assertEqual({family.id for family in cli.all_families()},
                          {family.id for family in FAMILIES})
+
+        resolved = type("R", (), {"descriptor": replace(
+            FAMILIES[0], has_cli_adapter=False, has_gateway_adapter=False)})()
+        args = type("A", (), {"model": ".", "prompt": ["hello"],
+                                "no_attach": True})()
+        with mock.patch.object(cli, "need_model"), \
+             mock.patch.object(cli, "resolve_model", return_value=resolved), \
+             mock.patch.object(cli, "engine_for", return_value="engine"), \
+             mock.patch.object(cli, "banner"):
+            with self.assertRaisesRegex(SystemExit, "coli run is not wired"):
+                cli.cmd_run(args)
+            with self.assertRaisesRegex(SystemExit, "gateway adapter is not wired"):
+                cli.cmd_chat(args)
+
+    def test_tuning_replay_prompts_are_registry_owned(self):
+        prompt = "hello {world}"
+        expected = {
+            "glm": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
+            "inkling": "<|user|>hello {world}<|assistant|>",
+            "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
+            "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
+            "deepseek_v4": "hello {world}",
+        }
+        self.assertEqual(
+            {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},
+            expected,
+        )
+
+    def test_optional_adapters_and_prompt_template_are_registry_invariants(self):
+        self.assertFalse(QWEN36_FIXTURE.has_cli_adapter)
+        self.assertFalse(QWEN36_FIXTURE.has_gateway_adapter)
+        self.assertEqual(tuning_replay_prompt(QWEN36_FIXTURE, "hello"), "hello")
+
+        for template in ("static", "{unknown}", "{prompt", "{prompt[foo]}"):
+            with self.subTest(template=template), self.assertRaises(RegistryError):
+                _build_registry((replace(QWEN36_FIXTURE,
+                                         tune_prompt_template=template),))
 
     def test_doctor_reports_unknown_family_instead_of_falling_back(self):
         from doctor import run_doctor

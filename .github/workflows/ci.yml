@@ -402,6 +402,42 @@ jobs:
             tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
             tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant
 
+  # The token-exact parity gate from #7 (c/tests/test_cluster_sharding.py): the
+  # engine's local CPU run must already reproduce the transformers oracle
+  # token-exactly, and delegating the routed-expert shard to a cluster worker
+  # must not perturb a single position. It exercises the fmt=6 (E8/IQ3,
+  # rotation-bearing) path and its fmt=4 (grouped int4, no-rotation) control.
+  #
+  # Not in `make check`: the two fixtures are gitignored (regenerated, not
+  # committed -- see .gitignore) and need the pinned torch/transformers to
+  # build, the same rationale as inkling-oracle and efficiency above. The test
+  # skips cleanly when the fixtures are absent, so leaving fixture generation
+  # out of CI would turn the gate into a silent no-op on a clean host -- the
+  # worker path would never actually run. This job regenerates both fixtures
+  # first so the gate is exercised, not dormant.
+  #
+  # Socket safety: the test spawns a cluster worker subprocess and a
+  # coordinator, each binding a 127.0.0.1 port obtained from _free_port()
+  # (bind to port 0), so it is safe on a shared runner.
+  cluster-parity:
+    name: Cluster parity gate (fmt6/fmt4, token-exact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build colibri
+        run: make -C c colibri
+      - name: Generate the fmt6/fmt4 quantized fixtures
+        run: cd c && python3 tools/make_glm_oracle.py --fmt6 && python3 tools/make_glm_oracle.py --fmt4
+      - name: Cluster parity gate (token-exact)
+        run: cd c && python3 -m unittest -v tests.test_cluster_sharding
+
   engine-hip-syntax:
     name: HIP syntax check
     runs-on: ubuntu-latest

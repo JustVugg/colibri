@@ -22,7 +22,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
 
     def test_drafter_is_lazy_and_budgeted_before_target_cache(self):
         reserve = self.engine.index("engine->runtime.dspark_reserve_bytes =")
-        store = self.engine.index("coli_v4_expert_store_open_planned(", reserve)
+        store = self.engine.index("coli_expert_store_backend_open_selected(", reserve)
         self.assertLess(reserve, store)
         self.assertIn("load=lazy verification=exact-target", self.engine)
         self.assertIn("double total_gb = coli_v4_dspark_cache_gb()", self.drafter)

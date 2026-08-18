@@ -30,6 +30,10 @@
 #include <unistd.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
@@ -128,6 +132,11 @@ static const float *g_pre_sh;
 /* routing precalcolata dalla GPU (Metal layer CB o device router CUDA, #431):
  * moe() la usa e salta la FASE A. NULL = router su CPU. */
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
+#if !defined(_WIN32)
+typedef struct { int fd; char host[128]; int port; } ClusterWorker;
+static ClusterWorker g_cluster_workers[16];
+static int g_cluster_n;
+#endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
@@ -983,6 +992,43 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
     }
 }
 
+/* ---- quantizzazione attivazioni sollevata a livello layer ---------------------------
+ * moe() quantizza x UNA volta per layer e raccoglie le righe int8 accanto al gather
+ * f32; il ramo IDOT di matmul_qt_ex le riusa quando (x,S,I) coincidono ESATTAMENTE
+ * col contesto. Prima lo stesso vettore veniva riquantizzato da ogni matmul che lo
+ * consumava (~16x per layer: 8 expert x gate+up), in seriale sul thread master.
+ * Bit-identico: qrow_i8 e' pura, quantizzare la riga originale o la sua copia
+ * raccolta produce gli stessi byte; l'ordine per-riga non cambia. Ogni altro
+ * percorso (CUDA/Metal/Vulkan, fmt 0/3/4/5/6/8, attenzione con allow_idot=0, la
+ * copia ruotata fmt=6) ignora il contesto e resta identico.
+ * EN: layer-level hoisted activation quantization. moe() quantizes x once and
+ * gathers int8 rows next to the f32 gather; the IDOT branch reuses them on an
+ * exact (x,S,I) pointer/shape match. Bit-identical (qrow_i8 is a pure function
+ * of the row bytes). Every other path ignores the context and is unchanged. */
+static struct { const float *x; int S, I; const int8_t *xq; const float *sx; } g_pq;
+static void pq_build(const float *x, int S, int D, int8_t *xq, float *sx){
+    /* righe indipendenti -> parallelizzare sulle righe e' bit-identico; il loop
+     * DENTRO qrow_i8 resta scalare (stesso ordine di lrintf di sempre).
+     * EN: rows are independent, so parallelizing across rows is bit-identical;
+     * the per-row loop inside qrow_i8 stays scalar (same lrintf order). */
+    #pragma omp parallel for schedule(static) if(S>=8)
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*D, xq+(int64_t)s*D, D);
+}
+/* Il gate/up di questo expert passerebbe dall'IDOT di matmul_qt_ex? Specchia
+ * l'ordine di dispatch di expert_gate_up: a S==1 la fused pair f32 (fmt=2)
+ * preempta matmul_qt, quindi li' il contesto non servirebbe a nessuno.
+ * EN: would this expert's gate/up take matmul_qt_ex's IDOT branch? Mirrors
+ * expert_gate_up's dispatch order: at S==1 the f32 fused pair (fmt=2) preempts
+ * matmul_qt entirely, so the context would go unused there. */
+static inline int pq_want(const QT *g,const QT *u,int nr){
+    if(!g_idot) return 0;
+    if(nr==1 && !g_no_fused_pair && !spec_pinned() &&
+       g->fmt==2 && u->fmt==2 && g->I==u->I && g->O==u->O) return 0;
+    int a = g->fmt==1 || (g->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
+    int b = u->fmt==1 || (u->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
+    return a || b;
+}
+
 /* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
  * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
  * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
@@ -1028,9 +1074,15 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
-        if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
-        quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
-        for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        if(g_pq.x==x && g_pq.S==S && g_pq.I==I){
+            /* righe gia' quantizzate una volta dal layer (vedi g_pq sopra)
+             * EN: rows already quantized once at layer level (see g_pq above) */
+            xq=(int8_t*)g_pq.xq; sx=(float*)g_pq.sx;
+        } else {
+            if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
+            quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+            for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        }
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
@@ -1628,12 +1680,14 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
  * SEMPRE — e' la forma CANONICA, pura funzione del fmt del down-tensor. Perche' resta
  * byte-identica al vecchio inline: (a) i fallback device-lost Vulkan ricaricano solo
  * expert che erano in registry (vk_reg_at), e vk_registry_fill ammette solo fmt 2/4/5 —
- * li' d->fmt!=6 e la rotazione e' un no-op; (b) l'oracolo e ogni modello single-format
- * (l'output di una conversione normale) non hanno mai un expert fmt=6 accanto a fmt 2/4/5.
+ * li' d->fmt!=6 e la rotazione e' un no-op; (b) l'oracolo e' single-format, e una
+ * conversione normale single-pass produce un modello single-format: le due copie che
+ * POSSONO vedere fmt=6 lo fanno solo su un container mixed-format, che il tooling
+ * normale non emette mai.
  * Le DUE copie che saltavano la rotazione e potevano davvero vedere fmt=6 — la CPU-share
- * del blocco Vulkan e il fallback CUDA — ora seguono il canonico: su un container
- * mixed-format (fmt per-tensor da qt_resolve_fmt, nessuna uniformita' tra expert, vedi il
- * commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
+ * del blocco Vulkan e il fallback CUDA early-issued — ora seguono il canonico: su un
+ * container mixed-format (fmt per-tensor da qt_resolve_fmt, nessuna uniformita' tra
+ * expert, vedi il commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
 static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, QT *u, QT *d, int nr, int I){
     expert_gate_up(gg,uu,xg,g,u,nr);
     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -3180,6 +3234,211 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
     atomic_fetch_add_explicit(&g_edisk_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
     return rc;
 }
+
+#if !defined(_WIN32)
+/* Expert-worker protocol. Headers use network-order u32 values; activation
+ * bytes remain raw little-endian f32, matching the native engine ABI. One
+ * request contains the routed batch-union for a layer. */
+#define COLI_CLUSTER_MAGIC "COLIEX01"
+#define COLI_CLUSTER_VERSION 1u
+static int cluster_io(int fd, void *buf, size_t n, int write_mode){
+    char *p=(char*)buf;
+    while(n){
+        ssize_t r=write_mode?send(fd,p,n,0):recv(fd,p,n,MSG_WAITALL);
+        if(r<=0){ if(r<0&&errno==EINTR) continue; return -1; }
+        p+=r; n-=(size_t)r;
+    }
+    return 0;
+}
+static int cluster_u32(int fd, uint32_t *v, int write_mode){
+    uint32_t x=write_mode?htonl(*v):0;
+    if(cluster_io(fd,write_mode?(void*)&x:(void*)v,sizeof(x),write_mode)) return -1;
+    if(!write_mode) *v=ntohl(*v);
+    return 0;
+}
+static int cluster_connect_one(const char *spec, ClusterWorker *out){
+    char copy[256]; strncpy(copy,spec,sizeof(copy)-1); copy[sizeof(copy)-1]=0;
+    char *colon=strrchr(copy,':'); if(!colon||colon==copy||!colon[1]) return -1;
+    *colon=0; int port=atoi(colon+1); if(port<1||port>65535) return -1;
+    char portbuf[16]; snprintf(portbuf,sizeof(portbuf),"%d",port);
+    struct addrinfo hint={0},*ai=NULL; hint.ai_socktype=SOCK_STREAM;
+    if(getaddrinfo(copy,portbuf,&hint,&ai)!=0) return -1;
+    int fd=-1;
+    for(struct addrinfo *p=ai;p;p=p->ai_next){
+        fd=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
+        if(fd<0) continue;
+        if(connect(fd,p->ai_addr,p->ai_addrlen)==0) break;
+        close(fd); fd=-1;
+    }
+    freeaddrinfo(ai); if(fd<0) return -1;
+    out->fd=fd;
+    size_t hostlen=strlen(copy); if(hostlen>=sizeof(out->host)) hostlen=sizeof(out->host)-1;
+    memcpy(out->host,copy,hostlen); out->host[hostlen]=0;
+    out->port=port; return 0;
+}
+static void cluster_close_all(void){
+    for(int i=0;i<g_cluster_n;i++) if(g_cluster_workers[i].fd>=0) close(g_cluster_workers[i].fd);
+    g_cluster_n=0;
+}
+static void cluster_init(void){
+    const char *list=getenv("CLUSTER_WORKERS"); if(!list||!*list) return;
+    char *copy=strdup(list),*save=NULL;
+    for(char *tok=strtok_r(copy,",",&save);tok&&g_cluster_n<16;tok=strtok_r(NULL,",",&save)){
+        while(*tok==' '||*tok=='\t') tok++;
+        if(!cluster_connect_one(tok,&g_cluster_workers[g_cluster_n])) g_cluster_n++;
+        else fprintf(stderr,"[CLUSTER] cannot connect to expert worker %s\n",tok);
+    }
+    free(copy);
+    if(g_cluster_n<1){ fprintf(stderr,"[CLUSTER] no expert workers reachable\n"); exit(1); }
+    fprintf(stderr,"[CLUSTER] coordinator connected to %d expert worker(s)\n",g_cluster_n);
+}
+typedef struct { int eid,nr; int *rows; float *weights,*inputs; } ClusterItem;
+static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,int S,
+                        int eid,ClusterItem *it,int D,const float *x){
+    it->eid=eid; it->nr=0;
+    for(int s=0;s<S;s++) for(int k=0;k<keff[s];k++)
+        if(idxs[(int64_t)s*K+k]==eid){ it->nr++; break; }
+    if(!it->nr) return 0;
+    it->rows=malloc((size_t)it->nr*sizeof(int));
+    it->weights=malloc((size_t)it->nr*sizeof(float));
+    it->inputs=falloc((int64_t)it->nr*D); int r=0;
+    for(int s=0;s<S;s++) for(int k=0;k<keff[s];k++) if(idxs[(int64_t)s*K+k]==eid){
+        it->rows[r]=s; it->weights[r]=ws[(int64_t)s*K+k];
+        memcpy(it->inputs+(int64_t)r*D,x+(int64_t)s*D,(size_t)D*sizeof(float)); r++; break;
+    }
+    return 1;
+}
+static void cluster_item_free(ClusterItem *it){ free(it->rows); free(it->weights); free(it->inputs); memset(it,0,sizeof(*it)); }
+static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
+                              const int *idxs,const float *ws,const int *keff,int K,
+                              const int *uniq,int base,int nb){
+    int D=m->c.hidden;
+    for(int wi=0;wi<g_cluster_n;wi++){
+        ClusterItem items[64]; memset(items,0,sizeof(items)); int n=0;
+        for(int j=0;j<nb;j++){
+            int eid=uniq[base+j];
+            if((eid+layer)%g_cluster_n!=wi) continue;
+            if(n<64 && cluster_item(idxs,ws,keff,K,S,eid,&items[n],D,x)) n++;
+        }
+        if(!n) continue;
+        ClusterWorker *w=&g_cluster_workers[wi]; char magic[8]; uint32_t v;
+        if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
+        v=COLI_CLUSTER_VERSION; if(cluster_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)m->c.moe_inter; if(cluster_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)n; if(cluster_u32(w->fd,&v,1)) goto fail;
+        for(int j=0;j<n;j++){
+            v=(uint32_t)items[j].eid; if(cluster_u32(w->fd,&v,1)) goto fail;
+            v=(uint32_t)items[j].nr; if(cluster_u32(w->fd,&v,1)) goto fail;
+            if(cluster_io(w->fd,items[j].inputs,(size_t)items[j].nr*D*sizeof(float),1)) goto fail;
+        }
+        if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
+        if(cluster_u32(w->fd,&v,0)||v!=COLI_CLUSTER_VERSION) goto fail;
+        if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
+        if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
+        for(int j=0;j<n;j++){
+            uint32_t eid,nr;
+            if(cluster_u32(w->fd,&eid,0)||cluster_u32(w->fd,&nr,0) ||
+               eid!=(uint32_t)items[j].eid || nr!=(uint32_t)items[j].nr) goto fail;
+            float *y=falloc((int64_t)nr*D);
+            if(cluster_io(w->fd,y,(size_t)nr*D*sizeof(float),0)){ free(y); goto fail; }
+            for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
+                float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
+            free(y);
+        }
+        for(int j=0;j<n;j++) cluster_item_free(&items[j]);
+        continue;
+fail:
+        for(int j=0;j<n;j++) cluster_item_free(&items[j]);
+        fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch\n",w->host,w->port,layer);
+        exit(1);
+    }
+}
+typedef struct { int eid,nr; float *inputs; } ClusterRequestItem;
+/* Mirror expert_load_impl's resolution so the worker can NAME the tensor it can't
+ * resolve instead of dying inside a fatal path (st_die_missing / st_read_* exit(1)).
+ * Returns 1 and fills `out` with the first missing expert tensor — quantized: a
+ * gate/up/down weight or its .qs sidecar; unquantized: the full weight — else 0. */
+static int worker_expert_missing_tensor(Model *m,int layer,int eid,char *out,size_t outsz){
+    static const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    char nm[288], qn[320];
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid);
+    snprintf(qn,sizeof(qn),"%s.qs",nm);
+    if(!st_has(&m->S,qn)){                       /* unquantized: full weights only */
+        for(int k=0;k<3;k++){
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+            if(!st_has(&m->S,nm)){ snprintf(out,outsz,"%s",nm); return 1; }
+        }
+        return 0;
+    }
+    for(int k=0;k<3;k++){                        /* quantized: weight + .qs sidecar */
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+        snprintf(qn,sizeof(qn),"%s.qs",nm);
+        if(!st_has(&m->S,nm)||!st_has(&m->S,qn)){ snprintf(out,outsz,"%s",nm); return 1; }
+    }
+    return 0;
+}
+static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
+    Model m; memset(&m,0,sizeof(m)); m.ebits=ebits; m.dbits=dbits; load_cfg(&m.c,snap);
+    { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: expert shards spread across N drives */
+      st_init_multi(&m.S,snap,(xd&&*xd)?xd:NULL); }
+    int nr_layers=m.c.n_layers+1; ESlot *cache=calloc((size_t)nr_layers,sizeof(ESlot));
+    for(int i=0;i<nr_layers;i++) cache[i].eid=-1;
+    int fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0){perror("cluster worker socket");return 1;}
+    int yes=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+    struct sockaddr_in addr={0}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons((uint16_t)port);
+    if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))||listen(fd,4)){perror("cluster worker bind/listen");return 1;}
+    fprintf(stderr,"[CLUSTER] expert worker listening on 0.0.0.0:%d (disk-backed, cache=%d/layer)\n",port,nr_layers);
+    for(;;){
+        int cfd=accept(fd,NULL,NULL); if(cfd<0){if(errno==EINTR)continue;break;}
+        for(;;){
+            char magic[8]; uint32_t v,layer,D,I,n;
+            if(cluster_io(cfd,magic,8,0)) break;
+            if(memcmp(magic,COLI_CLUSTER_MAGIC,8)||cluster_u32(cfd,&v,0)||v!=COLI_CLUSTER_VERSION||
+               cluster_u32(cfd,&layer,0)||cluster_u32(cfd,&D,0)||cluster_u32(cfd,&I,0)||cluster_u32(cfd,&n,0)||
+               D!=(uint32_t)m.c.hidden||I!=(uint32_t)m.c.moe_inter||layer>=(uint32_t)nr_layers||n<1||n>64){
+                close(cfd); cfd=-1; break;
+            }
+            ClusterRequestItem *items=calloc(n,sizeof(*items)); int bad=0;
+            for(uint32_t j=0;j<n;j++){
+                uint32_t eid,nr;
+                if(cluster_u32(cfd,&eid,0)||cluster_u32(cfd,&nr,0)||eid>=(uint32_t)m.c.n_experts||nr<1||nr>65536){bad=1;break;}
+                items[j].eid=(int)eid; items[j].nr=(int)nr; items[j].inputs=falloc((int64_t)nr*D);
+                if(cluster_io(cfd,items[j].inputs,(size_t)nr*D*sizeof(float),0)){bad=1;break;}
+            }
+            if(bad){ for(uint32_t j=0;j<n;j++)free(items[j].inputs); free(items); close(cfd); cfd=-1; break; }
+            v=COLI_CLUSTER_VERSION; if(cluster_io(cfd,(void*)COLI_CLUSTER_MAGIC,8,1)||cluster_u32(cfd,&v,1)) break;
+            v=0; if(cluster_u32(cfd,&v,1)) break; v=n; if(cluster_u32(cfd,&v,1)) break;
+            ESlot *slot=&cache[layer];
+            for(uint32_t j=0;j<n;j++){
+                if(slot->eid!=items[j].eid || !slot->slab){
+                    char miss[288];
+                    if(worker_expert_missing_tensor(&m,(int)layer,items[j].eid,miss,sizeof(miss))){
+                        fprintf(stderr,"[CLUSTER] worker cannot resolve expert tensor %s (layer %d, expert %d)\n",
+                                miss,(int)layer,items[j].eid);
+                        bad=1; break;
+                    }
+                    if(expert_load(&m,(int)layer,items[j].eid,slot,0,0)){bad=1;break;}
+                }
+                int rows=items[j].nr; float *g=falloc((int64_t)rows*I),*u=falloc((int64_t)rows*I),*y=falloc((int64_t)rows*D);
+                /* fmt=6: the gate/up input is per-item here (never reused after this
+                 * expert), so rotate it in place — the same Q^T x that moe() applies
+                 * once per layer via E8_XE. The down-input rotation lives in expert_ffn. */
+                if(slot->g.fmt==6) e8_rot_rows(items[j].inputs,rows,D);
+                expert_ffn(y,g,u,items[j].inputs,&slot->g,&slot->u,&slot->d,rows,I);
+                v=(uint32_t)items[j].eid; if(cluster_u32(cfd,&v,1)){bad=1;free(g);free(u);free(y);break;}
+                v=(uint32_t)rows; if(cluster_u32(cfd,&v,1)||cluster_io(cfd,y,(size_t)rows*D*sizeof(float),1)){bad=1;free(g);free(u);free(y);break;}
+                free(g);free(u);free(y);
+            }
+            for(uint32_t j=0;j<n;j++)free(items[j].inputs); free(items);
+            if(bad) break;
+        }
+        if(cfd>=0)close(cfd);
+    }
+    close(fd); return 0;
+}
+#endif
 
 #ifdef __linux__
 /* io_uring expert batches.  One owner prepares all reads for a block, submits
@@ -4980,6 +5239,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
+    /* quantizzazione sollevata (g_pq): materializzata al PRIMO expert che prenderebbe
+     * l'IDOT — mai per fmt 0/3/4/5/6/8, mai sui percorsi GPU, costo zero se inutile.
+     * EN: hoisted activation quantization, materialized on the FIRST IDOT-eligible
+     * expert; zero cost when no expert would take the IDOT branch. */
+    int8_t *xq_all=NULL, *xqg=NULL; float *sx_all=NULL, *sxg=NULL; int pq_ready=0;
+    g_pq.x=NULL;      /* mai fidarsi di un contesto di un moe() precedente / never trust a stale context */
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
                        * experts of the layer share it (the placement rule in quant.h) */
     /* Materialise xe on first use. Every site that feeds a routed expert's gate/up
@@ -5012,6 +5277,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
+#if !defined(_WIN32)
+        if(g_cluster_n){
+            cluster_moe_batch(m,layer,x,S,out,idxs,ws,keff,K,uniq,base,nb);
+            continue;
+        }
+#endif
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
 #ifdef COLI_VULKAN
         int vk_hit[64]={0};
@@ -5504,6 +5775,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
+            /* quantizzazione sollevata: raccogli le righe int8 accanto al gather f32 e
+             * pubblica il contesto per il ramo IDOT di matmul_qt_ex. Solo quando l'input
+             * e' x originale (mai la copia ruotata fmt=6) e gate/up lo consumerebbero.
+             * EN: hoisted quantization — gather the int8 rows next to the f32 gather and
+             * publish the context for matmul_qt_ex's IDOT branch. Only when the input is
+             * the original x (never the fmt=6 rotated copy) and gate/up would take it. */
+            g_pq.x=NULL;
+            if(xsrc==x && pq_want(&e->g,&e->u,nr)){
+                if(!pq_ready){
+                    if(!xq_all){
+                        xq_all=xalloc((size_t)S*D,"moe xq"); sx_all=xalloc((size_t)S*sizeof(float),"moe sx");
+                        xqg   =xalloc((size_t)S*D,"moe xqg"); sxg  =xalloc((size_t)S*sizeof(float),"moe sxg");
+                    }
+                    pq_build(x,S,D,xq_all,sx_all); pq_ready=1;
+                }
+                for(int r=0;r<nr;r++){ memcpy(xqg+(int64_t)r*D, xq_all+(int64_t)rows[r]*D,(size_t)D); sxg[r]=sx_all[rows[r]]; }
+                g_pq.x=xg; g_pq.S=nr; g_pq.I=D; g_pq.xq=xqg; g_pq.sx=sxg;
+            }
             expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -5738,6 +6027,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
+    g_pq.x=NULL;   /* xg sta per essere liberato: nessun contesto deve sopravvivergli
+                    * EN: xg is about to be freed — no context may outlive it */
+    free(xq_all); free(sx_all); free(xqg); free(sxg);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
     #undef E8_XE
 #ifdef COLI_CUDA
@@ -10254,6 +10546,17 @@ int main(int argc, char **argv){
     int cap_env = getenv("CAP")?atoi(getenv("CAP")):0;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
+#if !defined(_WIN32)
+    if(getenv("EXPERT_WORKER")){
+        int port=getenv("CLUSTER_WORKER_PORT")?atoi(getenv("CLUSTER_WORKER_PORT")):9100;
+        if(port<1||port>65535){fprintf(stderr,"CLUSTER_WORKER_PORT must be 1..65535\n");return 2;}
+        return cluster_worker_run(snap,port,ebits,dbits);
+    }
+#else
+    if(getenv("EXPERT_WORKER")){
+        fprintf(stderr,"[CLUSTER] expert workers are not supported on Windows yet\n"); return 2;
+    }
+#endif
     int kv_limit=(getenv("SERVE_BATCH")&&atoi(getenv("SERVE_BATCH")))?512:16;
     if(getenv("SERVE") && (kv_slot_count()<1 || kv_slot_count()>kv_limit)){
         fprintf(stderr,"KV_SLOTS must be between 1 and %d\n",kv_limit); return 2;
@@ -10404,6 +10707,12 @@ int main(int argc, char **argv){
         fprintf(stderr,"METAL: fast SSD (%.1f GB/s) — page cache favored, expert cache minimal (cap 1); override with --cap\n", coli_ssd_gbs);
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
+#if !defined(_WIN32)
+    if(getenv("CLUSTER_WORKERS") && *getenv("CLUSTER_WORKERS")){
+        cluster_init();
+        atexit(cluster_close_all);
+    }
+#endif
     Model m; double t0=now_s(); model_init(&m,snap,weights_dir,cap,ebits,dbits);
     rammap_build(&m);                              /* immutable direct tier precedes PIN/LRU */
     if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */

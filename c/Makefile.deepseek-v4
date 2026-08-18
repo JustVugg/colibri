@@ -162,19 +162,36 @@ include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS)
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
+REGISTRY_OBJ = expert_store_registry.o
 
-.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
+.PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
+	deepseek-v4-test-registry print-v4-objs
 deepseek-v4: $(V4_BINARY)
+
+# Build just the amalgamation unit + registry objects (no link). External
+# trees (e.g. a downstream integration) reuse these .o's to link an
+# alternative-backend deepseek_v4 binary without recompiling the units themselves.
+deepseek-v4-objs: $(V4_OBJS)
+
+# Echo the object list (target units + registry) for external linkers that need
+# to link exactly what the plain deepseek_v4 binary links, no more.
+print-v4-objs:
+	@echo $(V4_OBJS)
 
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+# Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
+# Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
+$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h
+	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h
+	native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
@@ -189,5 +206,12 @@ backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
+# Registry unit test (no engine link — stubs the auto open fn).
+deepseek-v4-test-registry: test_expert_store_registry
+	./test_expert_store_registry
+test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c \
+	expert_store_registry.h expert_store.h
+	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
+
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) test_expert_store_registry

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include "tensor.h"
 #include "expert_store.h"
+#include "expert_store_registry.h"
 #include "native_quant.h"
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
@@ -585,7 +586,7 @@ int coli_v4_shared_expert_forward_ref(float *output,
 extern "C" {
 #endif
 
-typedef struct {
+typedef struct ColiDeepSeekV4ExpertStoreOptions {
     const char *model_dir;
     int layers;
     int experts_per_layer;
@@ -924,9 +925,13 @@ struct ColiV4Session {
     int spec_disabled;
 };
 
-/* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
+/* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap).
+ * `config` is the model geometry (== engine->config on the engine_open path);
+ * it is forwarded by the backend registry so engine-less callers (the standalone
+ * CLI) can use routed backends that only need geometry, not the engine. */
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
+    const ColiDeepSeekV4Config *config,
     const ColiDeepSeekV4ExpertStoreOptions *options,
     ColiExpertStore **store,
     char *error,

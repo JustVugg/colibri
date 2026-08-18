@@ -3,8 +3,12 @@ glm_tiny/
 olmoe_hf/
 olmoe_i4/
 .build-config
+# DeepSeek-V4 amalgamation build artifacts (make -f Makefile.deepseek-v4)
 build/
 COLI_V4_UNIT_*.o
+expert_store_registry.o
+deepseek_v4
+test_expert_store_registry
 tests/test_st_mirror
 tests/test_st_pread
 tools/libiq3.so

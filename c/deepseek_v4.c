@@ -1354,8 +1354,10 @@ static int v5_dense_inventory(const char *model_dir,
 
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
+    const ColiDeepSeekV4Config *config,
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
+    (void)config; /* auto uses engine->runtime + engine->config; requires engine */
     if (!options || !engine) return -1;
     ColiDeepSeekV4ResourcePlan plan;
     ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
@@ -4249,6 +4251,13 @@ static int normalized_hc_pre(float *reduced, float *post, float *comb,
     return result;
 }
 
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
+#endif
+
 static int moe_token(float *output,
                      const ColiDeepSeekV4LayerWeights *weights,
                      const ColiDeepSeekV4Config *config,
@@ -4256,18 +4265,24 @@ static int moe_token(float *output,
     int d = config->hidden_size;
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    float *gate = NULL;
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+    int missing_gate = !raw_gate;
+#else
     size_t gate_count = (size_t)n * d;
     float *gate = malloc(gate_count * sizeof(*gate));
+    int missing_gate = !gate;
+#endif
     float *route_weights = malloc((size_t)topk * sizeof(*route_weights));
     int *indices = malloc((size_t)topk * sizeof(*indices));
     float *expert_output = malloc((size_t)d * sizeof(*expert_output));
     float *shared_output = malloc((size_t)d * sizeof(*shared_output));
-    if (!gate || !route_weights || !indices || !expert_output || !shared_output) {
+    if (missing_gate || !route_weights || !indices || !expert_output || !shared_output) {
         free(shared_output); free(expert_output); free(indices);
         free(route_weights); free(gate);
         return -1;
     }
-    decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
     int result = token < 0 || token >= config->vocab_size;
@@ -4278,10 +4293,20 @@ static int moe_token(float *output,
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
     }
-    if (!result) result = coli_v4_route(
-        route_weights, indices, input, gate, bias,
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    if (!result) result = coli_v4_route_bf16(
+        route_weights, indices, input, raw_gate, bias,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
+#else
+    if (!result) {
+        decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
+        result = coli_v4_route(
+            route_weights, indices, input, gate, bias,
+            weights->plan.uses_hash_router ? indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+    }
+#endif
 
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
@@ -8321,6 +8346,7 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #ifdef COLI_V4_UNIT_RUNTIME
 /* ######## deepseek_v4_runtime.c / engine ######## */
 #include "deepseek_v4_internal.h"
+#include "expert_store_registry.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -8667,8 +8693,8 @@ int coli_v4_engine_open(ColiV4Engine **output,
         return 0;
     }
 #endif
-    if (coli_v4_expert_store_open_planned(
-            engine,
+    if (coli_expert_store_backend_open_selected(
+            engine, &engine->config,
             &(ColiDeepSeekV4ExpertStoreOptions){
                 engine->runtime.target_model_dir,
                 engine->config.num_hidden_layers,
@@ -10653,12 +10679,28 @@ int main(int argc, char **argv) {
     ColiSafetensorsIndex *index = NULL;
     ColiExpertStore *experts = NULL;
     if (coli_v4_config_load(&config, argv[1], error, sizeof(error)) ||
-        coli_st_index_open(&index, argv[1], error, sizeof(error)) ||
-        coli_deepseek_v4_expert_store_open(
-            &(ColiDeepSeekV4ExpertStoreOptions){
-                argv[1], config.num_hidden_layers, config.n_routed_experts,
-                UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
-            }, &experts, error, sizeof(error))) {
+        coli_st_index_open(&index, argv[1], error, sizeof(error))) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    ColiDeepSeekV4ExpertStoreOptions store_opts = {
+        argv[1], config.num_hidden_layers, config.n_routed_experts,
+        UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
+    };
+    /* Route through the pluggable backend registry when COLI_EXPERT_STORE names
+     * a non-"auto" backend (e.g. a networked/remote store). The
+     * CLI has no ColiV4Engine, so pass NULL engine + the loaded config; the
+     * backend derives expert geometry from the config. Unset/"auto" keeps the
+     * historical direct on-disk open. */
+    const char *coli_be = getenv("COLI_EXPERT_STORE");
+    if (coli_be && *coli_be && strcmp(coli_be, "auto") != 0) {
+        if (coli_expert_store_backend_open_selected(
+                NULL, &config, &store_opts, &experts, error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
+    } else if (coli_deepseek_v4_expert_store_open(
+                   &store_opts, &experts, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
     }

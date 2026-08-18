@@ -72,6 +72,9 @@ class FamilyDescriptor:
     config_section: str
     limits: FamilyLimits
     capabilities: FamilyCapabilities
+    has_gateway_adapter: bool = False
+    has_cli_adapter: bool = False
+    tune_prompt_template: str = "{prompt}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,43 +166,127 @@ COMMON_CAP = FamilyCapabilities(False, False, False, True)
 
 FAMILIES = (
     FamilyDescriptor(
-        "glm", ("glm_moe_dsa", "glm5_moe", "glm"), "GLM-5.2", "744B",
-        "colibri", ("glm",), "colibri-core", "glm", "colibri",
-        ("colibri", "glm"), "glm-5.2-colibri", "glm", "glm", "glm_mla",
-        _glm_geometry, "", _individual_expert_inventory(_GLM_EXPERT), "root",
-        FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
-        FamilyCapabilities(True, True, False, True)),
+        id="glm",
+        model_types=("glm_moe_dsa", "glm5_moe", "glm"),
+        display_name="GLM-5.2",
+        display_scale="744B",
+        engine_artifact="colibri",
+        engine_aliases=("glm",),
+        engine_group="colibri-core",
+        internal_arch="glm",
+        build_target="colibri",
+        process_names=("colibri", "glm"),
+        default_model_id="glm-5.2-colibri",
+        cli_adapter="glm",
+        gateway_adapter="glm",
+        planner_id="glm_mla",
+        planner_geometry=_glm_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        config_section="root",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
+        capabilities=FamilyCapabilities(True, True, False, True),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>",
+    ),
     FamilyDescriptor(
-        "inkling", ("inkling_mm_model", "inkling"), "Inkling", "975B",
-        "inkling", (), "inkling", "inkling", "inkling", ("inkling",),
-        "inkling-colibri", "inkling", "inkling", "inkling_hybrid", None,
-        "Inkling planning awaits a measured hybrid GQA/sconv runtime adapter",
-        _inkling_expert_inventory, "text_config",
-        FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "CTX_MAX"),
-        FamilyCapabilities(False, False, True, True)),
+        id="inkling",
+        model_types=("inkling_mm_model", "inkling"),
+        display_name="Inkling",
+        display_scale="975B",
+        engine_artifact="inkling",
+        engine_aliases=(),
+        engine_group="inkling",
+        internal_arch="inkling",
+        build_target="inkling",
+        process_names=("inkling",),
+        default_model_id="inkling-colibri",
+        cli_adapter="inkling",
+        gateway_adapter="inkling",
+        planner_id="inkling_hybrid",
+        planner_geometry=None,
+        planner_unsupported_reason="Inkling planning awaits a measured hybrid GQA/sconv runtime adapter",
+        expert_inventory=_inkling_expert_inventory,
+        config_section="text_config",
+        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "CTX_MAX"),
+        capabilities=FamilyCapabilities(False, False, True, True),
+        has_gateway_adapter=True,
+        tune_prompt_template="<|user|>{prompt}<|assistant|>",
+    ),
     FamilyDescriptor(
-        "kimi", ("kimi_k3",), "Kimi K3", "2.8T", "kimi_k3", (), "kimi_k3",
-        "kimi_k3", "kimi_k3", ("kimi_k3",), "kimi-k3-colibri", "kimi", "kimi",
-        "kimi_hybrid", None,
-        "Kimi planning awaits measured KDA recurrent-state and native MXFP4 reserves",
-        _individual_expert_inventory(_KIMI_EXPERT), "text_config",
-        FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "K3_MAXT"), COMMON_CAP),
+        id="kimi",
+        model_types=("kimi_k3",),
+        display_name="Kimi K3",
+        display_scale="2.8T",
+        engine_artifact="kimi_k3",
+        engine_aliases=(),
+        engine_group="kimi_k3",
+        internal_arch="kimi_k3",
+        build_target="kimi_k3",
+        process_names=("kimi_k3",),
+        default_model_id="kimi-k3-colibri",
+        cli_adapter="kimi",
+        gateway_adapter="kimi",
+        planner_id="kimi_hybrid",
+        planner_geometry=None,
+        planner_unsupported_reason="Kimi planning awaits measured KDA recurrent-state and native MXFP4 reserves",
+        expert_inventory=_individual_expert_inventory(_KIMI_EXPERT),
+        config_section="text_config",
+        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "K3_MAXT"),
+        capabilities=COMMON_CAP,
+        has_gateway_adapter=True,
+        tune_prompt_template="K3CHAT1\nM user {prompt_len}\n{prompt}G 0\n\n",
+    ),
     FamilyDescriptor(
-        "olmoe", ("olmoe",), "OLMoE", "7B", "olmoe", (), "olmoe", "olmoe",
-        "olmoe", ("olmoe",), "olmoe-colibri", "olmoe", "olmoe", "olmoe_gqa",
-        None, "OLMoE planning awaits a measured runtime/workspace reserve",
-        _individual_expert_inventory(_GLM_EXPERT), "root",
-        FamilyLimits(4096, 4096, 1024, 1024, 1, 8, "CTX"),
-        FamilyCapabilities(False, False, False, False)),
+        id="olmoe",
+        model_types=("olmoe",),
+        display_name="OLMoE",
+        display_scale="7B",
+        engine_artifact="olmoe",
+        engine_aliases=(),
+        engine_group="olmoe",
+        internal_arch="olmoe",
+        build_target="olmoe",
+        process_names=("olmoe",),
+        default_model_id="olmoe-colibri",
+        cli_adapter="olmoe",
+        gateway_adapter="olmoe",
+        planner_id="olmoe_gqa",
+        planner_geometry=None,
+        planner_unsupported_reason="OLMoE planning awaits a measured runtime/workspace reserve",
+        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        config_section="root",
+        limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 8, "CTX"),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        tune_prompt_template="<|user|>\n{prompt}\n<|assistant|>\n",
+    ),
     FamilyDescriptor(
-        "deepseek_v4", ("deepseek_v4",), "DeepSeek V4 Flash", "284B",
-        "deepseek_v4", (), "deepseek_v4", "deepseek_v4", "deepseek-v4",
-        ("deepseek_v4",), "deepseek-v4-colibri", "deepseek_v4", "deepseek_v4",
-        "deepseek_v4", None,
-        "DeepSeek V4 uses its C resident-tier planner; Python parity is not yet proven",
-        _individual_expert_inventory(_V4_EXPERT), "root",
-        FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
-        FamilyCapabilities(True, False, False, True)),
+        id="deepseek_v4",
+        model_types=("deepseek_v4",),
+        display_name="DeepSeek V4 Flash",
+        display_scale="284B",
+        engine_artifact="deepseek_v4",
+        engine_aliases=(),
+        engine_group="deepseek_v4",
+        internal_arch="deepseek_v4",
+        build_target="deepseek-v4",
+        process_names=("deepseek_v4",),
+        default_model_id="deepseek-v4-colibri",
+        cli_adapter="deepseek_v4",
+        gateway_adapter="deepseek_v4",
+        planner_id="deepseek_v4",
+        planner_geometry=None,
+        planner_unsupported_reason="DeepSeek V4 uses its C resident-tier planner; Python parity is not yet proven",
+        expert_inventory=_individual_expert_inventory(_V4_EXPERT),
+        config_section="root",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+    ),
 )
 
 
@@ -212,9 +299,17 @@ def _build_registry(families):
             raise RegistryError(f"invalid or duplicate family id: {family.id!r}")
         if (not family.model_types or
                 (not callable(family.planner_geometry) and
-                 not family.planner_unsupported_reason) or
-                not callable(family.expert_inventory)):
+                  not family.planner_unsupported_reason) or
+                not callable(family.expert_inventory) or
+                not isinstance(family.has_gateway_adapter, bool) or
+                not isinstance(family.has_cli_adapter, bool) or
+                not isinstance(family.tune_prompt_template, str) or
+                "{prompt}" not in family.tune_prompt_template):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
+        try:
+            family.tune_prompt_template.format(prompt="test", prompt_len=4)
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+            raise RegistryError(f"invalid tune prompt template: {family.id}") from error
         identity = (family.engine_artifact, family.internal_arch)
         if identity in identities:
             raise RegistryError(f"duplicate engine identity: {identity}")
@@ -264,6 +359,12 @@ def family_for_config(config):
         return _BY_TYPE[model_type]
     except KeyError as error:
         raise UnknownFamilyError(f"unsupported model_type: {model_type}") from error
+
+
+def tuning_replay_prompt(family, prompt):
+    if not isinstance(prompt, str):
+        raise ValueError("tuning prompt must be a string")
+    return family.tune_prompt_template.format(prompt=prompt, prompt_len=len(prompt))
 
 
 def resolve_model(model_dir):

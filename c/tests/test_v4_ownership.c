@@ -12,11 +12,13 @@
 /* Stubs for symbols referenced by RUNTIME but unused in these tests. */
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
+    const ColiDeepSeekV4Config *config,
     const ColiDeepSeekV4ExpertStoreOptions *options,
     ColiExpertStore **store,
     char *error,
     size_t error_size) {
     (void)engine;
+    (void)config;
     (void)options;
     (void)store;
     if (error && error_size)
