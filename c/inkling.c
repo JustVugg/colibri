@@ -321,7 +321,11 @@ static inline __m256i i8dot_block(__m256i acc, __m256i a, __m256i b) {
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    /* Opt-in (IDOT=1), not default: the fast path only exists under __AVX2__
+     * and quantizes ACTIVATIONS per 32-block — the same model produced
+     * different tokens on x86 vs ARM with the old on-by-default. Same class
+     * and same fix as olmoe (#1044) and qwen36 (#712 review). */
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 32 == 0 && I <= 8192) {
         int nb = I / 32;
         int8_t xi[8192]; float xs[256];
@@ -366,7 +370,11 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 static void matmul_q4(float *y, const float *x, const uint8_t *p, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    /* Opt-in (IDOT=1), not default: the fast path only exists under __AVX2__
+     * and quantizes ACTIVATIONS per 32-block — the same model produced
+     * different tokens on x86 vs ARM with the old on-by-default. Same class
+     * and same fix as olmoe (#1044) and qwen36 (#712 review). */
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 32 == 0 && I <= 8192) {
         int nb = I / 32;
         int8_t xi[8192]; float xs[256];

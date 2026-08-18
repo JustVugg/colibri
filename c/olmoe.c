@@ -106,6 +106,10 @@ static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
+static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up pair matmul
+                                     * (fused_simd.h: quant_x_q8_avx2, matmul_q_idot_v3,
+                                     * matmul_q_idot_pair_v3). Exact integer arithmetic only —
+                                     * bit-identical to the stock matmul_q path; OFF by default. */
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
@@ -220,6 +224,10 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
 #ifdef OLMOE_TESTING
 int matmul_q_idot_force = -1;
 static inline void matmul_q_reset_for_test(void) { matmul_q_idot_force = -1; }
+#endif
+
+#if defined(__AVX2__)
+#include "fused_simd.h"   /* FUSED3=1: quant_x_q8_avx2 + matmul_q_idot{,_pair}_v3 (bit-exact) */
 #endif
 
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
@@ -723,10 +731,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
+#if defined(__AVX2__)
+            /* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
+             * dims %16==0, <=4096) — outside it the stock calls below run
+             * unchanged. Exact integer arithmetic only: bit-identical output
+             * (verified by memcmp in tests/bench_fused3.c). OFF by default. */
+            static int idot_moe = -1;
+            if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
+            if (g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096) {
+                matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
+                for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
+            } else
+#endif
+            {
             matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
             matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
             for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
             matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+            }
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -1337,6 +1360,7 @@ int main(int argc, char **argv) {
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
+    g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
@@ -1405,8 +1429,8 @@ int main(int argc, char **argv) {
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf);
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f fused3=%d ==\n",
+           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf, g_fused3);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);

@@ -176,13 +176,20 @@ class GenerationScheduler:
             self.active += 1
             self.admitted += 1
             wait_seconds = time.monotonic() - queued_at
+        cancelled_after_admission = False
         try:
             yield wait_seconds, available
+        except ClientCancelled:
+            cancelled_after_admission = True
+            raise
         finally:
             with self.condition:
                 self.active -= 1
                 self.free_slots.add(available)
-                self.completed += 1
+                if cancelled_after_admission:
+                    self.cancelled += 1
+                else:
+                    self.completed += 1
                 self.condition.notify_all()
 
     def snapshot(self):

@@ -62,6 +62,19 @@ int main(void){
     CHECK(m.max_t==10&&m.kvp.cap==10&&m.kvp.len==0,
           "fresh state max_t=%d cap=%d len=%d",m.max_t,m.kvp.cap,m.kvp.len);
 
+    kv_prefix_record(&m.kvp,divergent,0,4);
+    m.kstate[0][0]=7.f; m.cwq[0][0]=8.f; m.cwk[0][0]=9.f; m.cwv[0][0]=10.f;
+    k3_cancel_unpublished_state(&m);
+    CHECK(!m.Lc&&!m.Rc&&m.max_t==0&&m.kvp.len==0,
+          "cancelled prefill retained unpublished KV/prefix state");
+    CHECK(m.kstate[0][0]==0.f&&m.cwq[0][0]==0.f&&
+          m.cwk[0][0]==0.f&&m.cwv[0][0]==0.f,
+          "cancelled prefill retained unpublished recurrent state");
+
+    reuse=prepare_request_state(&m,first,3,8);
+    CHECK(reuse==0&&m.Lc&&m.Rc&&m.Lc[1]&&m.Rc[1],
+          "request after cancellation did not cold-rebuild cleanly");
+
     free_model(&m);
     if(failures){ fprintf(stderr,"kimi request state: %d failure(s)\n",failures); return 1; }
     puts("kimi request state: ok");

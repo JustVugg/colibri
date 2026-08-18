@@ -1120,9 +1120,15 @@ static int cuda_expert_apply(Model *m, const uint8_t *w1p, const uint8_t *w1s,
 #endif
 
 /* u += wk * E(z) for one loaded expert slot (SiTU-GLU in the latent).
- * gate/up are [moe_inter] scratch, hz is [latent] scratch. */
+ * gate/up are [moe_inter] scratch, hz is [latent] scratch.
+ * zq/zsc: riga di z già quantizzata a livello layer da mxfp4_qx (NULL = come
+ * prima, quantizza in-chiamata). Gate e up la condividono; il down riquantizza
+ * comunque il proprio input per-expert (gate), oggi però in scratch, non malloc.
+ * EN: zq/zsc = layer-hoisted pre-quantized z row (NULL = quantize in-call as
+ * before). Gate and up share it; down still quantizes its per-expert input. */
 static void expert_apply(Model *m, Slot *s, const float *z, float wk,
-                         float *u, float *gate, float *up, float *hz){
+                         float *u, float *gate, float *up, float *hz,
+                         const int8_t *zq, const float *zsc){
     Cfg *c=&m->c;
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
@@ -1133,8 +1139,13 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
 #endif
     void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)
         = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4;
-    mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
-    mm(up,z,w3p,w3s,1,c->latent,c->moe_inter);
+    if(g_k3_idot && zq){
+        matmul_mxfp4_i8_pre(gate,zq,zsc,w1p,w1s,1,c->latent,c->moe_inter);
+        matmul_mxfp4_i8_pre(up, zq,zsc,w3p,w3s,1,c->latent,c->moe_inter);
+    } else {
+        mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
+        mm(up,z,w3p,w3s,1,c->latent,c->moe_inter);
+    }
     for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
     mm(hz,gate,w2p,w2s,1,c->moe_inter,c->latent);
     for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
@@ -1257,6 +1268,28 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                                 const int *poslist, const float *wlist,
                                 const float *Z, int stride, float *U,
                                 float *gate, float *up, float *hz){
+    /* Quantizzazione sollevata a livello layer (specchia colibri.c #1071):
+     * ogni riga di Z veniva riquantizzata 2x per OGNI expert che la consuma
+     * (gate+up dentro matmul_mxfp4_i8, con un malloc/free a chiamata) — con
+     * topk=8 sono 16 quantizzazioni della stessa riga per layer. Una sola
+     * passata mxfp4_qx qui produce le stesse righe int8 (ordine identico:
+     * bit-identico), e il fallimento di allocazione degrada al vecchio path.
+     * EN: layer-hoisted activation quantization, mirroring colibri.c (#1071).
+     * One mxfp4_qx pass replaces 2 requantizations per (expert, position);
+     * allocation failure degrades to the old in-call path. */
+    int8_t *zq_all=NULL; float *zsc_all=NULL; int zng=0;
+    if(g_k3_idot && stride%32==0 && nu>0){
+        int maxt=-1;
+        for(int j=0;j<nu;j++) for(int p2=0;p2<pcnt[j];p2++)
+            if(poslist[pfirst[j]+p2]>maxt) maxt=poslist[pfirst[j]+p2];
+        if(maxt>=0){
+            zng=stride/32;
+            zq_all=malloc((size_t)(maxt+1)*stride);
+            zsc_all=malloc((size_t)(maxt+1)*zng*sizeof(float));
+            if(zq_all&&zsc_all) mxfp4_qx(Z,maxt+1,stride,zq_all,zsc_all);
+            else { free(zq_all); free(zsc_all); zq_all=NULL; zsc_all=NULL; }
+        }
+    }
     for(int base=0;base<nu;base+=LP_MAX){
         int nb=nu-base<LP_MAX?nu-base:LP_MAX;
         Slot *use[LP_MAX]; int missk[LP_MAX]; int qof[LP_MAX]; int nmiss=0;
@@ -1303,7 +1336,9 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
             for(int p2=0;p2<pcnt[base+j];p2++){
                 int t=poslist[f+p2];
                 expert_apply(m,use[j],Z+(int64_t)t*stride,wlist[f+p2],
-                             U+(int64_t)t*stride,gate,up,hz);
+                             U+(int64_t)t*stride,gate,up,hz,
+                             zq_all?zq_all+(int64_t)t*stride:NULL,
+                             zq_all?zsc_all+(int64_t)t*zng:NULL);
             }
         }
         /* promotion: swap the freshly-read slots into the layer LRU */
@@ -1328,6 +1363,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
             dst->used=++m->clock;
         }
     }
+    free(zq_all); free(zsc_all);
 }
 
 /* ---- AUTOPIN: seed the layer caches from the accumulated history ----------
@@ -1547,8 +1583,12 @@ static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out)
  * Returns the LAST position's logits (falloc'd), or NULL pre-head. ---------- */
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
 static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
-static float *step_chunk(Model *m, const int *ids, int pos0, int C){
+typedef int (*K3CancelPoll)(void *context);
+static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
+                            K3CancelPoll poll_cancel, void *cancel_context,
+                            int *cancelled){
     Cfg *c=&m->c; int D=c->hidden;
+    if(cancelled) *cancelled=0;
 #ifdef COLI_VULKAN
     g_vk_up_left=g_vk_upcap;              /* routed-tier upload budget per step */
 #endif
@@ -1599,9 +1639,16 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
             memcpy(hidden+(int64_t)t*D,p,D*sizeof(float));
             if(m->trace) fwrite(hidden+(int64_t)t*D,sizeof(float),D,m->trace);
         }
+        /* Prefill does not emit tokens, and a full chunk can take minutes on
+         * CPU. Poll after each layer so the gateway can cancel before the
+         * first token instead of waiting for the entire prompt. */
+        if(poll_cancel&&poll_cancel(cancel_context)){
+            if(cancelled) *cancelled=1;
+            break;
+        }
     }
     float *logits=NULL;
-    if(m->has_head){
+    if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
         for(int t=0;t<C;t++){
             /* head only where needed: the chunk's last token (feeds sampling)
@@ -1618,9 +1665,13 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         m->t_head+=now_s()-t0;
     }
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
-    kv_prefix_record(&m->kvp, ids, pos0, C);
+    if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
+}
+
+static float *step_chunk(Model *m, const int *ids, int pos0, int C){
+    return step_chunk_ex(m,ids,pos0,C,NULL,NULL,NULL);
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -1880,6 +1931,28 @@ static int serve_read_req(ServeReq *q, const char *active){
     return 2;
 }
 
+/* Drain only commands that can arrive while one request owns the engine. A
+ * second SUBMIT is refused without stealing the active request's state. */
+static int k3_serve_poll_cancel(void *context){
+    const char *active=context;
+    int cancelled=0;
+    while(serve_stdin_readable()){
+        ServeReq queued={0}; int r=serve_read_req(&queued,active);
+        if(r<0||r==1) cancelled=1;
+        if(r==2){
+            printf("ERROR %s engine busy\n",queued.id); fflush(stdout);
+            free(queued.payload);
+        }
+    }
+    return cancelled;
+}
+
+/* A cancelled prefill changed recurrent/KV state without publishing a model
+ * token. Drop that partial state so a later request cannot reuse it. */
+static void k3_cancel_unpublished_state(Model *m){
+    model_state_reset(m);
+}
+
 static void serve_data(const char *id, const char *p, int n){
     if(n<=0) return;
     printf("DATA %s %d\n",id,n);
@@ -1948,9 +2021,16 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     float *lo=NULL;
     /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
      * position-indexed, so the loop starts at `reuse`, not at 0. */
+    int prefill_cancelled=0;
     for(int i=reuse;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
-        free(lo); lo=step_chunk(m,ids+i,i,C);
+        free(lo); lo=step_chunk_ex(m,ids+i,i,C,k3_serve_poll_cancel,q->id,
+                                   &prefill_cancelled);
+        if(prefill_cancelled) break;
+    }
+    if(prefill_cancelled){
+        free(lo); k3_cancel_unpublished_state(m); free(ids);
+        printf("ERROR %s CANCELLED\n",q->id); fflush(stdout); return;
     }
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
     char buf[512], xtag[64];

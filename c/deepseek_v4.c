@@ -4,6 +4,14 @@
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
+/* n_routed_experts has no config.json upper bound (only >=1 is checked), so a
+ * fixed-size stack buffer can't be the only path -- an unusually large/hostile
+ * config must still work via heap, just slower. COLI_V4_ROUTE_STACK_EXPERTS
+ * covers every routed-MoE config seen in practice (typical: 64-256) so the
+ * per-token/per-layer routing call in the hot decode path allocates nothing;
+ * anything larger falls back to malloc exactly like before this change. */
+#define COLI_V4_ROUTE_STACK_EXPERTS 512
+
 #ifdef COLI_V4_UNIT_ST
 /* Shared st.h adapter and V4 tensor materialization helpers. */
 #include "deepseek_v4_internal.h"
@@ -37,7 +45,8 @@ int coli_st_index_open(ColiSafetensorsIndex **out, const char *directory,
     ColiSafetensorsIndex *index = calloc(1, sizeof(*index));
     if (!index)
         return set_error(error, error_size, "out of memory opening: %s", directory);
-    st_init(index, directory);
+    const char *extra_dirs = getenv("COLI_MODEL_DIRS"); /* SPLIT: shards spread across N drives */
+    st_init_multi(index, directory, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
     if (!index->nfd || !index->n) {
         coli_st_index_close(index);
         return set_error(error, error_size, "no safetensors tensors in: %s", directory);
@@ -1714,13 +1723,16 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts)
         return -1;
-    float *scores = malloc((size_t)experts * sizeof(*scores));
-    float *selection = malloc((size_t)experts * sizeof(*selection));
-    unsigned char *selected = calloc((size_t)experts, 1);
+    float scores_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    float selection_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    unsigned char selected_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    int on_stack = experts <= COLI_V4_ROUTE_STACK_EXPERTS;
+    float *scores = on_stack ? scores_buf : malloc((size_t)experts * sizeof(*scores));
+    float *selection = on_stack ? selection_buf : malloc((size_t)experts * sizeof(*selection));
+    unsigned char *selected = on_stack ? selected_buf : calloc((size_t)experts, 1);
+    if (on_stack) memset(selected, 0, (size_t)experts);
     if (!scores || !selection || !selected) {
-        free(scores);
-        free(selection);
-        free(selected);
+        if (!on_stack) { free(scores); free(selection); free(selected); }
         return -1;
     }
     for (int expert = 0; expert < experts; expert++) {
@@ -1733,9 +1745,7 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
     if (forced_indices) {
         for (int rank = 0; rank < topk; rank++) {
             if (forced_indices[rank] < 0 || forced_indices[rank] >= experts) {
-                free(selected);
-                free(selection);
-                free(scores);
+                if (!on_stack) { free(selected); free(selection); free(scores); }
                 return -1;
             }
             indices[rank] = forced_indices[rank];
@@ -1756,16 +1766,12 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
     for (int rank = 0; rank < topk; rank++)
         total += scores[indices[rank]];
     if (!(total > 0.0f)) {
-        free(selected);
-        free(selection);
-        free(scores);
+        if (!on_stack) { free(selected); free(selection); free(scores); }
         return -1;
     }
     for (int rank = 0; rank < topk; rank++)
         weights[rank] = scores[indices[rank]] / total * route_scale;
-    free(selected);
-    free(selection);
-    free(scores);
+    if (!on_stack) { free(selected); free(selection); free(scores); }
     return 0;
 }
 
@@ -1999,7 +2005,16 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    int result = coli_fp8_matvec_ref(qa, &wq_a, input);
+    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
+     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
+     * compute, GPU path invariato (riceve l'input raw come prima).
+     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
+    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales ||
+                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2049,7 +2064,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2220,6 +2235,7 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -2451,7 +2467,16 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    int result = coli_fp8_matvec_ref(qa, &wq_a, input);
+    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
+     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
+     * compute, GPU path invariato (riceve l'input raw come prima).
+     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
+    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales ||
+                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2489,7 +2514,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2617,6 +2642,7 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -2738,7 +2764,20 @@ int coli_v4_attention_window_batch_ref(
 #define V4_ATTN_PROF_MARK(slot) do { if (prof_t) { \
         double _now = v4_attn_prof_now(); (slot) += _now - prof_t; \
         prof_t = _now; } } while (0)
-    int result = coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch);
+    /* wq_a e wkv consumano lo stesso batch di input: qdq UNA volta per item e
+     * riuso via _pre (dedup rinviato da #1076). Bit-identico; il path GPU
+     * riceve gli input raw come prima.
+     * EN: wq_a and wkv consume the same input batch — qdq once, reuse. */
+    float *inputs_act = malloc((size_t)batch * hidden * sizeof(*inputs_act));
+    uint8_t *inputs_act_scales = malloc((size_t)batch * (hidden / 128 + 1));
+    int result = (!inputs_act || !inputs_act_scales) ? -1 : 0;
+    for (int item = 0; !result && item < batch; item++)
+        if (coli_fp8_activation_qdq_ref(
+                inputs_act + (size_t)item * hidden,
+                inputs_act_scales + (size_t)item * (hidden / 128),
+                inputs + (size_t)item * hidden, (size_t)hidden, 128))
+            result = -1;
+    if (!result) result = coli_fp8_matmul_batch_pre(qa, &wq_a, inputs, inputs_act, batch);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!raw_q_norm || decode_bf16(norm, raw_q_norm, q_rank))) result = -1;
@@ -2879,7 +2918,7 @@ int coli_v4_attention_window_batch_ref(
         }
     V4_ATTN_PROF_MARK(prof_qb);
 
-    if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
+    if (!result) result = coli_fp8_matmul_batch_pre(kv, &wkv, inputs, inputs_act, batch);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
     const void *raw_kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!raw_kv_norm || decode_bf16(norm, raw_kv_norm, head_dim))) result = -1;
@@ -3148,6 +3187,7 @@ int coli_v4_attention_window_batch_ref(
                 prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3);
 #undef V4_ATTN_PROF_MARK
 
+    free(inputs_act_scales); free(inputs_act);
     return result ? set_error(error, error_size, "batched attention failed") : 0;
 }
 #endif /* COLI_V4_UNIT_ATTENTION_BATCH */
@@ -6534,7 +6574,16 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    int result = coli_fp8_matvec_ref(qa, &wq_a, input);
+    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
+     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
+     * compute, GPU path invariato (riceve l'input raw come prima).
+     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
+    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales ||
+                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -6572,7 +6621,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -6700,6 +6749,7 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -7547,15 +7597,17 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_payload_bytes, record->weight_bytes,
                            __ATOMIC_RELAXED);
-    } else {
-        if (direct_available)
-            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
-                               __ATOMIC_RELAXED);
-        if (coli_st_read_at_rep(state->index, record->shard, rep,
+        return coli_st_read_at_rep(state->index, record->shard, rep,
+                                   record->scale_offset,
+                                   (size_t)record->scale_bytes, slot->slab);
+    }
+    if (direct_available)
+        __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
+                           __ATOMIC_RELAXED);
+    if (coli_st_read_at_rep(state->index, record->shard, rep,
                             record->weight_offset,
                             (size_t)record->weight_bytes,
                             slot->slab + record->scale_bytes)) return -1;
-    }
     return coli_st_read_at_rep(state->index, record->shard, rep,
                                record->scale_offset,
                                (size_t)record->scale_bytes, slot->slab);
@@ -8298,11 +8350,17 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        int topk, float route_scale) {
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts) return -1;
-    float *scores = malloc((size_t)experts * sizeof(*scores));
-    float *selection = malloc((size_t)experts * sizeof(*selection));
-    unsigned char *selected = calloc((size_t)experts, 1);
+    float scores_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    float selection_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    unsigned char selected_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    int on_stack = experts <= COLI_V4_ROUTE_STACK_EXPERTS;
+    float *scores = on_stack ? scores_buf : malloc((size_t)experts * sizeof(*scores));
+    float *selection = on_stack ? selection_buf : malloc((size_t)experts * sizeof(*selection));
+    unsigned char *selected = on_stack ? selected_buf : calloc((size_t)experts, 1);
+    if (on_stack) memset(selected, 0, (size_t)experts);
     if (!scores || !selection || !selected) {
-        free(selected); free(selection); free(scores); return -1;
+        if (!on_stack) { free(selected); free(selection); free(scores); }
+        return -1;
     }
     for (int expert = 0; expert < experts; expert++) {
         float sum = 0.0f;
@@ -8315,7 +8373,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
     if (forced_indices) {
         for (int rank = 0; rank < topk; rank++) {
             if (forced_indices[rank] < 0 || forced_indices[rank] >= experts) {
-                free(selected); free(selection); free(scores); return -1;
+                if (!on_stack) { free(selected); free(selection); free(scores); }
+                return -1;
             }
             indices[rank] = forced_indices[rank];
         }
@@ -8334,11 +8393,12 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
     for (int rank = 0; rank < topk; rank++)
         total += scores[indices[rank]];
     if (!(total > 0.0f)) {
-        free(selected); free(selection); free(scores); return -1;
+        if (!on_stack) { free(selected); free(selection); free(scores); }
+        return -1;
     }
     for (int rank = 0; rank < topk; rank++)
         weights[rank] = scores[indices[rank]] / total * route_scale;
-    free(selected); free(selection); free(scores);
+    if (!on_stack) { free(selected); free(selection); free(scores); }
     return 0;
 }
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
@@ -14628,6 +14688,39 @@ int coli_hadamard_bf16_ref(float *values, size_t length) {
     return 0;
 }
 
+/* Scratch _Thread_local riusabile per le attivazioni qdq (famiglia #1071/#1075):
+ * ogni entry *_ref qui sotto pagava un paio di malloc/free PER CHIAMATA sul
+ * path caldo (attenzione: ~5 matvec fp8 per layer per token; expert: una per
+ * coppia). I valori calcolati non cambiano di un bit — cambia solo da dove
+ * arriva il buffer. I buffer crescono e non si restituiscono mai: il picco è
+ * batch*columns del matmul più largo, pochi MB per thread.
+ * EN: growable thread-local scratch for the qdq activations. Every *_ref entry
+ * below paid a malloc/free pair per call on the hot path; values are bit-for-
+ * bit unchanged — only the buffer's provenance changes. */
+typedef struct {
+    float *activation; size_t activation_capacity;
+    uint8_t *scales; size_t scales_capacity;
+} V4QdqScratch;
+_Thread_local V4QdqScratch coli_v4_qdq_scratch_state;
+int coli_v4_qdq_scratch(size_t activation_count, size_t scales_count,
+                          float **activation, uint8_t **scales) {
+    V4QdqScratch *s = &coli_v4_qdq_scratch_state;
+    if (activation_count > s->activation_capacity) {
+        free(s->activation);
+        s->activation = malloc(activation_count * sizeof(*s->activation));
+        s->activation_capacity = s->activation ? activation_count : 0;
+    }
+    if (scales_count > s->scales_capacity) {
+        free(s->scales);
+        s->scales = malloc(scales_count);
+        s->scales_capacity = s->scales ? scales_count : 0;
+    }
+    if (!s->activation || !s->scales) return -1;
+    *activation = s->activation;
+    *scales = s->scales;
+    return 0;
+}
+
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -14654,30 +14747,22 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
         coli_v4_gpu_matvec_grouped(weight, output, input, 1) == 0)
         return 0;
 #endif
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation);
-        free(activation_scales);
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
         return -1;
-    }
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128) != 0) {
-        free(activation);
-        free(activation_scales);
         return -1;
     }
     matmul_mxfp4(output, activation, weight->data, weight->scales,
                  1, (int)columns, (int)rows);
-    free(activation_scales);
-    free(activation);
     return 0;
 }
 
-int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
-                        const float *input) {
-    if (!output || !weight || !input ||
-        weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+/* Validazione condivisa fra _ref e _pre (stessi controlli di sempre).
+ * EN: shared shape/format validation between _ref and _pre. */
+static int fp8_matvec_validate(const ColiTensorView *weight) {
+    if (!weight || weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
         weight->scale_format != COLI_SCALE_F32 ||
         !weight->data || !weight->scales || weight->rows < 1 ||
         weight->columns < 1 || weight->columns % 128 ||
@@ -14691,32 +14776,21 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
     if (weight->data_bytes != rows * columns ||
         weight->scale_bytes != scale_rows * scale_columns * sizeof(float))
         return -1;
-#ifdef COLI_V4_GPU_TIER
-    /* The resident layer mirror carries a Dsv4CudaTensor* in view->gpu. Its
-     * weight bytes are the UNPACKED row-major matrix (the resident copy may be
-     * rows8-packed for the AVX2 CPU path), so the handle alone drives the call;
-     * only the activation vectors cross the boundary. Any backend failure falls
-     * through to the CPU reference below. */
-    if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
-        return 0;
-#endif
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(scale_columns);
-    if (!activation || !activation_scales) {
-        free(activation);
-        free(activation_scales);
-        return -1;
-    }
-    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
-                                    input, columns, 128) != 0) {
-        free(activation);
-        free(activation_scales);
-        return -1;
-    }
+    return 0;
+}
+
+/* Compute CPU su attivazione GIA' qdq (estratto invariato da matvec_ref).
+ * EN: CPU compute on an already-qdq'd activation, extracted verbatim. */
+static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
+                              const float *activation) {
+    size_t rows = (size_t)weight->rows;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+    (void)scale_columns;
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {
-            free(activation_scales); free(activation); return -1;
+            return -1;
         }
         float fp8[256];
         for (int code = 0; code < 256; code++)
@@ -14743,14 +14817,56 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
             }
             _mm256_storeu_ps(output + (size_t)tile * 8, sum);
         }
-        free(activation_scales); free(activation); return 0;
+        return 0;
     }
 #endif
     matmul_fp8(output, activation, weight->data, weight->scales,
                1, (int)columns, (int)rows);
-    free(activation_scales);
-    free(activation);
     return 0;
+}
+
+int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
+                        const float *input) {
+    if (!output || !input || fp8_matvec_validate(weight))
+        return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+#ifdef COLI_V4_GPU_TIER
+    /* The resident layer mirror carries a Dsv4CudaTensor* in view->gpu. Its
+     * weight bytes are the UNPACKED row-major matrix (the resident copy may be
+     * rows8-packed for the AVX2 CPU path), so the handle alone drives the call;
+     * only the activation vectors cross the boundary. Any backend failure falls
+     * through to the CPU reference below. */
+    if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
+        return 0;
+#endif
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, scale_columns, &activation, &activation_scales))
+        return -1;
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128) != 0) {
+        return -1;
+    }
+    return fp8_matvec_compute(output, weight, activation);
+}
+
+/* Variante a qdq sollevata: `activation` e' l'input gia' passato da
+ * coli_fp8_activation_qdq_ref UNA volta dal chiamante (wq_a e wkv consumano lo
+ * stesso vettore: prima veniva riquantizzato due volte per token per layer).
+ * `input` resta il vettore raw per l'eventuale path GPU, che quantizza per
+ * conto suo — identico a _ref. Stessi controlli, stesso compute: bit-identico.
+ * EN: hoisted-qdq variant. `activation` is the input already qdq'd ONCE by the
+ * caller (wq_a and wkv consume the same vector); `input` stays raw for the GPU
+ * path, which does its own thing exactly as in _ref. Bit-identical. */
+int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
+                        const float *input, const float *activation) {
+    if (!output || !input || !activation || fp8_matvec_validate(weight))
+        return -1;
+#ifdef COLI_V4_GPU_TIER
+    if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
+        return 0;
+#endif
+    return fp8_matvec_compute(output, weight, activation);
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT */
 
@@ -14806,20 +14922,18 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
         coli_v4_gpu_matvec_grouped(b, output_b, input, 1) == 0)
         return 0;
 #endif
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128) != 0) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     matmul_mxfp4(output_a, activation, a->data, a->scales,
                  1, (int)columns, (int)rows);
     matmul_mxfp4(output_b, activation, b->data, b->scales,
                  1, (int)columns, (int)rows);
-    free(activation_scales); free(activation); return 0;
+    return 0;
 }
 
 int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
@@ -14848,19 +14962,17 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
         coli_v4_gpu_fp8_matvec(b, output_b, input) == 0)
         return 0;
 #endif
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(scale_columns);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, scale_columns, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128) != 0) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
 #ifdef __AVX2__
     if (a->block_rows == 8) {
         if (rows % 8) {
-            free(activation_scales); free(activation); return -1;
+            return -1;
         }
         float fp8[256];
         for (int code = 0; code < 256; code++)
@@ -14895,14 +15007,14 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
             _mm256_storeu_ps(output_a + (size_t)tile * 8, sum_a);
             _mm256_storeu_ps(output_b + (size_t)tile * 8, sum_b);
         }
-        free(activation_scales); free(activation); return 0;
+        return 0;
     }
 #endif
     matmul_fp8(output_a, activation, a->data, a->scales,
                1, (int)columns, (int)rows);
     matmul_fp8(output_b, activation, b->data, b->scales,
                1, (int)columns, (int)rows);
-    free(activation_scales); free(activation); return 0;
+    return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_DUAL */
 
@@ -14926,9 +15038,10 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 #pragma GCC diagnostic pop
 #endif
 
-int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
-                              const float *inputs, int batch) {
-    if (!outputs || !weight || !inputs || batch < 1 || batch > 128 ||
+/* Validazione condivisa fra _ref e _pre (stessi controlli di sempre).
+ * EN: shared shape/format validation between _ref and _pre. */
+static int fp8_batch_validate(const ColiTensorView *weight, int batch) {
+    if (!weight || batch < 1 || batch > 128 ||
         weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
         weight->scale_format != COLI_SCALE_F32 ||
         !weight->data || !weight->scales || weight->rows < 1 ||
@@ -14940,6 +15053,17 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
     size_t scale_columns = columns / 128;
     if (weight->data_bytes != rows * columns ||
         weight->scale_bytes != scale_rows * scale_columns * sizeof(float)) return -1;
+    return 0;
+}
+
+static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
+                             const float *activations, int batch);
+
+int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch) {
+    if (!outputs || !inputs || fp8_batch_validate(weight, batch)) return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
 #ifdef COLI_V4_GPU_TIER
     /* Same mirror-driven dispatch as coli_fp8_matvec_ref: the resident
      * layer's Dsv4CudaTensor handle rides on view->gpu and only activations
@@ -14950,22 +15074,50 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
         coli_v4_gpu_fp8_matmul_batch(weight, outputs, inputs, batch) == 0)
         return 0;
 #endif
-    float *activations = malloc((size_t)batch * columns * sizeof(*activations));
-    uint8_t *activation_scales = malloc((size_t)batch * scale_columns);
-    if (!activations || !activation_scales) {
-        free(activation_scales); free(activations); return -1;
-    }
+    float *activations; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch((size_t)batch * columns, (size_t)batch * scale_columns,
+                            &activations, &activation_scales))
+        return -1;
     for (int item = 0; item < batch; item++)
         if (coli_fp8_activation_qdq_ref(
                 activations + (size_t)item * columns,
                 activation_scales + (size_t)item * scale_columns,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
-            free(activation_scales); free(activations); return -1;
+            return -1;
         }
+    return fp8_batch_compute(outputs, weight, activations, batch);
+}
+
+/* Variante a qdq sollevata: `activations` sono gli input gia' passati da
+ * coli_fp8_activation_qdq_ref UNA volta dal chiamante (wq_a e wkv del prefill
+ * consumano lo stesso batch); `inputs` resta il batch raw per il path GPU,
+ * identico a _ref. Bit-identico.
+ * EN: hoisted-qdq variant — `activations` were qdq'd once by the caller,
+ * `inputs` stays raw for the GPU path exactly as in _ref. Bit-identical. */
+int coli_fp8_matmul_batch_pre(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, const float *activations,
+                              int batch) {
+    if (!outputs || !inputs || !activations || fp8_batch_validate(weight, batch))
+        return -1;
+#ifdef COLI_V4_GPU_TIER
+    if (weight->gpu &&
+        coli_v4_gpu_fp8_matmul_batch(weight, outputs, inputs, batch) == 0)
+        return 0;
+#endif
+    return fp8_batch_compute(outputs, weight, activations, batch);
+}
+
+/* Compute CPU su attivazioni GIA' qdq (estratto invariato da batch_ref).
+ * EN: CPU compute on already-qdq'd activations, extracted verbatim. */
+static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
+                             const float *activations, int batch) {
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+    (void)scale_columns;
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {
-            free(activation_scales); free(activations); return -1;
+            return -1;
         }
         float fp8[256];
         for (int code = 0; code < 256; code++)
@@ -15000,12 +15152,12 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 _mm256_storeu_ps(outputs + (size_t)item * rows +
                                  (size_t)tile * 8, sums[item]);
         }
-        free(activation_scales); free(activations); return 0;
+        return 0;
     }
 #endif
     matmul_fp8(outputs, activations, weight->data, weight->scales,
                batch, (int)columns, (int)rows);
-    free(activation_scales); free(activations); return 0;
+    return 0;
 }
 
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
@@ -15020,21 +15172,20 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
     size_t packed_stride = columns / 2, scale_stride = columns / 32;
     if (weight->data_bytes != rows * packed_stride ||
         weight->scale_bytes != rows * scale_stride) return -1;
-    float *activations = malloc((size_t)batch * columns * sizeof(*activations));
-    uint8_t *activation_scales = malloc((size_t)batch * columns / 128);
-    if (!activations || !activation_scales) {
-        free(activation_scales); free(activations); return -1;
-    }
+    float *activations; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch((size_t)batch * columns, (size_t)batch * columns / 128,
+                            &activations, &activation_scales))
+        return -1;
     for (int item = 0; item < batch; item++)
         if (coli_fp8_activation_qdq_ref(
                 activations + (size_t)item * columns,
                 activation_scales + (size_t)item * columns / 128,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
-            free(activation_scales); free(activations); return -1;
+            return -1;
         }
     matmul_mxfp4(outputs, activations, weight->data, weight->scales,
                  batch, (int)columns, (int)rows);
-    free(activation_scales); free(activations); return 0;
+    return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_BATCH */
 
@@ -15231,14 +15382,12 @@ int coli_fp4_matvec_rows16_v10(float *output,
     if (!output || !input || !packed_valid(weight)) return -1;
     size_t columns = (size_t)weight->columns;
     size_t data_stride = columns / 2, scale_stride = columns / 32;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128)) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     __m512 fp4_table; float e8[256]; decode_tables(&fp4_table, e8);
     const unsigned char *data = weight->data, *scales = weight->scales;
@@ -15261,19 +15410,17 @@ int coli_fp4_matvec_rows16_v10(float *output,
         }
         _mm512_storeu_ps(output + (size_t)tile * 16, sum);
     }
-    free(activation_scales); free(activation); return 0;
+    return 0;
 #elif defined(__AVX2__)
     if (!output || !input || !packed_valid(weight)) return -1;
     size_t columns = (size_t)weight->columns;
     size_t data_stride = columns / 2, scale_stride = columns / 32;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128)) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     Avx2Rows16Tables tables; avx2_rows16_tables(&tables);
     const unsigned char *data = weight->data, *scales = weight->scales;
@@ -15301,19 +15448,17 @@ int coli_fp4_matvec_rows16_v10(float *output,
         _mm256_storeu_ps(output + (size_t)tile * 16, sum[0]);
         _mm256_storeu_ps(output + (size_t)tile * 16 + 8, sum[1]);
     }
-    free(activation_scales); free(activation); return 0;
+    return 0;
 #else /* __aarch64__ */
     if (!output || !input || !packed_valid(weight)) return -1;
     size_t columns = (size_t)weight->columns;
     size_t data_stride = columns / 2, scale_stride = columns / 32;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128)) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     NeonRows16Tables tables;
     neon_rows16_tables(&tables);
@@ -15343,7 +15488,7 @@ int coli_fp4_matvec_rows16_v10(float *output,
         for (int group = 0; group < 4; group++)
             vst1q_f32(output + (size_t)tile * 16 + 4 * group, sums[group]);
     }
-    free(activation_scales); free(activation); return 0;
+    return 0;
 #endif
 }
 
@@ -15359,14 +15504,12 @@ int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
         a->columns != b->columns) return -1;
     size_t columns = (size_t)a->columns;
     size_t data_stride = columns / 2, scale_stride = columns / 32;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128)) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     __m512 fp4_table; float e8[256]; decode_tables(&fp4_table, e8);
     const unsigned char *data_a = a->data, *data_b = b->data;
@@ -15399,21 +15542,19 @@ int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
         _mm512_storeu_ps(output_a + (size_t)tile * 16, sum_a);
         _mm512_storeu_ps(output_b + (size_t)tile * 16, sum_b);
     }
-    free(activation_scales); free(activation); return 0;
+    return 0;
 #elif defined(__AVX2__)
     if (!output_a || !output_b || !input || !packed_valid(a) ||
         !packed_valid(b) || a->rows != b->rows ||
         a->columns != b->columns) return -1;
     size_t columns = (size_t)a->columns;
     size_t data_stride = columns / 2, scale_stride = columns / 32;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128)) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     Avx2Rows16Tables tables; avx2_rows16_tables(&tables);
     const unsigned char *data_a = a->data, *data_b = b->data;
@@ -15451,21 +15592,19 @@ int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
         _mm256_storeu_ps(output_b + (size_t)tile * 16, sum_b[0]);
         _mm256_storeu_ps(output_b + (size_t)tile * 16 + 8, sum_b[1]);
     }
-    free(activation_scales); free(activation); return 0;
+    return 0;
 #else /* __aarch64__ */
     if (!output_a || !output_b || !input || !packed_valid(a) ||
         !packed_valid(b) || a->rows != b->rows ||
         a->columns != b->columns) return -1;
     size_t columns = (size_t)a->columns;
     size_t data_stride = columns / 2, scale_stride = columns / 32;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
+        return -1;
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128)) {
-        free(activation_scales); free(activation); return -1;
+        return -1;
     }
     NeonRows16Tables tables;
     neon_rows16_tables(&tables);
@@ -15511,7 +15650,7 @@ int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
                       sums_b[group]);
         }
     }
-    free(activation_scales); free(activation); return 0;
+    return 0;
 #endif
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_ROWS16 */

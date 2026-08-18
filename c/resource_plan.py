@@ -8,6 +8,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from family_registry import expert_contributions, planner_geometry, resolve_model
@@ -15,6 +16,24 @@ from family_registry import expert_contributions, planner_geometry, resolve_mode
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\.")
+
+# analyze_model() scans every shard header + regex-matches ~116k tensor names on the
+# 372 GB model; it reruns on every `coli plan/doctor/tune/run --auto-tier`. Its output
+# is a pure function of each shard's and config.json's (size, mtime), so cache it to a
+# sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
+# straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
+_ANALYSIS_CACHE_NAME = ".coli_analysis.json"
+_ANALYSIS_CACHE_VERSION = 1
+
+
+def _analysis_signature(shards, config_path):
+    parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
+    st = config_path.stat()
+    parts.append(f"config:{st.st_size}:{st.st_mtime_ns}")
+    for shard in shards:
+        s = shard.stat()
+        parts.append(f"{shard.name}:{s.st_size}:{s.st_mtime_ns}")
+    return "|".join(parts)
 
 
 def _tensor_sizes(path):
@@ -43,6 +62,37 @@ def analyze_model(model):
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
+
+    # Sidecar cache: return the stored analysis if every shard + config is unchanged.
+    # resolve_model() already read config.json, so it exists by this point.
+    signature = _analysis_signature(shards, model / "config.json")
+    cache_path = model / _ANALYSIS_CACHE_NAME
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(cached, dict) and cached.get("signature") == signature \
+                and isinstance(cached.get("analysis"), dict):
+            analysis = cached["analysis"]
+            # JSON object keys are always strings: restore the int layer
+            # indices so a cache hit is identical to a fresh scan.
+            by_layer = analysis.get("expert_bytes_by_layer")
+            if isinstance(by_layer, dict):
+                analysis["expert_bytes_by_layer"] = {
+                    int(layer): size for layer, size in by_layer.items()}
+            # resolved_family is a live registry object and cannot be JSON'd.
+            # The resolve_model() above recomputed it cheaply (config.json
+            # only); the one scan-derived bit it carries for glm is the
+            # indexer-presence flag, which the cache stores alongside.
+            indexer = analysis.pop("_colibri_indexer_present", None)
+            if indexer is not None and resolved.descriptor.id == "glm":
+                family_cfg = dict(resolved.family_config,
+                                  _colibri_indexer_present=indexer)
+                resolved = type(resolved)(resolved.descriptor, resolved.model_type,
+                                          resolved.config, family_cfg,
+                                          resolved.model_dir)
+            analysis["resolved_family"] = resolved
+            return analysis
+    except (OSError, ValueError):
+        pass  # missing/corrupt/unreadable cache -> recompute
 
     dense_bytes = 0
     expert_groups = {}
@@ -96,7 +146,7 @@ def analyze_model(model):
         family_cfg = dict(family_cfg, _colibri_indexer_present=indexer_present)
         resolved = type(resolved)(resolved.descriptor, resolved.model_type,
                                   resolved.config, family_cfg, resolved.model_dir)
-    return {
+    result = {
         "path": str(model),
         "shards": len(shards),
         "model_bytes": model_bytes,
@@ -111,6 +161,42 @@ def analyze_model(model):
         "config": config,
         "resolved_family": resolved,
     }
+    try:  # best-effort write; a read-only model dir must never break planning.
+        # Atomic write (tmp file + os.replace): a concurrent `coli plan` on the
+        # same model dir must never observe a half-written cache -- write_text()
+        # alone can leave a truncated file for a racing reader's json.loads to
+        # choke on, which just falls back to a full recompute (harmless but
+        # defeats the cache for that call). Same directory so the replace stays
+        # on one filesystem (os.replace requires that to be atomic).
+        # resolved_family is a registry object, not JSON-serializable: persist
+        # only the scan-derived indexer flag it carries; the hit path rebuilds
+        # the object from a fresh (cheap) resolve_model().
+        payload = dict(result)
+        resolved_family = payload.pop("resolved_family")
+        family_cfg = getattr(resolved_family, "family_config", None)
+        if isinstance(family_cfg, dict) and "_colibri_indexer_present" in family_cfg:
+            payload["_colibri_indexer_present"] = family_cfg["_colibri_indexer_present"]
+        # The tmp name must be per-THREAD, not per-process: concurrent writers
+        # in one process would otherwise write the same tmp file, and one
+        # thread's os.replace renames it out from under the other. On Windows
+        # the replace can also fail (PermissionError) while a concurrent
+        # reader holds the destination open -- caught below, and the tmp must
+        # not be left behind either way.
+        tmp_path = cache_path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps({"signature": signature, "analysis": payload}),
+                encoding="utf-8")
+            os.replace(tmp_path, cache_path)
+        except (OSError, TypeError, ValueError):
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except (OSError, TypeError, ValueError):
+        pass
+    return result
 
 
 def memory_available():

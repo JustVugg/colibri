@@ -115,10 +115,13 @@ trace), so the two formats are numerically interchangeable.
 container. It maps each prepared U8 matrix and its F32 scale sidecar read-only
 instead of copying both into private heap. The mapped pages remain file-backed
 and reclaimable; this changes commit/accounting, not the active working set, so
-memory pressure can become page faults during inference. The option has no
-fallback: tensors that need load-time conversion, non-F32 scale sidecars, and
-enabled Vulkan/CUDA backends are refused. A Vulkan build therefore requires
-`K3_VK=0 K3_MMAP=1` explicitly.
+memory pressure can become page faults during inference. On Linux, process
+monitors may still show the touched mapping (about 33.8 GB for the full model)
+in RSS; it is clean file-backed memory, not private heap, so use `/proc` smaps
+accounting to distinguish file-backed RSS from private anonymous memory. The
+option has no fallback: tensors that need load-time conversion, non-F32 scale
+sidecars, and enabled Vulkan/CUDA backends are refused. A Vulkan build therefore
+requires `K3_VK=0 K3_MMAP=1` explicitly.
 
 Sizes: source 1.56 TB → ≈1.50 TB (`--bits 8`) / ≈1.48 TB (`--bits 4`). The
 experts (93 % of bytes) are already at 4.25 bits/weight and cannot shrink
@@ -237,7 +240,8 @@ loaded for the whole terminal session. `coli serve` exposes streaming and
 non-streaming `/v1/chat/completions`; `coli web` uses that same API. Reasoning
 is returned as `reasoning_content`, response text as `content`, and
 `<|end_of_msg|>` remains the model-owned stop token. `STOP` and `CANCEL` are
-honoured between generated tokens.
+honoured between generated tokens. Long prefill also polls `CANCEL` between
+layers and drops the unpublished partial state before serving another request.
 
 ## Vulkan tier (`make VK=1 kimi_k3`)
 

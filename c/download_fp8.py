@@ -3,12 +3,17 @@ HuggingFace fallback. Parallel shard download, clean progress display.
 Usage: python download_fp8.py
        python download_fp8.py --parallel 4
        python download_fp8.py --source hf  (force HuggingFace)
+       python download_fp8.py --dest /data/glm52_fp8  (or set $GLM_DEST)
 """
 import os, time, threading, argparse, subprocess
 
 REPO_MS = "ZhipuAI/GLM-5.2-FP8"        # ModelScope
 REPO_HF = "zai-org/GLM-5.2-FP8"        # HuggingFace
-DEST = r"I:\glm52_fp8"
+# Destination for the ~372 GB download. Override with --dest or $GLM_DEST;
+# defaults to ./glm52_fp8 in the current directory (cross-platform — the old
+# hardcoded r"I:\glm52_fp8" only worked on a Windows box that happened to have
+# an I: drive).
+DEST = os.environ.get("GLM_DEST", os.path.join(os.getcwd(), "glm52_fp8"))
 
 # ── ANSI colors ──
 class C:
@@ -83,12 +88,17 @@ def shard_complete(path, expected_size):
             and (expected_size <= 0 or os.path.getsize(path) == expected_size))
 
 def main():
+    global DEST
     ap = argparse.ArgumentParser()
     ap.add_argument("--parallel", type=int, default=3)
+    ap.add_argument("--dest", default=None,
+                    help="download target directory (default: $GLM_DEST or ./glm52_fp8)")
     ap.add_argument("--source", choices=["auto", "ms", "hf"], default="auto",
                     help="auto (try ModelScope first), ms (ModelScope only), hf (HuggingFace only)")
     args = ap.parse_args()
 
+    if args.dest:
+        DEST = args.dest
     os.makedirs(DEST, exist_ok=True)
 
     # Determine source and get shard list

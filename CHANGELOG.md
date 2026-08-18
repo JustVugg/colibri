@@ -3,6 +3,58 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.6.2] — 2026-08-14
+Security release: **six privately-reported memory-safety issues fixed**, all reachable
+from attacker-controlled input (malicious model file / `config.json`, or the kimi_k3
+SERVE stdin). Every fix validates at the trust boundary — no behavioural change on
+well-formed models or requests. Advisories: GHSA-gf38-c8fx-ppvv (kimi_k3 SERVE OOB
+write), GHSA-2qrj-xjmh-mv74 (json.h OOB read), GHSA-w696-h9p7-6rgc (inkling audio
+OOB), GHSA-7654-r78q-vc3r (deepseek_v4 indexer OOB R/W), and two more in the same
+class. See the GitHub Security Advisories for details.
+
+## [1.6.1] — 2026-08-13
+- `--allowed-host '*'` lets an operator reach a public bind deliberately (#990, #993)
+- OLMoE streaming no longer drops the answer into the reasoning channel (#984, #985)
+- chat reasoning-channel fixes and pty test hardening (#980)
+
+## [1.6.0] — 2026-08-12
+**If you are on v1.5.0, update:** it shipped a performance regression on GLM-5.2
+(#856), left up to ~60 GB of RAM unused with a 13-point expert hit-rate loss (#885),
+and broke Kimi K3 outright on some machines (#888).
+- #869 — the planner priced every expert row at the container's *widest* width;
+  mixed-width containers had their cache silently halved
+- #914 (bherald) — pin budgets accounted correctly
+- prefill batch-union: each distinct expert is read **once** per chunk
+
+## [1.5.0] — 2026-08-05
+51 pull requests from 15 contributors.
+- **Fifth engine: DeepSeek V4 Flash** (@DrewZt, #165) — MLA + DSA sparse attention,
+  43 layers, 256 routed experts + 1 shared, top-6; official checkpoint streams with
+  no conversion (fp4 experts, fp8-e4m3 dense with UE8M0 block scales)
+- #839 — the rows16 fp4 fast path no longer requires AVX-512: consumer Intel/AMD
+  CPUs since Alder Lake get the fast path
+
+## [1.4.0] — 2026-08-01
+162 commits, 29 pull requests (25 from contributors).
+- **Release archives now contain every engine** — v1.3.0 archives shipped `c/colibri`
+  alone while the README promised four families (#720); `inkling` and `kimi_k3` are
+  built, packaged and smoke-tested per platform
+- Third GPU backend lands
+
+## [1.3.0] — 2026-07-29
+Three MoE families on one engine, 744B → 2.8T.
+- **Kimi K3** (#676) — 2.8T/104B active: KDA + gated-NoPE-MLA + AttnRes + LatentMoE,
+  streams Moonshot's QAT MXFP4 experts straight from the original HF shards
+- **Inkling** — a 975B model answers on a 25 GB machine
+
+## [1.2.0] — 2026-07-28
+- GB10 / DGX Spark unified-memory OOM fix (#653); AMD/ROCm recognized by `doctor`
+  and `resource_plan` (#662, #663)
+- AVX2 `matmul_e8` — fmt=6 was 92% of decode on the scalar kernel (#654); native
+  SIMD fmt=6 encoder, 15× over numpy
+- chat stop-set fix (#633/#381), async packed-int4 parity (#632), stable KV slot
+  per conversation (#634, #639)
+
 ## [1.1.1] — 2026-07-23
 
 A same-day patch release. **Windows users on v1.1.0 should upgrade**: Microsoft

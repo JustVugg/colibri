@@ -381,6 +381,14 @@ jobs:
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build colibri
         run: make -C c colibri
+      - name: Integer-kernel exactness vs pure-C reference (#1081)
+        # Integer kernels have no rounding excuse: bit-equality on every ISA.
+        # The same binary check runs on the ARM job below — this is the gate
+        # that would have caught the olmoe/qwen36/inkling IDOT class.
+        run: |
+          cd c
+          gcc -O3 -march=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
+          /tmp/tike
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Token-exact oracle (teacher forcing)
@@ -594,3 +602,35 @@ jobs:
             'tests.test_convert_positioned_write'
           )
           python -m unittest -v @suites
+
+  # ARM oracle (#1081): every tiny-oracle job above runs on x86, so NEON
+  # branches were never compiled, let alone executed — which is how the
+  # olmoe (#1044) / qwen36 (#712 review) / inkling (#1080) IDOT class shipped.
+  # This job builds every engine on arm64 (NEON compile coverage), runs the
+  # integer-kernel bit-exactness gate with the NEON branches live, and replays
+  # the glm_tiny teacher-forcing oracle against a fixture generated on THIS
+  # runner (same-machine torch reference, so no cross-ISA float excuses).
+  oracle-arm:
+    name: ARM (engines + NEON kernel exactness + tiny oracle)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build every engine (NEON branches must compile)
+        run: make -C c colibri inkling kimi_k3 olmoe
+      - name: Integer-kernel exactness, NEON branches live (#1081)
+        run: |
+          cd c
+          gcc -O3 -mcpu=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
+          /tmp/tike
+      - name: Generate the glm_tiny fixture on this runner
+        run: cd c && python3 tools/make_glm_oracle.py
+      - name: Token-exact oracle on ARM (teacher forcing)
+        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16

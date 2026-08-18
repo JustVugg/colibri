@@ -341,6 +341,21 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(stats["timed_out"], 1)
         self.assertEqual(stats["cancelled"], 1)
 
+    def test_counts_admitted_client_cancellation_without_completion(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
+        with self.assertRaises(ClientCancelled):
+            with scheduler.admit():
+                raise ClientCancelled()
+        stats = scheduler.snapshot()
+        self.assertEqual(stats["active"], 0)
+        self.assertEqual(stats["admitted"], 1)
+        self.assertEqual(stats["completed"], 0)
+        self.assertEqual(stats["cancelled"], 1)
+
+        with scheduler.admit():
+            pass
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
     def test_admits_waiters_in_fifo_order(self):
         scheduler = GenerationScheduler(max_queue=2, queue_timeout=1)
         entered = threading.Event()

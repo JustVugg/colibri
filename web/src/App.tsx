@@ -168,10 +168,16 @@ export default function App() {
     }
   }
 
-  if (servedByEngine && !autoConnected.current && !connected) {
-    autoConnected.current = true
-    setTimeout(() => connect(), 0)
-  }
+  // Auto-connect once when the UI is served by the engine itself. In an
+  // effect, not in the render body: a side effect during render breaks under
+  // StrictMode double-rendering and concurrent re-renders.
+  useEffect(() => {
+    if (servedByEngine && !autoConnected.current && !connected) {
+      autoConnected.current = true
+      connect()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servedByEngine, connected])
 
   const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
 
@@ -209,7 +215,7 @@ export default function App() {
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
           count++
           setTokenCount(count)
-          const elapsed = (performance.now() - (firstToken ? t0 : t0)) / 1000
+          const elapsed = (performance.now() - t0) / 1000
           if (elapsed > 0.3) setTokPerSec(count / ((performance.now() - t0) / 1000))
           updateMessages((current) => current.map((item) =>
             item.id === assistant.id ? { ...item, content: item.content + delta } : item,

@@ -75,6 +75,15 @@ CFLAGS += -mcpu=$(ARCH)
 endif
 endif
 LDFLAGS = -lm $(OMPL) $(EXTRA_LDFLAGS)
+# LTO is opt-in (LTO=1), not default: cross-TU inlining can change
+# floating-point contraction (FMA formation), and colibri's token-exactness
+# oracles are validated against the default build's optimization regime
+# (#1044/#1024 showed how FMA + accumulator order changes rounding).
+# Enable only after a token-exactness A/B on your own toolchain.
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
 EXE     =
 else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
@@ -93,6 +102,10 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
 LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
 EXE     = .exe
 else
 ifneq (,$(PPC64))
@@ -104,6 +117,10 @@ CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
 EXE     =
 else ifneq (,$(AARCH64))
 # --- Linux / *BSD aarch64 (#631) ---
@@ -138,6 +155,10 @@ ARCHFLAG := -mcpu=$(ARCH)
 endif
 CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
@@ -149,6 +170,10 @@ CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
 EXE     =
 endif
 endif
@@ -933,6 +958,24 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# RoPE inv_freq precompute must stay byte-identical to the old powf-per-position
+# path; drives the real rope_interleave (includes colibri.c) vs a reference.
+# -ffp-contract=off: the in-test reference is a DIFFERENT loop body than the
+# shipping one, and on FMA targets (x86-64-v3, where -ffp-contract=fast is the
+# default) the compiler contracts the two bodies differently — a*cs-b*sn then
+# rounds differently between reference and real function even for pre-change
+# code, a harness artifact rather than an engine regression. Engine-level
+# equivalence under the shipping flags is covered by the differential dump
+# (old vs new rope_interleave are byte-identical); this test guards the
+# source-level formula equivalence and must not depend on contraction luck.
+tests/test_rope_invfreq$(EXE): tests/test_rope_invfreq.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -ffp-contract=off $< -o $@ $(LDFLAGS)
+
+# schema->GBNF compile cache (#7): grammar_reset must equal a fresh setup, and
+# the GrDraft.src ownership must not leak/double-free. Includes colibri.c.
+tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links

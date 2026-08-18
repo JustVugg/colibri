@@ -520,7 +520,7 @@ static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel Ope
 // g_queue (macOS 15+) replaces moe_submit's per-command-buffer useResource: loop over
 // resolved expert weight/scale slabs. Allocation is untouched (same newBufferWithBytesNoCopy
 // wrap as stock); only residency bookkeeping moves off the dispatch hot path -- see
-// SUMMARY.md for why skipping useResource: there is safe (read-only, indirectly-referenced
+// docs/experiments/e5-metal-residency-set.md for why skipping useResource: there is safe (read-only, indirectly-referenced
 // buffers only; residency sets don't do hazard tracking, but nothing here relied on it).
 // g_resset_obj is a bare `id` (holds id<MTLResidencySet>) so the global's declared type
 // carries no availability annotation -- the protocol name only appears inside
@@ -1281,7 +1281,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int q
   // contents), so there's no GPU-side write to serialize against; the one real hazard -- a
   // slab unregistered+freed+reused while an async in-flight CB still reads it -- is a
   // CPU-write race outside Metal's hazard tracking either way, held by the engine's own slot
-  // lifecycle, not by useResource:. See SUMMARY.md UNCERTAINTIES.
+  // lifecycle, not by useResource:. See docs/experiments/e5-metal-residency-set.md UNCERTAINTIES.
   if (!g_resset_enabled) {
     for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
   }
