@@ -1362,12 +1362,18 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         t->ng = (I + 127) / 128;
         t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
     }
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
-        !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
+    /* Ownership is a fact of the allocation, not the copy: set it BEFORE the
+     * memcpy, or a failed H2D upload frees the tensor while weights_owned is
+     * still 0 and free()'s ownership gate leaks the device buffer. */
     t->weights_owned=1;
+    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+        coli_cuda_tensor_free(t);
+        return 0;
+    }
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
