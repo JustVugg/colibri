@@ -21,9 +21,10 @@
  * Injection seam: the backend is included directly (kernel-level pattern of
  * tests/test_fp8_warp_cuda.cu), with every `cudaMemcpy` token in the included
  * backend source renamed to a hook via an object-like macro. The runtime
- * header itself is untouched: the compiler pre-includes its runtime header
- * before this file, so the real declaration is already in scope and the
- * macro only rewrites the backend's call sites. The hook fails HostToDevice
+ * header itself is untouched: it is in scope before the macro exists (nvcc
+ * pre-includes cuda_runtime.h; under HIP it is included explicitly below),
+ * so the real declaration survives and the macro only rewrites the
+ * backend's call sites. The hook fails HostToDevice
  * copies of exactly the armed byte count and passes everything else through
  * to the real runtime call, so ONLY the weight upload of the target tensor
  * shape is hit. On HIP the compat header maps cudaMemcpy -> hipMemcpy, so
@@ -36,9 +37,13 @@
 #include <cstring>
 #include <vector>
 
-/* Forward declaration first (the compiler's pre-included runtime header has
- * already supplied the types), then the rename, then the backend. */
+/* Forward declaration first, then the rename, then the backend. Under HIP
+ * the runtime header is included explicitly — the SAME header
+ * backend_gpu_compat.h pulls, unreachable under nvcc — so the declaration
+ * does not depend on hipcc pre-including it; under CUDA, nvcc pre-includes
+ * cuda_runtime.h before every TU. */
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#include <hip/hip_runtime.h>
 extern "C" hipError_t coli_test_memcpy_hook(void *dst, const void *src,
                                             size_t count, hipMemcpyKind kind);
 #define hipMemcpy coli_test_memcpy_hook
@@ -53,30 +58,30 @@ extern "C" cudaError_t coli_test_memcpy_hook(void *dst, const void *src,
 #include "../backend_cuda.cu"
 
 /* backend_gpu_compat.h maps only the names the backend itself uses:
- * cudaError_t and cudaMemcpyHostToDevice are aliased, but the kind TYPE and
- * the injected error value are not (the backend never names them). Alias
- * those two locally per vendor rather than widening the product header for
- * a test-only need. */
+ * cudaMemcpyKind (the backend never names the kind TYPE) and
+ * cudaErrorInvalidValue (it never names this error) are not among them, so
+ * under hipcc they are undefined. Alias the two locally per vendor rather
+ * than widening the product header for a test-only need — the same
+ * arrangement the repo's other direct-include tests use for their
+ * off-surface names. */
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #undef hipMemcpy
 #define COLI_REAL_MEMCPY      hipMemcpy
-#define COLI_TEST_MEMCPY_KIND hipMemcpyKind
-#define COLI_TEST_MEMCPY_FAIL hipErrorInvalidValue
+#define cudaMemcpyKind        hipMemcpyKind
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #else
 #undef cudaMemcpy
 #define COLI_REAL_MEMCPY      cudaMemcpy
-#define COLI_TEST_MEMCPY_KIND enum cudaMemcpyKind
-#define COLI_TEST_MEMCPY_FAIL cudaErrorInvalidValue
 #endif
 
 static size_t g_fail_h2d_bytes = 0;   /* 0 = pass everything through */
 static int    g_hook_hits      = 0;
 
 extern "C" cudaError_t coli_test_memcpy_hook(void *dst, const void *src,
-                                             size_t count, COLI_TEST_MEMCPY_KIND kind) {
+                                             size_t count, cudaMemcpyKind kind) {
     if (g_fail_h2d_bytes && kind == cudaMemcpyHostToDevice && count == g_fail_h2d_bytes) {
         g_hook_hits++;
-        return COLI_TEST_MEMCPY_FAIL;
+        return cudaErrorInvalidValue;
     }
     return COLI_REAL_MEMCPY(dst, src, count, kind);
 }
