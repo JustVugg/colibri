@@ -52,22 +52,31 @@ extern "C" cudaError_t coli_test_memcpy_hook(void *dst, const void *src,
  * which supplies the runtime surface for BOTH vendors. */
 #include "../backend_cuda.cu"
 
+/* backend_gpu_compat.h maps only the names the backend itself uses:
+ * cudaError_t and cudaMemcpyHostToDevice are aliased, but the kind TYPE and
+ * the injected error value are not (the backend never names them). Alias
+ * those two locally per vendor rather than widening the product header for
+ * a test-only need. */
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #undef hipMemcpy
-#define COLI_REAL_MEMCPY hipMemcpy
+#define COLI_REAL_MEMCPY      hipMemcpy
+#define COLI_TEST_MEMCPY_KIND hipMemcpyKind
+#define COLI_TEST_MEMCPY_FAIL hipErrorInvalidValue
 #else
 #undef cudaMemcpy
-#define COLI_REAL_MEMCPY cudaMemcpy
+#define COLI_REAL_MEMCPY      cudaMemcpy
+#define COLI_TEST_MEMCPY_KIND enum cudaMemcpyKind
+#define COLI_TEST_MEMCPY_FAIL cudaErrorInvalidValue
 #endif
 
 static size_t g_fail_h2d_bytes = 0;   /* 0 = pass everything through */
 static int    g_hook_hits      = 0;
 
 extern "C" cudaError_t coli_test_memcpy_hook(void *dst, const void *src,
-                                             size_t count, cudaMemcpyKind kind) {
+                                             size_t count, COLI_TEST_MEMCPY_KIND kind) {
     if (g_fail_h2d_bytes && kind == cudaMemcpyHostToDevice && count == g_fail_h2d_bytes) {
         g_hook_hits++;
-        return cudaErrorInvalidValue;
+        return COLI_TEST_MEMCPY_FAIL;
     }
     return COLI_REAL_MEMCPY(dst, src, count, kind);
 }
