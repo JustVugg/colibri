@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
   <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
+<a href="https://inspect.software/software/JustVugg/colibri"><img src="https://raw.githubusercontent.com/inspect-software/badges/main/v1/j/JustVugg/colibri.svg" alt="inspect.software score badge for JustVugg/colibri" /></a>
 </p>
 
 <p align="center">
