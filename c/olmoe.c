@@ -265,6 +265,29 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     return _mm_cvtsi128_si32(sum32);
 }
 #define HAVE_FAST_DOT_I8 1
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
+#include "sse41_kernels.h"
+/* Sandy Bridge-EP path: AVX 1.0 only, no FMA, no AVX-2.
+ * 16 int8 dot via two 8-wide SSE2 sign-extend + SSE4.1 madd pairs.
+ * Bit-for-bit identical to the AVX2 version above (just 2x 128-bit ops
+ * instead of 1x 256-bit op). NO FMA here -- this branch targets Sandy Bridge
+ * which has no FMA -- so use explicit mul+add for the inner accumulation. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    __m128i va_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));        /* lower 8 int8 -> 8 int16 */
+    __m128i vb_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m128i va_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(a + 8)));   /* upper 8 int8 -> 8 int16 */
+    __m128i vb_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(b + 8)));
+    __m128i p_lo = _mm_madd_epi16(va_lo, vb_lo);   /* 4 x int32 from 8 int16 pairs */
+    __m128i p_hi = _mm_madd_epi16(va_hi, vb_hi);   /* 4 x int32 from 8 int16 pairs */
+    __m128i sum = _mm_add_epi32(p_lo, p_hi);
+    /* horizontal reduce 4 x int32 -> 1 x int32 */
+    __m128i hi64   = _mm_unpackhi_epi64(sum, sum);
+    __m128i sum64  = _mm_add_epi32(sum, hi64);
+    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+}
+#define HAVE_FAST_DOT_I8 1
 #endif
 /* Test-only hook, compiled out of the shipping binary.
  *
