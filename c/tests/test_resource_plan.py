@@ -217,6 +217,37 @@ class ResourcePlanTest(unittest.TestCase):
                     one["tiers"]["ram"]["fixed_state_bytes"])
         self.assertEqual(delta, 3 * per_slot)
 
+    def test_olmoe_plans_instead_of_refusing(self):
+        # #1066: OLMoE used to refuse in `coli plan`/`doctor` because its
+        # planner_geometry was None (which under-reserved as zero-byte KV). With
+        # the adapter it plans, charging an fp32 K and V cache per layer sized at
+        # num_attention_heads * head_dim (mirrors olmoe.c:1019-1020), no fixed
+        # recurrent state.
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp)
+            (model / "config.json").write_text(json.dumps({
+                "model_type": "olmoe",
+                "num_hidden_layers": 2,
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts": 2,
+                "num_experts_per_tok": 2,
+                "intermediate_size": 16,
+                "vocab_size": 100,
+            }))
+            write_shard(model / "model.safetensors", [
+                ("model.embed_tokens.weight", 100),
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", 30),
+                ("model.layers.0.mlp.experts.1.gate_proj.weight", 30),
+            ])
+            plan = build_plan(model, context=32, kv_slots=1,
+                              available_memory=32 * GB, available_disk=1, gpus=[])
+            ram = plan["tiers"]["ram"]
+            # layers=2, ctx=32, heads=4, head_dim=32//4=8, K and V, fp32:
+            self.assertEqual(ram["sequence_state_bytes"], 2 * 32 * 4 * 8 * 2 * 4)
+            self.assertEqual(ram["fixed_state_bytes"], 0)
+
     def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
         config = json.loads((self.model / "config.json").read_text())
         config.update({"index_head_dim": 16,

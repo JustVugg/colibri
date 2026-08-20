@@ -3,6 +3,113 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.7.0] — 2026-08-19
+71 pull requests since v1.6.2. A sixth model family with its GPU tier, a
+rebuilt expert-matmul path, and the CI that would have caught the class of bug
+we shipped twice.
+
+### A sixth engine: Qwen3.6-35B-A3B — CPU and GPU
+- **#712** (@kreuzzelg) — hybrid Gated Attention + Gated DeltaNet + streaming
+  MoE, in `c/qwen36.c`. Pre-converted containers published (int4-gs64
+  recommended: cosine to the int8 anchor 0.98777 → 0.99313, KL 0.109 → 0.080
+  vs per-row). The engine takes any architecture-identical checkpoint
+  unchanged — KAT-Coder v2.5 runs on it with no code path of its own.
+- **#713** (@kreuzzelg) — CUDA VRAM expert tier with heat-based placement
+  across GPUs: **1.44 → 10.05 tok/s (7.0×) on 2× 8 GB cards, output
+  bit-identical to CPU** (`cmp` over the full 200-token generation), measured
+  cold with no heat table. A `qt_ready()` gate keeps CPU-only builds from
+  allocating the packed int4 buffers they never read: **7.33 GB saved**.
+
+### The expert matmul path, rebuilt (all bit-identical)
+- **#1071 / #1075 / #1076 / #1077** — activation quantization hoisted to layer
+  level across GLM, Kimi K3 and DeepSeek V4: the same vector was being
+  re-quantized ~16× per layer, serially. Removes ~5.2 ms/token of serial time
+  and every per-call `malloc` from the hot path.
+- **#1079 / #1086** — **K1: plane-nibble int4 layout + unsigned-VNNI dot.**
+  Storing element *k* and *k+32* in one byte deletes the unpack, and since
+  nibbles are stored unsigned, `dot(v,x) = dot(u,x) − 8·Σx` feeds `vpdpbusd`
+  natively. 8 uops per 64 MACs instead of 32: **1.45–2.65× on the IDOT
+  kernels**, zero bytes added.
+- **#1088** — **K2: 1×4 union tile.** The prefill union hands each expert
+  2–16 rows; the weight block's load+mask is now paid once per four rows
+  instead of once per row: **2.67–3.10× at S=4** (peak 253 GMAC/s).
+- **#1093** — parallel silu and the down-side activation hoist.
+- **#1094** — **K1b: grouped planar IDOT for gs64 containers** (`IDOT_GS=1`,
+  opt-in): the recommended container format could not reach the integer
+  kernels at any batch size before this.
+- **#1082** (@outtodata) — `FUSED3=1` opt-in fused AVX2 expert matmul.
+
+### Streaming and I/O
+- **#1097** — DeepSeek V4 expert-loader pool default 3 → 9 lanes:
+  **1.41× decode** on the real V4-Flash checkpoint (8 interleaved runs on a
+  quiet 25 GB box). `V4_LOADER_LANES` still overrides.
+- **#1056** (@dcutugno) — DeepGEMM sm120 headers fetched at a pinned commit on
+  first build: 2.5× prefill on sm120 with nothing vendored in-tree.
+- **#988 / #1054 / #1055** — DeepSeek V4 CUDA tier and dual-SSD mirror.
+
+### Correctness and CI
+- **#1083** — **ARM CI job** (`ubuntu-24.04-arm`) plus an integer-kernel
+  bit-exactness gate that runs on both ISAs. Every tiny-oracle job ran on x86
+  before this, so NEON-divergent paths were invisible — which is how the IDOT
+  defaults below shipped. Closes #1081.
+- **#1044 / #1080** — IDOT made opt-in in olmoe and inkling: the fast path is
+  x86-only and quantizes activations, so the same model produced different
+  tokens on x86 and ARM by default.
+- **#1109** (@SebaWag) — ARM64 dotprod probed by *compiling* the intrinsic:
+  GCC 11 defines `__ARM_FEATURE_DOTPROD` for a base it cannot emit
+  `vdotq_s32` for. Fixes #1104.
+- **#1111** — `__syncwarp()` after `grouped_s4_wmma`'s store (reported by
+  @monotophic with `compute-sanitizer` evidence). Fixes #1099.
+- **#1073 / #1074** (@bherald) — Kimi K3 cancels prefill between layers
+  instead of holding the engine for a minutes-long prompt; cancelled requests
+  no longer count as completed.
+
+### Apple Silicon
+- **#790 → #1113** (@RDouglasSharp) — **Metal backend for Kimi K3**: KDA state and
+  window buffers aligned, wrap-once buffer cache, CPU-side MLA KV cache. 1.7×/2.4×
+  on the compute-bound phases (KDA attention + projections dispatched to the GPU);
+  MoE experts stay on the CPU. Kimi K3's first GPU backend.
+
+### More correctness fixes
+- **#1098** (@monotophic) — `__syncthreads()` missing from the absorb softmax
+  reduction, with a determinism test that reproduces the hazard.
+- **#1101** (@monotophic) — allocation and `snprintf` results checked on the
+  checkpoint-load path (#798).
+- **#1100 / #1108** (@monotophic) — fmt=8/fmt=6 scale-byte accounting in
+  `tensor_bytes`/`tensor_free`, and `weights_owned` set before the host-to-device
+  copy so a failed upload frees its buffer. Each ships with its own regression
+  test; all four of this contributor's CUDA fixes landed in this release.
+- **#1122** (@ZacharyZcR) — `USAGE_SAVE=0` honoured in every engine (#1039): the
+  history was loaded but written back anyway, which quietly contaminated any A/B
+  that shared a usage file between arms.
+- **#1121** (@ZacharyZcR) — LRU victim selection now respects a lowered `ecap`
+  (#1034): after an RSS-guard reduction the cache kept evicting against the old
+  capacity.
+- **#1123** (@ZacharyZcR) — the v1.6.2 warning-cleanup patches landed (#1032).
+- **#1106** (@monotophic) — duplicate tensor names across indexed shards are now
+  refused rather than silently resolved to one of them (untrusted containers).
+
+### Interfaces
+- **#829** (@aaristov) — GPU-vs-fallback counters and chat status made visible in
+  `coli serve`: the tier's behaviour is now observable instead of inferred.
+- **#1095** (@benmaster82) — OLMoE planner geometry adapter, and **#1103**
+  (@SebaWag) — Kimi K3, Inkling and DeepSeek V4 adapters with 23 tests: every
+  family now has real planner geometry, so `coli plan` stops guessing (#1066).
+- **#1096** (@terrizoaguimor) — DeepSeek V4 serve framing on the shared codec,
+  completing the codec migration across OLMoE, Kimi K3 and V4.
+- **#1063 / #1068** (@terrizoaguimor) — model families are registry-owned:
+  `coli`, the gateway, `doctor` and the planner read one descriptor table.
+- **#1087 / #1090 / #1096 / #1116** (@terrizoaguimor) — a shared serve framing
+  codec, now adopted by **every engine**: OLMoE, Kimi K3, DeepSeek V4 and
+  Inkling (whose audio payload rides as an opaque extension). Each migration
+  landed behind a byte-exact wire-transcript freeze, so the gateway contract is
+  provably unchanged. Byte framing had been duplicated five times, which is how
+  Windows binary mode silently disappeared from sibling engines (#748).
+- **#1036** (@lineape) — distributed expert workers (LAN, opt-in via
+  `CLUSTER_WORKERS`).
+- Planner: DeepSeek V4 expert naming now recognized, so `coli plan` and
+  `coli doctor` stop counting every routed expert as dense (fixes #1110).
+
 ## [1.6.2] — 2026-08-14
 Security release: **six privately-reported memory-safety issues fixed**, all reachable
 from attacker-controlled input (malicious model file / `config.json`, or the kimi_k3

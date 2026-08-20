@@ -301,9 +301,37 @@ int main(void){
         }
     }
 
+    /* 8. USAGE_SAVE=0 is a read-only run (#1039): rt_save reports success but the
+     * file must not be touched — a benchmark loop relies on the profile it measures
+     * staying frozen. Enforced in rt_save itself so every engine gets it. */
+    {
+        rt_counts(3)[4] = 99;
+#ifdef _WIN32
+        _putenv_s("USAGE_SAVE", "0");
+#else
+        setenv("USAGE_SAVE", "0", 1);
+#endif
+        long before = fsize(TMP);
+        check(rt_save(TMP, 1) == 1, "USAGE_SAVE=0: a requested skip is not a failure");
+        check(fsize(TMP) == before, "USAGE_SAVE=0: the history file is not rewritten");
+#ifdef _WIN32
+        _putenv_s("USAGE_SAVE", "1");
+#else
+        setenv("USAGE_SAVE", "1", 1);
+#endif
+        check(rt_save(TMP, 1) == 1, "USAGE_SAVE=1: saving works again");
+        check(fsize(TMP) != before, "USAGE_SAVE=1: the new counter reaches the file");
+#ifdef _WIN32
+        _putenv_s("USAGE_SAVE", "");
+#else
+        unsetenv("USAGE_SAVE");
+#endif
+    }
+
     remove(TMP);
     if(g_nfails){ printf("route_trace: %d FAILED\n", g_nfails); return 1; }
     printf("route_trace: empty-history size, round trip, legacy read, refusals, "
-           "admitted-only totals, trusted read, dropped rows, old-reader contract ok\n");
+           "admitted-only totals, trusted read, dropped rows, old-reader contract, "
+           "USAGE_SAVE=0 read-only ok\n");
     return 0;
 }

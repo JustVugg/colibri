@@ -168,15 +168,29 @@ class MessagesHTTPTest(unittest.TestCase):
                 self.assertEqual(self.engine.prompts[-1], renderer(messages))
 
     def test_non_glm_architectures_reject_tools_before_generation(self):
+        # kimi left this list in #1143: K3 tool calling is wired up now.
         body = self.base_body(tools=[{"name": "f", "input_schema": {"type": "object"}}])
-        for arch in ("inkling", "kimi"):
+        for arch in ("inkling",):
             with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
                 before = len(self.engine.prompts)
                 with self.assertRaises(HTTPError) as caught:
                     self.post(body)
+                self.addCleanup(caught.exception.close)
                 self.assertEqual(caught.exception.code, 400)
                 self.assertIn("tool", json.load(caught.exception)["error"]["message"].lower())
                 self.assertEqual(len(self.engine.prompts), before)
+
+    def test_kimi_renders_tools_as_k3chat1_records(self):
+        body = self.base_body(tools=[{"name": "f", "input_schema": {
+            "type": "object", "properties": {"x": {"type": "string"}}}}])
+        with patch("openai_server.ARCH", "kimi"):
+            with self.post(body) as response:
+                self.assertEqual(response.status, 200)
+        prompt = self.engine.prompts[-1]
+        self.assertIn("K3CHAT1", prompt)
+        self.assertIn("tool-declare# Tools", prompt)
+        self.assertIn('"name":"f"', prompt)
+        self.assertNotIn("<|open|>", prompt)   # records, never raw XTML
 
     def test_deepseek_v4_renders_tools_as_dsml_block(self):
         body = self.base_body(tools=[{"name": "f", "input_schema": {
@@ -197,11 +211,13 @@ class MessagesHTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
         with self.assertRaises(HTTPError) as caught:
             self.post(self.base_body(), {"x-api-key": "wrong"})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_error_envelope_is_anthropic_shaped(self):
         with self.assertRaises(HTTPError) as caught:
             self.post({"model": "test-model", "messages": [{"role": "user", "content": "x"}]})
+        self.addCleanup(caught.exception.close)
         payload = json.load(caught.exception)
         self.assertEqual(payload["type"], "error")
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
@@ -403,6 +419,7 @@ class MessagesHTTPTest(unittest.TestCase):
         for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):
             with self.assertRaises(HTTPError) as caught:
                 self.post(self.base_body(**{field: value}))
+            self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
             self.assertIn(field, json.load(caught.exception)["error"]["message"])
 

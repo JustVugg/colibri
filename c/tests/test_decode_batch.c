@@ -52,11 +52,104 @@ static void test_submit_header(void)
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512 extra", &sub));
 }
 
+/* U7a extension fields: key=value tokens from the 8th field onward. The two
+ * legacy arms stay byte-identical in behavior (asserted above); the third arm
+ * accepts only known keys with in-range values, so an unknown or malformed
+ * extension rejects the whole frame exactly like a trailing garbage field. */
+static void test_submit_extension_fields(void)
+{
+    ColiSubmit sub;
+    /* legacy headers leave the new capabilities off */
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95", &sub));
+    assert(sub.logprobs == 0 && sub.tok_ids == 0);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512", &sub));
+    assert(sub.logprobs == 0 && sub.tok_ids == 0);
+    /* the 8-field opt-in forms */
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5", &sub));
+    assert(sub.logprobs == 5 && sub.tok_ids == 0 && sub.gbytes == 0);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=1", &sub));
+    assert(sub.tok_ids == 1 && sub.logprobs == 0);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512 logprobs=32 ids=1", &sub));
+    assert(sub.logprobs == 32 && sub.tok_ids == 1 && sub.gbytes == 512);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=0 ids=0", &sub));
+    assert(sub.logprobs == 0 && sub.tok_ids == 0);
+    /* rejects: over-cap, out-of-range, unknown key, malformed token */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=33", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=2", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=7", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 =5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5x", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5 junk", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs", &sub));
+    /* glued numeric field + key: one malformed field, NOT "512" + an opt-in
+     * (%llu would otherwise stop at the first letter and silently split it) */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0ids=1", &sub));
+    /* duplicate keys: rejected outright, never silently last-wins */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=3 logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=1 ids=1", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=0 ids=0", &sub));
+    /* overflowing values: rejected by the bounded digit loop, no sscanf %llu
+     * ever sees the value (overflow there is UB; a wrapping libc would fold
+     * 2^64+5 back to an in-range 5) */
+    assert(!coli_submit_parse(
+        "SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=18446744073709551621", &sub));
+    assert(!coli_submit_parse(
+        "SUBMIT 42 3 17 64 0.7 0.95 0 ids=18446744073709551617", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=329", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=1000", &sub));
+    /* an extended header still validates the base fields */
+    assert(!coli_submit_parse("SUBMIT 0 3 17 64 0.7 0.95 0 logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95 0 logprobs=5", &sub));
+}
+
+/* U7a token-ID intake: the ids the caller formatted are exactly the ids that
+ * come back out (the zero-round-trip property) -- and malformed input never
+ * parses partially. */
+static void test_ids_parse_round_trip(void)
+{
+    /* fixed known-good example: format then parse must reproduce the array */
+    const int ids[6] = {0, 154822, 154824, 12, 7, 99999};
+    char buf[128];
+    int out[8], n, k;
+    n = snprintf(buf, sizeof(buf), "%d %d %d %d %d %d",
+                 ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+    assert(n > 0);
+    k = coli_ids_parse(buf, (size_t)n, out, 8, 160000);
+    assert(k == 6);
+    for (int i = 0; i < 6; i++) assert(out[i] == ids[i]);
+
+    /* whitespace forms: leading/trailing/newlines are all separators */
+    k = coli_ids_parse("  5\n7\t9  ", 9, out, 8, 100);
+    assert(k == 3 && out[0] == 5 && out[1] == 7 && out[2] == 9);
+
+    /* rejects: sign, non-digit, vocab bound (exact and above), garbage tail */
+    assert(coli_ids_parse("-1", 2, out, 8, 100) == -1);
+    assert(coli_ids_parse("5x", 2, out, 8, 100) == -1);
+    assert(coli_ids_parse("1 two 3", 7, out, 8, 100) == -1);
+    assert(coli_ids_parse("100", 3, out, 8, 100) == -1);   /* id == vocab */
+    assert(coli_ids_parse("99", 2, out, 8, 100) == 1 && out[0] == 99);
+    assert(coli_ids_parse("101", 3, out, 8, 100) == -1);
+    assert(coli_ids_parse("123456789012345", 15, out, 8, 100) == -1);
+
+    /* empty payload parses to zero ids (the caller's EMPTY_PROMPT arm) */
+    assert(coli_ids_parse("   ", 3, out, 8, 100) == 0);
+
+    /* overflow reports the cap so the caller's context check refuses loudly,
+     * mirroring tok_encode's stop-at-cap contract (#401) */
+    assert(coli_ids_parse("1 2 3 4 5", 9, out, 4, 100) == 4);
+    assert(coli_ids_parse("1 2 3 4", 7, out, 4, 100) == 4);
+}
+
 int main(void)
 {
     test_rows_use_their_own_sequence_storage();
     test_const_reader_selects_the_same_row();
     test_submit_header();
+    test_submit_extension_fields();
+    test_ids_parse_round_trip();
     puts("decode batch helper tests: ok");
     return 0;
 }

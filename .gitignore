@@ -121,9 +121,19 @@ c/tiny_inkling/
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
 
+# DeepGEMM sm120 checkout made by c/tools/fetch_deepgemm.sh (pinned commit,
+# not vendored): the DeepSeek V4 DeepGEMM flavour's headers.
+c/third_party/deepgemm/
+
 # DLL flavours + MSVC import/export artifacts of the V4 CUDA tier (regenerated
 # by cuda-dsv4-dll / cuda-dsv4-dg-dll); the loader picks the DLL at runtime.
 c/coli_cuda_dsv4*.dll
 c/coli_cuda_dsv4*.lib
 c/coli_cuda_dsv4*.exp
 c/*.obj
+# macOS
+.DS_Store
+**/.DS_Store
+
+# compiled objects
+*.o

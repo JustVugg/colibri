@@ -21,6 +21,7 @@ tests/fuzz_rans
 tests/bench_omp_grain
 tests/mxfp4_ref.o
 mxfp4_cuda_test
+absorb_determinism_test
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped
@@ -36,6 +37,9 @@ tests/test_int3_load
 tests/test_tok_o200k
 tests/test_pipe_block
 tests/test_kimi_request_state
+tests/test_kimi_serve_framing
+tests/test_v4_serve_framing
+tests/test_inkling_serve_framing
 *.o
 *.dll
 cublasLt64*.dll

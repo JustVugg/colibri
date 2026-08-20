@@ -18,9 +18,9 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Five families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T), **DeepSeek V4 Flash** (284B) and **OLMoE** (7B) — one C file each, the
-same `coli chat` / `coli serve` / `coli web` front end.
+Six families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T), **DeepSeek V4 Flash** (284B), **Qwen3.6** (35B-A3B) and **OLMoE** (7B) —
+one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
@@ -390,7 +390,7 @@ the full 756 GB on disk at once:
 
 #### Other supported models
 
-GLM-5.2 is the reference model, but the same streaming approach runs three more
+GLM-5.2 is the reference model, but the same streaming approach runs five more
 families. Each is a **sibling engine** — one C file, its own architecture, the same
 `coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
 the model's `config.json`):
@@ -407,6 +407,7 @@ the model's `config.json`):
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; an NVIDIA card (any sm_80+, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
+> | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -418,7 +419,16 @@ the model's `config.json`):
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
+| **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+
+Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
+cosine to the int8 anchor 0.98777 → 0.99313 and KL 0.109 → 0.080 against per-row, i.e.
+~44% less quantization error), [int4 per-row](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4)
+as the A/B baseline, and [KAT-Coder v2.5](https://huggingface.co/Kreuzzelg/kat-coder-v2.5-dev-colibri-i4-gs64),
+which the same engine runs unchanged — any architecture-identical checkpoint works
+without a code path of its own. With `CUDA=1` the VRAM expert tier measured
+**1.44 → 10.05 tok/s (7.0×) on two 8 GB cards**, output bit-identical to the CPU path.
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.

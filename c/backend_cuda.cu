@@ -683,6 +683,9 @@ __global__ static void grouped_s4_wmma(float *y,const uint8_t *x,const float *xs
         wmma::mma_sync(acc,af,bf,acc);
     }
     __shared__ int out[8][64]; wmma::store_matrix_sync(out[warp],acc,8,wmma::mem_row_major);
+    __syncwarp();   /* i due fratelli sopra la portano; stessa lettura cross-lane di out[warp]
+                     * subito sotto -> stesso requisito di visibilita' (racecheck: 3 hazard qui).
+                     * EN: the two sibling kernels carry this; same cross-lane read follows. */
     for(int i=lane;i<64;i+=32){int s=i/8,o=tile*8+i%8;
         if(s<d.rows&&o<O)y[(size_t)(d.offset+s)*O+o]=(float)out[warp][i]*xscale[d.offset+s]*ws[o];}
 #endif
@@ -990,6 +993,7 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
     float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    __syncthreads(); /* every warp must read red[0] above before red[] is reused below */
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -1025,6 +1029,7 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
     float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    __syncthreads(); /* every warp must read red[0] above before red[] is reused below */
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -1362,12 +1367,18 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         t->ng = (I + 127) / 128;
         t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
     }
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
-        !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
+    /* Ownership is a fact of the allocation, not the copy: set it BEFORE the
+     * memcpy, or a failed H2D upload frees the tensor while weights_owned is
+     * still 0 and free()'s ownership gate leaks the device buffer. */
     t->weights_owned=1;
+    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+        coli_cuda_tensor_free(t);
+        return 0;
+    }
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
@@ -2282,17 +2293,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
-        int ng = tensor->ng > 0 ? tensor->ng : 1;
-        /* Must mirror the upload's accounting exactly: fmt=6 never charged for a
-         * scale buffer, and over-subtracting here trips the >= guard below, which
-         * silently leaves the tensor's bytes on the device counter forever. */
+        /* Must mirror the upload's accounting exactly -- literally the same
+         * expression upload uses to charge (scale_count * sizeof(float), gated
+         * on fmt=6 never having a separate scale buffer), so the two can no
+         * longer drift independently. Over-subtracting here trips the >= guard
+         * below, which silently leaves the tensor's bytes on the device counter
+         * forever. */
         size_t storage_bytes =
 #ifdef COLI_ANS
             tensor->compressed ? tensor->archive_bytes :
 #endif
             tensor->weight_bytes;
         size_t bytes = storage_bytes +
-            ((tensor->fmt && tensor->fmt != 6) ? (size_t)tensor->O * ng * sizeof(float) : 0);
+            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -2304,19 +2317,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
+    /* Must mirror upload's and free's accounting exactly -- literally the same
+     * expression they use (scale_count * sizeof(float), gated on fmt=6 never
+     * having a separate scale buffer) -- so all three can no longer drift
+     * independently. The prior `O * ng` shape over-reported for fmt=8 (real
+     * footprint is (O+127)/128 * ng block scales, not O * ng) and for fmt=6
+     * (which has no separate scale buffer at all). */
     size_t storage_bytes =
 #ifdef COLI_ANS
         tensor->compressed ? tensor->archive_bytes :
 #endif
         tensor->weight_bytes;
-    /* Report exactly what upload charged to the device counter.  In
-     * particular, fmt=6/E8 stores scales inside each weight block and has no
-     * separate scale allocation. */
     return storage_bytes +
-        ((tensor->fmt && tensor->fmt != 6)
-             ? (size_t)tensor->O * ng * sizeof(float)
-             : 0);
+        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

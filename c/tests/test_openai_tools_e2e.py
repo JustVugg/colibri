@@ -98,7 +98,8 @@ class ToolCallingE2E(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{cls.port}/v1"
         for _ in range(100):
             try:
-                urllib.request.urlopen(cls.base + "/models", timeout=2)
+                with urllib.request.urlopen(cls.base + "/models", timeout=2):
+                    pass
                 return
             except OSError:
                 if cls.server.poll() is not None:
@@ -117,15 +118,15 @@ class ToolCallingE2E(unittest.TestCase):
         req = urllib.request.Request(
             self.base + "/chat/completions", json.dumps(body).encode(),
             {"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        if not stream:
-            return json.loads(resp.read())
-        events = []
-        for raw in resp:
-            line = raw.decode().strip()
-            if line.startswith("data: ") and line != "data: [DONE]":
-                events.append(json.loads(line[6:]))
-        return events
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if not stream:
+                return json.loads(resp.read())
+            events = []
+            for raw in resp:
+                line = raw.decode().strip()
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    events.append(json.loads(line[6:]))
+            return events
 
     def test_tool_call_non_stream(self):
         r = self.post({"model": MODEL_ID, "tools": TOOLS,

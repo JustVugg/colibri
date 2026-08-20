@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — motore piccolo, modello immenso">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì — motore piccolo, modello immenso">
 </p>
 
 <p align="center">
@@ -12,9 +12,9 @@ miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogen
 in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
-Oggi girano quattro famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia `coli chat` /
-`coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+Oggi girano sei famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2,8T), **DeepSeek V4 Flash** (284B), **Qwen3.6** (35B-A3B) e **OLMoE** (7B) — un
+file C ciascuna, la stessa interfaccia `coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
 
 > **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
 > ricerca aperta.** Il suo obiettivo principale è migliorare le prestazioni di

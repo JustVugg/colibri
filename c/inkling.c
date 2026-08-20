@@ -39,6 +39,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
+#include "serve_codec.h"
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -1105,8 +1106,7 @@ static int usage_save(Model *m, const char *snap) {
     (void)m;                              /* the counters live in route_trace.h now */
     char up[2048];
     const char *env = getenv("PIN");
-    const char *sv = getenv("USAGE_SAVE");
-    if (sv && *sv == '0') return 0;
+    /* USAGE_SAVE=0 is honoured inside rt_save itself (#1039) */
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
@@ -1383,7 +1383,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         sxoff[ns] = ns*S;
-        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, sgp, sup, sdp,
+        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, 0, sgp, sup, sdp,
                                           sscale, sscale, sscale,
                                           sxg, sxoff, snr, srows, srw);
         free(srows);
@@ -1466,7 +1466,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * the round; shared_done stays set either way. */
                 if (base + cap >= npair && !sh_h) {
                     ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
-                        nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                        nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
                     if (h) {
                         double ts = now_s();
@@ -1480,7 +1480,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                         te = now_s();                      /* fault: CPU redo below */
                     }
                 }
-                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                                          mxg, mxoff, mnr, mrows, mrw, out, S)) {
                     m->t_expert += now_s() - te;
                     continue;                              /* round done on the GPU */
@@ -1858,6 +1858,22 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
                  uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile inkling_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_extension_bytes = 1u << 26,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+    .allow_extension_bytes = 1,
+    .allow_prefix_hint = 0,
+};
+
+static void serve_request_dispose(SReq *request) {
+    if (!request) return;
+    free(request->payload);
+    memset(request, 0, sizeof(*request));
+}
 
 static int stdin_readable(void) {
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
@@ -1867,15 +1883,16 @@ static int stdin_readable(void) {
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok, alen = 0; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
+static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result=coli_serve_read_command(input,&inkling_wire,&command);
+    if(result==COLI_SERVE_READ_EOF) return -1;
+    if(result==COLI_SERVE_READ_BAD_FRAME) return -2;
+    if(result==COLI_SERVE_READ_NOMEM){
+        coli_serve_write_error(output,command.id,"out of memory"); return -2;
+    }
+    if(result==COLI_SERVE_READ_BAD_REQUEST&&
+       command.kind==COLI_SERVE_COMMAND_SUBMIT){
         /* 6th field (optional, backward compatible): DMel byte count appended
          * verbatim after the text payload — frames x mel_bins u8 levels */
         /* SEC: max_tok was the one field nobody validated, and it is the one
@@ -1891,45 +1908,48 @@ static int serve_read_cmd(const char *cur_id) {
          * anything bridging it (socat, a custom gateway, a sidecar) exposes it
          * directly, so the check belongs here, next to the one plen already
          * has, rather than in one of its callers. */
-        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
-            max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        uint8_t *au = NULL;
-        if (alen > 0) {
-            au = malloc((size_t)alen);
-            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
-        }
-        int nl = fgetc(stdin); (void)nl;
+        coli_serve_write_error(output,command.id,"bad submit header"); return -2;
+    }
+    if(result!=COLI_SERVE_READ_OK) return 0;
+    if(command.kind==COLI_SERVE_COMMAND_CANCEL){
+        int matched=cur_id&&!strcmp(command.id,cur_id);
+        coli_serve_command_dispose(&command); return matched;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_STOP){
+        coli_serve_command_dispose(&command); return 0;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-            q->audio = au; q->alen = alen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok=command.max_tokens; q->temp=command.temperature;
+            q->top_p=command.top_p; q->plen=(int)command.payload_bytes;
+            q->alen=(int)command.extension_bytes;
+            q->audio=coli_serve_command_extension(&command);
+            q->payload=(char*)coli_serve_command_take_payload(&command);
+        } else coli_serve_write_error(output,command.id,"queue full");
     }
+    coli_serve_command_dispose(&command);
     return 0;
 }
 
-static void serve_one(Model *m, Tok *T, SReq *q) {
+static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
-    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
     const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (bad) { coli_serve_write_error(stdout,q->id,bad); free(ids); return 0; }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
-        printf("ERROR %s audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
-               q->id, naud, audio_tok_count(m, ids, np),
-               m->audio_norm ? "" : " — snapshot has no audio tensors");
-        fflush(stdout); free(ids); return;
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "audio frames (%d) do not match <|audio|> placeholders (%d)%s",
+                 naud,audio_tok_count(m,ids,np),
+                 m->audio_norm?"":" — snapshot has no audio tensors");
+        coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -1988,13 +2008,11 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         if (nhist < 128) hist[nhist++] = tk;
         else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
-        printf("DATA %s %d\n", q->id, nb);
-        fwrite(buf, 1, (size_t)nb, stdout);
-        fputc('\n', stdout); fflush(stdout);
+        coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
         while (stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
@@ -2003,14 +2021,18 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    ColiServeDone done={gen,dt>0?gen/dt:0.0,
+                        tot?100.0*(m->hits-h0)/tot:0.0,rss_gb(),np,limited};
+    char done_line[256];
+    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),q->id,&done);
+    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
     fflush(stdout);
     free(ids);
+    return 0;
 }
 
 /* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
@@ -2077,25 +2099,23 @@ static void serve_loop(Model *m, Tok *T) {
      * as \r\n, the gateway never matches it and waits forever (#748). Lives in
      * compat.h because colibri.c has had it since #195 and this engine was
      * written without it. */
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
+    coli_serve_stdio_init();
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
     else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
     /* the gateway reads a STAT line right after the READY sentinel (colibri
      * reports its load stats there) — match the handshake */
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
-    fflush(stdout);
+    coli_serve_write_ready(stdout,rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q);
+        int fatal=serve_one(m,T,&q);
         serve_tiers_emap(m);
-        free(q.payload); free(q.audio);
+        serve_request_dispose(&q);
+        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
     }
 }
 

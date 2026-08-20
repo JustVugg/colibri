@@ -113,6 +113,48 @@ int main(void){
         free(qp);free(ql);free(sc);free(x);free(ya);free(yb);
     }
 #endif
+    /* K1b: matmul_i4p_grouped_idot vs riferimento C puro con lo STESSO ordine
+     * float (per-gruppo: int esatto -> fmaf con la scala; poi * sx). Il kernel
+     * e' opt-in e non-bit-identico al f32 a gruppi; contro il SUO riferimento
+     * deve invece essere esatto al bit su ogni ISA. Copre gs=64 e gs=128
+     * (bpg=2) e una coda I%gs!=0. */
+    {
+        int cases[][2]={{64,2048},{128,2048},{64,2000}};
+        for(int t=0;t<3;t++){
+            int gs=cases[t][0], I=cases[t][1], O=128, S=3;
+            int rb=(I+1)/2, ng=(I+gs-1)/gs;
+            uint8_t *qp=malloc((size_t)O*rb); for(size_t i=0;i<(size_t)O*rb;i++) qp[i]=(uint8_t)rnd();
+            uint8_t *ql=malloc((size_t)O*rb); memcpy(ql,qp,(size_t)O*rb); planarize_i4(ql,O,I);
+            float *sc=malloc((size_t)O*ng*sizeof(float));
+            for(size_t i=0;i<(size_t)O*ng;i++) sc[i]=0.0005f+(rnd()%911)*1e-6f;
+            int8_t *xq=malloc((size_t)S*I); for(size_t i=0;i<(size_t)S*I;i++) xq[i]=rnd_x();
+            float *sx=malloc(S*sizeof(float)); for(int s=0;s<S;s++) sx[s]=0.01f+(rnd()%89)*1e-4f;
+            int32_t *xsg=malloc((size_t)S*ng*sizeof(int32_t));
+            for(int s=0;s<S;s++) for(int g=0;g<ng;g++){
+                int base=g*gs,end=base+gs; if(end>I) end=I;
+                int32_t a=0; for(int i=base;i<end;i++) a+=xq[(size_t)s*I+i]; xsg[(size_t)s*ng+g]=a; }
+            float *ya=malloc((size_t)S*O*sizeof(float)), *yb=malloc((size_t)S*O*sizeof(float));
+            /* riferimento: dot int per gruppo sul layout A COPPIE (pesi logici) */
+            for(int o=0;o<O;o++) for(int s=0;s<S;s++){
+                float a=0;
+                for(int g=0;g<ng;g++){
+                    int base=g*gs,end=base+gs; if(end>I) end=I;
+                    int64_t d=0;
+                    for(int i=base;i<end;i++){
+                        uint8_t byte=qp[(size_t)o*rb+(i>>1)];
+                        d+=(int64_t)((i&1)?(byte>>4):(byte&0xF))*xq[(size_t)s*I+i];
+                    }
+                    a=fmaf((float)((int32_t)d-8*xsg[(size_t)s*ng+g]),sc[(size_t)o*ng+g],a);
+                }
+                ya[(size_t)s*O+o]=a*sx[s];
+            }
+            matmul_i4p_grouped_idot(yb,xq,sx,xsg,ql,sc,S,I,O,gs);
+            for(size_t i=0;i<(size_t)S*O;i++){ checks++;
+                if(memcmp(&ya[i],&yb[i],4)){ fails++;
+                    fprintf(stderr,"FAIL grouped_idot gs=%d I=%d @%zu\n",gs,I,i); if(fails>8) break; } }
+            free(qp);free(ql);free(sc);free(xq);free(sx);free(xsg);free(ya);free(yb);
+        }
+    }
     printf("int-kernel exactness: %d checks, %d failures (%s / " IDOT_KERNEL ")\n",
            checks,fails,fails?"FAIL":"PASS");
     return fails?1:0;

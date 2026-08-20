@@ -40,6 +40,7 @@
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #ifdef __linux__
 #include <sys/syscall.h>                          /* COLI_NUMA: mbind degli slab expert / expert-slab interleave */
+#include <malloc.h>                               /* Needed to actually free memory if we go over our RAM budget */
 #endif
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
@@ -402,9 +403,23 @@ static void eslot_release(ESlot *s){
 static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
 static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
 static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
-static int eslot_lru_victim(ESlot *slots,int n){
-    int lru=-1;
-    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||slots[i].used<slots[lru].used)) lru=i;
+/* Victim per una riga piena (#1034): uno slot svuotato da rss_guard (eid=-1,
+ * slab=NULL) e' riusabile SOLO finche' gli slab vivi della riga stanno sotto
+ * ecap — riusarlo rialloca uno slab, quindi e' crescita, non eviction. Le
+ * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
+ * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
+ * EN: while the row's live-slab count is under ecap; else pick a slab owner. */
+static int eslot_lru_victim(ESlot *slots,int n,int ecap){
+    int lru=-1, empty=-1, live=0;
+    for(int i=0;i<n;i++){
+        ESlot *s=&slots[i];
+        if(s->slab || s->eid<-1) live++;
+        if(eslot_busy(s) || s->eid<-1) continue;
+        if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
+        if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
+        if(lru<0 || s->used<slots[lru].used) lru=i;
+    }
+    if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
     return lru;
 }
 
@@ -507,6 +522,37 @@ typedef struct {
 } Model;
 
 #include "quant.h"
+
+/* Runtime policy knobs used only by the GLM engine.  Keep them here rather
+ * than in quant.h: that header is shared by standalone kernel tests and
+ * sibling engines, where translation-unit-local copies are unused and trip
+ * -Wunused-variable. */
+static int g_idot=1;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static int g_i4s=1;
+#elif defined(__VSX__)
+static int g_i4s=1;
+#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
+static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
+                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
+                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
+                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
+                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
+#else
+static int g_i4s=2;
+#endif
+static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
+                       * region across all experts of the batch-union block instead of ~2
+                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
+                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
+                       * byte-identical to that family (same dot_i4i8 per row, same silu,
+                       * same requant, same accumulation order into out). Measured on a
+                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
+                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
+                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
+                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
+                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
+                       * opt-in; measure on your host. */
 static int g_no_fused_pair=0;
 static int g_spec_pin=1;
 static int g_spec_live=0;
@@ -524,7 +570,7 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&!wg->planar&&!wu->planar&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
-    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
+    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&!wg->planar&&!wu->planar&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
         matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
@@ -749,6 +795,38 @@ static double rss_gb(void){
 #endif
 #endif
 }
+#ifdef __linux__
+static double current_rss_gb(void) {
+  FILE *f = fopen("/proc/self/status", "r");
+  static int announced_proc_failure;
+  if (!f) {
+    if(!announced_proc_failure) {
+      announced_proc_failure=1;
+      fprintf(stderr, "[RSS] failed to open /proc/self/status, cannot measure current memory usage. Falling back to peak memory usage measurement.\n");
+    }
+    return rss_gb();  /*Return peak memory usage if we can't measure current usage*/
+  }
+
+  char line[256];
+  unsigned long long kb = 0;
+
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, "VmRSS:", 6) == 0) {
+      if (sscanf(line + 6, "%llu", &kb) == 1) {
+        fclose(f);
+        return (double)kb / (1024.0 * 1024.0);
+      }
+    }
+  }
+
+  fclose(f);
+  if(!announced_proc_failure) {
+    announced_proc_failure=1;
+    fprintf(stderr, "[RSS] failed to find VmRSS in /proc/self/status, cannot measure current memory usage. Falling back to peak memory usage measurement.\n");
+  }
+  return rss_gb();   /*Return peak memory usage if we can't measure current usage*/
+}
+#endif
 /* ---- PROF=1: opt-in performance profile ----------------------------------
  * Records per-forward decode latency and expert-file bytes fetched, then
  * reports percentiles, I/O totals, phase shares and a tuning verdict next to
@@ -1024,8 +1102,23 @@ static int planar_on(void){
     return g_planar;
 }
 static _Atomic long g_planar_n;   /* tensori planarizzati (telemetria una-tantum) */
+/* K1b: IDOT a gruppi per fmt=4 (gs%64==0) — OPT-IN, cambia le numeriche
+ * (attivazioni int8): resta 0 finche' l'ablazione non benedice un default.
+ * EN: opt-in grouped IDOT for fmt=4; int8 activations, awaiting ablation. */
+static int g_idot_gs=-1;
+static int idot_gs_on(void){
+    if(g_idot_gs<0){ const char *e=getenv("IDOT_GS"); g_idot_gs=(e&&atoi(e))?1:0;
+        if(g_idot_gs&&!planar_on()) g_idot_gs=0;   /* richiede la famiglia planare */
+        if(g_idot_gs) fprintf(stderr,"[K1b] grouped planar IDOT active for gs64 tensors (opt-in)\n"); }
+    return g_idot_gs;
+}
 static void qt_planarize(QT *t){
-    if(!planar_on()||t->fmt!=2||t->planar||!t->q4) return;
+    if(!planar_on()||t->planar||!t->q4) return;
+    if(t->fmt==4){
+        if(!idot_gs_on()||t->gs<64||t->gs%64) return;   /* K1b: solo su opt-in */
+        planarize_i4(t->q4,t->O,t->I); t->planar=1; return;
+    }
+    if(t->fmt!=2) return;
     planarize_i4(t->q4,t->O,t->I); t->planar=1;
     if(atomic_fetch_add_explicit(&g_planar_n,1,memory_order_relaxed)==0)
         fprintf(stderr,"[K1] planar int4 layout active (PLANAR=0 disables)\n");
@@ -1070,8 +1163,8 @@ static inline int pq_want(const QT *g,const QT *u,int nr){
     if(!g_idot) return 0;
     if(nr==1 && !g_no_fused_pair && !spec_pinned() &&
        g->fmt==2 && u->fmt==2 && g->I==u->I && g->O==u->O) return 0;
-    int a = g->fmt==1 || (g->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
-    int b = u->fmt==1 || (u->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
+    int a = g->fmt==1 || (g->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)) || (g->fmt==4 && g->planar);
+    int b = u->fmt==1 || (u->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)) || (u->fmt==4 && u->planar);
     return a || b;
 }
 
@@ -1116,7 +1209,32 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
+    if(w->fmt==4){
+        if(w->planar){
+            /* K1b: quantizza le attivazioni (o riusa il contesto g_pq) e calcola le
+             * somme per (riga, gruppo) — il termine -8*sum del dot unsigned.
+             * EN: grouped planar IDOT — int8 activations + per-(row,group) sums. */
+            int I=w->I, ng=(I+w->gs-1)/w->gs; int8_t *xq; float *sx;
+            if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
+            if(g_pq.x==x && g_pq.S==S && g_pq.I==I){ xq=(int8_t*)g_pq.xq; sx=(float*)g_pq.sx; }
+            else {
+                quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+                for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+            }
+            static _Thread_local int32_t *xsg; static _Thread_local size_t xsg_cap;
+            if((size_t)S*ng>xsg_cap){ free(xsg); xsg=malloc((size_t)S*ng*sizeof(int32_t));
+                xsg_cap=xsg?(size_t)S*ng:0; if(!xsg){ fprintf(stderr,"OOM xsg\n"); exit(1); } }
+            for(int s=0;s<S;s++) for(int g=0;g<ng;g++){
+                int base=g*w->gs, end=base+w->gs; if(end>I) end=I;
+                int32_t t2=0; const int8_t *r2=xq+(int64_t)s*I;
+                for(int i=base;i<end;i++) t2+=r2[i];
+                xsg[(int64_t)s*ng+g]=t2;
+            }
+            matmul_i4p_grouped_idot(y,xq,sx,xsg,w->q4,w->s,S,I,w->O,w->gs);
+            return;
+        }
+        matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return;
+    }
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
@@ -1756,8 +1874,55 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
  * expert, vedi il commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
 static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, QT *u, QT *d, int nr, int I){
     expert_gate_up(gg,uu,xg,g,u,nr);
+    /* K3: silu*up in parallelo — per-elemento, nessun ordine condiviso: gli
+     * stessi bit in qualunque schedulazione. Sotto soglia resta seriale (il
+     * fork/join costerebbe piu' del loop).
+     * EN: elementwise silu*up, parallel above a size threshold; per-element
+     * math has no shared accumulation order, so bits are unchanged. */
+    #pragma omp parallel for schedule(static) if((int64_t)nr*I>=16384)
     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
     if(d->fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
+#if !defined(COLI_CUDA)&&!defined(COLI_METAL)&&!defined(COLI_VULKAN)
+    /* K3: la meta' mancante di #1071 — la 0.1 sollevo' la quantizzazione della
+     * x di gate/up; la h del down restava SERIALE dentro matmul_qt_ex, una
+     * volta per expert. Se il down prendera' l'IDOT, quantizza h QUI (righe in
+     * parallelo, stessa qrow_i8: byte identici) e pubblica il contesto g_pq
+     * che matmul_qt_ex gia' consuma. Azzerato subito dopo: gg viene riscritto
+     * dal prossimo expert e un match stantio leggerebbe spazzatura.
+     * EN: the down-side half of #1071. If the down matmul will take the IDOT
+     * branch, quantize h here (rows in parallel, same qrow_i8 -> identical
+     * bytes) and publish the g_pq context matmul_qt_ex already consumes;
+     * cleared right after so no stale match can outlive this call. */
+    if(g_idot && (d->fmt==1 || (d->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)) || (d->fmt==4 && d->planar))){
+        static _Thread_local int8_t *hq; static _Thread_local size_t hq_cap;
+        static _Thread_local float *hsx; static _Thread_local int32_t *hxs;
+        static _Thread_local size_t hrow_cap;
+        if((size_t)nr*I>hq_cap){ free(hq); hq=malloc((size_t)nr*I);
+            hq_cap=hq?(size_t)nr*I:0; }
+        if((size_t)nr>hrow_cap){ free(hsx); free(hxs);
+            hsx=malloc((size_t)nr*sizeof(float)); hxs=malloc((size_t)nr*sizeof(int32_t));
+            hrow_cap=(hsx&&hxs)?(size_t)nr:0; }
+        if(hq && hrow_cap>=(size_t)nr){
+            /* copie locali PRIMA della regione: dentro l'omp parallel ogni
+             * worker risolve la PROPRIA _Thread_local (NULL), non quella del
+             * master — referenziarle direttamente li' segfaulta.
+             * EN: locals before the region — TLS variables are re-resolved
+             * per thread inside omp parallel; workers would see NULL. */
+            int8_t *hq_=hq; float *hsx_=hsx; int32_t *hxs_=hxs;
+            #pragma omp parallel for schedule(static) if(nr>=4)
+            for(int r=0;r<nr;r++){
+                hsx_[r]=qrow_i8(gg+(int64_t)r*I, hq_+(int64_t)r*I, I);
+                int32_t t=0; const int8_t *row=hq_+(int64_t)r*I;
+                for(int i=0;i<I;i++) t+=row[i];
+                hxs_[r]=t;
+            }
+            g_pq.x=gg; g_pq.S=nr; g_pq.I=I; g_pq.xq=hq; g_pq.sx=hsx; g_pq.xsum=hxs;
+            matmul_qt(hh, gg, d, nr);
+            g_pq.x=NULL;
+            return;
+        }
+    }
+#endif
     matmul_qt(hh, gg, d, nr);
 }
 
@@ -4847,8 +5012,136 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     /* 2) ricostruzione di k_nope+value per TUTTI i token 0..Tk-1 (un solo matmul su kv_b) */
     m->t_aproj+=now_s()-ta0; double tk0=now_s();
     int stL=m->kv_start[layer];
-    float *kvb_all=falloc((int64_t)Tk*kvb_dim);
-    matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    /* #768 (cause 2): the one-shot kvb_all buffer is Tk*H*(qk_nope+v_head) floats —
+     * 30.1 GB at ctx 262144 — and cap_for_ram reserves it PERMANENTLY even though it
+     * only exists during prefill; that reservation is what starves the expert cache
+     * at long context (5.46 -> 0.86 tok/s). Above KVB_FLASH_MB the reconstruction is
+     * tiled instead: rebuild kv_b for KVB_TILE_MB worth of tokens at a time and fold
+     * scores/values through an online (flash-style) softmax. Same rebuild total (one
+     * matmul pass over the context), same t-order for scores and values; only the
+     * softmax normalisation is applied incrementally, so the output can differ from
+     * the one-shot path by rounding — the same kernel-family divergence class as the
+     * CUDA/Metal attention arms (#510). Peak transient drops from Tk*kvb_dim*4 to the
+     * tile plus 2 floats per (row,head). DSA rows (dnsel) keep the one-shot path: the
+     * top-keep list is scanned in its two-band order and is not tileable by t-range.
+     * KVB_FLASH_MB=0 disables tiling entirely; KVB_FLASH=1 forces it at any size. */
+    int dsa_any=0; if(dnsel) for(int s=0;s<S && !dsa_any;s++) if(dnsel[s]>0) dsa_any=1;
+    int64_t kvb_rows=(int64_t)Tk-stL, kvb_need=kvb_rows*kvb_dim*4;
+    int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
+    int use_flash=!dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576;
+    if(getenv("KVB_FLASH")) use_flash=!dsa_any && atoi(getenv("KVB_FLASH"))!=0;
+    if(use_flash){
+        int64_t tile_mb=getenv("KVB_TILE_MB")?atoll(getenv("KVB_TILE_MB")):512;
+        int64_t tile=tile_mb*1048576/((int64_t)kvb_dim*4);
+        if(tile<256) tile=256; if(tile>kvb_rows) tile=kvb_rows;
+        static int said; if(!said){ said=1;
+            fprintf(stderr,"[ATTN] kvb reconstruction tiled (#768): %.1f GB one-shot buffer "
+                "-> %.0f MB tiles, online softmax (KVB_FLASH_MB=0 restores one-shot)\n",
+                kvb_need/1e9, tile*(double)kvb_dim*4/1048576.0);
+        }
+        m->t_kvb += now_s()-tk0;
+        float *kvb_tile=falloc(tile*kvb_dim);
+        float *ml=falloc((int64_t)S*H*2);              /* running (max, sum) per (row, head) */
+        double tac=now_s(), kvb_acc=0;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+            ml[((int64_t)s*H+h)*2]=-1e30f; ml[((int64_t)s*H+h)*2+1]=0.f;
+            float *cx=ctx+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++) cx[d]=0;
+        }
+        for(int64_t t0=stL; t0<Tk; t0+=tile){
+            int64_t tn=Tk-t0<tile?Tk-t0:tile;
+            double tk1=now_s();
+            matmul_qt(kvb_tile, m->Lc[layer]+t0*c->kv_lora, &l->kv_b, (int)tn);
+            kvb_acc+=now_s()-tk1;
+            #pragma omp parallel for collapse(2) schedule(static,1)
+            for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+                int pos=pos_base+s;
+                int64_t nt=(int64_t)pos+1-stL;         /* causal length of this row */
+                if(t0-stL>=nt) continue;
+                int64_t jn=nt-(t0-stL); if(jn>tn) jn=tn;
+                const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh, *qr=qp+c->qk_nope;
+                float *st=ml+((int64_t)s*H+h)*2, *cx=ctx+((int64_t)s*H+h)*vh;
+                float mrun=st[0], lrun=st[1];
+                for(int64_t jj=0;jj<jn;jj++){
+                    const float *kn=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh);
+                    const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
+                    float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
+                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                    a*=c->attn_scale;
+                    const float *vv=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
+                    if(a>mrun){
+                        float rs=expf(mrun-a);
+                        lrun*=rs; for(int d=0;d<vh;d++) cx[d]*=rs;
+                        mrun=a;
+                    }
+                    float w=expf(a-mrun);
+                    lrun+=w; for(int d=0;d<vh;d++) cx[d]+=w*vv[d];
+                }
+                st[0]=mrun; st[1]=lrun;
+            }
+        }
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+            float lrun=ml[((int64_t)s*H+h)*2+1];
+            float *cx=ctx+((int64_t)s*H+h)*vh;
+            if(lrun>0) for(int d=0;d<vh;d++) cx[d]/=lrun;
+        }
+        free(kvb_tile); free(ml);
+        m->t_kvb+=kvb_acc; m->t_acore+=now_s()-tac-kvb_acc; double tao=now_s();
+        matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
+        free(ctx); free(Q); free(QR); free(comp);
+        m->t_attn += now_s()-ta0;
+        return;
+    }
+    /* #768 follow-up (DSA): the loops below read only the top-keep rows, yet the
+     * one-shot matmul rebuilt ALL Tk rows — the same 30 GB paid for a top-k read.
+     * Past the same ceiling, rebuild only the UNION of selected rows: each row's
+     * rebuild is independent and the read order (jj along each tlist) is unchanged,
+     * so this is bit-identical to the one-shot path. Rows with ns==0 scan their full
+     * causal range and force those rows into the union; if the union does not at
+     * least halve the buffer, fall back to one-shot (gather overhead without the
+     * memory win). kvb_map: row t -> compact index, -1 = not rebuilt (never read). */
+    float *kvb_all=NULL; int32_t *kvb_map=NULL;
+    if(dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576){
+        uint8_t *want=calloc((size_t)kvb_rows,1);
+        if(want){
+            for(int s=0;s<S;s++){
+                int ns=dnsel[s];
+                if(ns>0){ const int *tl=dsel+(int64_t)s*dtopk;
+                    for(int j=0;j<ns;j++){ int64_t r=(int64_t)tl[j]-stL;
+                        if(r>=0&&r<kvb_rows) want[r]=1; } }
+                else { int64_t upto=(int64_t)pos_base+s+1-stL;
+                    if(upto>kvb_rows) upto=kvb_rows;
+                    if(upto>0) memset(want,1,(size_t)upto); }
+            }
+            int64_t un=0; for(int64_t r=0;r<kvb_rows;r++) if(want[r]) un++;
+            if(un>0 && un<kvb_rows/2){
+                kvb_map=malloc((size_t)kvb_rows*sizeof(int32_t));
+                if(kvb_map){
+                    float *Lg=falloc(un*c->kv_lora); int64_t w=0;
+                    for(int64_t r=0;r<kvb_rows;r++){
+                        if(want[r]){ memcpy(Lg+w*c->kv_lora,
+                                m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
+                                (size_t)c->kv_lora*sizeof(float));
+                            kvb_map[r]=(int32_t)w; w++; }
+                        else kvb_map[r]=-1;
+                    }
+                    kvb_all=falloc(un*kvb_dim);
+                    matmul_qt(kvb_all, Lg, &l->kv_b, (int)un);
+                    free(Lg);
+                    static int said_dsa; if(!said_dsa){ said_dsa=1;
+                        fprintf(stderr,"[ATTN] DSA kvb rebuild gathered (#768): %lld of %lld rows "
+                            "(%.1f -> %.1f GB)\n",(long long)un,(long long)kvb_rows,
+                            kvb_need/1e9, un*(double)kvb_dim*4/1e9); }
+                }
+            }
+            free(want);
+        }
+    }
+    if(!kvb_map){
+        kvb_all=falloc((int64_t)Tk*kvb_dim);
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    }
     m->t_kvb += now_s()-tk0;
     /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
      * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
@@ -4867,7 +5160,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-            const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
+            int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;   /* gathered vs absolute row */
+            const float *kn=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
             float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
             for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
@@ -4876,12 +5170,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         softmax(sc,nt);
         float *cx=ctx+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++) cx[d]=0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-            const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
+            int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;
+            const float *vv=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
     matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
-    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
+    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(kvb_map); free(sc_all);
     m->t_attn += now_s()-ta0;
 }
 
@@ -6054,9 +6349,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn);
+              else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
                      if(lru<0){ static int warned;
-                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
+                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                          continue; }
                      dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
@@ -6257,15 +6552,9 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew=0;
     if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=-1;
-        for(int z=0;z<nn;z++){
-            if(eslot_busy(&Sl[z])) continue;             /* borrowed by an async GPU read */
-            if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
-            if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
-            if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-        }
+        slot=eslot_lru_victim(Sl,nn,m->ecap);           /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti gli slot sono in volo */
+                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o cap raggiunto */
         /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
          * protect the victim only when genuinely WARM (>=2 demand accesses) AND clearly
          * hotter than the speculation by tier_pick_lfru's 25%+4-freq hysteresis; the
@@ -6336,15 +6625,7 @@ static void pilot_uring_batch(Model *m){
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else{
-            slot=-1;
-            for(int z=0;z<nn;z++){
-                if(eslot_busy(&Sl[z])) continue;      /* borrowed by an async GPU read */
-                if(Sl[z].eid==-1){ slot=z; break; }
-                if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
-                if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-            }
-        }
+        else slot=eslot_lru_victim(Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
@@ -7371,8 +7652,13 @@ static void intr_install(void){}
  * a mux spec turn is running and are reset at each turn boundary, so every other
  * spec_decode caller (chat, run, oracle) sees them permanently 0. */
 static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
+/* emit callback contract (U7a): `lo` is the vocab-sized logit row the token
+ * was picked or verified from -- live only for the duration of the call.
+ * Accepted DRAFT tokens get their verification row, so the per-token numeric
+ * channel has no gap on the speculative path (they bypass every pick_tok
+ * call site in the mux loop). Callers that don't need it ignore it. */
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
-                       void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
+                       void (*emit)(int,const float*,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
@@ -7395,9 +7681,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
     while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
-        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
-        if((eos>=0 && next==eos) || is_stop(next)) break;
-        emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
+        int next=pick_tok(logit,V,carry_ban); carry_ban=-1;
+        if((eos>=0 && next==eos) || is_stop(next)){ free(logit); logit=NULL; break; }
+        emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++;
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         /* One-shot generation does not need logits or KV for the last token.
          * Stateful callers do: their kv_out becomes chat history, feeds MORE,
@@ -7471,7 +7757,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                    accept = (rndu() < g_pbuf[draft[k]]); }
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
-            emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
+            emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
             gr_feed(&g_grd,draft[k]); k++;
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
@@ -7497,10 +7783,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 
 /* emit callback: accumula in un array (validazione) */
 typedef struct { int *dst; int n; } EmitStore;
-static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
+static void emit_store(int t, const float *lo, void *ud){ (void)lo; EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
 /* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
 typedef struct { Tok *T; Model *m; double t0; int count; int quiet; double first_s; } EmitStream;
-static void emit_stream(int t, void *ud){
+static void emit_stream(int t, const float *lo, void *ud){
+    (void)lo;
     EmitStream *e=(EmitStream*)ud; char dec[64];
     int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
     if(e->first_s<0) e->first_s=now_s()-e->t0;
@@ -8153,7 +8440,11 @@ static void rss_guard(Model *m){
     if(lim<=0) return;
     if(m->n_emit - g_rssg_last < 16) return;
     g_rssg_last = m->n_emit;
+#ifdef __linux__
+    double rss=current_rss_gb();
+#else
     double rss=rss_gb();
+#endif
     if(rss <= lim*1.02+0.3) return;                       /* tolleranza: 2% + 300MB */
     Cfg *c=&m->c;
     int64_t need=(int64_t)((rss-lim)*1e9), freed=0; int dropped=0;
@@ -8192,6 +8483,9 @@ static void rss_guard(Model *m){
     if(dropped)
         fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
                        "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
+#ifdef __linux__
+    malloc_trim(1024);
+#endif
 }
 static void repin_pass_limit(Model *m,int limit){
     rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
@@ -8316,6 +8610,8 @@ typedef struct {
     float *spec_logit;                   /* continuation logits between chunks; NULL = the last
                                             emitted token sits at hist[len], not yet forwarded */
     unsigned long long id;
+    int logprobs;                        /* per-token numeric channel (U7a): requested
+                                            top-k count from SUBMIT logprobs=k; 0 = off */
     float temp, top_p;
     double started, request_started, first_s;
     uint64_t hits0, miss0;
@@ -8323,10 +8619,97 @@ typedef struct {
                                             request_pb: full-request I/O window for PROF physical.bytes */
 } ServeReq;
 
-static void mux_data(Tok *T, unsigned long long id, int token){
+/* Numeric tail shared by opted-in DATA and ECHO frames (U7a): writes
+ * " <lp> <k> [<tid> <tlp>]*k" into dst. lp = log-softmax of `token` over the
+ * logit row; the top-k table selects by logit (identical order to selecting
+ * by log-probability) and is UNSORTED, same as run_ablate_score's tk output.
+ * The token's own entry, when it appears in the table, is the SAME double as
+ * lp printed through the same format -- the bit-identity the harness's
+ * is_greedy check depends on. lo==NULL (an echo's position 0: nothing to
+ * condition on) writes " nan 0"; the server maps that to OpenAI's null.
+ * k is capped by COLI_SUBMIT_TOPK_MAX (=32, run_ablate_score's ceiling). */
+static int logprob_tail(char *dst, size_t cap, const float *lo, int V, int token, int topk){
+    int tk_id[COLI_SUBMIT_TOPK_MAX]; float tk_val[COLI_SUBMIT_TOPK_MAX];
+    int w;
+    if(!lo || token<0 || token>=V) return snprintf(dst,cap," nan 0");
+    if(topk>COLI_SUBMIT_TOPK_MAX) topk=COLI_SUBMIT_TOPK_MAX;
+    if(topk>V) topk=V;
+    float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
+    double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
+    double logZ=(double)mx+log(se);
+    for(int k=0;k<topk;k++){ tk_id[k]=-1; tk_val[k]=-1e30f; }
+    for(int i=0;i<V;i++){ float v=lo[i];
+        int mn=0; for(int k=1;k<topk;k++) if(tk_val[k]<tk_val[mn]) mn=k;
+        if(v>tk_val[mn]){ tk_val[mn]=v; tk_id[mn]=i; } }
+    w=snprintf(dst,cap," %.6f %d",(double)lo[token]-logZ,topk);
+    for(int k=0;k<topk && w>0 && (size_t)w<cap;k++)
+        w+=snprintf(dst+w,cap-(size_t)w," %d %.6f",tk_id[k],(double)tk_val[k]-logZ);
+    return w;
+}
+
+/* One generated token -> one DATA frame. Opted-in requests (SUBMIT logprobs=k)
+ * carry the numeric channel in the header: "DATA <id> <n> <lp> <k> [tid tlp]*k";
+ * opt-out requests keep the exact legacy 3-field frame, byte for byte -- an old
+ * server (whose dispatcher hard-fails on unknown framing) can only ever be
+ * paired with requests that never opt in, so it never sees the extended form. */
+static void mux_data(Tok *T, unsigned long long id, int token,
+                     const float *lo, int V, int topk){
     char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
-    printf("DATA %llu %d\n",id,n); if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
+    if(topk>0 && lo){
+        char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+        printf("DATA %llu %d%s\n",id,n,tail);
+    } else
+        printf("DATA %llu %d\n",id,n);
+    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
     fflush(stdout);
+}
+
+/* Echoed-prompt read-out frame (U7a, opt-in only): "ECHO <id> <n> <pos> <lp>
+ * <k> [tid tlp]*k" + payload framed exactly like DATA (n bytes + '\n').
+ * One frame per prompt position, in position order, BEFORE any DATA frame;
+ * position 0 carries " nan 0" (nothing to condition on). Never emitted unless
+ * the request set SUBMIT logprobs=k, so an old server can never receive one. */
+static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
+                     const float *lo, int V, int topk){
+    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+    printf("ECHO %llu %d %d%s\n",id,n,pos,tail);
+    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
+    fflush(stdout);
+}
+
+/* Opt-in prefill read-out (U7a, SUBMIT logprobs=k): one full-prompt forward
+ * whose per-position hidden states are read out through lm_head -- one ECHO
+ * frame per prompt position. Structurally run_score's loop, but live inside
+ * the serve path and gated per request instead of a launch-env-gated
+ * exit-early mode. Cost: one vocab-sized lm_head matmul per prompt position
+ * (P x vocab, P = prompt length), paid ONLY by requests that opted in; the
+ * opt-out path keeps step()'s single last-position lm_head untouched.
+ * Returns the last position's logits (step()'s contract) as the generation
+ * continuation. The caller resets the slot to len 0 first: the read-out
+ * needs logits at EVERY position, so this path takes no cached-prefix skip
+ * and no cross-slot KV adoption (KV rows [0,nt) are rewritten in full). */
+static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
+                               const int *ids, int nt, int topk){
+    Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
+    float *x=falloc((int64_t)nt*D);
+    for(int s=0;s<nt;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    layers_forward(m,x,nt,0);
+    if(m->hlast) memcpy(m->hlast, x+(int64_t)(nt-1)*D, D*sizeof(float));
+    if(m->has_mtp && nt>=2 && g_draft>0) mtp_absorb(m, ids+1, x, nt-1, 0);  /* same as step() */
+    float *lo=falloc(V), *row=falloc(D);
+    mux_echo(T,id,0,ids[0],NULL,V,0);
+    double th0=now_s();
+    for(int pos=1; pos<nt; pos++){
+        rmsnorm(row, x+(int64_t)(pos-1)*D, m->final_norm, D, c->eps);
+        matmul_qt(lo, row, &m->lm_head, 1);
+        mux_echo(T,id,pos,ids[pos],lo,V,topk);
+    }
+    rmsnorm(row, x+(int64_t)(nt-1)*D, m->final_norm, D, c->eps);
+    matmul_qt(lo, row, &m->lm_head, 1);
+    m->t_head += now_s()-th0;
+    free(x); free(row);
+    return lo;                           /* last position: the generation continuation */
 }
 
 /* #678: non-blocking stdin poll while a single-slot spec turn is running. Consumes
@@ -8379,10 +8762,13 @@ static void mux_ctl_poll(unsigned long long id){
     }
 }
 
-/* emit callback for the single-slot speculative path: stream straight to the mux protocol */
-typedef struct { Tok *T; unsigned long long id; } MuxEmit;
-static void mux_spec_emit(int t, void *ud){
-    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t);
+/* emit callback for the single-slot speculative path: stream straight to the mux
+ * protocol. `lo` is the row the token was picked/verified from (spec_decode's
+ * emit contract) -- accepted draft tokens included, so opted-in requests get a
+ * numeric value on EVERY generated token, with no speculative-path gap. */
+typedef struct { Tok *T; unsigned long long id; int V, logprobs; } MuxEmit;
+static void mux_spec_emit(int t, const float *lo, void *ud){
+    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t,lo,e->V,e->logprobs);
     mux_ctl_poll(e->id);                 /* #678: honor STOP/CANCEL within ~1 token */
 }
 
@@ -8527,7 +8913,20 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * mid-markup and emitted a bare "<". Retries were identical because the surviving *head*
      * never changes when a client appends to the end (hence "prefill 0" on every retry).
      * Refuse loudly instead; the gateway turns this into a 400 context_length_exceeded. */
-    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
+    int nt;
+    if(sub.tok_ids){
+        /* Pre-tokenized intake (SUBMIT ids=1, U7a): the payload is ASCII token
+         * ids fed straight into the same tmp[] buffer the text path fills --
+         * identical embedding/position machinery downstream, no tok_encode, no
+         * detokenize/re-encode round trip. Same one-token headroom contract as
+         * the text arm above (coli_ids_parse reports the cap on overflow). */
+        nt=coli_ids_parse(raw,(size_t)sub.bytes,tmp,maxctx-1,m->c.vocab);
+        if(nt<0){
+            free(tmp); free(raw); free(line);
+            printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); return 0;
+        }
+    } else
+        nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
     free(raw); free(line);
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
     if(nt>maxctx-2){
@@ -8543,7 +8942,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
      * lets a CONTEXT_EXCEEDED become a clean HTTP 400 instead of a broken already-200 stream. */
     printf("ACCEPT %llu %d\n",sub.id,nt); fflush(stdout);
-    int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    /* Echo read-out (U7a): needs logits at EVERY prompt position, so the whole
+     * prompt re-prefills from position 0 -- no cached-prefix skip and no
+     * cross-slot adoption below (either would leave positions with no logits). */
+    int echo = sub.logprobs>0;
+    int prefix=0;
+    if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
@@ -8558,7 +8962,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * generated tokens identical to the full-prefill run. */
     static int kvshare=-1;
     if(kvshare<0) kvshare=getenv("COLI_KV_SHARE")?atoi(getenv("COLI_KV_SHARE")):0;
-    if(kvshare && nctx>1 && prefix>=sc->len){
+    if(kvshare && !echo && nctx>1 && prefix>=sc->len){
         int best=-1, blen=sc->len;
         for(int i=0;i<nctx;i++){
             if(i==sub.slot) continue;
@@ -8596,11 +9000,13 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
     ProfBase request_pb; prof_base(m,&request_pb);
-    float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
-                         : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs)
+                        : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
+                                : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
+    r->logprobs=sub.logprobs;
     r->prompt_tokens=nt; r->started=now_s(); r->request_started=request_started; r->first_s=-1;
     r->hits0=m->hits; r->miss0=m->miss;
     r->request_pb=request_pb;
@@ -8624,13 +9030,14 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         r->spec=1; r->spec_logit=logit; r->active=1;
         return 1;
     }
-    int next=pick_tok(logit,m->c.vocab,-1); free(logit);
-    if(r->maximum<=0){ r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
-    if(next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
+    int next=pick_tok(logit,m->c.vocab,-1);
+    if(r->maximum<=0){ free(logit); r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
+    if(next==eos || is_stop(next)){ free(logit); mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
     r->first_s=now_s()-r->request_started;
     if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
-    mux_data(T,r->id,next);
+    mux_data(T,r->id,next,logit,m->c.vocab,r->logprobs);
+    free(logit);
     if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
     return 1;
 }
@@ -8726,7 +9133,7 @@ static void run_serve_mux(Model *m, const char *snap, const char *state_dir){
                 kv_bind(m,&sc->kv);
                 g_temp=r->temp; g_nuc=r->top_p;
                 float *lg=r->spec_logit; r->spec_logit=NULL;   /* spec_decode takes ownership */
-                MuxEmit ud={&T,r->id};
+                MuxEmit ud={&T,r->id,m->c.vocab,r->logprobs};
                 g_mux_stop=0; g_mux_cancel=0;                  /* fresh per turn (#678) */
                 int prod=spec_decode(m,sc->hist,sc->len,r->maximum-r->emitted,eos,lg,
                                      mux_spec_emit,&ud,&sc->len,NULL);
@@ -8767,7 +9174,7 @@ static void run_serve_mux(Model *m, const char *snap, const char *state_dir){
                     if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
                     r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
                     if(gd->on) gr_feed(gd,next);
-                    mux_data(&T,r->id,next);
+                    mux_data(&T,r->id,next,lo+(int64_t)j*m->c.vocab,m->c.vocab,r->logprobs);
                     if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); done=1; break; }
                     if(j<k){
                         if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
@@ -8791,7 +9198,7 @@ static void run_serve_mux(Model *m, const char *snap, const char *state_dir){
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
             if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
-            mux_data(&T,r->id,next);
+            mux_data(&T,r->id,next,lo+(int64_t)s*m->c.vocab,m->c.vocab,r->logprobs);
             if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
         }
         free(lo);
@@ -8818,6 +9225,7 @@ static void run_serve(Model *m, const char *snap, const char *state_dir){
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
+    double t_serve0=now_s();             /* PROF: wall base for the exit-time profile_print */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
@@ -8970,6 +9378,12 @@ static void run_serve(Model *m, const char *snap, const char *state_dir){
     }
     free(line); free(buf);
     usage_save(m);
+    /* PROF=1 only: the cumulative backend counters (METAL:/METAL-ATTN:/MIRROR:) were
+     * unreachable in serve mode — profile_print only ran on the oracle/generate exit
+     * paths, so a served session could never show GPU-vs-fallback truth. stdin has hit
+     * EOF here: the last END/STAT frame is already out, so these stdout lines can no
+     * longer interleave with protocol a client is parsing. */
+    if(g_prof) profile_print(m, now_s()-t_serve0);
     #undef hist
     #undef len
     #undef first
@@ -9792,6 +10206,15 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
+    /* #768: above KVB_FLASH_MB attention_rows tiles the reconstruction instead of
+     * materialising kvb_all, so the transient to reserve is the flash ceiling plus
+     * one tile and the per-(row,head) running state — not 30 GB at ctx 262144.
+     * The reserve mirrors the trigger in attention_rows: same env, same default. */
+    { int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
+      int64_t tile_mb =getenv("KVB_TILE_MB") ?atoll(getenv("KVB_TILE_MB")) :512;
+      double capped = (double)flash_mb*1048576.0 + (double)tile_mb*1048576.0
+                    + (double)max_ctx*c->n_heads*2*4.0;
+      if(flash_mb>0 && kvb_b>capped) kvb_b = capped; }
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
      * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.

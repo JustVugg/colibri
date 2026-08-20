@@ -232,10 +232,10 @@ export default function App() {
       setConnected(true)
     } catch (cause) {
       if (controller.signal.aborted) {
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
       } else {
         setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
       }
     } finally {
       abortRef.current = null
@@ -363,7 +363,12 @@ export default function App() {
               {messages.map((item) => (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.content
+                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.reasoning
+                    ? <details className="reasoning" open={!item.content}>
+                        <summary>{t("sidebar.reasoning")}</summary>
+                        <div className="reasoning-body">{item.reasoning}</div>
+                      </details>
+                    : null}{item.content
                     ? (item.role === "assistant"
                         /* User turns stay literal: the person typed those
                            characters and expects to see them back. Only the

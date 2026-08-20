@@ -2,6 +2,7 @@
 #include "../deepseek_v4_internal.h"
 #include "../compat.h"
 #include "../native_quant.h"
+#include "../native_quant_fp4_rows16.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -215,6 +216,63 @@ static int test_expert(void) {
     if (!(output[0] > 0.0f)) return 1;
     puts("DeepSeek-V4 expert tests: ok");
     return 0;
+}
+
+/* #1136: a rows16-packed copy and the row-major original of the SAME matrix
+ * must produce bit-identical matvec outputs — the reference path accumulates
+ * in the rows16 order now, so which kernel an expert takes (cache residency)
+ * can no longer move greedy text. Varied nibbles AND varied per-group scales:
+ * uniform data would let the old group-partial-sum order pass by accident. */
+static int test_rows16_convergence(void) {
+#ifndef COLI_FP4_ROWS16_KERNEL
+    puts("DeepSeek-V4 rows16 convergence: skipped (no rows16 kernel on this ISA)");
+    return 0;
+#else
+    enum { ROWS = 32, COLUMNS = 128 };
+    static uint8_t data[ROWS * COLUMNS / 2], scales[ROWS * COLUMNS / 32];
+    static uint8_t packed_data[ROWS * COLUMNS / 2], packed_scales[ROWS * COLUMNS / 32];
+    uint32_t state = 0x1136u;
+    for (size_t i = 0; i < sizeof(data); i++) {
+        state = state * 1664525u + 1013904223u;
+        data[i] = (uint8_t)(state >> 24);
+    }
+    for (size_t i = 0; i < sizeof(scales); i++) {
+        state = state * 1664525u + 1013904223u;
+        scales[i] = (uint8_t)(120 + ((state >> 24) & 15));   /* e8m0 near 1.0 */
+    }
+    ColiTensorView source = {
+        COLI_TENSOR_FP4_NATIVE_BLOCK, COLI_SCALE_UE8M0,
+        data, scales, sizeof(data), sizeof(scales), ROWS, COLUMNS, 1, 32, NULL
+    };
+    if (coli_fp4_pack_rows16_v10(packed_data, packed_scales, &source) != 0)
+        return 1;
+    ColiTensorView packed = source;
+    packed.data = packed_data; packed.scales = packed_scales;
+    packed.block_rows = 16;
+    float input[COLUMNS];
+    for (int i = 0; i < COLUMNS; i++)
+        input[i] = 0.05f * (float)((i * 7) % 13 - 6);
+    /* the rows16 kernel qdq's internally; feed the converged core the same
+     * qdq'd activation the ref path would use */
+    float activation[COLUMNS]; uint8_t activation_scales[COLUMNS / 128];
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, COLUMNS, 128) != 0) return 1;
+    float hot[ROWS], cold[ROWS], ref[ROWS];
+    if (coli_fp4_matvec_rows16_v10(hot, &packed, input) != 0) return 1;
+    coli_fp4_matvec_rows16_order(cold, data, scales, activation, COLUMNS, ROWS);
+    if (memcmp(hot, cold, sizeof(hot)) != 0) {
+        for (int r = 0; r < ROWS; r++)
+            if (hot[r] != cold[r])
+                fprintf(stderr, "  row %d: rows16 %.9g vs converged ref %.9g\n",
+                        r, (double)hot[r], (double)cold[r]);
+        return 1;
+    }
+    /* and the public entry point routes rows%16==0 through the converged core */
+    if (coli_fp4_matvec_ref(ref, &source, input) != 0) return 1;
+    if (memcmp(hot, ref, sizeof(hot)) != 0) return 1;
+    puts("DeepSeek-V4 rows16 convergence: ok (hot and cold bits identical)");
+    return 0;
+#endif
 }
 /* ==== end test_deepseek_v4_expert.c ==== */
 
@@ -789,6 +847,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert() != 0) {
         fprintf(stderr, "FAIL: test_expert\n");
+        return 1;
+    }
+    if (test_rows16_convergence() != 0) {
+        fprintf(stderr, "FAIL: test_rows16_convergence\n");
         return 1;
     }
     if (test_expert_store() != 0) {

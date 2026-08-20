@@ -107,7 +107,11 @@ static jval *j_parse_val(jparser *p) {
     if (c == '{') {
         if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_OBJ);
-        int cap = 8; v->keys = malloc(cap * sizeof(char*)); v->kids = malloc(cap * sizeof(jval*));
+        int cap = 8;
+        v->keys = malloc(cap * sizeof(char*));
+        if (!v->keys) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
+        v->kids = malloc(cap * sizeof(jval*));
+        if (!v->kids) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
         j_ws(p);
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
@@ -116,7 +120,13 @@ static jval *j_parse_val(jparser *p) {
             char *key = j_parse_str_raw(p);
             j_ws(p); if (*p->s == ':') p->s++;
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->keys = realloc(v->keys, cap*sizeof(char*)); v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (v->len == cap) { cap *= 2;
+                char **nk = (char**)realloc(v->keys, cap*sizeof(char*));
+                if (!nk) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
+                v->keys = nk;
+                jval **nc = (jval**)realloc(v->kids, cap*sizeof(jval*));
+                if (!nc) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
+                v->kids = nc; }
             v->keys[v->len] = key; v->kids[v->len] = val; v->len++;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
@@ -129,12 +139,17 @@ static jval *j_parse_val(jparser *p) {
     if (c == '[') {
         if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_ARR);
-        int cap = 8; v->kids = malloc(cap * sizeof(jval*));
+        int cap = 8;
+        v->kids = malloc(cap * sizeof(jval*));
+        if (!v->kids) { fprintf(stderr, "OOM parsing JSON array\n"); exit(1); }
         j_ws(p);
         if (*p->s == ']') { p->s++; p->depth--; return v; }
         for (;;) {
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (v->len == cap) { cap *= 2;
+                jval **nc = (jval**)realloc(v->kids, cap*sizeof(jval*));
+                if (!nc) { fprintf(stderr, "OOM parsing JSON array\n"); exit(1); }
+                v->kids = nc; }
             v->kids[v->len++] = val;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }

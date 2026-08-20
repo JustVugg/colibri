@@ -73,6 +73,9 @@ Format: `VAR` — default — effect.
 | `RSS_GUARD_GB` | the resolved RAM budget | Resident-set ceiling (GB) checked every 16 emitted tokens; the cache is trimmed when it is crossed. Set explicitly to guard tighter or looser than the RAM budget. |
 | `XEXP` | `0` (off) | `=1` runs ONE OpenMP region across all experts of a batch-union block instead of ~2 fork/joins per expert. Engages only at S=1 with an all-resident int4 block, off the speculation window, and with the int4-IDOT S=1 family (`I4S<=1`); output is byte-identical to that family. Measured +11.6% on a 2-socket 48-core Ice Lake, but neutral-to-negative on a 24-core box — hence opt-in. Measure on your host. |
 | `COLI_KV_SHARE` | `0` (off) | `=1` lets a new serve slot adopt an existing slot's KV prefix instead of re-prefilling it. Measured on 6x5090 with a 675-token shared prefix: slot TTFT 50.1s → 1.7s, generated tokens identical. |
+| `KVB_FLASH_MB` | `2048` | Ceiling (MB) for the one-shot `kvb_all` k/v reconstruction buffer in prefill attention (#768 — 30.1 GB at ctx 262144, and `cap_for_ram` reserved it permanently). Above the ceiling the reconstruction is tiled with an online (flash-style) softmax: same rebuild total, ~tile-sized transient, output may differ from one-shot by rounding (same divergence class as the CUDA/Metal attention arms). `=0` disables tiling (always one-shot). DSA-selected rows always take the one-shot path. |
+| `KVB_TILE_MB` | `512` | Tile size (MB) for the tiled reconstruction above. |
+| `KVB_FLASH` | unset | `=1` forces the tiled path at any size, `=0` forces one-shot — overrides the `KVB_FLASH_MB` trigger (A/B switch). |
 | `COLI_GROUP_ASYNC` | `0` (off) | `=1` issues and collects CUDA expert groups asynchronously so CPU and GPU overlap at decode (S≤4). |
 | `COLI_DISKCLASS_WINDOW` | see source | Recency window (in ticks) for the DISK-CLASS heat statistic. |
 | `URING` | `0` (off) | Linux-only queued expert I/O. `URING=1` implies `PIPE=1`, forces cold reads through io-wq (`IOSQE_ASYNC`), replaces blocking loader pthreads and spin waits with batched SQEs/CQEs, and batches `PILOT_REAL` loads on a separate ring. Use `DIRECT=1` for cold NVMe to avoid page-cache copy/readahead limits. Fails clearly if the kernel denies io_uring; incompatible with `COLI_MMAP=1`. |
@@ -109,7 +112,8 @@ Format: `VAR` — default — effect.
 | `PROF` | `0` (off) | Performance profile: a startup header (machine + effective config), then per run — or per turn in serve mode, on stderr — forward-latency percentiles (p50/p90/p99/max), expert-I/O totals and cache-tier fill, phase shares of wall time, and a verdict naming the knob most likely to help on this machine. Output is additive; `PROF` unset changes nothing. |
 | `COLI_NO_FUSED_PAIR` | `0` (off) | `=1` disables the fused-pair matmul kernel. |
 | `DISK_SPLIT` | `0` (off) | `=1` splits the reported disk-load time across the draft/absorb/forward phases in stats. |
-| `I4S` | unset | Engage the int4 `IDOT` kernel only for batch `S>=<n>` (testing). |
+| `I4S` | per-ISA (`1` on AVX-512-VNNI / NEON-dotprod, `2` elsewhere) | Engage the int4 `IDOT` kernel for batch `S>=<n>`. `I4S=1` turns IDOT on at decode too: int8-quantized activations on expert matmuls — **not bit-identical** to the f32 decode path (measured 0.39% of scale on the gate output; the same numerics prefill already uses at `S>=2`, and the shipped default on AVX-512-VNNI, measured +5.5% end-to-end there). Attention projections always stay exact regardless. A default flip on AVX-VNNI awaits the quality ablation. |
+| `IDOT_GS` | `0` (off) | **Opt-in** grouped planar IDOT for `fmt=4` (gs64/gs128) tensors: int8 activations with the K1 plane layout, one integer dot per scale group. Same numerics family as `I4S=1` — not bit-identical to the f32 grouped kernel, hence off until the ablation. Requires the planar family (AVX2 build, no GPU backend, no `XEXP`). Activation prints `[K1b]` once. |
 | `SPEC_PIN` | `1` (on) | Speculation gate mode. `0` reverts to the legacy S-dependent speculation gates (#163). |
 | `COLI_RAM_OVERCOMMIT` | off | `=1` overrides the "projected peak > MemAvailable → exit(2)" guard so a run that risks kernel OOM-kill is allowed to proceed. |
 
@@ -360,6 +364,25 @@ documented with defaults in
 the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
 `COLI_CUDA_ATTN_BATCH=1`, `COLI_CUDA_MOE_BATCH=1`, `DSV4_CUDA_EXPERT_MIRRORS`,
 `V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
+`COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
+usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_V4_ROWS16` | `1` (on) | Repack hot-pinned experts into the vectorized `rows16` layout. **While this is on, greedy output varies run to run on the same machine** (#1136): rows16 and the reference matvec accumulate in different orders, and which experts take which kernel follows the expert-cache state. `=0` runs the reference matvec for every expert — slower, but the kernel variable is gone. **Set `=0` for any quality A/B on this engine**; throughput A/Bs do not need it. |
+
+**Reproducible greedy runs (#1136):** greedy text on this engine varies with
+the expert-cache state — hot experts run the vectorized `rows16` kernel, cold
+ones run the reference matvec, the two accumulate in different orders, and
+which experts are hot follows the autopin history (`.coli_usage`, rewritten by
+every run). This is a known defect, not a documented trade-off — the house
+rule since the olmoe/inkling IDOT cases (#1044, #1080) is that a fast path
+which changes tokens is opt-in, and a convergence fix (reference path adopting
+rows16's accumulation order) is planned under #1136. Until it lands: for
+byte-identical output across runs, either freeze the history (`USAGE_SAVE=0`,
+after seeding it once) or remove the variable entirely
+(`COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 USAGE_SAVE=0`: reference kernels only, no
+history). Details in [deepseek-v4.md — CPU-only behaviour](deepseek-v4.md).
 
 ## OLMoE engine (`olmoe`)
 

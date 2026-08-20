@@ -48,7 +48,8 @@ class EnvDefaultsTest(unittest.TestCase):
         False keeps these tests independent of the host's GPU."""
         with mock.patch.dict(os.environ, environ, clear=True), \
              mock.patch.object(sys, "platform", platform), \
-             mock.patch.object(coli, "cuda_binary", return_value=cuda):
+             mock.patch.object(coli, "cuda_binary", return_value=cuda), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8):
             return coli.env_for(args())
 
     def test_win32_sets_measured_defaults(self):
@@ -109,6 +110,7 @@ class CudaAutoEnableTest(unittest.TestCase):
              mock.patch.object(sys, "platform", platform), \
              mock.patch.object(coli, "cuda_binary", return_value=cuda), \
              mock.patch.object(resource_plan, "discover_gpus", return_value=gpus), \
+             mock.patch.object(resource_plan, "physical_cpu_count", return_value=8), \
              mock.patch.object(resource_plan, "build_plan", return_value=plan), \
              mock.patch.object(resource_plan, "environment_for_plan",
                                side_effect=fake_environment_for_plan):

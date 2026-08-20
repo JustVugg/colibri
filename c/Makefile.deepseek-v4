@@ -122,9 +122,12 @@ ifeq ($(DEEPGEMM),1)
 # The DeepGEMM kernels use sm_120a-only PTX (block-scaled MMA); they cannot be
 # compiled for compute_120 or any other target, so DEEPGEMM=1 builds for
 # sm_120a only (CUDA_ARCH is ignored). Use the generic build for other cards.
-ifndef DEEPGEMM_HOME
-$(error DEEPGEMM_HOME must point to the sm120 DeepGEMM checkout (see patches-deepgemm-sm120-msvc.patch))
-endif
+# Headers: a pinned checkout made by tools/fetch_deepgemm.sh on first build
+# (gitignored third_party/deepgemm); DEEPGEMM_HOME points at an existing tree.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
+V4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
 V4_CUDA_GENCODE = -gencode arch=compute_120a,code=sm_120a
 V4_DEEPGEMM_FLAGS = -DCOLI_DSV4_DEEPGEMM \
                 -I$(DEEPGEMM_HOME)/deep_gemm/include -I$(DEEPGEMM_HOME)/cutlass/include \
@@ -164,6 +167,8 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
 REGISTRY_OBJ = expert_store_registry.o
+V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
+V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
 	deepseek-v4-test-registry print-v4-objs
@@ -194,6 +199,12 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
+COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
+
+$(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
 # to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
 # Linux it is empty so the engine links without it.
@@ -201,8 +212,13 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
 	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+ifneq ($(DEEPGEMM_STAMP),)
+$(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+endif
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
@@ -214,4 +230,4 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) test_expert_store_registry
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_SERVE_TEST) test_expert_store_registry

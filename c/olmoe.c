@@ -37,6 +37,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
+#include "serve_codec.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1191,44 +1192,63 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile olmoe_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+};
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
- * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
-        if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        int nl = fgetc(stdin); (void)nl;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on input EOF. */
+static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result = coli_serve_read_command(in, &olmoe_wire, &command);
+    if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) return -1;
+    if (result == COLI_SERVE_READ_NOMEM) {
+        coli_serve_write_error(out, command.id, "out of memory");
+        return -1;
+    }
+    if (result == COLI_SERVE_READ_BAD_REQUEST &&
+        command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+        coli_serve_write_error(out, command.id, "bad submit header");
+        return -1;
+    }
+    if (result != COLI_SERVE_READ_OK) return 0;
+    if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
+        int cancelled = cur_id && !strcmp(command.id, cur_id);
+        coli_serve_command_dispose(&command);
+        return cancelled;
+    }
+    if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok = command.max_tokens;
+            q->temp = command.temperature;
+            q->top_p = command.top_p;
+            q->payload = (char *)coli_serve_command_take_payload(&command);
+            q->plen = (int)command.payload_bytes;
+        } else {
+            coli_serve_write_error(out, command.id, "queue full");
+        }
     }
+    coli_serve_command_dispose(&command);
     return 0;
 }
 
-static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
-    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    if (np <= 0) { coli_serve_write_error(stdout, q->id, "empty prompt"); free(ids); return 0; }
     if (np + q->max_tok > ctx_cap) {
-        printf("ERROR %s context exceeds CTX (%d + %d > %d)\n", q->id, np, q->max_tok, ctx_cap);
-        fflush(stdout); free(ids); return;
+        char message[128];
+        snprintf(message, sizeof(message), "context exceeds CTX (%d + %d > %d)",
+                 np, q->max_tok, ctx_cap);
+        coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
     }
     g_temp = q->temp; g_nuc = q->top_p;
     double t0 = now_s();
@@ -1241,13 +1261,11 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         free(logit); logit = NULL;
         if (is_stop(nt)) { limited = 0; break; }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
-        printf("DATA %s %d\n", q->id, nb);
-        fwrite(buf, 1, (size_t)nb, stdout);
-        fputc('\n', stdout); fflush(stdout);
+        coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         /* Unlike run_chat(), we do not step() the final token just to populate
@@ -1259,8 +1277,15 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    ColiServeDone done = {
+        .completion_tokens = gen,
+        .tokens_per_second = dt > 0 ? gen/dt : 0.0,
+        .cache_hit_percent = tot ? 100.0*(m->hits-h0)/tot : 0.0,
+        .rss_gb = rss_gb(),
+        .prompt_tokens = np,
+        .length_limited = limited,
+    };
+    coli_serve_write_done(stdout, q->id, &done);
     /* PROF: per-turn phase timings for the dashboard. olmoe.c does not split
      * its wall time into fill/expert/shared/attn phases the way glm.c and
      * inkling.c do, so this reports total time only; a real phase breakdown
@@ -1268,6 +1293,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
     fflush(stdout);
     free(ids);
+    return 0;
 }
 
 /* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
@@ -1326,21 +1352,19 @@ static void serve_tiers_emap(Model *m) {
 }
 
 static void serve_loop(Model *m, Tok *T, int ctx_cap) {
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
+    coli_serve_stdio_init();
     int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
     stops_arm_tok(&m->c, tok_eos, T);
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
-    fflush(stdout);
+    coli_serve_write_ready(stdout, rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q, ctx_cap);
+        int fatal = serve_one(m, T, &q, ctx_cap);
         free(q.payload);
+        if (fatal < 0) return;
     }
 }
 

@@ -21,9 +21,10 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            default_engine, generation_options, parse_dsv4_tool_calls,
-                           parse_tool_calls, read_engine_turn, render_chat, render_chat_kimi,
-                           render_chat_olmoe, render_chat_v4, _dsv4_tool_calls, serve,
-                           split_thinking_reply, stop_policy, tune_child_env)
+                           parse_k3_tool_calls, parse_tool_calls,
+                           read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
+                           render_chat_v4, _dsv4_tool_calls, serve, split_thinking_reply,
+                           stop_policy, tune_child_env)
 
 
 class FakeEngine:
@@ -103,12 +104,100 @@ class TemplateTest(unittest.TestCase):
             "G 1\n",
         )
 
-    def test_kimi_rejects_tools_and_unknown_roles(self):
-        with self.assertRaisesRegex(APIError, "Tool use"):
-            render_chat_kimi([{"role": "user", "content": "Hi"}],
-                             tools=[{"type": "function"}])
+    def test_kimi_renders_tool_declaration_and_choice(self):
+        tools = [{"type": "function", "function": {
+            "name": "get_weather", "parameters": {"type": "object"}}}]
+        body = ("# Tools\nHere are the available tools, described in JSONSchema.\n\n"
+                "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
+                                         sort_keys=True) + "\n```")
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], tools=tools)
+        self.assertEqual(prompt, "K3CHAT1\n"
+                         f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}"
+                         "M user 2\nHi"
+                         "G 0\n")
+        # tool_choice=none: the tools are not offered at all
+        self.assertEqual(render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                          tools=tools, tool_choice="none"),
+                         "K3CHAT1\nM user 2\nHiG 0\n")
+        # tool_choice=required appends the reference's tool-choice system message
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                  tools=tools, tool_choice="required")
+        self.assertIn("\ntool-choiceThe system is invoked with `tool_choice=required`.", prompt)
+        self.assertTrue(prompt.endswith("G 0\n"))
+
+    def test_kimi_renders_tool_calls_and_results(self):
+        messages = [
+            {"role": "user", "content": "Weather in Rome?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Rome", "days": 1e2, "metric": true}'}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+        ]
+        prompt = render_chat_kimi(messages)
+        # B: assistant turn carrying the call; V records keep the exact JSON
+        # literal for non-strings (1e2 stays 1e2) and decode strings.
+        self.assertIn("B 0 0 0 1\n", prompt)
+        self.assertIn("F 11 3\nget_weather", prompt)
+        self.assertIn("V 4 6 4\ncitystringRome", prompt)
+        self.assertIn("V 4 6 3\ndaysnumber1e2", prompt)
+        self.assertIn("V 6 7 4\nmetricbooleantrue", prompt)
+        # O: the result resolves its name through tool_call_id
+        self.assertIn("O 1 11 5\nget_weathersunny", prompt)
+
+    def test_kimi_tool_results_resort_by_call_id(self):
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function",
+                 "function": {"name": "first", "arguments": "{}"}},
+                {"id": "b", "type": "function",
+                 "function": {"name": "second", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "b", "content": "B"},
+            {"role": "tool", "tool_call_id": "a", "content": "A"},
+        ]
+        prompt = render_chat_kimi(messages)
+        # Results are re-sorted into tool_calls order, names resolved from ids.
+        self.assertIn("O 1 5 1\nfirstA", prompt)
+        self.assertIn("O 2 6 1\nsecondB", prompt)
+        self.assertLess(prompt.index("O 1 5 1"), prompt.index("O 2 6 1"))
+
+    def test_kimi_json_fallback_for_unparseable_arguments(self):
+        prompt = render_chat_kimi([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "x", "type": "function", "function": {
+                    "name": "fn", "arguments": "not json"}}]}])
+        self.assertIn("J 2 8\nfnnot json", prompt)
+
+    def test_kimi_still_rejects_unknown_roles(self):
         with self.assertRaisesRegex(APIError, "Unsupported role"):
-            render_chat_kimi([{"role": "tool", "content": "result"}])
+            render_chat_kimi([{"role": "critic", "content": "hm"}])
+        with self.assertRaisesRegex(APIError, "resolvable tool name"):
+            render_chat_kimi([{"role": "tool", "content": "orphan result"}])
+
+    def test_kimi_parses_generated_tool_calls(self):
+        reply = ('Sure.<|open|>tools<|sep|>'
+                 '<|open|>call tool="get_weather" index="1"<|sep|>'
+                 '<|open|>argument key="city" type="string"<|sep|>Rome<|close|>argument<|sep|>'
+                 '<|open|>argument key="days" type="number"<|sep|>1e2<|close|>argument<|sep|>'
+                 '<|close|>call<|sep|>'
+                 '<|close|>tools<|sep|>')
+        text, calls = parse_k3_tool_calls(reply)
+        self.assertEqual(text, "Sure.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 100.0})
+
+    def test_kimi_parses_json_block_and_unclosed_tail(self):
+        reply = ('<|open|>tools<|sep|>'
+                 '<|open|>call tool="a&amp;b" index="1"<|sep|>'
+                 '<|open|>json type="object"<|sep|>{"x":1}<|close|>json<|sep|>'
+                 '<|close|>call<|sep|>')       # tools block never closed: budget ran out
+        text, calls = parse_k3_tool_calls(reply)
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "a&b")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"x":1}')
 
     def test_kimi_preserves_prior_reasoning_channel(self):
         self.assertEqual(
@@ -626,6 +715,118 @@ class EngineStartupTest(unittest.TestCase):
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_inkling_audio_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<|message_user|><|content_audio_input|><|audio|><|end_message|>"
+        payload = prompt.encode("utf-8")
+        audio = bytes(range(16)) * 5
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 {len(audio)}\n".encode() +
+                    payload + audio + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 7 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "inkling"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("inkling", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append,
+                                    audio=audio)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["prompt_tokens"], 7)
+
+    def test_v4_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<｜begin▁of▁sentence｜>System<｜User｜>Hello<｜Assistant｜>"
+        payload = prompt.encode("utf-8")
+        prefix = len("<｜begin▁of▁sentence｜>System".encode("utf-8"))
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 0 {prefix}\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0 17\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "deepseek_v4"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("deepseek_v4", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_kimi_request_and_response_transcript_is_byte_exact(self):
+        prompt = render_chat_kimi([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "你好\nKimi"},
+            {"role": "assistant", "reasoning_content": "because",
+             "content": "你好。"},
+            {"role": "user", "content": "Continue"},
+        ], enable_thinking=True)
+        payload = prompt.encode("utf-8")
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "kimi"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("kimi_k3", "model")
+        chunks = []
+        stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_olmoe_request_and_response_transcript_is_byte_exact(self):
+        expected = b"SUBMIT 1 0 5 3 0.25 0.9\nH\xc3\xa9\nx\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 5 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "olmoe"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        chunks = []
+        stats = engine.generate("Hé\nx", 3, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 5)
+        self.assertFalse(stats["length_limited"])
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 
@@ -798,7 +999,6 @@ class DispatcherTest(unittest.TestCase):
                 b"5 GPU-abc 2000 700 900 600 300 6\n"
                 b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n"
             )
-
         process = FakeProcess(respond)
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
@@ -826,7 +1026,6 @@ class DispatcherTest(unittest.TestCase):
             request_id = frame.split()[1]
             process.stdout.feed(b"GPUS 1 1.250 24.000 7\n")
             process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
-
         process = FakeProcess(respond)
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
@@ -1037,6 +1236,57 @@ class DispatcherTest(unittest.TestCase):
         profile = list(engine.profile)[0]
         self.assertEqual(profile["physical_ssd_bytes"], 4096)
         self.assertIs(profile["physical_ssd_valid"], True)
+
+    def test_accepts_u7a_echo_and_extended_data_frames(self):
+        # U7a forward-compat: the engine's opt-in per-token numeric channel --
+        # ECHO frames for echoed prompt positions and DATA frames extended
+        # with "<lp> <k> [tid tlp]*k" -- must NOT trip the dispatcher's
+        # catch-all (which kills every in-flight request). Text delivery and
+        # the DONE stats stay exactly as for legacy frames; the numeric
+        # fields are consumed by the server feature half (U7b).
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + request_id + b" 3\n")
+            process.stdout.feed(b"ECHO " + request_id + b" 2 0 nan 0\nHi\n")
+            process.stdout.feed(
+                b"ECHO " + request_id +
+                b" 6 1 -0.105361 2 7 -0.105361 9 -2.302585\n world\n")
+            process.stdout.feed(
+                b"ECHO " + request_id +
+                b" 1 2 -1.203973 2 4 -0.803973 6 -1.203973\n!\n")
+            process.stdout.feed(
+                b"DATA " + request_id +
+                b" 2 -0.223144 2 3 -0.223144 8 -1.723144\nok\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 3 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        stats = engine.generate("Hi world!", 4, 0.0, 1.0, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 3)
+        self.assertIsNone(engine.dispatcher_error)
+        engine.close()
+
+    def test_malformed_u7a_echo_stops_dispatcher(self):
+        # Unknown telemetry remains forward-compatible, but ECHO is now a
+        # known protocol kind. A truncated ECHO header must therefore take the
+        # malformed-known-frame path instead of being ignored as advisory.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ECHO " + request_id + b" 0\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 0 0 0 1.0 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine response: ECHO"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
 
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
@@ -1268,6 +1518,7 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/models", key="wrong")
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_health_reports_scheduler_and_kv_slots(self):
@@ -1425,6 +1676,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stop": "H", "x_colibri_ignore_leading_stop": "yes",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_rejects_invalid_cache_slot(self):
@@ -1433,6 +1685,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "cache_slot": 2,
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_olmoe_never_files_the_answer_as_reasoning(self):
@@ -1504,6 +1757,7 @@ class HTTPTest(unittest.TestCase):
     def test_rejects_empty_legacy_completion(self):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/completions", {"model": "test-model", "prompt": ""})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
         self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
 
@@ -1513,6 +1767,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True, "stream_options": "usage",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
 
@@ -1589,7 +1844,8 @@ class ClientHangupTest(unittest.TestCase):
             "the old except clause would have covered this; the test proves nothing")
         with patch.object(APIHandler, "end_headers", self._abort):
             try:
-                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
             except Exception:
                 pass                      # the client sees a broken response; that is fine
             time.sleep(0.3)
@@ -1600,7 +1856,8 @@ class ClientHangupTest(unittest.TestCase):
         """Same as the hangup case: the damage is a lost handler, not the log."""
         with patch.object(APIHandler, "end_headers", self._abort):
             try:
-                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
             except Exception:
                 pass
             time.sleep(0.3)
@@ -1639,6 +1896,7 @@ class StaticServingTest(unittest.TestCase):
             self.assertEqual(response.read(), b"dashboard")
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
 
     def test_health_without_configured_key_exposes_gpu_telemetry_shape(self):
@@ -1680,6 +1938,7 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertTrue(self.engine.entered.wait(1))
         with self.assertRaises(HTTPError) as caught:
             self.request()
+        self.addCleanup(caught.exception.close)
         error = json.loads(caught.exception.read())["error"]
         self.assertEqual(caught.exception.code, 429)
         self.assertEqual(caught.exception.headers["Retry-After"], "1")
@@ -2251,6 +2510,7 @@ class StreamingContextRejectTest(unittest.TestCase):
                       headers={"Content-Type": "application/json"})
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=3)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
         body = json.load(caught.exception)
         self.assertEqual(body["error"]["code"], "context_length_exceeded")

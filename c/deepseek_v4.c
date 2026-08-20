@@ -4515,13 +4515,23 @@ typedef struct {
  * only the pool. */
 enum { DUAL_EXPERT_LOADER_COUNT = COLI_V4_EXPERT_LOADER_COUNT };
 enum { DUAL_EXPERT_LOADER_MAX = 16 };
+/* Default del POOL (non della riserva CPU qui sotto: quella resta sul COMPILE
+ * default — le lane bloccano in pread e non consumano core, vedi il commento
+ * sopra). 9 misurato contro 3 su questa classe di macchina: 8 run interfogliate
+ * a box quieto sul V4-Flash reale, decode 147.3s -> 104.8s medi (1.41x, 1.46x
+ * in mediana), TTFT invariato nel rumore, zero OOM/crash su 8/8 run — coerente
+ * con la misura in-tree 48ms -> 29.6ms per lettura fredda. V4_LOADER_LANES
+ * resta la manopola per dischi che si comportano diversamente.
+ * EN: pool default only; the CPU reservation keeps subtracting the compile
+ * constant. 9 vs 3 measured on the real checkpoint: 1.41x decode, no OOM. */
+enum { DUAL_EXPERT_LOADER_DEFAULT_LANES = 9 };
 
 static int dual_loader_lanes(void) {
     static int lanes;
     if (!lanes) {
         const char *value = getenv("V4_LOADER_LANES");
-        int n = value ? atoi(value) : DUAL_EXPERT_LOADER_COUNT;
-        if (n < 1) n = DUAL_EXPERT_LOADER_COUNT;
+        int n = value ? atoi(value) : DUAL_EXPERT_LOADER_DEFAULT_LANES;
+        if (n < 1) n = DUAL_EXPERT_LOADER_DEFAULT_LANES;
         if (n > DUAL_EXPERT_LOADER_MAX) n = DUAL_EXPERT_LOADER_MAX;
         lanes = n;
     }
@@ -10436,6 +10446,7 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include "deepseek_v4_internal.h"
 #include "json.h"
 #include "native_quant.h"
+#include "serve_codec.h"
 #include "tok.h"
 
 static int load_embedding(float *state, const ColiSafetensorsIndex *index,
@@ -12521,7 +12532,19 @@ typedef struct {
     ColiV4Session *session;
     const char *request_id;
     int cancelled;
+    int fatal;
 } V4ServeStream;
+
+static const ColiServeWireProfile v4_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 24,
+    .max_extension_bytes = 1u << 24,
+    .max_tokens = 0,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+    .allow_extension_bytes = 1,
+    .allow_prefix_hint = 1,
+};
 
 static double v4_serve_rss_gb(void) {
 #ifdef _WIN32
@@ -12598,80 +12621,77 @@ static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
     fflush(stdout);
 }
 
-static int v4_serve_read_request(V4ServeRequest *request,
+static int v4_serve_read_request(FILE *input, FILE *output,
+                                 V4ServeRequest *request,
                                  const char *active_id) {
-    char line[512], command[16], id[64];
-    if (!fgets(line, sizeof(line), stdin)) return -1;
-    if (sscanf(line, "%15s %63s", command, id) < 2) return 0;
-    if (!strcmp(command, "CANCEL") || !strcmp(command, "STOP"))
-        return active_id && !strcmp(active_id, id);
-    if (strcmp(command, "SUBMIT")) return 0;
-
-    int slot = 0, prompt_bytes = 0, max_tokens = 0, extension_bytes = 0;
-    int prefix_bytes = 0;
-    float temperature = 0.0f, top_p = 1.0f;
-    /* Optional 8th field: byte length of the prompt's stable system prefix
-     * (gateway hint for the prefix checkpoint). Older gateways omit it. */
-    int fields = sscanf(line, "%*s %*s %d %d %d %f %f %d %d",
-                        &slot, &prompt_bytes, &max_tokens,
-                        &temperature, &top_p, &extension_bytes, &prefix_bytes);
-    if (fields < 7) prefix_bytes = 0;
-    if (prefix_bytes < 0 || prefix_bytes > prompt_bytes) prefix_bytes = 0;
-    if (fields < 5 || slot != 0 || prompt_bytes < 0 ||
-        prompt_bytes > (1 << 24) || max_tokens < 1 ||
-        extension_bytes < 0 || extension_bytes > (1 << 24)) {
-        printf("ERROR %s bad submit header\n", id);
-        fflush(stdout);
+    ColiServeCommand command;
+    ColiServeReadResult result = coli_serve_read_command(input, &v4_wire, &command);
+    if (result == COLI_SERVE_READ_EOF) return -1;
+    if (result == COLI_SERVE_READ_BAD_FRAME) return -2;
+    if (result == COLI_SERVE_READ_NOMEM) {
+        coli_serve_write_error(output, command.id, "out of memory");
+        return -2;
+    }
+    if (result == COLI_SERVE_READ_BAD_REQUEST &&
+        command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+        coli_serve_write_error(output, command.id, "bad submit header");
+        return -2;
+    }
+    if (result != COLI_SERVE_READ_OK) return 0;
+    if (command.kind == COLI_SERVE_COMMAND_STOP ||
+        command.kind == COLI_SERVE_COMMAND_CANCEL) {
+        int matched = active_id && !strcmp(active_id, command.id);
+        coli_serve_command_dispose(&command);
+        return matched;
+    }
+    if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
+        coli_serve_command_dispose(&command);
         return 0;
     }
-    size_t total = (size_t)prompt_bytes + (size_t)extension_bytes;
-    char *payload = malloc(total + 1);
-    if (!payload) {
-        printf("ERROR %s out of memory\n", id);
-        fflush(stdout);
-        return 0;
+    if (command.slot != 0) {
+        coli_serve_write_error(output, command.id, "bad submit header");
+        coli_serve_command_dispose(&command);
+        return -2;
     }
-    if (fread(payload, 1, total, stdin) != total) {
-        free(payload);
-        return -1;
-    }
-    (void)fgetc(stdin);
-    payload[prompt_bytes] = 0;
+    int prefix_bytes = command.prefix_bytes;
+    if (prefix_bytes < 0 || (uint64_t)prefix_bytes > command.payload_bytes)
+        prefix_bytes = 0;
     memset(request, 0, sizeof(*request));
-    snprintf(request->id, sizeof(request->id), "%s", id);
-    request->prompt = payload;
-    request->prompt_bytes = prompt_bytes;
-    request->max_tokens = max_tokens;
-    request->temperature = temperature;
-    request->top_p = top_p;
-    request->extension_bytes = extension_bytes;
+    snprintf(request->id, sizeof(request->id), "%s", command.id);
+    request->prompt = (char *)coli_serve_command_take_payload(&command);
+    request->prompt_bytes = (int)command.payload_bytes;
+    request->max_tokens = command.max_tokens;
+    request->temperature = command.temperature;
+    request->top_p = command.top_p;
+    request->extension_bytes = (int)command.extension_bytes;
     request->prefix_bytes = prefix_bytes;
+    coli_serve_command_dispose(&command);
     return 2;
 }
 
-static void v4_serve_data(const char *id, const char *data, int bytes) {
+static void v4_serve_data(FILE *output, const char *id,
+                          const char *data, int bytes) {
     if (bytes <= 0) return;
-    printf("DATA %s %d\n", id, bytes);
-    fwrite(data, 1, (size_t)bytes, stdout);
-    fputc('\n', stdout);
-    fflush(stdout);
+    coli_serve_write_data(output, id, data, (size_t)bytes);
 }
 
 /* Drain gateway commands queued behind an active request: CANCEL/STOP for the
  * active id (or stdin EOF) reports "stop generating"; a SUBMIT that arrives
  * while the engine is busy is answered with an engine-busy ERROR so its
  * gateway thread fails fast instead of waiting on a pipe nobody is reading. */
-static int v4_serve_drain_commands(const char *active_id) {
+static int v4_serve_drain_commands(V4ServeStream *stream) {
     while (coli_stdin_readable()) {
         V4ServeRequest queued = {0};
-        int result = v4_serve_read_request(&queued, active_id);
-        if (result < 0 || result == 1) {
+        int result = v4_serve_read_request(stdin, stdout, &queued,
+                                           stream->request_id);
+        if (result < 0) {
+            if (result == -2) stream->fatal = 1;
             free(queued.prompt);
             return 1;
         }
+        if (result == 1) { free(queued.prompt); return 1; }
         if (result == 2) {
-            printf("ERROR %s engine busy\n", queued.id);
-            fflush(stdout);
+            coli_serve_write_error(stdout, queued.id, "engine busy");
             free(queued.prompt);
         }
     }
@@ -12688,9 +12708,9 @@ static int v4_serve_token(void *user_data, int token, float logit,
         char piece[1024];
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
-        v4_serve_data(stream->request_id, piece, bytes);
+        v4_serve_data(stdout, stream->request_id, piece, bytes);
     }
-    if (v4_serve_drain_commands(stream->request_id)) {
+    if (v4_serve_drain_commands(stream)) {
         stream->cancelled = 1;
         return 1;
     }
@@ -12704,27 +12724,32 @@ static int v4_serve_token(void *user_data, int token, float logit,
 static int v4_serve_abort(void *user_data) {
     V4ServeStream *stream = user_data;
     if (stream->cancelled) return 1;
-    if (v4_serve_drain_commands(stream->request_id)) {
+    if (v4_serve_drain_commands(stream)) {
         stream->cancelled = 1;
         return 1;
     }
     return 0;
 }
 
-static void v4_serve_error(const char *id, const char *message) {
-    char clean[512];
-    snprintf(clean, sizeof(clean), "%s", message && *message ? message : "engine request failed");
-    for (char *p = clean; *p; p++)
-        if (*p == '\r' || *p == '\n') *p = ' ';
-    printf("ERROR %s %s\n", id, clean);
-    fflush(stdout);
+static void v4_serve_error(FILE *output, const char *id, const char *message) {
+    coli_serve_write_error(output, id,
+                           message && *message ? message : "engine request failed");
 }
 
-static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
-                         V4ServeRequest *request) {
+static void v4_serve_done(FILE *output, const char *id, int completion,
+                          double tokens_per_second, double hit_rate,
+                          double rss, int prompt_tokens, int length_limited,
+                          int prefix_reused) {
+    ColiServeDone done = {completion, tokens_per_second, hit_rate, rss,
+                          prompt_tokens, length_limited};
+    coli_serve_write_done_i32_suffix(output, id, &done, &prefix_reused, 1);
+}
+
+static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
+                        V4ServeRequest *request) {
     if (request->extension_bytes) {
-        v4_serve_error(request->id, "unsupported request extension");
-        return;
+        v4_serve_error(stdout, request->id, "unsupported request extension");
+        return 0;
     }
     if (request->temperature != 0.0f)
         fprintf(stderr, "[V4] temperature %.3g ignored; target engine is greedy\n",
@@ -12754,8 +12779,8 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         char message[256];
         snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
                  prompt_count, prompt_capacity);
-        v4_serve_error(request->id, message);
-        return;
+        v4_serve_error(stdout, request->id, message);
+        return 0;
     }
     /* max_tokens is a CEILING, not a target (#260/#382): generation ends at
      * EOS either way, so an oversized budget is clamped to what the context
@@ -12770,8 +12795,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                 prompt_count);
         request->max_tokens = context - prompt_count;
     }
-    printf("ACCEPT %s %d\n", request->id, prompt_count);
-    fflush(stdout);
+    coli_serve_write_accept(stdout, request->id, prompt_count);
 
     ColiExpertStoreStats before = {0}, after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
@@ -12780,7 +12804,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
-    V4ServeStream stream = {session, request->id, 0};
+    V4ServeStream stream = {session, request->id, 0, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
     double started = spec_now();
@@ -12796,9 +12820,10 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
+    if (stream.fatal) return -1;
     if (result) {
-        v4_serve_error(request->id, error);
-        return;
+        v4_serve_error(stdout, request->id, error);
+        return 0;
     }
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &after);
@@ -12814,12 +12839,10 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
      * state instead of being prefilled again. Appended rather than inserted --
      * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
      * it and a newer one can report it. */
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %d\n",
-           request->id, completion,
-           decode > 0.0 ? completion / decode : 0.0,
-           hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
-           session->prefix_reused);
-    fflush(stdout);
+    v4_serve_done(stdout, request->id, completion,
+                  decode > 0.0 ? completion / decode : 0.0,
+                  hit_rate, v4_serve_rss_gb(), stats.prompt_tokens,
+                  length_limited, session->prefix_reused);
     double expert_disk_s = engine->experts
         ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
         : 0.0;
@@ -12849,6 +12872,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                                &g_v4_mir_nread[r], __ATOMIC_RELAXED));
         fprintf(stderr, "%s\n", line);
     }
+    return 0;
 }
 
 static int v4_serve_main(void) {
@@ -12905,22 +12929,21 @@ static int v4_serve_main(void) {
             }
         }
     }
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", v4_serve_rss_gb());
-    fflush(stdout);
+    coli_serve_stdio_init();
+    coli_serve_write_ready(stdout, v4_serve_rss_gb());
     v4_hwinfo_emit();
     coli_v4_expert_store_emit_tiers(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
     for (;;) {
         V4ServeRequest request = {0};
         int result;
-        do result = v4_serve_read_request(&request, NULL); while (result == 0);
+        do result = v4_serve_read_request(stdin, stdout, &request, NULL);
+        while (result == 0);
         if (result < 0) break;
         if (result == 2) {
-            v4_serve_one(engine, session, &request);
+            int fatal = v4_serve_one(engine, session, &request);
             free(request.prompt);
+            if (fatal < 0) break;
         }
     }
     coli_v4_session_destroy(session);
@@ -14721,6 +14744,136 @@ int coli_v4_qdq_scratch(size_t activation_count, size_t scales_count,
     return 0;
 }
 
+/* ---- #1136 convergence: the reference matvec accumulates in the rows16 order.
+ *
+ * The rows16 kernels and matmul_mxfp4 compute the same math in two float
+ * orders: rows16 folds (x*w)*scale straight into the row accumulator column
+ * by column (identical per-row order on AVX-512, AVX2 and NEON — mul, mul,
+ * add, never fused); matmul_mxfp4 builds 32-column partial sums and scales
+ * them afterwards (plus an 8-lane horizontal reduction on AVX2). Which expert
+ * takes which kernel follows cache residency, so greedy output moved run to
+ * run (#1136). Per the maintainer's call there, the reference path adopts the
+ * rows16 order — same shape as the K1 f32 planar-tail fix — so a hot
+ * (rows16-packed) and a cold (row-major) expert produce identical bits.
+ *
+ * Only rows%16==0 matrices can ever be rows16-packed (the packer refuses the
+ * rest), so the old order is kept verbatim where no divergence is possible.
+ * The AVX2 arm vectorizes ACROSS rows (16 rows = two 8-lane vectors, columns
+ * in order), which preserves each row's scalar operation order exactly — the
+ * rows16 kernels' own trick. The scalar arm splits the two multiplies and the
+ * add into separate statements so no compiler contracts them into an FMA:
+ * every rows16 ISA rounds the product before the add. */
+void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
+                                    const uint8_t *e8s, const float *x,
+                                    int I, int O) {
+    int rb = I / 2, ng = I / 32;
+#ifdef __AVX2__
+    /* Nibble decode borrows matmul_mxfp4's trick — doubled e2m1 values are
+     * exact int8, one pshufb decodes a 16-byte row into 32 codes — but the
+     * 0.5 un-doubling multiplies the DECODED VALUE here (exact: d*0.5 is a
+     * pure exponent shift), never the scale: the accumulation must see the
+     * same w as coli_e2m1_decode so (x*w)*scale rounds identically to the
+     * rows16 kernels. Rows decode row-major (streaming loads), then 8x8
+     * transposes turn them column-major so 16 rows ride two 8-lane vectors
+     * down the column loop in the rows16 per-row order: mul, mul, add. */
+    float e8lut[256];
+    for (int v = 0; v < 256; v++) e8lut[v] = coli_e8m0_decode((uint8_t)v);
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < O / 16; tile++) {
+        const __m128i lut2 = _mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+        for (int base = 0; base < I; base += 32) {
+            float sc[16], tmp[2][32][8];
+            for (int half_rows = 0; half_rows < 2; half_rows++) {
+                __m256 rowv[8][4];
+                for (int r8 = 0; r8 < 8; r8++) {
+                    int64_t row = tile * 16 + half_rows * 8 + r8;
+                    sc[half_rows * 8 + r8] = e8lut[e8s[row * ng + base / 32]];
+                    __m128i by = _mm_loadu_si128(
+                        (const __m128i *)(q4 + row * rb + base / 2));
+                    __m128i lo = _mm_and_si128(by, m4);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+                    __m128i n0 = _mm_shuffle_epi8(lut2, _mm_unpacklo_epi8(lo, hi));
+                    __m128i n1 = _mm_shuffle_epi8(lut2, _mm_unpackhi_epi8(lo, hi));
+                    rowv[r8][0] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(n0)), half);
+                    rowv[r8][1] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(_mm_srli_si128(n0, 8))), half);
+                    rowv[r8][2] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(n1)), half);
+                    rowv[r8][3] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(_mm_srli_si128(n1, 8))), half);
+                }
+                for (int cb = 0; cb < 4; cb++) {
+                    __m256 blk[8];
+                    for (int r8 = 0; r8 < 8; r8++) blk[r8] = rowv[r8][cb];
+                    __m256 t0 = _mm256_unpacklo_ps(blk[0], blk[1]);
+                    __m256 t1 = _mm256_unpackhi_ps(blk[0], blk[1]);
+                    __m256 t2 = _mm256_unpacklo_ps(blk[2], blk[3]);
+                    __m256 t3 = _mm256_unpackhi_ps(blk[2], blk[3]);
+                    __m256 t4 = _mm256_unpacklo_ps(blk[4], blk[5]);
+                    __m256 t5 = _mm256_unpackhi_ps(blk[4], blk[5]);
+                    __m256 t6 = _mm256_unpacklo_ps(blk[6], blk[7]);
+                    __m256 t7 = _mm256_unpackhi_ps(blk[6], blk[7]);
+                    __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3,2,3,2));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 0],
+                                     _mm256_permute2f128_ps(s0, s4, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 1],
+                                     _mm256_permute2f128_ps(s1, s5, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 2],
+                                     _mm256_permute2f128_ps(s2, s6, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 3],
+                                     _mm256_permute2f128_ps(s3, s7, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 4],
+                                     _mm256_permute2f128_ps(s0, s4, 0x31));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 5],
+                                     _mm256_permute2f128_ps(s1, s5, 0x31));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 6],
+                                     _mm256_permute2f128_ps(s2, s6, 0x31));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 7],
+                                     _mm256_permute2f128_ps(s3, s7, 0x31));
+                }
+            }
+            __m256 sc0 = _mm256_loadu_ps(sc), sc1 = _mm256_loadu_ps(sc + 8);
+            for (int c = 0; c < 32; c++) {
+                __m256 xv = _mm256_set1_ps(x[base + c]);
+                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
+                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[0][c])), sc0));
+                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[1][c])), sc1));
+            }
+        }
+        _mm256_storeu_ps(y + tile * 16, sum0);
+        _mm256_storeu_ps(y + tile * 16 + 8, sum1);
+    }
+#else
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const uint8_t *scl = e8s + (int64_t)o * ng;
+        float sum = 0.0f;
+        for (int c = 0; c < I; c++) {
+            uint8_t byte = w[c >> 1];
+            float wv = coli_e2m1_decode((c & 1) ? (uint8_t)(byte >> 4)
+                                                : (uint8_t)(byte & 0xF));
+            float t = x[c] * wv;                 /* separate statements: the   */
+            t = t * coli_e8m0_decode(scl[c / 32]); /* product must round before */
+            sum = sum + t;                       /* the add, as on every ISA   */
+        }
+        y[o] = sum;
+    }
+#endif
+}
+
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -14754,8 +14907,12 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                                     input, columns, 128) != 0) {
         return -1;
     }
-    matmul_mxfp4(output, activation, weight->data, weight->scales,
-                 1, (int)columns, (int)rows);
+    if (rows % 16 == 0)          /* rows16-packable shape: converge (#1136) */
+        coli_fp4_matvec_rows16_order(output, weight->data, weight->scales,
+                                activation, (int)columns, (int)rows);
+    else
+        matmul_mxfp4(output, activation, weight->data, weight->scales,
+                     1, (int)columns, (int)rows);
     return 0;
 }
 
@@ -14929,10 +15086,17 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         return -1;
     }
-    matmul_mxfp4(output_a, activation, a->data, a->scales,
-                 1, (int)columns, (int)rows);
-    matmul_mxfp4(output_b, activation, b->data, b->scales,
-                 1, (int)columns, (int)rows);
+    if (rows % 16 == 0) {        /* rows16-packable shape: converge (#1136) */
+        coli_fp4_matvec_rows16_order(output_a, a->data, a->scales,
+                                activation, (int)columns, (int)rows);
+        coli_fp4_matvec_rows16_order(output_b, b->data, b->scales,
+                                activation, (int)columns, (int)rows);
+    } else {
+        matmul_mxfp4(output_a, activation, a->data, a->scales,
+                     1, (int)columns, (int)rows);
+        matmul_mxfp4(output_b, activation, b->data, b->scales,
+                     1, (int)columns, (int)rows);
+    }
     return 0;
 }
 

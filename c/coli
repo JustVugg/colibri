@@ -1305,7 +1305,13 @@ def cmd_chat(a):
     p=subprocess.Popen([GLM,str(a.cap if a.cap is not None else 0)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
-    st=stream_turn(p, READY, lambda b: None)
+    # Keep the pre-READY stdout preamble instead of discarding it: the engine's
+    # "loaded in Xs | resident dense: Y MB" line is a printf, i.e. STDOUT
+    # (colibri.c:9595 — same in inkling.c/olmoe.c), so it arrives HERE and never
+    # in errlog. The ready-line regex below used to scan stderr for it and could
+    # never match. A few hundred bytes of banner; nothing else reads them.
+    _preamble=bytearray()
+    st=stream_turn(p, READY, _preamble.extend)
     sp.stop()
     if st is None:
         try: errlog.write(p.stderr.read().decode("utf-8","replace"))
@@ -1321,7 +1327,16 @@ def cmd_chat(a):
     # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
     _drain_box={"done":False}
     def _drain():
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        # readline(), NOT read(): read() returns only at EOF, and the engine is alive
+        # on stdin, so it never returned and errlog.write() below it never ran — the
+        # bounded wait always timed out on an EMPTY file and the whole status block
+        # (including "ready in Xs") silently displayed nothing. Per-line write+flush
+        # makes each status line visible to the reader below as soon as it arrives.
+        try:
+            while True:
+                raw=p.stderr.readline()
+                if not raw: break
+                errlog.write(raw.decode("utf-8","replace")); errlog.flush()
         except (OSError, ValueError): pass
         _drain_box["done"]=True
     threading.Thread(target=_drain, daemon=True).start()
@@ -1330,12 +1345,17 @@ def cmd_chat(a):
         if _drain_box["done"]: break
         time.sleep(0.05)
     errlog.flush()
+    mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB",
+                    _preamble.decode("utf-8","replace"))
+    if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
     try:
         elog=open(errlog.name).read()
-        mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
-        if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
-            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
+            # [METAL]/[CUDA] first: the splash tagline (model_banner_line) names the
+            # checkpoint, not the backend — this engine line is the only confirmation
+            # the GPU tier actually engaged (it can still fall back per-block). The
+            # engine prints it to stderr, we drain it into errlog; keep it whitelisted.
+            if l.startswith(("[METAL]","[CUDA]","[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
                 l=re.sub(r" from$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
@@ -1642,7 +1662,7 @@ def project_python():
 
 def cmd_bench(a):
     need_model(a.model)
-    banner("bench")
+    banner("bench", model=a.model)
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
     py = project_python()
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"

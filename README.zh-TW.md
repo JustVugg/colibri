@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì——小巧引擎，龐大模型">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì——小巧引擎，龐大模型">
 </p>
 
 <p align="center">
@@ -10,9 +10,9 @@
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
 2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-目前可執行四個模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
-（2.8T）與 **OLMoE**（7B）——各自一個 C 檔案，共用同一套 `coli chat` /
-`coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
+目前可執行六個模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
+（2.8T）、**DeepSeek V4 Flash**（284B）、**Qwen3.6**（35B-A3B）與 **OLMoE**（7B）
+——各自一個 C 檔案，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
 
 > **Colibrì 既是今天就能執行的推論引擎，也是一個開放的研究平台。**它的首要目標是在
 > 完整的軟硬體邊界上追求推論側效能——模型格式、記憶體階層、儲存 I/O、配置、排程、核心、

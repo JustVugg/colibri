@@ -3,37 +3,37 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>colibri — frontier MoE models on hardware you own</title>
-<meta name="description" content="Run frontier Mixture-of-Experts models — 744B to 2.8T parameters — on hardware you already own. Pure C, zero dependencies, experts streamed from disk.">
-<meta property="og:title" content="colibri — frontier MoE models on hardware you own">
-<meta property="og:description" content="Frontier MoE models on consumer hardware, from 744B to 2.8T: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
+<title>colibrì — run models bigger than your machine</title>
+<meta name="description" content="An inference engine in pure C that streams Mixture-of-Experts weights from disk. A 2.8-trillion-parameter model runs on a 32 GB box. Six model families, zero dependencies, CPU or GPU.">
+<meta property="og:title" content="colibrì — run models bigger than your machine">
+<meta property="og:description" content="Six frontier MoE families, up to 2.8T parameters, on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Bytesized&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;1,8..60,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Bytesized&display=swap" rel="stylesheet">
 <style>
 :root{
-  --cream:#F0EDE4; --tan:#E7E0D1; --tan2:#DFD7C6; --card-line:#D2CAB7;
-  --ink:#191817; --ink2:#3c3931; --gray:#726b5e; --faint:#a49c8b;
-  --dark:#141311; --on-dark:#EDE9DF; --on-dark-dim:#a7a094;
-  --hair:#dcd6c8; --clay:#b3603f;
-  --sans:'Hanken Grotesk',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  --serif:'Source Serif 4',Georgia,'Times New Roman',serif;
+  --bg:#FCFCFB; --panel:#F4F4F1; --card:#FFFFFF;
+  --ink:#101010; --ink2:#43433F; --gray:#71716B; --faint:#A2A29B;
+  --dark:#0E0E0C; --on-dark:#F1F1ED; --on-dark-dim:#9C9C95;
+  --hair:#E6E6E2; --line:#D9D9D4; --teal:#087A63;
+  --sans:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   --maxw:1200px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--cream);color:var(--ink);font-family:var(--sans);line-height:1.5;
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.55;
   -webkit-font-smoothing:antialiased;overflow-x:hidden;font-size:17px}
 a{color:inherit;text-decoration:none}
-::selection{background:rgba(179,96,63,.16)}
+::selection{background:rgba(8,122,99,.14)}
 .wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(1.3rem,4vw,2.6rem)}
-.serif{font-family:var(--serif)}
+.mono{font-family:var(--mono)}
 
 /* nav */
-nav{position:fixed;inset:0 0 auto 0;z-index:50;background:rgba(240,237,228,.88);backdrop-filter:blur(10px);transition:border-color .25s;border-bottom:1px solid transparent}
+nav{position:fixed;inset:0 0 auto 0;z-index:50;background:rgba(252,252,251,.88);backdrop-filter:blur(10px);transition:border-color .25s;border-bottom:1px solid transparent}
 nav.on{border-color:var(--hair)}
 nav .in{max-width:var(--maxw);margin:0 auto;display:flex;align-items:center;padding:.85rem clamp(1.3rem,4vw,2.6rem)}
 nav .brand{display:flex;align-items:center}
@@ -47,78 +47,103 @@ nav.on .brand .word{max-width:0;opacity:0;margin-left:0}
 nav .nl{margin-left:auto;display:flex;gap:2rem;align-items:center;font-weight:500;font-size:.96rem}
 nav .nl a:not(.btn){color:var(--ink2)} nav .nl a:not(.btn):hover{color:var(--ink)}
 .btn{font-family:var(--sans);font-weight:600;font-size:.94rem;display:inline-flex;align-items:center;gap:.45rem;
-  background:var(--ink);color:var(--cream);padding:.6rem 1.15rem;border-radius:7px;transition:.15s;border:1.5px solid var(--ink)}
+  background:var(--ink);color:var(--bg);padding:.62rem 1.2rem;border-radius:8px;transition:.15s;border:1.5px solid var(--ink)}
 .btn:hover{background:#000;border-color:#000}
-.btn.ghost{background:transparent;color:var(--ink);border-color:var(--card-line)}
+.btn.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
 .btn.ghost:hover{background:transparent;border-color:var(--ink)}
 @media(max-width:820px){nav .nl a:not(.btn){display:none}}
 
-/* hero */
-.hero{padding:9.5rem 0 4.5rem}
-.hero-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:3rem;align-items:end}
-@media(max-width:860px){.hero-grid{grid-template-columns:1fr;gap:1.6rem}}
-.hero h1{font-weight:800;font-size:clamp(2.6rem,6.2vw,4.7rem);line-height:1.03;letter-spacing:-.03em;text-wrap:balance}
-.hero h1 u{text-decoration:none;border-bottom:.11em solid var(--ink);padding-bottom:.02em}
-.hero .aside{font-family:var(--serif);font-size:clamp(1.1rem,1.7vw,1.32rem);line-height:1.45;color:var(--ink2);max-width:26rem}
-.hero .cta{display:flex;gap:.7rem;margin-top:2.4rem;flex-wrap:wrap}
+/* hero — centered, one axis, nothing fighting for the eye */
+.hero{padding:10rem 0 5.5rem;text-align:center}
+.hero .kicker{font-family:var(--mono);font-size:.78rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--teal)}
+.hero h1{font-weight:700;font-size:clamp(2.7rem,6.4vw,4.9rem);line-height:1.06;letter-spacing:-.028em;text-wrap:balance;
+  max-width:17ch;margin:1.1rem auto 0}
+.hero h1 u{text-decoration:none;border-bottom:.1em solid var(--teal);padding-bottom:.03em}
+.hero .sub{font-weight:400;font-size:clamp(1.08rem,1.55vw,1.25rem);line-height:1.6;color:var(--ink2);
+  max-width:42rem;margin:1.5rem auto 0;text-wrap:pretty}
+.hero .cta{display:flex;gap:.75rem;margin-top:2.3rem;flex-wrap:wrap;justify-content:center}
 
-/* dark block */
+/* traction band — real, checkable numbers; mono + tabular so they line up */
+section.tract{padding:0}
+.tract{border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);background:var(--panel)}
+.tract .in{max-width:var(--maxw);margin:0 auto;padding:2.2rem clamp(1.3rem,4vw,2.6rem);
+  display:grid;grid-template-columns:repeat(5,1fr);gap:1.5rem}
+@media(max-width:900px){.tract .in{grid-template-columns:repeat(2,1fr);gap:1.6rem}}
+.tract .n{font-family:var(--mono);font-weight:600;
+  font-size:clamp(1.5rem,3vw,2.05rem);letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1;color:var(--ink)}
+.tract .l{font-size:.8rem;letter-spacing:.05em;text-transform:uppercase;color:var(--gray);margin-top:.5rem;line-height:1.4}
+.tract .since{grid-column:1/-1;color:var(--ink2);font-size:1rem;
+  padding-top:.9rem;border-top:1px solid var(--line);margin-top:.4rem}
+.tract .since b{color:var(--teal);font-weight:600}
+
+/* dark blocks */
 .block-dark{background:var(--dark);color:var(--on-dark)}
 .block-dark .inner{max-width:860px;margin:0 auto;padding:clamp(4.5rem,10vh,7rem) clamp(1.3rem,4vw,2.6rem);text-align:center}
-.block-dark h2{font-family:var(--serif);font-weight:400;font-size:clamp(2.1rem,5vw,3.4rem);line-height:1.12;letter-spacing:-.01em;text-wrap:balance}
-.block-dark p{color:var(--on-dark-dim);font-size:1.1rem;max-width:38rem;margin:1.1rem auto 0;line-height:1.5}
+.block-dark h2{font-weight:700;font-size:clamp(2rem,4.6vw,3.15rem);line-height:1.1;letter-spacing:-.025em;text-wrap:balance}
+.block-dark p{color:var(--on-dark-dim);font-size:1.1rem;max-width:38rem;margin:1.2rem auto 0;line-height:1.55}
 .block-dark .btn{background:var(--on-dark);color:var(--dark);border-color:var(--on-dark);margin-top:2rem}
 .block-dark .btn:hover{background:#fff;border-color:#fff}
 .atlas-block{position:relative;overflow:hidden;min-height:720px;display:flex;align-items:center}
 .atlas-block > canvas{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:0;cursor:grab;touch-action:pan-y}
 .atlas-block::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
-  background:radial-gradient(ellipse 58% 46% at 50% 48%,rgba(20,19,17,.66),rgba(20,19,17,.12) 72%,transparent)}
+  background:radial-gradient(ellipse 58% 46% at 50% 48%,rgba(14,14,12,.66),rgba(14,14,12,.12) 72%,transparent)}
 .atlas-block .inner{position:relative;z-index:2;pointer-events:none}
-.atlas-block .inner h2,.atlas-block .inner p{text-shadow:0 2px 26px rgba(20,19,17,.85),0 1px 5px rgba(20,19,17,.8)}
+.atlas-block .inner h2,.atlas-block .inner p{text-shadow:0 2px 26px rgba(14,14,12,.85),0 1px 5px rgba(14,14,12,.8)}
 .atlas-hint{position:absolute;bottom:1.3rem;left:50%;transform:translateX(-50%);z-index:2;pointer-events:none;
-  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.06em;text-align:center;padding:0 1rem}
+  font-family:var(--mono);font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.06em;text-align:center;padding:0 1rem}
 
 /* generic section */
 section{padding:clamp(4.5rem,9vh,7rem) 0}
-.eyebrow{font-weight:700;font-size:1.15rem;letter-spacing:-.01em;margin-bottom:2rem}
-.lead{font-family:var(--serif);color:var(--ink2);max-width:44rem;font-size:clamp(1.1rem,1.7vw,1.28rem);line-height:1.5}
-
+.overline{font-family:var(--mono);font-size:.76rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--teal);margin-bottom:.9rem}
+.sec-h{font-weight:700;font-size:clamp(1.7rem,3.2vw,2.3rem);line-height:1.12;letter-spacing:-.025em;text-wrap:balance;margin-bottom:1.1rem}
+.lead{color:var(--ink2);max-width:44rem;font-size:clamp(1.05rem,1.5vw,1.18rem);line-height:1.62}
+.lead strong{color:var(--ink);font-weight:600}
 
 /* cards (models) */
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:1.4rem;margin-top:.5rem}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:1.2rem;margin-top:2.2rem}
 @media(max-width:900px){.cards{grid-template-columns:1fr}}
-.card{background:var(--tan);border-radius:12px;padding:1.7rem 1.6rem 1.6rem;display:flex;flex-direction:column;transition:.16s}
-.card:hover{background:var(--tan2);transform:translateY(-3px)}
-.card h3{font-weight:700;font-size:1.35rem;letter-spacing:-.02em;margin-bottom:.5rem}
-.card .desc{font-family:var(--serif);color:var(--ink2);font-size:1.02rem;line-height:1.45;flex:1}
+.card{background:var(--card);border:1px solid var(--hair);border-radius:10px;padding:1.6rem 1.5rem 1.5rem;display:flex;flex-direction:column;transition:.16s}
+.card:hover{border-color:var(--ink);transform:translateY(-2px)}
+.card h3{font-weight:700;font-size:1.3rem;letter-spacing:-.02em;margin-bottom:.5rem}
+.card .desc{color:var(--ink2);font-size:.99rem;line-height:1.55;flex:1}
 .meta{margin-top:1.4rem}
-.meta .row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;padding:.65rem 0;border-top:1px solid var(--card-line)}
-.meta .k{font-weight:700;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--gray)}
-.meta .v{font-family:var(--serif);font-size:.98rem;color:var(--ink)}
+.meta .row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;padding:.6rem 0;border-top:1px solid var(--hair)}
+.meta .k{font-weight:600;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;color:var(--gray)}
+.meta .v{font-family:var(--mono);font-size:.88rem;color:var(--ink)}
 .card .btn{margin-top:1.3rem;align-self:flex-start}
-.card .btn.soon{background:transparent;color:var(--gray);border-color:var(--card-line);pointer-events:none}
 
 /* data list (hardware) */
 .dlist{margin-top:2.4rem;border-top:1px solid var(--hair)}
-.dlist a,.dlist .drow{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:center;
+.dlist a{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:center;
   padding:1.15rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
 .dlist a:hover{padding-left:.7rem}
-.dlist .name{font-weight:600;font-size:1.08rem;letter-spacing:-.01em}
+.dlist .name{font-weight:600;font-size:1.06rem;letter-spacing:-.01em}
 .dlist .sub{color:var(--gray);font-size:.9rem;margin-top:.15rem}
-.dlist .spd{font-family:var(--serif);font-size:1.15rem;white-space:nowrap;text-align:right}
-.dlist .hi{color:var(--clay)}
-.dlistnote{font-family:var(--serif);color:var(--gray);margin-top:1.6rem;font-size:1rem}
-.dlistnote a{border-bottom:1px solid var(--card-line)}
+.dlist .spd{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.08rem;white-space:nowrap;text-align:right}
+.dlist .hi{color:var(--teal);font-weight:600}
+.dlistnote{color:var(--gray);margin-top:1.6rem;font-size:.98rem}
+.dlistnote a{border-bottom:1px solid var(--line)}
+.dlistnote a:hover{border-color:var(--ink)}
 
 /* split (build) */
 .split{display:grid;grid-template-columns:1fr 1.3fr;gap:3rem;align-items:start}
 @media(max-width:900px){.split{grid-template-columns:1fr;gap:1.5rem}}
-.split h2{font-weight:800;font-size:clamp(1.9rem,3.6vw,2.6rem);line-height:1.08;letter-spacing:-.03em;text-wrap:balance}
+.split h2{font-weight:700;font-size:clamp(1.9rem,3.6vw,2.6rem);line-height:1.1;letter-spacing:-.028em;text-wrap:balance}
 .jlist{border-top:1px solid var(--hair)}
 .jlist a{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:baseline;padding:1.2rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
 .jlist a:hover{padding-left:.7rem}
-.jlist .t{font-weight:600;font-size:1.1rem}
-.jlist .c{font-family:var(--serif);color:var(--gray);font-size:.98rem;white-space:nowrap}
+.jlist .t{font-weight:600;font-size:1.08rem}
+.jlist .c{font-family:var(--mono);color:var(--gray);font-size:.85rem;white-space:nowrap}
+
+/* terminal — this is a command-line tool; show the command line */
+.term{background:var(--dark);border-radius:12px;overflow:hidden;box-shadow:0 18px 40px -24px rgba(14,14,12,.5)}
+.term .bar{display:flex;align-items:center;gap:.45rem;padding:.7rem .9rem;border-bottom:1px solid rgba(241,241,237,.1)}
+.term .bar i{width:10px;height:10px;border-radius:50%;background:#33332F;display:block}
+.term .bar span{margin-left:.5rem;font-family:var(--mono);font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.04em}
+.term pre{margin:0;padding:1.15rem 1.2rem 1.3rem;overflow-x:auto;
+  font-family:var(--mono);font-size:.86rem;line-height:1.75;color:var(--on-dark)}
+.term .p{color:#12B08D;user-select:none}
+.term .c{color:var(--on-dark-dim)}
 
 /* footer */
 footer{background:var(--dark);color:var(--on-dark-dim);padding:4rem 0 3rem}
@@ -129,7 +154,7 @@ footer h4{color:var(--on-dark);font-weight:700;font-size:.95rem;margin-bottom:1r
 footer ul{list-style:none;display:flex;flex-direction:column;gap:.7rem}
 footer li a{color:var(--on-dark-dim);font-size:.95rem}
 footer li a:hover{color:var(--on-dark)}
-.fbot{max-width:var(--maxw);margin:2.8rem auto 0;padding:1.6rem clamp(1.3rem,4vw,2.6rem) 0;border-top:1px solid #2a2822;
+.fbot{max-width:var(--maxw);margin:2.8rem auto 0;padding:1.6rem clamp(1.3rem,4vw,2.6rem) 0;border-top:1px solid #262622;
   display:flex;gap:1.2rem;flex-wrap:wrap;font-size:.88rem;color:var(--on-dark-dim)}
 .fbot .sp{margin-left:auto}
 
@@ -142,7 +167,7 @@ footer li a:hover{color:var(--on-dark)}
 
 <!-- colibri mark — monochrome, no box -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#191817">
+  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#101010">
     <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
     <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
     <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
@@ -152,7 +177,7 @@ footer li a:hover{color:var(--on-dark)}
     <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
     <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
   </g></symbol>
-  <symbol id="logo-light" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#EDE9DF">
+  <symbol id="logo-light" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#F1F1ED">
     <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
     <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
     <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
@@ -172,47 +197,60 @@ footer li a:hover{color:var(--on-dark)}
       <a href="#models">Models</a>
       <a href="#hardware">Hardware</a>
       <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a>
+      <a href="https://discord.gg/MAaKtQRc">Discord</a>
       <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
     </div>
   </div>
 </nav>
 
 <header class="hero" id="top">
-  <div class="wrap hero-grid">
-    <h1>These models do not fit in your machine. <u>They run in it anyway.</u></h1>
-    <div class="aside">
-      A Mixture-of-Experts token touches a small fraction of the weights, so colibri keeps that part
-      resident and streams the rest from disk as it is needed. Four families run today — GLM-5.2
-      (744B), Inkling (975B), Kimi K3 (2.8T) and OLMoE (7B) — in pure C, with zero dependencies.
-      No cluster, no cloud, no API key.
-      <div class="cta">
-        <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Quick start →</a>
-      </div>
+  <div class="wrap">
+    <div class="kicker">Pure C · zero dependencies · Apache 2.0</div>
+    <h1>Run models <u>bigger than your machine</u></h1>
+    <p class="sub">
+      colibrì streams Mixture-of-Experts weights from disk instead of loading them,
+      so a 2.8-trillion-parameter model runs on a 32&nbsp;GB box.
+      Six model families, one engine, CPU or GPU.
+    </p>
+    <div class="cta">
+      <a class="btn" href="https://github.com/JustVugg/colibri#quick-start">Quick start →</a>
+      <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">See the benchmarks</a>
     </div>
   </div>
 </header>
 
+<section class="tract">
+  <div class="in reveal">
+    <div><div class="n" data-gh="stargazers_count">25,157</div><div class="l">GitHub stars</div></div>
+    <div><div class="n" data-gh="forks_count">2,730</div><div class="l">forks</div></div>
+    <div><div class="n">100+</div><div class="l">contributors</div></div>
+    <div><div class="n">510</div><div class="l">pull requests merged</div></div>
+    <div><div class="n">6</div><div class="l">families · 4 backends · 3 platforms</div></div>
+    <div class="since">All of it in <b data-gh-age>six weeks</b>, in the open: issues filed from strangers' machines,
+      reproduced and fixed the same day. Currently shipping <b>v1.7.0</b>.</div>
+  </div>
+</section>
+
 <section class="block-dark" id="engine">
   <div class="inner reveal">
     <h2>Frontier models should not be sealed inside datacenters.</h2>
-    <p>Anyone curious enough should be able to open one up — run it, watch every expert fire, and make it better.</p>
+    <p>Anyone curious enough should be able to open one up: run it, watch every expert fire, and make it better.</p>
     <a class="btn" href="https://github.com/JustVugg/colibri">Read the engine →</a>
   </div>
 </section>
 
 <section>
   <div class="wrap reveal">
-    <div class="eyebrow">How it works — a JIT, but for weights</div>
+    <div class="overline">How it works</div>
     <div class="split">
       <h2>Weights are not state to hold. They are data to stage.</h2>
       <div>
         <p class="lead" style="margin-bottom:1.3rem">A token through GLM-5.2 activates only <strong>~40B parameters</strong>, and just
-          <strong>~11 GB</strong> of those change from token to token — the routed experts. colibri keeps the dense weights resident
-          and treats the 19,456 experts as a storage hierarchy: measured routing heat decides which experts earn VRAM, which earn
-          pinned RAM, and which stream from NVMe. The router runs a layer ahead, so prefetch hides the latency.</p>
-        <p class="lead">Everything is validated <strong>token-exact</strong> against the reference transformers implementation —
-          speed never buys drift.</p>
+          <strong>~11&nbsp;GB</strong> of those change from token to token: the routed experts. colibrì keeps the dense weights resident
+          and treats the 19,456 experts as a storage hierarchy. Measured routing heat decides which experts earn VRAM, which earn
+          pinned RAM, and which stream from NVMe, and the router runs a layer ahead so prefetch hides the latency.</p>
+        <p class="lead">Everything is validated <strong>token-exact</strong> against the reference transformers implementation.
+          Speed never buys drift.</p>
       </div>
     </div>
   </div>
@@ -220,26 +258,27 @@ footer li a:hover{color:var(--on-dark)}
 
 <section id="models">
   <div class="wrap reveal">
-    <div class="eyebrow">The models — one engine, more minds coming</div>
+    <div class="overline">The models</div>
+    <h2 class="sec-h">Six families run today, one engine each.</h2>
     <div class="cards">
       <div class="card"><h3>GLM-5.2</h3><p class="desc">The flagship target: an int4 container, token-exact versus reference, with the full expert atlas published.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size · Status</span><span class="v">744B MoE · Live</span></div></div>
-        <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
-      <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse — quantization A/Bs and quality ablations run here first.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">7B MoE · Live</span></div></div>
-        <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
-      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE, running today. An int4 dense container brings the resident set to 15.3 GB, so it fits a 25 GB box.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Live</span></div></div>
-        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it →</a></div>
-      <div class="card"><h3>DeepSeek</h3><p class="desc">A widely-studied frontier MoE family — the tiered engine's next large-scale target.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">671B–1T MoE · Planned</span></div></div>
-        <a class="btn soon">On the roadmap</a></div>
-      <div class="card"><h3>Kimi K3</h3><p class="desc">The largest model here, running today — its QAT-trained MXFP4 experts are streamed straight from the original checkpoint, with no conversion.</p>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Run it →</a></div>
+      <div class="card"><h3>Kimi K3</h3><p class="desc">The largest family we run: gated recurrence plus MLA attention, 2.8T parameters, now with a Metal backend on Apple Silicon.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">2.8T MoE · Live</span></div></div>
-        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it →</a></div>
-      <div class="card"><h3>Qwen3 MoE</h3><p class="desc">The most widely-deployed open family — broad hardware coverage meets broad adoption.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">MoE · Planned</span></div></div>
-        <a class="btn soon">On the roadmap</a></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it →</a></div>
+      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE with an audio tower. Mixed-precision staging fits it on a consumer box.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Live</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it →</a></div>
+      <div class="card"><h3>DeepSeek V4</h3><p class="desc">Sparse attention, multi-token prediction and a trained drafter: the most instrumented engine here.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">284B MoE · Live</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">Run it →</a></div>
+      <div class="card"><h3>Qwen3.6</h3><p class="desc">Gated attention plus Gated DeltaNet. Its CUDA tier keeps hot experts in VRAM: 7x faster than CPU on two 8&nbsp;GB cards, output bit-identical.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">35B MoE · Live</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md">Run it →</a></div>
+      <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse. Quantization A/Bs and quality ablations run here first.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">7B MoE · Live</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri">Run it →</a></div>
     </div>
   </div>
 </section>
@@ -248,7 +287,7 @@ footer li a:hover{color:var(--on-dark)}
   <canvas id="atlasCanvas"></canvas>
   <div class="inner reveal">
     <h2>The mind, measured.</h2>
-    <p>Every point behind this text is a real measured expert — 13,260 characterised experts, specialists clustering by topic,
+    <p>Every point behind this text is a real measured expert: 13,260 characterised experts, specialists clustering by topic,
       generalists drifting to the centre. The first expert atlas of a 700B-class model, mapped on ordinary machines.</p>
   </div>
   <div class="atlas-hint">drag to spin · position is measured routing affinity, not a learned embedding</div>
@@ -256,7 +295,8 @@ footer li a:hover{color:var(--on-dark)}
 
 <section id="hardware">
   <div class="wrap reveal">
-    <div class="eyebrow">Same engine, any hardware</div>
+    <div class="overline">Hardware</div>
+    <h2 class="sec-h">Same engine, any machine.</h2>
     <p class="lead">Measured decode speed on real community machines. The hardware only changes where the experts live, not what the model answers.</p>
     <div class="dlist">
       <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">6× RTX 5090 · full residency + NUMA</div><div class="sub">all in VRAM + RAM · disk 0</div></div><div class="spd">9.0–9.2 tok/s</div></a>
@@ -277,10 +317,22 @@ footer li a:hover{color:var(--on-dark)}
     <div class="split">
       <h2>Come build the microscope.</h2>
       <div class="jlist">
-        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Run a benchmark on your hardware</span><span class="c">Any machine is a datapoint</span></a>
-        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Pick an open issue</span><span class="c">Kernels · schedulers · atlas</span></a>
-        <a href="https://github.com/JustVugg/colibri"><span class="t">Read the engine</span><span class="c">One C file · zero dependencies</span></a>
-        <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">Drop-in gateway</span></a>
+        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Run a benchmark on your hardware</span><span class="c">any machine is a datapoint</span></a>
+        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Pick an open issue</span><span class="c">kernels · schedulers · atlas</span></a>
+        <a href="https://github.com/JustVugg/colibri"><span class="t">Read the engine</span><span class="c">one C file · zero deps</span></a>
+        <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">drop-in gateway</span></a>
+      </div>
+      <div class="term" style="grid-column:1/-1;margin-top:2.2rem">
+        <div class="bar"><i></i><i></i><i></i><span>bash</span></div>
+<pre><span class="c"># one C file, no dependencies</span>
+<span class="p">$</span> git clone https://github.com/JustVugg/colibri
+<span class="p">$</span> make -C colibri/c
+
+<span class="c"># point it at a checkpoint and talk to it</span>
+<span class="p">$</span> ./coli chat --model /path/to/glm-5.2
+
+<span class="c"># or serve an OpenAI-compatible API + dashboard</span>
+<span class="p">$</span> ./coli web --model /path/to/glm-5.2</pre>
       </div>
     </div>
   </div>
@@ -297,28 +349,68 @@ footer li a:hover{color:var(--on-dark)}
         <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a></li>
       </ul></div>
       <div><h4>Models</h4><ul>
-        <li><a href="#models">GLM-5.2</a></li><li><a href="#models">OLMoE</a></li>
-        <li><a href="#models">Inkling</a></li><li><a href="#models">Kimi K3</a></li>
+        <li><a href="#models">GLM-5.2</a></li><li><a href="#models">Kimi K3</a></li>
+        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek V4</a></li>
+        <li><a href="#models">Qwen3.6</a></li><li><a href="#models">OLMoE</a></li>
       </ul></div>
       <div><h4>Project</h4><ul>
         <li><a href="https://github.com/JustVugg/colibri/issues">Issues</a></li>
+        <li><a href="https://discord.gg/MAaKtQRc">Discord</a></li>
         <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Community results</a></li>
         <li><a href="https://github.com/JustVugg/colibri">Apache 2.0 license</a></li>
       </ul></div>
     </div>
-    <div class="fbot"><span>colibri — the hummingbird: tiny, fast, precise.</span><span class="sp">Apache 2.0</span></div>
+    <div class="fbot"><span>colibrì — the hummingbird: tiny, fast, precise.</span><span class="sp">Apache 2.0</span></div>
   </div>
 </footer>
 
 <script>
+/* Live GitHub figures.
+ * Progressive enhancement, deliberately: the numbers are already correct in the
+ * HTML, so this page is honest with JS disabled, with the API rate-limited, or
+ * offline. The fetch only ever *refreshes* them -- it never blanks them, never
+ * shows a spinner, and never writes a smaller number than the one already there
+ * (a rate-limited 403 returns no data, and a partial response is ignored).
+ * Cached for an hour in localStorage so a reload doesn't spend the visitor's
+ * unauthenticated quota (60 req/h per IP). */
+(function liveStats(){
+  var KEY='coli.gh.v1', TTL=36e5, REPO='JustVugg/colibri';
+  function paint(d){
+    if(!d) return;
+    document.querySelectorAll('[data-gh]').forEach(function(el){
+      var v=d[el.getAttribute('data-gh')];
+      if(typeof v==='number' && v>0) el.textContent=v.toLocaleString('en-US');
+    });
+    if(d.created_at){
+      var wk=Math.floor((Date.now()-Date.parse(d.created_at))/6048e5);
+      var el=document.querySelector('[data-gh-age]');
+      if(el && wk>0){
+        var words=['one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve'];
+        el.textContent = wk<=12 ? words[wk-1]+' weeks'
+                       : (wk<52 ? Math.round(wk/4.345)+' months' : (wk/52).toFixed(1)+' years');
+      }
+    }
+  }
+  try{
+    var c=JSON.parse(localStorage.getItem(KEY)||'null');
+    if(c && Date.now()-c.t<TTL){ paint(c.d); return; }
+  }catch(e){}
+  fetch('https://api.github.com/repos/'+REPO,{headers:{'Accept':'application/vnd.github+json'}})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(d){
+      if(!d || typeof d.stargazers_count!=='number') return;   // rate-limited or odd payload: keep the static numbers
+      paint(d);
+      try{ localStorage.setItem(KEY, JSON.stringify({t:Date.now(), d:{
+        stargazers_count:d.stargazers_count, forks_count:d.forks_count, created_at:d.created_at}})); }catch(e){}
+    })
+    .catch(function(){});   /* offline / blocked: the HTML numbers stand */
+})();
+
 const nav=document.getElementById('nav');
 addEventListener('scroll',()=>nav.classList.toggle('on',scrollY>16),{passive:true});
 const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.08});
 document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
 const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
-const pimgs=[...document.querySelectorAll('.pf img[data-parallax]')];
-function park(){const vh=innerHeight;for(const img of pimgs){const f=img.closest('.pf').getBoundingClientRect();const c=(f.top+f.height/2-vh/2)/vh;const s=img.classList.contains('sc4')?1.04:1.06;img.style.transform='scale('+s+') translateY('+(c*-2.4)+'%)';}}
-if(!reduce&&pimgs.length){addEventListener('scroll',park,{passive:true});addEventListener('resize',park);park()}
 
 /* ---- Expert atlas: a rotating 3-D galaxy of measured experts, clustered by topic ---- */
 (function(){

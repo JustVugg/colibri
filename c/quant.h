@@ -558,32 +558,6 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
 #else
 #define IDOT_KERNEL "scalar"
 #endif
-static int g_idot=1;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static int g_i4s=1;
-#elif defined(__VSX__)
-static int g_i4s=1;
-#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
-static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
-                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
-                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
-                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
-                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
-#else
-static int g_i4s=2;
-#endif
-static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
-                       * region across all experts of the batch-union block instead of ~2
-                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
-                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
-                       * byte-identical to that family (same dot_i4i8 per row, same silu,
-                       * same requant, same accumulation order into out). Measured on a
-                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
-                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
-                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
-                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
-                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
-                       * opt-in; measure on your host. */
 
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
@@ -1084,6 +1058,77 @@ static inline int32_t dot_i4p_u(const uint8_t *w4, const int8_t *x, int I){
         if(i+1<I) sum+=(int32_t)(byte>>4)*x[i+1];
     }
     return sum;
+}
+
+/* ---- K1b (OPT-IN, IDOT_GS=1): IDOT planare A GRUPPI (fmt=4, gs%64==0) -----
+ * Con gs=64 il gruppo di scala COINCIDE col blocco-piano da 64 elementi: il
+ * dot unsigned del blocco (2 dpbusd) -> int32 di gruppo, meno 8*somma(x) del
+ * gruppo, per la scala f32 del gruppo. Attivazioni int8 (stessa famiglia
+ * qrow_i8 del resto dell'IDOT): NON bit-identico al kernel f32 a gruppi --
+ * per questo e' dietro flag, in attesa dell'ablazione. xsg = somme int32
+ * per (riga, gruppo), calcolate dal chiamante in una passata esatta.
+ * EN: grouped planar IDOT, opt-in. With gs=64 the scale group IS the plane
+ * block; per-group unsigned dot minus 8*group-sum, times the group scale.
+ * int8 activations: not bit-identical to the f32 grouped kernel, hence the
+ * flag until the ablation blesses a default. */
+static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
+                                    const int32_t *xsg, const uint8_t *q4,
+                                    const float *scale, int S, int I, int O, int gs){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs, bpg=gs/64;   /* blocchi-piano per gruppo */
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const int8_t *xr=xq+(int64_t)s*I;
+            const int32_t *xg=xsg+(int64_t)s*ng;
+            float a=0; int g=0;
+            for(; (g+1)*gs<=I; g++){                     /* gruppi interi */
+                int32_t d=0;
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    const uint8_t *blk=w+(base>>1);
+                    const int8_t *xb=xr+base;
+#if defined(coli_dpbusd256)
+                    const __m256i m4=_mm256_set1_epi8(0x0F);
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i acc=_mm256_setzero_si256();
+                    acc=coli_dpbusd256(acc,_mm256_and_si256(bb,m4),
+                                       _mm256_loadu_si256((const __m256i*)xb));
+                    acc=coli_dpbusd256(acc,_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
+                                       _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    d+=hsum256_i32(acc);
+#elif defined(__AVX2__)
+                    const __m256i m4=_mm256_set1_epi8(0x0F);
+                    const __m256i ones=_mm256_set1_epi16(1);
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i p0=_mm256_maddubs_epi16(_mm256_and_si256(bb,m4),
+                                                    _mm256_loadu_si256((const __m256i*)xb));
+                    __m256i p1=_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
+                                                    _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    __m256i acc=_mm256_add_epi32(_mm256_madd_epi16(p0,ones),
+                                                 _mm256_madd_epi16(p1,ones));
+                    d+=hsum256_i32(acc);
+#else
+                    for(int k=0;k<32;k++){
+                        d+=(int32_t)(blk[k]&0xF)*xb[k];
+                        d+=(int32_t)(blk[k]>>4)*xb[k+32];
+                    }
+#endif
+                }
+                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+            }
+            if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
+                int32_t d=0;
+                for(int i=g*gs;i<I;i++){
+                    uint8_t byte=w[i>>1];
+                    d+=(int32_t)((i&1)?(byte>>4):(byte&0xF))*xr[i];
+                }
+                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+            }
+            y[(int64_t)s*O+o]=a*sx[s];
+        }
+    }
 }
 
 /* matmul IDOT planare (fmt=2): y = (dot_u - 8*xsum[s]) * scale[o] * sx[s].

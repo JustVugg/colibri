@@ -136,7 +136,10 @@ class FamilyRegistryTest(unittest.TestCase):
             "linear_key_head_dim": 8, "linear_value_head_dim": 8,
             "linear_conv_kernel_dim": 4,
         }
-        by_id, by_type = _build_registry(FAMILIES + (QWEN36_FIXTURE,))
+        # qwen36 is a registered family now, so the fixture would collide on its
+        # model_type alias. Assert against the production descriptor instead --
+        # which is the stronger test: it pins the shipped geometry, not a copy.
+        by_id, by_type = _build_registry(FAMILIES)
         family = by_type[config["model_type"]]
         self.assertEqual(family, by_id["qwen36"])
         resolved = type("R", (), {"descriptor": family, "family_config": config,
@@ -174,14 +177,624 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.configured_experts, 4)
         self.assertEqual(geometry.context_state_bytes, 13_312)
 
-    def test_unproven_production_planners_refuse_instead_of_inventing_zero(self):
-        for model_type in ("inkling", "kimi_k3", "olmoe", "deepseek_v4"):
+    def test_olmoe_fixture_models_conventional_fp32_kv_cache(self):
+        # OLMoE keeps a full K and V cache per layer, sized at num_attention_heads
+        # * head_dim in fp32 (olmoe.c:1019-1020), no recurrent/fixed state, and no
+        # model-specific workspace beyond the base runtime reserve.
+        config = {
+            "model_type": "olmoe",
+            "num_hidden_layers": 4,
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 16,
+            "vocab_size": 100,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type["olmoe"]
+        self.assertEqual(family, by_id["olmoe"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.configured_experts, 8)
+        # layers=4, context=32, heads=4, head_dim=32//4=8, K and V, fp32:
+        # 4 * 32 * 4 * 8 * 2 * 4 = 32768
+        self.assertEqual(geometry.context_state_bytes, 4 * 32 * 4 * 8 * 2 * 4)
+        self.assertEqual(geometry.fixed_state_bytes, 0)
+        self.assertEqual(geometry.workspace_bytes, 0)
+
+    def test_production_planners_report_real_geometry(self):
+        # #1066 is closed: every production planner now returns a real
+        # PlannerGeometry instead of refusing with PlannerUnsupportedError.
+        # The plan must never be a silently-invented zero-byte budget --
+        # every family here has a resident KV/state cache, so at least one
+        # of context_state_bytes or fixed_state_bytes must be non-zero.
+        cases = {
+            "olmoe": {
+                "model_type": "olmoe",
+                "hidden_size": 2048,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 16,
+                "num_experts": 8,
+            },
+            "kimi_k3": {
+                "model_type": "kimi_k3",
+                "hidden_size": 2048,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 16,
+                "q_lora_rank": 64,
+                "kv_lora_rank": 128,
+                "qk_nope_head_dim": 64,
+                "qk_rope_head_dim": 32,
+                "v_head_dim": 128,
+                "num_experts": 32,
+                "linear_attn_config": {
+                    "num_heads": 8,
+                    "head_dim": 64,
+                    "kda_layers": [1, 2, 3, 4, 5],
+                },
+            },
+            "inkling": {
+                "model_type": "inkling",
+                "hidden_size": 2048,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 32,
+                "n_routed_experts": 8,
+            },
+            "deepseek_v4": {
+                "model_type": "deepseek_v4",
+                "hidden_size": 2048,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 16,
+                "head_dim": 32,
+                "q_lora_rank": 16,
+                "o_groups": 4,
+                "o_lora_rank": 64,
+                "sliding_window": 8,
+                "index_head_dim": 24,
+                "n_routed_experts": 32,
+                "compress_ratios": [0, 2, 4, 4],
+            },
+        }
+        for model_type, config in cases.items():
             family = family_for_config({"model_type": model_type})
-            resolved = type("R", (), {"descriptor": family, "family_config": {},
-                                       "model_dir": "."})()
-            with self.subTest(model_type=model_type), \
-                 self.assertRaises(PlannerUnsupportedError):
-                planner_geometry(resolved, 32)
+            resolved = type("R", (), {"descriptor": family,
+                                      "family_config": config,
+                                      "model_dir": "."})()
+            with self.subTest(model_type=model_type):
+                geometry = planner_geometry(resolved, 32)
+                self.assertIsInstance(geometry, PlannerGeometry)
+                self.assertGreater(
+                    geometry.context_state_bytes + geometry.fixed_state_bytes,
+                    0)
+
+
+    def test_olmoe_geometry_matches_engine_kv_allocation(self):
+        # OLMoE config shaped like the real 1B-7B model (AI2), but small.
+        config = {
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 512,
+            "vocab_size": 50304,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["olmoe"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # Engine allocates K+V with n_heads (not n_kv_heads), fp32:
+        #   head_dim = hidden // n_heads = 2048 // 16 = 128
+        #   state   = layers * context * heads * head_dim * 2 * 4
+        self.assertEqual(geometry.configured_experts, 8)
+        self.assertEqual(geometry.context_state_bytes,
+                         2 * 32 * 16 * 128 * 2 * 4)
+        self.assertEqual(geometry.fixed_state_bytes, 0)
+        # Workspace: the bounded per-forward scratch (attention scores,
+        # logits, expert temporaries) is covered by the base runtime reserve,
+        # so the planner reports no context-scaling workspace (dev #1095).
+        self.assertEqual(geometry.workspace_bytes, 0)
+
+    def test_olmoe_geometry_scales_with_context(self):
+        config = {
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 512,
+            "vocab_size": 50304,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 16)
+        large = planner_geometry(resolved, 64)
+        ratio = large.context_state_bytes / small.context_state_bytes
+        self.assertEqual(ratio, 4)  # linear in context
+        # Workspace stays at zero at every context (per dev #1095): only the
+        # KV state scales with context, so the ratio above is the full story.
+        self.assertEqual(small.workspace_bytes, 0)
+        self.assertEqual(large.workspace_bytes, 0)
+
+    def test_olmoe_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["olmoe"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_olmoe_geometry_uses_n_heads_not_n_kv_heads(self):
+        # GQA where kv < q heads: the engine still allocates K/V per q head,
+        # so the plan must follow num_attention_heads (olmoe.c:1019-1020).
+        config = {
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,   # GQA ratio 4
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 512,
+            "vocab_size": 50304,
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["olmoe"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.context_state_bytes,
+                         2 * 32 * 16 * 128 * 2 * 4)  # 16 heads, not 4
+
+    def test_kimi_geometry_matches_engine_hybrid_allocation(self):
+        # Kimi K3-shaped config: 8 layers, 5 KDA + 3 MLA (small synthetic).
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {
+                "num_heads": 8,
+                "head_dim": 64,
+                "short_conv_kernel_size": 3,
+                "kda_layers": [1, 2, 3, 4, 5],
+            },
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["kimi"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # MLA cache: 3 MLA layers x context x (kv_lora + qk_rope) x 4
+        self.assertEqual(geometry.context_state_bytes,
+                         3 * 32 * (128 + 32) * 4)
+        # KDA fixed recurrent state: 5 KDA layers x heads x hd x hd x 4
+        self.assertEqual(geometry.fixed_state_bytes,
+                         5 * 8 * 64 * 64 * 4)
+        self.assertEqual(geometry.configured_experts, 32)
+
+    def test_kimi_geometry_kda_state_does_not_scale_with_context(self):
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {
+                "num_heads": 8,
+                "head_dim": 64,
+                "short_conv_kernel_size": 3,
+                "kda_layers": [1, 2, 3, 4, 5],
+            },
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 16)
+        large = planner_geometry(resolved, 64)
+        # KDA recurrent state is context-independent
+        self.assertEqual(small.fixed_state_bytes, large.fixed_state_bytes)
+        # MLA cache scales linearly with context
+        self.assertEqual(large.context_state_bytes / small.context_state_bytes, 4)
+
+    def test_kimi_geometry_rejects_missing_linear_attn_config(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+        }
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_kimi_geometry_rejects_missing_kda_layers(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {"num_heads": 8, "head_dim": 64},
+        }
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_kimi_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_kimi_geometry_workspace_is_max_of_kda_and_mla(self):
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {
+                "num_heads": 8,
+                "head_dim": 64,
+                "short_conv_kernel_size": 3,
+                "kda_layers": [1, 2, 3, 4, 5],
+            },
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        ctx = 32
+        # KDA workspace: 6*ctx*P + ctx*hd + ctx*hidden floats
+        ws_kda = (6 * ctx * (8 * 64) + ctx * 64 + ctx * 2048) * 4
+        # MLA workspace: qa + qv + ckv + gv + ctx buffers
+        qh = 64 + 32
+        ws_mla = (ctx * 64 + ctx * 16 * qh + ctx * (128 + 32) +
+                  2 * ctx * 16 * 128) * 4
+        self.assertEqual(geometry.workspace_bytes, max(ws_kda, ws_mla))
+
+    def test_inkling_geometry_matches_engine_hybrid_allocation(self):
+        # 6 layers: default rule (i+1)%6 -> 5 sliding + 1 global (last).
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["inkling"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # 5 sliding layers: kv=2, hd=32, rows=window=8 -> 2*2*8*32*4 each
+        sliding = 5 * (2 * 2 * 8 * 32 * 4)
+        # 1 global layer: kv=4, hd=32, rows=context=32 -> 2*4*32*32*4
+        global_ = 1 * (2 * 4 * 32 * 32 * 4)
+        self.assertEqual(geometry.context_state_bytes, sliding + global_)
+        # Conv states per layer: (2*kvdim + 2*hidden) * (conv_k-1) * 4
+        kvdim_s = 2 * 32   # sliding kv*hd
+        kvdim_g = 4 * 32   # global kv*hd
+        fixed = 5 * (2 * kvdim_s + 2 * 2048) * 2 * 4
+        fixed += 1 * (2 * kvdim_g + 2 * 2048) * 2 * 4
+        self.assertEqual(geometry.fixed_state_bytes, fixed)
+        self.assertEqual(geometry.configured_experts, 8)
+
+    def test_inkling_geometry_sliding_ring_does_not_scale_past_window(self):
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 8)    # context == window
+        large = planner_geometry(resolved, 64)   # context > window
+        # Sliding ring rows are capped at window, so beyond window the
+        # sliding contribution is flat; only the 1 global layer grows.
+        delta = large.context_state_bytes - small.context_state_bytes
+        self.assertEqual(delta, 1 * (2 * 4 * (64 - 8) * 32 * 4))
+        # Fixed (conv) state is context-independent
+        self.assertEqual(small.fixed_state_bytes, large.fixed_state_bytes)
+
+    def test_inkling_geometry_local_layer_ids_override_default(self):
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+            "local_layer_ids": [0, 2],   # only layers 0 and 2 are sliding
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # 2 sliding (kv=2, rows=8) + 2 global (kv=4, rows=32)
+        expected = 2 * (2 * 2 * 8 * 32 * 4) + 2 * (2 * 4 * 32 * 32 * 4)
+        self.assertEqual(geometry.context_state_bytes, expected)
+
+    def test_inkling_geometry_audio_tower_adds_fixed_reserve(self):
+        base = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": base,
+                                   "model_dir": "."})()
+        no_audio = planner_geometry(resolved, 32)
+
+        with_audio_cfg = dict(base)
+        with_audio_cfg["audio_config"] = {"n_mel_bins": 80, "mel_vocab_size": 16}
+        resolved2 = type("R", (), {"descriptor": family,
+                                   "family_config": with_audio_cfg,
+                                   "model_dir": "."})()
+        audio = planner_geometry(resolved2, 32)
+        # audio_enc table [80*16, 2048] + norm [2048], fp32
+        expected_audio = (80 * 16 * 2048 + 2048) * 4
+        self.assertEqual(audio.fixed_state_bytes - no_audio.fixed_state_bytes,
+                         expected_audio)
+        self.assertEqual(audio.context_state_bytes, no_audio.context_state_bytes)
+
+    def test_inkling_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_inkling_geometry_rejects_bad_layer_types_length(self):
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "n_routed_experts": 8,
+            "layer_types": ["hybrid_sliding"],  # wrong length
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_dsv4_geometry_matches_engine_context_bytes(self):
+        # 4 layers: ratios [0, 2, 4, 4] -> no-compress, compressor, indexer, indexer
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2, 4, 4],
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["deepseek_v4"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # Fixed window ring: 4 layers * window 8 * head_dim 32 * 4
+        self.assertEqual(geometry.fixed_state_bytes, 4 * 8 * 32 * 4)
+        # Compressor states: ceil(32/2)=16 * hd * 4  +  ceil(32/4)=8 * hd * 4 * 2
+        state = 16 * 32 * 4 + 8 * 32 * 4 + 8 * 32 * 4
+        # Indexer states (ratio==4): ceil(32/4)=8 * index_hd 24 * 4, for 2 layers
+        state += 8 * 24 * 4 + 8 * 24 * 4
+        self.assertEqual(geometry.context_state_bytes, state)
+        self.assertEqual(geometry.configured_experts, 32)
+
+    def test_dsv4_geometry_fixed_ring_does_not_scale_with_context(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2, 4, 4],
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 16)
+        large = planner_geometry(resolved, 64)
+        # Window ring is context-independent
+        self.assertEqual(small.fixed_state_bytes, large.fixed_state_bytes)
+        # Compressed states scale ~linearly with context (ceil divisions)
+        ratio = large.context_state_bytes / small.context_state_bytes
+        self.assertAlmostEqual(ratio, 4, delta=0.5)
+
+    def test_dsv4_geometry_workspace_matches_attention_scratch(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2, 4, 4],
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        ctx = 32
+        q_width = 16 * 32       # heads * head_dim
+        oa_width = 4 * 64       # o_groups * o_lora_rank
+        expected = (ctx * (16 + 2 * q_width + 32 + oa_width) +
+                    max(16, 32)) * 4
+        self.assertEqual(geometry.workspace_bytes, expected)
+
+    def test_dsv4_geometry_rejects_bad_compress_ratios(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2],  # wrong length
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_dsv4_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_dsv4_geometry_all_uncompressed_layers_have_only_ring(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 0, 0, 0],
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 64)
+        # No compressors: context state is zero, only the ring is resident
+        self.assertEqual(geometry.context_state_bytes, 0)
+        self.assertEqual(geometry.fixed_state_bytes, 4 * 8 * 32 * 4)
 
     def test_cli_and_gateway_dispatch_follow_the_registry(self):
         import openai_server
@@ -224,6 +837,11 @@ class FamilyRegistryTest(unittest.TestCase):
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
+            # Qwen3.6's generation prompt MUST open <think>: the model was
+            # never trained on the bare "assistant\\n" state and greedy argmax
+            # there lands on an EOS special (measured gen=0).
+            "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
+                      "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
         }
         self.assertEqual(

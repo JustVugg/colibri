@@ -141,10 +141,25 @@ ifeq ($(shell $(CC) -mcpu=native -dM -E - </dev/null 2>/dev/null | grep -c __ARM
 CPUFEAT  := $(shell grep -m1 '^Features' /proc/cpuinfo 2>/dev/null)
 ARCH_EXT := $(if $(filter asimddp,$(CPUFEAT)),+dotprod)$(if $(filter i8mm,$(CPUFEAT)),+i8mm)
 ifneq ($(ARCH_EXT),)
-ifneq ($(shell $(CC) -march=armv8-a$(ARCH_EXT) -dM -E - </dev/null 2>/dev/null | grep -cE '__ARM_FEATURE_DOTPROD|__ARM_FEATURE_MATMUL_INT8'),0)
+# gcc 11 defines __ARM_FEATURE_DOTPROD for -march=armv8-a+dotprod yet cannot
+# emit vdotq_s32 for that base ("target specific option mismatch"): the macro
+# probe alone is not enough. Verify by compiling the intrinsic for real, and
+# prefer the armv8.2-a base where dotprod is a first-class ISA feature
+# (Neoverse-N1 and friends report asimddp but are armv8.2 cores). Fall back to
+# armv8-a only if the compiler accepts the modifiers there too; otherwise the
+# idot kernels compile out and int4 S=1 decode falls back to f32 (#631, #1104).
+PROBE_C := $(shell mktemp /tmp/coli_v4_probe.XXXXXX.c)
+PROBE_OK := $(shell echo '#include <arm_neon.h>' > $(PROBE_C); echo 'int p(const signed char*w,const signed char*x,int n){int32x4_t a=vdupq_n_s32(0);for(;n>=16;n-=16)a=vdotq_s32(a,vld1q_s8(w),vld1q_s8(x));return vaddvq_s32(a);}' >> $(PROBE_C); $(CC) -c $(PROBE_C) -o /dev/null -march=armv8.2-a$(ARCH_EXT) 2>/dev/null && echo yes; rm -f $(PROBE_C))
+ifeq ($(PROBE_OK),yes)
+ARCHFLAG := -march=armv8.2-a$(ARCH_EXT)
+else
+PROBE_C8 := $(shell mktemp /tmp/coli_v4_probe.XXXXXX.c)
+PROBE_OK8 := $(shell echo '#include <arm_neon.h>' > $(PROBE_C8); echo 'int p(const signed char*w,const signed char*x,int n){int32x4_t a=vdupq_n_s32(0);for(;n>=16;n-=16)a=vdotq_s32(a,vld1q_s8(w),vld1q_s8(x));return vaddvq_s32(a);}' >> $(PROBE_C8); $(CC) -c $(PROBE_C8) -o /dev/null -march=armv8-a$(ARCH_EXT) 2>/dev/null && echo yes; rm -f $(PROBE_C8))
+ifeq ($(PROBE_OK8),yes)
 ARCHFLAG := -march=armv8-a$(ARCH_EXT)
 else
 $(warning $(CC) does not accept$(subst +, +,$(ARCH_EXT)): int8/int4 idot kernels compile out (#631))
+endif
 endif
 endif
 endif
@@ -201,6 +216,12 @@ COLI_ANS  ?= 0
 DIETGPU_ROOT ?=
 DEEPGEMM  ?= 0
 NCCL      ?= 0
+# DeepGEMM sm120 headers for the DeepSeek V4 DeepGEMM flavour: a pinned
+# checkout made by tools/fetch_deepgemm.sh on first use (gitignored), see the
+# DeepSeek V4 CUDA kernels block and the cuda-dsv4-dg-dll target below.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
 # GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
@@ -430,13 +451,14 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
-TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
+	tests/test_v4_serve_framing$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -488,14 +510,19 @@ endif
 # objects are self-contained: backend_cuda_dsv4.* include only their own header
 # and the CUDA runtime, so they build and their tests run without the engine.
 #
-# DEEPGEMM is unsupported: CI cannot compile it without an external checkout,
-# and its kernels require Blackwell to run. It gates nothing and blocks nothing;
-# the default build is the supported configuration.
+# DEEPGEMM is an opt-in: its kernels require Blackwell (sm_120a) to run and CI
+# does not compile it. It gates nothing and blocks nothing; the default build
+# (generic kernels, any sm_80+) is the supported configuration and the one to
+# report bugs against. The sm120 headers it needs are NOT in this repository:
+# tools/fetch_deepgemm.sh checks out the community sm120 port at a pinned
+# commit into third_party/deepgemm (gitignored), verifies the pin, applies
+# patches-deepgemm-sm120-msvc.patch, and DEEPGEMM=1 / cuda-dsv4-dg-dll invoke
+# it on first build (deepgemm-fetch). DEEPGEMM_HOME points at an existing
+# checkout instead; DEEPGEMM_PIN bumps the commit. Attribution:
+# THIRD_PARTY_NOTICES.md.
 DSV4_CUDA_OBJ = backend_cuda_dsv4.o
 ifeq ($(DEEPGEMM),1)
-ifndef DEEPGEMM_HOME
-$(error DEEPGEMM_HOME must point to a DeepGEMM include tree)
-endif
+DSV4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
 CFLAGS += -DCOLI_DSV4_DEEPGEMM
 # Append, never replace. This was `:=` and discarded the whole inherited flag
 # set: $(CUDA_GENCODE), so any CUDA_ARCH the user chose was silently swapped for
@@ -623,8 +650,15 @@ deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
 
-# phony targets — 'glm' kept for backward compatibility
+# Convenience aliases — 'glm' kept for backward compatibility.
+# On POSIX EXE is empty, so `colibri: colibri$(EXE)` becomes a self-dependency
+# and marking it phony also forces the real binary to rebuild on every invocation.
+# Only create the alias when the platform executable suffix makes it distinct.
+ifneq ($(EXE),)
+.PHONY: colibri
 colibri: colibri$(EXE)
+endif
+.PHONY: glm
 glm: colibri$(EXE)
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
@@ -718,9 +752,16 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
 
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+# The pinned DeepGEMM sm120 checkout (see the DEEPGEMM block above). The stamp
+# is a header that only exists in the sm120 port, so an empty or wrong tree
+# refetches; the script itself is a no-op when the tree is already at the pin.
+deepgemm-fetch $(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+.PHONY: deepgemm-fetch
 
 # Windows DeepSeek V4 CUDA DLLs: the sibling of cuda-dll for the DeepSeek V4
 # engine. deepseek-v4.exe is built with MinGW gcc and cannot link MSVC/nvcc
@@ -742,9 +783,11 @@ cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
 
+# The DeepGEMM sm120 headers come from tools/fetch_deepgemm.sh (pinned
+# checkout into $(DEEPGEMM_HOME), see the DEEPGEMM block above); this target
+# fetches them on first use.
 DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
-cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
-	@test -n "$(DEEPGEMM_HOME)" || { echo "DEEPGEMM_HOME must point to the sm120 DeepGEMM checkout" >&2; exit 1; }
+cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_STAMP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
@@ -804,7 +847,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
@@ -817,6 +860,29 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# failure on some hosts and would otherwise abort the recipe first.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
 	./fp8_warp_test$(EXE)
+	# The batch and ragged absorb kernels must reproduce their own output: they
+	# reduce in a fixed tree order with no atomics, so two identical launches
+	# that disagree have read shared memory another thread was still writing.
+	# Needs both an oversubscribed grid and a token count in the affected band
+	# (roughly 33..256 per block) to reach the output; the sweep covers both,
+	# and one cell sits above the band on purpose. See the test's header.
+	# Runs AFTER the fp8 test on purpose: this is the most schedule-sensitive
+	# test in the recipe, and it should not cost the broader kernel suites if
+	# it trips. It stays BEFORE MXFP4 so it still runs on the hosts where that
+	# one is expected to fail.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
+	./absorb_determinism_test$(EXE)
+	# fmt=8 (fp8-e4m3) kernel oracle + public API (LUT gate, dense, expert
+	# group, byte accounting). Includes backend_cuda.cu itself, so only the
+	# test file is compiled. Also runs BEFORE the MXFP4 test (same reason).
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	./fp8_cuda_test$(EXE)
+	# Upload-failure ownership: a failed H2D weight copy must release the
+	# bytes it allocated (weights_owned set by the malloc, not the copy).
+	# Includes backend_cuda.cu itself to plant the memcpy failure, so only
+	# the test file is compiled.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
+	./weights_owned_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
@@ -851,7 +917,9 @@ hip-test:
 gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -873,10 +941,40 @@ fp8-bench: fp8_bench$(EXE)
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
+olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
-inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+# Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
+# MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
+# in and reuses the shared CUDA backend; without it the engine is CPU-only
+# (qwen36_tier.h provides inline stubs).
+#
+# The flags follow the same switch. Without CUDA=1 this target keeps the
+# NOCUDA_* flags it got when the engine had no CUDA at all: compiling
+# -DCOLI_CUDA and linking -lcudart for a build that calls neither only made
+# `make qwen36` depend on a toolkit it never touches. With CUDA=1 the tier is
+# real CUDA and takes the normal flags back.
+ifeq ($(CUDA),1)
+QWEN36_TIER_SRC = qwen36_tier.c
+QWEN36_CFLAGS   = $(CFLAGS)
+QWEN36_LDFLAGS  = $(LDFLAGS)
+else
+QWEN36_TIER_SRC =
+QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
+QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
+endif
+qwen36$(EXE): qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+
+# Context-size gates: KV layout, growth across requests, and the attention
+# capacity. Includes qwen36.c directly, so no model file is needed.
+# Same tier sources as the engine: the test includes qwen36.c, so with CUDA=1
+# it needs qwen36_tier.c and the backend object too (without CUDA, the header's
+# inline stubs cover it and both are empty).
+tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
+inkling$(EXE): inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
@@ -891,8 +989,8 @@ NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
-kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
+	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -916,7 +1014,7 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
-tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
+tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
@@ -931,10 +1029,10 @@ tests/test_json$(EXE): tests/test_json.c json.h
 tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h
+tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h
+tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
@@ -943,6 +1041,9 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
 
 tests/test_st_map$(EXE): tests/test_st_map.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_dup_name_refusal$(EXE): tests/test_dup_name_refusal.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
@@ -992,10 +1093,25 @@ tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c st.
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_serve_codec$(EXE): tests/test_serve_codec.c serve_codec.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
 # ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
 # the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
-tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
+tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
@@ -1090,7 +1206,8 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
-	COLI_V4_UNIT_NATIVE_QUANT.o
+	COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
 # Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
 # is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
 # native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
@@ -1105,6 +1222,7 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
 		$(V4_TEST_EXTRA_TARGETS)
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
@@ -1141,9 +1259,16 @@ $(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c expert_store_regi
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 
+tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c deepseek_v4.c \
+		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
+
 endif
 
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
@@ -1299,6 +1424,7 @@ install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) \
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
@@ -1324,7 +1450,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+.PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
@@ -1337,5 +1463,5 @@ bench: iobench$(EXE)
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
 
-tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)

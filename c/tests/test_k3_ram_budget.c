@@ -26,7 +26,7 @@ enum { NMOE = 93, N_EXPERTS = 384 };
 static const double SLOT_GB   = 17.5e-3;   /* 17.5 MB per slot */
 static const double RESIDENT  = 35.2;      /* RSS at the init line */
 static const double KV_GB     = 3.0;       /* projected, K3_MAXT default */
-static const double RESERVE   = 2.5 + 1.2 + 3.0;
+static const double RESERVE   = 2.5 + 1.2 + KV_GB;
 
 /* What v1.5.0 did: K3_EXPERT_GB straight into a cap, nothing subtracted. */
 static int cap_v150(double egb){

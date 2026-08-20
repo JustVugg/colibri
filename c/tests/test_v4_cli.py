@@ -183,6 +183,7 @@ class V4CliTest(unittest.TestCase):
                                    return_value="deepseek_v4.exe"), \
                  mock.patch.object(self.cli, "need_model"), \
                  mock.patch.object(self.cli, "banner"), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=8), \
                  mock.patch.object(self.cli.subprocess, "call",
                                    side_effect=fake_call):
                 with self.assertRaises(SystemExit) as stopped:

@@ -34,6 +34,16 @@ int coli_hadamard_bf16_ref(float *values, size_t length);
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input);
 
+/* #1136 convergence core: row-major fp4 matvec accumulating in the rows16
+ * kernels' per-row order — (x*w)*scale folded straight into the row
+ * accumulator, column by column, product rounded before the add — so a
+ * rows16-packed and a row-major copy of the same matrix produce identical
+ * bits. Requires I%32==0 and O%16==0 (the only shapes rows16 can pack);
+ * `x` is the already-qdq'd activation. */
+void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
+                                  const uint8_t *e8s, const float *x,
+                                  int I, int O);
+
 /* Correctness-first FP8 matvec for native 128x128 E4M3 weight blocks with
  * UE8M0 scales and dynamically quantized E4M3 activations. */
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
