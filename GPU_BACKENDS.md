@@ -442,10 +442,20 @@ and the constraints below are hard gates rather than guidance.
 family        MoE shared-expert gate / up  (sh_gate, sh_up)
 K             6144
 N             2048
-stored format fmt=4 grouped int4, group size 64
+stored format fmt=4 grouped int4, group size 64, PAIR nibble layout
 logical M     1..64, zero-padded to the artifact's M=64
 execution     blocking, one operation at a time
 ```
+
+The layout constraint is not decoration. `fmt=4` has two in-memory layouts: the
+classic **pair** layout (elements `2j` and `2j+1` in byte `j`) and the K1
+**planar** layout (elements `k` and `k+32` in byte `k` of each 64-element block),
+which `qt_planarize()` writes in place when the grouped planar IDOT path is
+opted into with `IDOT_GS=1`. The prepared-weight converter was qualified against
+the pair layout only, and planar bytes would decode to plausible-looking nonsense
+rather than fail — so a planar tensor is refused (`LAYOUT_UNSUPPORTED`) and falls
+back to the current path. Supporting the planar layout is a separate question
+with its own qualification.
 
 `sh_down` is deliberately **not** accelerated: its orientation is `I=2048,
 O=6144`, which is not what the qualified artifact computes. Nor is the generic
@@ -468,7 +478,7 @@ Hard eligibility is evaluated in this order, cheapest and most semantic first,
 and no later gate can excuse an earlier refusal:
 
 ```
-family -> logical M -> K/N -> fmt -> group size -> registry row
+family -> logical M -> K/N -> fmt -> group size -> byte layout -> registry row
        -> artifact qualification -> artifact present -> artifact SHA256
        -> helper ABI -> prepared weight VALID -> 4096-byte alignment
        -> device/runtime -> artifact runtime object -> userptr wrap -> execute
@@ -552,6 +562,7 @@ HELPER_ABI_INCOMPATIBLE       loaded, wrong generation or incomplete
 ARTIFACT_UNAVAILABLE          this build does not ship those bytes
 ARTIFACT_INTEGRITY_FAILED     the bytes are not the bytes that were qualified
 ARTIFACT_UNQUALIFIED          a known artifact that was never correctness-qualified
+LAYOUT_UNSUPPORTED            fmt=4 bytes are in the K1 planar layout, not pairs
 REGISTRY_INVALID              the registry itself is malformed
 WEIGHT_PREPARE_FAILED         fmt4 to BF16 conversion failed
 PREPARED_INVALID              no usable prepared image
