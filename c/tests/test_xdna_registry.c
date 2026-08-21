@@ -400,6 +400,83 @@ static void test_production_rows(void){
        "unshipped production artifact -> ARTIFACT_UNAVAILABLE");
 }
 
+/* ---- the compiled-in production registry -------------------------------
+ *
+ * REGRESSION for a defect W2-N7-I5 found in this file: g_nrows was initialised
+ * to 0 with no lazy initialisation, so the production table was installed but
+ * EMPTY and every production lookup answered UNKNOWN_FAMILY. It stayed
+ * invisible for two slices because every caller was a test that installed its
+ * own registry first, and it surfaced only when I5 became the first production
+ * consumer.
+ *
+ * So this runs FIRST, before anything calls coli_xdna_test_set_registry, and it
+ * asks the production table what it actually contains. */
+static void test_production_registry_default(void){
+    printf("compiled-in production registry, with no test rows installed\n");
+
+    ck(coli_xdna_registry_validate(), "the production registry validates as compiled");
+
+    struct { unsigned m, k, n; const char *label; } want[] = {
+        { 64,  6144, 2048, "F3 M64  K6144 N2048" },
+        { 256, 6144, 2048, "F3 M256 K6144 N2048" }
+    };
+    for(size_t i = 0; i < sizeof want/sizeof want[0]; i++){
+        ColiXdnaRequest q;
+        q.family = COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP;
+        q.m = want[i].m; q.k = want[i].k; q.n = want[i].n;
+        q.in_dtype = COLI_XDNA_DT_BF16;
+        q.weight_dtype = COLI_XDNA_DT_BF16;
+        q.out_dtype = COLI_XDNA_DT_F32;
+        const ColiXdnaArtifact *a = coli_xdna_registry_lookup(&q);
+        char m[96];
+        snprintf(m, sizeof m, "%s is visible without any test setup", want[i].label);
+        ck(a != NULL, m);
+        if(a){
+            snprintf(m, sizeof m, "%s carries its research family", want[i].label);
+            ck(a->research_family && !strcmp(a->research_family, "F3"), m);
+            snprintf(m, sizeof m, "%s carries a 64-hex xclbin hash", want[i].label);
+            ck(a->xclbin_sha256 && strlen(a->xclbin_sha256) == 64, m);
+            snprintf(m, sizeof m, "%s is fully research-qualified", want[i].label);
+            ck(a->runtime_weight_qualified && a->correctness_qualified
+               && a->userptr_qualified && a->structural_qualified, m);
+        }
+    }
+
+    /* Exactly those rows, and nothing that was never qualified. */
+    ColiXdnaRequest q;
+    q.family = COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP;
+    q.m = 128; q.k = 6144; q.n = 2048;
+    q.in_dtype = COLI_XDNA_DT_BF16; q.weight_dtype = COLI_XDNA_DT_BF16;
+    q.out_dtype = COLI_XDNA_DT_F32;
+    ck(coli_xdna_registry_lookup(&q) == NULL,
+       "an M bucket that was never qualified is absent");
+
+    /* And a test registry stays a TEST registry: installing one must not be how
+     * the production table becomes visible, and restoring must bring it back. */
+    ColiXdnaArtifact none[1];
+    memset(none, 0, sizeof none);
+    none[0].family = COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP;
+    none[0].research_family = "TEST";
+    none[0].artifact_m = 8; none[0].k = 8; none[0].n = 8;
+    none[0].in_dtype = COLI_XDNA_DT_BF16;
+    none[0].weight_dtype = COLI_XDNA_DT_BF16;
+    none[0].out_dtype = COLI_XDNA_DT_F32;
+    none[0].target = COLI_XDNA_TARGET_XDNA2;
+    none[0].xclbin_name = "t.xclbin";
+    none[0].xclbin_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    none[0].insts_name = "t.bin";
+    none[0].insts_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    none[0].runtime_weight_qualified = none[0].correctness_qualified = 1;
+    none[0].userptr_qualified = none[0].structural_qualified = 1;
+    coli_xdna_test_set_registry(none, 1);
+    q.m = 64;
+    ck(coli_xdna_registry_lookup(&q) == NULL,
+       "a test registry replaces the production one rather than adding to it");
+    coli_xdna_test_set_registry(NULL, 0);
+    ck(coli_xdna_registry_lookup(&q) != NULL,
+       "and restoring brings the production rows back");
+}
+
 int main(void){
     /* Every fixture lives in a private directory beside the test binary; the
      * registry never reads the current directory of its own accord. */
@@ -409,6 +486,9 @@ int main(void){
 #else
     mkdir(g_root, 0777);
 #endif
+
+    /* FIRST, before any test registry is installed. */
+    test_production_registry_default();
 
     build_registry();
     test_sha256_vectors();

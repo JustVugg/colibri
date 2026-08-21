@@ -1107,6 +1107,12 @@ tests/xdna_fake_helper_partial.dll: tests/xdna_fake_helper.c
 tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c backend_xdna.h compat.h $(XDNA_FAKE_HELPERS)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Failure/fallback owner. Needs BOTH the engine (matmul_qt is the fallback
+# target it verifies against) and the synthetic ABI-2 helpers, which is why it
+# is a separate owner from test_xdna_execution.
+tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+
 # NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
 # the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
 # XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact

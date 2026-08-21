@@ -319,10 +319,16 @@ int main(int argc, char **argv){
     /* ================================================================== */
     printf("helper absent / ABI 1 / incomplete ABI 2\n");
     {
-        struct { const char *path, *what; } hs[] = {
-            { "tests/definitely_no_such_helper.dll", "helper absent" },
-            { g_helper_abi1,    "ABI generation 1 helper" },
-            { g_helper_partial, "incomplete ABI 2 helper" }
+        /* Since W2-N7-I6 absence and ABI failure are different verdicts: one
+         * says this machine simply has no optional lane, the other says a
+         * helper is installed and something about it is wrong. */
+        struct { const char *path, *what; ColiXdnaHard want; } hs[] = {
+            { "tests/definitely_no_such_helper.dll", "helper absent",
+              COLI_XDNA_HARD_HELPER_UNAVAILABLE },
+            { g_helper_abi1,    "ABI generation 1 helper",
+              COLI_XDNA_HARD_HELPER_ABI_INCOMPATIBLE },
+            { g_helper_partial, "incomplete ABI 2 helper",
+              COLI_XDNA_HARD_HELPER_ABI_INCOMPATIBLE }
         };
         for(size_t c = 0; c < 3; c++){
             use_helper(hs[c].path);
@@ -337,8 +343,8 @@ int main(int argc, char **argv){
             snprintf(msg,sizeof msg,"%s -> not handled", hs[c].what); ck(handled==0,msg);
             snprintf(msg,sizeof msg,"%s -> dispatches 0", hs[c].what);
             ck(coli_xdna_test_dispatches()==0,msg);
-            snprintf(msg,sizeof msg,"%s -> HELPER_UNAVAILABLE", hs[c].what);
-            ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_HELPER_UNAVAILABLE,msg);
+            snprintf(msg,sizeof msg,"%s -> %s", hs[c].what, coli_xdna_hard_text(hs[c].want));
+            ck(coli_xdna_test_last_hard()==hs[c].want,msg);
             snprintf(msg,sizeof msg,"%s -> no entry point bound", hs[c].what);
             ck(coli_xdna_test_entry_points_bound()==0,msg);
             snprintf(msg,sizeof msg,"%s -> output untouched", hs[c].what);
@@ -369,10 +375,15 @@ int main(int argc, char **argv){
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&slot,
                                                4,W.q4,W.s,TK,TN,64,y,x,TM);
             const char *what = c==0 ? "artifact absent" : "artifact hash mismatch";
+            /* Since W2-N7-I6 these are DIFFERENT verdicts: a build that does not
+             * ship the bytes and a build whose bytes were tampered with call for
+             * different responses. */
+            ColiXdnaHard want = c==0 ? COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE
+                                     : COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED;
             char msg[160];
             snprintf(msg,sizeof msg,"%s -> not handled", what); ck(handled==0,msg);
-            snprintf(msg,sizeof msg,"%s -> ARTIFACT_NOT_QUALIFIED", what);
-            ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_ARTIFACT_NOT_QUALIFIED,msg);
+            snprintf(msg,sizeof msg,"%s -> %s", what, coli_xdna_hard_text(want));
+            ck(coli_xdna_test_last_hard()==want,msg);
             snprintf(msg,sizeof msg,"%s -> helper never called", what);
             ck(coli_xdna_test_helper_calls()==0,msg);
             snprintf(msg,sizeof msg,"%s -> unverified bytes never reached the helper", what);

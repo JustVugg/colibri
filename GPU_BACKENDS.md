@@ -528,3 +528,141 @@ value — every request declines.
 No full-model acceleration, no token-throughput figure, no general XDNA backend,
 no routed-expert support, no concurrency with the GPU, and no scheduler. One
 family, one shape, one bucket, one dispatch at a time.
+
+### Failure and fallback
+
+The invariant the lane is built around:
+
+> **Optional XDNA work may fail. Current Colibri operation semantics may not.**
+
+Every decline and every runtime failure ends the same way: the candidate returns
+"not handled" and the caller runs the exact `matmul_qt` call that stood at that
+site before the lane existed. There is no special CPU fallback, no alternative
+dequantisation path, no partial-result salvage, and no helper-side recovery. The
+candidate never calls `matmul_qt` itself, so the call graph stays acyclic and no
+operation can be computed twice.
+
+Failure stages are classified rather than collapsed, because they call for
+different actions:
+
+```
+DECLINED                      not eligible -- never an error
+HELPER_UNAVAILABLE            absent, or would not load
+HELPER_ABI_INCOMPATIBLE       loaded, wrong generation or incomplete
+ARTIFACT_UNAVAILABLE          this build does not ship those bytes
+ARTIFACT_INTEGRITY_FAILED     the bytes are not the bytes that were qualified
+ARTIFACT_UNQUALIFIED          a known artifact that was never correctness-qualified
+REGISTRY_INVALID              the registry itself is malformed
+WEIGHT_PREPARE_FAILED         fmt4 to BF16 conversion failed
+PREPARED_INVALID              no usable prepared image
+ALIGNMENT_INVALID             prepared pointer not 4096-aligned
+DEVICE_INIT_FAILED            the device would not initialise
+ARTIFACT_OPEN_FAILED          verified bytes, but the runtime would not open them
+WEIGHT_WRAP_FAILED            the userptr wrap was refused
+EXECUTE_FAILED                dispatch refused or threw
+COMPLETION_FAILED             dispatched, did not complete cleanly
+```
+
+An absent artifact and a *tampered* one are deliberately different verdicts. So
+are a missing helper and an incompatible one.
+
+### Output validity is a state, not a measurement
+
+XDNA output is valid **only** after the helper reports successful completion.
+A failure at any stage — including one that occurs after the helper has already
+written a full, finite, entirely plausible result — leaves the output invalid,
+and the caller's buffer untouched. Nothing about the bytes themselves can raise
+that verdict: there is no NaN scan, no finiteness check and no plausibility
+heuristic anywhere in the lane, because none of them would be evidence.
+
+Structurally, the caller's output buffer is never passed to the helper at all.
+The helper writes into a lane-owned staging buffer, and only a successful
+completion causes the logical rows to be copied out. A late failure therefore
+cannot leave a half-written result behind even in principle.
+
+### Lane health
+
+The narrowest model the observed failures justify:
+
+| failure | scope |
+|---|---|
+| helper absent / unloadable / ABI mismatch | sticky loader verdict, never retried |
+| **device init** | **process-scoped** — the lane is marked unavailable |
+| artifact runtime open | one shape; the lane stays healthy |
+| weight wrap, dispatch, completion | one operation; the lane stays healthy |
+
+There is no retry, backoff or quarantine policy beyond this. A full
+`coli_xdna_execution_shutdown()` is the only thing that clears an unavailable
+lane, because a fresh attempt after a complete teardown is meaningful and a
+fresh attempt on every operation is not.
+
+### Prepared state survives runtime failure
+
+Whether the prepared BF16 image is **correct** and whether the runtime
+**succeeded** are separate facts, and a runtime failure does not invalidate a
+correct image. A wrap, dispatch or completion failure leaves the prepared weight
+`PREPARED_VALID` and reusable; only a conversion failure produces
+`PREPARED_INVALID`. This matters for any future cache policy, which would
+otherwise throw away good work on unrelated news.
+
+### Userptr wrapper lifetime
+
+The helper-owned wrapper is **persistent runtime state**: it is created on
+demand, reused across operations, and released when it is replaced, when the
+engine frees or invalidates the memory it borrows, or at shutdown.
+
+It is keyed on **(pointer, publication generation)**, not on the pointer alone.
+Retained prepared capacity is reused in place, so a different weight can occupy
+the same address — and because the helper snapshots at wrap time via
+`sync(BO_TO_DEVICE)`, keying on the address alone left the device computing
+against a view that no longer matched the engine's image. That was measured on
+real XDNA2 hardware. Every publication now bumps a generation, and the engine
+tells the lane to release a wrapper before freeing or invalidating the memory it
+borrows, so a wrapper can never outlive or alias released engine memory.
+
+### Two internal modes, neither of them public
+
+```
+AUTO-LIKE   coli_xdna_try_matmul()    decline or failure -> current path
+EXPLICIT    coli_xdna_test_attempt()  decline or failure -> classified failure,
+                                      no fallback, no output claimed
+```
+
+Both share one implementation so their gate order and classification cannot
+drift apart. Explicit mode is a separate entry point rather than a mode flag, so
+no global state can leave the production seam in a no-fallback configuration.
+
+**Default behaviour is unchanged and remains so.** With a helper present, a
+device available and valid artifacts staged, an ordinary build still runs the
+current path and dispatches zero XDNA operations. Automatic selection needs an
+economic policy that does not exist, and a semantic qualification that has not
+been done — see below.
+
+### What successful XDNA execution does and does not mean
+
+```
+SUCCESSFUL_XDNA_CORRECTNESS_OWNER  = the qualified BF16 oracle
+FAILED_XDNA_FALLBACK_CORRECTNESS_OWNER = the current matmul_qt path
+```
+
+These are different contracts and must not be conflated. Device execution is
+qualified against a BF16 oracle under a criterion frozen by the research
+programme. It is **not** a claim that the lane is numerically interchangeable
+with `matmul_qt`: the current path accumulates f32 activations against
+dequantised int4, the lane is BF16 throughout, and the two legitimately differ.
+
+```
+MODEL_LEVEL_BF16_REPLACEMENT_ACCEPTABILITY = NOT YET QUALIFIED
+```
+
+Whether substituting BF16 activation semantics is acceptable *for a model* is an
+open question, and answering it is a prerequisite for any automatic selection.
+It is not answered by inventing an elementwise tolerance.
+
+### A note on the registry
+
+The compiled-in production registry is now covered by a regression that reads it
+with no test rows installed. An earlier revision initialised its row count to
+zero, leaving the table present but empty; every caller at the time was a test
+that installed its own registry, so nothing noticed until the first production
+consumer arrived.

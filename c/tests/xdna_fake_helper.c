@@ -45,7 +45,9 @@ enum { F_NONE = 0, F_DEVICE, F_ARTIFACT, F_WRAP, F_EXECUTE, F_COMPLETION };
 static int g_fail;
 static int g_open, g_wrap, g_exec, g_relw, g_shut;
 static int g_is_open;
-static const unsigned short *g_w;      /* borrowed, never owned */
+static unsigned short *g_w;             /* SNAPSHOT of the caller image, see wrap */
+static const void *g_w_src;              /* the caller pointer it was taken from */
+static size_t g_w_elems;
 static size_t g_m, g_k, g_n;
 static char g_err[256] = {0};
 
@@ -67,7 +69,7 @@ API int coli_xdna_helper_open(const char *xclbin, const char *insts,
     if(!xclbin || !insts) return H_E_ARTIFACT;
     { FILE *f = fopen(xclbin, "rb"); if(!f) return H_E_ARTIFACT; fclose(f); }
     { FILE *f = fopen(insts,  "rb"); if(!f) return H_E_ARTIFACT; fclose(f); }
-    g_m = m; g_k = k; g_n = n; g_is_open = 1; g_w = NULL;
+    g_m = m; g_k = k; g_n = n; g_is_open = 1; free(g_w); g_w = NULL; g_w_src = NULL;
     return H_OK;
 }
 
@@ -79,7 +81,16 @@ API int coli_xdna_helper_wrap_weight(void *bf16, uint64_t bytes){
     /* The alignment the qualified userptr path requires. The fake enforces it
      * so a host regression that dropped the check would still be caught here. */
     if(((uintptr_t)bf16 % 4096u) != 0){ snprintf(g_err,sizeof g_err,"unaligned userptr"); return H_E_WRAP; }
-    g_w = (const unsigned short *)bf16;    /* borrowed; no copy is made */
+    /* SNAPSHOT, deliberately. The real helper wraps this memory in an
+     * xrt::ext::bo and immediately sync()s it BO_TO_DEVICE, so the device sees
+     * the bytes as they were AT WRAP TIME. Reading the caller pointer live at
+     * execute time would model a shortcut the real path does not take, and
+     * would hide any host bug that fails to re-wrap after the image changes. */
+    { size_t elems = (size_t)(bytes / 2);
+      unsigned short *snap = (unsigned short *)malloc(bytes ? (size_t)bytes : 2);
+      if(!snap) return H_E_WRAP;
+      memcpy(snap, bf16, (size_t)bytes);
+      free(g_w); g_w = snap; g_w_src = bf16; g_w_elems = elems; }
     return H_OK;
 }
 
@@ -113,8 +124,8 @@ API int coli_xdna_helper_execute(const void *a_bf16, uint64_t a_bytes,
 }
 #endif
 
-API int coli_xdna_helper_release_weight(void){ g_relw++; g_w = NULL; return H_OK; }
-API void coli_xdna_helper_shutdown(void){ g_shut++; g_is_open = 0; g_w = NULL; }
+API int coli_xdna_helper_release_weight(void){ g_relw++; free(g_w); g_w = NULL; g_w_src = NULL; return H_OK; }
+API void coli_xdna_helper_shutdown(void){ g_shut++; g_is_open = 0; free(g_w); g_w = NULL; g_w_src = NULL; }
 
 /* -- test controls, not part of the ABI ---------------------------------- */
 API void fake_set_fail(int stage){ g_fail = stage; }

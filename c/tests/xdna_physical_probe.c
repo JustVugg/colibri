@@ -307,6 +307,55 @@ int main(int argc, char **argv){
         free(x); free(y);
     }
 
+    /* ---- stale-wrapper control -------------------------------------------
+     * Re-prepare a DIFFERENT weight into the SAME prepared object. Capacity is
+     * retained, so the buffer pointer is unchanged. If the lane keys its
+     * userptr wrapper on the pointer alone it skips the re-wrap, and the device
+     * -- which snapshotted at wrap time via sync(BO_TO_DEVICE) -- computes with
+     * the previous weight. */
+    {
+        int S = 64;
+        float *x = (float*)malloc((size_t)S*PK*4);
+        unsigned s = 0xBEEF01u;
+        for(size_t i=0;i<(size_t)S*PK;i++){ s=s*1664525u+1013904223u;
+            x[i] = (float)((int)((s>>20)&255)-128)*0.0078125f; }
+        float *ya = (float*)malloc((size_t)S*PN*4);
+        float *yb = (float*)malloc((size_t)S*PN*4);
+        printf("\n-- stale-wrapper control: reprepare a different weight in place --\n");
+        int ha = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &G.xdna,
+                                      G.fmt, G.q4, G.s, G.I, G.O, G.gs, ya, x, S);
+        const void *p1 = coli_xdna_prepared_image(G.xdna);
+        int w0 = coli_xdna_test_userptr_wraps();
+        coli_xdna_prepared_invalidate(G.xdna);
+        ColiXdnaPrepResult pr = coli_xdna_prepare_from_fmt4(G.xdna, 4, U.q4, U.s, PK, PN, PGS);
+        const void *p2 = coli_xdna_prepared_image(G.xdna);
+        int hb = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &G.xdna,
+                                      G.fmt, G.q4, G.s, G.I, G.O, G.gs, yb, x, S);
+        printf("PREPARE_RC       %d   ptr_same %s\n", (int)pr, p1==p2?"YES":"no");
+        printf("HANDLED          %d %d\n", ha, hb);
+        printf("WRAPS            before=%d after=%d  rewrap=%s\n", w0,
+               coli_xdna_test_userptr_wraps(),
+               coli_xdna_test_userptr_wraps()>w0 ? "HAPPENED" : "SKIPPED");
+        if(ha && hb){
+            const unsigned short *W = (const unsigned short*)p2;
+            float *ref = (float*)malloc((size_t)S*PN*4);
+            oracle_double(ref, x, W, S, PK, PN);
+            size_t mism=0, sameA=0;
+            for(size_t i=0;i<(size_t)S*PN;i++){
+                if(!accept_a1c1(ref[i], yb[i])) mism++;
+                if(yb[i]==ya[i]) sameA++;
+            }
+            printf("SECOND_VS_ITS_OWN_WEIGHT  mismatches %llu / %d\n",
+                   (unsigned long long)mism, S*PN);
+            printf("SECOND_VS_FIRST_RESULT    identical  %llu / %d\n",
+                   (unsigned long long)sameA, S*PN);
+            if(mism){ printf("WEIGHT_VIEW      DEFECT -- device view not resynchronised\n"); g_bad = 1; }
+            else      printf("WEIGHT_VIEW      coherent -- the re-wrap happened\n");
+            free(ref);
+        } else { printf("WEIGHT_VIEW      inconclusive (an operation declined)\n"); g_bad = 1; }
+        free(x); free(ya); free(yb);
+    }
+
     /* Negative control on live hardware: same shape, wrong family. */
     {
         float *x = (float*)malloc((size_t)8*PK*4); memset(x,0,(size_t)8*PK*4);

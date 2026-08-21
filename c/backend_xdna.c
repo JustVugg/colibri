@@ -611,6 +611,7 @@ struct ColiXdnaPrepared {
     size_t           bytes;     /* logical payload: k*n*sizeof(bf16) */
     size_t           capacity;  /* what base can actually hold */
     unsigned         k, n;
+    unsigned long long generation;   /* bumped on every successful publication */
 };
 
 /* Engine-side host accounting. Deliberately counts LOGICAL payload bytes: the
@@ -619,6 +620,11 @@ struct ColiXdnaPrepared {
  * one we can. */
 static size_t g_xdna_prepared_bytes;
 static int    g_xdna_prepared_objects;
+
+/* Defined with the execution lane below, declared here because the prepared
+ * buffer owner must be able to tell the lane to let go of memory it is about
+ * to free or replace. */
+static void coli_xdna_lane_forget_pointer(const void *p);
 
 const char *coli_xdna_prep_text(ColiXdnaPrepState s){
     switch(s){
@@ -647,6 +653,9 @@ ColiXdnaPrepared *coli_xdna_prepared_create(void){
  * so they get separate operations. */
 void coli_xdna_prepared_free_buffer(ColiXdnaPrepared *p){
     if(!p) return;
+    /* Tell the lane before the memory goes away: a helper-owned userptr wrapper
+     * borrowing this allocation must never outlive it. */
+    coli_xdna_lane_forget_pointer(p->base);
     if(p->base){
         compat_aligned_free(p->base);       /* MUST pair with posix_memalign */
         p->base = NULL;
@@ -735,6 +744,10 @@ int coli_xdna_prepare_publish_success(ColiXdnaPrepared *p){
     if(!p->base || !coli_xdna_pointer_alignment_ok(p->base)) return 0;
     if(p->bytes == 0 || p->capacity < p->bytes) return 0;
     p->state = COLI_XDNA_PREP_VALID;
+    /* A new publication is a new image even when it lands on the same address:
+     * retained capacity is reused in place. Anything caching a view of these
+     * bytes keys on (pointer, generation), never on the pointer alone. */
+    p->generation++;
     return 1;
 }
 
@@ -749,6 +762,9 @@ int coli_xdna_prepared_invalidate(ColiXdnaPrepared *p){
     if(!p) return 0;
     if(p->state != COLI_XDNA_PREP_VALID) return 0;
     p->state = COLI_XDNA_PREP_INVALID;
+    /* The image is no longer authoritative, so no device-side view of it may
+     * remain current either. */
+    coli_xdna_lane_forget_pointer(p->base);
     return 1;
 }
 
@@ -758,6 +774,9 @@ ColiXdnaPrepState coli_xdna_prepared_state(const ColiXdnaPrepared *p){
 size_t   coli_xdna_prepared_bytes(const ColiXdnaPrepared *p){ return p ? p->bytes : 0; }
 unsigned coli_xdna_prepared_k(const ColiXdnaPrepared *p){ return p ? p->k : 0u; }
 unsigned coli_xdna_prepared_n(const ColiXdnaPrepared *p){ return p ? p->n : 0u; }
+unsigned long long coli_xdna_prepared_generation(const ColiXdnaPrepared *p){
+    return p ? p->generation : 0ull;
+}
 
 size_t coli_xdna_prepared_total_bytes(void){ return g_xdna_prepared_bytes; }
 int    coli_xdna_prepared_live_objects(void){ return g_xdna_prepared_objects; }
@@ -899,10 +918,14 @@ const char *coli_xdna_hard_text(ColiXdnaHard h){
         case COLI_XDNA_HARD_SHAPE_UNSUPPORTED:           return "SHAPE_UNSUPPORTED";
         case COLI_XDNA_HARD_FORMAT_UNSUPPORTED:          return "FORMAT_UNSUPPORTED";
         case COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED:      return "GROUP_SIZE_UNSUPPORTED";
-        case COLI_XDNA_HARD_ARTIFACT_NOT_QUALIFIED:      return "ARTIFACT_NOT_QUALIFIED";
+        case COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE:        return "ARTIFACT_UNAVAILABLE";
+        case COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED:   return "ARTIFACT_INTEGRITY_FAILED";
+        case COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED:        return "ARTIFACT_UNQUALIFIED";
+        case COLI_XDNA_HARD_REGISTRY_INVALID:            return "REGISTRY_INVALID";
         case COLI_XDNA_HARD_PREPARED_INVALID:            return "PREPARED_INVALID";
         case COLI_XDNA_HARD_ALIGNMENT_INVALID:           return "ALIGNMENT_INVALID";
         case COLI_XDNA_HARD_HELPER_UNAVAILABLE:          return "HELPER_UNAVAILABLE";
+        case COLI_XDNA_HARD_HELPER_ABI_INCOMPATIBLE:     return "HELPER_ABI_INCOMPATIBLE";
         case COLI_XDNA_HARD_DEVICE_UNAVAILABLE:          return "DEVICE_UNAVAILABLE";
         case COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE:return "ARTIFACT_RUNTIME_UNAVAILABLE";
         case COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE:     return "WEIGHT_WRAP_UNAVAILABLE";
@@ -937,6 +960,9 @@ static ColiXdnaExec g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
 static int g_xdna_dispatches, g_xdna_completions, g_xdna_artifact_opens;
 static int g_xdna_act_preps, g_xdna_padded_ops, g_xdna_fallbacks;
 static int g_xdna_device_opens, g_xdna_helper_calls, g_xdna_userptr_wraps;
+static int g_xdna_wrapper_reuses, g_xdna_wrapper_releases, g_xdna_stale_rejects;
+static int g_xdna_output_valid;
+static ColiXdnaLaneHealth g_xdna_lane_health = COLI_XDNA_LANE_UNINITIALIZED;
 
 /* Which artifact the helper currently holds open, so a run of operations on the
  * same shape does not reopen the device, the context or the program. This is a
@@ -945,11 +971,36 @@ static int g_xdna_device_opens, g_xdna_helper_calls, g_xdna_userptr_wraps;
 static struct {
     int      open;
     unsigned m, k, n;
-    /* the wrapped weight, identified by the exact pointer the engine handed us */
-    const void *wrapped;
+    /* The wrapped weight, identified by (pointer, generation). The pointer
+     * alone is NOT an identity: retained capacity is reused in place, so a
+     * different image can occupy the same address. */
+    const void        *wrapped;
+    unsigned long long wrapped_gen;
     unsigned short *act;   size_t act_cap;    /* [artifact_m, K] BF16 staging */
     float          *out;   size_t out_cap;    /* [artifact_m, N] F32 staging  */
 } g_lane;
+/* Release the helper-owned userptr wrapper and forget its identity.
+ *
+ * Called from three places, and each one matters: before wrapping a different
+ * image, before the engine frees or replaces the memory the wrapper borrows,
+ * and at shutdown. The wrapper borrows CALLER memory, so it must never outlive
+ * the allocation it points into. */
+static void coli_xdna_lane_drop_wrapper(void){
+    if(!g_lane.wrapped) return;
+    coli_xdna_helper_release_weight_call();
+    g_lane.wrapped = NULL;
+    g_lane.wrapped_gen = 0;
+    g_xdna_wrapper_releases++;
+}
+
+/* The engine is about to free or replace prepared memory. If the helper holds a
+ * wrapper over exactly that allocation, drop it FIRST. Without this the wrapper
+ * would reference a freed region until the next wrap replaced it -- and a
+ * subsequent allocation landing on the same address would make the stale
+ * wrapper look current. */
+static void coli_xdna_lane_forget_pointer(const void *p){
+    if(p && g_lane.wrapped == p) coli_xdna_lane_drop_wrapper();
+}
 
 /* ---- helper entry points (ABI generation 2) ------------------------------
  *
@@ -975,6 +1026,9 @@ int coli_xdna_test_artifact_opens(void){ return g_xdna_artifact_opens; }
 int coli_xdna_test_activation_preparations(void){ return g_xdna_act_preps; }
 int coli_xdna_test_padded_operations(void){ return g_xdna_padded_ops; }
 int coli_xdna_test_fallbacks(void){ return g_xdna_fallbacks; }
+int coli_xdna_test_wrapper_reuses(void){ return g_xdna_wrapper_reuses; }
+int coli_xdna_test_wrapper_releases(void){ return g_xdna_wrapper_releases; }
+int coli_xdna_test_stale_wrapper_rejects(void){ return g_xdna_stale_rejects; }
 ColiXdnaHard coli_xdna_test_last_hard(void){ return g_xdna_last_hard; }
 ColiXdnaExec coli_xdna_test_last_exec(void){ return g_xdna_last_exec; }
 
@@ -1034,10 +1088,29 @@ static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
     if(!row) return COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
 
     /*  7-9  qualification flags, artifact presence, artifact integrity. All
-     *       three live behind coli_xdna_artifact_status, which fails closed. */
-    if(coli_xdna_artifact_status(&q, g_xdna_root[0] ? g_xdna_root : NULL)
-       != COLI_XDNA_STATIC_QUALIFIED)
-        return COLI_XDNA_HARD_ARTIFACT_NOT_QUALIFIED;
+     *       three live behind coli_xdna_artifact_status, which fails closed.
+     *       The sub-reason is carried through rather than collapsed: "this
+     *       build does not ship that artifact", "the bytes are not the bytes
+     *       that were qualified", and "we never qualified this one" call for
+     *       different actions, and an operator who is told only
+     *       ARTIFACT_NOT_QUALIFIED cannot tell a missing file from a tampered
+     *       one. */
+    switch(coli_xdna_artifact_status(&q, g_xdna_root[0] ? g_xdna_root : NULL)){
+        case COLI_XDNA_STATIC_QUALIFIED:
+            break;
+        case COLI_XDNA_STATIC_ARTIFACT_UNAVAILABLE:
+            return COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE;
+        case COLI_XDNA_STATIC_ARTIFACT_INTEGRITY_FAILED:
+            return COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED;
+        case COLI_XDNA_STATIC_ARTIFACT_UNQUALIFIED:
+            return COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED;
+        case COLI_XDNA_STATIC_REGISTRY_INVALID:
+            return COLI_XDNA_HARD_REGISTRY_INVALID;
+        default:
+            /* Family/shape/format verdicts cannot occur here: the lookup above
+             * already matched a row on the full key. */
+            return COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
+    }
 
     *row_out = row;
     return COLI_XDNA_HARD_ELIGIBLE;
@@ -1055,46 +1128,62 @@ static int coli_xdna_stage(void **base, size_t *cap, size_t need){
     return 1;
 }
 
-int coli_xdna_try_matmul(ColiXdnaFamily family,
-                         ColiXdnaPrepared **slot,
-                         int fmt, const unsigned char *q4, const float *scale,
-                         int I, int O, int gs,
-                         float *y, const float *x, int S)
+/* The shared execution core. Both modes call this, so their gate order and
+ * their failure classification cannot drift apart.
+ *
+ * It returns a CLASS, never a handled flag: deciding what a failure means for
+ * the caller belongs to the mode, not to this function. It writes y only after
+ * the helper reports successful completion, and never calls matmul_qt. */
+static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
+                                      ColiXdnaPrepared **slot,
+                                      int fmt, const unsigned char *q4, const float *scale,
+                                      int I, int O, int gs,
+                                      float *y, const float *x, int S)
 {
-    /* Gate 0: the internal control. Without it this function is inert, which is
-     * what keeps I5 from being an automatic scheduler. */
-    if(!g_xdna_force){ g_xdna_fallbacks++; g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED; return 0; }
+    g_xdna_output_valid = 0;          /* nothing is valid until completion says so */
 
     if(!slot || !q4 || !scale || !y || !x){
         g_xdna_last_hard = COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
-        g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
-        g_xdna_fallbacks++; return 0;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
+    }
+
+    /* A device that would not initialise stays refused for the process. This is
+     * the whole of the retry policy, and deliberately not more: the sealed A5
+     * taxonomy classifies device-init failure PROCESS-scoped, and re-attempting
+     * it on every operation would cost without prospect. */
+    if(g_xdna_lane_health == COLI_XDNA_LANE_UNAVAILABLE){
+        g_xdna_last_hard = COLI_XDNA_HARD_DEVICE_UNAVAILABLE;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
     }
 
     const ColiXdnaArtifact *row = NULL;
     ColiXdnaHard h = coli_xdna_engine_gates(family, fmt, I, O, gs, S, &row);
     if(h != COLI_XDNA_HARD_ELIGIBLE){
-        g_xdna_last_hard = h; g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
-        g_xdna_fallbacks++; return 0;
+        g_xdna_last_hard = h;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
     }
 
-    /* 10  helper ABI. Checked before the weight is prepared: preparing 24 MiB
-     *     for a lane that cannot execute would be pure waste. */
-    if(coli_xdna_binding() != COLI_XDNA_AVAILABLE){
-        g_xdna_last_hard = COLI_XDNA_HARD_HELPER_UNAVAILABLE;
-        g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
-        g_xdna_fallbacks++; return 0;
+    /* 10  helper binding. Checked before the weight is prepared: preparing
+     *     24 MiB for a lane that cannot execute would be pure waste. The
+     *     loader verdict is sticky, so this is a branch, not a module load. */
+    {
+        ColiXdnaBinding b = coli_xdna_binding();
+        if(b != COLI_XDNA_AVAILABLE){
+            g_xdna_last_hard = (b == COLI_XDNA_ABI_INCOMPATIBLE
+                                || b == COLI_XDNA_SYMBOL_INCOMPLETE)
+                             ? COLI_XDNA_HARD_HELPER_ABI_INCOMPATIBLE
+                             : COLI_XDNA_HARD_HELPER_UNAVAILABLE;
+            return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
+        }
     }
 
-    /* 11  prepared weight. Lazy: prepared on first use of this tensor and
-     *     reused while it stays VALID for the same dimensions. There is no
-     *     eviction or cache policy here -- that is a later slice's decision. */
+    /* 11  prepared weight. Lazy, and reused while it stays VALID for these
+     *     dimensions. No eviction or cache policy here. */
     if(!*slot){
         *slot = coli_xdna_prepared_create();
         if(!*slot){
             g_xdna_last_hard = COLI_XDNA_HARD_PREPARED_INVALID;
-            g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED;
-            g_xdna_fallbacks++; return 0;
+            return (g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED);
         }
     }
     ColiXdnaPrepared *prep = *slot;
@@ -1103,84 +1192,88 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
        || coli_xdna_prepared_n(prep) != (unsigned)O){
         if(coli_xdna_prepare_from_fmt4(prep, fmt, q4, scale, I, O, gs) != COLI_XDNA_PREP_OK){
             g_xdna_last_hard = COLI_XDNA_HARD_PREPARED_INVALID;
-            g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED;
-            g_xdna_fallbacks++; return 0;
+            return (g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED);
         }
     }
     const void *wimg = coli_xdna_prepared_image(prep);   /* NULL unless VALID */
     if(!wimg){
         g_xdna_last_hard = COLI_XDNA_HARD_PREPARED_INVALID;
-        g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED;
-        g_xdna_fallbacks++; return 0;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED);
     }
 
-    /* 12  alignment. The allocator guarantees it; checking anyway is cheap and
-     *     turns a confusing XRT "insufficient free video memory" into a local,
-     *     accurate refusal. */
+    /* 12  alignment */
     if(!coli_xdna_pointer_alignment_ok(wimg)){
         g_xdna_last_hard = COLI_XDNA_HARD_ALIGNMENT_INVALID;
-        g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
-        g_xdna_fallbacks++; return 0;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
     }
 
     const unsigned am = row->artifact_m;
 
-    /* 13  device / runtime / artifact runtime object. Opened lazily, only now
-     *     that every engine-side gate has passed. */
+    /* 13  device / runtime / artifact runtime object, opened lazily. */
     if(!g_lane.open || g_lane.m != am || g_lane.k != (unsigned)I || g_lane.n != (unsigned)O){
         char xb[2048], ib[2048];
         if(!coli_xdna_join(xb, sizeof xb, g_xdna_root, row->xclbin_name)
            || !coli_xdna_join(ib, sizeof ib, g_xdna_root, row->insts_name)){
             g_xdna_last_hard = COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
-            g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED;
-            g_xdna_fallbacks++; return 0;
+            return (g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED);
         }
-        if(g_lane.open){ coli_xdna_helper_release_weight_call(); coli_xdna_helper_shutdown_call(); }
+        if(g_lane.open){ coli_xdna_lane_drop_wrapper(); coli_xdna_helper_shutdown_call(); }
+        g_lane.open = 0;
         g_xdna_helper_calls++; g_xdna_device_opens++;
         int rc = coli_xdna_helper_open_call(xb, ib, am, (unsigned)I, (unsigned)O);
         if(rc != COLI_XDNA_H_OK){
-            g_xdna_last_hard = (rc == COLI_XDNA_H_E_DEVICE)
-                             ? COLI_XDNA_HARD_DEVICE_UNAVAILABLE
-                             : COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
-            g_xdna_last_exec = (rc == COLI_XDNA_H_E_DEVICE)
-                             ? COLI_XDNA_EXEC_DEVICE_INIT_FAILED
-                             : COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED;
-            g_xdna_fallbacks++; return 0;
+            if(rc == COLI_XDNA_H_E_DEVICE){
+                g_xdna_lane_health = COLI_XDNA_LANE_UNAVAILABLE;   /* process-scoped */
+                g_xdna_last_hard = COLI_XDNA_HARD_DEVICE_UNAVAILABLE;
+                return (g_xdna_last_exec = COLI_XDNA_EXEC_DEVICE_INIT_FAILED);
+            }
+            /* Artifact-runtime scope. The engine already verified these bytes,
+             * so this is NOT the same thing as a missing or tampered artifact
+             * and must stay distinguishable from both. The lane stays healthy:
+             * another shape may well open. */
+            g_xdna_last_hard = COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
+            return (g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED);
         }
         g_lane.open = 1; g_lane.m = am; g_lane.k = (unsigned)I; g_lane.n = (unsigned)O;
-        g_lane.wrapped = NULL;
+        g_lane.wrapped = NULL; g_lane.wrapped_gen = 0;
+        g_xdna_lane_health = COLI_XDNA_LANE_HEALTHY;
         g_xdna_artifact_opens++;
     }
 
-    /* 14  userptr wrap of the engine-owned prepared image. The helper wraps
-     *     THIS memory; it never allocates a second copy of the weight. */
-    if(g_lane.wrapped != wimg){
-        g_xdna_helper_calls++; g_xdna_userptr_wraps++;
-        if(coli_xdna_helper_wrap_call((void *)wimg,
-                                      (uint64_t)coli_xdna_prepared_bytes(prep)) != COLI_XDNA_H_OK){
-            g_xdna_last_hard = COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE;
-            g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_WRAP_FAILED;
-            g_xdna_fallbacks++; return 0;
+    /* 14  userptr wrap, keyed on (pointer, generation).
+     *
+     *     The pointer alone is not an identity. prepare_begin reuses retained
+     *     capacity IN PLACE, so re-preparing a different weight yields the same
+     *     address with different contents -- and the helper snapshots at wrap
+     *     time via sync(BO_TO_DEVICE). Keying on the pointer alone therefore
+     *     skipped the re-wrap and left the device computing against a view that
+     *     no longer matched the engine image. Measured on real XDNA2 hardware,
+     *     not merely reasoned about. */
+    {
+        unsigned long long gen = coli_xdna_prepared_generation(prep);
+        if(g_lane.wrapped == wimg && g_lane.wrapped_gen == gen){
+            g_xdna_wrapper_reuses++;
+        } else {
+            if(g_lane.wrapped == wimg) g_xdna_stale_rejects++;   /* same address, new image */
+            if(g_lane.wrapped) coli_xdna_lane_drop_wrapper();
+            g_xdna_helper_calls++; g_xdna_userptr_wraps++;
+            if(coli_xdna_helper_wrap_call((void *)wimg,
+                                          (uint64_t)coli_xdna_prepared_bytes(prep)) != COLI_XDNA_H_OK){
+                g_xdna_last_hard = COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE;
+                return (g_xdna_last_exec = COLI_XDNA_EXEC_WEIGHT_WRAP_FAILED);
+            }
+            g_lane.wrapped = wimg; g_lane.wrapped_gen = gen;
         }
-        g_lane.wrapped = wimg;
     }
 
     g_xdna_last_hard = COLI_XDNA_HARD_ELIGIBLE;   /* FULL_XDNA_HARD_ELIGIBLE */
 
-    /* ---- activation staging -------------------------------------------------
-     * Caller activation is f32 [S, K] row-major. The artifact consumes BF16
-     * [artifact_m, K]. The conversion uses the SAME round-to-nearest-even rule
-     * as the weight, because both were qualified on that rule together.
-     *
-     * Rows S..artifact_m-1 are zeroed. Zero is the mathematically neutral row
-     * for a pure GEMM: it contributes a zero output row and cannot perturb any
-     * logical row, because C = A x B is row-independent. */
+    /* ---- activation staging ------------------------------------------------- */
     size_t abytes = (size_t)am * (size_t)I * 2u;
     size_t obytes = (size_t)am * (size_t)O * 4u;
     if(!coli_xdna_stage((void **)&g_lane.act, &g_lane.act_cap, abytes)
        || !coli_xdna_stage((void **)&g_lane.out, &g_lane.out_cap, obytes)){
-        g_xdna_last_exec = COLI_XDNA_EXEC_ACTIVATION_FAILED;
-        g_xdna_fallbacks++; return 0;
+        return (g_xdna_last_exec = COLI_XDNA_EXEC_ACTIVATION_FAILED);
     }
     for(size_t i = 0; i < (size_t)S * (size_t)I; i++)
         g_lane.act[i] = coli_xdna_f2b(x[i]);
@@ -1191,34 +1284,94 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
     }
     g_xdna_act_preps++;
 
-    /* ---- blocking execution -------------------------------------------------
-     * One operation, one dispatch, one wait. No worker thread, no queue, no
-     * second outstanding operation. */
+    /* ---- blocking execution ------------------------------------------------- */
     g_xdna_helper_calls++;
     int rc = coli_xdna_helper_execute_call(g_lane.act, (uint64_t)abytes,
                                            g_lane.out, (uint64_t)obytes);
     if(rc != COLI_XDNA_H_OK){
-        g_xdna_last_exec = (rc == COLI_XDNA_H_E_COMPLETION)
-                         ? COLI_XDNA_EXEC_COMPLETION_FAILED
-                         : COLI_XDNA_EXEC_EXECUTE_FAILED;
-        g_xdna_fallbacks++;
-        return 0;                       /* y untouched: the caller's path owns it */
+        /* The helper may already have written real bytes into the staging
+         * buffer before deciding it had failed. They stay there and are simply
+         * never copied: y is untouched, and no property of those bytes can make
+         * them valid, because validity is a state and this state is failure. */
+        return (g_xdna_last_exec = (rc == COLI_XDNA_H_E_COMPLETION)
+                                 ? COLI_XDNA_EXEC_COMPLETION_FAILED
+                                 : COLI_XDNA_EXEC_EXECUTE_FAILED);
     }
     g_xdna_dispatches++; g_xdna_completions++;
 
-    /* Only the logical rows become output. The padded rows are never copied and
-     * so can never reach anything downstream, whatever the device wrote there. */
-    memcpy(y, g_lane.out, (size_t)S * (size_t)O * 4u);
-    g_xdna_last_exec = COLI_XDNA_EXEC_OK;
-    return 1;
+    memcpy(y, g_lane.out, (size_t)S * (size_t)O * 4u);   /* logical rows only */
+    g_xdna_output_valid = 1;
+    return (g_xdna_last_exec = COLI_XDNA_EXEC_OK);
 }
 
-void coli_xdna_execution_shutdown(void){
-    if(g_lane.open){
-        coli_xdna_helper_release_weight_call();
-        coli_xdna_helper_shutdown_call();
+/* AUTO-LIKE mode: the production seam. Any decline or failure returns 0 and the
+ * caller runs its current path, which is the exact matmul_qt call that stood
+ * there before this lane existed. */
+int coli_xdna_try_matmul(ColiXdnaFamily family,
+                         ColiXdnaPrepared **slot,
+                         int fmt, const unsigned char *q4, const float *scale,
+                         int I, int O, int gs,
+                         float *y, const float *x, int S)
+{
+    /* Gate 0: the internal control. Without it this function is inert, which is
+     * what keeps the lane from being an automatic scheduler. */
+    if(!g_xdna_force){
+        /* Clear validity here too. Declining before the core runs still ends an
+         * attempt, and a stale 1 left over from an earlier success would claim
+         * an XDNA result for an operation the lane never touched. */
+        g_xdna_output_valid = 0;
+        g_xdna_fallbacks++;
+        g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
+        return 0;
     }
-    g_lane.open = 0; g_lane.wrapped = NULL;
+    if(coli_xdna_attempt(family, slot, fmt, q4, scale, I, O, gs, y, x, S)
+       == COLI_XDNA_EXEC_OK)
+        return 1;
+    g_xdna_fallbacks++;
+    return 0;
+}
+
+/* EXPLICIT mode, internal and test-facing. Returns the class and implies no
+ * fallback: a caller here asked for XDNA specifically and gets a classified
+ * failure rather than a silent substitution. It does not consult the force
+ * control, because asking explicitly IS the request. Kept as a separate entry
+ * point rather than a mode flag so that no global state can ever leave the
+ * production seam in a no-fallback configuration. */
+ColiXdnaExec coli_xdna_test_attempt(ColiXdnaFamily family,
+                                    ColiXdnaPrepared **slot,
+                                    int fmt, const unsigned char *q4, const float *scale,
+                                    int I, int O, int gs,
+                                    float *y, const float *x, int S)
+{
+    return coli_xdna_attempt(family, slot, fmt, q4, scale, I, O, gs, y, x, S);
+}
+
+int coli_xdna_test_output_valid(void){ return g_xdna_output_valid; }
+
+const float *coli_xdna_test_output_staging(size_t *floats){
+    if(floats) *floats = g_lane.out_cap / sizeof(float);
+    return g_lane.out;
+}
+
+ColiXdnaLaneHealth coli_xdna_lane_health(void){ return g_xdna_lane_health; }
+
+const char *coli_xdna_lane_health_text(ColiXdnaLaneHealth h){
+    switch(h){
+        case COLI_XDNA_LANE_UNINITIALIZED: return "UNINITIALIZED";
+        case COLI_XDNA_LANE_HEALTHY:       return "HEALTHY";
+        case COLI_XDNA_LANE_UNAVAILABLE:   return "UNAVAILABLE";
+    }
+    return "UNKNOWN";
+}
+void coli_xdna_execution_shutdown(void){
+    coli_xdna_lane_drop_wrapper();
+    if(g_lane.open) coli_xdna_helper_shutdown_call();
+    g_lane.open = 0; g_lane.wrapped = NULL; g_lane.wrapped_gen = 0;
+    /* Lane health is lane runtime state, so it resets with the rest of it. A
+     * fresh attempt after a full teardown is a meaningful thing to allow; a
+     * fresh attempt on every operation is not, which is why nothing else
+     * clears it. */
+    g_xdna_lane_health = COLI_XDNA_LANE_UNINITIALIZED;
     free(g_lane.act); g_lane.act = NULL; g_lane.act_cap = 0;
     free(g_lane.out); g_lane.out = NULL; g_lane.out_cap = 0;
 }

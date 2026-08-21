@@ -316,6 +316,18 @@ size_t   coli_xdna_prepared_bytes(const ColiXdnaPrepared *p);
 unsigned coli_xdna_prepared_k(const ColiXdnaPrepared *p);
 unsigned coli_xdna_prepared_n(const ColiXdnaPrepared *p);
 
+/* Publication generation: incremented every time this object publishes a VALID
+ * image. Two images can occupy the same address -- retained capacity is reused
+ * in place -- so an address alone does not identify contents. Anything that
+ * caches a view of the prepared bytes must key on (pointer, generation).
+ *
+ * W2-N7-I6 added this because the I5 lane keyed its userptr wrapper on the
+ * pointer alone. Re-preparing a different weight into the same buffer therefore
+ * skipped the re-wrap, and the device -- which snapshots at wrap time -- kept
+ * computing against a view that no longer matched the engine's image. Confirmed
+ * on real XDNA2 hardware, not merely reasoned about. */
+unsigned long long coli_xdna_prepared_generation(const ColiXdnaPrepared *p);
+
 /* Defensive validator. The allocator guarantees alignment, but a buffer that
  * arrives from elsewhere, from a pool, or at an offset does not -- and a
  * misaligned pointer fails at the XRT boundary with a message about video
@@ -347,13 +359,21 @@ typedef enum {
     COLI_XDNA_HARD_SHAPE_UNSUPPORTED,
     COLI_XDNA_HARD_FORMAT_UNSUPPORTED,      /* stored tensor is not fmt=4 */
     COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED,  /* fmt=4 but gs is not the qualified 64 */
-    /* artifact gates */
-    COLI_XDNA_HARD_ARTIFACT_NOT_QUALIFIED,  /* any non-QUALIFIED static verdict */
+    /* artifact gates -- kept distinct because they mean different things
+     * operationally: "this build does not ship that artifact", "the bytes are
+     * not the bytes that were qualified", and "we never qualified this one"
+     * lead to different actions, and collapsing them loses the difference
+     * exactly where an operator needs it most. */
+    COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE,
+    COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED,
+    COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED,
+    COLI_XDNA_HARD_REGISTRY_INVALID,
     /* representation gates */
     COLI_XDNA_HARD_PREPARED_INVALID,
     COLI_XDNA_HARD_ALIGNMENT_INVALID,
     /* runtime gates */
-    COLI_XDNA_HARD_HELPER_UNAVAILABLE,
+    COLI_XDNA_HARD_HELPER_UNAVAILABLE,       /* absent, or would not load */
+    COLI_XDNA_HARD_HELPER_ABI_INCOMPATIBLE,  /* loaded, wrong generation or incomplete */
     COLI_XDNA_HARD_DEVICE_UNAVAILABLE,
     COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE,
     COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE
@@ -395,6 +415,24 @@ typedef enum {
     COLI_XDNA_EXEC_COMPLETION_FAILED     /* dispatched, did not complete cleanly */
 } ColiXdnaExec;
 
+/* Lane health. The narrowest model the observed failures justify, and no retry,
+ * backoff or quarantine policy beyond it.
+ *
+ * Most failures are SINGLE-OPERATION: a wrap, a dispatch or a completion can
+ * fail without saying anything about the next operation. A device that will not
+ * initialise is different -- the sealed A5 taxonomy classifies it PROCESS-scoped,
+ * and re-attempting it per operation is pure cost -- so it marks the lane
+ * unavailable for the remainder of the process. Loader verdicts are already
+ * sticky and are reported through ColiXdnaBinding, not here. */
+typedef enum {
+    COLI_XDNA_LANE_UNINITIALIZED = 0,  /* nothing has been attempted yet */
+    COLI_XDNA_LANE_HEALTHY,            /* usable, or at worst failed per-operation */
+    COLI_XDNA_LANE_UNAVAILABLE         /* device unusable for this process */
+} ColiXdnaLaneHealth;
+
+ColiXdnaLaneHealth coli_xdna_lane_health(void);
+const char *coli_xdna_lane_health_text(ColiXdnaLaneHealth h);
+
 const char *coli_xdna_exec_text(ColiXdnaExec e);
 
 /* The production candidate, called from the GLM shared gate/up sites and
@@ -427,6 +465,41 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
  * when nothing was ever initialised, and safe to repeat. */
 void coli_xdna_execution_shutdown(void);
 
+/* -- the two internal execution modes -------------------------------------
+ *
+ * AF0 froze two conceptual modes and I6 defines both mechanically. Neither is
+ * public: there is no --xdna flag and no COLI_XDNA variable, and the AUTO-like
+ * mode is additionally inert unless the internal force control is set.
+ *
+ *   AUTO-LIKE   coli_xdna_try_matmul(). Any decline or failure returns 0 and
+ *               the caller runs its current path. This is the production seam.
+ *
+ *   EXPLICIT    coli_xdna_test_attempt(). Returns the failure class instead of
+ *               a handled flag, and implies NO fallback: a caller in this mode
+ *               asked for XDNA specifically and gets a classified failure
+ *               rather than a silent substitution. Deliberately a separate
+ *               entry point rather than a mode flag, so no global state can
+ *               leave the production seam in a no-fallback configuration.
+ *
+ * Both share one implementation, so their gate order and classification cannot
+ * drift apart. */
+ColiXdnaExec coli_xdna_test_attempt(ColiXdnaFamily family,
+                                    ColiXdnaPrepared **slot,
+                                    int fmt, const unsigned char *q4, const float *scale,
+                                    int I, int O, int gs,
+                                    float *y, const float *x, int S);
+
+/* 1 only after an attempt reported successful completion. Any failure -- at any
+ * stage, including one that occurs after the helper has already written output
+ * bytes -- leaves this 0. No property of the bytes themselves (finite, non-NaN,
+ * non-poison, plausible) can raise it: validity is a state, not a measurement. */
+int coli_xdna_test_output_valid(void);
+
+/* The lane's output staging buffer, so a test can observe that a failing helper
+ * really did write real bytes into it before the failure was reported. Never
+ * read by production code, which copies from it only after success. */
+const float *coli_xdna_test_output_staging(size_t *floats);
+
 /* Install a registry for tests; NULL restores the production table. */
 void coli_xdna_test_set_registry(const ColiXdnaArtifact *rows, int count);
 
@@ -458,6 +531,12 @@ int coli_xdna_test_artifact_opens(void);
 int coli_xdna_test_activation_preparations(void);
 int coli_xdna_test_padded_operations(void);
 int coli_xdna_test_fallbacks(void);       /* candidate returned 0 */
+/* Wrapper accounting. stale_rejects counts the case that made I6 necessary:
+ * the same address carrying a NEW image, which must force a re-wrap rather
+ * than be reused. */
+int coli_xdna_test_wrapper_reuses(void);
+int coli_xdna_test_wrapper_releases(void);
+int coli_xdna_test_stale_wrapper_rejects(void);
 
 /* Deterministic mid-conversion fault injection, for tests only. 0 disables it;
  * 1..99 fails after approximately that percentage of the conversion's rows.
