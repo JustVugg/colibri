@@ -6987,6 +6987,15 @@ typedef struct {
     double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
                         * dashboard needs alongside disk_sec so it stops folding
                         * everything into "other". One shared instance per store. */
+    /* Prefill-scoped slot pooling (#1157). Batched prefill is layer-major:
+     * the whole prompt sweeps layer L before L+1 starts, so while L runs, the
+     * other layers' partitions sit idle and L thrashes its own slice against a
+     * union of 150-256 experts. -1 = off (per-layer partition, the decode
+     * shape); >=0 = every slot belongs to that one layer. Slots carry no layer
+     * tag -- the partition made it implicit -- so switching owner MUST clear
+     * the pool, which is why the field holds the owning layer rather than a
+     * flag. */
+    int pool_layer;
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
@@ -7073,7 +7082,17 @@ static V4ExpertRecord *get_record(V4ExpertStoreState *state, ColiExpertKey key) 
 }
 
 static V4ExpertSlot *layer_slots(V4ExpertStoreState *state, int layer) {
+    if (state->pool_layer >= 0) return state->slots;   /* prefill pool: one region */
     return state->slots + (size_t)layer * state->slots_per_layer;
+}
+
+/* Slots reachable through layer_slots(): the layer's own partition normally,
+ * the whole array while the prefill pool is open. Every scan over a
+ * layer_slots() result must bound itself with this rather than
+ * slots_per_layer, or the pool is allocated and never searched. */
+static int layer_slot_count(const V4ExpertStoreState *state) {
+    return state->pool_layer >= 0 ? state->layers * state->slots_per_layer
+                                  : state->slots_per_layer;
 }
 
 static void fill_tensor_view(ColiTensorView *view,
@@ -7111,7 +7130,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     state->stats.requests++;
     V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = NULL;
-    for (int i = 0; i < state->slots_per_layer; i++) {
+    for (int i = 0; i < layer_slot_count(state); i++) {
         if (slots[i].slab && slots[i].expert == key.expert) {
             slot = &slots[i];
             state->stats.hits++;
@@ -7119,7 +7138,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
     }
     if (!slot) {
-        for (int i = 0; i < state->slots_per_layer; i++) {
+        for (int i = 0; i < layer_slot_count(state); i++) {
             if (!slots[i].references && (!slot || !slots[i].slab ||
                                          (slot->slab && slots[i].used < slot->used)))
                 slot = &slots[i];
@@ -7225,7 +7244,7 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         if (!record) continue;
         int resident = 0;
         V4ExpertSlot *slots = layer_slots(state, keys[i].layer);
-        for (int slot = 0; slot < state->slots_per_layer; slot++)
+        for (int slot = 0; slot < layer_slot_count(state); slot++)
             if (slots[slot].slab && slots[slot].expert == keys[i].expert) {
                 resident = 1; break;
             }
@@ -7355,6 +7374,9 @@ int coli_deepseek_v4_expert_store_open(
     }
     if (state->slots_per_layer > state->experts_per_layer)
         state->slots_per_layer = state->experts_per_layer;
+    /* calloc would leave pool_layer at 0, which this code reads as "pool open,
+     * owned by layer 0". Off is -1 and must be written, not assumed. */
+    state->pool_layer = -1;
     state->slots = calloc((size_t)state->layers * state->slots_per_layer,
                           sizeof(*state->slots));
     if (!state->slots) {
@@ -7786,7 +7808,7 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
         pins[rank] = best;
     }
     V4ExpertSlot *slots = layer_slots(state, layer);
-    for (int i = 0; i < state->slots_per_layer; i++)
+    for (int i = 0; i < layer_slot_count(state); i++)
         if (slots[i].slab && slots[i].expert >= 0 &&
             hot_is_pinned(policy, layer, slots[i].expert))
             slots[i].used = ++state->clock;
@@ -7828,7 +7850,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
 
     V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = NULL;
-    for (int i = 0; i < state->slots_per_layer; i++) {
+    for (int i = 0; i < layer_slot_count(state); i++) {
         if (slots[i].slab && slots[i].expert == key.expert) {
             slot = &slots[i]; slot->references++;
             state->active_leases++;
@@ -7843,15 +7865,15 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             pthread_mutex_unlock(&state->mutex); return 0;
         }
     }
-    for (int i = 0; i < state->slots_per_layer; i++)
+    for (int i = 0; i < layer_slot_count(state); i++)
         if (!slots[i].references && !slots[i].slab) { slot = &slots[i]; break; }
     if (!slot)
-        for (int i = 0; i < state->slots_per_layer; i++)
+        for (int i = 0; i < layer_slot_count(state); i++)
             if (!slots[i].references &&
                 !hot_is_pinned(policy, key.layer, slots[i].expert) &&
                 (!slot || slots[i].used < slot->used)) slot = &slots[i];
     if (!slot)
-        for (int i = 0; i < state->slots_per_layer; i++)
+        for (int i = 0; i < layer_slot_count(state); i++)
             if (!slots[i].references && (!slot || slots[i].used < slot->used))
                 slot = &slots[i];
     if (!slot) {
@@ -8124,6 +8146,10 @@ void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
         int layer = (int)(i / (size_t)cols), expert = (int)(i % (size_t)cols);
         V4ExpertSlot *slots = state->slots +
             (size_t)layer * state->slots_per_layer;
+        /* Base computed by hand, not via layer_slots(): this scan must stay
+         * bounded by the partition width or it runs past the array when the
+         * prefill pool is open. Residency shown here is approximate during
+         * prefill, which is fine — it is a telemetry read-out, not a lookup. */
         for (int z = 0; z < state->slots_per_layer; z++)
             if (slots[z].slab && slots[z].expert == expert) { tier = 1; break; }
         int heat = state->eheat ? state->eheat[i] : 0;
@@ -8185,6 +8211,48 @@ double coli_v4_expert_store_disk_sec(ColiExpertStore *store) {
 /* #890: the compute phase, accumulated by the MoE and read by the serve loop —
  * the disk_sec twin. add is called from the block units around expert forward;
  * the getter is read per-turn in v4_serve_one, same as disk_sec. */
+/* Prefill-scoped slot pooling (#1157).
+ *
+ * Batched prefill is layer-major: the whole prompt sweeps layer L before L+1
+ * begins. While L runs, the other layers' partitions sit idle and L thrashes
+ * its own slice against a union of 150-256 experts. Measured on a 1606-token
+ * prompt: 65,585 misses over 11,008 distinct experts -- 5.96 reads each,
+ * 876 GB where <=138 GB suffices. The CUDA tier already avoids this with its
+ * per-layer bank; this is the CPU equivalent.
+ *
+ * `layer` >= 0 hands the whole slot array to that layer. `layer` < 0 closes
+ * the pool and restores the per-layer partition.
+ *
+ * DECODE MUST NOT OPEN THIS. There every layer is touched once per token, so
+ * the partition is already optimal, and a single LRU smaller than one token's
+ * working set (43 x 6 = 258 references with no reuse) degenerates to a 0%
+ * hit rate -- measured.
+ *
+ * Slots carry no layer tag: the partition made it implicit, so a slot holding
+ * layer 3's expert 5 would be returned as layer 7's. Changing owner therefore
+ * MUST clear identities. Slabs are kept allocated -- only `expert` is reset --
+ * so a layer switch costs a scan, not a round of free/malloc. Leased slots
+ * are skipped: the lease contract in expert_store.h outranks this, and a slot
+ * still held is simply not reused until it is released.
+ *
+ * Defined once here rather than in the included base source: the base is
+ * compiled into both store units, and V4ExpertStoreState has the same layout
+ * in each, so one definition serves whichever backend the registry selected.
+ */
+void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
+    if (!store || !store->state) return;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0) layer = -1;
+    pthread_mutex_lock(&state->mutex);
+    if (state->pool_layer != layer) {
+        int total = state->layers * state->slots_per_layer;
+        for (int i = 0; i < total; i++)
+            if (!state->slots[i].references) state->slots[i].expert = -1;
+        state->pool_layer = layer;
+    }
+    pthread_mutex_unlock(&state->mutex);
+}
+
 void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec) {
     if (!store || !store->state || sec <= 0.0) return;
     V4ExpertStoreState *state = store->state;
@@ -10981,7 +11049,22 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+                               error, error_size)) {
+            coli_v4_expert_store_prefill_pool(experts, -1);
+            return -1;
+        }
+        /* Hand the whole slot array to the layer now in flight (#1157). This
+         * sweep reads the entire prompt through layer_id before layer_id+1
+         * starts, so the other layers' partitions are dead weight meanwhile
+         * while this one thrashes its slice against the prompt's expert union.
+         * Called every iteration: the store clears slot identities on owner
+         * change, which is required because slots carry no layer tag.
+         *
+         * target_batch only. target_token (decode) must never open this: there
+         * every layer is touched once per token, so the per-layer partition is
+         * already optimal and one shared LRU smaller than a token's working
+         * set degenerates to a 0%% hit rate. Closed on every exit below. */
+        coli_v4_expert_store_prefill_pool(experts, layer_id);
         int result = 0;
         /* Chunk width caps every batch-scaled buffer in the block AND bounds
          * the expert union. The batch kernels' contract is 128 (the CPU
@@ -11021,12 +11104,13 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                          layer_id, offset, chunk);
         }
         coli_v4_layer_free(engine, &layer);
-        if (result) return -1;
+        if (result) { coli_v4_expert_store_prefill_pool(experts, -1); return -1; }
         float *swap = state; state = next; next = swap;
         for (int item = 0; item < batch; item++)
             v4_mainh_tap(config, layer_id, state + (size_t)item * hd,
                          (int64_t)start + item);
     }
+    coli_v4_expert_store_prefill_pool(experts, -1);   /* decode gets its per-layer partition back */
     *state_ptr = state;
     *next_ptr = next;
     return 0;
@@ -13635,6 +13719,15 @@ typedef struct {
     double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
                         * dashboard needs alongside disk_sec so it stops folding
                         * everything into "other". One shared instance per store. */
+    /* Prefill-scoped slot pooling (#1157). Batched prefill is layer-major:
+     * the whole prompt sweeps layer L before L+1 starts, so while L runs, the
+     * other layers' partitions sit idle and L thrashes its own slice against a
+     * union of 150-256 experts. -1 = off (per-layer partition, the decode
+     * shape); >=0 = every slot belongs to that one layer. Slots carry no layer
+     * tag -- the partition made it implicit -- so switching owner MUST clear
+     * the pool, which is why the field holds the owning layer rather than a
+     * flag. */
+    int pool_layer;
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
@@ -13721,7 +13814,17 @@ static V4ExpertRecord *get_record(V4ExpertStoreState *state, ColiExpertKey key) 
 }
 
 static V4ExpertSlot *layer_slots(V4ExpertStoreState *state, int layer) {
+    if (state->pool_layer >= 0) return state->slots;   /* prefill pool: one region */
     return state->slots + (size_t)layer * state->slots_per_layer;
+}
+
+/* Slots reachable through layer_slots(): the layer's own partition normally,
+ * the whole array while the prefill pool is open. Every scan over a
+ * layer_slots() result must bound itself with this rather than
+ * slots_per_layer, or the pool is allocated and never searched. */
+static int layer_slot_count(const V4ExpertStoreState *state) {
+    return state->pool_layer >= 0 ? state->layers * state->slots_per_layer
+                                  : state->slots_per_layer;
 }
 
 static void fill_tensor_view(ColiTensorView *view,
@@ -13759,7 +13862,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     state->stats.requests++;
     V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = NULL;
-    for (int i = 0; i < state->slots_per_layer; i++) {
+    for (int i = 0; i < layer_slot_count(state); i++) {
         if (slots[i].slab && slots[i].expert == key.expert) {
             slot = &slots[i];
             state->stats.hits++;
@@ -13767,7 +13870,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
     }
     if (!slot) {
-        for (int i = 0; i < state->slots_per_layer; i++) {
+        for (int i = 0; i < layer_slot_count(state); i++) {
             if (!slots[i].references && (!slot || !slots[i].slab ||
                                          (slot->slab && slots[i].used < slot->used)))
                 slot = &slots[i];
@@ -13873,7 +13976,7 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         if (!record) continue;
         int resident = 0;
         V4ExpertSlot *slots = layer_slots(state, keys[i].layer);
-        for (int slot = 0; slot < state->slots_per_layer; slot++)
+        for (int slot = 0; slot < layer_slot_count(state); slot++)
             if (slots[slot].slab && slots[slot].expert == keys[i].expert) {
                 resident = 1; break;
             }
@@ -13996,6 +14099,9 @@ int coli_deepseek_v4_expert_store_open(
     }
     if (state->slots_per_layer > state->experts_per_layer)
         state->slots_per_layer = state->experts_per_layer;
+    /* calloc would leave pool_layer at 0, which this code reads as "pool open,
+     * owned by layer 0". Off is -1 and must be written, not assumed. */
+    state->pool_layer = -1;
     state->slots = calloc((size_t)state->layers * state->slots_per_layer,
                           sizeof(*state->slots));
     if (!state->slots) {

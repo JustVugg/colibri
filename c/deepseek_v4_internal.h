@@ -602,6 +602,11 @@ int coli_deepseek_v4_expert_store_open(
     char *error,
     size_t error_size);
 
+/* Prefill-scoped slot pooling (#1157): `layer` >= 0 hands the whole slot array
+ * to that layer, `layer` < 0 restores the per-layer partition. Batched prefill
+ * only -- decode must keep the partition (see the definition for why). */
+void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
+
 #ifdef __cplusplus
 }
 #endif
