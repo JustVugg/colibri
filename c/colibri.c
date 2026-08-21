@@ -6255,7 +6255,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #ifdef COLI_XDNA
         if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_gate.xdna,
                                  l->sh_gate.fmt, l->sh_gate.q4, l->sh_gate.s,
-                                 l->sh_gate.I, l->sh_gate.O, l->sh_gate.gs, sg, x, S))
+                                 l->sh_gate.I, l->sh_gate.O, l->sh_gate.gs, l->sh_gate.planar,
+                                 sg, x, S))
 #endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
@@ -6264,7 +6265,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #ifdef COLI_XDNA
         if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_up.xdna,
                                  l->sh_up.fmt, l->sh_up.q4, l->sh_up.s,
-                                 l->sh_up.I, l->sh_up.O, l->sh_up.gs, su, x, S))
+                                 l->sh_up.I, l->sh_up.O, l->sh_up.gs, l->sh_up.planar,
+                                 su, x, S))
 #endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_up, su, x, S))

@@ -359,6 +359,7 @@ typedef enum {
     COLI_XDNA_HARD_SHAPE_UNSUPPORTED,
     COLI_XDNA_HARD_FORMAT_UNSUPPORTED,      /* stored tensor is not fmt=4 */
     COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED,  /* fmt=4 but gs is not the qualified 64 */
+    COLI_XDNA_HARD_LAYOUT_UNSUPPORTED,      /* fmt=4 pair layout expected; bytes are planar */
     /* artifact gates -- kept distinct because they mean different things
      * operationally: "this build does not ship that artifact", "the bytes are
      * not the bytes that were qualified", and "we never qualified this one"
@@ -458,7 +459,7 @@ const char *coli_xdna_exec_text(ColiXdnaExec e);
 int coli_xdna_try_matmul(ColiXdnaFamily family,
                          ColiXdnaPrepared **slot,
                          int fmt, const unsigned char *q4, const float *scale,
-                         int I, int O, int gs,
+                         int I, int O, int gs, int planar,
                          float *y, const float *x, int S);
 
 /* Release helper-owned runtime state and the transient staging buffers. Safe
@@ -486,7 +487,7 @@ void coli_xdna_execution_shutdown(void);
 ColiXdnaExec coli_xdna_test_attempt(ColiXdnaFamily family,
                                     ColiXdnaPrepared **slot,
                                     int fmt, const unsigned char *q4, const float *scale,
-                                    int I, int O, int gs,
+                                    int I, int O, int gs, int planar,
                                     float *y, const float *x, int S);
 
 /* 1 only after an attempt reported successful completion. Any failure -- at any

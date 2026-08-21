@@ -179,7 +179,7 @@ int main(int argc, char **argv){
         float *x = mk_x(TM, TK, 1u);
         float *y = (float *)malloc((size_t)TM*TN*4); poison(y,(size_t)TM*TN);
         int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &slot,
-                                           4, W.q4, W.s, TK, TN, 64, y, x, TM);
+                                           4, W.q4, W.s, TK, TN, 64, 0, y, x, TM);
         ck(handled == 0, "helper, artifact and device all available -- still not handled");
         ck(coli_xdna_test_dispatches() == 0, "and zero dispatches");
         ck(all_poison(y,(size_t)TM*TN), "caller output untouched");
@@ -196,7 +196,7 @@ int main(int argc, char **argv){
         float *x = mk_x(TM, TK, 2u);
         float *y = (float *)malloc((size_t)TM*TN*4); poison(y,(size_t)TM*TN);
         int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &slot,
-                                           4, W.q4, W.s, TK, TN, 64, y, x, TM);
+                                           4, W.q4, W.s, TK, TN, 64, 0, y, x, TM);
         ck(handled == 1, "handled");
         ck(coli_xdna_test_last_hard() == COLI_XDNA_HARD_ELIGIBLE, "FULL_XDNA_HARD_ELIGIBLE");
         ck(coli_xdna_test_last_exec() == COLI_XDNA_EXEC_OK, "exec OK");
@@ -230,7 +230,7 @@ int main(int argc, char **argv){
             float *x = mk_x(S, TK, 100u + (unsigned)S);
             float *y = (float *)malloc((size_t)S*TN*4); poison(y,(size_t)S*TN);
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &slot,
-                                               4, W.q4, W.s, TK, TN, 64, y, x, S);
+                                               4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
             char msg[128];
             snprintf(msg,sizeof msg,"S=%d handled",S); ck(handled==1,msg);
             snprintf(msg,sizeof msg,"S=%d padded_ops=%d",S,coli_xdna_test_padded_operations());
@@ -277,7 +277,7 @@ int main(int argc, char **argv){
             float *y = (float *)malloc((size_t)S*cases[c].O*4); poison(y,(size_t)S*cases[c].O);
             int handled = coli_xdna_try_matmul(cases[c].fam, &slot, cases[c].fmt,
                                                T.q4, T.s, cases[c].I, cases[c].O,
-                                               cases[c].gs, y, x, cases[c].S);
+                                               cases[c].gs, 0, y, x, cases[c].S);
             char msg[160];
             snprintf(msg,sizeof msg,"%s -> not handled", cases[c].what);   ck(handled==0,msg);
             snprintf(msg,sizeof msg,"%s -> dispatches 0", cases[c].what);
@@ -310,7 +310,7 @@ int main(int argc, char **argv){
         float *x = mk_x(TM, TK, 4u);
         float *y = (float *)malloc((size_t)TM*TN*4); poison(y,(size_t)TM*TN);
         ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&slot,4,T.q4,T.s,
-                                TK,TN,32,y,x,TM) == 0,
+                                TK,TN,32,0,y,x,TM) == 0,
            "GENERIC_PREPARABLE is not INITIAL_XDNA_QUALIFIED");
         ck(coli_xdna_test_dispatches()==0, "dispatches 0");
         coli_xdna_prepared_release(&slot); free(x); free(y); fmt4_free(&T);
@@ -338,7 +338,7 @@ int main(int argc, char **argv){
             float *x = mk_x(TM, TK, 5u);
             float *y = (float *)malloc((size_t)TM*TN*4); poison(y,(size_t)TM*TN);
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&slot,
-                                               4,W.q4,W.s,TK,TN,64,y,x,TM);
+                                               4,W.q4,W.s,TK,TN,64,0,y,x,TM);
             char msg[160];
             snprintf(msg,sizeof msg,"%s -> not handled", hs[c].what); ck(handled==0,msg);
             snprintf(msg,sizeof msg,"%s -> dispatches 0", hs[c].what);
@@ -373,7 +373,7 @@ int main(int argc, char **argv){
             float *x = mk_x(TM, TK, 6u);
             float *y = (float *)malloc((size_t)TM*TN*4); poison(y,(size_t)TM*TN);
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&slot,
-                                               4,W.q4,W.s,TK,TN,64,y,x,TM);
+                                               4,W.q4,W.s,TK,TN,64,0,y,x,TM);
             const char *what = c==0 ? "artifact absent" : "artifact hash mismatch";
             /* Since W2-N7-I6 these are DIFFERENT verdicts: a build that does not
              * ship the bytes and a build whose bytes were tampered with call for
@@ -424,7 +424,7 @@ int main(int argc, char **argv){
             float *x = mk_x(TM, TK, 7u);
             float *y = (float *)malloc((size_t)TM*TN*4); poison(y,(size_t)TM*TN);
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&slot,
-                                               4,W.q4,W.s,TK,TN,64,y,x,TM);
+                                               4,W.q4,W.s,TK,TN,64,0,y,x,TM);
             char msg[200];
             snprintf(msg,sizeof msg,"%s failure -> not handled", fs[c].what); ck(handled==0,msg);
             snprintf(msg,sizeof msg,"%s failure -> %s", fs[c].what,
@@ -459,16 +459,16 @@ int main(int argc, char **argv){
         float *ya2= (float *)malloc((size_t)TM*TN*4);
 
         ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&sa,4,W.q4,W.s,
-                                TK,TN,64,ya,x,TM)==1, "gate-like weight executes");
+                                TK,TN,64,0,ya,x,TM)==1, "gate-like weight executes");
         ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&sa,4,W.q4,W.s,
-                                TK,TN,64,ya2,x,TM)==1, "same weight again executes");
+                                TK,TN,64,0,ya2,x,TM)==1, "same weight again executes");
         ck(coli_xdna_test_conversions()-conv0 == 1, "prepared once, reused on the second call");
         ck(coli_xdna_test_userptr_wraps() == 1, "wrapped once for the same pointer");
         ck(coli_xdna_test_artifact_opens() == 1, "artifact runtime opened once, not per operation");
         ck(memcmp(ya,ya2,(size_t)TM*TN*4)==0, "identical inputs give identical outputs");
 
         ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&sb,4,W2.q4,W2.s,
-                                TK,TN,64,yb,x,TM)==1, "up-like weight executes");
+                                TK,TN,64,0,yb,x,TM)==1, "up-like weight executes");
         ck(coli_xdna_test_userptr_wraps() == 2, "a different prepared image is wrapped again");
         ck(coli_xdna_test_artifact_opens() == 1, "and reuses the same artifact runtime");
         ck(memcmp(ya,yb,(size_t)TM*TN*4)!=0, "different runtime weights give different outputs");
@@ -495,7 +495,7 @@ int main(int argc, char **argv){
         float *x = mk_x(TM,TK,10u);
         float *y = (float*)malloc((size_t)TM*TN*4);
         ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&slot,4,W.q4,W.s,
-                                TK,TN,64,y,x,TM)==1, "operation succeeds");
+                                TK,TN,64,0,y,x,TM)==1, "operation succeeds");
         coli_xdna_execution_shutdown();
         ck(1, "shutdown after a successful operation is safe");
         coli_xdna_execution_shutdown();

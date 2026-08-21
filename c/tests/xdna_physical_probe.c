@@ -188,7 +188,7 @@ int main(int argc, char **argv){
             double t0 = now_s();
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
                                                &w->xdna, w->fmt, w->q4, w->s,
-                                               w->I, w->O, w->gs, y, x, S);
+                                               w->I, w->O, w->gs, w->planar, y, x, S);
             double ms = (now_s()-t0)*1000.0;
 
             printf("\n-- %s  M=%d --\n", names[t], S);
@@ -278,7 +278,7 @@ int main(int argc, char **argv){
         float *y = (float*)malloc((size_t)S*PN*4);
         int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
                                            &G.xdna, G.fmt, G.q4, G.s,
-                                           G.I, G.O, G.gs, y, x, S);
+                                           G.I, G.O, G.gs, G.planar, y, x, S);
         printf("\n-- generic f32 activations (BF16 rounding is LOSSY here), M=%d --\n", S);
         printf("HANDLED          %d\n", handled);
         if(!handled) g_bad = 1;
@@ -323,14 +323,14 @@ int main(int argc, char **argv){
         float *yb = (float*)malloc((size_t)S*PN*4);
         printf("\n-- stale-wrapper control: reprepare a different weight in place --\n");
         int ha = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &G.xdna,
-                                      G.fmt, G.q4, G.s, G.I, G.O, G.gs, ya, x, S);
+                                      G.fmt, G.q4, G.s, G.I, G.O, G.gs, G.planar, ya, x, S);
         const void *p1 = coli_xdna_prepared_image(G.xdna);
         int w0 = coli_xdna_test_userptr_wraps();
         coli_xdna_prepared_invalidate(G.xdna);
         ColiXdnaPrepResult pr = coli_xdna_prepare_from_fmt4(G.xdna, 4, U.q4, U.s, PK, PN, PGS);
         const void *p2 = coli_xdna_prepared_image(G.xdna);
         int hb = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &G.xdna,
-                                      G.fmt, G.q4, G.s, G.I, G.O, G.gs, yb, x, S);
+                                      G.fmt, G.q4, G.s, G.I, G.O, G.gs, G.planar, yb, x, S);
         printf("PREPARE_RC       %d   ptr_same %s\n", (int)pr, p1==p2?"YES":"no");
         printf("HANDLED          %d %d\n", ha, hb);
         printf("WRAPS            before=%d after=%d  rewrap=%s\n", w0,
@@ -362,7 +362,7 @@ int main(int argc, char **argv){
         float *y = (float*)malloc((size_t)8*PN*4);
         int before = coli_xdna_test_dispatches();
         int h2 = coli_xdna_try_matmul(COLI_XDNA_FAMILY_NONE, &G.xdna, G.fmt, G.q4, G.s,
-                                      G.I, G.O, G.gs, y, x, 8);
+                                      G.I, G.O, G.gs, G.planar, y, x, 8);
         printf("\nWRONG_FAMILY_HANDLED %d  dispatch_delta %d  (%s)\n", h2,
                coli_xdna_test_dispatches()-before,
                coli_xdna_hard_text(coli_xdna_test_last_hard()));

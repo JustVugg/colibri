@@ -918,6 +918,7 @@ const char *coli_xdna_hard_text(ColiXdnaHard h){
         case COLI_XDNA_HARD_SHAPE_UNSUPPORTED:           return "SHAPE_UNSUPPORTED";
         case COLI_XDNA_HARD_FORMAT_UNSUPPORTED:          return "FORMAT_UNSUPPORTED";
         case COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED:      return "GROUP_SIZE_UNSUPPORTED";
+        case COLI_XDNA_HARD_LAYOUT_UNSUPPORTED:          return "LAYOUT_UNSUPPORTED";
         case COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE:        return "ARTIFACT_UNAVAILABLE";
         case COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED:   return "ARTIFACT_INTEGRITY_FAILED";
         case COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED:        return "ARTIFACT_UNQUALIFIED";
@@ -1054,7 +1055,7 @@ int coli_xdna_test_conversions(void){ return g_xdna_conversions; }
  * returns, none of them merely records. */
 
 static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
-                                           int fmt, int I, int O, int gs, int S,
+                                           int fmt, int I, int O, int gs, int planar, int S,
                                            const ColiXdnaArtifact **row_out){
     /*  1  semantic family -- passed in by the call site, never inferred */
     if(family != COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP)
@@ -1073,6 +1074,19 @@ static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
     /*  5  group size -- the converter is more permissive than the device */
     if(gs != COLI_XDNA_QUALIFIED_GROUP_SIZE)
         return COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED;
+
+    /*  5b in-memory byte layout.
+     *
+     *     fmt=4 has TWO layouts in current Colibri. The classic PAIR layout
+     *     puts elements 2j and 2j+1 in byte j; the K1 PLANAR layout puts
+     *     elements k and k+32 in byte k of each 64-element block, and
+     *     qt_planarize() rewrites the tensor IN PLACE when the grouped planar
+     *     IDOT path is opted into (IDOT_GS=1), for exactly the gs>=64 tensors
+     *     this lane qualifies. The converter was qualified against the pair
+     *     layout only, so planar bytes would decode to nonsense rather than
+     *     fail. Decline instead. */
+    if(planar)
+        return COLI_XDNA_HARD_LAYOUT_UNSUPPORTED;
 
     /*  6  a qualified artifact for exactly this family/bucket/shape/dtypes.
      *     The bucket is the artifact's M, which is where logical M is mapped. */
@@ -1137,7 +1151,7 @@ static int coli_xdna_stage(void **base, size_t *cap, size_t need){
 static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
                                       ColiXdnaPrepared **slot,
                                       int fmt, const unsigned char *q4, const float *scale,
-                                      int I, int O, int gs,
+                                      int I, int O, int gs, int planar,
                                       float *y, const float *x, int S)
 {
     g_xdna_output_valid = 0;          /* nothing is valid until completion says so */
@@ -1157,7 +1171,7 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
     }
 
     const ColiXdnaArtifact *row = NULL;
-    ColiXdnaHard h = coli_xdna_engine_gates(family, fmt, I, O, gs, S, &row);
+    ColiXdnaHard h = coli_xdna_engine_gates(family, fmt, I, O, gs, planar, S, &row);
     if(h != COLI_XDNA_HARD_ELIGIBLE){
         g_xdna_last_hard = h;
         return (g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED);
@@ -1310,7 +1324,7 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
 int coli_xdna_try_matmul(ColiXdnaFamily family,
                          ColiXdnaPrepared **slot,
                          int fmt, const unsigned char *q4, const float *scale,
-                         int I, int O, int gs,
+                         int I, int O, int gs, int planar,
                          float *y, const float *x, int S)
 {
     /* Gate 0: the internal control. Without it this function is inert, which is
@@ -1324,7 +1338,7 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
         g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
         return 0;
     }
-    if(coli_xdna_attempt(family, slot, fmt, q4, scale, I, O, gs, y, x, S)
+    if(coli_xdna_attempt(family, slot, fmt, q4, scale, I, O, gs, planar, y, x, S)
        == COLI_XDNA_EXEC_OK)
         return 1;
     g_xdna_fallbacks++;
@@ -1340,10 +1354,10 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
 ColiXdnaExec coli_xdna_test_attempt(ColiXdnaFamily family,
                                     ColiXdnaPrepared **slot,
                                     int fmt, const unsigned char *q4, const float *scale,
-                                    int I, int O, int gs,
+                                    int I, int O, int gs, int planar,
                                     float *y, const float *x, int S)
 {
-    return coli_xdna_attempt(family, slot, fmt, q4, scale, I, O, gs, y, x, S);
+    return coli_xdna_attempt(family, slot, fmt, q4, scale, I, O, gs, planar, y, x, S);
 }
 
 int coli_xdna_test_output_valid(void){ return g_xdna_output_valid; }

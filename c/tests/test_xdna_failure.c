@@ -158,7 +158,7 @@ static void use_helper(const char *path){
  * existed. Nothing else is a fallback. */
 static void seam(float *y, const float *x, QT *w, int S){
     if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &w->xdna,
-                             w->fmt, w->q4, w->s, w->I, w->O, w->gs, y, x, S))
+                             w->fmt, w->q4, w->s, w->I, w->O, w->gs, w->planar, y, x, S))
         matmul_qt(y, x, w, S);
 }
 
@@ -219,13 +219,15 @@ int main(int argc, char **argv){
     /* ================================================================== */
     printf("\npre-device declines -- nothing may reach the device\n");
     {
-        struct { const char *what; ColiXdnaFamily fam; int fmt,I,O,gs,S; ColiXdnaHard want; } c[] = {
-            { "wrong semantic family", COLI_XDNA_FAMILY_NONE, 4,TK,TN,64,TM, COLI_XDNA_HARD_FAMILY_UNSUPPORTED },
-            { "sh_down orientation",   COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TN,TK,64,TM, COLI_XDNA_HARD_SHAPE_UNSUPPORTED },
-            { "gs != 64",              COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,32,TM, COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED },
-            { "fmt != 4",              COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 2,TK,TN,64,TM, COLI_XDNA_HARD_FORMAT_UNSUPPORTED },
-            { "M above range",         COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,TM+1, COLI_XDNA_HARD_M_OUT_OF_RANGE },
-            { "K/N mismatch",          COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK+8,TN,64,TM, COLI_XDNA_HARD_SHAPE_UNSUPPORTED }
+        struct { const char *what; ColiXdnaFamily fam; int fmt,I,O,gs,planar,S; ColiXdnaHard want; } c[] = {
+            { "wrong semantic family", COLI_XDNA_FAMILY_NONE, 4,TK,TN,64,0,TM, COLI_XDNA_HARD_FAMILY_UNSUPPORTED },
+            { "sh_down orientation",   COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TN,TK,64,0,TM, COLI_XDNA_HARD_SHAPE_UNSUPPORTED },
+            { "gs != 64",              COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,32,0,TM, COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED },
+            { "fmt != 4",              COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 2,TK,TN,64,0,TM, COLI_XDNA_HARD_FORMAT_UNSUPPORTED },
+            { "M above range",         COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,0,TM+1, COLI_XDNA_HARD_M_OUT_OF_RANGE },
+            { "K/N mismatch",          COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK+8,TN,64,0,TM, COLI_XDNA_HARD_SHAPE_UNSUPPORTED },
+            /* K1 planar layout: the converter was never qualified against it */
+            { "planar fmt4 layout",    COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,1,TM, COLI_XDNA_HARD_LAYOUT_UNSUPPORTED }
         };
         for(size_t i = 0; i < sizeof c/sizeof c[0]; i++){
             use_helper(g_helper);
@@ -239,7 +241,7 @@ int main(int argc, char **argv){
             T.fmt = 4; matmul_qt(rr, xx, &T, c[i].S); T.fmt = c[i].fmt;
             poison_buf(yy,(size_t)c[i].S*c[i].O);
             int handled = coli_xdna_try_matmul(c[i].fam, &T.xdna, c[i].fmt, T.q4, T.s,
-                                               c[i].I, c[i].O, c[i].gs, yy, xx, c[i].S);
+                                               c[i].I, c[i].O, c[i].gs, c[i].planar, yy, xx, c[i].S);
             char m[200];
             snprintf(m,sizeof m,"%s -> %s", c[i].what, coli_xdna_hard_text(coli_xdna_test_last_hard()));
             ck(coli_xdna_test_last_hard()==c[i].want, m);
@@ -266,7 +268,7 @@ int main(int argc, char **argv){
         char none[1200]; snprintf(none,sizeof none,"%s/absent", g_root);
         coli_xdna_test_set_artifact_root(none);
         float *y = (float*)malloc((size_t)TM*TN*4); poison_buf(y,(size_t)TM*TN);
-        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&W.xdna,4,W.q4,W.s,TK,TN,64,y,x,TM);
+        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&W.xdna,4,W.q4,W.s,TK,TN,64,0,y,x,TM);
         ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_ARTIFACT_UNAVAILABLE,
            "artifact absent -> ARTIFACT_UNAVAILABLE");
         ck(coli_xdna_test_helper_calls()==0, "artifact absent -> helper never called");
@@ -274,7 +276,7 @@ int main(int argc, char **argv){
 
         coli_xdna_test_set_artifact_root(g_root);
         { FILE *f = fopen(g_xclbin,"r+b"); if(f){ fseek(f,64,SEEK_SET); fputc(0x5A,f); fclose(f); } }
-        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&W.xdna,4,W.q4,W.s,TK,TN,64,y,x,TM);
+        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&W.xdna,4,W.q4,W.s,TK,TN,64,0,y,x,TM);
         ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED,
            "artifact tampered -> ARTIFACT_INTEGRITY_FAILED (not the same as absent)");
         ck(coli_xdna_test_helper_calls()==0, "artifact tampered -> unverified bytes never reach the helper");
@@ -282,7 +284,7 @@ int main(int argc, char **argv){
         write_blob(g_xclbin, 31u, 4096); build_registry();
 
         g_test_rows[0].correctness_qualified = 0;
-        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&W.xdna,4,W.q4,W.s,TK,TN,64,y,x,TM);
+        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&W.xdna,4,W.q4,W.s,TK,TN,64,0,y,x,TM);
         ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_ARTIFACT_UNQUALIFIED,
            "artifact never correctness-qualified -> ARTIFACT_UNQUALIFIED");
         g_test_rows[0].correctness_qualified = 1;
@@ -303,7 +305,7 @@ int main(int argc, char **argv){
             coli_xdna_test_set_force_execution(1);
             QT T; qt_make(&T, TK, TN, 64, 4242u);
             float *y = (float*)malloc((size_t)TM*TN*4); poison_buf(y,(size_t)TM*TN);
-            coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,4,T.q4,T.s,TK,TN,64,y,x,TM);
+            coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,4,T.q4,T.s,TK,TN,64,0,y,x,TM);
             char m[200];
             snprintf(m,sizeof m,"%s -> %s", h[i].what, coli_xdna_hard_text(coli_xdna_test_last_hard()));
             ck(coli_xdna_test_last_hard()==h[i].want, m);
@@ -332,7 +334,7 @@ int main(int argc, char **argv){
         coli_xdna_test_set_convert_fail_pct(50);
         float *y = (float*)malloc((size_t)TM*TN*4); poison_buf(y,(size_t)TM*TN);
         int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
-                                           4,T.q4,T.s,TK,TN,64,y,x,TM);
+                                           4,T.q4,T.s,TK,TN,64,0,y,x,TM);
         ck(handled==0, "mid-conversion failure -> not handled");
         ck(coli_xdna_test_last_exec()==COLI_XDNA_EXEC_WEIGHT_PREPARE_FAILED,
            "classified WEIGHT_PREPARE_FAILED");
@@ -351,7 +353,7 @@ int main(int argc, char **argv){
         coli_xdna_test_set_convert_fail_pct(0);
         poison_buf(y,(size_t)TM*TN);
         ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
-                                4,T.q4,T.s,TK,TN,64,y,x,TM)==1,
+                                4,T.q4,T.s,TK,TN,64,0,y,x,TM)==1,
            "a complete re-preparation recovers and executes");
         ck(coli_xdna_prepared_state(T.xdna)==COLI_XDNA_PREP_VALID, "state VALID again");
         ck(coli_xdna_test_output_valid()==1, "and the output is valid");
@@ -378,7 +380,7 @@ int main(int argc, char **argv){
             float *y = (float*)malloc((size_t)TM*TN*4); poison_buf(y,(size_t)TM*TN);
             int d0 = coli_xdna_test_dispatches();
             int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
-                                               4,T.q4,T.s,TK,TN,64,y,x,TM);
+                                               4,T.q4,T.s,TK,TN,64,0,y,x,TM);
             char m[220];
             snprintf(m,sizeof m,"%s failure -> not handled", st[i].what); ck(handled==0,m);
             snprintf(m,sizeof m,"%s failure -> %s", st[i].what,
@@ -423,7 +425,7 @@ int main(int argc, char **argv){
 
         int d_late = coli_xdna_test_dispatches();
         int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
-                                           4,T.q4,T.s,TK,TN,64,y,x,TM);
+                                           4,T.q4,T.s,TK,TN,64,0,y,x,TM);
         ck(handled==0, "not handled");
         ck(coli_xdna_test_last_exec()==COLI_XDNA_EXEC_COMPLETION_FAILED, "COMPLETION_FAILED");
 
@@ -463,7 +465,7 @@ int main(int argc, char **argv){
         QT T; qt_make(&T, TK, TN, 64, 4242u);
         float *y = (float*)malloc((size_t)TM*TN*4); poison_buf(y,(size_t)TM*TN);
         ColiXdnaExec e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
-                                                4,T.q4,T.s,TK,TN,64,y,x,TM);
+                                                4,T.q4,T.s,TK,TN,64,0,y,x,TM);
         ck(e==COLI_XDNA_EXEC_EXECUTE_FAILED, "explicit mode returns the failure class");
         ck(coli_xdna_test_output_valid()==0, "output not valid");
         ck(count_poison(y,(size_t)TM*TN)==(size_t)TM*TN,
@@ -471,7 +473,7 @@ int main(int argc, char **argv){
         arm(F_NONE);
         poison_buf(y,(size_t)TM*TN);
         e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
-                                   4,T.q4,T.s,TK,TN,64,y,x,TM);
+                                   4,T.q4,T.s,TK,TN,64,0,y,x,TM);
         ck(e==COLI_XDNA_EXEC_OK, "explicit mode succeeds when the lane works");
         ck(coli_xdna_test_output_valid()==1, "and the output is valid");
         ck(count_poison(y,(size_t)TM*TN)==0, "and was written");
@@ -495,11 +497,11 @@ int main(int argc, char **argv){
         arm(F_WRAP);
         QT T; qt_make(&T, TK, TN, 64, 4242u);
         float *y = (float*)malloc((size_t)TM*TN*4);
-        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,4,T.q4,T.s,TK,TN,64,y,x,TM);
+        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,4,T.q4,T.s,TK,TN,64,0,y,x,TM);
         ck(coli_xdna_lane_health()==COLI_XDNA_LANE_HEALTHY,
            "a wrap failure leaves the lane HEALTHY -- it is one operation");
         arm(F_NONE);
-        ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,4,T.q4,T.s,TK,TN,64,y,x,TM)==1,
+        ck(coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,4,T.q4,T.s,TK,TN,64,0,y,x,TM)==1,
            "and the very next operation succeeds");
 
         use_helper(g_helper);
@@ -507,12 +509,12 @@ int main(int argc, char **argv){
         coli_xdna_test_set_force_execution(1);
         arm(F_DEVICE);
         QT D; qt_make(&D, TK, TN, 64, 4242u);
-        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&D.xdna,4,D.q4,D.s,TK,TN,64,y,x,TM);
+        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&D.xdna,4,D.q4,D.s,TK,TN,64,0,y,x,TM);
         ck(coli_xdna_lane_health()==COLI_XDNA_LANE_UNAVAILABLE,
            "a device-init failure marks the lane UNAVAILABLE for the process");
         arm(F_NONE);
         int o0 = coli_xdna_test_device_opens();
-        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&D.xdna,4,D.q4,D.s,TK,TN,64,y,x,TM);
+        coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&D.xdna,4,D.q4,D.s,TK,TN,64,0,y,x,TM);
         ck(coli_xdna_test_device_opens()==o0,
            "and the device is not re-attempted per operation");
         ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_DEVICE_UNAVAILABLE, "the decline says why");
