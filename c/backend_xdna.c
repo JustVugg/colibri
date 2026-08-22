@@ -960,6 +960,53 @@ static ColiXdnaHard g_xdna_last_hard = COLI_XDNA_HARD_ELIGIBLE;
 static ColiXdnaExec g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
 static int g_xdna_dispatches, g_xdna_completions, g_xdna_artifact_opens;
 static int g_xdna_act_preps, g_xdna_padded_ops, g_xdna_fallbacks;
+
+/* ---- bucket accounting ---------------------------------------------------
+ *
+ * Two buckets are live, so a single padded_ops total no longer identifies what
+ * happened: it cannot say which artifact ran, and it weights a 24-row pad the
+ * same as a 191-row one. Everything below is indexed by BUCKET SLOT, and the
+ * slot mapping is the one place that knows the bucket set.
+ *
+ * Slots, not artifact_m values, because the accounting must stay O(buckets)
+ * rather than sparse-keyed, and because an unknown artifact_m must be a loud
+ * miss rather than a silently created bin. */
+enum { COLI_XDNA_SLOT_M64 = 0, COLI_XDNA_SLOT_M256 = 1, COLI_XDNA_SLOTS = 2 };
+
+static int coli_xdna_bucket_slot(unsigned artifact_m){
+    if(artifact_m == COLI_XDNA_BUCKET_M_SMALL) return COLI_XDNA_SLOT_M64;
+    if(artifact_m == COLI_XDNA_BUCKET_M_LARGE) return COLI_XDNA_SLOT_M256;
+    return -1;                                  /* not a compiled bucket */
+}
+
+static int       g_xdna_b_hard_eligible[COLI_XDNA_SLOTS];
+static int       g_xdna_b_dispatches[COLI_XDNA_SLOTS];
+static int       g_xdna_b_completions[COLI_XDNA_SLOTS];
+static int       g_xdna_b_padded_ops[COLI_XDNA_SLOTS];
+static long long g_xdna_b_padded_rows[COLI_XDNA_SLOTS];
+static int       g_xdna_b_artifact_opens[COLI_XDNA_SLOTS];
+static int       g_xdna_b_switches[COLI_XDNA_SLOTS][COLI_XDNA_SLOTS];
+static int       g_xdna_m_above_range_declines;
+
+/* THE BUCKET SELECTOR.
+ *
+ * The smallest compiled bucket that holds `logical_m`, or 0 if none does.
+ * This is SHAPE ELIGIBILITY, not an economic choice: it has no cost model, no
+ * device-load input and no preference. A caller may not override it, and it may
+ * not round a request up into a bucket that was never built -- there is no
+ * M128 artifact, so an S=65 request runs on M256 with 191 padded rows rather
+ * than on something that does not exist.
+ *
+ * Pure: no globals, no device, no registry. The registry lookup that follows
+ * still has to find a row for the returned bucket, so a bucket named here but
+ * absent from the registry declines at gate 6 exactly as an unknown shape
+ * would. */
+static unsigned coli_xdna_bucket_for_logical_m(int logical_m){
+    if(logical_m < COLI_XDNA_LOGICAL_M_MIN) return 0u;
+    if(logical_m <= (int)COLI_XDNA_BUCKET_M_SMALL) return COLI_XDNA_BUCKET_M_SMALL;
+    if(logical_m <= (int)COLI_XDNA_BUCKET_M_LARGE) return COLI_XDNA_BUCKET_M_LARGE;
+    return 0u;                                  /* above every bucket: decline */
+}
 static int g_xdna_device_opens, g_xdna_helper_calls, g_xdna_userptr_wraps;
 static int g_xdna_wrapper_reuses, g_xdna_wrapper_releases, g_xdna_stale_rejects;
 static int g_xdna_output_valid;
@@ -1027,6 +1074,46 @@ int coli_xdna_test_artifact_opens(void){ return g_xdna_artifact_opens; }
 int coli_xdna_test_activation_preparations(void){ return g_xdna_act_preps; }
 int coli_xdna_test_padded_operations(void){ return g_xdna_padded_ops; }
 int coli_xdna_test_fallbacks(void){ return g_xdna_fallbacks; }
+
+/* Per-bucket accessors. An unrecognised artifact M returns 0 -- it is not a
+ * bucket this build compiled, so there is nothing to report and nothing may be
+ * silently folded into a neighbouring bin. */
+int coli_xdna_test_bucket_dispatches(unsigned artifact_m){
+    int sl = coli_xdna_bucket_slot(artifact_m); return sl < 0 ? 0 : g_xdna_b_dispatches[sl];
+}
+int coli_xdna_test_bucket_completions(unsigned artifact_m){
+    int sl = coli_xdna_bucket_slot(artifact_m); return sl < 0 ? 0 : g_xdna_b_completions[sl];
+}
+int coli_xdna_test_bucket_padded_operations(unsigned artifact_m){
+    int sl = coli_xdna_bucket_slot(artifact_m); return sl < 0 ? 0 : g_xdna_b_padded_ops[sl];
+}
+long long coli_xdna_test_bucket_padded_rows(unsigned artifact_m){
+    int sl = coli_xdna_bucket_slot(artifact_m); return sl < 0 ? 0 : g_xdna_b_padded_rows[sl];
+}
+int coli_xdna_test_bucket_artifact_opens(unsigned artifact_m){
+    int sl = coli_xdna_bucket_slot(artifact_m); return sl < 0 ? 0 : g_xdna_b_artifact_opens[sl];
+}
+int coli_xdna_test_bucket_hard_eligible(unsigned artifact_m){
+    int sl = coli_xdna_bucket_slot(artifact_m); return sl < 0 ? 0 : g_xdna_b_hard_eligible[sl];
+}
+int coli_xdna_test_m_above_range_declines(void){ return g_xdna_m_above_range_declines; }
+int coli_xdna_test_bucket_switches(unsigned from_m, unsigned to_m){
+    int a = coli_xdna_bucket_slot(from_m), b = coli_xdna_bucket_slot(to_m);
+    return (a < 0 || b < 0) ? 0 : g_xdna_b_switches[a][b];
+}
+unsigned coli_xdna_test_bucket_for(int logical_m){
+    return coli_xdna_bucket_for_logical_m(logical_m);
+}
+void coli_xdna_test_reset_bucket_counters(void){
+    memset(g_xdna_b_hard_eligible,  0, sizeof g_xdna_b_hard_eligible);
+    memset(g_xdna_b_dispatches,     0, sizeof g_xdna_b_dispatches);
+    memset(g_xdna_b_completions,    0, sizeof g_xdna_b_completions);
+    memset(g_xdna_b_padded_ops,     0, sizeof g_xdna_b_padded_ops);
+    memset(g_xdna_b_padded_rows,    0, sizeof g_xdna_b_padded_rows);
+    memset(g_xdna_b_artifact_opens, 0, sizeof g_xdna_b_artifact_opens);
+    memset(g_xdna_b_switches,       0, sizeof g_xdna_b_switches);
+    g_xdna_m_above_range_declines = 0;
+}
 int coli_xdna_test_wrapper_reuses(void){ return g_xdna_wrapper_reuses; }
 int coli_xdna_test_wrapper_releases(void){ return g_xdna_wrapper_releases; }
 int coli_xdna_test_stale_wrapper_rejects(void){ return g_xdna_stale_rejects; }
@@ -1061,9 +1148,18 @@ static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
     if(family != COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP)
         return COLI_XDNA_HARD_FAMILY_UNSUPPORTED;
 
-    /*  2  logical M in the range this slice implements */
-    if(S < COLI_XDNA_I5_LOGICAL_M_MIN || S > COLI_XDNA_I5_LOGICAL_M_MAX)
+    /*  2  logical M within the range some compiled bucket serves.
+     *
+     *     The upper bound is now the LARGEST bucket, not the only one. Below
+     *     the minimum and above the largest are the same verdict to the caller
+     *     -- M_OUT_OF_RANGE, decline to the current path -- but the
+     *     above-the-range case is counted separately, because it is the new
+     *     first-decline boundary and a later slice will want to know how often
+     *     real work lands there. */
+    if(S < COLI_XDNA_LOGICAL_M_MIN || S > COLI_XDNA_LOGICAL_M_MAX){
+        if(S > COLI_XDNA_LOGICAL_M_MAX) g_xdna_m_above_range_declines++;
         return COLI_XDNA_HARD_M_OUT_OF_RANGE;
+    }
 
     /*  3  K / N representable and positive */
     if(I <= 0 || O <= 0) return COLI_XDNA_HARD_SHAPE_UNSUPPORTED;
@@ -1092,7 +1188,8 @@ static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
      *     The bucket is the artifact's M, which is where logical M is mapped. */
     ColiXdnaRequest q;
     q.family = family;
-    q.m = (unsigned)COLI_XDNA_I5_LOGICAL_M_MAX;   /* the F3 M64 bucket */
+    q.m = coli_xdna_bucket_for_logical_m(S);      /* smallest bucket holding S */
+    if(q.m == 0u) return COLI_XDNA_HARD_M_OUT_OF_RANGE;   /* unreachable: gate 2 */
     q.k = (unsigned)I; q.n = (unsigned)O;
     q.in_dtype = COLI_XDNA_DT_BF16;
     q.weight_dtype = COLI_XDNA_DT_BF16;
@@ -1231,6 +1328,15 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
             g_xdna_last_hard = COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
             return (g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED);
         }
+        /* Record the transition BEFORE tearing the old artifact down, while
+         * g_lane.m still names the bucket being left. A bucket switch is the
+         * expensive case (shutdown + open + forced re-wrap), so it is counted
+         * rather than inferred from artifact_opens, which also fires on the
+         * very first open and on a K/N change. */
+        if(g_lane.open){
+            int from = coli_xdna_bucket_slot(g_lane.m), to = coli_xdna_bucket_slot(am);
+            if(from >= 0 && to >= 0 && from != to) g_xdna_b_switches[from][to]++;
+        }
         if(g_lane.open){ coli_xdna_lane_drop_wrapper(); coli_xdna_helper_shutdown_call(); }
         g_lane.open = 0;
         g_xdna_helper_calls++; g_xdna_device_opens++;
@@ -1252,6 +1358,7 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
         g_lane.wrapped = NULL; g_lane.wrapped_gen = 0;
         g_xdna_lane_health = COLI_XDNA_LANE_HEALTHY;
         g_xdna_artifact_opens++;
+        { int sl = coli_xdna_bucket_slot(am); if(sl >= 0) g_xdna_b_artifact_opens[sl]++; }
     }
 
     /* 14  userptr wrap, keyed on (pointer, generation).
@@ -1281,6 +1388,7 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
     }
 
     g_xdna_last_hard = COLI_XDNA_HARD_ELIGIBLE;   /* FULL_XDNA_HARD_ELIGIBLE */
+    { int sl = coli_xdna_bucket_slot(am); if(sl >= 0) g_xdna_b_hard_eligible[sl]++; }
 
     /* ---- activation staging ------------------------------------------------- */
     size_t abytes = (size_t)am * (size_t)I * 2u;
@@ -1295,6 +1403,12 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
         memset(g_lane.act + (size_t)S * (size_t)I, 0,
                ((size_t)am - (size_t)S) * (size_t)I * 2u);
         g_xdna_padded_ops++;
+        /* ROWS as well as OPS: with two buckets the op count no longer says how
+         * much padding was computed. An S=65 operation on M256 pads 191 rows;
+         * an S=63 operation on M64 pads 1. Both are one "padded op". */
+        { int sl = coli_xdna_bucket_slot(am);
+          if(sl >= 0){ g_xdna_b_padded_ops[sl]++;
+                       g_xdna_b_padded_rows[sl] += (long long)(am - (unsigned)S); } }
     }
     g_xdna_act_preps++;
 
@@ -1312,6 +1426,8 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
                                  : COLI_XDNA_EXEC_EXECUTE_FAILED);
     }
     g_xdna_dispatches++; g_xdna_completions++;
+    { int sl = coli_xdna_bucket_slot(am);
+      if(sl >= 0){ g_xdna_b_dispatches[sl]++; g_xdna_b_completions[sl]++; } }
 
     memcpy(y, g_lane.out, (size_t)S * (size_t)O * 4u);   /* logical rows only */
     g_xdna_output_valid = 1;

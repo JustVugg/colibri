@@ -28,13 +28,14 @@ static void ck(int cond, const char *what){
 
 #define TK 256        /* K -- small so the CPU GEMM in the fake stays quick */
 #define TN 128        /* N */
-#define TM 64         /* artifact M, the bucket this slice implements */
+#define TM 64         /* the small artifact bucket */
+#define TM2 256       /* the large artifact bucket (M1) */
 
 static char g_root[1024];
 static char g_helper[1024], g_helper_abi1[1024], g_helper_partial[1024];
 static char g_xclbin[2048], g_insts[2048];
 static char g_xhex[65], g_ihex[65];
-static ColiXdnaArtifact g_test_rows[1];
+static ColiXdnaArtifact g_test_rows[2];
 
 static void hexify(const unsigned char h[32], char out[65]){
     static const char *H = "0123456789abcdef";
@@ -76,8 +77,22 @@ static void build_registry(void){
     g_test_rows[0].correctness_qualified = 1;
     g_test_rows[0].userptr_qualified = 1;
     g_test_rows[0].structural_qualified = 1;
-    coli_xdna_test_set_registry(g_test_rows, 1);
+
+    /* M1: the large bucket. Same family, same K/N, same dtypes, same artifact
+     * bytes -- only artifact_m differs. Sharing the fixture bytes is deliberate:
+     * the fake helper is generic in m, so any behavioural difference between the
+     * two rows can only come from the bucket, not from the artifact. */
+    g_test_rows[1] = g_test_rows[0];
+    g_test_rows[1].artifact_m = TM2;
+
+    coli_xdna_test_set_registry(g_test_rows, 2);
 }
+
+/* Install only the SMALL bucket, so a request that selects M256 finds no row.
+ * This is the "bucket named by the selector but absent from the registry" case:
+ * it must decline, never fall back to a different bucket. */
+static void registry_small_only(void){ coli_xdna_test_set_registry(g_test_rows, 1); }
+static void registry_both(void){ coli_xdna_test_set_registry(g_test_rows, 2); }
 
 /* A deterministic fmt4 tensor with I=K, O=N. */
 typedef struct { unsigned char *q4; float *s; int I, O, gs; } Fmt4;
@@ -134,6 +149,7 @@ static void lane_reset(void){
     g_xdna_dispatches = g_xdna_completions = g_xdna_artifact_opens = 0;
     g_xdna_act_preps = g_xdna_padded_ops = g_xdna_fallbacks = 0;
     g_xdna_device_opens = g_xdna_helper_calls = g_xdna_userptr_wraps = 0;
+    coli_xdna_test_reset_bucket_counters();
 }
 
 /* Rebind the loader to a helper path and clear its sticky verdict. */
@@ -259,7 +275,7 @@ int main(int argc, char **argv){
               COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED },
             { "fmt != 4", COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 2, TK, TN, 64, TM,
               COLI_XDNA_HARD_FORMAT_UNSUPPORTED },
-            { "logical M above the qualified range", COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4, TK, TN, 64, TM+1,
+            { "logical M above EVERY bucket", COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4, TK, TN, 64, TM2+1,
               COLI_XDNA_HARD_M_OUT_OF_RANGE },
             { "logical M below the qualified range", COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4, TK, TN, 64, 0,
               COLI_XDNA_HARD_M_OUT_OF_RANGE },
@@ -503,6 +519,181 @@ int main(int argc, char **argv){
         coli_xdna_shutdown();
         ck(coli_xdna_test_entry_points_bound()==0, "module released, no pointer survives it");
         coli_xdna_prepared_release(&slot); free(x); free(y);
+    }
+
+    /* ==================================================================
+     * M1 -- DUAL BUCKET SELECTION
+     * ================================================================== */
+    printf("M1 bucket selection -- which artifact serves which logical M\n");
+    {
+        /* The selector is pure, so assert it directly before asserting the
+         * behaviour it drives. If these disagree with the execution results
+         * below, the bug is in the wiring, not in the rule. */
+        struct { int m; unsigned want; const char *what; } sel[] = {
+            {    0,        0u, "M=0 -> no bucket" },
+            {    1,  (unsigned)TM,  "M=1 -> small" },
+            {   63,  (unsigned)TM,  "M=63 -> small" },
+            {   64,  (unsigned)TM,  "M=64 -> small, exact fill" },
+            {   65,  (unsigned)TM2, "M=65 -> large (there is no M128 artifact)" },
+            {   66,  (unsigned)TM2, "M=66 -> large" },
+            {  128,  (unsigned)TM2, "M=128 -> large" },
+            {  255,  (unsigned)TM2, "M=255 -> large" },
+            {  256,  (unsigned)TM2, "M=256 -> large, exact fill" },
+            {  257,        0u, "M=257 -> no bucket" },
+            { 1000,        0u, "M=1000 -> no bucket" }
+        };
+        for(size_t i=0;i<sizeof sel/sizeof sel[0];i++)
+            ck(coli_xdna_test_bucket_for(sel[i].m)==sel[i].want, sel[i].what);
+    }
+
+    printf("M1 execution per bucket -- dispatch, padding rows, copyback\n");
+    {
+        registry_both();
+        struct { int S; unsigned bucket; long long pad_rows; } cases[] = {
+            {   1, (unsigned)TM,  (long long)TM-1      },
+            {  63, (unsigned)TM,  1                    },
+            {  64, (unsigned)TM,  0                    },
+            {  65, (unsigned)TM2, (long long)TM2-65    },
+            { 128, (unsigned)TM2, (long long)TM2-128   },
+            { 255, (unsigned)TM2, 1                    },
+            { 256, (unsigned)TM2, 0                    }
+        };
+        for(size_t c=0;c<sizeof cases/sizeof cases[0];c++){
+            int S = cases[c].S; unsigned bk = cases[c].bucket;
+            unsigned other = (bk==(unsigned)TM) ? (unsigned)TM2 : (unsigned)TM;
+            use_helper(g_helper);
+            coli_xdna_test_set_artifact_root(g_root);
+            coli_xdna_test_set_force_execution(1);
+            ColiXdnaPrepared *slot = NULL;
+            float *x = mk_x(S, TK, 4242u + (unsigned)S);
+            size_t want = (size_t)S*TN, guard = TN;
+            float *y = (float*)malloc((want+guard)*sizeof(float));
+            poison(y, want+guard);
+            ColiXdnaExec e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                                    &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+            char msg[192];
+            snprintf(msg,sizeof msg,"S=%d -> OK on M%u", S, bk);
+            ck(e==COLI_XDNA_EXEC_OK, msg);
+            snprintf(msg,sizeof msg,"S=%d -> 1 dispatch on M%u", S, bk);
+            ck(coli_xdna_test_bucket_dispatches(bk)==1, msg);
+            snprintf(msg,sizeof msg,"S=%d -> 0 dispatches on the other bucket M%u", S, other);
+            ck(coli_xdna_test_bucket_dispatches(other)==0, msg);
+            snprintf(msg,sizeof msg,"S=%d -> completions match dispatches", S);
+            ck(coli_xdna_test_bucket_completions(bk)==1, msg);
+            snprintf(msg,sizeof msg,"S=%d -> padded rows = %lld on M%u", S, cases[c].pad_rows, bk);
+            ck(coli_xdna_test_bucket_padded_rows(bk)==cases[c].pad_rows, msg);
+            snprintf(msg,sizeof msg,"S=%d -> padded ops = %d", S, cases[c].pad_rows?1:0);
+            ck(coli_xdna_test_bucket_padded_operations(bk)==(cases[c].pad_rows?1:0), msg);
+            int guard_ok = 1;
+            for(size_t i=0;i<guard;i++) if(y[want+i]!=POISON){ guard_ok=0; break; }
+            snprintf(msg,sizeof msg,"S=%d -> guard past %zu floats untouched (no artifact rows escaped)", S, want);
+            ck(guard_ok, msg);
+            int wrote_all = 1;
+            for(size_t i=0;i<want;i++) if(y[i]==POISON){ wrote_all=0; break; }
+            snprintf(msg,sizeof msg,"S=%d -> all %zu logical floats written", S, want);
+            ck(wrote_all, msg);
+            float *REFS = (float*)malloc(want*sizeof(float));
+            oracle(REFS, x, coli_xdna_prepared_image(slot), S, TK, TN);
+            int exact = 1;
+            for(size_t i=0;i<want;i++) if(y[i]!=REFS[i]){ exact=0; break; }
+            snprintf(msg,sizeof msg,"S=%d -> matches the BF16 oracle exactly on M%u", S, bk);
+            ck(exact, msg);
+            free(REFS);
+            coli_xdna_prepared_release(&slot); free(x); free(y);
+        }
+    }
+
+    printf("M1 above every bucket -- the new first decline\n");
+    {
+        registry_both();
+        use_helper(g_helper);
+        coli_xdna_test_set_artifact_root(g_root);
+        coli_xdna_test_set_force_execution(1);
+        ColiXdnaPrepared *slot = NULL;
+        int S = TM2+1;
+        float *x = mk_x(S, TK, 9u);
+        float *y = (float*)malloc((size_t)S*TN*sizeof(float));
+        poison(y, (size_t)S*TN);
+        ColiXdnaExec e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                                &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+        ck(e==COLI_XDNA_EXEC_DECLINED, "S=257 -> DECLINED");
+        ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_M_OUT_OF_RANGE, "S=257 -> M_OUT_OF_RANGE");
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==0,  "S=257 -> no small-bucket dispatch");
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM2)==0, "S=257 -> no large-bucket dispatch");
+        ck(coli_xdna_test_m_above_range_declines()>0, "S=257 -> counted as above-range");
+        int untouched = 1;
+        for(size_t i=0;i<(size_t)S*TN;i++) if(y[i]!=POISON){ untouched=0; break; }
+        ck(untouched, "S=257 -> caller output untouched");
+        coli_xdna_prepared_release(&slot); free(x); free(y);
+    }
+
+    printf("M1 selector names a bucket the registry does not hold\n");
+    {
+        registry_small_only();
+        use_helper(g_helper);
+        coli_xdna_test_set_artifact_root(g_root);
+        coli_xdna_test_set_force_execution(1);
+        ColiXdnaPrepared *slot = NULL;
+        int S = 65;
+        float *x = mk_x(S, TK, 11u);
+        float *y = (float*)malloc((size_t)S*TN*sizeof(float));
+        poison(y, (size_t)S*TN);
+        ColiXdnaExec e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                                &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+        ck(e==COLI_XDNA_EXEC_DECLINED, "S=65 with no M256 row -> DECLINED");
+        ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_SHAPE_UNSUPPORTED,
+           "S=65 with no M256 row -> SHAPE_UNSUPPORTED, not a silent downgrade");
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==0,
+           "S=65 with no M256 row -> the small bucket was NOT used instead");
+        int untouched = 1;
+        for(size_t i=0;i<(size_t)S*TN;i++) if(y[i]!=POISON){ untouched=0; break; }
+        ck(untouched, "S=65 with no M256 row -> caller output untouched");
+        coli_xdna_prepared_release(&slot); free(x); free(y);
+        registry_both();
+    }
+
+    printf("M1 bucket switching -- one prepared weight, two artifacts\n");
+    {
+        registry_both();
+        use_helper(g_helper);
+        coli_xdna_test_set_artifact_root(g_root);
+        coli_xdna_test_set_force_execution(1);
+        ColiXdnaPrepared *slot = NULL;
+        int seq[] = { 64, 65, 64, 130, 256, 64 };
+        for(size_t i=0;i<sizeof seq/sizeof seq[0];i++){
+            int S = seq[i];
+            unsigned bk = coli_xdna_test_bucket_for(S);
+            float *x = mk_x(S, TK, 700u+(unsigned)i);
+            float *y = (float*)malloc((size_t)S*TN*sizeof(float));
+            poison(y, (size_t)S*TN);
+            ColiXdnaExec e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                                    &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+            char msg[192];
+            snprintf(msg,sizeof msg,"switch step %zu (S=%d) -> OK", i, S);
+            ck(e==COLI_XDNA_EXEC_OK, msg);
+            float *REFS = (float*)malloc((size_t)S*TN*sizeof(float));
+            oracle(REFS, x, coli_xdna_prepared_image(slot), S, TK, TN);
+            int exact = 1;
+            for(size_t j=0;j<(size_t)S*TN;j++) if(y[j]!=REFS[j]){ exact=0; break; }
+            snprintf(msg,sizeof msg,"switch step %zu (S=%d, M%u) -> exact after transition", i, S, bk);
+            ck(exact, msg);
+            free(REFS);
+            snprintf(msg,sizeof msg,"switch step %zu -> still exactly one prepared object", i);
+            ck(coli_xdna_prepared_live_objects()==1, msg);
+            free(x); free(y);
+        }
+        ck(coli_xdna_test_bucket_switches((unsigned)TM,(unsigned)TM2)==2,
+           "small->large transitions counted (2: 64->65 and 64->130)");
+        ck(coli_xdna_test_bucket_switches((unsigned)TM2,(unsigned)TM)==2,
+           "large->small transitions counted (2: 65->64 and 256->64)");
+        ck(coli_xdna_test_bucket_artifact_opens((unsigned)TM2)==2,
+           "130 and 256 share the large bucket -- no reopen between them");
+        ck(coli_xdna_test_bucket_artifact_opens((unsigned)TM)>=1,  "small bucket opened");
+        ck(coli_xdna_test_bucket_artifact_opens((unsigned)TM2)>=1, "large bucket opened");
+        ck(coli_xdna_test_stale_wrapper_rejects()==0, "no stale wrapper reuse across buckets");
+        ck(coli_xdna_prepared_live_objects()==1, "bucket switching created no second prepared image");
+        coli_xdna_prepared_release(&slot);
+        ck(coli_xdna_prepared_live_objects()==0, "prepared image released");
     }
 
     coli_xdna_test_set_helper_path(NULL);

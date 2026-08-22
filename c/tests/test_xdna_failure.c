@@ -38,6 +38,7 @@ static void ck(int cond, const char *what){
 #define TK 256
 #define TN 128
 #define TM 64
+#define TM2 256      /* the large artifact bucket (M1) */
 
 /* Failure stages the synthetic helper can be told to produce. Mirrors the enum
  * in tests/xdna_fake_helper.c. */
@@ -46,7 +47,7 @@ enum { F_NONE = 0, F_DEVICE, F_ARTIFACT, F_WRAP, F_EXECUTE, F_COMPLETION };
 static char g_root[1024], g_helper[1024], g_helper_abi1[1024], g_helper_partial[1024];
 static char g_xclbin[2048], g_insts[2048];
 static char g_xhex[65], g_ihex[65];
-static ColiXdnaArtifact g_test_rows[1];
+static ColiXdnaArtifact g_test_rows[2];
 static HMODULE g_fake;
 static void (*p_set_fail)(int);
 static void (*p_reset)(void);
@@ -87,7 +88,13 @@ static void build_registry(void){
     g_test_rows[0].correctness_qualified = 1;
     g_test_rows[0].userptr_qualified = 1;
     g_test_rows[0].structural_qualified = 1;
-    coli_xdna_test_set_registry(g_test_rows, 1);
+
+    /* M1: the large bucket. Identical in every field but artifact_m, so any
+     * behavioural difference is attributable to the bucket alone. */
+    g_test_rows[1] = g_test_rows[0];
+    g_test_rows[1].artifact_m = TM2;
+
+    coli_xdna_test_set_registry(g_test_rows, 2);
 }
 
 static void qt_make(QT *t, int I, int O, int gs, unsigned seed){
@@ -132,6 +139,11 @@ static void arm(int stage){ if(p_set_fail) p_set_fail(stage); }
 static void use_helper(const char *path){
     coli_xdna_execution_shutdown();
     coli_xdna_test_set_force_execution(0);
+    /* Per-bucket counters are cumulative by design; each scenario measures one
+     * operation, so they are zeroed at the same point every other per-run
+     * counter is. Without this, "this scenario dispatched zero times" silently
+     * becomes "some earlier scenario dispatched". */
+    coli_xdna_test_reset_bucket_counters();
     coli_xdna_test_set_helper_path(path);
     g_fake = NULL; p_set_fail = NULL; p_reset = NULL;
     if(coli_xdna_binding() == COLI_XDNA_AVAILABLE){
@@ -224,7 +236,8 @@ int main(int argc, char **argv){
             { "sh_down orientation",   COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TN,TK,64,0,TM, COLI_XDNA_HARD_SHAPE_UNSUPPORTED },
             { "gs != 64",              COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,32,0,TM, COLI_XDNA_HARD_GROUP_SIZE_UNSUPPORTED },
             { "fmt != 4",              COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 2,TK,TN,64,0,TM, COLI_XDNA_HARD_FORMAT_UNSUPPORTED },
-            { "M above range",         COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,0,TM+1, COLI_XDNA_HARD_M_OUT_OF_RANGE },
+            { "M above EVERY bucket",  COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,0,TM2+1, COLI_XDNA_HARD_M_OUT_OF_RANGE },
+            { "M=0, below the range",  COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,0,0, COLI_XDNA_HARD_M_OUT_OF_RANGE },
             { "K/N mismatch",          COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK+8,TN,64,0,TM, COLI_XDNA_HARD_SHAPE_UNSUPPORTED },
             /* K1 planar layout: the converter was never qualified against it */
             { "planar fmt4 layout",    COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, 4,TK,TN,64,1,TM, COLI_XDNA_HARD_LAYOUT_UNSUPPORTED }
@@ -361,6 +374,69 @@ int main(int argc, char **argv){
     }
 
     /* ================================================================== */
+    /* M1 -- the SAME failure owners, reached through the LARGE bucket.
+     *
+     * The point is not to re-prove the failure taxonomy, which is generic in
+     * artifact_m. It is to prove that an operation which selects M256 arrives at
+     * those same owners, fails closed the same way, and leaves the caller's
+     * buffer and the authoritative fmt4 exactly as untouched. S=65 is used
+     * because it is the first logical M that selects the large bucket. */
+    printf("\nM1 runtime failure stages on the LARGE bucket (S=65 -> M256)\n");
+    {
+        const int S2 = 65;
+        struct { int stage; const char *what; ColiXdnaExec want; ColiXdnaHard hard; } st2[] = {
+            { F_DEVICE,     "device init",           COLI_XDNA_EXEC_DEVICE_INIT_FAILED,   COLI_XDNA_HARD_DEVICE_UNAVAILABLE },
+            { F_ARTIFACT,   "artifact runtime open", COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED, COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE },
+            { F_WRAP,       "userptr wrap",          COLI_XDNA_EXEC_WEIGHT_WRAP_FAILED,   COLI_XDNA_HARD_WEIGHT_WRAP_UNAVAILABLE },
+            { F_EXECUTE,    "dispatch",              COLI_XDNA_EXEC_EXECUTE_FAILED,       COLI_XDNA_HARD_ELIGIBLE },
+            { F_COMPLETION, "completion",            COLI_XDNA_EXEC_COMPLETION_FAILED,    COLI_XDNA_HARD_ELIGIBLE }
+        };
+        float *x2 = mk_x(S2, TK, 313u);
+        for(size_t i = 0; i < sizeof st2/sizeof st2[0]; i++){
+            use_helper(g_helper);
+            coli_xdna_test_set_artifact_root(g_root);
+            coli_xdna_test_set_force_execution(1);
+            arm(st2[i].stage);
+            QT T; qt_make(&T, TK, TN, 64, 4242u);
+            float *ref2 = (float*)malloc((size_t)S2*TN*4); matmul_qt(ref2, x2, &T, S2);
+            float *y2 = (float*)malloc((size_t)S2*TN*4); poison_buf(y2,(size_t)S2*TN);
+            int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,&T.xdna,
+                                               4,T.q4,T.s,TK,TN,64,0,y2,x2,S2);
+            char m[240];
+            snprintf(m,sizeof m,"M256 %s failure -> not handled", st2[i].what);
+            ck(handled==0,m);
+            snprintf(m,sizeof m,"M256 %s failure -> %s", st2[i].what,
+                     coli_xdna_exec_text(coli_xdna_test_last_exec()));
+            ck(coli_xdna_test_last_exec()==st2[i].want, m);
+            snprintf(m,sizeof m,"M256 %s failure -> hard verdict %s", st2[i].what,
+                     coli_xdna_hard_text(coli_xdna_test_last_hard()));
+            ck(coli_xdna_test_last_hard()==st2[i].hard, m);
+            snprintf(m,sizeof m,"M256 %s failure -> output not valid", st2[i].what);
+            ck(coli_xdna_test_output_valid()==0, m);
+            snprintf(m,sizeof m,"M256 %s failure -> caller output entirely untouched", st2[i].what);
+            ck(count_poison(y2,(size_t)S2*TN)==(size_t)S2*TN, m);
+            snprintf(m,sizeof m,"M256 %s failure -> zero large-bucket dispatches", st2[i].what);
+            ck(coli_xdna_test_bucket_dispatches((unsigned)TM2)==0, m);
+            snprintf(m,sizeof m,"M256 %s failure -> zero SMALL-bucket dispatches (no downgrade)", st2[i].what);
+            ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==0, m);
+            if(st2[i].stage != F_DEVICE && st2[i].stage != F_ARTIFACT){
+                snprintf(m,sizeof m,"M256 %s failure -> a correct prepared image stays VALID", st2[i].what);
+                ck(coli_xdna_prepared_state(T.xdna)==COLI_XDNA_PREP_VALID, m);
+            }
+            snprintf(m,sizeof m,"M256 %s failure -> authoritative fmt4 unchanged", st2[i].what);
+            ck(fnv(T.q4,q4b)==fnv(W.q4,q4b) && fnv(T.s,scb)==fnv(W.s,scb), m);
+            matmul_qt(y2, x2, &T, S2);
+            snprintf(m,sizeof m,"M256 %s failure -> residual poison 0 after current path", st2[i].what);
+            ck(count_poison(y2,(size_t)S2*TN)==0, m);
+            snprintf(m,sizeof m,"M256 %s failure -> current path result exact", st2[i].what);
+            ck(memcmp(y2,ref2,(size_t)S2*TN*4)==0, m);
+            free(ref2); free(y2);
+            arm(F_NONE);
+            coli_xdna_prepared_release(&T.xdna); free(T.q4); free(T.s);
+        }
+        free(x2);
+    }
+
     printf("\nruntime failure stages -- each classified, each falls back exactly\n");
     {
         struct { int stage; const char *what; ColiXdnaExec want; ColiXdnaHard hard; } st[] = {

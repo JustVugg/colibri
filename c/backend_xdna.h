@@ -389,7 +389,7 @@ const char *coli_xdna_hard_text(ColiXdnaHard h);
  * here, because no artifact was ever correctness-qualified against one. */
 #define COLI_XDNA_QUALIFIED_GROUP_SIZE 64
 
-/* The logical-M range this slice implements, against the F3 M64 artifact.
+/* The logical-M range this lane implements, and the artifact buckets serving it.
  *
  * Row padding is legitimate because C = A x B is row-independent: output row i
  * depends only on input row i and on B. N6-A2-A1A qualified the strategy
@@ -398,11 +398,28 @@ const char *coli_xdna_hard_text(ColiXdnaHard h);
  * property of PURE GEMM and must never be extended to attention, normalisation
  * or routing.
  *
- * Row TILING (logical M above the bucket) is equally qualified as a strategy
- * and deliberately NOT implemented here: the smallest first seam is one
- * dispatch. Anything above the range declines to the current path. */
-#define COLI_XDNA_I5_LOGICAL_M_MIN 1
-#define COLI_XDNA_I5_LOGICAL_M_MAX 64
+ * Row TILING (logical M above the largest bucket) is equally qualified as a
+ * strategy and deliberately NOT implemented: one dispatch, one artifact.
+ * Anything above the largest bucket declines to the current path.
+ *
+ * TWO buckets are served, and they are BUCKETS, not a range to interpolate
+ * across. An M bucket is a separately compiled program: N6 saw `wa F6 M256`
+ * fail to compile where its M64 sibling compiled, so a bucket that was never
+ * built cannot be synthesised by rounding. Selection is therefore an exact
+ * lookup of the smallest qualified bucket that holds the logical rows, and a
+ * request between the buckets uses the larger one with zero padding -- never an
+ * unbuilt M128. */
+#define COLI_XDNA_LOGICAL_M_MIN 1
+#define COLI_XDNA_BUCKET_M_SMALL 64
+#define COLI_XDNA_BUCKET_M_LARGE 256
+#define COLI_XDNA_LOGICAL_M_MAX COLI_XDNA_BUCKET_M_LARGE
+
+/* Kept as the historical I5 names so the qualified-range vocabulary of the
+ * earlier slices still resolves. _MAX was BOTH the range end and the bucket
+ * when only one bucket existed; M1 split those meanings, and the name that
+ * used to mean both now means only the small bucket. */
+#define COLI_XDNA_I5_LOGICAL_M_MIN COLI_XDNA_LOGICAL_M_MIN
+#define COLI_XDNA_I5_LOGICAL_M_MAX COLI_XDNA_BUCKET_M_SMALL
 
 typedef enum {
     COLI_XDNA_EXEC_OK = 0,
@@ -532,6 +549,38 @@ int coli_xdna_test_artifact_opens(void);
 int coli_xdna_test_activation_preparations(void);
 int coli_xdna_test_padded_operations(void);
 int coli_xdna_test_fallbacks(void);       /* candidate returned 0 */
+
+/* PER-BUCKET accounting.
+ *
+ * With one bucket, a single padded_ops total was unambiguous. With two it is
+ * not: an S=200 operation padded to 256 and an S=40 operation padded to 64 are
+ * both "padded" and waste 56 rows versus 24. Worse, the aggregate cannot say
+ * WHICH artifact ran. Every accessor below takes the artifact M so the caller
+ * names the bucket it is asking about; an unknown bucket returns 0 rather than
+ * silently aggregating.
+ *
+ * padded_ROWS is reported as well as padded_OPS because the two answer
+ * different questions: how many operations padded at all, and how much padding
+ * was actually computed. Only the second scales with the waste.
+ *
+ * These are qualification diagnostics, not a product interface. */
+int coli_xdna_test_bucket_dispatches(unsigned artifact_m);
+int coli_xdna_test_bucket_completions(unsigned artifact_m);
+int coli_xdna_test_bucket_padded_operations(unsigned artifact_m);
+long long coli_xdna_test_bucket_padded_rows(unsigned artifact_m);
+int coli_xdna_test_bucket_artifact_opens(unsigned artifact_m);
+int coli_xdna_test_bucket_hard_eligible(unsigned artifact_m);
+/* Logical M above the largest qualified bucket: the new first-decline class. */
+int coli_xdna_test_m_above_range_declines(void);
+/* Bucket transitions actually taken by the lane, counted on artifact reopen. */
+int coli_xdna_test_bucket_switches(unsigned from_m, unsigned to_m);
+/* The bucket the lane would select for a logical M, or 0 if none serves it.
+ * Pure function of the compiled bucket set; touches no device and no registry. */
+unsigned coli_xdna_test_bucket_for(int logical_m);
+/* Zero every per-bucket counter. Tests measure one scenario at a time, and a
+ * cumulative total silently turns "this scenario dispatched once" into "some
+ * earlier scenario also dispatched". */
+void coli_xdna_test_reset_bucket_counters(void);
 /* Wrapper accounting. stale_rejects counts the case that made I6 necessary:
  * the same address carrying a NEW image, which must force a re-wrap rather
  * than be reused. */
