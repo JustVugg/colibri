@@ -52,13 +52,15 @@ static double shared_run(Model *m,Layer *l,const float *x,const float *seed,
 static int shared_benchmark(void) {
     Model m;memset(&m,0,sizeof(m));m.c.hidden=I;m.c.shared_inter=O;
     Layer l;memset(&l,0,sizeof(l));
-    l.sh_g=falloc((int64_t)O*I);l.sh_u=falloc((int64_t)O*I);
-    l.sh_d=falloc((int64_t)I*O);l.sh_gate=falloc(I);
-    for(int64_t i=0;i<(int64_t)O*I;i++){l.sh_g[i]=value(i,2);l.sh_u[i]=value(i,3);}
-    for(int64_t i=0;i<(int64_t)I*O;i++)l.sh_d[i]=value(i,4);
+    l.sh_g.f32=falloc((int64_t)O*I);l.sh_u.f32=falloc((int64_t)O*I);
+    l.sh_d.f32=falloc((int64_t)I*O);l.sh_gate=falloc(I);
+    for(int64_t i=0;i<(int64_t)O*I;i++){l.sh_g.f32[i]=value(i,2);l.sh_u.f32[i]=value(i,3);}
+    for(int64_t i=0;i<(int64_t)I*O;i++)l.sh_d.f32[i]=value(i,4);
     for(int i=0;i<I;i++)l.sh_gate[i]=value(i,5);
-    qdw_register(l.sh_g,I,O);qdw_register(l.sh_u,I,O);qdw_register(l.sh_d,O,I);
-    if(g_qdw_n!=3){fprintf(stderr,"FAIL: expected three dense-int8 copies, got %d\n",g_qdw_n);return 1;}
+    if(!dense_weight_quantize(&l.sh_g,I,O)||!dense_weight_quantize(&l.sh_u,I,O)||
+       !dense_weight_quantize(&l.sh_d,O,I)){
+        fputs("FAIL: expected three dense-int8 copies\n",stderr);return 1;
+    }
     float *x=falloc((int64_t)S*I),*seed=falloc((int64_t)S*I);
     float *a=falloc((int64_t)S*I),*b=falloc((int64_t)S*I);
     for(int64_t i=0;i<(int64_t)S*I;i++){x[i]=value(i,6);seed[i]=value(i,7);}
@@ -73,8 +75,9 @@ static int shared_benchmark(void) {
     printf("qwen shared int8: S=%d D=%d I=%d weights=%.1f MiB\n",S,I,O,
            3.0*I*O/1048576.0);
     printf("scalar %.6f s  batch %.6f s  speedup %.2fx  calls %d -> 3\n",ts,tb,ts/tb,S*3);
-    for(int i=0;i<g_qdw_n;i++){free(g_qdw[i].q);free(g_qdw[i].sc);}g_qdw_n=0;
-    free(l.sh_g);free(l.sh_u);free(l.sh_d);free(l.sh_gate);
+    free(l.sh_g.f32);free(l.sh_g.q);free(l.sh_g.sc);
+    free(l.sh_u.f32);free(l.sh_u.q);free(l.sh_u.sc);
+    free(l.sh_d.f32);free(l.sh_d.q);free(l.sh_d.sc);free(l.sh_gate);
     free(x);free(seed);free(a);free(b);env_unset("QWEN_SHARED_BATCH");env_unset("QWEN_DENSE_BATCH");
     return 0;
 }

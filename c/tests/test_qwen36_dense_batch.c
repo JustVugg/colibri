@@ -61,21 +61,56 @@ static void env_unset(const char *name) {
 #endif
 }
 
-static void clear_qdw(void) {
-    for(int i=0;i<g_qdw_n;i++){free(g_qdw[i].q);free(g_qdw[i].sc);}
-    g_qdw_n=0;
+static void clear_dense_weight(DenseWeight *w) {
+    free(w->f32);free(w->q);free(w->sc);memset(w,0,sizeof(*w));
+}
+
+static void incremental_release_case(void) {
+    enum { I=16,O=4 };
+    DenseWeight first={0},second={0},kept={0};
+    float x[I],got[O],want[O];
+    env_unset("COLI_KEEP_F32");
+
+    first.f32=falloc((int64_t)I*O);
+    for(int i=0;i<I*O;i++)first.f32[i]=input_value(i,8);
+    CHECK(dense_weight_quantize(&first,I,O),"first tensor did not quantize");
+    CHECK(first.f32==NULL,"first f32 tensor survived its quantization step");
+    CHECK(first.q!=NULL&&first.sc!=NULL,"first tensor has no int8 representation");
+
+    /* Allocate the next source only after the first has been released. The
+     * two DenseWeight objects must still dispatch to their own int8 data even
+     * if malloc recycles the just-freed f32 address. */
+    second.f32=falloc((int64_t)I*O);
+    for(int i=0;i<I*O;i++)second.f32[i]=input_value(i,9);
+    CHECK(dense_weight_quantize(&second,I,O),"second tensor did not quantize");
+    CHECK(second.f32==NULL,"second f32 tensor survived its quantization step");
+    for(int i=0;i<I;i++)x[i]=input_value(i,10);
+    matmul_d(got,x,&first,1,I,O);matmul_q(want,x,first.q,first.sc,I,O);
+    CHECK(!memcmp(got,want,sizeof(got)),"first tensor lost its quantized dispatch");
+    matmul_d(got,x,&second,1,I,O);matmul_q(want,x,second.q,second.sc,I,O);
+    CHECK(!memcmp(got,want,sizeof(got)),"second tensor lost its quantized dispatch");
+
+    env_set("COLI_KEEP_F32","1");
+    kept.f32=falloc((int64_t)I*O);
+    for(int i=0;i<I*O;i++)kept.f32[i]=input_value(i,11);
+    CHECK(dense_weight_quantize(&kept,I,O),"debug tensor did not quantize");
+    CHECK(kept.f32!=NULL,"COLI_KEEP_F32 did not retain the source tensor");
+    env_unset("COLI_KEEP_F32");
+
+    clear_dense_weight(&first);clear_dense_weight(&second);clear_dense_weight(&kept);
+    puts("qwen dense load: each f32 source released before the next tensor");
 }
 
 static void shared_case(const char *format,int quantized) {
     enum { S=12,D=64,I=32 };
     Model m;memset(&m,0,sizeof(m));m.c.hidden=D;m.c.shared_inter=I;
     Layer l;memset(&l,0,sizeof(l));
-    l.sh_g=falloc((int64_t)I*D);l.sh_u=falloc((int64_t)I*D);
-    l.sh_d=falloc((int64_t)D*I);l.sh_gate=falloc(D);
-    for(int64_t i=0;i<(int64_t)I*D;i++){l.sh_g[i]=input_value(i,2);l.sh_u[i]=input_value(i,3);}
-    for(int64_t i=0;i<(int64_t)D*I;i++)l.sh_d[i]=input_value(i,4);
+    l.sh_g.f32=falloc((int64_t)I*D);l.sh_u.f32=falloc((int64_t)I*D);
+    l.sh_d.f32=falloc((int64_t)D*I);l.sh_gate=falloc(D);
+    for(int64_t i=0;i<(int64_t)I*D;i++){l.sh_g.f32[i]=input_value(i,2);l.sh_u.f32[i]=input_value(i,3);}
+    for(int64_t i=0;i<(int64_t)D*I;i++)l.sh_d.f32[i]=input_value(i,4);
     for(int i=0;i<D;i++)l.sh_gate[i]=input_value(i,5);
-    if(quantized){qdw_register(l.sh_g,D,I);qdw_register(l.sh_u,D,I);qdw_register(l.sh_d,I,D);}
+    if(quantized){dense_weight_quantize(&l.sh_g,D,I);dense_weight_quantize(&l.sh_u,D,I);dense_weight_quantize(&l.sh_d,I,D);}
     float *x=falloc((int64_t)S*D),*seed=falloc((int64_t)S*D);
     float *ref=falloc((int64_t)S*D),*got=falloc((int64_t)S*D);
     float *g=falloc(I),*u=falloc(I),*hh=falloc(D);
@@ -101,13 +136,14 @@ static void shared_case(const char *format,int quantized) {
           (unsigned long long)g_qwen_matmul_d_calls);
     printf("qwen shared batch exact: format=%s S=%d calls=%d -> 3\n",format,S,S*3);
 
-    clear_qdw();free(l.sh_g);free(l.sh_u);free(l.sh_d);free(l.sh_gate);
+    clear_dense_weight(&l.sh_g);clear_dense_weight(&l.sh_u);clear_dense_weight(&l.sh_d);free(l.sh_gate);
     free(x);free(seed);free(ref);free(got);free(g);free(u);free(hh);
 }
 
 int main(void) {
     /* This gate owns the dense-int8 mode regardless of the caller's shell. */
     env_unset("COLI_DENSE_I8");
+    incremental_release_case();
     one_shape(1, 17, 13);       /* decode-shaped fallback */
     one_shape(2, 32, 31);       /* one vector block, one row pair */
     one_shape(4, 64, 73);       /* even prompt, serial OpenMP clause */
