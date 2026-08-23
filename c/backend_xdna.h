@@ -43,6 +43,11 @@ extern "C" {
  * never collide with the host-side coli_xdna_ names in this header. */
 #define COLI_XDNA_HELPER_DLL "coli_xdna.dll"
 
+/* Directory, relative to the executable, holding the qualified artifacts of the
+ * optional XDNA package. A fixed relative name, joined to an absolute
+ * executable directory -- never searched for. */
+#define COLI_XDNA_ARTIFACT_DIR "xdna"
+
 /* Prepared-host pointer alignment required by the qualified Windows XRT
  * userptr path. Scoped to that path deliberately: it is not a claim about
  * every XRT implementation. The payload SIZE need not be a page multiple. */
@@ -482,6 +487,83 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
 /* Release helper-owned runtime state and the transient staging buffers. Safe
  * when nothing was ever initialised, and safe to repeat. */
 void coli_xdna_execution_shutdown(void);
+
+/* -- explicit product policy (W2-N7-P1) -----------------------------------
+ *
+ * The ONLY non-test way to permit this lane. It is set from an explicit user
+ * request parsed by Colibri (`coli --xdna` -> COLI_XDNA=1), never from hardware
+ * discovery, never from a helper, never from an economic comparison, and never
+ * by default.
+ *
+ * "Permit" is exact. Enabling does NOT force anything onto the device: every
+ * hard gate still decides, and an operation this lane was not qualified for
+ * still runs the current path. The user is authorising a qualified
+ * reduced-precision lane, not overriding eligibility.
+ *
+ * Kept separate from the test seam on purpose. The test control forces
+ * execution for qualification runs; this one expresses product intent. They
+ * must not be the same switch, because a test seam that could be reached from
+ * a user-facing option would be a way to enable unqualified behaviour in
+ * production. */
+/* -- optional package provisioning (W2-N7-P1-A1) ---------------------------
+ *
+ * Where the qualified artifact bytes come from in a shipped build.
+ *
+ * V1 contract: an OPTIONAL sidecar package installed beside the executable.
+ *
+ *     <exe-dir>\coli_xdna.dll          the helper
+ *     <exe-dir>\xdna\<registry names>  the qualified artifacts
+ *
+ * The artifact root is derived from the executable path exactly as the helper
+ * path already is: absolute, and NOT a search. No PATH, no working directory,
+ * no recursive lookup, no first-match. W1 established that a same-basename
+ * module already loaded beats a later absolute-path load, and the same
+ * reasoning applies to artifacts: a search order here would be unsafe and
+ * unpredictable. A package that is not where we look is simply ABSENT.
+ *
+ * Provisioning answers "where are the qualified bytes?". It does NOT answer
+ * "should XDNA run?" -- a complete, valid, hash-perfect package enables
+ * nothing on its own. That remains the explicit policy above. */
+
+/* Product-facing provisioning verdict.
+ *
+ * The execution path keeps its coarser hard/exec codes; this exists so the
+ * DIAGNOSTIC layer can tell a user which of several very different problems
+ * they have. "Your build lacks the feature", "install the optional package",
+ * and "your package is corrupt" have three different fixes, and collapsing
+ * them into one ARTIFACT_UNAVAILABLE line tells the user nothing actionable. */
+typedef enum {
+    COLI_XDNA_PROV_READY = 0,        /* every required byte present and verified */
+    COLI_XDNA_PROV_NOT_REQUESTED,    /* explicit policy is off; nothing resolved */
+    COLI_XDNA_PROV_PACKAGE_MISSING,  /* the artifact directory is not there */
+    COLI_XDNA_PROV_PACKAGE_INCOMPLETE, /* directory present, a required file is not */
+    COLI_XDNA_PROV_INTEGRITY_FAILED, /* file present, bytes are not the qualified bytes */
+    COLI_XDNA_PROV_HELPER_UNAVAILABLE, /* no compatible helper beside the executable */
+    COLI_XDNA_PROV_REGISTRY_INVALID  /* the compiled registry itself is unusable */
+} ColiXdnaProvision;
+
+/* Stable label, allocation-free. */
+const char *coli_xdna_provision_text(ColiXdnaProvision p);
+
+/* The absolute artifact root this build will use: <exe-dir>\xdna.
+ * Returns 0 if the executable path cannot be determined. Pure resolution --
+ * it touches no file and enables nothing. */
+int coli_xdna_product_artifact_root(char *out, size_t cap);
+
+/* Resolve the package and verify EVERY artifact the currently qualified
+ * product lane needs, against the SHA256 values compiled into the registry.
+ *
+ * Verifies the whole set, not the first row: a package missing only the M256
+ * artifact would otherwise look READY until a long request arrived, which is
+ * exactly the class of failure that should surface at activation instead.
+ *
+ * `missing_name`, when non-NULL, receives a pointer to the static registry
+ * filename responsible for a non-READY verdict, so a diagnostic can name it.
+ * The pointer is into the compiled registry and outlives any caller. */
+ColiXdnaProvision coli_xdna_provision_status(const char **missing_name);
+
+void coli_xdna_set_explicit_enabled(int on);
+int  coli_xdna_explicit_enabled(void);
 
 /* -- the two internal execution modes -------------------------------------
  *

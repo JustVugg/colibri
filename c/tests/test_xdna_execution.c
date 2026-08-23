@@ -696,6 +696,279 @@ int main(int argc, char **argv){
         ck(coli_xdna_prepared_live_objects()==0, "prepared image released");
     }
 
+    /* ==================================================================
+     * W2-N7-P1 -- EXPLICIT PRODUCT POLICY
+     *
+     * The product control is separate from the test force. These cases are
+     * about PERMISSION, not about execution: they check who may turn the lane
+     * on and what happens when nobody has.
+     * ================================================================== */
+    /* ==================================================================
+     * W2-N7-P1-A1 -- PRODUCTION PROVISIONING
+     *
+     * Where the qualified bytes come from in a shipped build, and what
+     * happens when they are absent, incomplete or not what they claim.
+     * ================================================================== */
+    printf("A1 production artifact root -- absolute, derived, never searched\n");
+    {
+        char root[1024];
+        int ok = coli_xdna_product_artifact_root(root, sizeof root);
+        ck(ok, "product root resolves");
+        if(ok){
+            /* Absolute: on Windows a drive letter and colon, or a UNC prefix. */
+            int absolute = (root[0] && root[1] == ':') ||
+                           (root[0] == '\\' && root[1] == '\\');
+            ck(absolute, "product root is absolute, not relative to the CWD");
+            /* It ends with the fixed artifact directory name. */
+            size_t rl = strlen(root), dl = strlen(COLI_XDNA_ARTIFACT_DIR);
+            ck(rl > dl && strcmp(root + rl - dl, COLI_XDNA_ARTIFACT_DIR) == 0,
+               "product root ends with the fixed artifact directory name");
+            /* Deriving it twice gives the same answer -- it is a pure
+             * function of the executable path, not of the environment. */
+            char again[1024];
+            ck(coli_xdna_product_artifact_root(again, sizeof again) &&
+               strcmp(root, again) == 0, "product root is deterministic");
+        }
+        /* A tiny buffer must fail rather than truncate into a wrong path. */
+        char tiny[8];
+        ck(coli_xdna_product_artifact_root(tiny, sizeof tiny) == 0,
+           "product root refuses to truncate into a shorter wrong path");
+    }
+
+    printf("A1 provisioning verdicts -- missing, incomplete, corrupt, ready\n");
+    {
+        registry_both();
+        use_helper(g_helper);
+
+        /* PACKAGE MISSING: point the root at a directory that does not exist. */
+        {   char nowhere[1024];
+            snprintf(nowhere, sizeof nowhere, "%s/no_such_package_dir", g_root);
+            coli_xdna_test_set_artifact_root(nowhere);
+            const char *who = NULL;
+            ColiXdnaProvision p = coli_xdna_provision_status(&who);
+            ck(p == COLI_XDNA_PROV_PACKAGE_MISSING, "absent directory -> PACKAGE_MISSING");
+            ck(strcmp(coli_xdna_provision_text(p), "PACKAGE_MISSING") == 0,
+               "PACKAGE_MISSING has a stable label");
+        }
+
+        /* READY: the fixture root holds both fixture artifacts, and the test
+         * registry rows point at them with correct hashes. */
+        coli_xdna_test_set_artifact_root(g_root);
+        {   const char *who = NULL;
+            ColiXdnaProvision p = coli_xdna_provision_status(&who);
+            ck(p == COLI_XDNA_PROV_READY, "complete valid fixture package -> READY");
+            ck(who == NULL, "READY names no offending file");
+        }
+
+        /* INTEGRITY FAILED: same filenames, different bytes. The file is
+         * exactly where it should be and named exactly right -- and is still
+         * refused, because bytes that are not the qualified bytes are not the
+         * qualified lane. */
+        {   char xp[2048];
+            snprintf(xp, sizeof xp, "%s", g_xclbin);
+            FILE *f = fopen(xp, "r+b");
+            ck(f != NULL, "fixture artifact is writable for the corruption case");
+            if(f){
+                fseek(f, 16, SEEK_SET);
+                unsigned char orig = 0, flip;
+                size_t got = fread(&orig, 1, 1, f);
+                flip = (unsigned char)(orig ^ 0xFFu);
+                fseek(f, 16, SEEK_SET); fwrite(&flip, 1, 1, f); fclose(f);
+
+                const char *who = NULL;
+                ColiXdnaProvision p = coli_xdna_provision_status(&who);
+                ck(p == COLI_XDNA_PROV_INTEGRITY_FAILED,
+                   "correct filename, wrong bytes -> INTEGRITY_FAILED");
+                ck(who != NULL, "INTEGRITY_FAILED names the offending file");
+
+                /* and execution refuses it too, not just the report */
+                coli_xdna_test_set_force_execution(1);
+                ColiXdnaPrepared *slot = NULL;
+                float *x = mk_x(8, TK, 31u);
+                float *y = (float*)malloc((size_t)8*TN*sizeof(float));
+                poison(y, (size_t)8*TN);
+                ColiXdnaExec e = coli_xdna_test_attempt(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                                        &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, 8);
+                ck(e == COLI_XDNA_EXEC_DECLINED, "corrupt artifact -> execution DECLINED");
+                ck(coli_xdna_test_last_hard() == COLI_XDNA_HARD_ARTIFACT_INTEGRITY_FAILED,
+                   "corrupt artifact -> ARTIFACT_INTEGRITY_FAILED");
+                ck(coli_xdna_test_dispatches() == 0, "corrupt artifact -> zero dispatches");
+                {   int untouched = 1;
+                    for(size_t i=0;i<(size_t)8*TN;i++) if(y[i]!=POISON){ untouched=0; break; }
+                    ck(untouched, "corrupt artifact -> caller output untouched"); }
+                coli_xdna_prepared_release(&slot); free(x); free(y);
+                coli_xdna_test_set_force_execution(0);
+
+                /* restore the fixture for the tests that follow */
+                f = fopen(xp, "r+b");
+                if(f){ fseek(f, 16, SEEK_SET); fwrite(&orig, 1, 1, f); fclose(f); }
+                ck(got == 1, "fixture byte was read before being flipped");
+            }
+        }
+
+        /* back to READY after restoring the byte */
+        {   const char *who = NULL;
+            ck(coli_xdna_provision_status(&who) == COLI_XDNA_PROV_READY,
+               "restoring the byte restores READY");
+        }
+
+        /* Extra unrelated files in the directory must not change anything:
+         * selection is registry-driven, never a directory scan. */
+        {   char extra[2048];
+            snprintf(extra, sizeof extra, "%s/zz_unrelated.xclbin", g_root);
+            if(write_blob(extra, 7u, 256)){
+                const char *who = NULL;
+                ck(coli_xdna_provision_status(&who) == COLI_XDNA_PROV_READY,
+                   "an extra unknown file in the directory is ignored");
+                remove(extra);
+            }
+        }
+
+        /* HELPER UNAVAILABLE is reported separately from the bytes. */
+        {   coli_xdna_test_set_helper_path("no_such_helper_at_all.dll");
+            const char *who = NULL;
+            ColiXdnaProvision p = coli_xdna_provision_status(&who);
+            ck(p == COLI_XDNA_PROV_HELPER_UNAVAILABLE,
+               "valid bytes + no helper -> HELPER_UNAVAILABLE, not a package verdict");
+            use_helper(g_helper);
+            coli_xdna_test_set_artifact_root(g_root);
+        }
+    }
+
+    printf("A1 provisioning does not enable -- a READY package is still inert\n");
+    {
+        registry_both();
+        use_helper(g_helper);
+        coli_xdna_test_set_artifact_root(g_root);
+        coli_xdna_test_set_force_execution(0);
+        coli_xdna_set_explicit_enabled(0);
+
+        const char *who = NULL;
+        ck(coli_xdna_provision_status(&who) == COLI_XDNA_PROV_READY,
+           "package is READY");
+        ck(coli_xdna_binding() == COLI_XDNA_AVAILABLE, "helper is bound");
+        ck(coli_xdna_explicit_enabled() == 0, "and the policy is STILL off");
+
+        ColiXdnaPrepared *slot = NULL;
+        float *x = mk_x(16, TK, 88u);
+        float *y = (float*)malloc((size_t)16*TN*sizeof(float));
+        poison(y, (size_t)16*TN);
+        int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                           &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, 16);
+        ck(handled == 0, "READY package + policy off -> declines");
+        ck(coli_xdna_test_dispatches() == 0, "READY package + policy off -> zero dispatches");
+        {   int untouched = 1;
+            for(size_t i=0;i<(size_t)16*TN;i++) if(y[i]!=POISON){ untouched=0; break; }
+            ck(untouched, "READY package + policy off -> caller output untouched"); }
+        coli_xdna_prepared_release(&slot); free(x); free(y);
+    }
+
+    printf("P1 explicit product policy -- default off, explicit on\n");
+    {
+        registry_both();
+
+        /* DEFAULT: everything a discovering system could find is present and
+         * valid -- helper bound, artifacts staged and integrity-checked, a
+         * registry holding both buckets -- and the lane still does nothing. */
+        use_helper(g_helper);
+        coli_xdna_test_set_artifact_root(g_root);
+        coli_xdna_test_set_force_execution(0);
+        coli_xdna_set_explicit_enabled(0);
+        ck(coli_xdna_explicit_enabled()==0, "default: explicit policy is OFF");
+
+        ColiXdnaPrepared *slot = NULL;
+        int S = 32;
+        float *x = mk_x(S, TK, 5150u);
+        float *y = (float*)malloc((size_t)S*TN*sizeof(float));
+        poison(y, (size_t)S*TN);
+        int handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                           &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+        ck(handled==0, "default: candidate declines");
+        ck(coli_xdna_test_last_exec()==COLI_XDNA_EXEC_DECLINED, "default: DECLINED");
+        ck(coli_xdna_test_dispatches()==0, "default: zero dispatches");
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==0,  "default: zero on M64");
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM2)==0, "default: zero on M256");
+        ck(coli_xdna_test_artifact_opens()==0, "default: no artifact opened");
+        ck(coli_xdna_test_output_valid()==0, "default: no output claimed");
+        {   int untouched = 1;
+            for(size_t i=0;i<(size_t)S*TN;i++) if(y[i]!=POISON){ untouched=0; break; }
+            ck(untouched, "default: caller output untouched"); }
+
+        /* NO SILENT ACTIVATION: the things a naive implementation might have
+         * treated as "XDNA is available, so use it" are all true right now. */
+        ck(coli_xdna_binding()==COLI_XDNA_AVAILABLE,
+           "default: a compatible helper IS bound -- and that alone changes nothing");
+        ck(coli_xdna_explicit_enabled()==0,
+           "default: a bound helper does not set the product policy");
+
+        /* EXPLICIT: the same call, the same everything, one bit of user intent. */
+        coli_xdna_set_explicit_enabled(1);
+        ck(coli_xdna_explicit_enabled()==1, "explicit: policy reads back ON");
+        poison(y, (size_t)S*TN);
+        handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                       &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+        ck(handled==1, "explicit: the SAME operation is now handled");
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==1, "explicit: dispatched on M64");
+        {   float *REFS = (float*)malloc((size_t)S*TN*sizeof(float));
+            oracle(REFS, x, coli_xdna_prepared_image(slot), S, TK, TN);
+            int exact = 1;
+            for(size_t i=0;i<(size_t)S*TN;i++) if(y[i]!=REFS[i]){ exact=0; break; }
+            ck(exact, "explicit: result matches the BF16 oracle");
+            free(REFS); }
+
+        /* PERMISSION IS NOT SELECTION: an operation the lane was never
+         * qualified for still runs the current path, however explicit the
+         * user was. Opting in buys the qualified lane, not a bypass. */
+        coli_xdna_test_reset_bucket_counters();
+        {   ColiXdnaPrepared *s2 = NULL;
+            int Sbig = TM2+1;                       /* above every bucket */
+            float *xb = mk_x(Sbig, TK, 77u);
+            float *yb = (float*)malloc((size_t)Sbig*TN*sizeof(float));
+            poison(yb, (size_t)Sbig*TN);
+            int h2 = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                          &s2, 4, W.q4, W.s, TK, TN, 64, 0, yb, xb, Sbig);
+            ck(h2==0, "explicit: an unqualified shape still declines");
+            ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_M_OUT_OF_RANGE,
+               "explicit: declines for the SHAPE reason, not the policy");
+            ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==0 &&
+               coli_xdna_test_bucket_dispatches((unsigned)TM2)==0,
+               "explicit: no dispatch on either bucket");
+            {   int untouched = 1;
+                for(size_t i=0;i<(size_t)Sbig*TN;i++) if(yb[i]!=POISON){ untouched=0; break; }
+                ck(untouched, "explicit: caller output untouched by the decline"); }
+            coli_xdna_prepared_release(&s2); free(xb); free(yb); }
+
+        /* A wrong-family operation is likewise unaffected by permission. */
+        coli_xdna_test_reset_bucket_counters();
+        {   ColiXdnaPrepared *s3 = NULL;
+            float *yf = (float*)malloc((size_t)S*TN*sizeof(float));
+            poison(yf, (size_t)S*TN);
+            int h3 = coli_xdna_try_matmul(COLI_XDNA_FAMILY_NONE,
+                                          &s3, 4, W.q4, W.s, TK, TN, 64, 0, yf, x, S);
+            ck(h3==0, "explicit: wrong semantic family still declines");
+            ck(coli_xdna_test_last_hard()==COLI_XDNA_HARD_FAMILY_UNSUPPORTED,
+               "explicit: declines for the FAMILY reason");
+            coli_xdna_prepared_release(&s3); free(yf); }
+
+        /* Turning it back off restores the default immediately. */
+        coli_xdna_set_explicit_enabled(0);
+        coli_xdna_test_reset_bucket_counters();
+        poison(y, (size_t)S*TN);
+        handled = coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP,
+                                       &slot, 4, W.q4, W.s, TK, TN, 64, 0, y, x, S);
+        ck(handled==0, "policy off again: declines");
+        /* per-bucket, not the cumulative aggregate: the aggregate still holds the
+         * dispatch the explicit case above legitimately made. Asserting 0 on it
+         * would be asserting that history never happened. */
+        ck(coli_xdna_test_bucket_dispatches((unsigned)TM)==0 &&
+           coli_xdna_test_bucket_dispatches((unsigned)TM2)==0,
+           "policy off again: zero NEW dispatches on either bucket");
+        ck(coli_xdna_test_last_exec()==COLI_XDNA_EXEC_DECLINED,
+           "policy off again: DECLINED, not a failure");
+
+        coli_xdna_prepared_release(&slot); free(x); free(y);
+    }
+
     coli_xdna_test_set_helper_path(NULL);
     coli_xdna_shutdown();
     coli_xdna_test_set_registry(NULL,0);

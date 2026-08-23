@@ -1,0 +1,110 @@
+# XDNA backend (Windows, AMD Ryzen AI NPU)
+
+colibrì includes an **experimental, opt-in** backend that runs some GLM
+operations on an AMD XDNA2 NPU using a **reduced-precision BF16 compute path**.
+It is off by default, it is never selected automatically, and model output may
+differ from the normal path.
+
+```bash
+coli run --xdna "your prompt"
+```
+
+Without `--xdna` nothing changes: no helper is loaded, no device is opened, and
+the engine produces exactly the results it produces today. Installing the
+optional package does not enable anything on its own.
+
+## What runs on the NPU
+
+Only the **MoE shared-expert gate/up projection** for GLM
+(`K=6144, N=2048`, fmt=4 grouped int4, group size 64), and only at sequence
+lengths the qualified artifacts cover:
+
+| rows per call | runs on |
+|---|---|
+| 1 – 64 | NPU, M64 artifact |
+| 65 – 256 | NPU, M256 artifact |
+| more than 256 | normal path |
+
+Everything else — the down projection, routed experts, attention, every other
+model — uses the normal path. Any operation the lane does not support, and any
+runtime failure, falls back to the exact computation the engine performs
+without this backend.
+
+## Precision
+
+The NPU path converts activations and weights to BF16 and accumulates in F32.
+This is **not** the same arithmetic as the normal path, and it is not claimed to
+be equivalent:
+
+- per-option scores on a small internal benchmark changed on every operation the
+  NPU handled;
+- in a separate experiment with free-running generation, 5 of 8 prompts produced
+  **different text**.
+
+Whether that matters for your use is a judgement you have to make. The mode
+exists so the choice is explicit.
+
+## Installing the optional package
+
+The NPU backend needs two things beside the executable: a helper DLL and the
+qualified kernel artifacts. They ship as a separate optional download, not in
+the main archive.
+
+Extract it over your colibrì directory so the layout is:
+
+```
+<colibri directory>\
+    colibri.exe
+    coli_xdna.dll
+    xdna\
+        wa_F3_M64_K6144_N2048.xclbin
+        wa_F3_M64_K6144_N2048_insts.bin
+        wa_F3_M256_K6144_N2048.xclbin
+        wa_F3_M256_K6144_N2048_insts.bin
+```
+
+Both locations are resolved **relative to the executable**, by absolute path.
+`PATH` and the working directory are not searched, so the package has to be in
+that one place. Every artifact is checked against a hash built into the binary
+before it is used.
+
+Requirements: Windows, an XDNA2-class NPU, and AMD's XRT runtime installed for
+the helper to load.
+
+## When something is missing
+
+`--xdna` always tells you what happened and always keeps running on the normal
+path:
+
+```
+[XDNA] requested, but this build has no XDNA support: continuing on the normal path
+[XDNA] requested, but the XDNA package was not found at <dir>\xdna: continuing on the normal path
+[XDNA] requested, but the XDNA package is incomplete (missing <file>) in <dir>\xdna: ...
+[XDNA] requested, but an XDNA artifact does not match its expected hash (<file>):
+       refusing to use it, continuing on the normal path
+[XDNA] requested, and the artifact package is valid, but the XDNA helper
+       (coli_xdna.dll) is not usable beside the executable: ...
+```
+
+An artifact whose bytes do not match the expected hash is refused even though
+you asked for the NPU — bytes that are not the qualified bytes are not the
+qualified kernel.
+
+When everything is in place you get the activation notice instead, once:
+
+```
+[XDNA] experimental: qualified GLM shared expert operations will use the
+[XDNA] native NPU with a reduced-precision BF16 compute path. Model output
+[XDNA] may differ from the normal path, and generated text has been observed
+[XDNA] to diverge. Operations this lane does not support continue to use the
+[XDNA] normal path.
+```
+
+All of this goes to stderr, so it never mixes into machine-readable output.
+
+## What this backend does not do
+
+- It is not enabled by having the hardware, the helper, or the package.
+- It does not choose between the NPU and the normal path on speed or cost.
+- No speed claim is made here; none has been measured in a comparable way.
+- It does not extend to other models or other operations.

@@ -955,7 +955,16 @@ const char *coli_xdna_exec_text(ColiXdnaExec e){
  * artifact currently open in the helper. The prepared WEIGHT is not here: it
  * belongs to the tensor, which outlives any of this. */
 static int          g_xdna_force;                 /* internal test control only */
+/* Explicit PRODUCT policy (W2-N7-P1), deliberately distinct from g_xdna_force.
+ * Set only from a parsed user request; never from discovery, never by default. */
+static int          g_xdna_explicit;
 static char         g_xdna_root[1024];            /* artifact root; empty = none */
+/* Set only by the test seam. When 0, the root is the PRODUCT one derived from
+ * the executable directory. Kept as a separate flag rather than inferred from
+ * g_xdna_root being empty, because "a test deliberately set no root" and "no
+ * test has spoken, use the product default" are different states and the first
+ * must not silently acquire the second. */
+static int          g_xdna_root_overridden;
 static ColiXdnaHard g_xdna_last_hard = COLI_XDNA_HARD_ELIGIBLE;
 static ColiXdnaExec g_xdna_last_exec = COLI_XDNA_EXEC_DECLINED;
 static int g_xdna_dispatches, g_xdna_completions, g_xdna_artifact_opens;
@@ -1121,8 +1130,93 @@ ColiXdnaHard coli_xdna_test_last_hard(void){ return g_xdna_last_hard; }
 ColiXdnaExec coli_xdna_test_last_exec(void){ return g_xdna_last_exec; }
 
 void coli_xdna_test_set_force_execution(int on){ g_xdna_force = on ? 1 : 0; }
+/* The product artifact root: <exe-dir>\xdna. Same anchor as the helper, same
+ * absolute form, same refusal to search. */
+int coli_xdna_product_artifact_root(char *out, size_t cap){
+#ifdef _WIN32
+    char exe[512];
+    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+    if(n == 0 || n >= sizeof exe) return 0;
+    char *slash = strrchr(exe, '\\');
+    char *fwd   = strrchr(exe, '/');
+    if(fwd && (!slash || fwd > slash)) slash = fwd;
+    if(!slash) return 0;
+    *slash = '\0';
+    int written = snprintf(out, cap, "%s\\%s", exe, COLI_XDNA_ARTIFACT_DIR);
+    return written > 0 && (size_t)written < cap;
+#else
+    (void)out; (void)cap;
+    return 0;
+#endif
+}
+
+/* The root actually used by execution: a test override when one was set,
+ * otherwise the product location. Returns NULL when neither is available,
+ * which the artifact status treats as ARTIFACT_UNAVAILABLE -- never as a
+ * licence to look somewhere else. */
+static const char *coli_xdna_effective_root(char *scratch, size_t cap){
+    if(g_xdna_root_overridden) return g_xdna_root[0] ? g_xdna_root : NULL;
+    if(coli_xdna_product_artifact_root(scratch, cap)) return scratch;
+    return NULL;
+}
+
+const char *coli_xdna_provision_text(ColiXdnaProvision p){
+    switch(p){
+    case COLI_XDNA_PROV_READY:              return "READY";
+    case COLI_XDNA_PROV_NOT_REQUESTED:      return "NOT_REQUESTED";
+    case COLI_XDNA_PROV_PACKAGE_MISSING:    return "PACKAGE_MISSING";
+    case COLI_XDNA_PROV_PACKAGE_INCOMPLETE: return "PACKAGE_INCOMPLETE";
+    case COLI_XDNA_PROV_INTEGRITY_FAILED:   return "INTEGRITY_FAILED";
+    case COLI_XDNA_PROV_HELPER_UNAVAILABLE: return "HELPER_UNAVAILABLE";
+    case COLI_XDNA_PROV_REGISTRY_INVALID:   return "REGISTRY_INVALID";
+    }
+    return "UNKNOWN";
+}
+
+ColiXdnaProvision coli_xdna_provision_status(const char **missing_name){
+    if(missing_name) *missing_name = NULL;
+    if(!coli_xdna_registry_validate()) return COLI_XDNA_PROV_REGISTRY_INVALID;
+
+    char scratch[1024];
+    const char *root = coli_xdna_effective_root(scratch, sizeof scratch);
+    if(!root) return COLI_XDNA_PROV_PACKAGE_MISSING;
+
+    /* Every row this build ships, not just the first. A package holding only
+     * the small bucket would otherwise report READY and then fail at the first
+     * long request -- surfacing at activation is the whole point. */
+    int checked = 0;
+    for(int i = 0; i < g_nrows; i++){
+        const ColiXdnaArtifact *a = &g_rows[i];
+        const char *names[2]  = { a->xclbin_name, a->insts_name };
+        const char *hashes[2] = { a->xclbin_sha256, a->insts_sha256 };
+        for(int k = 0; k < 2; k++){
+            ColiXdnaStatic st = coli_xdna_check_file(root, names[k], hashes[k]);
+            if(st == COLI_XDNA_STATIC_QUALIFIED){ checked++; continue; }
+            if(missing_name) *missing_name = names[k];
+            if(st == COLI_XDNA_STATIC_ARTIFACT_INTEGRITY_FAILED)
+                return COLI_XDNA_PROV_INTEGRITY_FAILED;
+            /* Absent file. If NOTHING was verified yet the package as a whole is
+             * missing; if some files verified, the package is present but
+             * incomplete. Different problems, different fixes. */
+            return checked ? COLI_XDNA_PROV_PACKAGE_INCOMPLETE
+                           : COLI_XDNA_PROV_PACKAGE_MISSING;
+        }
+    }
+
+    /* Bytes are good. The helper is the remaining prerequisite, and it is
+     * reported separately because "install the package" and "the helper will
+     * not load" are not the same instruction. */
+    if(coli_xdna_binding() != COLI_XDNA_AVAILABLE)
+        return COLI_XDNA_PROV_HELPER_UNAVAILABLE;
+
+    return COLI_XDNA_PROV_READY;
+}
+
+void coli_xdna_set_explicit_enabled(int on){ g_xdna_explicit = on ? 1 : 0; }
+int  coli_xdna_explicit_enabled(void){ return g_xdna_explicit; }
 
 void coli_xdna_test_set_artifact_root(const char *root){
+    g_xdna_root_overridden = 1;
     if(root && *root) snprintf(g_xdna_root, sizeof g_xdna_root, "%s", root);
     else              g_xdna_root[0] = '\0';
 }
@@ -1206,7 +1300,9 @@ static ColiXdnaHard coli_xdna_engine_gates(ColiXdnaFamily family,
      *       different actions, and an operator who is told only
      *       ARTIFACT_NOT_QUALIFIED cannot tell a missing file from a tampered
      *       one. */
-    switch(coli_xdna_artifact_status(&q, g_xdna_root[0] ? g_xdna_root : NULL)){
+    char root_scratch[1024];
+    const char *eff_root = coli_xdna_effective_root(root_scratch, sizeof root_scratch);
+    switch(coli_xdna_artifact_status(&q, eff_root)){
         case COLI_XDNA_STATIC_QUALIFIED:
             break;
         case COLI_XDNA_STATIC_ARTIFACT_UNAVAILABLE:
@@ -1323,8 +1419,11 @@ static ColiXdnaExec coli_xdna_attempt(ColiXdnaFamily family,
     /* 13  device / runtime / artifact runtime object, opened lazily. */
     if(!g_lane.open || g_lane.m != am || g_lane.k != (unsigned)I || g_lane.n != (unsigned)O){
         char xb[2048], ib[2048];
-        if(!coli_xdna_join(xb, sizeof xb, g_xdna_root, row->xclbin_name)
-           || !coli_xdna_join(ib, sizeof ib, g_xdna_root, row->insts_name)){
+        char rs2[1024];
+        const char *r2 = coli_xdna_effective_root(rs2, sizeof rs2);
+        if(!r2
+           || !coli_xdna_join(xb, sizeof xb, r2, row->xclbin_name)
+           || !coli_xdna_join(ib, sizeof ib, r2, row->insts_name)){
             g_xdna_last_hard = COLI_XDNA_HARD_ARTIFACT_RUNTIME_UNAVAILABLE;
             return (g_xdna_last_exec = COLI_XDNA_EXEC_ARTIFACT_OPEN_FAILED);
         }
@@ -1443,9 +1542,19 @@ int coli_xdna_try_matmul(ColiXdnaFamily family,
                          int I, int O, int gs, int planar,
                          float *y, const float *x, int S)
 {
-    /* Gate 0: the internal control. Without it this function is inert, which is
-     * what keeps the lane from being an automatic scheduler. */
-    if(!g_xdna_force){
+    /* Gate 0: PERMISSION. Without it this function is inert, which is what keeps
+     * the lane from being an automatic scheduler.
+     *
+     * Two independent sources, and they are not interchangeable:
+     *   g_xdna_explicit  the user asked for it (`coli --xdna` -> COLI_XDNA=1)
+     *   g_xdna_force     an internal qualification run forced it
+     *
+     * Neither is discovery. Present hardware, a loadable helper and valid
+     * artifacts do not set either one, so a machine that COULD run this lane
+     * still does not until someone says so. Permission is also not selection:
+     * every hard gate below still decides, and an unqualified operation runs
+     * the current path no matter who asked. */
+    if(!(g_xdna_explicit || g_xdna_force)){
         /* Clear validity here too. Declining before the core runs still ends an
          * attempt, and a stale 1 left over from an earlier success would claim
          * an XDNA result for an operation the lane never touched. */

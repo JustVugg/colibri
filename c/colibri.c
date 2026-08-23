@@ -11084,6 +11084,87 @@ int main(int argc, char **argv){
         atexit(cluster_close_all);
     }
 #endif
+    /* EXPLICIT XDNA REQUEST (W2-N7-P1, ordering corrected by P1-A1).
+     *
+     * COLI_XDNA=1 is an explicit user decision, parsed and owned by `coli`
+     * (--xdna). Read once, before the model runs.
+     *
+     * ORDERING IS THE POINT. P1 emitted the reduced-precision warning as soon
+     * as the request was parsed -- it announced that operations "will use the
+     * native NPU", and then dispatched zero times because no production
+     * artifact root existed. The message was a promise the run did not keep.
+     *
+     * So the success warning now comes LAST, after the package has been
+     * resolved and every qualified artifact verified against the registry.
+     * Anything short of that gets its own diagnostic and the normal path:
+     * "this build cannot", "install the package", "your package is corrupt"
+     * and "the helper will not load" are four different problems with four
+     * different fixes.
+     *
+     * Everything goes to stderr. SCORE mode writes machine-readable results
+     * to stdout and its parser consumes any stdout line starting with a digit
+     * or a minus sign, so a diagnostic there would be absorbed as a score. */
+#ifdef COLI_XDNA
+    {   const char *xe = getenv("COLI_XDNA");
+        if(xe && atoi(xe)){
+            const char *missing = NULL;
+            ColiXdnaProvision pv = coli_xdna_provision_status(&missing);
+            char root[1024];
+            int have_root = coli_xdna_product_artifact_root(root, sizeof root);
+            switch(pv){
+            case COLI_XDNA_PROV_READY:
+                coli_xdna_set_explicit_enabled(1);
+                fprintf(stderr,
+                    "[XDNA] experimental: qualified GLM shared expert operations will use the\n"
+                    "[XDNA] native NPU with a reduced-precision BF16 compute path. Model output\n"
+                    "[XDNA] may differ from the normal path, and generated text has been observed\n"
+                    "[XDNA] to diverge. Operations this lane does not support continue to use the\n"
+                    "[XDNA] normal path.\n");
+                break;
+            case COLI_XDNA_PROV_PACKAGE_MISSING:
+                fprintf(stderr,
+                    "[XDNA] requested, but the XDNA package was not found%s%s: "
+                    "continuing on the normal path\n",
+                    have_root ? " at " : "", have_root ? root : "");
+                break;
+            case COLI_XDNA_PROV_PACKAGE_INCOMPLETE:
+                fprintf(stderr,
+                    "[XDNA] requested, but the XDNA package is incomplete (missing %s)%s%s: "
+                    "continuing on the normal path\n",
+                    missing ? missing : "a required artifact",
+                    have_root ? " in " : "", have_root ? root : "");
+                break;
+            case COLI_XDNA_PROV_INTEGRITY_FAILED:
+                fprintf(stderr,
+                    "[XDNA] requested, but an XDNA artifact does not match its expected hash "
+                    "(%s): refusing to use it, continuing on the normal path\n",
+                    missing ? missing : "unknown file");
+                break;
+            case COLI_XDNA_PROV_HELPER_UNAVAILABLE:
+                fprintf(stderr,
+                    "[XDNA] requested, and the artifact package is valid, but the XDNA helper "
+                    "(" COLI_XDNA_HELPER_DLL ") is not usable beside the executable: "
+                    "continuing on the normal path\n");
+                break;
+            case COLI_XDNA_PROV_REGISTRY_INVALID:
+                fprintf(stderr,
+                    "[XDNA] requested, but this build's artifact registry is invalid: "
+                    "continuing on the normal path\n");
+                break;
+            case COLI_XDNA_PROV_NOT_REQUESTED:
+                break;   /* unreachable here: the request is what got us in */
+            }
+        }
+    }
+#else
+    /* Built without the lane. An explicit request deserves an answer rather
+     * than silence -- the user asked for something this binary cannot do. */
+    {   const char *xe = getenv("COLI_XDNA");
+        if(xe && atoi(xe))
+            fprintf(stderr, "[XDNA] requested, but this build has no XDNA support: "
+                            "continuing on the normal path\n");
+    }
+#endif
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     /* KV_TQ requires power-of-two row widths: both codecs rotate through a
      * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
