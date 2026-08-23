@@ -1188,10 +1188,12 @@ static DenseWeight load_dense_t_n(Model *m, const char *name, int I, int O) {
     w.I = I; w.O = O;
     if (dense_i8_on()) {
         double tq = now_s();
-        if (dense_weight_quantize(&w, I, O)) {
-            m->dense_i8_count++;
-            if (!w.f32) m->dense_f32_freed += (double)I * O * sizeof(float);
+        if (!dense_weight_quantize(&w, I, O)) {
+            fprintf(stderr, "%s: dense int8 quantization allocation failed\n", name);
+            exit(1);
         }
+        m->dense_i8_count++;
+        if (!w.f32) m->dense_f32_freed += (double)I * O * sizeof(float);
         m->dense_quant_s += now_s() - tq;
     }
     return w;

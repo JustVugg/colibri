@@ -1,5 +1,6 @@
 import json
 import re
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -900,21 +901,23 @@ class FamilyRegistryTest(unittest.TestCase):
         release = (repo / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         docker = (repo / "docker" / "Dockerfile.slim").read_text(encoding="utf-8")
-        make_rules = re.sub(r"\\\n[ \t]*", " ", makefile)
-        install_rule = re.search(r"(?m)^install:\s*(.*)$", make_rules)
-        self.assertIsNotNone(install_rule)
-        install_prerequisites = install_rule.group(1).split("#", 1)[0]
+        make_db = subprocess.run(
+            ["make", "-qp", "-f", "Makefile", "install", "EXE=",
+             "COLI_V4_SUPPORTED=1", "BUILD_CONFIG=registry-test",
+             "BUILD_CONFIG_OLD=registry-test"],
+            cwd=repo / "c", text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False)
+        self.assertIn(make_db.returncode, (0, 1), make_db.stderr)
+        install_rules = [line for line in make_db.stdout.splitlines()
+                         if line.startswith("install:")]
+        self.assertEqual(len(install_rules), 1, make_db.stderr)
+        install_prerequisites = set(install_rules[0].split(":", 1)[1].split())
         for family in FAMILIES:
             with self.subTest(family=family.id):
                 self.assertRegex(
                     makefile,
                     rf"(?m)^{re.escape(family.build_target)}(?:\$\(EXE\))?:")
-                install_target = family.build_target
-                if family.id != "deepseek_v4":
-                    install_target += "$(EXE)"
-                self.assertRegex(
-                    install_prerequisites,
-                    rf"(?<![\w.-]){re.escape(install_target)}(?![\w.-])")
+                self.assertIn(family.build_target, install_prerequisites)
                 if family.id != "deepseek_v4":
                     self.assertIn(family.build_target,
                                   re.search(r'ENGINES="([^"]+)"', ci).group(1).split())
