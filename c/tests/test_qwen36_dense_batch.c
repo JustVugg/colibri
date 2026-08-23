@@ -115,6 +115,48 @@ static void dense_quant_convention_case(void) {
     puts("qwen dense quantization: signed int8 + one exact f32 scale per row");
 }
 
+static void dense_f32_reference_case(void) {
+    enum { I=5,O=3,N=I*O };
+    static const float src[N]={
+        -2.f,-1.f,0.f,1.f,2.f,
+        .5f,.25f,.125f,-.25f,-.5f,
+        1.f,-2.f,3.f,-4.f,5.f
+    };
+    const char *dir="tests/tmp_qwen36_f32_snap";
+#ifdef _WIN32
+    mkdir(dir);
+#else
+    mkdir(dir,0755);
+#endif
+    char path[256];snprintf(path,sizeof(path),"%s/model.safetensors",dir);
+    char hdr[512];int nbytes=(int)sizeof(src);
+    int hl=snprintf(hdr,sizeof(hdr),
+        "{\"dense.weight\":{\"dtype\":\"F32\",\"shape\":[%d,%d],\"data_offsets\":[0,%d]}}",
+        O,I,nbytes);
+    FILE *f=fopen(path,"wb");
+    CHECK(f!=NULL,"cannot create Qwen f32 reference safetensors fixture");
+    if(!f)return;
+    uint64_t hlen=(uint64_t)hl;
+    fwrite(&hlen,8,1,f);fwrite(hdr,1,(size_t)hl,f);fwrite(src,1,sizeof(src),f);fclose(f);
+
+    env_set("COLI_DENSE_I8","0");
+    Model m;memset(&m,0,sizeof(m));st_init(&m.S,dir);
+    DenseWeight w=load_dense_t_n(&m,"dense.weight",I,O);
+    CHECK(w.f32!=NULL,"COLI_DENSE_I8=0 did not retain the f32 tensor");
+    CHECK(w.q==NULL&&w.sc==NULL,"COLI_DENSE_I8=0 unexpectedly created int8 storage");
+    CHECK(m.dense_i8_count==0&&m.dense_f32_freed==0.,
+          "COLI_DENSE_I8=0 reported quantized or freed dense storage");
+
+    float x[I]={.25f,-.5f,.75f,-1.f,1.25f},got[O],want[O];
+    matmul_d(got,x,&w,1,I,O);matmul(want,x,src,1,I,O);
+    CHECK(!memcmp(got,want,sizeof(got)),"COLI_DENSE_I8=0 did not dispatch exact f32 matmul");
+
+    clear_dense_weight(&w);
+    for(int i=0;i<m.S.nfd;i++)close(m.S.fds[i]);
+    unlink(path);rmdir(dir);env_unset("COLI_DENSE_I8");
+    puts("qwen dense reference: COLI_DENSE_I8=0 retains and dispatches exact f32");
+}
+
 static void qwen_gs64_loader_case(void) {
     enum { D=64,I=64,N=3*D*I,PACKED=N/2,NS=3*D };
     static int8_t unpacked[N];static uint8_t packed[PACKED];static float scales[NS];
@@ -251,8 +293,8 @@ static void shared_case(const char *format,int quantized) {
 }
 
 int main(void) {
-    /* This gate owns the dense-int8 mode regardless of the caller's shell. */
-    env_unset("COLI_DENSE_I8");
+    /* Exercise the reference loader before dense_i8_on caches its mode. */
+    dense_f32_reference_case();
     incremental_release_case();
     dense_quant_convention_case();
     qwen_gs64_loader_case();
