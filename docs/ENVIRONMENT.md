@@ -268,6 +268,8 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `COLI_CORPUS_MINACC` | `50` | Acceptance floor (percent) for the corpus source. Below it over a 24-proposal window the source pauses for 256 tokens, then re-arms — rejected drafts cost real time. |
 | `EXPERT_BUDGET` | `0` (off) | Cap experts loaded per layer (MoE-Spec). **Quarantined:** silently forced to `0` unless `EXPERT_BUDGET_EXPERIMENTAL` is set — every tested value is either no faster or incoherent (issue #303). |
 | `EXPERT_BUDGET_EXPERIMENTAL` | unset | Setting it (any value) allows `EXPERT_BUDGET>0` to actually take effect (expect garbage, #294). |
+| `DEGRADE_ZERO` | `0` (off) | **Opt-in approximate mode:** miss slots with per-position gate weight < `DEGRADE_TAU` are zero-filled instead of triggering a blocking disk read. Decode-only (`S≤4`). Changes output — must be set explicitly. Measured on OLMoE-1B-7B: `tau=0.03` → +2.9% ppl, 21.8% slots zeroed; `tau=0.05` → +41% ppl. GLM-5.2 and Kimi K3 router contracts are unmeasured — treat `tau=0.03` as OLMoE-calibrated and tune per-model. `[PROF]` footer reports zeroed slot count and top-3 layers by drop share. See PR #906, issue #865. |
+| `DEGRADE_TAU` | `0.03` | Gate weight threshold for `DEGRADE_ZERO` (clamped to `(0, 1]`). Compared per-position, post-`norm_topk`, pre-`routed_scale` — i.e. as a fraction of each position's routed mass. |
 | `DSA` | on | Dynamic Sparse Attention indexer. `DSA=0` disables. |
 | `DSA_FORCE` | `0` | Force the DSA path on. |
 | `DSA_TOPK` | model value | Override the DSA index top-k (testing). |

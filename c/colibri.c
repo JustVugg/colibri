@@ -1207,12 +1207,13 @@ static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded 
                                * (arXiv 2602.16052): top-32 of 64 capture 93% routing weight. */
 static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET across all layers */
 static int64_t g_budget_rescued=0; /* experts re-kept because a position would have been left with zero */
-static int   g_degrade_zero=0;   /* DEGRADE_ZERO=1: zero-fill miss slots whose aggregate gate weight
+static int   g_degrade_zero=0;   /* DEGRADE_ZERO=1: zero-fill miss slots whose per-position gate weight
                                    * is below DEGRADE_TAU instead of blocking on a demand-load.
                                    * Opt-in only; changes output. Decode-only (S<=4 guard in moe()). */
 static float g_degrade_tau=0.03f; /* DEGRADE_TAU=<f>: gate weight threshold (default 0.03).
                                    * Issue #865: tau=0.03 zeroes 21.8% of slots for +2.9% perplexity. */
 static int64_t g_degrade_dropped=0; /* cumulative miss slots zeroed by DEGRADE_ZERO across all layers */
+static int64_t g_degrade_dropped_by_layer[512]; /* per-layer miss slots zeroed (for footer breakdown) */
 /* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
  * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
 static int g_cache_route=0;
@@ -4942,6 +4943,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int j=0;j<nu;j++) if(!dg_keep[j]) dg_dropped++;
         if(dg_dropped){
             g_degrade_dropped+=dg_dropped;
+            if(layer<512) g_degrade_dropped_by_layer[layer]+=dg_dropped;
             memset(seen,0,(size_t)E);
             for(int j=0;j<nu;j++) if(dg_keep[j]) seen[uniq[j]]=1;
             for(int s=0;s<S;s++){
@@ -7601,8 +7603,22 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         printf(" | EXPERT_BUDGET=%d (dropped %lld experts, ~%.1f GB I/O saved)", g_expert_budget, (long long)g_budget_dropped, g_budget_dropped*18.9e6/1e9);
         if(g_budget_rescued) printf(" [%lld rescued: budget too tight, position would have had 0 routed experts]", (long long)g_budget_rescued);
     }
-    if(g_degrade_zero)
-        printf(" | DEGRADE_ZERO tau=%.3f (zeroed %lld miss slots)", g_degrade_tau, (long long)g_degrade_dropped);
+    if(g_degrade_zero){
+        printf(" | DEGRADE_ZERO tau=%.3f (zeroed %lld miss slots", g_degrade_tau, (long long)g_degrade_dropped);
+        if(g_degrade_dropped>0){
+            /* top-3 layers by drop count */
+            int top[3]={-1,-1,-1}; int64_t tv[3]={0,0,0};
+            for(int i=0;i<512;i++){
+                int64_t v=g_degrade_dropped_by_layer[i]; if(!v) continue;
+                if(v>tv[0]){tv[2]=tv[1];top[2]=top[1];tv[1]=tv[0];top[1]=top[0];tv[0]=v;top[0]=i;}
+                else if(v>tv[1]){tv[2]=tv[1];top[2]=top[1];tv[1]=v;top[1]=i;}
+                else if(v>tv[2]){tv[2]=v;top[2]=i;}
+            }
+            printf("; top layers:");
+            for(int k=0;k<3&&top[k]>=0;k++) printf(" L%d:%lld",top[k],(long long)tv[k]);
+        }
+        printf(")");
+    }
     printf("\n");
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
