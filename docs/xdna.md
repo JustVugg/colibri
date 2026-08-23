@@ -68,8 +68,30 @@ Both locations are resolved **relative to the executable**, by absolute path.
 that one place. Every artifact is checked against a hash built into the binary
 before it is used.
 
-Requirements: Windows, an XDNA2-class NPU, and AMD's XRT runtime installed for
-the helper to load.
+## What the optional package needs installed
+
+The sidecar is small because it ships only the helper and the kernels. Two
+things have to already be on the machine for `coli_xdna.dll` to load:
+
+- **AMD XRT runtime** (`xrt_coreutil.dll`), from AMD's Ryzen AI / XRT install.
+- **Microsoft Visual C++ Redistributable** (x64). The helper is built with MSVC
+  — that is how it reaches XRT's C++ interface — so it imports `MSVCP140.dll`,
+  `VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`.
+
+Neither is bundled. If either is missing the helper simply will not load, and
+`--xdna` reports it and continues on the normal path:
+
+```
+[XDNA] requested, and the artifact package is valid, but the XDNA helper
+       (coli_xdna.dll) is not usable beside the executable: continuing on the
+       normal path
+```
+
+**The ordinary colibrì host needs neither of these.** It imports only Windows
+system libraries, with or without the NPU capability compiled in — the external
+dependencies belong to the optional package alone.
+
+Also required: Windows and an XDNA2-class NPU.
 
 ## When something is missing
 

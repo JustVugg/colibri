@@ -605,6 +605,22 @@ VK_OBJ    = backend_vulkan.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
 endif
 
+# Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
+# a switch, a define, an object. Deliberately NOT a second executable -- the
+# capability compiles into the ordinary host and stays off until the user passes
+# `coli --xdna`.
+#
+# No LDFLAGS entry, unlike VK: this side never links XRT. backend_xdna.c resolves
+# the optional helper (coli_xdna.dll) through LoadLibraryExA at runtime, so an
+# XDNA=1 host has the same import table as a default one and starts normally on a
+# machine with no NPU, no XRT and no helper. See docs/xdna.md.
+XDNA      ?= 0
+XDNA_OBJ   =
+ifeq ($(XDNA),1)
+CFLAGS   += -DCOLI_XDNA
+XDNA_OBJ  = backend_xdna.o
+endif
+
 all: colibri$(EXE)
 
 # Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
@@ -686,7 +702,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -699,8 +715,9 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
@@ -716,10 +733,12 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # Optional XDNA2 (Ryzen AI NPU) lane, host side only. This object resolves an
 # optional coli_xdna.dll at runtime and links nothing: it needs no XRT header,
 # no XRT import library and no NPU, exactly like backend_loader.o needs no CUDA
-# SDK. colibri$(EXE) does NOT link it yet -- there is no caller until the
-# operation seam lands -- so the default build stays byte-for-byte what it was.
-# The rule exists so an ordinary `make xdna-obj` (and the loader tests, which
-# compile the same source in place) catch a break in the C side early.
+# SDK.
+#
+# W2-N8: colibri$(EXE) NOW links it, but only under XDNA=1 (see the switch
+# beside VK above). The default build still does not, and stays byte-for-byte
+# what it was. `make xdna-obj` remains useful on its own so a break in the C
+# side is caught without building a whole host.
 .PHONY: xdna-obj
 xdna-obj: backend_xdna.o
 backend_xdna.o: backend_xdna.c backend_xdna.h .build-config
