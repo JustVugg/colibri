@@ -27,6 +27,9 @@ typedef struct ColiCudaTensor ColiCudaTensor;
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
+/* Number of CUDA devices visible to this process, before a device list is
+ * selected. Returns 0 when the runtime cannot discover any device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_available_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);

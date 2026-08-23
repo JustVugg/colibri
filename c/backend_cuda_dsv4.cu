@@ -10,6 +10,9 @@
 #include <cstring>
 #include <climits>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -671,17 +674,35 @@ static float *g_kv_comp[DSV4_KV_CACHE_LAYERS];
 static int g_kv_comp_cap[DSV4_KV_CACHE_LAYERS];
 
 /* Which GPUs this build's kernels can run on. The DeepGEMM build carries
- * sm_120a-only block-scaled MMA kernels; the generic build is a portable fat
- * binary of plain CUDA kernels (fp32 compute from fp8/fp4 decode) that runs
- * on any sm_80+ card. The engine's loader tries the DeepGEMM DLL first and
- * falls back to the generic one when this says no. */
+ * sm_120a-only block-scaled MMA kernels. The generic build is a portable fat
+ * binary of plain CUDA kernels (fp32 compute from fp8/fp4 decode); the engine's
+ * loader tries the DeepGEMM DLL first and falls back to the generic one when
+ * this says no.
+ *
+ * The generic floor is sm_60, not sm_80. Nothing in these kernels needs Ampere:
+ * bf16 is storage only (every use is a __bfloat162float / __float2bfloat16
+ * convert, the arithmetic is fp32) and fp8 weights are decoded through a
+ * constant lookup table rather than fp8 tensor cores. The warp primitives used
+ * here (__shfl_*_sync, __syncwarp) are sm_30-era and impose no floor of their
+ * own.
+ *
+ * sm_60 is chosen because Pascal is the oldest architecture this has actually
+ * been validated on -- sm_61 on a GTX 1080 Ti, matching the CPU reference to
+ * 2^-26. Maxwell would very likely work and is deliberately NOT claimed here,
+ * because nobody has run it.
+ *
+ * This is a RUNTIME gate and is separate from what the build actually contains:
+ * a binary compiled with CUDA_ARCH=portable still has no sm_61 or sm_75 code in
+ * it. Use CUDA_ARCH=portable-pre-ampere for those cards. Saying yes here for a
+ * card the build has no cubin for surfaces as a "no kernel image is available"
+ * launch failure, not a wrong answer. */
 extern "C" int dsv4_cuda_backend_arch_ok(int device){
     cudaDeviceProp prop;
     if(cudaGetDeviceProperties(&prop,device)!=cudaSuccess){cudaGetLastError();return 0;}
 #ifdef COLI_DSV4_DEEPGEMM
     return prop.major==12;
 #else
-    return prop.major>=8;
+    return prop.major>=6;
 #endif
 }
 extern "C" const char *dsv4_cuda_backend_name(void){
@@ -1900,8 +1921,35 @@ static bool host_pinned(const void*p,size_t len){
     g_pin_bytes+=size;g_pin_regions.push_back({base,size});
     return true;
 #else
-    (void)a;return false;
+    /* Linux/WSL: no VirtualQuery, but none is needed — cudaHostRegister pins
+     * whole pages, so register the requested range rounded out to page
+     * boundaries. The slot slabs are stable for the process lifetime (one
+     * posix_memalign per slot, freed only at store destroy), exactly like the
+     * Windows branch assumes. Overlapping ranges collapse into the
+     * already-registered success case; any failure (WSL builds without
+     * pinning support included) lands in g_pin_failed and every later upload
+     * from that slab takes the pageable path, same as before this branch
+     * existed. */
+    long page=sysconf(_SC_PAGESIZE);if(page<=0)page=4096;
+    uintptr_t base=a&~((uintptr_t)page-1);
+    size_t size=((a+len+page-1)&~((uintptr_t)page-1))-base;
+    static const size_t cap=(size_t)20<<30;
+    if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
+    cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
+    if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
+    if(err!=cudaSuccess){cudaGetLastError();g_pin_failed.push_back({base,size});return false;}
+    g_pin_bytes+=size;g_pin_regions.push_back({base,size});
+    return true;
 #endif
+}
+
+/* Drain the device's expert stream: the hybrid decode split enqueues its
+ * fill-set uploads asynchronously, computes the CPU subset while the DMA is
+ * in flight, and closes the pipeline here before the GPU group runs. */
+extern "C" int dsv4_cuda_stream_drain(int device){
+    Dev*c=ctx(device);if(!c)return 0;
+    if(!ok(cudaSetDevice(device),"select drain device"))return 0;
+    return ok(cudaStreamSynchronize(c->stream),"hybrid drain")?1:0;
 }
 
 extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,

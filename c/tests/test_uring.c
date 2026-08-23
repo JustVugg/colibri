@@ -11,6 +11,23 @@
 
 static int fail(const char *s){ fprintf(stderr,"FAIL: %s\n",s); return 1; }
 
+static int expert_slot_matches(const ESlot *slot,const unsigned char *data,
+                               const float *scales,int eid){
+    return slot->eid==eid && slot->g.fmt==1 && slot->u.fmt==1 && slot->d.fmt==1
+        && !memcmp(slot->g.q8,data,12) && !memcmp(slot->u.q8,data+12,12)
+        && !memcmp(slot->d.q8,data+24,12)
+        && !memcmp(slot->g.s,scales,12) && !memcmp(slot->u.s,scales+3,12)
+        && !memcmp(slot->d.s,scales+6,16);
+}
+
+static void mirror_stats_reset(void){
+    for(int r=0;r<MIR_REPS;r++){
+        atomic_store(&g_mir_bytes[r],0);
+        atomic_store(&g_mir_nread[r],0);
+    }
+    atomic_store(&g_prof_io,0);
+}
+
 static int test_expert_layout(int fd){
     Model m={0}; ESlot slot={0}; UringBatch batch={0};
     m.c.hidden=4; m.c.moe_inter=3; m.ebits=8;
@@ -39,12 +56,76 @@ static int test_expert_layout(int fd){
     if(li!=0 || uring_submit_batch(&batch) || uring_finalize_load(&batch,li,1)){
         coli_uring_close(&batch.ring); free(m.S.t); return fail("expert batch load");
     }
-    int bad=slot.eid!=7 || slot.g.fmt!=1 || slot.u.fmt!=1 || slot.d.fmt!=1
-        || memcmp(slot.g.q8,data,12) || memcmp(slot.u.q8,data+12,12) || memcmp(slot.d.q8,data+24,12)
-        || memcmp(slot.g.s,scales,12) || memcmp(slot.u.s,scales+3,12) || memcmp(slot.d.s,scales+6,16);
+    int bad=!expert_slot_matches(&slot,data,scales,7);
     coli_uring_close(&batch.ring);
     compat_aligned_free(slot.slab); free(slot.fslab);
     if(bad){ for(int i=0;i<m.S.n;i++) free(m.S.t[i].name); free(m.S.t); return fail("expert tensor views"); }
+
+    /* #1165: a real second fd with different bytes proves URING reads the
+     * routed replica. The completion counters and request source also make the
+     * PROF/DROP contract observable without requiring two physical SSDs. */
+    char mirror_path[]="/tmp/coli-uring-mirror-XXXXXX";
+    int mirror_fd=mkstemp(mirror_path);
+    if(mirror_fd<0){ free(m.S.t); return fail("mirror mkstemp"); }
+    unlink(mirror_path);
+    unsigned char mirror_data[76];
+    memcpy(mirror_data,data,sizeof(mirror_data));
+    for(int i=0;i<36;i++) mirror_data[i]^=0x5a;
+    float mirror_scales[10];
+    for(int i=0;i<10;i++) mirror_scales[i]=(float)i+20.5f;
+    memcpy(mirror_data+36,mirror_scales,sizeof(mirror_scales));
+    if(pwrite(mirror_fd,mirror_data,sizeof(mirror_data),0)!=(ssize_t)sizeof(mirror_data))
+        return fail("mirror fixture write");
+    m.S.nfd=1; m.S.fds[0]=fd; m.S.dfds[0]=-1; m.S.nrep=1;
+    m.S.mfds[0][0]=mirror_fd; m.S.mdfds[0][0]=-1;
+    g_mirror=1; g_mir_nrep=2; g_mir_cut[0]=0; g_mir_cut[1]=256;
+    g_direct=0; g_drop=1; mirror_stats_reset();
+
+    ESlot mirror_slot={0}; UringBatch mirror_batch={0};
+    if(uring_batch_init(&mirror_batch)) return fail("mirror ring init");
+    li=uring_load_add(&mirror_batch,&m,1,7,&mirror_slot,1);
+    if(li!=0 || uring_submit_batch(&mirror_batch) ||
+       uring_finalize_load(&mirror_batch,li,1))
+        return fail("mirror expert batch load");
+    bad=!expert_slot_matches(&mirror_slot,mirror_data,mirror_scales,7)
+        || mirror_batch.nreq!=4
+        || atomic_load(&g_mir_bytes[0])!=0
+        || atomic_load(&g_mir_nread[0])!=0
+        || atomic_load(&g_mir_bytes[1])!=(int64_t)sizeof(mirror_data)
+        || atomic_load(&g_mir_nread[1])!=4
+        || atomic_load(&g_prof_io)!=(int64_t)sizeof(mirror_data);
+    for(int i=0;i<mirror_batch.nreq;i++)
+        if(mirror_batch.req[i].fd!=mirror_fd || mirror_batch.req[i].rep!=1)
+            bad=1;
+    coli_uring_close(&mirror_batch.ring);
+    compat_aligned_free(mirror_slot.slab); free(mirror_slot.fslab);
+    if(bad) return fail("mirror routing/accounting");
+
+    /* A replica can disappear after submission metadata was prepared. Closing
+     * its fd forces -EBADF completions; every request must retry on the primary
+     * and publish the primary bytes instead of aborting inference. */
+    ESlot fallback_slot={0}; UringBatch fallback_batch={0};
+    if(uring_batch_init(&fallback_batch)) return fail("mirror fallback ring init");
+    li=uring_load_add(&fallback_batch,&m,1,7,&fallback_slot,1);
+    close(mirror_fd);
+    mirror_stats_reset();
+    if(li!=0 || uring_submit_batch(&fallback_batch) ||
+       uring_finalize_load(&fallback_batch,li,1))
+        return fail("mirror fallback expert load");
+    bad=!expert_slot_matches(&fallback_slot,data,scales,7)
+        || atomic_load(&g_mir_bytes[0])!=(int64_t)sizeof(data)
+        || atomic_load(&g_mir_nread[0])!=4
+        || atomic_load(&g_mir_bytes[1])!=0
+        || atomic_load(&g_mir_nread[1])!=0
+        || atomic_load(&g_prof_io)!=(int64_t)sizeof(data);
+    for(int i=0;i<fallback_batch.nreq;i++)
+        if(fallback_batch.req[i].fd!=fd || fallback_batch.req[i].rep!=0)
+            bad=1;
+    coli_uring_close(&fallback_batch.ring);
+    compat_aligned_free(fallback_slot.slab); free(fallback_slot.fslab);
+    if(bad) return fail("mirror runtime fallback");
+    m.S.nrep=0; m.S.mfds[0][0]=-1; m.S.mdfds[0][0]=-1;
+    g_mirror=0; g_mir_nrep=1; g_mir_cut[0]=256; g_drop=0;
 
     m.c.n_experts=8; m.c.n_layers=2; m.ecap=2;
     m.pin=calloc(3,sizeof(ESlot*)); m.npin=calloc(3,sizeof(int));

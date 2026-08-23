@@ -48,10 +48,25 @@ SNAP=~/Models/qwen36_i4_gs64 TOK=~/Models/qwen36_i4_gs64/tokenizer.json \
 N_NEW=200 ./c/qwen36 256 4 prompt.txt
 ```
 
-Requirements: ~30 GB RAM for comfortable expert caching, NVMe storage for the
-container. CPU-only in this build; the CUDA VRAM expert tier is a separate PR
-([#713](https://github.com/JustVugg/colibri/pull/713)), which brings its own
-`docs/qwen36-cuda-tier.md` — the file does not exist in this PR.
+## CPU prefill batching
+
+On AVX2/FMA CPUs, dense int8 projections process two prompt rows per weight
+decode.  The same kernel is used by attention, the router, DeltaNet projections,
+and the CPU shared expert.  `S=1` decode keeps the original four-register GEMV,
+and non-AVX2 builds retain the established per-row implementation.  The shared
+expert additionally batches gate/up/down calls across prompt rows with at most
+32 MiB of temporary activations; the CUDA expert tier keeps its per-token shared
+work so it can continue to overlap the in-flight GPU groups.
+
+Both optimizations are bit-exact and on by default.  For controlled A/Bs,
+`QWEN_DENSE_BATCH=0` restores per-row dense-int8 GEMVs and
+`QWEN_SHARED_BATCH=0` restores per-row shared-expert calls.  A positive
+`QWEN_SHARED_BATCH=N` limits each shared chunk to `N` rows.
+
+Requirements: ~30 GB RAM for comfortable expert caching and NVMe storage for
+the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` adds
+the optional CUDA VRAM expert tier documented in
+[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md).
 
 ## Which container?
 

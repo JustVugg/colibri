@@ -53,6 +53,7 @@ EXPORTS
     dsv4_cuda_backend_name
     dsv4_cuda_kv_ring_append
     dsv4_cuda_mem_free_mb
+    dsv4_cuda_stream_drain
     dsv4_cuda_kv_comp_append
     dsv4_cuda_head_argmax
     dsv4_cuda_final_argmax

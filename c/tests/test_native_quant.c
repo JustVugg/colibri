@@ -23,6 +23,13 @@ int main(void) {
         !close_enough(coli_e8m0_decode(0x7f), 1.0f) ||
         !close_enough(coli_e8m0_decode(0x80), 2.0f) ||
         !isnan(coli_e8m0_decode(0xff))) return 1;
+    const float *e8m0 = coli_e8m0_table();
+    if (!e8m0 || e8m0 != coli_e8m0_table()) return 1;
+    for (int code = 0; code < 255; code++) {
+        float decoded = coli_e8m0_decode((uint8_t)code);
+        if (memcmp(&e8m0[code], &decoded, sizeof(decoded)) != 0) return 1;
+    }
+    if (!isnan(e8m0[255])) return 1;
 
     static const float representable[] = {
         0.0f, 0.001953125f, 0.5f, 1.0f, 1.5f, 6.0f,

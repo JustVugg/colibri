@@ -483,7 +483,11 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="kimi",
-        model_types=("kimi_k3",),
+        # "kimi_linear" is Moonshot's model_type for the text model itself
+        # (the real checkpoint's text_config carries it; the root "kimi_k3"
+        # belongs to the vision wrapper). A text-only export -- the tiny
+        # fixture included -- is therefore kimi_linear at top level.
+        model_types=("kimi_k3", "kimi_linear"),
         display_name="Kimi K3",
         display_scale="2.8T",
         engine_artifact="kimi_k3",

@@ -1231,6 +1231,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     return 1;
 }
 
+extern "C" int coli_cuda_available_device_count(void) {
+    int available = 0;
+    if (cudaGetDeviceCount(&available) != cudaSuccess) return 0;
+    return available;
+}
+
 extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];

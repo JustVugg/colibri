@@ -54,8 +54,9 @@ COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
 # 3) full automated datapoint — machine info + cold/warm decode + disk, one command:
 python tools/datapoint.py --snap /path/to/model --shard /path/to/container/model-00000.safetensors
-# (stdlib-only; evicts the page cache before the cold run, caps decode at --max-new
-#  tokens so tok/s is exact, and prints a ready-to-paste datapoint block)
+# (stdlib-only; auto-selects GLM, Inkling, Kimi K3, OLMoE, Qwen3.6, or DeepSeek V4
+#  from config.json; evicts the page cache before engine load; then keeps one
+#  SERVE=1 engine alive for cold, warm-identical, and rotating-prompt measurements)
 
 # 4) record expert usage, then pin the hottest experts in your spare RAM:
 STATS=stats.txt ./coli chat
@@ -64,6 +65,21 @@ PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 # 5) quality benchmarks (MMLU/HellaSwag/ARC):
 ./coli bench
 ```
+
+The default datapoint measures serving behavior, not repeated startup: the same
+engine process and cache slot are used for one cold request, one repeated-prompt
+warm request, and four requests drawn in fixed order from a diverse built-in
+prompt suite. The **rotating-prompt median is the primary result** because the
+expert cache must keep adapting as requests change. Warm-identical remains in
+the report only as a useful cache/KV upper bound; it is not representative of a
+mixed chat workload. The reported completion count, decode tok/s, expert hit
+rate, and RSS come from each engine's `DONE` frame.
+
+Use repeated `--rotate-prompt '...'` arguments to replace the built-in suite
+(at least two distinct prompts), or `--rotating-runs N` to run more fixed-order
+samples. Use `--mode fresh-process` only when measuring startup or OS page-cache
+effects; that compatibility mode launches a new engine for every row and
+therefore does not retain in-process caches.
 
 ## Back-of-envelope predictions
 

@@ -619,7 +619,17 @@ def env_for(a):
                 print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% calibration throughput{C.r}",
                       file=sys.stderr)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
-        gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
+        # The plan label used to derive the backend from CUDA alone, so on
+        # Apple Silicon it printed " · CPU" even when the calibration child
+        # processes ran on Metal (COLI_METAL is inherited through env_for and
+        # environment_for_plan, so the measurements are real). Report the
+        # active backend: CUDA VRAM first, then Metal, then CPU.
+        if has_cuda and vt["devices"]:
+            gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}"
+        elif str(e.get("COLI_METAL","")).strip() not in ("","0"):
+            gpu=" · Metal (unified memory)"
+        else:
+            gpu=" · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
         # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
@@ -1015,7 +1025,8 @@ def cmd_tune(a):
     print("  only quality-preserving scheduling knobs are eligible\n")
     try:
         profile,path=run_tune(
-            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,tokens=a.tokens,
+            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,family=family,
+            tokens=a.tokens,
             repeats=a.repeats,timeout=a.timeout,min_gain=a.min_gain,
             profile_dir=a.profile_dir,
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),

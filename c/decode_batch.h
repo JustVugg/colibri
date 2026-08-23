@@ -2,6 +2,7 @@
 #define COLIBRI_DECODE_BATCH_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -16,6 +17,12 @@ static inline float *coli_kv_row(float *base, int position, int width)
 /* Per-token top-k emission cap: run_ablate_score's existing top-32 read-out
  * ceiling, adopted as the wire cap too (no named consumer asks for more). */
 #define COLI_SUBMIT_TOPK_MAX 32
+
+/* KV8 twin: same row arithmetic on the fp8 (e4m3) byte cache. */
+static inline uint8_t *coli_kv_row8(uint8_t *base, int position, int width)
+{
+    return base + (size_t)position * (size_t)width;
+}
 
 typedef struct {
     unsigned long long id, bytes, gbytes;

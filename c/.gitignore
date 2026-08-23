@@ -28,6 +28,7 @@ tests/test_i4_grouped
 tests/test_kv_alloc
 tests/test_kv_disk
 tests/test_kv_fp8
+tests/test_kv_tq
 tests/test_logit_nan
 tests/test_sample_nan
 tests/test_stops

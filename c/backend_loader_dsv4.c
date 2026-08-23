@@ -172,6 +172,7 @@ typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
+typedef int             (*fn_stream_drain)(int device);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -307,6 +308,7 @@ static struct {
     fn_backend_name backend_name;         /* optional */
     char loaded_name[64];
     fn_mem_free_mb mem_free_mb;
+    fn_stream_drain stream_drain;                /* optional (older DLLs) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -485,6 +487,9 @@ static int dsv4_cuda_resolve(const char *dllname){
     _Pragma("GCC diagnostic push")
     _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
     g_dsv4.backend_arch_ok = (fn_backend_arch_ok)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_arch_ok");
+    /* optional: an older DLL without the export keeps the whole tier alive;
+     * the engine probes this and simply stays on synchronous attaches. */
+    g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
     _Pragma("GCC diagnostic pop")
     return 1;
@@ -830,6 +835,16 @@ const char *dsv4_cuda_backend_name(void){
 long long dsv4_cuda_mem_free_mb(int device){
     if(!g_dsv4.available) return -1;
     return g_dsv4.mem_free_mb(device);
+}
+
+int dsv4_cuda_stream_drain(int device){
+    /* Without the DLL there is never in-flight DMA to wait for, so a drain
+     * trivially succeeds. With an older DLL that lacks the export, report
+     * failure instead: the engine probes this once and keeps every attach
+     * synchronous, so nothing is ever enqueued that could not be drained. */
+    if(!g_dsv4.available) return 1;
+    if(!g_dsv4.stream_drain) return 0;
+    return g_dsv4.stream_drain(device);
 }
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,

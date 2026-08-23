@@ -900,11 +900,21 @@ class FamilyRegistryTest(unittest.TestCase):
         release = (repo / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         docker = (repo / "docker" / "Dockerfile.slim").read_text(encoding="utf-8")
+        make_rules = re.sub(r"\\\n[ \t]*", " ", makefile)
+        install_rule = re.search(r"(?m)^install:\s*(.*)$", make_rules)
+        self.assertIsNotNone(install_rule)
+        install_prerequisites = install_rule.group(1).split("#", 1)[0]
         for family in FAMILIES:
             with self.subTest(family=family.id):
                 self.assertRegex(
                     makefile,
                     rf"(?m)^{re.escape(family.build_target)}(?:\$\(EXE\))?:")
+                install_target = family.build_target
+                if family.id != "deepseek_v4":
+                    install_target += "$(EXE)"
+                self.assertRegex(
+                    install_prerequisites,
+                    rf"(?<![\w.-]){re.escape(install_target)}(?![\w.-])")
                 if family.id != "deepseek_v4":
                     self.assertIn(family.build_target,
                                   re.search(r'ENGINES="([^"]+)"', ci).group(1).split())

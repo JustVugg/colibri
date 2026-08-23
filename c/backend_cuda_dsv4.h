@@ -64,6 +64,10 @@ int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
 long long dsv4_cuda_mem_free_mb(int device);
+/* Drain the device's expert stream (hybrid split: async fill DMA is enqueued,
+ * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
+ * success, 0 when the backend is unavailable. */
+int dsv4_cuda_stream_drain(int device);
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,

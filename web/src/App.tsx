@@ -211,6 +211,19 @@ export default function App() {
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
+        /* Reasoning tokens are tokens: they count toward the rate, and the
+           first one is the real time-to-first-token — the answer's first
+           token arrives much later on a reasoning model. */
+        onReasoning: (delta) => {
+          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
+          count++
+          setTokenCount(count)
+          const elapsed = (performance.now() - t0) / 1000
+          if (elapsed > 0.3) setTokPerSec(count / elapsed)
+          updateMessages((current) => current.map((item) =>
+            item.id === assistant.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
+          ))
+        },
         onDelta: (delta) => {
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
           count++

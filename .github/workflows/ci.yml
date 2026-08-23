@@ -199,6 +199,25 @@ jobs:
           done
           exit $rc
       - if: matrix.os == 'macos-latest'
+        name: Build every Metal-capable engine with METAL=1
+        # `make <engine>` above builds the CPU path only: everything behind
+        # COLI_METAL is invisible to it. That is how #1150 survived a month --
+        # inkling.c kept calling coli_metal_moe_block with the pre-qgs
+        # signature from v1.6.0 onward and no job ever compiled the call.
+        # Compile-only by necessity: the runner's Apple Paravirtual device
+        # cannot execute Metal submissions (see the note below), but signature
+        # drift is a compile error, which is exactly what this catches.
+        run: |
+          cd c
+          rc=0
+          for t in colibri inkling kimi_k3; do
+            echo "::group::$t METAL=1"
+            make clean >/dev/null 2>&1 || true
+            make $t METAL=1 || { echo "FAILED: $t METAL=1"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+      - if: matrix.os == 'macos-latest'
         name: Metal backend tests
         # The Metal backend suite is its own target (metal-test) and is not
         # part of `make check`: TEST_BINS is derived from tests/test_*.$(EXE)
