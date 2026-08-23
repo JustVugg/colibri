@@ -70,8 +70,21 @@ typedef struct {
 /* pinned=1 means this slot is strongly preferred to keep (hot expert); it will
  * not be evicted during normal LRU eviction, but may be displaced under extreme
  * cache pressure when all slots are pinned or in-flight. */
-typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
-typedef struct { Slot *slots; int n, cap; } LCache;
+typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; uint8_t recent; } Slot;
+typedef struct { Slot *slots; int n, cap, hand; } LCache;
+
+static int slot_clock_victim(LCache *lc, int allow_pinned) {
+    if (lc->n <= 0) return -1;
+    if (lc->hand < 0 || lc->hand >= lc->n) lc->hand = 0;
+    for (int pass = 0; pass < 2; pass++) for (int seen = 0; seen < lc->n; seen++) {
+        int i = lc->hand; lc->hand = (i + 1) % lc->n;
+        Slot *s = &lc->slots[i];
+        if (s->eid < 0 || (!allow_pinned && s->pinned)) continue;
+        if (!s->recent) return i;
+        s->recent = 0;
+    }
+    return -1;
+}
 
 typedef struct {
     Cfg c;
@@ -487,7 +500,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        m->hits++; lc->slots[i].used = ++m->clock; lc->slots[i].recent = 1; *out = &lc->slots[i];
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -499,20 +512,9 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
-        if (lru < 0) {
-            /* All slots are pinned or in-flight; find oldest non-in-flight slot
-             * (may be pinned, but never select one currently being loaded). */
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue; /* never evict in-flight */
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
-        }
+        /* Prefer unpinned slots; pinned slots retain the historical last-resort fallback. */
+        int lru = slot_clock_victim(lc, 0);
+        if (lru < 0) lru = slot_clock_victim(lc, 1);
         while (lru < 0) {
             /* EVERY slot is in flight: each buffer is owned by an unlocked pread
              * in the pilot worker (or a demand load) that will publish into it.
@@ -524,15 +526,13 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             pthread_mutex_unlock(&g_pilot_mx);
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
+            lru = slot_clock_victim(lc, 1);
         }
         s = &lc->slots[lru];
         s->pinned = 0;
     }
     s->eid = -1;
+    s->recent = 0;
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
@@ -542,6 +542,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    s->recent = 1;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -831,12 +832,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        int lru = slot_clock_victim(lc, 0);
         if (lru < 0) {
             m->is_queued[layer * c->n_experts + eid] = 0;
             pthread_mutex_unlock(&g_pilot_mx);
@@ -858,7 +854,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
         s = &lc->slots[lru]; s->pinned = 0;
     }
-    s->eid = -1; s->used = ++m->clock;
+    s->eid = -1; s->recent = 0; s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
@@ -867,6 +863,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    s->recent = 1;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);

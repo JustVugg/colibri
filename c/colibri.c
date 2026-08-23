@@ -378,6 +378,7 @@ typedef struct {
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used;
+                 uint8_t recent; /* second-chance reference bit */
                  unsigned in_flight; /* async GPU readers borrowing this slot */
                  /* pin-arena backing (#419): when set, slab/fslab are interior
                   * slices of a per-layer arena and must never be free()d —
@@ -393,24 +394,38 @@ static void eslot_release(ESlot *s){
 static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
 static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
 static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
-/* Victim per una riga piena (#1034): uno slot svuotato da rss_guard (eid=-1,
- * slab=NULL) e' riusabile SOLO finche' gli slab vivi della riga stanno sotto
- * ecap — riusarlo rialloca uno slab, quindi e' crescita, non eviction. Le
- * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
- * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
- * EN: while the row's live-slab count is under ecap; else pick a slab owner. */
-static int eslot_lru_victim(ESlot *slots,int n,int ecap){
-    int lru=-1, empty=-1, live=0;
+/* Second-chance (clock) victim for a full row, cap-aware (#1034).
+ * Two policies must both hold:
+ *  - clock: skip a slot whose reference bit is set, clearing it (second chance),
+ *    so a hot resident survives one sweep instead of dying on a raw LRU stamp;
+ *  - cap: a slot emptied by rss_guard (eid==-1, slab==NULL) is only reusable while
+ *    the row's live-slab count is under ecap, because reusing it re-allocates a
+ *    slab and that is growth, not eviction. At or over the cap, evict a slab owner.
+ * In-flight reservations (eid<-1) count as live: they are about to own a slab.
+ * The hand persists per layer, so sweeps resume where the last one stopped. */
+static int eslot_clock_victim(ESlot *slots,int n,int *hand,int ecap){
+    if(n<=0) return -1;
+    if(*hand<0 || *hand>=n) *hand=0;
+    int live=0, empty=-1;
     for(int i=0;i<n;i++){
         ESlot *s=&slots[i];
         if(s->slab || s->eid<-1) live++;
-        if(eslot_busy(s) || s->eid<-1) continue;
-        if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
-        if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
-        if(lru<0 || s->used<slots[lru].used) lru=i;
+        /* An emptied, idle slot is a candidate only if the cap allows growth. */
+        if(!s->slab && s->eid==-1 && !eslot_busy(s) && empty<0) empty=i;
     }
-    if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
-    return lru;
+    int owner=-1;
+    /* Two passes: the first may clear reference bits, the second then finds a victim. */
+    for(int pass=0;pass<2 && owner<0;pass++) for(int seen=0;seen<n;seen++){
+        int i=*hand; *hand=(i+1)%n;
+        ESlot *s=&slots[i];
+        if(eslot_busy(s) || s->eid<-1 || !s->slab) continue;  /* busy, reserved, or empty */
+        if(s->eid==-1){ owner=i; break; }        /* free but still owns its slab: best victim */
+        if(!s->recent){ owner=i; break; }        /* reference bit already clear: evict */
+        s->recent=0;                             /* grant the second chance */
+    }
+    if(empty>=0 && live<ecap) return empty;      /* under the cap: growing beats evicting */
+    if(owner>=0) return owner;
+    return live<ecap ? empty : -1;
 }
 
 typedef struct {
@@ -442,7 +457,7 @@ typedef struct {
     uint8_t **Lc8, **Rc8; float **Lsc, **Rsc;    /* alias KV8 (fp8 + scale) della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
-    ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
+    ESlot **ecache; int *ecn, *ehand; int ecap;      /* second-chance expert cache per layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
 #ifdef COLI_VULKAN
@@ -2250,6 +2265,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
+    m->ehand=calloc(NR,sizeof(int));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
 #ifdef COLI_VULKAN
@@ -5307,7 +5323,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; m->hit_ecache++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; m->hit_ecache++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); Sl[z].recent=1; use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
@@ -5962,12 +5978,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
+              /* second chance, then a slab owner; emptied slots only reused under ecap (#1034) */
+              else { int lru=eslot_clock_victim(Sl,*nn,&m->ehand[layer],m->ecap);
                      if(lru<0){ static int warned;
                          if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                          continue; }
                      dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); dst->recent=1; }
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
@@ -6156,7 +6173,8 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew=0;
     if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=eslot_lru_victim(Sl,nn,m->ecap);           /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        /* second chance, then a slab owner; emptied slots only reused under ecap (#1034) */
+        slot=eslot_clock_victim(Sl,nn,&m->ehand[layer],m->ecap);
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                     pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o cap raggiunto */
         /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
@@ -6185,7 +6203,7 @@ static void pilot_realload(Model *m, int layer, int eid){
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
+        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); dst->recent=1;  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
         /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
@@ -6195,7 +6213,7 @@ static void pilot_realload(Model *m, int layer, int eid){
          * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
          * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
         dst->eid=-1;
-        dst->used=0;
+        dst->used=0; dst->recent=0;
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
@@ -6229,7 +6247,8 @@ static void pilot_uring_batch(Model *m){
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else slot=eslot_lru_victim(Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        /* second chance, then a slab owner; emptied slots only reused under ecap (#1034) */
+        else slot=eslot_clock_victim(Sl,nn,&m->ehand[layer],m->ecap);
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
@@ -6267,10 +6286,10 @@ static void pilot_uring_batch(Model *m){
         pthread_mutex_lock(&g_pilot_mx);
         if(rc==0){
             d->dst->eid=d->eid;
-            d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+            d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); d->dst->recent=1;
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
         }else{
-            d->dst->eid=-1;
+            d->dst->eid=-1; d->dst->recent=0;
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
         }
         g_pilot_inflight[d->layer]--;
@@ -8080,7 +8099,7 @@ static void rss_guard(Model *m){
             s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
             QT *q[3]={&s->g,&s->u,&s->d};
             for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
-            s->used=0;                                    /* primo candidato al riuso */
+            s->used=0; s->recent=0;                        /* first clock candidate on reuse */
             pthread_mutex_unlock(&g_pilot_mx);
             freed += sb; dropped++;
         }

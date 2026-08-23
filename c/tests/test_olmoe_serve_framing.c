@@ -175,8 +175,23 @@ static void test_bad_frame_stops_before_the_next_command(void)
     fclose(output);
 }
 
+static void test_clock_eviction_skips_pinned_and_inflight(void)
+{
+    Slot slots[4] = {0};
+    LCache cache = {.slots = slots, .n = 4, .cap = 4};
+    for (int i = 0; i < 4; i++) { slots[i].eid = 10 + i; slots[i].recent = 1; }
+    assert(slot_clock_victim(&cache, 0) == 0);
+    assert(cache.hand == 1);
+    slots[1].pinned = 1;
+    assert(slot_clock_victim(&cache, 0) == 2);
+    slots[0].eid = slots[2].eid = slots[3].eid = -1;
+    assert(slot_clock_victim(&cache, 0) == -1);
+    assert(slot_clock_victim(&cache, 1) == 1);
+}
+
 int main(void)
 {
+    test_clock_eviction_skips_pinned_and_inflight();
     test_submit_moves_exact_payload_into_queue();
     test_cancel_only_matches_active_request();
     test_errors_are_byte_exact_and_frames_are_consumed();
