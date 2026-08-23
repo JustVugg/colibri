@@ -2,10 +2,37 @@
  * path calls matmul_q once per prompt row; the new path shares every int8
  * weight decode between two rows.  Compare raw float bytes across even/odd
  * row counts, vector tails, and both sides of the OpenMP threshold. */
+#include <stddef.h>
+#include <stdlib.h>
+static void *qwen_test_malloc(size_t n);
+static void qwen_test_free(void *p);
+#define malloc qwen_test_malloc
+#define free qwen_test_free
 #define COLI_QWEN_BATCH_TEST 1
 #define main qwen36_main_unused
 #include "../qwen36.c"
 #undef main
+#undef malloc
+#undef free
+
+#include <sys/stat.h>
+
+static void *recycle_addr;
+static size_t recycle_size;
+static int recycle_active;
+static void *qwen_test_malloc(size_t n) {
+    if(recycle_active&&n==recycle_size&&recycle_addr){
+        void *p=recycle_addr;recycle_addr=NULL;return p;
+    }
+    return malloc(n);
+}
+static void qwen_test_free(void *p) {
+    if(recycle_active&&p&&p==recycle_addr)return;
+    if(recycle_active&&p&&recycle_addr==NULL){
+        recycle_addr=p;return;
+    }
+    free(p);
+}
 
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { \
@@ -65,6 +92,83 @@ static void clear_dense_weight(DenseWeight *w) {
     free(w->f32);free(w->q);free(w->sc);memset(w,0,sizeof(*w));
 }
 
+static void dense_quant_convention_case(void) {
+    enum { I=5,O=3 };
+    DenseWeight w={0};
+    static const float src[O*I]={
+        -2.f,-1.f,0.f,1.f,2.f,
+        0.f,0.f,0.f,0.f,0.f,
+        -.5f,-.25f,.125f,.25f,.5f
+    };
+    static const int8_t want_q[O*I]={
+        -127,-64,0,64,127,
+        0,0,0,0,0,
+        -127,-64,32,64,127
+    };
+    env_set("COLI_KEEP_F32","1");
+    w.f32=falloc(O*I);memcpy(w.f32,src,sizeof(src));
+    CHECK(dense_weight_quantize(&w,I,O),"quantization convention tensor failed");
+    CHECK(!memcmp(w.q,want_q,sizeof(want_q)),"dense per-row signed int8 convention changed");
+    CHECK(w.sc[0]==2.f/127.f&&w.sc[1]==1.f&&w.sc[2]==.5f/127.f,
+          "dense per-row f32 scale convention changed");
+    env_unset("COLI_KEEP_F32");clear_dense_weight(&w);
+    puts("qwen dense quantization: signed int8 + one exact f32 scale per row");
+}
+
+static void qwen_gs64_loader_case(void) {
+    enum { D=64,I=64,N=3*D*I,PACKED=N/2,NS=3*D };
+    static int8_t unpacked[N];static uint8_t packed[PACKED];static float scales[NS];
+    for(int i=0;i<N;i++)unpacked[i]=(int8_t)((i*11+3)%16-8);
+    for(int i=0;i<PACKED;i++)
+        packed[i]=(uint8_t)(((uint8_t)unpacked[2*i]&15)|(((uint8_t)unpacked[2*i+1]&15)<<4));
+    for(int i=0;i<NS;i++)scales[i]=(float)(i+1)/1024.f;
+
+    const char *dir="tests/tmp_qwen36_gs64_snap";
+#ifdef _WIN32
+    mkdir(dir);
+#else
+    mkdir(dir,0755);
+#endif
+    char path[256];snprintf(path,sizeof(path),"%s/model.safetensors",dir);
+    char hdr[1024];int nsbytes=(int)sizeof(scales);
+    int hl=snprintf(hdr,sizeof(hdr),
+        "{\"model.layers.0.mlp.experts.0.merged_weight\":{\"dtype\":\"U8\",\"shape\":[%d],\"data_offsets\":[0,%d]},"
+        "\"model.layers.0.mlp.experts.0.qs\":{\"dtype\":\"F32\",\"shape\":[%d],\"data_offsets\":[%d,%d]}}",
+        PACKED,PACKED,NS,PACKED,PACKED+nsbytes);
+    FILE *f=fopen(path,"wb");
+    CHECK(f!=NULL,"cannot create Qwen gs64 safetensors fixture");
+    if(!f)return;
+    uint64_t hlen=(uint64_t)hl;
+    fwrite(&hlen,8,1,f);fwrite(hdr,1,(size_t)hl,f);
+    fwrite(packed,1,sizeof(packed),f);fwrite(scales,1,sizeof(scales),f);fclose(f);
+
+    Model m;memset(&m,0,sizeof(m));m.c.hidden=D;m.c.inter=I;m.c.expert_gs=64;
+    int active_of[1]={0};m.active_of=active_of;st_init(&m.S,dir);
+    Slot slot;memset(&slot,0,sizeof(slot));slot_ensure_allocated(&m,&slot);
+    load_expert_merged(&m,0,0,&slot);
+    CHECK(slot.is_int4==1,"packed-int4 Qwen expert was not detected by stored size");
+    CHECK(!memcmp(slot.g,unpacked,sizeof(unpacked)),"Qwen signed-nibble unpack convention changed");
+    CHECK(!memcmp(slot.gs,scales,sizeof(scales)),"Qwen gs64 f32 scales changed during load");
+    CHECK(slot.g4==NULL&&slot.u4==NULL&&slot.d4==NULL,
+          "dependency-free CPU load retained an unnecessary packed expert copy");
+
+    float x[D],got[I],want[I];for(int i=0;i<D;i++)x[i]=(float)(i-31)/64.f;
+    g_expert_gs=64;matmul_qe(got,x,slot.g,slot.gs,D,I);
+    for(int o=0;o<I;o++){
+        double acc=0.;for(int i=0;i<D;i++)acc+=(double)x[i]*(double)unpacked[o*D+i]*(double)scales[o];
+        want[o]=(float)acc;
+    }
+    for(int o=0;o<I;o++)
+        CHECK(fabsf(got[o]-want[o])<=1e-6f*(1.f+fabsf(want[o])),
+              "Qwen gs64 routed forward mismatch at row %d: got=%g want=%g",o,got[o],want[o]);
+    g_expert_gs=0;
+
+    free(slot.g);free(slot.gs);
+    for(int i=0;i<m.S.nfd;i++)close(m.S.fds[i]);
+    unlink(path);rmdir(dir);
+    puts("qwen routed expert: packed signed int4 + f32 gs64 scales forward exact");
+}
+
 static void incremental_release_case(void) {
     enum { I=16,O=4 };
     DenseWeight first={0},second={0},kept={0};
@@ -73,6 +177,8 @@ static void incremental_release_case(void) {
 
     first.f32=falloc((int64_t)I*O);
     for(int i=0;i<I*O;i++)first.f32[i]=input_value(i,8);
+    void *first_addr=first.f32;
+    recycle_addr=first.f32;recycle_size=sizeof(float)*I*O;recycle_active=1;
     CHECK(dense_weight_quantize(&first,I,O),"first tensor did not quantize");
     CHECK(first.f32==NULL,"first f32 tensor survived its quantization step");
     CHECK(first.q!=NULL&&first.sc!=NULL,"first tensor has no int8 representation");
@@ -81,7 +187,11 @@ static void incremental_release_case(void) {
      * two DenseWeight objects must still dispatch to their own int8 data even
      * if malloc recycles the just-freed f32 address. */
     second.f32=falloc((int64_t)I*O);
+    CHECK(second.f32==first_addr,
+          "test allocator did not hand the exact freed source address to the next tensor");
+    CHECK(recycle_addr==NULL,"test allocator did not force exact source-address reuse");
     for(int i=0;i<I*O;i++)second.f32[i]=input_value(i,9);
+    recycle_active=0;
     CHECK(dense_weight_quantize(&second,I,O),"second tensor did not quantize");
     CHECK(second.f32==NULL,"second f32 tensor survived its quantization step");
     for(int i=0;i<I;i++)x[i]=input_value(i,10);
@@ -144,6 +254,8 @@ int main(void) {
     /* This gate owns the dense-int8 mode regardless of the caller's shell. */
     env_unset("COLI_DENSE_I8");
     incremental_release_case();
+    dense_quant_convention_case();
+    qwen_gs64_loader_case();
     one_shape(1, 17, 13);       /* decode-shaped fallback */
     one_shape(2, 32, 31);       /* one vector block, one row pair */
     one_shape(4, 64, 73);       /* even prompt, serial OpenMP clause */
