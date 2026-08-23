@@ -172,6 +172,11 @@ different router contracts and expert counts — their operating points have not
 been measured. Until they are, treat `tau=0.03` as a starting point and verify
 quality on your model before relying on it.
 
+**These numbers assume a warm expert cache.** Cold-start sessions — where the cache
+begins empty and all experts miss initially — will see higher drop rates until the LRU
+fills. The steady-state perplexity delta above is what was measured; cold-start transient
+behavior has not been separately characterized.
+
 The feature is decode-only (`S≤4` guard, same as `EXPERT_BUDGET`): dropping
 experts during prefill corrupts the KV cache. A rescue rule ensures no token
 position is left with zero routed experts. Resident (pinned or LRU-cached)
