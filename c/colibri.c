@@ -9052,37 +9052,44 @@ static void vk_registry_fill(Model *m){
     double vkr_reserve = getenv("COLI_VK_RESERVE_GB")?atof(getenv("COLI_VK_RESERVE_GB")):3.0;
     int vkr_stopped=0; double vkr_used=0, vkr_budget=0;
     int64_t i2=0;
-    coli_vk_alloc_priority(0.4f);
+    coli_vk_alloc_priority(0.4f);               /* back to the dense/default class */
+    int vk_tried=0, vk_loadfail=0, vk_fmtskip=0, vk_allocfail=0, vk_ok=0;
     for(;i2<n && g_vk_reg_n<g_vk_budget;i2++){
         if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
            && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
-        int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
-        ESlot *src=NULL, *P=m->pin[layer];
+        int layer=cand[i2].layer, eid=cand[i2].eid; tried++; vk_tried++;
+        ESlot *src=NULL; ESlot *P=m->pin[layer];
         for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
-        if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){   /* 0 = success (impl convention); demand=0: startup tier fill */
+        if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){
                 if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
-                if(loadfail>=64) break;                     /* disk trouble: stop burning time */
-                continue; } src=&tmp; }
-        int xf=src->g.fmt;   /* int4 (2), grouped int4 (4), int3-g64 (5) tiers; gate/up must
-                              * share fmt for the fused gate_up shader, down may differ */
-        if((xf!=2&&xf!=4&&xf!=5)||src->u.fmt!=xf||src->u.gs!=src->g.gs
-           ||(src->d.fmt!=2&&src->d.fmt!=4&&src->d.fmt!=5)
-           ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8))){
-            if(tried<4) fprintf(stderr,"[VK] tier fill: (%d,%d) fmt %d/%d/%d not int4/int3-g64 (src=%s)\n",
-                layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
-            continue; }
+                if(loadfail>=64) break; vk_loadfail++; continue; } src=&tmp; }
+        int xf=src->g.fmt; int fmt_ok=0;
+        if((xf==2||xf==4||xf==5) && src->u.fmt==xf && src->d.fmt==xf &&
+           src->g.gs==src->u.gs && src->g.gs==src->d.gs &&
+           !((xf==4||src->d.fmt==4) && (src->g.gs<8 || src->g.gs%8))){
+            fmt_ok=1;
+        }
+        if(!fmt_ok){
+            if(vk_fmtskip<8) fprintf(stderr,"[VK] fmtskip layer=%d eid=%d g=%d/%d u=%d/%d d=%d/%d\n",layer,eid,src->g.fmt,src->g.gs,src->u.fmt,src->u.gs,src->d.fmt,src->d.gs);
+            vk_fmtskip++; continue; }
         ColiVkTensor **slot=vk_reg_at(layer,eid);
-        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
-           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
-           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
+        int ok=coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs) &&
+               coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs) &&
+               coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs);
+        if(!ok){
             if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
             if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
-            fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
-            break;
-        }
+            if(slot[2]){coli_vk_tensor_free(slot[2]);slot[2]=NULL;}
+            fprintf(stderr,"[VK] allocfail layer=%d eid=%d after resident=%d\n",layer,eid,g_vk_reg_n);
+            vk_allocfail++; break; }
         bytes+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
-        g_vk_reg_n++;
+        {
+            ESlot *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ P[z].g.vk_eligible=1; break; }
+        }
+        g_vk_reg_n++; vk_ok++;
     }
+    fprintf(stderr,"[VK] tier summary: tried=%d loadfail=%d fmtskip=%d allocfail=%d ok=%d resident=%d\n",vk_tried,vk_loadfail,vk_fmtskip,vk_allocfail,vk_ok,g_vk_reg_n);
     coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
     fprintf(stderr,"[VK] expert tier: %d hot experts resident (%.2f GB VRAM, %.1fs, top-%d of history)\n",
             g_vk_reg_n,bytes/1e9,now_s()-t0,tried);

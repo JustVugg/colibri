@@ -156,7 +156,7 @@ static void hwinfo_emit(Model *m){
     hw_probe(cpu,sizeof(cpu),&cores,&ram_total,&ram_avail);
     int ngpu=0; double vram_total=0;
     char gpu_name[128]="";
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA)
     ngpu=g_cuda_ndev; vram_total=m->gpu_expert_bytes/1e9;
     for(int i=0;i<g_cuda_ndev;i++){
         size_t fr=0,to=0; coli_cuda_mem_info(g_cuda_devices[i],&fr,&to);
@@ -164,6 +164,9 @@ static void hwinfo_emit(Model *m){
     }
     if(g_cuda_ndev>0)
         snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+#elif defined(COLI_VULKAN)
+    ngpu = coli_vk_available() ? 1 : 0;
+    vram_total = coli_vk_expert_bytes()/1e9;
 #endif
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
         cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
@@ -177,8 +180,10 @@ static void tiers_emit(Model *m){
     int pinned=0,lru=0;
     for(int i=0;i<=c->n_layers;i++){ pinned+=m->npin?m->npin[i]:0; lru+=m->ecn?m->ecn[i]:0; }
     int vram=0; double vram_gb=0;
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA)
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
+#elif defined(COLI_VULKAN)
+    vram=coli_vk_expert_count(); vram_gb=coli_vk_expert_bytes()/1e9;
 #endif
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
@@ -216,12 +221,18 @@ static void emap_emit(Model *m){
             for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
+#elif defined(COLI_VULKAN)
+                tier = P[z].g.vk_eligible?2:1;
 #else
                 tier = 1;
 #endif
                 break; }
             if(!tier && m->ecache && m->ecache[i])
                 for(int z=0;z<m->ecn[i];z++) if(m->ecache[i][z].eid==e){ tier=1; break; }
+            if(!tier){
+                ColiVkTensor **rg=vk_reg_at(i,e);
+                if(rg && rg[0]!=NULL) tier=2;
+            }
             uint32_t u = m->eusage[i]?m->eusage[i][e]:0;
             int heat=0; while(u){ heat++; u>>=1; } if(heat>63) heat=63;
             int b=(tier<<6)|heat;

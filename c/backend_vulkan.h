@@ -88,6 +88,10 @@ int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                            ColiVkTensor *const *downs, const int *rows, int count,
                            float *y, const float *x);
 
+int  coli_vk_available(void);
+int  coli_vk_expert_count(void);
+int64_t coli_vk_expert_bytes(void);
+
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
  * via _reset), _row mirrors one host row (absolute position), _reset drops all layers.
