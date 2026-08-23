@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -18,9 +18,9 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Five families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T), **DeepSeek V4 Flash** (284B) and **OLMoE** (7B) — one C file each, the
-same `coli chat` / `coli serve` / `coli web` front end.
+Six families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T), **DeepSeek V4 Flash** (284B), **Qwen3.6** (35B-A3B) and **OLMoE** (7B) —
+one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
@@ -162,8 +162,40 @@ the right experts get. It works because routing has measurable structure (see
 the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
 structure is cacheable.
 
-The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
-at runtime, no GPU required.
+The engine is a single C file (`c/colibri.c`) plus small headers. No BLAS, no
+Python at runtime, no GPU required.
+
+### Local cluster mode
+
+The coordinator keeps token generation, routing, and KV state local while
+disk-backed expert workers execute routed FFNs on other Macs. A layer's routed
+batch-union is sent as one persistent TCP request, so a token does not incur one
+round trip per expert.
+
+Start the optional registration service:
+
+```bash
+./coli cluster coordinator --host 0.0.0.0 --port 8765
+```
+
+On each worker, with the same converted model available locally:
+
+```bash
+./coli cluster worker --model /nvme/glm52_i4 --port 9100 \
+  --coordinator http://COORDINATOR:8765 --advertise-host WORKER_IP
+```
+
+Run the coordinator with discovery, or provide `--cluster-workers
+HOST:PORT,...` for a static setup:
+
+```bash
+./coli serve --model /nvme/glm52_i4 \
+  --cluster-coordinator http://127.0.0.1:8765
+```
+
+The transport is disabled unless workers are configured, so the existing
+single-machine path remains unchanged. Dense-layer sharding and browser/WebGPU
+workers are separate follow-up seams.
 
 ## How it works
 
@@ -358,7 +390,7 @@ the full 756 GB on disk at once:
 
 #### Other supported models
 
-GLM-5.2 is the reference model, but the same streaming approach runs three more
+GLM-5.2 is the reference model, but the same streaming approach runs five more
 families. Each is a **sibling engine** — one C file, its own architecture, the same
 `coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
 the model's `config.json`):
@@ -370,11 +402,12 @@ the model's `config.json`):
 >
 > | Model | Disk for the weights | RAM | GPU |
 > |---|---|---|---|
-> | **OLMoE** | ~4 GB | 8 GB | not needed |
+> | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed |
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
-> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 22 GB comfortable | not needed |
+> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; an NVIDIA card (any sm_80+, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
+> | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -386,7 +419,16 @@ the model's `config.json`):
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
-| **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
+| **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
+| **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+
+Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
+cosine to the int8 anchor 0.98777 → 0.99313 and KL 0.109 → 0.080 against per-row, i.e.
+~44% less quantization error), [int4 per-row](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4)
+as the A/B baseline, and [KAT-Coder v2.5](https://huggingface.co/Kreuzzelg/kat-coder-v2.5-dev-colibri-i4-gs64),
+which the same engine runs unchanged — any architecture-identical checkpoint works
+without a code path of its own. With `CUDA=1` the VRAM expert tier measured
+**1.44 → 10.05 tok/s (7.0×) on two 8 GB cards**, output bit-identical to the CPU path.
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
@@ -465,16 +507,26 @@ Two things that differ per model, both documented in the per-model page:
 **DeepSeek V4 Flash** streams the official checkpoint with no conversion: routed
 experts stay **native fp4**, the dense set stays **fp8-e4m3** with UE8M0 block
 scales. MLA + DSA sparse attention, 43 layers, 256 routed experts plus one
-shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2.
+shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2 (CPU), with
+an optional CUDA tier (Windows runtime DLL; Linux `CUDA=1` direct link,
+verified under WSL2) that keeps every stage CPU-canonical and falls back per stage.
 
 ```bash
 cd c
 make deepseek-v4
-python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
+python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 32
 # also: coli run / coli serve / coli web
+# Windows CUDA tier: make cuda-dsv4-dll CUDA_ARCH=portable  (+ make cuda-dsv4-dg-dll on RTX 50)
 ```
 
-Greedy decode, one KV slot; tools and grammar are not wired up yet.
+Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
+with V4's native prompt and DSML call blocks; grammar is not supported. See the
+[per-engine API matrix](docs/api.md#tool-calling-support). Prefix checkpoints
+(in memory + on disk) make agent sessions and follow-up turns start in seconds
+after the first prefill of a system prompt. Measured on an RTX 5080 + 2 NVMe:
+3324-token prefill 90 s, 8.3k-token first turn ~4 min once, later
+sessions/turns 6-9 s, decode ~1.6 tok/s at 3k context — see
+[docs/deepseek-v4.md](docs/deepseek-v4.md).
 
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`
@@ -489,8 +541,9 @@ the drafts saved — one 14-token answer took 495 seconds. So `V4_DRAFT` and
 `V4_MTP` default to `0` and the code stays, with the numbers beside it, for
 whoever retries this on faster storage.
 
-See [docs/deepseek-v4.md](docs/deepseek-v4.md) for checkpoint validation, the
-generated tiny independent oracle, and the full knob list.
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for the CUDA tier (build, DLL
+selection, GPU coverage), the environment reference, performance numbers,
+checkpoint validation, and the generated tiny independent oracle.
 
 ## What's next
 
@@ -513,7 +566,7 @@ today its numbers come from a community of real machines. If it's useful to you:
 - ⭐ star the repo and share it;
 - 🐛 open issues with benchmark numbers from your hardware — datapoints move
   this project more than anything else;
-- 💬 join the [Discord community](https://discord.gg/fpQxKnRb) to discuss
+- 💬 join the [Discord community](https://discord.gg/MAaKtQRc) to discuss
   experiments, hardware results, and research directions;
 - 💬 reach out via GitHub issues to sponsor development or donate hardware.
 

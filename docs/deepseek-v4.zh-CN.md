@@ -1,6 +1,9 @@
-# DeepSeek V4 目标引擎（colibri CPU）
+# DeepSeek V4 目标引擎（CPU + 可选 CUDA 层）
 
 [English](deepseek-v4.md)
+
+> 本页为早期版本，尚未更新 CUDA 层（Windows DLL / Linux `CUDA=1`）、环境变量
+> 参考、前缀检查点与性能数据。以英文页为准。
 
 这是 V4 拆分后第一个 PR 中的 DeepSeek V4 Flash 目标引擎。DSpark 推测解码
 不属于本 PR，将放在后续连续（stacked）PR 中。
@@ -65,8 +68,11 @@ python ./coli serve --model /path/to/DeepSeek-V4-Flash --ram 32
 python ./coli web --model /path/to/DeepSeek-V4-Flash --ram 32
 ```
 
-V4 chat 使用模型原生标记。原生服务当前只支持 greedy 和一个活动 KV slot，
-tools 与 grammar 会被拒绝。请求会重新 prefill，但进程、权重、dense、
+V4 chat 使用模型原生标记。原生服务当前支持 greedy 和一个活动 KV slot。
+HTTP gateway 会把 OpenAI 与 Anthropic 的工具转换为 V4 原生 prompt 协议，
+再把 DSML 调用块解析回相应协议；grammar 仍不支持。参见
+[各引擎 API 支持表](api.md#tool-calling-support)。请求会复用严格匹配的 prompt
+前缀，只 prefill 新增后缀；prompt 分叉时则从头 prefill。进程、权重、dense、
 head 与专家缓存会保持热状态。
 
 ## 验证

@@ -7,6 +7,9 @@ cd "$(dirname "$0")"
 echo "🐦 colibrì — setup"
 
 UNAME_S=$(uname -s)
+OMP_PROBE=".colibri-omp-probe-$$"
+cleanup_omp_probe() { rm -f "$OMP_PROBE" "$OMP_PROBE.exe"; }
+trap cleanup_omp_probe EXIT
 
 # 1) dipendenze
 command -v make >/dev/null || { echo "make is missing"; exit 1; }
@@ -21,14 +24,16 @@ Darwin)
 MINGW*|MSYS*)
     command -v gcc  >/dev/null || { echo "gcc is missing (MinGW-w64). Install: pacman -S mingw-w64-x86_64-gcc make"; exit 1; }
     echo "  gcc: $(gcc -dumpversion) · MinGW-w64"
-    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "libgomp is missing (pacman -S mingw-w64-x86_64-gcc)"; exit 1; }
+    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o "$OMP_PROBE" 2>/dev/null && echo ok || { echo "libgomp is missing (pacman -S mingw-w64-x86_64-gcc)"; exit 1; }
     ;;
 *)
     command -v gcc  >/dev/null || { echo "gcc is missing (for example: sudo apt install build-essential)"; exit 1; }
     echo "  gcc: $(gcc -dumpversion) · $(nproc) core"
-    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "libgomp is missing"; exit 1; }
+    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o "$OMP_PROBE" 2>/dev/null && echo ok || { echo "libgomp is missing"; exit 1; }
     ;;
 esac
+cleanup_omp_probe
+trap - EXIT
 
 # 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
 echo "  building (ARCH=${ARCH:-native})…"

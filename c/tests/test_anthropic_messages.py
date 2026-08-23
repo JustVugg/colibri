@@ -174,6 +174,7 @@ class MessagesHTTPTest(unittest.TestCase):
                 before = len(self.engine.prompts)
                 with self.assertRaises(HTTPError) as caught:
                     self.post(body)
+                self.addCleanup(caught.exception.close)
                 self.assertEqual(caught.exception.code, 400)
                 self.assertIn("tool", json.load(caught.exception)["error"]["message"].lower())
                 self.assertEqual(len(self.engine.prompts), before)
@@ -197,11 +198,13 @@ class MessagesHTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
         with self.assertRaises(HTTPError) as caught:
             self.post(self.base_body(), {"x-api-key": "wrong"})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_error_envelope_is_anthropic_shaped(self):
         with self.assertRaises(HTTPError) as caught:
             self.post({"model": "test-model", "messages": [{"role": "user", "content": "x"}]})
+        self.addCleanup(caught.exception.close)
         payload = json.load(caught.exception)
         self.assertEqual(payload["type"], "error")
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
@@ -403,6 +406,7 @@ class MessagesHTTPTest(unittest.TestCase):
         for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):
             with self.assertRaises(HTTPError) as caught:
                 self.post(self.base_body(**{field: value}))
+            self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
             self.assertIn(field, json.load(caught.exception)["error"]["message"])
 

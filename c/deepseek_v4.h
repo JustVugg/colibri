@@ -119,10 +119,22 @@ typedef struct {
     int max_new_tokens_cap;  /* 0 => 512 */
 } ColiV4SessionCreateOptions;
 
+/* Return non-zero to abort generation. Polled between prefill chunks, where
+ * the per-token callback cannot fire; a NULL callback keeps prefill
+ * uninterruptible as before. */
+typedef int (*ColiV4SessionAbortFn)(void *user_data);
+
 typedef struct {
     int max_new_tokens;      /* required; clamped by session cap */
     int stop_at_sentence;
     int no_dspark;           /* disable speculative draft/verification */
+    ColiV4SessionAbortFn should_abort;  /* optional prefill abort poll */
+    void *abort_user_data;
+    /* Optional: byte length of the prompt's stable leading prefix (the
+     * rendered system turn). The session snapshots the attention state at
+     * that token boundary during this prefill so later conversations that
+     * share it start there. 0 = unknown. */
+    size_t prefix_bytes;
 } ColiV4SessionGenerateOptions;
 
 typedef struct {

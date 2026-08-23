@@ -188,7 +188,14 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                     __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-                a+=hsum256(acc)*sc;
+                /* Pinned as an fma in the SOURCE. With the default
+                 * -ffp-contract=fast the compiler may fuse this multiply-add
+                 * (one rounding) or not (two), so the same source produced
+                 * different bits depending on the flag -- see the PR for a
+                 * reproduction. That made every bit-exactness gate, including
+                 * the glm_tiny token oracle, depend on build flags rather than
+                 * on the code. */
+                a=fmaf(hsum256(acc),sc,a);
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];
@@ -551,32 +558,6 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
 #else
 #define IDOT_KERNEL "scalar"
 #endif
-static int g_idot=1;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static int g_i4s=1;
-#elif defined(__VSX__)
-static int g_i4s=1;
-#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
-static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
-                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
-                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
-                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
-                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
-#else
-static int g_i4s=2;
-#endif
-static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
-                       * region across all experts of the batch-union block instead of ~2
-                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
-                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
-                       * byte-identical to that family (same dot_i4i8 per row, same silu,
-                       * same requant, same accumulation order into out). Measured on a
-                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
-                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
-                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
-                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
-                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
-                       * opt-in; measure on your host. */
 
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
@@ -931,6 +912,377 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
+
+
+/* ================= K1: layout int4 A PIANI (fmt 2/4, opzionale) ==============
+ * Layout classico ("a coppie"): byte k = elementi (2k, 2k+1). Ogni kernel paga
+ * unpacklo/unpackhi per riordinare i nibble, e l'IDOT paga sub+abs+sign per
+ * forzare l'operando con segno dentro vpdpbusd (che e' nativamente u8 x s8).
+ *
+ * Layout A PIANI, per blocco di 64 elementi consecutivi (32 byte):
+ *   byte k del blocco = (elem k + 8) | ((elem k+32 + 8) << 4)      k = 0..31
+ * `and 0x0F` produce gli elementi 0..31 GIA' in ordine; `srli 4 + and` produce
+ * 32..63 in ordine: l'unpack sparisce. La coda (I mod 64) resta a coppie.
+ *
+ * L'algebra dell'IDOT: i nibble memorizzati sono u = v+8 (unsigned 0..15), e
+ *   dot(v, x) = dot(u, x) - 8 * sum(x)
+ * dove sum(x) e' UN int32 per riga di attivazione, condiviso da ogni riga di
+ * output. vpdpbusd consuma (u8, s8) direttamente: via sub+abs+sign (3 op
+ * vettoriali per dpbusd). Misurato su questa famiglia: 1.87x L3-resident,
+ * 25.3 GB/s DRAM (al tetto), 0 differenze di bit.
+ * NB: allargare a 256 bit SENZA cambiare layout e' stato misurato 0.79-0.81x
+ * (il fixup di lane costa piu' della larghezza): il layout e' la precondizione
+ * della larghezza, non un'ottimizzazione indipendente.
+ *
+ * I kernel f32 planari preservano ESATTAMENTE l'ordine di accumulazione dei
+ * gemelli a coppie (stesse lane, stessa sequenza 0..63): bit-identici anche
+ * loro. EN: plane-nibble int4 layout. Low nibble of block byte k = element k,
+ * high = element k+32; the unpack disappears, and the stored-unsigned nibbles
+ * feed vpdpbusd natively via dot(v,x) = dot(u,x) - 8*sum(x). The f32 planar
+ * kernels keep the pair kernels' exact accumulation order: bit-identical. */
+
+/* riordina in place una riga (o un tensore [O,rb] riga per riga) da coppie a
+ * piani; la coda I%64 resta a coppie. EN: in-place pair->planar repack. */
+static void planarize_i4_row(uint8_t *row, int I){
+    uint8_t tmp[32];
+    int nb=I/64;
+    for(int b=0;b<nb;b++){
+        uint8_t *blk=row+b*32;
+        /* pair: byte j ha (elem 2j, elem 2j+1). planar: byte k = (elem k, elem k+32) */
+        for(int k=0;k<32;k++){
+            int src_lo=k, src_hi=k+32;                       /* elementi voluti */
+            uint8_t nib_lo=(blk[src_lo>>1]>>((src_lo&1)*4))&0xF;
+            uint8_t nib_hi=(blk[src_hi>>1]>>((src_hi&1)*4))&0xF;
+            tmp[k]=(uint8_t)(nib_lo|(nib_hi<<4));
+        }
+        memcpy(blk,tmp,32);
+    }
+}
+static void planarize_i4(uint8_t *q4, int O, int I){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++) planarize_i4_row(q4+(int64_t)o*rb, I);
+}
+
+/* dot unsigned-nibble planare * int8: ritorna dot(u, x) SENZA la correzione
+ * -8*sum(x) (la applica il chiamante, una volta per riga di output).
+ * Coda I%64: nibble a coppie letti come unsigned, stessa identita'. */
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+#if defined(__AVXVNNI__) && !defined(__AVX512VNNI__)
+#define coli_dpbusd256 _mm256_dpbusd_avx_epi32
+#else
+#define coli_dpbusd256 _mm256_dpbusd_epi32
+#endif
+#endif
+static inline int32_t dot_i4p_u(const uint8_t *w4, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#if defined(coli_dpbusd256)
+    const __m256i m4=_mm256_set1_epi8(0x0F);
+    __m256i a0=_mm256_setzero_si256(),a1=_mm256_setzero_si256();
+    __m256i a2=_mm256_setzero_si256(),a3=_mm256_setzero_si256();
+    for(;i+128<=I;i+=128){
+        __m256i b0=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        __m256i b1=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)+32));
+        a0=coli_dpbusd256(a0,_mm256_and_si256(b0,m4),
+                          _mm256_loadu_si256((const __m256i*)(x+i)));
+        a1=coli_dpbusd256(a1,_mm256_and_si256(_mm256_srli_epi16(b0,4),m4),
+                          _mm256_loadu_si256((const __m256i*)(x+i+32)));
+        a2=coli_dpbusd256(a2,_mm256_and_si256(b1,m4),
+                          _mm256_loadu_si256((const __m256i*)(x+i+64)));
+        a3=coli_dpbusd256(a3,_mm256_and_si256(_mm256_srli_epi16(b1,4),m4),
+                          _mm256_loadu_si256((const __m256i*)(x+i+96)));
+    }
+    __m256i acc=_mm256_add_epi32(_mm256_add_epi32(a0,a1),_mm256_add_epi32(a2,a3));
+    for(;i+64<=I;i+=64){
+        __m256i b0=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        acc=coli_dpbusd256(acc,_mm256_and_si256(b0,m4),
+                           _mm256_loadu_si256((const __m256i*)(x+i)));
+        acc=coli_dpbusd256(acc,_mm256_and_si256(_mm256_srli_epi16(b0,4),m4),
+                           _mm256_loadu_si256((const __m256i*)(x+i+32)));
+    }
+    sum=hsum256_i32(acc);
+#elif defined(__AVX2__)
+    const __m256i m4=_mm256_set1_epi8(0x0F);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+64<=I;i+=64){
+        __m256i b0=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        /* maddubs(u8, s8): u<=15, |x|<=127 -> coppia <= 3810, int16 sicuro */
+        __m256i p0=_mm256_maddubs_epi16(_mm256_and_si256(b0,m4),
+                                        _mm256_loadu_si256((const __m256i*)(x+i)));
+        __m256i p1=_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(b0,4),m4),
+                                        _mm256_loadu_si256((const __m256i*)(x+i+32)));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p0,ones));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p1,ones));
+    }
+    sum=hsum256_i32(acc);
+#elif defined(__ARM_NEON)
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        uint8x16_t b0=vld1q_u8(w4+(i>>1)), b1=vld1q_u8(w4+(i>>1)+16);
+        int8x16_t lo0=vreinterpretq_s8_u8(vandq_u8(b0,vdupq_n_u8(0x0F)));
+        int8x16_t lo1=vreinterpretq_s8_u8(vandq_u8(b1,vdupq_n_u8(0x0F)));
+        int8x16_t hi0=vreinterpretq_s8_u8(vshrq_n_u8(b0,4));
+        int8x16_t hi1=vreinterpretq_s8_u8(vshrq_n_u8(b1,4));
+#if defined(__ARM_FEATURE_DOTPROD)
+        acc=vdotq_s32(acc,lo0,vld1q_s8(x+i));
+        acc=vdotq_s32(acc,lo1,vld1q_s8(x+i+16));
+        acc=vdotq_s32(acc,hi0,vld1q_s8(x+i+32));
+        acc=vdotq_s32(acc,hi1,vld1q_s8(x+i+48));
+#else
+        int8x16_t xs0=vld1q_s8(x+i), xs1=vld1q_s8(x+i+16);
+        int8x16_t xs2=vld1q_s8(x+i+32), xs3=vld1q_s8(x+i+48);
+        int16x8_t m;
+        m=vmull_s8(vget_low_s8(lo0),vget_low_s8(xs0));  acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_high_s8(lo0),vget_high_s8(xs0)); acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_low_s8(lo1),vget_low_s8(xs1));  acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_high_s8(lo1),vget_high_s8(xs1)); acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_low_s8(hi0),vget_low_s8(xs2));  acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_high_s8(hi0),vget_high_s8(xs2)); acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_low_s8(hi1),vget_low_s8(xs3));  acc=vpadalq_s16(acc,m);
+        m=vmull_s8(vget_high_s8(hi1),vget_high_s8(xs3)); acc=vpadalq_s16(acc,m);
+#endif
+    }
+    sum=vaddvq_s32(acc);
+#endif
+    for(;i+64<=I;i+=64){          /* fallback scalare sui blocchi planari */
+        const uint8_t *blk=w4+(i>>1);
+        for(int k=0;k<32;k++){
+            sum+=(int32_t)(blk[k]&0xF)*x[i+k];
+            sum+=(int32_t)(blk[k]>>4)*x[i+k+32];
+        }
+    }
+    for(;i<I;i+=2){               /* coda a coppie, unsigned (u=v+8 memorizzato) */
+        uint8_t byte=w4[i>>1];
+        sum+=(int32_t)(byte&0xF)*x[i];
+        if(i+1<I) sum+=(int32_t)(byte>>4)*x[i+1];
+    }
+    return sum;
+}
+
+/* ---- K1b (OPT-IN, IDOT_GS=1): IDOT planare A GRUPPI (fmt=4, gs%64==0) -----
+ * Con gs=64 il gruppo di scala COINCIDE col blocco-piano da 64 elementi: il
+ * dot unsigned del blocco (2 dpbusd) -> int32 di gruppo, meno 8*somma(x) del
+ * gruppo, per la scala f32 del gruppo. Attivazioni int8 (stessa famiglia
+ * qrow_i8 del resto dell'IDOT): NON bit-identico al kernel f32 a gruppi --
+ * per questo e' dietro flag, in attesa dell'ablazione. xsg = somme int32
+ * per (riga, gruppo), calcolate dal chiamante in una passata esatta.
+ * EN: grouped planar IDOT, opt-in. With gs=64 the scale group IS the plane
+ * block; per-group unsigned dot minus 8*group-sum, times the group scale.
+ * int8 activations: not bit-identical to the f32 grouped kernel, hence the
+ * flag until the ablation blesses a default. */
+static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
+                                    const int32_t *xsg, const uint8_t *q4,
+                                    const float *scale, int S, int I, int O, int gs){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs, bpg=gs/64;   /* blocchi-piano per gruppo */
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const int8_t *xr=xq+(int64_t)s*I;
+            const int32_t *xg=xsg+(int64_t)s*ng;
+            float a=0; int g=0;
+            for(; (g+1)*gs<=I; g++){                     /* gruppi interi */
+                int32_t d=0;
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    const uint8_t *blk=w+(base>>1);
+                    const int8_t *xb=xr+base;
+#if defined(coli_dpbusd256)
+                    const __m256i m4=_mm256_set1_epi8(0x0F);
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i acc=_mm256_setzero_si256();
+                    acc=coli_dpbusd256(acc,_mm256_and_si256(bb,m4),
+                                       _mm256_loadu_si256((const __m256i*)xb));
+                    acc=coli_dpbusd256(acc,_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
+                                       _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    d+=hsum256_i32(acc);
+#elif defined(__AVX2__)
+                    const __m256i m4=_mm256_set1_epi8(0x0F);
+                    const __m256i ones=_mm256_set1_epi16(1);
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i p0=_mm256_maddubs_epi16(_mm256_and_si256(bb,m4),
+                                                    _mm256_loadu_si256((const __m256i*)xb));
+                    __m256i p1=_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
+                                                    _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    __m256i acc=_mm256_add_epi32(_mm256_madd_epi16(p0,ones),
+                                                 _mm256_madd_epi16(p1,ones));
+                    d+=hsum256_i32(acc);
+#else
+                    for(int k=0;k<32;k++){
+                        d+=(int32_t)(blk[k]&0xF)*xb[k];
+                        d+=(int32_t)(blk[k]>>4)*xb[k+32];
+                    }
+#endif
+                }
+                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+            }
+            if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
+                int32_t d=0;
+                for(int i=g*gs;i<I;i++){
+                    uint8_t byte=w[i>>1];
+                    d+=(int32_t)((i&1)?(byte>>4):(byte&0xF))*xr[i];
+                }
+                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+            }
+            y[(int64_t)s*O+o]=a*sx[s];
+        }
+    }
+}
+
+/* matmul IDOT planare (fmt=2): y = (dot_u - 8*xsum[s]) * scale[o] * sx[s].
+ * Bit-identico a matmul_i4_idot: somme intere, identita' esatta. */
+static void matmul_i4p_idot(float *y, const int8_t *xq, const float *sx, const int32_t *xsum,
+                            const uint8_t *q4, const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        int s=0;
+#if defined(coli_dpbusd256)
+        /* K2: tile 1x4 sulla union — il blocco pesi (load + 2 and + srli) si
+         * paga UNA volta per 4 righe di attivazione invece che per riga. La
+         * union del prefill consegna nr=2..16 righe per expert: e' esattamente
+         * la finestra che il per-riga serviva peggio. Somme intere ->
+         * bit-identico al path per-riga per associativita'.
+         * EN: 1x4 register tile — the weight block's load+mask cost is paid
+         * once per 4 activation rows. Integer sums: bit-identical to the
+         * per-row path by associativity. */
+        const __m256i m4t=_mm256_set1_epi8(0x0F);
+        for(;s+4<=S;s+=4){
+            const int8_t *x0=xq+(int64_t)s*I, *x1=x0+I, *x2=x1+I, *x3=x2+I;
+            __m256i a0=_mm256_setzero_si256(), a1=_mm256_setzero_si256();
+            __m256i a2=_mm256_setzero_si256(), a3=_mm256_setzero_si256();
+            int i=0;
+            for(;i+64<=I;i+=64){
+                __m256i b =_mm256_loadu_si256((const __m256i*)(w+(i>>1)));
+                __m256i lo=_mm256_and_si256(b,m4t);
+                __m256i hi=_mm256_and_si256(_mm256_srli_epi16(b,4),m4t);
+                a0=coli_dpbusd256(a0,lo,_mm256_loadu_si256((const __m256i*)(x0+i)));
+                a0=coli_dpbusd256(a0,hi,_mm256_loadu_si256((const __m256i*)(x0+i+32)));
+                a1=coli_dpbusd256(a1,lo,_mm256_loadu_si256((const __m256i*)(x1+i)));
+                a1=coli_dpbusd256(a1,hi,_mm256_loadu_si256((const __m256i*)(x1+i+32)));
+                a2=coli_dpbusd256(a2,lo,_mm256_loadu_si256((const __m256i*)(x2+i)));
+                a2=coli_dpbusd256(a2,hi,_mm256_loadu_si256((const __m256i*)(x2+i+32)));
+                a3=coli_dpbusd256(a3,lo,_mm256_loadu_si256((const __m256i*)(x3+i)));
+                a3=coli_dpbusd256(a3,hi,_mm256_loadu_si256((const __m256i*)(x3+i+32)));
+            }
+            int32_t d0=hsum256_i32(a0), d1=hsum256_i32(a1);
+            int32_t d2=hsum256_i32(a2), d3=hsum256_i32(a3);
+            /* coda a coppie, unsigned: stessa identita' -8*xsum del per-riga */
+            for(;i<I;i+=2){
+                uint8_t byte=w[i>>1];
+                d0+=(int32_t)(byte&0xF)*x0[i]; d1+=(int32_t)(byte&0xF)*x1[i];
+                d2+=(int32_t)(byte&0xF)*x2[i]; d3+=(int32_t)(byte&0xF)*x3[i];
+                if(i+1<I){
+                    d0+=(int32_t)(byte>>4)*x0[i+1]; d1+=(int32_t)(byte>>4)*x1[i+1];
+                    d2+=(int32_t)(byte>>4)*x2[i+1]; d3+=(int32_t)(byte>>4)*x3[i+1];
+                }
+            }
+            y[(int64_t)(s+0)*O+o]=(float)(d0-8*xsum[s+0])*sc*sx[s+0];
+            y[(int64_t)(s+1)*O+o]=(float)(d1-8*xsum[s+1])*sc*sx[s+1];
+            y[(int64_t)(s+2)*O+o]=(float)(d2-8*xsum[s+2])*sc*sx[s+2];
+            y[(int64_t)(s+3)*O+o]=(float)(d3-8*xsum[s+3])*sc*sx[s+3];
+        }
+#endif
+        for(;s<S;s++){
+            int32_t d=dot_i4p_u(w,xq+(int64_t)s*I,I)-8*xsum[s];
+            y[(int64_t)s*O+o]=(float)d*sc*sx[s];
+        }
+    }
+}
+
+/* f32 planare (fmt=2): stesso ordine di accumulazione di matmul_i4 (sequenza
+ * 0..63 in blocchi di 8 lane, stessa lane per elemento) -> bit-identico. */
+static void matmul_i4p(float *y, const float *x, const uint8_t *q4, const float *scale,
+                       int S, int I, int O){
+#ifdef __AVX2__
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            const __m256i m4=_mm256_set1_epi32(0xF), b8=_mm256_set1_epi32(8);
+            __m256 acc=_mm256_setzero_ps();
+            int i=0;
+            for(;i+64<=I;i+=64){
+                __m128i lo0=_mm_loadu_si128((const __m128i*)(w+(i>>1)));      /* byte 0..15 */
+                __m128i lo1=_mm_loadu_si128((const __m128i*)(w+(i>>1)+16));   /* byte 16..31 */
+                /* elementi 0..31: nibble bassi in ordine */
+                __m256i e0=_mm256_and_si256(_mm256_cvtepu8_epi32(lo0),m4);
+                __m256i e1=_mm256_and_si256(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0,8)),m4);
+                __m256i e2=_mm256_and_si256(_mm256_cvtepu8_epi32(lo1),m4);
+                __m256i e3=_mm256_and_si256(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1,8)),m4);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(e0,b8)),acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(e1,b8)),acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+16),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(e2,b8)),acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+24),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(e3,b8)),acc);
+                /* elementi 32..63: nibble alti in ordine */
+                __m256i h0=_mm256_srli_epi32(_mm256_cvtepu8_epi32(lo0),4);
+                __m256i h1=_mm256_srli_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0,8)),4);
+                __m256i h2=_mm256_srli_epi32(_mm256_cvtepu8_epi32(lo1),4);
+                __m256i h3=_mm256_srli_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1,8)),4);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+32),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_and_si256(h0,m4),b8)),acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+40),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_and_si256(h1,m4),b8)),acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+48),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_and_si256(h2,m4),b8)),acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+56),
+                                    _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_and_si256(h3,m4),b8)),acc);
+            }
+            /* coda: PRIMA il loop vettoriale a 16 del gemello (stesso acc,
+             * stessa sequenza per-lane {8m+L}: nessuna cucitura), POI la coda
+             * scalare identica. EN: tail = the pair kernel's 16-wide loop into
+             * the same acc (seamless per-lane order), then its scalar tail. */
+            {
+                const __m128i m4p=_mm_set1_epi8(0x0F); const __m256i b8p=_mm256_set1_epi32(8);
+                for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4p), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4p);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8p));
+                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8p));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+            }
+            float a=hsum256(acc);
+            for(;i+1<I;i+=2){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8, hi=(int)(byte>>4)-8;
+                a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
+            if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
+            y[(int64_t)s*O+o]=a*sc;
+        }
+    }
+#else
+    /* scalare: blocchi planari + coda a coppie */
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+            for(;i+64<=I;i+=64){
+                const uint8_t *blk=w+(i>>1);
+                for(int k=0;k<32;k++){
+                    a+=xs[i+k]*(float)((int)(blk[k]&0xF)-8);
+                    a+=xs[i+k+32]*(float)((int)(blk[k]>>4)-8);
+                }
+            }
+            for(;i<I;i+=2){
+                uint8_t byte=w[i>>1];
+                a+=xs[i]*(float)((int)(byte&0xF)-8);
+                if(i+1<I) a+=xs[i+1]*(float)((int)(byte>>4)-8);
+            }
+            y[(int64_t)s*O+o]=a*sc;
+        }
+    }
+#endif
+}
+/* ============================ fine blocco K1 ============================== */
 
 /* ---- per-thread quantization scratch -------------------------------------- */
 typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
@@ -1446,13 +1798,18 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
  *     y = sum_g idot_g * (2^(e8-127) * 0.5) * xscale_g
  * Activation-quant noise (~0.4%/group) rides on top of the e2m1 grid; gate
  * with K3_IDOT=0 in the K3 engine for exact-float A/B. */
-static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
-                            int S, int I, int O){
-    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
-    int rb=I/2, ng=I/32;
-    int8_t *xq=(int8_t*)malloc((size_t)S*I);
-    float *xsc=(float*)malloc((size_t)S*ng*sizeof(float));
-    if(!xq||!xsc){ fprintf(stderr,"OOM mxfp4 idot scratch\n"); exit(1); }
+/* Quantizzazione int8 per-gruppo-di-32 delle attivazioni per l'IDOT mxfp4.
+ * Estratta da matmul_mxfp4_i8 (ordine dei loop IDENTICO -> stessi byte) così i
+ * chiamanti possono sollevarla a livello layer: in kimi_k3 gate e up consumano
+ * lo stesso z, e ogni expert del layer consuma le stesse righe — prima ogni
+ * chiamata riquantizzava da capo, con un malloc/free a giro (issue del PR #1071
+ * per colibri.c; qui è la stessa malattia in forma mxfp4).
+ * EN: per-32-group int8 activation quantization for the mxfp4 IDOT kernel.
+ * Extracted with the loop order unchanged (bit-identical) so callers can hoist
+ * it to layer level: gate/up share one z, and every expert of the layer
+ * consumes the same rows. */
+static void mxfp4_qx(const float *x, int S, int I, int8_t *xq, float *xsc){
+    int ng=I/32;
     for(int s=0;s<S;s++)
         for(int g=0;g<ng;g++){
             const float *xg=x+(int64_t)s*I+g*32;
@@ -1465,6 +1822,14 @@ static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const u
                 if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
             }
         }
+}
+
+/* Compute su attivazioni GIA' quantizzate (xq/xsc da mxfp4_qx). Contratto: I%32==0.
+ * EN: compute on pre-quantized activations. Contract: I%32==0. */
+static void matmul_mxfp4_i8_pre(float *y, const int8_t *xq, const float *xsc,
+                                const uint8_t *q4, const uint8_t *e8s,
+                                int S, int I, int O){
+    int rb=I/2, ng=I/32;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
@@ -1511,12 +1876,120 @@ static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const u
             }
         }
     }
-    free(xq); free(xsc);
 }
+
+/* Wrapper storico: quantizza in scratch _Thread_local (niente più malloc/free
+ * per chiamata) e delega al kernel _pre. Stessi valori, stessi ordini.
+ * EN: historical entry point — quantize into the growable thread-local scratch
+ * (no more per-call malloc/free) and delegate to the _pre kernel. */
+static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+                            int S, int I, int O){
+    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
+    int ng=I/32;
+    int8_t *xq; float *xsc;
+    quant_scratch((size_t)S*I,(size_t)S*ng,&xq,&xsc);
+    mxfp4_qx(x,S,I,xq,xsc);
+    matmul_mxfp4_i8_pre(y,xq,xsc,q4,e8s,S,I,O);
+}
+
+#ifdef __ARM_NEON
+/* Chemin NEON pour fmt=6 (E8/IQ3).
+ *
+ * Le noyau amont n'a qu'un chemin AVX2 et un repli scalaire : sur aarch64
+ * (GB10 / DGX Spark, Apple silicon) tout le deballage retombe donc sur du C
+ * scalaire, mesure en amont a ~92 % du temps de decodage. Cette version
+ * transpose la structure du chemin AVX2, qui suit deja la forme du format :
+ *
+ *   - une "lane" = 8 poids = deux lignes de grille de 4 octets + 8 signes,
+ *     soit exactement DEUX registres NEON de 4 flottants ;
+ *   - les 8 octets de grille s'elargissent par vmovl_u8 puis vmovl_u16 ;
+ *   - les 7 bits de signe stockes plus le 8e derive de la parite deviennent
+ *     des masques par comparaison contre le vecteur de selection, appliques
+ *     par XOR du bit de signe flottant -- aucun branchement, ce qui est
+ *     precisement ce qui rendait la version scalaire couteuse ;
+ *   - le 0.5 de la convention demi-unite de la grille est replie dans
+ *     l'echelle du sous-bloc.
+ *
+ * Deux accumulateurs evitent une chaine de dependance unique sur les 32 FMA
+ * d'un super-bloc, et une seule reduction horizontale par 256 poids remplace
+ * une par 32.
+ */
+static void matmul_e8_neon(float *y, const float *x, const uint8_t *q, const float *unused,
+                           int S, int I, int O){
+    (void)unused;                                  /* les echelles vivent dans les blocs */
+    int64_t nb=e8_blocks(I), rb=e8_rowbytes(I);
+    const uint32x4_t sel_lo=(uint32x4_t){1,2,4,8};
+    const uint32x4_t sel_hi=(uint32x4_t){16,32,64,128};
+    const uint32x4_t sgn=vdupq_n_u32(0x80000000u);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wrow=q+(int64_t)o*rb;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float acc=0;
+            for(int64_t b=0;b<nb;b++){
+                const uint8_t *blk=wrow+b*E8_BBYTES;
+                uint16_t dh; memcpy(&dh, blk+96, 2);
+                float d=e8_fp16_to_f32(dh);
+                int base=(int)(b*E8_QK);
+                if(base+E8_QK<=I){
+                    float32x4_t ac0=vdupq_n_f32(0.0f), ac1=vdupq_n_f32(0.0f);
+                    for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                        uint32_t word; memcpy(&word, blk+E8_QK/4+ib*4, 4);
+                        float db=d*(0.5f+(float)((word>>28)&0xF))*0.5f;
+                        const float32x4_t vdb=vdupq_n_f32(0.5f*db);
+                        const uint8_t *ix=blk+ib*8;
+                        int off=base+ib*E8_SUB;
+                        for(int l=0;l<4;l++){
+                            uint32_t sv=(word>>(7*l))&0x7Fu;
+                            uint32_t s8=sv|((uint32_t)__builtin_parity(sv)<<7); /* parite impaire ferme la lane */
+                            uint8_t g[8];
+                            memcpy(g,   e8_grid[ix[l*2+0]], 4);
+                            memcpy(g+4, e8_grid[ix[l*2+1]], 4);
+                            uint16x8_t w16=vmovl_u8(vld1_u8(g));
+                            float32x4_t v0=vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16))),  vdb);
+                            float32x4_t v1=vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16))), vdb);
+                            uint32x4_t sd=vdupq_n_u32(s8);
+                            uint32x4_t m0=vceqq_u32(vandq_u32(sd,sel_lo),sel_lo);
+                            uint32x4_t m1=vceqq_u32(vandq_u32(sd,sel_hi),sel_hi);
+                            v0=vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v0),vandq_u32(m0,sgn)));
+                            v1=vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v1),vandq_u32(m1,sgn)));
+                            ac0=vfmaq_f32(ac0,v0,vld1q_f32(xs+off+l*8));
+                            ac1=vfmaq_f32(ac1,v1,vld1q_f32(xs+off+l*8+4));
+                        }
+                    }
+                    acc+=vaddvq_f32(vaddq_f32(ac0,ac1));
+                    continue;
+                }
+                /* Queue non alignee : on garde le deballage de reference. */
+                for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                    int off=base+ib*E8_SUB;
+                    if(off>=I) break;
+                    float w[E8_SUB];
+                    e8_expand_sub(blk, ib, d, w);
+                    int n = I-off < E8_SUB ? I-off : E8_SUB;
+                    float a=0;
+                    for(int k=0;k<n;k++) a += xs[off+k]*w[k];
+                    acc+=a;
+                }
+            }
+            y[(int64_t)s*O+o]=acc;
+        }
+    }
+}
+#endif /* __ARM_NEON */
 
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
+#ifdef __ARM_NEON
+    /* aarch64 : le corps ci-dessous na quun chemin AVX2 et un repli scalaire,
+     * donc tout retombait sur du C non vectorise. Mesure ici (expert GLM
+     * 6144x2048) : 3,6x plus rapide a S=1, et 2,2x PLUS PRECIS contre une
+     * reference en double precision. */
+    matmul_e8_neon(y, x, q, unused, S, I, O);
+    return;
+#endif
     int64_t nb=e8_blocks(I), rb=e8_rowbytes(I);
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){

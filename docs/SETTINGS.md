@@ -108,7 +108,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | KV conversation slots. |
 
-Tool calling (`tools` in the request) is supported; the opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed int4 tool calls. Server-relevant env vars: `COLI_METAL`, `PIPE`, `DIRECT`, `COLI_NO_OMP_TUNE`, `RAM_GB`, `CTX`, `KVSAVE` (all from [ENVIRONMENT.md](ENVIRONMENT.md)) apply because the server launches the same `glm` engine.
+Tool calling is supported by GLM and DeepSeek V4; Inkling, Kimi K3, and OLMoE reject active tool declarations and choices explicitly. See the [per-engine API matrix](api.md#tool-calling-support). The opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed GLM int4 tool calls; V4 uses its native DSML parser. Engine-specific runtime variables are listed in [ENVIRONMENT.md](ENVIRONMENT.md); the server passes the environment through to the selected engine.
 
 ---
 

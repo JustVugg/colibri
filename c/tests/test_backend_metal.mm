@@ -4,6 +4,7 @@
 // reference (cpu_ref_grouped) and harness (run_grouped) below -- unlike fmt 1-3 the
 // group scale is per-GROUP, not per-row, so it can't share cpu_ref's [O] scale layout.
 #include "../backend_metal.h"
+#include <Metal/Metal.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -256,9 +257,10 @@ static int run_fp8_gemm_gate(const char *name) {
 // up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
 // (q4, NULL/stale for an fmt=8 tensor whose weights live in q8) tagged as fmt=8.
 // This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
-// `fmt != 1 && fmt != 2` as its very FIRST statement, before any of g/u/d/gs/us/ds is
-// dereferenced or even resolve()'d -- so an fmt=8 submission is refused before the
-// bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
+// on its fmt allowlist ({1,2,4,5,6}) as its very FIRST statement, before any of
+// g/u/d/gs/us/ds is dereferenced or even resolve()'d -- so an fmt=8 submission is
+// refused before the bad pointer would ever be read, no matter what garbage
+// MB_BUILD packed into it. This
 // test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
 // holds) to prove the fence BY TEST rather than leaving it an artifact of moe_submit's
 // fmt allowlist happening not to include 8 (yet) -- same discipline
@@ -648,10 +650,161 @@ static int run_attn_grouped(int S, int pos_base, int gs, const char* name){
   return pass?0:1;
 }
 
+// ---- Shared error-reporting helper ------------------------------------------------
+// Computes maxAbsErr and meanAbsErr between GPU and CPU arrays, prints standardized
+// report line. `tol` is the max-abs-error tolerance (absolute, not normalized).
+// Returns 0 on pass, 1 on failure.
+static int report_err(const float *cpu, const float *gpu, size_t n, const char *name, double tol) {
+  double maxabs=0, sumabs=0, ymax=0;
+  for (size_t i=0; i<n; i++) {
+    double d = fabs((double)cpu[i] - (double)gpu[i]);
+    double v = fabs((double)cpu[i]);
+    maxabs = fmax(maxabs, d);
+    sumabs += d;
+    ymax = fmax(ymax, v);
+  }
+  double mae = sumabs / (double)n;
+  double nerr = maxabs / (ymax + 1e-9);
+  int ok = maxabs < tol;
+  printf("  %-30s maxAbs=%.2e mae=%.2e nerr=%.2e  %s\n", name, maxabs, mae, nerr, ok ? "ok" : "*** MISMATCH");
+  return ok ? 0 : 1;
+}
+
+// ---- RMSNorm CPU reference -------------------------------------------------------
+static void cpu_rmsnorm(float *out, const float *x, const float *w, int D, float eps) {
+  double ms = 0; for (int i=0; i<D; i++) ms += (double)x[i] * (double)x[i];
+  float r = 1.f / sqrtf((float)(ms / D) + eps);
+  for (int i=0; i<D; i++) out[i] = x[i] * r * w[i];
+}
+
+static int run_rmsnorm(int nrows, int D, const char *name) {
+  std::vector<float> x((size_t)nrows * D), w(D), ref((size_t)nrows * D), gpu((size_t)nrows * D);
+  srand(5050 + D + nrows);
+  for (auto &v : x) v = ((rand() % 2000) - 1000) / 1000.f;
+  for (auto &v : w) v = 0.5f + (rand() % 1000) / 1000.f;
+  float eps = 1e-5f;
+  for (int r = 0; r < nrows; r++) {
+    cpu_rmsnorm(&ref[(size_t)r * D], &x[(size_t)r * D], w.data(), D, eps);
+  }
+  memcpy(gpu.data(), x.data(), (size_t)nrows * D * 4);
+  if (!coli_metal_rmsnorm(gpu.data(), w.data(), nrows, D, eps)) {
+    printf("  %-30s FAIL (rmsnorm returned 0)\n", name); return 1;
+  }
+  return report_err(ref.data(), gpu.data(), (size_t)nrows * D, name, 1e-4);
+}
+
+// ---- Residual add CPU reference --------------------------------------------------
+static void cpu_add(float *y, const float *a, size_t n) {
+  for (size_t i = 0; i < n; i++) y[i] += a[i];
+}
+
+static int run_add(size_t n, const char *name) {
+  std::vector<float> y_cpu(n), y_gpu(n), a(n);
+  srand(6060 + (int)(n % 10000));
+  for (auto &v : y_cpu) v = ((rand() % 2000) - 1000) / 1000.f;
+  for (auto &v : a)     v = ((rand() % 2000) - 1000) / 1000.f;
+  memcpy(y_gpu.data(), y_cpu.data(), n * 4);
+  cpu_add(y_cpu.data(), a.data(), n);
+  if (!coli_metal_add(y_gpu.data(), a.data(), n)) {
+    printf("  %-30s FAIL (add returned 0)\n", name); return 1;
+  }
+  return report_err(y_cpu.data(), y_gpu.data(), n, name, 1e-6);
+}
+
+// ---- SiLU-multiply CPU reference -------------------------------------------------
+static float cpu_siluf(float x) { return x / (1.f + expf(-x)); }
+
+static void cpu_silu_mul(float *g, const float *u, size_t n) {
+  for (size_t i = 0; i < n; i++) g[i] = cpu_siluf(g[i]) * u[i];
+}
+
+static int run_silu_mul(size_t n, const char *name) {
+  std::vector<float> g_cpu(n), g_gpu(n), u(n);
+  srand(7070 + (int)(n % 10000));
+  for (auto &v : g_cpu) v = ((rand() % 4000) - 2000) / 1000.f;     // wider range to exercise sigmoid saturation
+  for (auto &v : u)     v = ((rand() % 2000) - 1000) / 1000.f;
+  memcpy(g_gpu.data(), g_cpu.data(), n * 4);
+  cpu_silu_mul(g_cpu.data(), u.data(), n);
+  if (!coli_metal_silu_mul(g_gpu.data(), u.data(), n)) {
+    printf("  %-30s FAIL (silu_mul returned 0)\n", name); return 1;
+  }
+  return report_err(g_cpu.data(), g_gpu.data(), n, name, 1e-4);
+}
+
 int main(void) {
   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
-  printf("Metal backend kernel tests:\n");
+  /* GitHub Actions Apple Silicon runners expose Metal through the Apple
+   * Paravirtual device, where Metal submissions never complete (hangs -- the
+   * #947 CI observation). The shader compile above (coli_metal_init) still
+   * runs, keeping this suite's compile coverage -- the class of bug #940
+   * shipped -- while GPU execution is honestly skipped here. (#947 review) */
+  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+  if (dev && [[dev name] containsString:@"Apple Paravirtual device"]) {
+    printf("SKIPPED: paravirtual device (%s) -- compile-only\n",
+           [[dev name] UTF8String]);
+    return 0;
+  }
+  printf("Metal standalone op tests (MAE / maxAbs error vs CPU reference):\n");
   int fail=0;
+  // RMSNorm: single-row and multi-row, real model dims, small D
+  fail |= run_rmsnorm(1, 6144, "rmsnorm S=1 D=6144");
+  fail |= run_rmsnorm(1, 256,  "rmsnorm S=1 D=256");
+  fail |= run_rmsnorm(1, 4096, "rmsnorm S=1 D=4096");
+  fail |= run_rmsnorm(1, 73,   "rmsnorm S=1 D=73 (odd)");
+  fail |= run_rmsnorm(4, 2048, "rmsnorm S=4 D=2048");
+  fail |= run_rmsnorm(8, 4096, "rmsnorm S=8 D=4096");
+  // Residual add: small, mid, large
+  fail |= run_add(256,    "add n=256");
+  fail |= run_add(6144,   "add n=6144");
+  fail |= run_add(32768,  "add n=32768");
+  fail |= run_add(1,      "add n=1 (degenerate)");
+  // SiLU-multiply: small, mid, large
+  fail |= run_silu_mul(256,    "silu_mul n=256");
+  fail |= run_silu_mul(2048,   "silu_mul n=2048");
+  fail |= run_silu_mul(32768,  "silu_mul n=32768");
+  fail |= run_silu_mul(13,     "silu_mul n=13 (odd)");
+  fail |= run_silu_mul(1,      "silu_mul n=1 (degenerate)");
+  // ---- Phase 5: expanded standalone op battery (edge cases + real model shapes) ----
+  printf("  Phase 5: expanded standalone op battery:\n");
+  // RMSNorm: simd boundary, extreme D, large batch, pathological inputs
+  fail |= run_rmsnorm(1, 1,      "rmsnorm S=1 D=1 (degenerate)");
+  fail |= run_rmsnorm(1, 2,      "rmsnorm S=1 D=2 (minimum)");
+  fail |= run_rmsnorm(1, 16,     "rmsnorm S=1 D=16 (sub-simd)");
+  fail |= run_rmsnorm(1, 32,     "rmsnorm S=1 D=32 (simd_width)");
+  fail |= run_rmsnorm(1, 128,    "rmsnorm S=1 D=128");
+  fail |= run_rmsnorm(1, 16384,  "rmsnorm S=1 D=16384 (larger)");
+  fail |= run_rmsnorm(16, 6144,  "rmsnorm S=16 D=6144 (batch)");
+  fail |= run_rmsnorm(32, 2048,  "rmsnorm S=32 D=2048 (wide batch)");
+  // Residual add: simd boundary, very large, non-power-of-2
+  fail |= run_add(16,       "add n=16 (sub-simd)");
+  fail |= run_add(32,       "add n=32 (simd_width)");
+  fail |= run_add(131072,   "add n=131072 (large)");
+  fail |= run_add(262145,   "add n=262145 (large odd)");
+  fail |= run_add(65537,    "add n=65537 (prime-ish)");
+  // SiLU-multiply: simd boundary, large, odd
+  fail |= run_silu_mul(32,     "silu_mul n=32 (simd_width)");
+  fail |= run_silu_mul(128,    "silu_mul n=128");
+  fail |= run_silu_mul(65536,  "silu_mul n=65536 (large)");
+  fail |= run_silu_mul(131073, "silu_mul n=131073 (large odd)");
+  fail |= run_silu_mul(7,      "silu_mul n=7 (small odd)");
+  fail |= run_silu_mul(2,      "silu_mul n=2 (minimum)");
+  fail |= run_silu_mul(16,     "silu_mul n=16 (sub-simd)");
+  /* TODO: KV-cache tests — run_kv_* not implemented yet
+  printf("Metal KV cache tests (MAE / maxAbs error vs CPU reference):\n");
+  fail |= run_kv_write(1, 0,   "kv_write S=1 pos=0");
+  fail |= run_kv_write(4, 12,  "kv_write S=4 pos=12");
+  fail |= run_kv_write(1, 100, "kv_write S=1 pos=100");
+  fail |= run_kv_write(8, 0,   "kv_write S=8 pos=0");
+  fail |= run_kv_clear(1, 10,  "kv_clear [0,10)");
+  fail |= run_kv_clear(5, 20,  "kv_clear [5,20)");
+  fail |= run_kv_clear(0, 0,   "kv_clear empty range");
+  fail |= run_kv_prefill(10,   "kv_prefill 10 tokens");
+  fail |= run_kv_decode(15,    "kv_decode pos=15");
+  fail |= run_kv_long_decode(100, "kv_long_decode pos=100");
+  fail |= run_kv_reset(12,     "kv_reset write-clear-reuse");
+  fail |= run_kv_multiseq(3, 8, "kv_multiseq 3 seqs len=8");
+  */
+  printf("Metal quantized GEMV tests:\n");
   fail |= run(I8, 2048,6144,1, "int8 gate/up S=1");
   fail |= run(I4, 2048,6144,1, "int4 gate/up S=1");
   fail |= run(I4, 6144,2048,1, "int4 down S=1");

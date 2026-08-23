@@ -187,6 +187,15 @@ class TemplateTest(unittest.TestCase):
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
 
+    def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
+        with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
+            self.assertEqual(generation_options({}, 8)[1], 0.25)
+            self.assertEqual(generation_options({"temperature": 0}, 8)[1], 0.0)
+        for invalid in ("malformed", "5", "-1", "nan", "1e999"):
+            with self.subTest(invalid=invalid):
+                with patch.dict("openai_server.os.environ", {"COLI_TEMP": invalid}):
+                    self.assertEqual(generation_options({}, 8)[1], 0.7)
+
     def test_validates_stop_sequences(self):
         self.assertEqual(generation_options({"stop": "END"}, 8)[4], ("END",))
         self.assertEqual(generation_options({"stop": ["ONE", "TWO"]}, 8)[4],
@@ -325,6 +334,21 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(stats["timed_out"], 1)
         self.assertEqual(stats["cancelled"], 1)
 
+    def test_counts_admitted_client_cancellation_without_completion(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
+        with self.assertRaises(ClientCancelled):
+            with scheduler.admit():
+                raise ClientCancelled()
+        stats = scheduler.snapshot()
+        self.assertEqual(stats["active"], 0)
+        self.assertEqual(stats["admitted"], 1)
+        self.assertEqual(stats["completed"], 0)
+        self.assertEqual(stats["cancelled"], 1)
+
+        with scheduler.admit():
+            pass
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
     def test_admits_waiters_in_fifo_order(self):
         scheduler = GenerationScheduler(max_queue=2, queue_timeout=1)
         entered = threading.Event()
@@ -448,6 +472,118 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_inkling_audio_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<|message_user|><|content_audio_input|><|audio|><|end_message|>"
+        payload = prompt.encode("utf-8")
+        audio = bytes(range(16)) * 5
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 {len(audio)}\n".encode() +
+                    payload + audio + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 7 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "inkling"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("inkling", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append,
+                                    audio=audio)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["prompt_tokens"], 7)
+
+    def test_v4_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<｜begin▁of▁sentence｜>System<｜User｜>Hello<｜Assistant｜>"
+        payload = prompt.encode("utf-8")
+        prefix = len("<｜begin▁of▁sentence｜>System".encode("utf-8"))
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 0 {prefix}\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0 17\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "deepseek_v4"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("deepseek_v4", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_kimi_request_and_response_transcript_is_byte_exact(self):
+        prompt = render_chat_kimi([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "你好\nKimi"},
+            {"role": "assistant", "reasoning_content": "because",
+             "content": "你好。"},
+            {"role": "user", "content": "Continue"},
+        ], enable_thinking=True)
+        payload = prompt.encode("utf-8")
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "kimi"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("kimi_k3", "model")
+        chunks = []
+        stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_olmoe_request_and_response_transcript_is_byte_exact(self):
+        expected = b"SUBMIT 1 0 5 3 0.25 0.9\nH\xc3\xa9\nx\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 5 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "olmoe"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        chunks = []
+        stats = engine.generate("Hé\nx", 3, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 5)
+        self.assertFalse(stats["length_limited"])
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 
@@ -724,14 +860,14 @@ class CapSentinelShimTest(unittest.TestCase):
                     [executable, want],
                     f"arch={model_type} exe={executable} kwargs={kwargs}")
 
-    def test_missing_or_unreadable_config_is_glm(self):
-        # historic default: anything that cannot be classified is glm
+    def test_synthetic_engine_without_config_uses_explicit_arch(self):
         self.assertEqual(self._spawn_argv("engine", "/nonexistent/model"),
                          ["engine", "0"])
         model = Path(self.tmp.name) / "model-broken"
         model.mkdir()
         (model / "config.json").write_text("{not json")
-        self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
+        with self.assertRaisesRegex(ValueError, "invalid config.json"):
+            self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
         self.assertEqual(cap_for_arch("glm", None), 0)
@@ -749,20 +885,35 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
-        self.assertEqual(model_arch("/nonexistent"), "glm")
+        with self.assertRaisesRegex(ValueError, "cannot read config.json"):
+            model_arch("/nonexistent")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}
-        with patch("resource_plan.physical_cpu_count", return_value=6), \
+        with patch("resource_plan.physical_cpu_count",
+                   side_effect=AssertionError("V4 server sized the team")), \
              patch("openai_server.sys.platform", "linux"):
             tune_child_env(env, "deepseek_v4")
-        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertNotIn("OMP_NUM_THREADS", env)
         self.assertEqual(env["OMP_PROC_BIND"], "close")
         self.assertEqual(env["V4_DRAFT"], "0")
         self.assertEqual(env["V4_MTP"], "0")
         self.assertEqual(env["V4_MTP_DRAFT"], "3")
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+        self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
+
+    def test_direct_v4_server_preserves_explicit_omp_threads(self):
+        env = {"OMP_NUM_THREADS": "3"}
+        tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+
+    def test_direct_v4_server_honours_omp_kill_switch(self):
+        env = {"COLI_NO_OMP_TUNE": "1"}
+        tune_child_env(env, "deepseek_v4")
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+                    "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
+            self.assertNotIn(key, env)
 
 
 class HTTPTest(unittest.TestCase):
@@ -794,6 +945,7 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/models", key="wrong")
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_health_reports_scheduler_and_kv_slots(self):
@@ -904,6 +1056,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stop": "H", "x_colibri_ignore_leading_stop": "yes",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_rejects_invalid_cache_slot(self):
@@ -912,6 +1065,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "cache_slot": 2,
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_olmoe_never_files_the_answer_as_reasoning(self):
@@ -983,6 +1137,7 @@ class HTTPTest(unittest.TestCase):
     def test_rejects_empty_legacy_completion(self):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/completions", {"model": "test-model", "prompt": ""})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
         self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
 
@@ -992,6 +1147,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True, "stream_options": "usage",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
 
@@ -1068,7 +1224,8 @@ class ClientHangupTest(unittest.TestCase):
             "the old except clause would have covered this; the test proves nothing")
         with patch.object(APIHandler, "end_headers", self._abort):
             try:
-                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
             except Exception:
                 pass                      # the client sees a broken response; that is fine
             time.sleep(0.3)
@@ -1079,7 +1236,8 @@ class ClientHangupTest(unittest.TestCase):
         """Same as the hangup case: the damage is a lost handler, not the log."""
         with patch.object(APIHandler, "end_headers", self._abort):
             try:
-                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
             except Exception:
                 pass
             time.sleep(0.3)
@@ -1118,6 +1276,7 @@ class StaticServingTest(unittest.TestCase):
             self.assertEqual(response.read(), b"dashboard")
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
 
 
@@ -1153,6 +1312,7 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertTrue(self.engine.entered.wait(1))
         with self.assertRaises(HTTPError) as caught:
             self.request()
+        self.addCleanup(caught.exception.close)
         error = json.loads(caught.exception.read())["error"]
         self.assertEqual(caught.exception.code, 429)
         self.assertEqual(caught.exception.headers["Retry-After"], "1")
@@ -1724,6 +1884,7 @@ class StreamingContextRejectTest(unittest.TestCase):
                       headers={"Content-Type": "application/json"})
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=3)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
         body = json.load(caught.exception)
         self.assertEqual(body["error"]["code"], "context_length_exceeded")

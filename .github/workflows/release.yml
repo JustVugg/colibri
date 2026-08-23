@@ -62,10 +62,10 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri inkling kimi_k3 olmoe; do
+          for t in colibri inkling kimi_k3 olmoe qwen36; do
             make $t ${{ matrix.make_args }}
           done
-          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
@@ -120,6 +120,10 @@ jobs:
           cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
           cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
           cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+          # qwen36 -- plain name, like the others: engine_for() resolves "qwen" to
+          # a "qwen36" binary next to coli. Unconditional: the engine is portable C
+          # with no platform gate, so every archive can carry it.
+          cp c/qwen36${{ matrix.ext }} dist/qwen36${{ matrix.ext }}
           # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
           # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
           # the macos-arm64 archive has no such engine to ship (#858).
@@ -134,6 +138,8 @@ jobs:
           cp c/coli dist/
           cp c/version.py dist/
           cp c/openai_server.py dist/
+          cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import
+          cp c/family_registry.py dist/ # authoritative model-family dispatch/capability registry
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp c/autotune.py dist/
@@ -166,7 +172,7 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          SIBLINGS="inkling kimi_k3 olmoe"
+          SIBLINGS="inkling kimi_k3 olmoe qwen36"
           # deepseek_v4 only where the engine builds (COLI_V4_SUPPORTED); asserting it
           # unconditionally would fail the macos-arm64 archive for shipping an engine
           # that platform cannot have.
@@ -183,11 +189,9 @@ jobs:
           # fine. The check was wrong, not the artifact.
           python3 -c "import ast; ast.parse(open('tools/k3_tokenizer.py', encoding='utf-8').read())" \
             || { echo "FAIL: packaged k3_tokenizer.py does not parse"; exit 1; }
-          # COLI_EXPECT rather than a literal tuple: the list is platform-dependent
-          # now, and one hardcoded list that silently omitted an engine is what #858
-          # was. Keep the expectation in a single place, above.
           COLI_EXPECT="$SIBLINGS" python3 - <<'PYCHK'
           import importlib.machinery, importlib.util, json, os, sys, tempfile
+          from family_registry import all_families
           exe = ".exe" if os.name == "nt" else ""
           expect = os.environ["COLI_EXPECT"].split()
 
@@ -212,16 +216,25 @@ jobs:
           loader.exec_module(cli)
 
           bad = []
-          for model_type, label, _ in cli._BANNER_MODELS:
-              with tempfile.TemporaryDirectory() as d:
+          for family in all_families():
+            if family.id == "deepseek_v4" and "deepseek_v4" not in expect:
+              continue
+            model_type = family.model_types[0]
+            label = family.display_name
+            with tempfile.TemporaryDirectory() as d:
                   with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
                       json.dump({"model_type": model_type}, f)
                   open(os.path.join(d, "tokenizer.json"), "w").close()
                   engine = os.path.basename(cli.engine_for(d))
                   arch = cli.model_arch(d)
-              if model_type != "glm" and arch == "glm":
-                  bad.append("%s (%s) -> the GLM engine; the banner names a family "
-                             "the launcher cannot dispatch" % (label, model_type))
+            expected_file = family.engine_artifact + exe
+            if not os.path.exists(expected_file):
+              bad.append("%s: expected artifact %s is absent" %
+                         (label, expected_file))
+            elif arch != family.id or engine != expected_file:
+              bad.append("%s (%s) -> %s/%s, expected %s/%s" %
+                         (label, model_type, arch, engine,
+                          family.id, expected_file))
           if bad:
               sys.exit("FAIL: packaged launcher misroutes:\n  " + "\n  ".join(bad))
           print("OK: every engine is packaged AND coli dispatches to it:", " ".join(expect))

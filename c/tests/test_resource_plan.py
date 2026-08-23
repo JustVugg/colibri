@@ -40,6 +40,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.model = Path(self.tmp.name)
         (self.model / "config.json").write_text(json.dumps({
+            "model_type": "glm_moe_dsa",
             "num_hidden_layers": 2,
             "n_routed_experts": 2,
             "kv_lora_rank": 4,
@@ -203,6 +204,67 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertIn("clamped", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
 
+    def test_glm_kv_slots_scale_the_planned_state_pool(self):
+        one = build_plan(self.model, context=32, kv_slots=1,
+                         available_memory=32 * GB, available_disk=1, gpus=[])
+        four = build_plan(self.model, context=32, kv_slots=4,
+                          available_memory=32 * GB, available_disk=1, gpus=[])
+        self.assertEqual(four["tiers"]["ram"]["sequence_state_bytes"],
+                         one["tiers"]["ram"]["sequence_state_bytes"])
+        delta = (four["tiers"]["ram"]["runtime_bytes"] -
+                 one["tiers"]["ram"]["runtime_bytes"])
+        per_slot = (one["tiers"]["ram"]["sequence_state_bytes"] +
+                    one["tiers"]["ram"]["fixed_state_bytes"])
+        self.assertEqual(delta, 3 * per_slot)
+
+    def test_olmoe_plans_instead_of_refusing(self):
+        # #1066: OLMoE used to refuse in `coli plan`/`doctor` because its
+        # planner_geometry was None (which under-reserved as zero-byte KV). With
+        # the adapter it plans, charging an fp32 K and V cache per layer sized at
+        # num_attention_heads * head_dim (mirrors olmoe.c:1019-1020), no fixed
+        # recurrent state.
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp)
+            (model / "config.json").write_text(json.dumps({
+                "model_type": "olmoe",
+                "num_hidden_layers": 2,
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts": 2,
+                "num_experts_per_tok": 2,
+                "intermediate_size": 16,
+                "vocab_size": 100,
+            }))
+            write_shard(model / "model.safetensors", [
+                ("model.embed_tokens.weight", 100),
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", 30),
+                ("model.layers.0.mlp.experts.1.gate_proj.weight", 30),
+            ])
+            plan = build_plan(model, context=32, kv_slots=1,
+                              available_memory=32 * GB, available_disk=1, gpus=[])
+            ram = plan["tiers"]["ram"]
+            # layers=2, ctx=32, heads=4, head_dim=32//4=8, K and V, fp32:
+            self.assertEqual(ram["sequence_state_bytes"], 2 * 32 * 4 * 8 * 2 * 4)
+            self.assertEqual(ram["fixed_state_bytes"], 0)
+
+    def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
+        config = json.loads((self.model / "config.json").read_text())
+        config.update({"index_head_dim": 16,
+                       "indexer_types": ["full", "shared"]})
+        (self.model / "config.json").write_text(json.dumps(config))
+        absent = build_plan(self.model, context=32, available_memory=32 * GB,
+                            available_disk=1, gpus=[])
+        write_shard(self.model / "indexer.safetensors", [
+            ("model.layers.0.self_attn.indexer.wq_b.weight", 4),
+        ])
+        present = build_plan(self.model, context=32, available_memory=32 * GB,
+                             available_disk=1, gpus=[])
+        self.assertEqual(
+            present["tiers"]["ram"]["sequence_state_bytes"] -
+            absent["tiers"]["ram"]["sequence_state_bytes"],
+            1 * 32 * 16 * 4)
+
     def test_unified_memory_uses_one_shared_pool(self):
         gpus = [{"index": 0, "name": "NVIDIA GB10", "total_bytes": 130 * GB,
                  "free_bytes": 128 * GB, "unified_memory": True}]
@@ -224,6 +286,277 @@ class ResourcePlanTest(unittest.TestCase):
             from resource_plan import _discover_nvidia_gpus
             devices = _discover_nvidia_gpus()
         self.assertTrue(devices[0]["unified_memory"])
+
+    # --- identity-only devices -------------------------------------------
+    # A device can be discovered without its free memory being qualified as a
+    # Colibri placement budget. That is the state of a Windows AMD device found
+    # through hipInfo: the runtime may well report a free figure, but on an
+    # integrated part it describes the same physical pages the host RAM tier is
+    # already counting. Until a later slice qualifies that relationship, such a
+    # device carries free_bytes=None -- "unknown for planning", which is NOT the
+    # same claim as free_bytes=0 ("measured, and none is free").
+
+    def _identity_only_gpu(self):
+        return {"index": 0, "name": "AMD Radeon(TM) 8060S Graphics",
+                "total_bytes": 78 * GB, "free_bytes": None,
+                "unified_memory": True}
+
+    def test_identity_only_gpu_is_planned_without_a_free_memory_value(self):
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[self._identity_only_gpu()],
+                          physical_cpus=8, cpu_sockets=1)
+        # It is still reported: the hardware exists and the user should see it.
+        names = [gpu["name"] for gpu in plan["tiers"]["vram"]["devices"]]
+        self.assertIn("AMD Radeon(TM) 8060S Graphics", names)
+        text = format_plan(plan)
+        self.assertIn("8060S", text)
+        # ...and the reader is told why it earns no tier, rather than being
+        # left to read "0.0 GB hot tier" as "the card is full".
+        self.assertIn("identity only", text)
+        self.assertTrue(any("not qualified as a placement budget" in warning
+                            for warning in plan["warnings"]))
+
+    def test_plan_wording_is_backend_neutral_without_a_gpu(self):
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[], physical_cpus=8,
+                          cpu_sockets=1)
+        text = format_plan(plan)
+        self.assertIn("no supported GPU detected", text)
+        self.assertNotIn("NVIDIA", text)
+        # But it buys no tier.
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(plan["tiers"]["vram"]["expert_capacity"], 0)
+
+    def test_identity_only_gpu_decides_nothing_a_cpu_only_host_would_not(self):
+        gpu_plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[self._identity_only_gpu()],
+                              physical_cpus=8, cpu_sockets=1)
+        cpu_plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[], physical_cpus=8,
+                              cpu_sockets=1)
+        # Presence alone must not reclassify the bottleneck or move DRAFT.
+        self.assertEqual(gpu_plan["bottleneck_class"], cpu_plan["bottleneck_class"])
+        self.assertNotEqual(gpu_plan["bottleneck_class"], "mixed")
+        self.assertEqual(gpu_plan["tune"].get("DRAFT"), cpu_plan["tune"].get("DRAFT"))
+        # Nor may it switch on the resident pipeline.
+        self.assertNotIn("COLI_CUDA_PIPE", gpu_plan["tune"])
+        # The strongest statement of the contract: for the same inputs, the
+        # recommended environment is byte-identical to the CPU-only host's.
+        # PIN_GB=all may legitimately appear in BOTH -- that is the no-GPU
+        # residency advice (_auto_tune, `not has_gpu`), not a VRAM-derived
+        # budget -- so equality is the assertion, not absence.
+        env = environment_for_plan(gpu_plan, {"PIN": "stats.txt"})
+        cpu_env = environment_for_plan(cpu_plan, {"PIN": "stats.txt"})
+        self.assertEqual(env, cpu_env)
+        self.assertNotIn("COLI_CUDA_PIPE", env)
+        self.assertNotIn("COLI_CUDA", env)
+        self.assertNotIn("COLI_GPU", env)
+        self.assertNotIn("CUDA_EXPERT_GB", env)
+        self.assertNotEqual(env.get("PIN_GB"), f"{gpu_plan['tiers']['vram']['budget_bytes'] / GB:.3f}")
+
+    def test_identity_only_gpu_does_not_claim_vram_is_in_use(self):
+        # The "already in use" warning divides free by total. With no qualified
+        # free value there is nothing to divide, and telling the user to stop a
+        # running engine would be a fabricated diagnosis.
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[self._identity_only_gpu()],
+                          physical_cpus=8, cpu_sockets=1)
+        self.assertFalse(any("already in use" in warning
+                             for warning in plan["warnings"]))
+
+    def test_measured_zero_free_memory_still_plans_as_before(self):
+        # free_bytes=0 is a MEASUREMENT, not the unqualified state, and keeps
+        # every behaviour it had: the tier is empty because the card is full,
+        # the pipeline knob is still offered, and the in-use warning still fires.
+        gpus = [{"index": 0, "name": "full-gpu", "total_bytes": 12 * GB,
+                 "free_bytes": 0}]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus, physical_cpus=8,
+                          cpu_sockets=1)
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(plan["tune"]["COLI_CUDA_PIPE"]["value"], "1")
+        self.assertTrue(any("already in use" in warning
+                            for warning in plan["warnings"]))
+
+    def test_mixed_fleet_plans_only_the_qualified_device(self):
+        gpus = [self._identity_only_gpu(),
+                {"index": 1, "name": "discrete", "total_bytes": 12 * GB,
+                 "free_bytes": 10 * GB}]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus, physical_cpus=8,
+                          cpu_sockets=1)
+        env = environment_for_plan(plan)
+        # The qualified card earns a tier; the unqualified one must not be
+        # named to the engine as a placement target.
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(env.get("COLI_GPU"), "1")
+        self.assertNotIn("COLI_GPUS", env)
+
+    # --- Windows AMD discovery through hipInfo ----------------------------
+    # Captured from hipInfo.exe shipped with the Windows HIP SDK (TheRock and
+    # ROCm 7.1 both emit this layout). Trimmed to the fields the parser reads
+    # plus a few it must ignore; the "89.39 GB" spellings are verbatim, and
+    # hipInfo divides by 1024 (it prints a 65536-byte shared block as 64.00 KB).
+    HIPINFO_INTEGRATED = """\
+--------------------------------------------------------------------------------
+device#                           0
+Name:                             AMD Radeon(TM) 8060S Graphics
+pciBusID:                         196
+totalGlobalMem:                   89.39 GB
+sharedMemPerBlock:                64.00 KB
+isIntegrated:                     1
+gcnArchName:                      gfx1151
+peers:
+non-peers:                        device#0
+
+memInfo.total:                    89.39 GB
+memInfo.free:                     89.24 GB (100%)
+"""
+
+    HIPINFO_DISCRETE = """\
+--------------------------------------------------------------------------------
+device#                           0
+Name:                             AMD Radeon RX 7900 XTX
+totalGlobalMem:                   24.00 GB
+isIntegrated:                     0
+gcnArchName:                      gfx1100
+
+memInfo.total:                    24.00 GB
+memInfo.free:                     23.50 GB (97%)
+"""
+
+    def _run_hipinfo(self, stdout, returncode=0):
+        """Discover with hipInfo located and returning `stdout`."""
+        from resource_plan import _discover_amd_gpus
+        completed = subprocess.CompletedProcess(args=[], returncode=returncode,
+                                                stdout=stdout, stderr="")
+        with mock.patch.object(sys, "platform", "win32"), \
+             mock.patch("resource_plan._hipinfo_executable",
+                        return_value=Path("C:/sdk/bin/hipInfo.exe")), \
+             mock.patch("resource_plan.subprocess.run", return_value=completed):
+            return _discover_amd_gpus()
+
+    def test_windows_integrated_amd_device_is_identity_only(self):
+        devices = self._run_hipinfo(self.HIPINFO_INTEGRATED)
+        self.assertEqual(len(devices), 1)
+        gpu = devices[0]
+        self.assertEqual(gpu["index"], 0)
+        self.assertEqual(gpu["name"], "AMD Radeon(TM) 8060S Graphics")
+        self.assertEqual(gpu["arch"], "gfx1151")
+        self.assertTrue(gpu["unified_memory"])
+        self.assertEqual(gpu["total_bytes"], int(89.39 * 1024 ** 3))
+        # The whole point of the slice: hipInfo DID report free memory, and it
+        # deliberately did not become a planning budget.
+        self.assertIsNone(gpu["free_bytes"])
+
+    def test_windows_positive_hipinfo_free_memory_never_becomes_a_budget(self):
+        # Belt and braces on the regression that matters most: the fixture says
+        # 89.24 GB free (100%), so any leak of that number into planning would
+        # show up as a non-zero VRAM tier here.
+        self.assertIn("memInfo.free", self.HIPINFO_INTEGRATED)
+        devices = self._run_hipinfo(self.HIPINFO_INTEGRATED)
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=devices, physical_cpus=8,
+                          cpu_sockets=1)
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertNotIn("COLI_CUDA_PIPE", plan["tune"])
+        self.assertNotIn("CUDA_EXPERT_GB", environment_for_plan(plan))
+
+    def test_windows_discrete_amd_device_is_not_marked_unified(self):
+        devices = self._run_hipinfo(self.HIPINFO_DISCRETE)
+        self.assertEqual(len(devices), 1)
+        self.assertFalse(devices[0]["unified_memory"])
+        self.assertEqual(devices[0]["arch"], "gfx1100")
+        # Windows AMD free memory is unqualified for every part in this slice,
+        # discrete included: we have no discrete Windows AMD host to qualify it
+        # against, and guessing is what this slice exists to avoid.
+        self.assertIsNone(devices[0]["free_bytes"])
+
+    HIPINFO_SECOND_DEVICE = """\
+--------------------------------------------------------------------------------
+device#                           1
+Name:                             AMD Radeon RX 7900 XTX
+totalGlobalMem:                   24.00 GB
+isIntegrated:                     0
+gcnArchName:                      gfx1100
+
+memInfo.total:                    24.00 GB
+memInfo.free:                     23.50 GB (97%)
+"""
+
+    def test_windows_parses_every_complete_device_block(self):
+        devices = self._run_hipinfo(self.HIPINFO_INTEGRATED
+                                    + self.HIPINFO_SECOND_DEVICE)
+        self.assertEqual([gpu["index"] for gpu in devices], [0, 1])
+        self.assertEqual([gpu["unified_memory"] for gpu in devices], [True, False])
+        self.assertEqual([gpu["free_bytes"] for gpu in devices], [None, None])
+
+    def test_windows_without_hipinfo_reports_no_device(self):
+        from resource_plan import _discover_amd_gpus
+        with mock.patch.object(sys, "platform", "win32"), \
+             mock.patch("resource_plan._hipinfo_executable", return_value=None):
+            self.assertEqual(_discover_amd_gpus(), [])
+
+    def test_windows_hipinfo_failure_invents_nothing(self):
+        from resource_plan import _discover_amd_gpus
+        with mock.patch.object(sys, "platform", "win32"), \
+             mock.patch("resource_plan._hipinfo_executable",
+                        return_value=Path("C:/sdk/bin/hipInfo.exe")), \
+             mock.patch("resource_plan.subprocess.run",
+                        side_effect=subprocess.CalledProcessError(1, "hipInfo")):
+            self.assertEqual(_discover_amd_gpus(), [])
+
+    def test_windows_incomplete_device_block_is_not_half_trusted(self):
+        # A block that names a device but reports no memory must produce no
+        # record at all rather than one with fabricated zeros.
+        partial = ("--------------------------------------------------------\n"
+                   "device#                           0\n"
+                   "Name:                             AMD Radeon(TM) 8060S Graphics\n"
+                   "isIntegrated:                     1\n")
+        self.assertEqual(self._run_hipinfo(partial), [])
+        headless = ("--------------------------------------------------------\n"
+                    "device#                           0\n"
+                    "totalGlobalMem:                   89.39 GB\n"
+                    "memInfo.total:                    89.39 GB\n")
+        self.assertEqual(self._run_hipinfo(headless), [])
+
+    def test_hipinfo_lookup_prefers_the_colibri_runtime_over_a_stale_install(self):
+        # This machine has had two Windows HIP installs at once. The engine
+        # binds the runtime COLI_HIP_RUNTIME_DIR names, and hipInfo sits beside
+        # amdhip64_7.dll in that same directory, so its answer describes the
+        # runtime that will actually be used. An ambient HIP_PATH pointing at a
+        # different SDK must not win.
+        from resource_plan import _hipinfo_executable
+        with tempfile.TemporaryDirectory() as root:
+            chosen = Path(root) / "therock" / "bin"
+            stale = Path(root) / "sdk" / "bin"
+            for directory in (chosen, stale):
+                directory.mkdir(parents=True)
+                (directory / "hipInfo.exe").write_bytes(b"")
+            env = {"COLI_HIP_RUNTIME_DIR": str(chosen),
+                   "HIP_PATH": str(stale.parent)}
+            with mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.dict(os.environ, env, clear=False):
+                self.assertEqual(_hipinfo_executable(), chosen / "hipInfo.exe")
+            # With no Colibri-specific runtime selected, the SDK root is used.
+            with mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.dict(os.environ, {"HIP_PATH": str(stale.parent)}, clear=True):
+                self.assertEqual(_hipinfo_executable(), stale / "hipInfo.exe")
+
+    def test_linux_amd_discovery_still_uses_rocm_smi(self):
+        from resource_plan import _discover_amd_gpus
+        output = ("device,Card Series,VRAM Total Memory (B),VRAM Total Used Memory (B)\n"
+                  "card0,Instinct MI300X,68719476736,8589934592\n")
+        completed = subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout=output, stderr="")
+        with mock.patch.object(sys, "platform", "linux"), \
+             mock.patch("resource_plan.subprocess.run",
+                        return_value=completed) as run:
+            devices = _discover_amd_gpus()
+        self.assertEqual(run.call_args[0][0][0], "rocm-smi")
+        self.assertEqual(devices[0]["total_bytes"], 68719476736)
+        self.assertEqual(devices[0]["free_bytes"], 68719476736 - 8589934592)
+        self.assertFalse(devices[0]["unified_memory"])
 
     def test_auto_tier_thread_count_uses_physical_cores(self):
         # End-to-end for #325: build_plan + environment_for_plan must export the
@@ -372,6 +705,7 @@ class ResourcePlanTest(unittest.TestCase):
         big = tempfile.TemporaryDirectory()
         bigmodel = Path(big.name)
         (bigmodel / "config.json").write_text(json.dumps({
+            "model_type": "glm_moe_dsa",
             "num_hidden_layers": 2, "n_routed_experts": 4,
             "kv_lora_rank": 4, "qk_rope_head_dim": 2,
             "qk_nope_head_dim": 3, "v_head_dim": 5, "num_attention_heads": 2,

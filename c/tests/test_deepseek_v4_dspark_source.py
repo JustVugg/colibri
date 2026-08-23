@@ -22,7 +22,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
 
     def test_drafter_is_lazy_and_budgeted_before_target_cache(self):
         reserve = self.engine.index("engine->runtime.dspark_reserve_bytes =")
-        store = self.engine.index("coli_v4_expert_store_open_planned(", reserve)
+        store = self.engine.index("coli_expert_store_backend_open_selected(", reserve)
         self.assertLess(reserve, store)
         self.assertIn("load=lazy verification=exact-target", self.engine)
         self.assertIn("double total_gb = coli_v4_dspark_cache_gb()", self.drafter)
@@ -84,6 +84,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
             'env.setdefault("V4_MTP", "0")',
             'env.setdefault("V4_MTP_DRAFT", "3")',
             'env.setdefault("V4_MTP_GB", "0.45")',
+            'env.setdefault("V4_MTP_GPU", "0")',
         ):
             self.assertIn(setting, self.launcher)
         self.assertIn(".no_dspark = 0,", self.engine)
@@ -92,7 +93,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
         self.assertIn('getenv("V4_NGRAM_PARTIAL_KEEP")', self.engine)
 
     def test_target_ssd_reader_uses_aligned_final_slots(self):
-        self.assertIn("v4_read_expert_record(state, record, slot)", self.engine)
+        self.assertIn("v4_read_expert_record(state, record, slot, rep)", self.engine)
         self.assertIn("posix_memalign((void **)&slot->slab, 4096", self.engine)
         self.assertIn("payload_bytes=%llu", self.engine)
 

@@ -45,6 +45,11 @@ jobs:
         run: |
           docker run --rm colibri:ci --version
           docker run --rm colibri:ci --help > /dev/null
+          # The gateway has runtime modules that launcher-only commands do not
+          # import. Exercise that boundary so the advertised serve path cannot
+          # ship with a missing Python file.
+          docker run --rm --entrypoint python3 colibri:ci -c \
+            "import openai_server; print('gateway imports')"
       - name: The engine binary is in the image and is executable
         run: docker run --rm --entrypoint /app/colibri colibri:ci --help 2>&1 | head -5 || true
       - name: Lint both Dockerfiles
@@ -185,7 +190,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri inkling kimi_k3 olmoe"
+          ENGINES="colibri inkling kimi_k3 olmoe qwen36"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -193,6 +198,22 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      - if: matrix.os == 'macos-latest'
+        name: Metal backend tests
+        # The Metal backend suite is its own target (metal-test) and is not
+        # part of `make check`: TEST_BINS is derived from tests/test_*.$(EXE)
+        # rules, and backend_metal_test is built/run by the metal-test target
+        # itself. Nothing in CI exercised it until issue #940 shipped a
+        # compile error in it, so run it explicitly on the Apple Silicon
+        # runners.
+        # The runner's Apple Paravirtual device hangs on Metal submissions
+        # (observed: 47 min vs a 5-6 min normal run), so the test harness
+        # detects it and skips GPU execution with an explicit line; this
+        # timeout is the backstop that turns any residual hang into a red X.
+        timeout-minutes: 10
+        run: |
+          cd c
+          make metal-test
 
       # macOS is the newest COLI_V4_SUPPORTED platform and the only one whose
       # engine coverage lives solely in this job (Linux has the v4-tiny job in
@@ -296,6 +317,111 @@ jobs:
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
 
+  qwen36-tiny-check:
+    name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Tiny Qwen3.6-shaped fixture + full-hybrid oracle
+        run: |
+          cd c
+          # Same layout as the 35B model (10 x (3 x DeltaNet -> MoE, 1 x Attention
+          # -> MoE)) at toy dimensions, so the converter and the engine treat it
+          # exactly like the real one. --mode full exercises BOTH layer kinds;
+          # attention_only would leave the DeltaNet path untested.
+          # The reference comes from make_qwen36_tiny.py, not make_qwen36_oracle.py:
+          # the oracle encodes a text prompt through AutoTokenizer.from_pretrained(),
+          # and this fixture is synthetic -- weights, no tokenizer. The tiny script
+          # already has the model in memory and generates greedily from fixed ids.
+          # --ref-mode full leaves BOTH layer kinds active; the default
+          # attention_only replaces the 30 DeltaNet layers with identity, which is
+          # what Phase 1 computed and would leave three quarters of the engine
+          # untested.
+          python3 tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full \
+                  --emit-ref qwen36_tiny/ref_full.json
+          # ebits=8 keeps the expert quantization error below anything that could
+          # flip a greedy argmax here -- measured. The DENSE weights are the ones
+          # that matter: the engine quantizes them to int8 by default, the torch
+          # reference does not, and that alone cost 7 of 16 tokens. The runs below
+          # therefore set COLI_DENSE_I8=0, which is what the accuracy A/B in
+          # 07_Tests uses for the same reason. Without it this gate compares two
+          # different models and reddens on the luck of the draw.
+          python3 tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+      - name: Token-exact against the oracle, at several cache capacities
+        run: |
+          cd c
+          make qwen36
+          # cap=1 evicts on every routed expert, which is where slot bookkeeping
+          # breaks; cap=8 never would. That is not hypothetical here: the
+          # in-flight eviction fallback this engine inherited was exactly such a
+          # bug, and it only shows when cap is smaller than the number of loads
+          # in flight. The engine exits non-zero on any token mismatch.
+          for cap in 1 2 8; do
+            echo "::group::cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c \
+              ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+      - name: Same run under ASan + UBSan
+        run: |
+          cd c
+          # Token-exactness alone would not have caught the config-driven heap
+          # overflows this engine shipped with: they do not necessarily change
+          # the output. The sanitizers are the half of this gate that watches
+          # memory, and PILOT=1 puts concurrent expert loads against the cache
+          # so the slot paths are exercised, not just walked past.
+          #
+          # This step asserts MEMORY SAFETY, not token-exactness -- the three
+          # runs above already own that. -fsanitize changes inlining and
+          # vectorization, so this is a differently-compiled binary, and float
+          # reassociation can flip a token wherever the margin is thin. Demanding
+          # exactness from it conflates two goals and made this job red on a
+          # docs-only commit: the normal build matched 16/16, the sanitizer build
+          # did not. So: run it, ignore a token mismatch, fail on any sanitizer
+          # diagnostic.
+          make clean >/dev/null 2>&1 || true
+          make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
+            ./qwen36 1 8 qwen36_tiny/ref_full.json > san.log 2>&1 || true
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
+            echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
+          fi
+          echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
+      - name: A malformed container is refused, not read
+        run: |
+          cd c
+          # The case ASan caught in review: config.json and qwen36_meta.json ship
+          # in the same container and disagreed on the layer count, so is_attn was
+          # sized from one and written from the other. Reproduced without the
+          # guard as a heap-buffer-overflow WRITE at load_meta; with it the engine
+          # refuses. A well-formed fixture cannot cover this, which is why it gets
+          # its own step -- and it asserts the REFUSAL, so a guard that silently
+          # stops guarding fails here.
+          cp -r qwen36_tiny_c qwen36_tiny_bad
+          python3 - <<'PY'
+          import json
+          p = "qwen36_tiny_bad/config.json"
+          cfg = json.load(open(p))
+          cfg["num_hidden_layers"] = 4          # meta says 8
+          json.dump(cfg, open(p, "w"))
+          PY
+          if COLI_DENSE_I8=0 SNAP=qwen36_tiny_bad ./qwen36 8 8 \
+               qwen36_tiny/ref_full.json > bad.log 2>&1; then
+            echo "FAIL: engine accepted a container whose two config files disagree"
+            cat bad.log; exit 1
+          fi
+          grep -q "config.json says 4 layers" bad.log || {
+            echo "FAIL: refused, but not for the reason under test"; cat bad.log; exit 1; }
+          echo "refused as expected:"; grep '^\[cfg\]' bad.log
+
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
     runs-on: ubuntu-latest
@@ -360,6 +486,14 @@ jobs:
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build colibri
         run: make -C c colibri
+      - name: Integer-kernel exactness vs pure-C reference (#1081)
+        # Integer kernels have no rounding excuse: bit-equality on every ISA.
+        # The same binary check runs on the ARM job below — this is the gate
+        # that would have caught the olmoe/qwen36/inkling IDOT class.
+        run: |
+          cd c
+          gcc -O3 -march=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
+          /tmp/tike
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Token-exact oracle (teacher forcing)
@@ -380,6 +514,42 @@ jobs:
             tests.test_inefficiency.TinyEfficiencyTest.test_telemetry_parses \
             tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
             tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant
+
+  # The token-exact parity gate from #7 (c/tests/test_cluster_sharding.py): the
+  # engine's local CPU run must already reproduce the transformers oracle
+  # token-exactly, and delegating the routed-expert shard to a cluster worker
+  # must not perturb a single position. It exercises the fmt=6 (E8/IQ3,
+  # rotation-bearing) path and its fmt=4 (grouped int4, no-rotation) control.
+  #
+  # Not in `make check`: the two fixtures are gitignored (regenerated, not
+  # committed -- see .gitignore) and need the pinned torch/transformers to
+  # build, the same rationale as inkling-oracle and efficiency above. The test
+  # skips cleanly when the fixtures are absent, so leaving fixture generation
+  # out of CI would turn the gate into a silent no-op on a clean host -- the
+  # worker path would never actually run. This job regenerates both fixtures
+  # first so the gate is exercised, not dormant.
+  #
+  # Socket safety: the test spawns a cluster worker subprocess and a
+  # coordinator, each binding a 127.0.0.1 port obtained from _free_port()
+  # (bind to port 0), so it is safe on a shared runner.
+  cluster-parity:
+    name: Cluster parity gate (fmt6/fmt4, token-exact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build colibri
+        run: make -C c colibri
+      - name: Generate the fmt6/fmt4 quantized fixtures
+        run: cd c && python3 tools/make_glm_oracle.py --fmt6 && python3 tools/make_glm_oracle.py --fmt4
+      - name: Cluster parity gate (token-exact)
+        run: cd c && python3 -m unittest -v tests.test_cluster_sharding
 
   engine-hip-syntax:
     name: HIP syntax check
@@ -470,7 +640,30 @@ jobs:
           path-type: inherit
           install: >-
             make
+            git
             mingw-w64-ucrt-x86_64-gcc
+      # The DeepSeek V4 DeepGEMM flavour compiles against a pinned checkout
+      # that tools/fetch_deepgemm.sh makes on first use (nothing vendored).
+      # CI cannot compile it (sm_120a needs CUDA >= 12.8; this job pins 12.6)
+      # but it does exercise the fetch — pin verification + MSVC patch — and
+      # caches the tree keyed on the pin so a bump is the only cache miss.
+      - name: DeepGEMM pin (for the cache key)
+        id: deepgemm-pin
+        shell: bash
+        run: echo "pin=$(sed -n 's/^DEEPGEMM_PIN ?= //p' c/Makefile | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Cache the pinned DeepGEMM checkout
+        uses: actions/cache@v4
+        with:
+          path: c/third_party/deepgemm
+          key: deepgemm-${{ steps.deepgemm-pin.outputs.pin }}-${{ hashFiles('c/patches-deepgemm-sm120-msvc.patch') }}
+      - name: make deepgemm-fetch (pinned checkout + MSVC patch, no compile)
+        shell: msys2 {0}
+        run: |
+          cd c
+          make deepgemm-fetch
+          test -f third_party/deepgemm/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh || { echo "fetch_deepgemm produced no sm120 headers" >&2; exit 1; }
+          # second run must be a no-op (idempotency)
+          make deepgemm-fetch | grep -q "already at" || { echo "fetch_deepgemm is not idempotent" >&2; exit 1; }
       - name: make cuda-dll (nvcc + MSVC host)
         shell: msys2 {0}
         run: |
@@ -537,3 +730,35 @@ jobs:
             'tests.test_convert_positioned_write'
           )
           python -m unittest -v @suites
+
+  # ARM oracle (#1081): every tiny-oracle job above runs on x86, so NEON
+  # branches were never compiled, let alone executed — which is how the
+  # olmoe (#1044) / qwen36 (#712 review) / inkling (#1080) IDOT class shipped.
+  # This job builds every engine on arm64 (NEON compile coverage), runs the
+  # integer-kernel bit-exactness gate with the NEON branches live, and replays
+  # the glm_tiny teacher-forcing oracle against a fixture generated on THIS
+  # runner (same-machine torch reference, so no cross-ISA float excuses).
+  oracle-arm:
+    name: ARM (engines + NEON kernel exactness + tiny oracle)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build every engine (NEON branches must compile)
+        run: make -C c colibri inkling kimi_k3 olmoe
+      - name: Integer-kernel exactness, NEON branches live (#1081)
+        run: |
+          cd c
+          gcc -O3 -mcpu=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
+          /tmp/tike
+      - name: Generate the glm_tiny fixture on this runner
+        run: cd c && python3 tools/make_glm_oracle.py
+      - name: Token-exact oracle on ARM (teacher forcing)
+        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16

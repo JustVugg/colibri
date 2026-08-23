@@ -11,6 +11,15 @@
 #ifndef COMPAT_H
 #define COMPAT_H
 
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #ifdef __APPLE__
 #include <fcntl.h>
 #include <unistd.h>
@@ -385,6 +394,77 @@ static inline char *compat_mkdtemp(char *tmpl){
 #ifndef COMPAT_O_BINARY
 #define COMPAT_O_BINARY 0
 #endif
+
+/* --- read-only file mapping -------------------------------------------------
+ * A small ownership-carrying primitive for safetensors that are already in the
+ * engine's final byte representation.  The caller gets a pointer to the exact
+ * requested (possibly unaligned) range while this object retains the aligned
+ * OS view needed to release it safely.
+ *
+ * This does not prefetch or lock pages.  Mapping changes ownership/accounting,
+ * not the model's active working set: pages are faulted when the caller reads
+ * them and remain reclaimable file-backed cache pages. */
+typedef struct {
+    void *base;
+    size_t len;
+#ifdef _WIN32
+    HANDLE mapping;
+#endif
+} compat_ro_map;
+
+static inline int compat_map_readonly(int fd, int64_t off, size_t len,
+                                      compat_ro_map *map, const void **data)
+{
+    if (!map || !data || off < 0 || len == 0) { errno = EINVAL; return -1; }
+    memset(map, 0, sizeof(*map));
+#ifdef _WIN32
+    intptr_t osfh = _get_osfhandle(fd);
+    if (osfh == -1 || osfh == -2) { errno = EBADF; return -1; }
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uint64_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536u;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    HANDLE fm = CreateFileMappingA((HANDLE)osfh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!fm) { errno = EIO; return -1; }
+    void *base = MapViewOfFile(fm, FILE_MAP_READ,
+                               (DWORD)(aligned >> 32), (DWORD)(aligned & 0xffffffffu),
+                               view_len);
+    if (!base) { CloseHandle(fm); errno = EIO; return -1; }
+    map->base = base;
+    map->len = view_len;
+    map->mapping = fm;
+    *data = (const char*)base + (size_t)delta;
+#else
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    uint64_t gran = (uint64_t)pg;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    void *base = mmap(NULL, view_len, PROT_READ, MAP_SHARED, fd, (off_t)aligned);
+    if (base == MAP_FAILED) return -1;
+    map->base = base;
+    map->len = view_len;
+    *data = (const char*)base + (size_t)delta;
+#endif
+    return 0;
+}
+
+static inline void compat_unmap_readonly(compat_ro_map *map)
+{
+    if (!map || !map->base) return;
+#ifdef _WIN32
+    UnmapViewOfFile(map->base);
+    if (map->mapping) CloseHandle(map->mapping);
+#else
+    munmap(map->base, map->len);
+#endif
+    memset(map, 0, sizeof(*map));
+}
 
 /* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
  *

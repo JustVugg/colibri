@@ -187,7 +187,7 @@ static void make_tensor(ColiTensorView *view, uint8_t *data, uint8_t *scales,
     *view = (ColiTensorView){
         COLI_TENSOR_FP4_NATIVE_BLOCK, COLI_SCALE_UE8M0,
         data, scales, (size_t)rows * columns / 2,
-        (size_t)rows * columns / 32, rows, columns, 1, 32
+        (size_t)rows * columns / 32, rows, columns, 1, 32, NULL
     };
 }
 

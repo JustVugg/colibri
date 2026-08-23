@@ -52,11 +52,16 @@ gcc -O2 -fopenmp iobench.c -o iobench
 # 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
 COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
-# 3) record expert usage, then pin the hottest experts in your spare RAM:
+# 3) full automated datapoint — machine info + cold/warm decode + disk, one command:
+python tools/datapoint.py --snap /path/to/model --shard /path/to/container/model-00000.safetensors
+# (stdlib-only; evicts the page cache before the cold run, caps decode at --max-new
+#  tokens so tok/s is exact, and prints a ready-to-paste datapoint block)
+
+# 4) record expert usage, then pin the hottest experts in your spare RAM:
 STATS=stats.txt ./coli chat
 PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 
-# 4) quality benchmarks (MMLU/HellaSwag/ARC):
+# 5) quality benchmarks (MMLU/HellaSwag/ARC):
 ./coli bench
 ```
 

@@ -1,18 +1,18 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì——小巧引擎，庞大模型">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì——小巧引擎，庞大模型">
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   <a href="README.md">English</a> · 简体中文 · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
 **小巧引擎，庞大模型。**在消费级与异构硬件上运行**前沿 MoE 模型——从 744B 到
 2.8T 参数**——以引擎零依赖的纯 C 实现，将存储、RAM 与 VRAM 视为统一的推理层级。
 
-目前可运行四个模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
-（2.8T）与 **OLMoE**（7B）——各自一个 C 文件，共用同一套 `coli chat` /
-`coli serve` / `coli web` 前端。[完整列表](README.md#other-supported-models)
+目前可运行六个模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
+（2.8T）、**DeepSeek V4 Flash**（284B）、**Qwen3.6**（35B-A3B）与 **OLMoE**（7B）
+——各自一个 C 文件，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整列表](README.md#other-supported-models)
 
 > **Colibrì 既是今天就能运行的推理引擎，也是一个开放的研究平台。**它的首要目标是在
 > 完整的软硬件边界上追求推理侧性能——模型格式、内存层级、存储 I/O、放置、调度、内核、
@@ -318,7 +318,7 @@ colibrì 最初由一人使用 12 核心、25 GB RAM 的笔记本开发；
 
 - ⭐ 为仓库加星并分享；
 - 🐛 以 issue 提交你的硬件 benchmark 数据——实测数据比任何其他事都更能推动项目；
-- 💬 加入 [Discord 社区](https://discord.gg/fpQxKnRb)，讨论实验、硬件数据与研究方向；
+- 💬 加入 [Discord 社区](https://discord.gg/MAaKtQRc)，讨论实验、硬件数据与研究方向；
 - 💬 若想赞助开发或捐赠硬件，请通过 GitHub issues 联系。
 
 ## 仓库结构

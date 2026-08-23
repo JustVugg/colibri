@@ -153,12 +153,11 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "deepseek_v4")
         self.assertEqual(env["NGEN"], "1024")
 
-    def test_kimi_does_not_get_v4_only_settings(self):
-        """The widening is RAM_GB alone; CTX and the V4 speculation defaults stay
-        where they were."""
+    def test_kimi_context_uses_its_registered_environment_channel(self):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=242, ctx=4096)
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("CTX", env)
+        self.assertEqual(env["K3_MAXT"], "4096")
         self.assertNotIn("V4_MTP", env)
 
     def test_windows_v4_run_passes_chinese_prompt_as_utf8_file(self):
@@ -184,6 +183,7 @@ class V4CliTest(unittest.TestCase):
                                    return_value="deepseek_v4.exe"), \
                  mock.patch.object(self.cli, "need_model"), \
                  mock.patch.object(self.cli, "banner"), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=8), \
                  mock.patch.object(self.cli.subprocess, "call",
                                    side_effect=fake_call):
                 with self.assertRaises(SystemExit) as stopped:

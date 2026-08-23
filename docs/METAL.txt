@@ -1,0 +1,323 @@
+If you're coming from CUDA or Vulkan compute, Metal is generally pleasant to write, but there are a number of architectural differences that can cause subtle correctness or performance problems. For a project like Colibri, the biggest issues are less about the shader language itself and more about adapting to Apple's GPU architecture.
+
+Here are the ones I'd pay attention to.
+
+1. Apple GPUs are tile-based and unified-memory architectures
+
+This is the biggest conceptual difference.
+
+Unlike discrete NVIDIA GPUs:
+
+CPU and GPU normally share physical memory.
+Explicit host/device copies are often unnecessary.
+Memory bandwidth is excellent, but unnecessary synchronization can be expensive.
+
+A common mistake is writing code that mimics CUDA's upload/download pattern.
+
+Instead, prefer:
+
+persistent buffers
+in-place computation
+minimal CPU synchronization
+2. Threadgroup size matters much more than you expect
+
+Metal lets you launch arbitrary threadgroup sizes, but Apple GPUs have preferred sizes.
+
+For compute kernels, common values are:
+
+32
+64
+128
+256
+
+Many CUDA kernels use:
+
+1024 threads/block
+
+which is almost never appropriate on Apple GPUs.
+
+Always check
+
+pipeline.maxTotalThreadsPerThreadgroup
+
+and tune accordingly.
+
+3. SIMD groups are not CUDA warps
+
+CUDA:
+
+warp = 32
+
+Metal:
+
+simdgroup
+
+The width depends on hardware.
+
+Never assume
+
+32
+
+Use Metal intrinsics instead.
+
+Examples:
+
+simd_sum()
+simd_broadcast()
+simd_prefix_exclusive_sum()
+
+rather than rolling your own warp logic.
+
+4. Threadgroup memory is limited
+
+Metal equivalent:
+
+threadgroup float cache[...];
+
+This is similar to CUDA shared memory.
+
+However,
+
+available size varies
+exceeding limits may silently reduce occupancy
+
+Large attention kernels often need redesign rather than direct translation.
+
+5. Buffer alignment rules
+
+Metal is stricter than CUDA.
+
+Structures shared between Swift/C++ and Metal need proper alignment.
+
+For example
+
+struct Params
+{
+    uint32_t n;
+    float scale;
+};
+
+may require padding.
+
+Using
+
+alignas(16)
+
+is often necessary.
+
+Incorrect alignment leads to mysterious incorrect values rather than crashes.
+
+6. No pointer arithmetic between address spaces
+
+Metal has address spaces:
+
+device
+
+constant
+
+thread
+
+threadgroup
+
+Pointers cannot be mixed freely.
+
+For example
+
+device float*
+
+cannot simply become
+
+threadgroup float*
+
+CUDA code often assumes generic pointers.
+
+Metal does not.
+
+7. Constant buffers are special
+
+If data never changes during dispatch:
+
+constant Params&
+
+is preferable to
+
+device Params*
+
+The compiler can generate significantly better code.
+
+8. Synchronization is different
+
+Within a threadgroup:
+
+threadgroup_barrier(...)
+
+works similarly to CUDA.
+
+Across threadgroups:
+
+there is no global barrier.
+
+If Vulkan code relies on multiple compute passes with pipeline barriers, you'll typically express that as multiple Metal compute dispatches encoded in sequence on the same command buffer.
+
+9. Resource binding is explicit
+
+Metal kernels declare resources like
+
+kernel void foo(
+    device float *a [[buffer(0)]],
+    device float *b [[buffer(1)]]
+)
+
+Binding indices must match exactly.
+
+A surprisingly common bug is
+
+shader:
+buffer(3)
+
+CPU:
+setBuffer(..., index:2)
+
+Everything compiles.
+
+Results are garbage.
+
+10. Pipeline creation is expensive
+
+Never rebuild pipelines repeatedly.
+
+Compile once.
+
+Reuse forever.
+
+Colibri should cache every
+
+MTLComputePipelineState
+
+object.
+
+11. Don't recreate command queues
+
+Typically
+
+1 device
+
+1 command queue
+
+for the lifetime of the application.
+
+Recreating them every inference hurts performance.
+
+12. Minimize command buffers
+
+Apple drivers are very efficient, but dispatch overhead exists.
+
+Prefer
+
+one command buffer
+
+many kernels
+
+rather than
+
+hundreds of tiny command buffers
+13. Storage modes matter
+
+Metal offers:
+
+Shared
+
+Private
+
+Managed (macOS)
+
+Memoryless
+
+For inference:
+
+Shared is simple and leverages unified memory, making it suitable for many workloads.
+
+Private can improve GPU-only performance for buffers the CPU never touches, but requires explicit transfer strategies.
+
+Choosing the wrong storage mode can negate performance gains.
+
+14. Metal compiler is aggressive
+
+The compiler performs extensive optimization.
+
+Occasionally it removes code you expected to execute.
+
+When debugging numerical issues,
+
+disable fast math:
+
+-fast-math
+
+or use precise math attributes where appropriate.
+
+15. Float16 behaviour
+
+Apple hardware is extremely good at FP16.
+
+But beware:
+
+half
+
+float
+
+mixing.
+
+Implicit promotions can increase register pressure.
+
+Conversely, forcing everything to half can accumulate numerical error in reductions or attention score calculations. A common pattern is FP16 storage with FP32 accumulation.
+
+16. Memory access patterns matter
+
+Apple GPUs strongly prefer contiguous accesses.
+
+Good:
+
+0
+1
+2
+3
+4
+
+Bad:
+
+0
+4096
+8192
+12288
+
+When porting Vulkan kernels, examine tensor layouts to preserve coalesced access.
+
+17. Profiling is essential
+
+Use Xcode's Metal tools rather than guessing. They can show:
+
+GPU occupancy
+threadgroup utilization
+memory bandwidth
+cache behavior
+pipeline execution timeline
+shader hotspots
+
+These tools often reveal bottlenecks that aren't obvious from code inspection alone.
+
+For Colibri specifically
+
+Because Colibri already has:
+
+a CPU implementation of Kimi K3 (correctness reference),
+a Vulkan implementation (GPU algorithm reference), and
+a Metal backend for other models (backend framework),
+
+the highest-risk areas are likely to be:
+
+Delta Attention kernels, where threadgroup sizing, memory access, and synchronization patterns may need to be adapted rather than translated directly.
+MoE expert execution, particularly batching expert GEMMs efficiently without excessive command encoding overhead.
+KV-cache layout and updates, ensuring the memory layout remains GPU-friendly and matches the CPU/Vulkan semantics.
+Numerical parity, especially if the Vulkan backend relies on fused operations or different precision choices.
+
+The most reliable development pattern is to keep the CPU implementation as the oracle, compare Vulkan and Metal outputs after each kernel port, and optimize only after establishing numerical equivalence.

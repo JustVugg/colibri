@@ -19,3 +19,17 @@ Run them from `c/`, for example:
 python3 tools/convert_fp8_to_int4.py --selftest
 python3 tools/make_glm_bench_model.py --output /tmp/colibri-bench
 ```
+
+`make_glm_oracle.py` also produces the quantized routed-expert fixtures for the
+fmt=6 (E8/IQ3, rotation-bearing) and fmt=4 (grouped int4, no-rotation control)
+parity gate (#3/#7). Only the routed experts are quantized; shared/dense/attn
+stay f32, and the reference (`ref_glm.json` inside each fixture dir) is computed
+from the dequantized weights so the engine reproduces it token-exactly:
+
+```sh
+python3 tools/make_glm_oracle.py --fmt6   # -> glm_tiny_fmt6/
+python3 tools/make_glm_oracle.py --fmt4   # -> glm_tiny_fmt4/
+# verify the engine loads the formats directly (32/32 expected):
+SNAP=./glm_tiny_fmt6 REF=./glm_tiny_fmt6/ref_glm.json TF=1 COLI_TEMP=0 ./colibri 64 16 16
+SNAP=./glm_tiny_fmt4 REF=./glm_tiny_fmt4/ref_glm.json TF=1 COLI_TEMP=0 ./colibri 64 16 16
+```

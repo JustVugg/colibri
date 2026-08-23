@@ -33,8 +33,13 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
+#include "serve_codec.h"
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -141,7 +146,7 @@ typedef struct {
     uint64_t clock, hits, miss;
     uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
-    float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
+    float **K, **V; int kv_len, max_t;    /* per-layer [kv][kv_ring_rows][hd]; sliding layers are a t%window ring */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
     /* KV prefix reuse: what the current K/V and conv states were built from.
@@ -317,7 +322,11 @@ static inline __m256i i8dot_block(__m256i acc, __m256i a, __m256i b) {
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    /* Opt-in (IDOT=1), not default: the fast path only exists under __AVX2__
+     * and quantizes ACTIVATIONS per 32-block — the same model produced
+     * different tokens on x86 vs ARM with the old on-by-default. Same class
+     * and same fix as olmoe (#1044) and qwen36 (#712 review). */
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 32 == 0 && I <= 8192) {
         int nb = I / 32;
         int8_t xi[8192]; float xs[256];
@@ -362,7 +371,11 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 static void matmul_q4(float *y, const float *x, const uint8_t *p, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    /* Opt-in (IDOT=1), not default: the fast path only exists under __AVX2__
+     * and quantizes ACTIVATIONS per 32-block — the same model produced
+     * different tokens on x86 vs ARM with the old on-by-default. Same class
+     * and same fix as olmoe (#1044) and qwen36 (#712 review). */
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 32 == 0 && I <= 8192) {
         int nb = I / 32;
         int8_t xi[8192]; float xs[256];
@@ -798,6 +811,21 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * sidecar dropped in the snapshot dir (st_init indexes every *.safetensors).
      * Absent tensors = text-only engine, exactly as before. */
     if (st_has(&m->S, "model.audio.encoder.weight")) {
+        /* SEC (GHSA-w696): mel_bins/mel_vocab come straight from config.json with
+         * no bounds. audio_embed_row indexes the table at (b*mel_vocab+v)*D with
+         * b<mel_bins, v<mel_vocab — so the table must have exactly
+         * mel_bins*mel_vocab rows or that index runs off the heap (bidirectional
+         * OOB read, config-controlled). Reconcile the real element count against
+         * the geometry before using it. */
+        st_tensor *aet = st_find(&m->S, "model.audio.encoder.weight");
+        if (c->mel_bins < 1 || c->mel_vocab < 1 || D < 1 ||
+            (int64_t)c->mel_bins * c->mel_vocab > INT64_MAX / D ||
+            !aet || aet->numel != (int64_t)c->mel_bins * c->mel_vocab * D) {
+            fprintf(stderr, "[audio] rejected: encoder table has %lld elements, "
+                    "config geometry is %d bins x %d levels x D=%d\n",
+                    aet ? (long long)aet->numel : -1, c->mel_bins, c->mel_vocab, D);
+            exit(1);
+        }
         m->audio_enc  = load_w(m, "model.audio.encoder.weight", 0);
         m->audio_norm = load_t(m, "model.audio.final_norm.weight");
         fprintf(stderr, "[audio] DMel encoder loaded (%d bins x %d levels -> D=%d)\n",
@@ -1078,8 +1106,7 @@ static int usage_save(Model *m, const char *snap) {
     (void)m;                              /* the counters live in route_trace.h now */
     char up[2048];
     const char *env = getenv("PIN");
-    const char *sv = getenv("USAGE_SAVE");
-    if (sv && *sv == '0') return 0;
+    /* USAGE_SAVE=0 is honoured inside rt_save itself (#1039) */
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
@@ -1089,11 +1116,23 @@ static int usage_save(Model *m, const char *snap) {
     return rt_save(up, 1);
 }
 
+/* KV rows actually kept per layer: sliding layers only ever attend to the last
+ * `window` positions (t0 clamp in attention), so their cache is a ring of
+ * `window` rows instead of max_t — at 32k context that is a ~64x cut on the
+ * 5-of-6 sliding layers. Global layers keep the full max_t. Must be computed
+ * from the SAME max_t the buffers were allocated with (m->max_t). */
+static inline int kv_ring_rows(const Cfg *c, int li, int max_t) {
+    return (c->local[li] && c->window > 0 && c->window < max_t) ? c->window : max_t;
+}
+
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
 static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, H = L_HEADS(c,li), KV = L_KV(c,li), hd = L_HD(c,li), ext = L_EXT(c,li);
     int local = c->local[li];
+    /* the ring made an over-run silent (t%win wraps instead of writing OOB), so
+     * fail fast here: every caller sizes the cache via kv_alloc before stepping */
+    if (pos0 + S > m->max_t) { fprintf(stderr, "attention: pos %d+%d exceeds kv alloc %d\n", pos0, S, m->max_t); exit(1); }
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
     float *q  = falloc((int64_t)S*qdim);
     float *k  = falloc((int64_t)S*kvdim);
@@ -1111,12 +1150,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         for (int h = 0; h < H;  h++) rmsnorm_row(q + (int64_t)s*qdim  + h*hd, q + (int64_t)s*qdim  + h*hd, l->qn, hd, c->eps);
         for (int h = 0; h < KV; h++) rmsnorm_row(k + (int64_t)s*kvdim + h*hd, k + (int64_t)s*kvdim + h*hd, l->kn, hd, c->eps);
     }
-    /* append K,V to the cache */
-    for (int s = 0; s < S; s++) for (int h = 0; h < KV; h++) {
-        int t = pos0 + s;
-        memcpy(m->K[li] + ((int64_t)h*m->max_t + t)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-        memcpy(m->V[li] + ((int64_t)h*m->max_t + t)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-    }
+    /* Rows for positions inside this batch are read from the k/vv scratch, not
+     * the cache: with a ring, appending the whole batch up front could overwrite
+     * history rows that earlier queries in the batch still need. The scratch
+     * holds exactly what the cache would (post-sconv, post-rmsnorm), so the
+     * arithmetic is unchanged; the cache is appended after scoring. */
+    int win = kv_ring_rows(c, li, m->max_t);
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
     #pragma omp parallel
@@ -1128,6 +1167,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
             for (int s = 0; s < S; s++) {
                 int qpos = pos0 + s;
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
+                int tb = pos0 > t0 ? pos0 : t0;   /* first row served by the scratch */
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
                 for (int e = 0; e < ext; e++) {
@@ -1142,9 +1182,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
                 const float *qv = q + (int64_t)s*qdim + h*hd;
-                const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                const float *Kh = m->K[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Kb = k  + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
-                    const float *kv = Kh + (int64_t)t*hd;
+                    const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
+                                             : Kb + (int64_t)(t - pos0)*kvdim;
                     float acc = 0.f;
                     for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
                     int dist = qpos - t;
@@ -1154,15 +1196,25 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 softmax_row(sc, n);
                 float *cx = ctx + (int64_t)s*qdim + h*hd;
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                const float *Vh = m->V[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Vb = vv + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = Vh + (int64_t)t*hd;
+                    const float *vrow = t < tb ? Vh + (int64_t)(t % win)*hd
+                                               : Vb + (int64_t)(t - pos0)*kvdim;
                     float a = sc[t - t0];
                     for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
                 }
             }
         }
         free(rl); free(sc);
+    }
+    /* append K,V to the cache (ring on sliding layers); rows the ring would
+     * overwrite within this same batch are skipped, they can never be read */
+    int s0 = S - win > 0 ? S - win : 0;
+    for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
+        int t = pos0 + s;
+        memcpy(m->K[li] + ((int64_t)h*win + t % win)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        memcpy(m->V[li] + ((int64_t)h*win + t % win)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(ctx);
@@ -1608,29 +1660,52 @@ static void kv_alloc(Model *m, int max_t) {
      * for a larger max_t every turn, so the state was thrown away just before
      * the point of using it.
      *
-     * K/V are laid out [kv_head][max_t][hd], so a larger max_t changes the
-     * stride: the old contents cannot be realloc'd, they have to be re-laid-out
-     * head by head. That copy costs a memcpy of what is already computed, which
-     * is nothing beside re-running the prefill that produced it. */
+     * K/V are laid out [kv_head][rows][hd] with rows = kv_ring_rows(), so a
+     * larger max_t changes the stride wherever rows follows max_t: those
+     * contents cannot be realloc'd, they have to be re-laid-out head by head.
+     * That copy costs a memcpy of what is already computed, which is nothing
+     * beside re-running the prefill that produced it.
+     *
+     * Sliding layers whose ring is already window rows are the exception in
+     * BOTH directions: their size does not depend on max_t (nothing to grow),
+     * and a ring that has wrapped is not linear (position t lives at row
+     * t % window), so the linear copy below would silently rotate it. Steal
+     * the buffer instead — the slot map is unchanged, so it stays valid.
+     * Every layer that does reach the copy IS linear: rows != old_rows only
+     * happens when old_rows == old_max (a wrapped ring keeps rows == window
+     * forever), and keep <= old_max <= rows there, so the copy fits. */
     float **oldK = m->K, **oldV = m->V;
     int old_max = m->max_t;
     int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
 
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    int64_t ring = 0, full = 0;
     for (int i = 0; i < c->n_layers; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
-        m->K[i] = falloc((int64_t)kv * max_t * hd);
-        m->V[i] = falloc((int64_t)kv * max_t * hd);
-        for (int h = 0; h < kv && keep; h++) {
-            memcpy(m->K[i] + (int64_t)h * max_t * hd,
-                   oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
-            memcpy(m->V[i] + (int64_t)h * max_t * hd,
-                   oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+        int64_t rows     = kv_ring_rows(c, i, max_t);
+        int64_t old_rows = oldK ? kv_ring_rows(c, i, old_max) : 0;
+        if (oldK && rows == old_rows) {
+            m->K[i] = oldK[i]; m->V[i] = oldV[i];
+            oldK[i] = NULL;    oldV[i] = NULL;
+        } else {
+            m->K[i] = falloc((int64_t)kv * rows * hd);
+            m->V[i] = falloc((int64_t)kv * rows * hd);
+            for (int h = 0; h < kv && keep; h++) {
+                memcpy(m->K[i] + (int64_t)h * rows * hd,
+                       oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+                memcpy(m->V[i] + (int64_t)h * rows * hd,
+                       oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+            }
         }
+        ring += 2 * (int64_t)kv * rows  * hd * (int64_t)sizeof(float);
+        full += 2 * (int64_t)kv * max_t * hd * (int64_t)sizeof(float);
     }
     if (oldK) for (int i = 0; i < c->n_layers; i++) { free(oldK[i]); free(oldV[i]); }
     free(oldK); free(oldV);
+    if (ring < full)
+        fprintf(stderr, "[kv] %.1f MiB (ring buffers on sliding layers; full cache would be %.1f MiB)\n",
+                ring/1048576.0, full/1048576.0);
 
     /* the record describes those same positions, so it survives with them --
      * unless its own allocation fails, in which case reuse simply stops. */
@@ -1783,6 +1858,22 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
                  uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile inkling_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_extension_bytes = 1u << 26,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+    .allow_extension_bytes = 1,
+    .allow_prefix_hint = 0,
+};
+
+static void serve_request_dispose(SReq *request) {
+    if (!request) return;
+    free(request->payload);
+    memset(request, 0, sizeof(*request));
+}
 
 static int stdin_readable(void) {
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
@@ -1792,15 +1883,16 @@ static int stdin_readable(void) {
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok, alen = 0; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
+static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result=coli_serve_read_command(input,&inkling_wire,&command);
+    if(result==COLI_SERVE_READ_EOF) return -1;
+    if(result==COLI_SERVE_READ_BAD_FRAME) return -2;
+    if(result==COLI_SERVE_READ_NOMEM){
+        coli_serve_write_error(output,command.id,"out of memory"); return -2;
+    }
+    if(result==COLI_SERVE_READ_BAD_REQUEST&&
+       command.kind==COLI_SERVE_COMMAND_SUBMIT){
         /* 6th field (optional, backward compatible): DMel byte count appended
          * verbatim after the text payload — frames x mel_bins u8 levels */
         /* SEC: max_tok was the one field nobody validated, and it is the one
@@ -1816,45 +1908,48 @@ static int serve_read_cmd(const char *cur_id) {
          * anything bridging it (socat, a custom gateway, a sidecar) exposes it
          * directly, so the check belongs here, next to the one plen already
          * has, rather than in one of its callers. */
-        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
-            max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        uint8_t *au = NULL;
-        if (alen > 0) {
-            au = malloc((size_t)alen);
-            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
-        }
-        int nl = fgetc(stdin); (void)nl;
+        coli_serve_write_error(output,command.id,"bad submit header"); return -2;
+    }
+    if(result!=COLI_SERVE_READ_OK) return 0;
+    if(command.kind==COLI_SERVE_COMMAND_CANCEL){
+        int matched=cur_id&&!strcmp(command.id,cur_id);
+        coli_serve_command_dispose(&command); return matched;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_STOP){
+        coli_serve_command_dispose(&command); return 0;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-            q->audio = au; q->alen = alen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok=command.max_tokens; q->temp=command.temperature;
+            q->top_p=command.top_p; q->plen=(int)command.payload_bytes;
+            q->alen=(int)command.extension_bytes;
+            q->audio=coli_serve_command_extension(&command);
+            q->payload=(char*)coli_serve_command_take_payload(&command);
+        } else coli_serve_write_error(output,command.id,"queue full");
     }
+    coli_serve_command_dispose(&command);
     return 0;
 }
 
-static void serve_one(Model *m, Tok *T, SReq *q) {
+static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
-    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
     const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (bad) { coli_serve_write_error(stdout,q->id,bad); free(ids); return 0; }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
-        printf("ERROR %s audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
-               q->id, naud, audio_tok_count(m, ids, np),
-               m->audio_norm ? "" : " — snapshot has no audio tensors");
-        fflush(stdout); free(ids); return;
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "audio frames (%d) do not match <|audio|> placeholders (%d)%s",
+                 naud,audio_tok_count(m,ids,np),
+                 m->audio_norm?"":" — snapshot has no audio tensors");
+        coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -1913,13 +2008,11 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         if (nhist < 128) hist[nhist++] = tk;
         else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
-        printf("DATA %s %d\n", q->id, nb);
-        fwrite(buf, 1, (size_t)nb, stdout);
-        fputc('\n', stdout); fflush(stdout);
+        coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
         while (stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
@@ -1928,14 +2021,18 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    ColiServeDone done={gen,dt>0?gen/dt:0.0,
+                        tot?100.0*(m->hits-h0)/tot:0.0,rss_gb(),np,limited};
+    char done_line[256];
+    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),q->id,&done);
+    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
     fflush(stdout);
     free(ids);
+    return 0;
 }
 
 /* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
@@ -2002,25 +2099,23 @@ static void serve_loop(Model *m, Tok *T) {
      * as \r\n, the gateway never matches it and waits forever (#748). Lives in
      * compat.h because colibri.c has had it since #195 and this engine was
      * written without it. */
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
+    coli_serve_stdio_init();
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
     else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
     /* the gateway reads a STAT line right after the READY sentinel (colibri
      * reports its load stats there) — match the handshake */
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
-    fflush(stdout);
+    coli_serve_write_ready(stdout,rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q);
+        int fatal=serve_one(m,T,&q);
         serve_tiers_emap(m);
-        free(q.payload); free(q.audio);
+        serve_request_dispose(&q);
+        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
     }
 }
 
@@ -2058,6 +2153,7 @@ int main(int argc, char **argv) {
 #endif
     }
 #endif  /* !COLI_CUDA && !__APPLE__ */
+    coli_omp_tune_threads("inkling");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;

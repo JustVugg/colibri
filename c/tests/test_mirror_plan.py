@@ -67,6 +67,49 @@ class MirrorPlannerTest(unittest.TestCase):
         self.assertEqual(selected[0]["activated_experts"], 1)
         self.assertEqual(selected[1]["activated_experts"], 0)
 
+    def test_plan_recognizes_k3_expert_tensors_and_packed_w1_anchor(self):
+        prefix = "language_model.model.layers.1.block_sparse_moe.experts.7"
+        anchor = self.write_shard(self.model, "k3-w1.safetensors", [
+            (f"{prefix}.w1.weight_packed", 11),
+        ])
+        companion = self.write_shard(self.model, "k3-rest.safetensors", [
+            (f"{prefix}.w1.weight_scale", 2),
+            (f"{prefix}.w2.weight_packed", 13),
+            (f"{prefix}.w2.weight_scale", 3),
+            (f"{prefix}.w3.weight_packed", 17),
+            (f"{prefix}.w3.weight_scale", 5),
+        ])
+        self.usage.write_text("1 7 99\n", encoding="utf-8")
+        budget = anchor.stat().st_size + companion.stat().st_size
+
+        plan, selected = create_plan(self.model, self.mirror, [], self.usage, budget, 0)
+
+        self.assertTrue(plan["admitted"])
+        self.assertEqual([item["name"] for item in selected],
+                         ["k3-w1.safetensors", "k3-rest.safetensors"])
+        self.assertEqual(selected[0]["weighted_expert_bytes"], 99 * 11)
+        self.assertEqual(selected[1]["weighted_expert_bytes"], 99 * 40)
+        self.assertEqual([item["activated_experts"] for item in selected], [1, 0])
+
+    def test_k3_names_accept_engine_prefixes_and_reject_near_matches(self):
+        accepted = [
+            ("model.layers.2.block_sparse_moe.experts.8.w1.weight_packed", 7),
+            ("language_model.model.layers.3.block_sparse_moe.experts.9."
+             "w1.weight_packed", 11),
+        ]
+        rejected = [
+            ("model.layers.2.block_sparse_moe.shared_experts.w1.weight_packed", 13),
+            ("model.layers.2.block_sparse_moe.experts.8.w4.weight_packed", 17),
+            ("model.layers.2.block_sparse_moe.experts.8.w1.weight_scale_inv", 19),
+            ("foo.model.layers.2.block_sparse_moe.experts.8.w1.weight_packed", 23),
+        ]
+        self.write_shard(self.model, "k3-names.safetensors", accepted + rejected)
+
+        _directories, candidates = discover_shards(self.model, [])
+
+        self.assertEqual(candidates[0]["expert_bytes"], {(2, 8): 7, (3, 9): 11})
+        self.assertEqual(candidates[0]["anchor_experts"], {(2, 8), (3, 9)})
+
     def test_plan_requires_learned_usage_instead_of_guessing(self):
         shard = self.write_shard(self.model, "model.safetensors", [
             ("model.layers.0.mlp.experts.0.gate_proj.weight", 8),

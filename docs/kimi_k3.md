@@ -111,6 +111,18 @@ on the full model this removes a 10–15 minute quantization pass. Quantized
 values are bit-identical to the load-time path (verified by hidden-state
 trace), so the two formats are numerically interchangeable.
 
+`K3_MMAP=1` is an experimental CPU-only residency option for a fully repacked
+container. It maps each prepared U8 matrix and its F32 scale sidecar read-only
+instead of copying both into private heap. The mapped pages remain file-backed
+and reclaimable; this changes commit/accounting, not the active working set, so
+memory pressure can become page faults during inference. On Linux, process
+monitors may still show the touched mapping (about 33.8 GB for the full model)
+in RSS; it is clean file-backed memory, not private heap, so use `/proc` smaps
+accounting to distinguish file-backed RSS from private anonymous memory. The
+option has no fallback: tensors that need load-time conversion, non-F32 scale
+sidecars, and enabled Vulkan/CUDA backends are refused. A Vulkan build therefore
+requires `K3_VK=0 K3_MMAP=1` explicitly.
+
 Sizes: source 1.56 TB → ≈1.50 TB (`--bits 8`) / ≈1.48 TB (`--bits 4`). The
 experts (93 % of bytes) are already at 4.25 bits/weight and cannot shrink
 losslessly; sub-4-bit expert re-encodes (fmt=5/6) would be double quantization
@@ -157,6 +169,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_BITS` | 4 | load-time bits for KDA/latent/shared/dense mats (4, 8, 32=f32) |
 | `K3_MLA_BITS` | 8 | load-time bits for MLA projections |
 | `K3_HEAD_BITS` | 8 | load-time bits for lm_head |
+| `K3_MMAP` | 0 | map fully prepared U8/F32 weights read-only (experimental, CPU-only, no conversion fallback) |
 | `K3_EXPERT_GB` | 8 | routed-expert LRU budget |
 | `K3_VK` | 1 | Vulkan tier when built with `make VK=1 kimi_k3` (0 = pure CPU) |
 | `K3_VK_GB` | driver budget | VRAM cap for the Vulkan tier |
@@ -227,7 +240,8 @@ loaded for the whole terminal session. `coli serve` exposes streaming and
 non-streaming `/v1/chat/completions`; `coli web` uses that same API. Reasoning
 is returned as `reasoning_content`, response text as `content`, and
 `<|end_of_msg|>` remains the model-owned stop token. `STOP` and `CANCEL` are
-honoured between generated tokens.
+honoured between generated tokens. Long prefill also polls `CANCEL` between
+layers and drops the unpublished partial state before serving another request.
 
 ## Vulkan tier (`make VK=1 kimi_k3`)
 

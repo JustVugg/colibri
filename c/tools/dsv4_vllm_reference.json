@@ -1,0 +1,22 @@
+{
+  "upstream": "https://github.com/vllm-project/vllm.git",
+  "commit": "ffd46bfab2128bb84146050e98b51a617c6575ab",
+  "container_image": "vllm/vllm-openai:v0.26.0",
+  "reported_version": "0.26.0",
+  "license": "Apache-2.0",
+  "model": "DeepSeek-V4-Flash-0731",
+  "hardware": "6x NVIDIA GeForce RTX 5090",
+  "tensor_parallel_size": 2,
+  "pipeline_parallel_size": 3,
+  "data_parallel_size": 1,
+  "decode_context_parallel_size": 1,
+  "kv_cache_dtype": "fp8",
+  "max_model_len": 128,
+  "max_num_seqs": 1,
+  "gpu_memory_utilization": 0.97,
+  "cuda_graph_mode": "FULL_AND_PIECEWISE",
+  "verified_decode_tokens_per_second": 120.9308,
+  "verified_tokens": 640,
+  "verified_elapsed_seconds": 5.292282,
+  "verified_log": "/tmp/dsv4-vllm-reference-steady.log"
+}

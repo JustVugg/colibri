@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 #include <mutex>
+#include <unordered_map>
 
 // ---- shader: general quantized GEMV, one threadgroup per output element (o,si) ----
 // y[si,o] = (sum_i dequant(W[o,i]) * x[si,i]) * scale[o]. fmt: 0=f32 1=i8 2=i4 3=i2.
@@ -445,6 +446,138 @@ kernel void r_top8_par(device const float* sig [[buffer(0)]], device const float
   if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
   for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
 }
+
+// ===== KV cache kernels =====
+// per-row rope_interleave on a single qk_rope vector (no heads). grid = S*(qk_rope/2).
+kernel void kv_rope(device float* R [[buffer(0)]], constant int& pos_base [[buffer(1)]],
+                    constant int& qk_rope [[buffer(2)]], constant float& theta [[buffer(3)]],
+                    uint gid [[thread_position_in_grid]]) {
+  int S=gid/(qk_rope/2); int j=gid%(qk_rope/2); int s=S; int hl=qk_rope/2;
+  int pos=pos_base+s;
+  device float* rv=R+(long)s*qk_rope;
+  float inv=pow(theta, -2.0f*j/(float)qk_rope); float ang=pos*inv, cs=cos(ang), sn=sin(ang);
+  // Read original pair BEFORE any write (threadgroup-local copy to avoid hazard)
+  thread float a=rv[2*j], b=rv[2*j+1];
+  // Write to both halves — may read from positions we'll also write, but we already have a/b
+  rv[j]     = a*cs - b*sn;
+  rv[hl+j]  = b*cs + a*sn;
+}
+// clear range: zero rows [from, to) [from,to) of Lc/Rc. grid = 2*nrows*maxD.
+kernel void kv_clear(device float* Lc [[buffer(0)]], device float* Rc [[buffer(1)]],
+                     constant int& from [[buffer(2)]], constant int& to [[buffer(3)]],
+                     constant int& kv_lora [[buffer(4)]], constant int& qk_rope [[buffer(5)]],
+                     uint gid [[thread_position_in_grid]]) {
+  int nr=to-from; int sel=gid%(2*nr), row=gid/(2*nr);
+   int s= row; if(s>=nr) return;
+   if(sel < nr){ Lc[(long)(from+s)*kv_lora+gid%(kv_lora)]=0.f; }
+   else        { Rc[(long)(from+s)*qk_rope+gid%(qk_rope)]=0.f; }
+}
+
+// ===== KDA Conv1d + SiLU kernel =====
+// Each thread (0..P-1) handles one dimension of one projection (q, k, or v).
+//  conv_win[d*K]   — stateful shift register [P*K], oldest first, newest at K-1
+//  vec[d]          — raw projected value (saved to window[K-1], overwritten with SiLU result)
+//  taps[d*K]       — constant convolution taps [P*K]
+kernel void kda_conv_silu(
+    device float* conv_win  [[buffer(0)]],
+    device float* vec       [[buffer(1)]],
+    device const float* taps [[buffer(2)]],
+    constant int& P         [[buffer(3)]],
+    constant int& K         [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  int d = (int)gid;
+  if (d >= P) return;
+  long base = (long)d * K;
+
+  // Shift window left by 1 and store new value at position K-1
+  for (int j = 0; j < K - 1; j++) {
+    conv_win[base + j] = conv_win[base + j + 1];
+  }
+  conv_win[base + K - 1] = vec[d];
+
+  // Compute dot product of taps and window
+  float acc = 0.f;
+  for (int j = 0; j < K; j++) {
+    acc += taps[base + j] * conv_win[base + j];
+  }
+
+  // Apply SiLU: x / (1 + exp(-x))
+  vec[d] = acc / (1.f + exp(-acc));
+}
+
+// ===== KDA L2 normalization kernel =====
+// Each thread (0..H-1) normalizes one head of Q and K in-place.
+//  q[h*hd:(h+1)*hd] *= 1/sqrt(sum(q^2) + eps) * qscale
+//  k[h*hd:(h+1)*hd] *= 1/sqrt(sum(k^2) + eps)
+kernel void kda_l2_norm(
+    device float* q       [[buffer(0)]],
+    device float* k       [[buffer(1)]],
+    constant int& H       [[buffer(2)]],
+    constant int& hd      [[buffer(3)]],
+    constant float& qscale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  int h = (int)gid;
+  if (h >= H) return;
+
+  long base = (long)h * hd;
+  float sq = 0.f, sk = 0.f;
+  for (int i = 0; i < hd; i++) {
+    sq += q[base + i] * q[base + i];
+    sk += k[base + i] * k[base + i];
+  }
+  sq = 1.f / sqrt(sq + 1e-6f);
+  sk = 1.f / sqrt(sk + 1e-6f);
+  float qs = sq * qscale;
+  for (int i = 0; i < hd; i++) {
+    q[base + i] *= qs;
+    k[base + i] *= sk;
+  }
+}
+
+// ===== KDA state recurrence kernel =====
+// Each thread handles one (h, i) element of output space [H, hd].
+// Two-pass sweep: (1) decay S by alpha, accumulate kS = S^T * kn,
+//   then vt = (vh - kS) * beta; (2) expand S += kn[kk]*vt[vv],
+//   merge oh[i] += qn[kk] * S[kk][i].
+kernel void kda_state(
+    device float* S      [[buffer(0)]],     // [H, hd, hd] in-place state
+    device const float* qn     [[buffer(1)]],   // [H, hd] L2-normalized, gated Q
+    device const float* kn     [[buffer(2)]],   // [H, hd] L2-normalized K
+    device const float* vh     [[buffer(3)]],   // [H, hd] gated V
+    device const float* alpha  [[buffer(4)]],   // [H, hd] per-head decay factors
+    device const float* beta   [[buffer(5)]],   // [H] mixing factor
+    device float* oh     [[buffer(6)]],     // [H, hd] output accumulator
+    constant int& H      [[buffer(7)]],
+    constant int& hd     [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  int th = gid / hd;
+  int i = gid % hd;
+  if (th >= H) return;
+  long hS = (long)th * hd * hd;
+  long hq = (long)th * hd;
+  const device float* qn_h = qn + hq;
+  const device float* kn_h = kn + hq;
+  const device float* vh_h = vh + hq;
+  const device float* alpha_h = alpha + hq;
+  // Pass 1: decay + kS accumulate for this output column
+  float kiS = 0.f;
+  for (int kk = 0; kk < hd; kk++) {
+    long row = hS + (long)kk * hd;
+    float al = alpha_h[kk];
+    S[row + i] *= al;
+    kiS += kn_h[kk] * S[row + i];
+  }
+  float vi = (vh_h[i] - kiS) * beta[th];
+  // Pass 2: expand + merge
+  float oi = 0.f;
+  for (int kk = 0; kk < hd; kk++) {
+    long row = hS + (long)kk * hd;
+    float kv = kn_h[kk];
+    S[row + i] += kv * vi;
+    oi += qn_h[kk] * S[row + i];
+  }
+  oh[hq + i] = oi;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -481,6 +614,9 @@ static id<MTLBuffer> fwht_signs(int n) {
 }
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
 static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
+static id<MTLComputePipelineState> g_kv_rope, g_kv_clear;
+static id<MTLComputePipelineState> g_kda_state;
+static id<MTLComputePipelineState> g_kda_conv_silu, g_kda_l2_norm;
 static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
                                   // serial kernel — see coli_metal_init.
 static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
@@ -520,7 +656,7 @@ static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel Ope
 // g_queue (macOS 15+) replaces moe_submit's per-command-buffer useResource: loop over
 // resolved expert weight/scale slabs. Allocation is untouched (same newBufferWithBytesNoCopy
 // wrap as stock); only residency bookkeeping moves off the dispatch hot path -- see
-// SUMMARY.md for why skipping useResource: there is safe (read-only, indirectly-referenced
+// docs/experiments/e5-metal-residency-set.md for why skipping useResource: there is safe (read-only, indirectly-referenced
 // buffers only; residency sets don't do hazard tracking, but nothing here relied on it).
 // g_resset_obj is a bare `id` (holds id<MTLResidencySet>) so the global's declared type
 // carries no availability annotation -- the protocol name only appears inside
@@ -629,8 +765,9 @@ static size_t fmt_bytes(int fmt, int I, int O) {
 // tensor in that encoding could ever reach this Metal-side sizing helper.
 static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
   if (fmt == 4) return (size_t)O * ((I + gs - 1) / gs) * sizeof(float);
-  if (fmt == 8) return (size_t)((O + 127) / 128) * (size_t)((I + 127) / 128) * sizeof(float);
-  return (size_t)O * sizeof(float);
+  if (fmt == 6) return (size_t)O * ((I + gs - 1) / gs) * 2; // e8: 2-byte group scales
+  if (fmt == 8) return (size_t)((O + 127) / 128) * (size_t)((I + 127) / 128) * sizeof(float); // fp8 block scales
+  return (size_t)O * sizeof(float); // per-row scale, fmt 0/1/2/3 (dev catch-all; #790 rebase must keep this)
 }
 
 // Wrap host memory zero-copy if page-aligned, else copy into a shared buffer.
@@ -639,6 +776,22 @@ static id<MTLBuffer> wrap(const void *p, size_t n) {
   if (((uintptr_t)p % pg) == 0 && (n % pg) == 0)
     return [g_dev newBufferWithBytesNoCopy:(void*)p length:n options:MTLResourceStorageModeShared deallocator:nil];
   return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared];
+}
+
+// Wrap-once cache for host buffers that live for the whole model (KDA state, conv windows,
+// conv taps). These are re-used every token, so wrapping them on each call churns thousands
+// of MTLBuffer objects. Keyed by host pointer, which is safe ONLY because these allocations
+// are never freed or resized during inference. Do NOT use for per-forward transient buffers
+// (qt/kt/tv/alpha/beta/oh) — their pointers get freed and reused.
+static std::unordered_map<const void*, id<MTLBuffer>> g_wrap_cache;
+static std::mutex g_wrap_cache_mu;
+static id<MTLBuffer> wrap_persistent(const void *p, size_t n) {
+  std::lock_guard<std::mutex> lk(g_wrap_cache_mu);
+  auto it = g_wrap_cache.find(p);
+  if (it != g_wrap_cache.end()) return it->second;
+  id<MTLBuffer> b = wrap(p, n);
+  if (b) g_wrap_cache[p] = b;
+  return b;
 }
 
 extern "C" int coli_metal_init(void) {
@@ -664,7 +817,10 @@ extern "C" int coli_metal_init(void) {
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
-    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    g_kv_rope=P("kv_rope"); g_kv_clear=P("kv_clear");
+    g_kda_state=P("kda_state");
+    g_kda_conv_silu=P("kda_conv_silu"); g_kda_l2_norm=P("kda_l2_norm");
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kv_rope||!g_kv_clear||!g_kda_state||!g_kda_conv_silu||!g_kda_l2_norm){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
     // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
     // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
@@ -801,13 +957,14 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
   /* fmt==8 (fp8 passthrough) is an explicit allow-list entry, not folded into the 0..4
    * contiguous range check below: it is not adjacent to it. */
   if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 8)) return 0;
+  if(!weights||!x||!y) return 0;
   @autoreleasepool {
     ColiMetalTensor *t = *tp;
     if (!t) {
       t = new ColiMetalTensor();
       t->fmt = fmt; t->I = I; t->O = O; t->wbytes = fmt_bytes(fmt, I, O);
       t->w = wrap(weights, t->wbytes);
-      t->s = wrap(scales, fmt_scale_bytes(fmt, I, O, gs));
+      { size_t sb=fmt_scale_bytes(fmt, I, O, gs); t->s=sb?wrap(scales,sb):0; }
       *tp = t;
       g_tensor_count++; g_tensor_bytes += t->wbytes;
     }
@@ -1281,7 +1438,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int q
   // contents), so there's no GPU-side write to serialize against; the one real hazard -- a
   // slab unregistered+freed+reused while an async in-flight CB still reads it -- is a
   // CPU-write race outside Metal's hazard tracking either way, held by the engine's own slot
-  // lifecycle, not by useResource:. See SUMMARY.md UNCERTAINTIES.
+  // lifecycle, not by useResource:. See docs/experiments/e5-metal-residency-set.md UNCERTAINTIES.
   if (!g_resset_enabled) {
     for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
   }
@@ -1395,4 +1552,414 @@ extern "C" int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out) {
   @autoreleasepool { ok = moe_finish(h->cb,h->hh,h->nb,h->R,h->D,h->rows.data(),h->rwv.data(),out); }
   h->cb=nil; h->hh=nil; delete h;
   return ok;
+}
+
+/* ---- Standalone elementwise / normalization ops --------------------------------
+
+ These are thin wrappers around the already-compiled g_a_rms / g_a_add / g_moe_silu
+ pipelines.  Each helper allocates a Managed (私密) buffer so the initial CPU-side
+ floating-point data survives for GPU reads, then uses `blitSynchronizeResource` +
+ `blitFromResource:toBuffer` to push back the GPU result into caller's ptr.  */
+
+// Push initial bytes from a CPU pointer into a Managed buffer and return the buffer.
+static id<MTLBuffer> cpubuf(id<MTLDevice> dev, const void *cpu, size_t len) {
+  id<MTLBuffer> b = [dev newBufferWithLength:len options:MTLResourceStorageModeManaged];
+  if (!b) return nil;
+  memcpy(b.contents, cpu, len);
+  [b didModifyRange:NSMakeRange(0, (NSUInteger)len)];
+  return b;
+}
+
+extern "C" int coli_metal_rmsnorm(float *x, const float *w, int nrows, int D, float eps) {
+  if (!g_dev) return 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> xb = cpubuf(g_dev, x, (size_t)nrows*D*4);
+    id<MTLBuffer> wb = cpubuf(g_dev, w, (size_t)D*4);
+    if (!xb || !wb) return 0;
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    int tgsz = 256;
+    [e setComputePipelineState:g_a_rms];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:wb offset:0 atIndex:1];
+    [e setBytes:&D length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
+    [e dispatchThreadgroups:MTLSizeMake(nrows,1,1) threadsPerThreadgroup:MTLSizeMake(tgsz,1,1)];
+    [e endEncoding];
+    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:xb]; [bl endEncoding]; }
+    [cb commit]; [cb waitUntilCompleted];
+    memcpy(x, xb.contents, (size_t)nrows * D * 4);
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+extern "C" int coli_metal_add(float *y, const float *a, size_t n) {
+  if (!g_dev || n == 0) return n == 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> yb = cpubuf(g_dev, y, n*4);
+    id<MTLBuffer> ab = cpubuf(g_dev, a, n*4);
+    if (!yb || !ab) return 0;
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    int tgsz = 256;
+    [e setComputePipelineState:g_a_add];
+    [e setBuffer:yb offset:0 atIndex:0]; [e setBuffer:ab offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((uint32_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(tgsz,1,1)];
+    [e endEncoding];
+    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:yb]; [bl endEncoding]; }
+    [cb commit]; [cb waitUntilCompleted];
+    memcpy(y, yb.contents, n*4);
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+extern "C" int coli_metal_silu_mul(float *g, const float *u, size_t n) {
+  if (!g_dev || n == 0) return n == 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> gb = cpubuf(g_dev, g, n*4);
+    id<MTLBuffer> ub = cpubuf(g_dev, u, n*4);
+    if (!gb || !ub) return 0;
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    int tgsz = 256;
+    [e setComputePipelineState:g_moe_silu];
+    [e setBuffer:gb offset:0 atIndex:0]; [e setBuffer:ub offset:0 atIndex:1];
+    [e dispatchThreads:MTLSizeMake((uint32_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(tgsz,1,1)];
+    [e endEncoding];
+    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:gb]; [bl endEncoding]; }
+    [cb commit]; [cb waitUntilCompleted];
+    memcpy(g, gb.contents, n*4);
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+// — KV cache row write & clear —
+
+static int cpy(id<MTLCommandBuffer> cb, id<MTLBuffer> dst, ptrdiff_t doff,
+               id<MTLBuffer> src, ptrdiff_t soff, uint32_t n) {
+  id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+  [e setComputePipelineState:g_a_copy];
+  [e setBuffer:dst offset:0 atIndex:0]; [e setBuffer:src offset:0 atIndex:1];
+  [e setBytes:&doff length:4 atIndex:2]; [e setBytes:&soff length:4 atIndex:3];
+  uint32_t tg=128, nt=((uint32_t)n+tg-1)/tg;
+  [e dispatchThreads:MTLSizeMake(nt*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+  [e endEncoding];
+  return cb.status != MTLCommandBufferStatusError;
+}
+
+extern "C" int coli_metal_kv_write(float *Lc, float *Rc, const float *L_raw, const float *R_raw,
+    const float *kv_a_ln, int S, int pos_base, int kv_lora, int qk_rope, float eps, float theta) {
+  if (!g_dev || S <= 0) return S <= 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+
+    id<MTLBuffer> bLc = wrap(Lc,  (size_t)S * kv_lora * 4);
+    id<MTLBuffer> bRc = wrap(Rc,  (size_t)S * qk_rope * 4);
+    id<MTLBuffer> bLu = wrap(L_raw, (size_t)S * kv_lora * 4);
+    id<MTLBuffer> bRu = wrap(R_raw, (size_t)S * qk_rope * 4);
+    id<MTLBuffer> bWa = wrap(kv_a_ln, kv_lora * 4);
+
+    if (!bLc || !bRc || !bLu || !bRu || !bWa) return 0;
+
+    // 1) Copy raw L → Lc rows
+    int rL = cpy(cb, bLc, 0, bLu, 0, (uint32_t)(S * kv_lora));
+    // 2) Copy raw R → Rc rows
+    int rR = cpy(cb, bRc, 0, bRu, 0, (uint32_t)(S * qk_rope));
+    if (!rL || !rR) return 0; // will still commit below — a_copy sets both buffers
+
+    auto rms = [&](id<MTLCommandBuffer> x, id<MTLBuffer> b, size_t off, id<MTLBuffer> Qw, int n) {
+      int QV = n; uint32_t tg = 128, nt = ((uint32_t)QV + tg - 1) / tg;
+      id<MTLComputeCommandEncoder> e = [x computeCommandEncoder];
+      [e setComputePipelineState:g_a_rms];
+      [e setBuffer:b  offset:off atIndex:0]; [e setBuffer:Qw offset:0 atIndex:1];
+      float ep[2] = {eps, 0}; [e setBytes:ep length:8 atIndex:2];
+      [e dispatchThreads:MTLSizeMake(nt*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [e endEncoding];
+    };
+
+    auto rope = [&](id<MTLCommandBuffer> x, id<MTLBuffer> b, size_t off,
+                    int base, int rs, int hs, int nh, float theta) {
+      uint32_t ttgq = 256; uint32_t threads = (uint32_t)nh * (uint32_t)(rs / 2);
+      uint32_t ntg = (threads + ttgq - 1) / ttgq;
+      id<MTLComputeCommandEncoder> e = [x computeCommandEncoder];
+      [e setComputePipelineState:g_a_rope];
+      [e setBuffer:b    offset:off atIndex:0];
+      [e setBytes:&pos_base length:4 atIndex:1];
+      int v0[4] = {base, rs, hs, 0};
+      [e setBytes:v0 length:16 atIndex:2];
+      float th[2] = {theta, 0}; [e setBytes:th length:8 atIndex:3];
+      [e dispatchThreads:MTLSizeMake(ntg*ttgq,1,1) threadsPerThreadgroup:MTLSizeMake(ttgq,1,1)];
+      [e endEncoding];
+    };
+
+    // 3) rmsnorm on L rows
+    for (int i = 0; i < S; i++)
+      rms(cb, bLc, (size_t)i * kv_lora * 4, bWa, kv_lora);
+
+    // 4) rope_interleave on R rows
+    rope(cb, bRc, 0, 0, qk_rope, 0, S, theta);
+
+    [cb commit]; [cb waitUntilCompleted];
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+extern "C" int coli_metal_kv_clear(float *Lc, float *Rc, int from, int to, int kv_lora, int qk_rope) {
+  if (!g_dev) return 0;
+  int nr = to - from;
+  if (nr <= 0) return 1;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> bLc = wrap(Lc, (size_t)nr * kv_lora * 4);
+    id<MTLBuffer> bRc = wrap(Rc, (size_t)nr * qk_rope * 4);
+    if (!bLc || !bRc) return 0;
+
+    uint32_t maxD = (uint32_t)(kv_lora > qk_rope ? kv_lora : qk_rope);
+    uint32_t total = 2 * (uint32_t)nr * maxD;
+    uint32_t tg = 256, ntg = (total + tg - 1) / tg;
+
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kv_clear];
+    [e setBuffer:bLc offset:(size_t)from * kv_lora * 4 atIndex:0];
+    [e setBuffer:bRc offset:(size_t)from * qk_rope * 4 atIndex:1];
+    int v[4] = {from, to, kv_lora, qk_rope};
+    [e setBytes:v length:16 atIndex:2];
+    [e dispatchThreads:MTLSizeMake(ntg * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [e endEncoding];
+
+    [cb commit]; [cb waitUntilCompleted];
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+// — KDA state recurrence —
+
+extern "C" int coli_metal_kda_state(float *S, const float *qn, const float *kn, const float *vh,
+                                     const float *alpha, const float *beta, float *oh,
+                                     int H, int hd) {
+  if (!g_dev || H <= 0) return H <= 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> bS = wrap(S,        (size_t)H * hd * hd * sizeof(float));
+    id<MTLBuffer> bqn = wrap(qn,      (size_t)H * hd * sizeof(float));
+    id<MTLBuffer> bkn = wrap(kn,      (size_t)H * hd * sizeof(float));
+    id<MTLBuffer> bvh = wrap(vh,      (size_t)H * hd * sizeof(float));
+    id<MTLBuffer> balph = wrap(alpha, (size_t)H * hd * sizeof(float));
+    id<MTLBuffer> bbet = wrap(beta,   (size_t)H * sizeof(float));
+    id<MTLBuffer> boh = wrap(oh,      (size_t)H * hd * sizeof(float));
+    if (!bS || !bqn || !bkn || !bvh || !balph || !bbet || !boh) return 0;
+    uint32_t total = (uint32_t)H * (uint32_t)hd;
+    uint32_t tg = 256, ntg = (total + tg - 1) / tg;
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kda_state];
+    [e setBuffer:bS    offset:0 atIndex:0];
+    [e setBuffer:bqn   offset:0 atIndex:1];
+    [e setBuffer:bkn   offset:0 atIndex:2];
+    [e setBuffer:bvh   offset:0 atIndex:3];
+    [e setBuffer:balph offset:0 atIndex:4];
+    [e setBuffer:bbet  offset:0 atIndex:5];
+    [e setBuffer:boh   offset:0 atIndex:6];
+    [e setBytes:&H length:4 atIndex:7];
+    [e setBytes:&hd length:4 atIndex:8];
+    [e dispatchThreads:MTLSizeMake(ntg * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    { memcpy(oh, [boh contents], (size_t)H * hd * sizeof(float)); }
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+// — KDA Conv1d + SiLU (one projection) —
+
+extern "C" int coli_metal_kda_conv_silu(float *conv_win, float *vec, const float *taps, int P, int K) {
+  if (!g_dev || P <= 0) return P <= 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> bwin = wrap(conv_win, (size_t)P * K * sizeof(float));
+    id<MTLBuffer> bvec = wrap(vec,      (size_t)P * sizeof(float));
+    id<MTLBuffer> btap = wrap(taps,     (size_t)P * K * sizeof(float));
+    if (!bwin || !bvec || !btap) return 0;
+
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kda_conv_silu];
+    [e setBuffer:bwin offset:0 atIndex:0];
+    [e setBuffer:bvec offset:0 atIndex:1];
+    [e setBuffer:btap offset:0 atIndex:2];
+
+    int Pv = P; int Kv = K;
+    [e setBytes:&Pv length:4 atIndex:3];
+    [e setBytes:&Kv length:4 atIndex:4];
+
+    uint32_t tg = 256, ntg = (P + tg - 1) / tg;
+    [e dispatchThreads:MTLSizeMake(ntg * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+// — KDA L2 normalization (q and k, in-place) —
+
+extern "C" int coli_metal_kda_l2_norm(float *q, float *k, int H, int hd, float qscale) {
+  if (!g_dev || H <= 0) return H <= 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> bq = wrap(q, (size_t)H * hd * sizeof(float));
+    id<MTLBuffer> bk = wrap(k, (size_t)H * hd * sizeof(float));
+    if (!bq || !bk) return 0;
+
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_kda_l2_norm];
+    [e setBuffer:bq offset:0 atIndex:0];
+    [e setBuffer:bk offset:0 atIndex:1];
+
+    int Hv = H; int hdv = hd;
+    [e setBytes:&Hv length:4 atIndex:2];
+    [e setBytes:&hdv length:4 atIndex:3];
+    [e setBytes:&qscale length:sizeof(float) atIndex:4];
+
+    uint32_t tg = 256, ntg = (H + tg - 1) / tg;
+    [e dispatchThreads:MTLSizeMake(ntg * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+/* ---------- KDA fused token step ----------
+ * Single command buffer: conv_silu(q,k,v) → l2_norm(q,k) → state recurrence.
+ * Alpha and beta are precomputed on CPU (graw+dt → alpha, braw → beta).
+ * oh[] is written by state kernel; caller must zero before call.
+ * After return, CPU performs per-head RMSNorm + sigmoid gate from oh → on. */
+extern "C" int coli_metal_kda_fused_token(
+    float *win_q, float *qt,
+    float *win_k, float *kt,
+    float *win_v, float *tv,
+    const float *taps_q, const float *taps_k, const float *taps_v,
+    float *S,
+    const float *alpha, const float *beta,
+    float *oh,
+    int P, int K, int H, int hd) {
+  if (!g_dev || P <= 0 || H <= 0) return 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+
+    // Pre-wrap all buffers
+    size_t P_K_sz = (size_t)P * K * sizeof(float);
+    size_t P_sz   = (size_t)P * sizeof(float);
+    size_t S_sz   = (size_t)H * hd * hd * sizeof(float);
+    size_t a_sz   = (size_t)H * hd * sizeof(float);
+    size_t b_sz   = (size_t)H * sizeof(float);
+
+    // Persistent (model-lifetime) buffers: wrap once and reuse. win_* and S are 16 KB-aligned
+    // (afcalloc) so these are zero-copy — GPU writes to conv windows and state land directly
+    // in host memory and persist to the next token. taps are read-only constants.
+    id<MTLBuffer> bwin_q = wrap_persistent(win_q, P_K_sz);
+    id<MTLBuffer> bwin_k = wrap_persistent(win_k, P_K_sz);
+    id<MTLBuffer> bwin_v = wrap_persistent(win_v, P_K_sz);
+    id<MTLBuffer> btap_q = wrap_persistent(taps_q, P_K_sz);
+    id<MTLBuffer> btap_k = wrap_persistent(taps_k, P_K_sz);
+    id<MTLBuffer> btap_v = wrap_persistent(taps_v, P_K_sz);
+    id<MTLBuffer> bS     = wrap_persistent(S, S_sz);
+    // Transient (per-forward) buffers: pointers change each call, so wrap fresh every time.
+    id<MTLBuffer> bqt    = wrap(qt, P_sz);
+    id<MTLBuffer> bkt    = wrap(kt, P_sz);
+    id<MTLBuffer> btv    = wrap(tv, P_sz);
+    id<MTLBuffer> balph  = wrap(alpha, a_sz);
+    id<MTLBuffer> bbet   = wrap(beta, b_sz);
+    id<MTLBuffer> boh    = wrap(oh, a_sz);
+
+    #define _BT(b) ((b)?(void*)1:(void*)0)
+    if(!bwin_q||!bwin_k||!bwin_v||!bqt||!bkt||!btv||
+       !btap_q||!btap_k||!btap_v||!bS||!balph||!bbet||!boh){
+      fprintf(stderr,"[FUSED] wrap nil: q=%p k=%p v=%p qt=%p kt=%p tv=%p tq=%p tk=%p tv2=%p S=%p a=%p b=%p oh=%p\n",
+              _BT(bwin_q),_BT(bwin_k),_BT(bwin_v),_BT(bqt),_BT(bkt),_BT(btv),
+              _BT(btap_q),_BT(btap_k),_BT(btap_v),_BT(bS),_BT(balph),_BT(bbet),_BT(boh));
+      return 0;
+    }
+    #undef _BT
+
+    /* -- Dispatch 1-3: conv_silu for q, k, v -- */
+    { // conv q
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_kda_conv_silu];
+      [e setBuffer:bwin_q offset:0 atIndex:0];
+      [e setBuffer:bqt    offset:0 atIndex:1];
+      [e setBuffer:btap_q offset:0 atIndex:2];
+      int Pv=P, Kv=K;
+      [e setBytes:&Pv length:4 atIndex:3];
+      [e setBytes:&Kv length:4 atIndex:4];
+      uint32_t tg=256, ntg=(P+tg-1)/tg;
+      [e dispatchThreads:MTLSizeMake(ntg*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [e endEncoding];
+    }
+    { // conv k
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_kda_conv_silu];
+      [e setBuffer:bwin_k offset:0 atIndex:0];
+      [e setBuffer:bkt    offset:0 atIndex:1];
+      [e setBuffer:btap_k offset:0 atIndex:2];
+      int Pv=P, Kv=K;
+      [e setBytes:&Pv length:4 atIndex:3];
+      [e setBytes:&Kv length:4 atIndex:4];
+      uint32_t tg=256, ntg=(P+tg-1)/tg;
+      [e dispatchThreads:MTLSizeMake(ntg*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [e endEncoding];
+    }
+    { // conv v
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_kda_conv_silu];
+      [e setBuffer:bwin_v offset:0 atIndex:0];
+      [e setBuffer:btv    offset:0 atIndex:1];
+      [e setBuffer:btap_v offset:0 atIndex:2];
+      int Pv=P, Kv=K;
+      [e setBytes:&Pv length:4 atIndex:3];
+      [e setBytes:&Kv length:4 atIndex:4];
+      uint32_t tg=256, ntg=(P+tg-1)/tg;
+      [e dispatchThreads:MTLSizeMake(ntg*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [e endEncoding];
+    }
+
+    /* -- Dispatch 4: l2_norm on q, k -- */
+    {
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_kda_l2_norm];
+      [e setBuffer:bqt offset:0 atIndex:0];
+      [e setBuffer:bkt offset:0 atIndex:1];
+      int Hv=H, hdv=hd;
+      float qs = 1.f / sqrtf((float)hd);
+      [e setBytes:&Hv length:4 atIndex:2];
+      [e setBytes:&hdv length:4 atIndex:3];
+      [e setBytes:&qs length:sizeof(float) atIndex:4];
+      uint32_t tg=256, ntg=(H+tg-1)/tg;
+      [e dispatchThreads:MTLSizeMake(ntg*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [e endEncoding];
+    }
+
+    /* -- Dispatch 5: state recurrence -- */
+    {
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_kda_state];
+      [e setBuffer:bS    offset:0 atIndex:0];
+      [e setBuffer:bqt   offset:0 atIndex:1];
+      [e setBuffer:bkt   offset:0 atIndex:2];
+      [e setBuffer:btv   offset:0 atIndex:3];
+      [e setBuffer:balph offset:0 atIndex:4];
+      [e setBuffer:bbet  offset:0 atIndex:5];
+      [e setBuffer:boh   offset:0 atIndex:6];
+      [e setBytes:&H length:4 atIndex:7];
+      [e setBytes:&hd length:4 atIndex:8];
+      uint32_t total=(uint32_t)H*(uint32_t)hd;
+      uint32_t tg=256, ntg=(total+tg-1)/tg;
+      [e dispatchThreads:MTLSizeMake(ntg*tg,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [e endEncoding];
+    }
+
+    [cb commit];
+    [cb waitUntilCompleted];
+    memcpy(oh, [boh contents], (size_t)H * hd * sizeof(float));
+    memcpy(S, [bS contents], S_sz);
+    memcpy(win_q, [bwin_q contents], P_K_sz);
+    memcpy(win_k, [bwin_k contents], P_K_sz);
+    memcpy(win_v, [bwin_v contents], P_K_sz);
+    return cb.status != MTLCommandBufferStatusError;
+  }
 }

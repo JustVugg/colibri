@@ -12,6 +12,21 @@ else
 IS_WIN :=
 UNAME_S := $(shell uname -s 2>/dev/null)
 UNAME_M := $(shell uname -m 2>/dev/null)
+# $(OS) is set by cmd.exe, but an MSYS2/MinGW login shell does not always export
+# it -- there uname reports MINGW64_NT-10.0-26200 / MSYS_NT-* / CYGWIN_NT-*,
+# which matched no branch below and tripped the $(error) on the very platform
+# the message lists as supported. Recognise those families as Windows too.
+#
+# Gated on x86_64 deliberately: the Windows arm below hardcodes ARCH ?= x86-64-v3,
+# so an ARM64 MinGW shell must NOT be routed there -- it would fail later with a
+# confusing -march error instead of the clear $(error) it gets today.
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
+ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
+IS_WIN := 1
+UNAME_S :=
+UNAME_M :=
+endif
+endif
 endif
 
 COLI_V4_OK :=
@@ -39,9 +54,11 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_GPU_TIER \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
+V4_WIN_EXTRA_OBJS = backend_loader_dsv4.o
 else ifeq ($(UNAME_S),Darwin)
 # Apple clang has no bundled OpenMP runtime: use Homebrew libomp when its
 # artifacts are actually present, else build single-threaded (pragmas are
@@ -76,6 +93,7 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
+V4_WIN_EXTRA_OBJS =
 endif
 
 LTO ?= 1
@@ -84,25 +102,132 @@ CFLAGS += -flto
 LDFLAGS += -flto
 endif
 
+# ---- Linux/macOS CUDA tier (opt-in): CUDA=1 ---------------------------------
+# On Windows the tier lives in coli_cuda_dsv4*.dll, resolved at runtime by
+# backend_loader_dsv4.o. Elsewhere there is no loader: the same
+# backend_cuda_dsv4.cu is compiled by nvcc and linked straight into the
+# engine, so the dsv4_cuda_* symbols are the real ones. Defaults to the
+# GENERIC kernels (any sm_80+; CUDA_ARCH=native|portable|sm_XX);
+# DEEPGEMM=1 adds the sm_120a DeepGEMM tensor-core paths and needs the
+# patched sm120 DeepGEMM checkout at DEEPGEMM_HOME (see
+# patches-deepgemm-sm120-msvc.patch and docs/deepseek-v4.md). Untested here
+# (no Linux GPU box): built by inspection from the Windows tier.
+CUDA ?= 0
+ifeq ($(CUDA),1)
+ifeq ($(IS_WIN),)
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+DEEPGEMM ?= 0
+ifeq ($(DEEPGEMM),1)
+# The DeepGEMM kernels use sm_120a-only PTX (block-scaled MMA); they cannot be
+# compiled for compute_120 or any other target, so DEEPGEMM=1 builds for
+# sm_120a only (CUDA_ARCH is ignored). Use the generic build for other cards.
+# Headers: a pinned checkout made by tools/fetch_deepgemm.sh on first build
+# (gitignored third_party/deepgemm); DEEPGEMM_HOME points at an existing tree.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
+V4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
+V4_CUDA_GENCODE = -gencode arch=compute_120a,code=sm_120a
+V4_DEEPGEMM_FLAGS = -DCOLI_DSV4_DEEPGEMM \
+                -I$(DEEPGEMM_HOME)/deep_gemm/include -I$(DEEPGEMM_HOME)/cutlass/include \
+                -I$(DEEPGEMM_HOME)/third-party/cutlass/include
+else
+CUDA_ARCH ?= native
+ifeq ($(CUDA_ARCH),portable)
+V4_CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+                  -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
+                  -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120
+else
+V4_CUDA_GENCODE = -arch=$(CUDA_ARCH)
+endif
+endif
+# NO_TC=1 adds -DCOLI_DSV4_NO_TC: builds on toolkits older than 12.8 that lack
+# the cuBLASLt block-scaling APIs (opt-in DSV4_CUDA_TC path is compiled out).
+NO_TC ?= 0
+ifeq ($(NO_TC),1)
+V4_DEEPGEMM_FLAGS += -DCOLI_DSV4_NO_TC
+endif
+V4_NVCCFLAGS = -O3 -std=c++20 --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=-fPIC \
+               $(V4_CUDA_GENCODE) $(V4_DEEPGEMM_FLAGS)
+CFLAGS += -DCOLI_V4_GPU_TIER
+V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
+# libcuda (driver API, TMA descriptors) is linked from the toolkit stubs: the
+# driver package (and WSL2's /usr/lib/wsl/lib) ships libcuda.so.1 but often no
+# libcuda.so dev symlink. rpath so the binary finds the toolkit's libcudart /
+# libcublasLt without an ld.so.conf entry.
+LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOME)/lib64 \
+           -lcudart -lcuda -lcublasLt -lstdc++
+endif
+endif
+
 include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_OBJS = $(TARGET_OBJS)
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
+REGISTRY_OBJ = expert_store_registry.o
+V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
+V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
-.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
+.PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
+	deepseek-v4-test-registry print-v4-objs
 deepseek-v4: $(V4_BINARY)
+
+# Build just the amalgamation unit + registry objects (no link). External
+# trees (e.g. a downstream integration) reuse these .o's to link an
+# alternative-backend deepseek_v4 binary without recompiling the units themselves.
+deepseek-v4-objs: $(V4_OBJS)
+
+# Echo the object list (target units + registry) for external linkers that need
+# to link exactly what the plain deepseek_v4 binary links, no more.
+print-v4-objs:
+	@echo $(V4_OBJS)
 
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
+# Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
+# Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
+$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h
+	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
+
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
+	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h
+	native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
+
+$(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
+# The CUDA tier loader object. Compiled only on Windows, where it is appended
+# to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
+# Linux it is empty so the engine links without it.
+backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
+
+# Linux/macOS CUDA=1: the tier compiled straight into the engine.
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
+	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+ifneq ($(DEEPGEMM_STAMP),)
+$(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+endif
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
+# Registry unit test (no engine link — stubs the auto open fn).
+deepseek-v4-test-registry: test_expert_store_registry
+	./test_expert_store_registry
+test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c \
+	expert_store_registry.h expert_store.h
+	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
+
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS)
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_SERVE_TEST) test_expert_store_registry

@@ -35,10 +35,16 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
 
   // load the expert atlas if published (measured topic affinity, #175)
   useEffect(() => {
-    fetch("/experts.json").then(r => r.ok ? r.json() : null).then(d => {
-      if (d?.experts) setAtlas(d.experts)
-    }).catch(() => {})
-  }, [])
+    // The atlas lives next to the engine's /experts endpoint, not on the page
+    // origin: when the UI is hosted elsewhere (dev server, static hosting) a
+    // root-relative fetch pointed at the wrong server and the atlas never
+    // loaded. Same base + auth as the live expert map above.
+    const base = baseUrl.replace(/\/v1\/?$/, "")
+    fetch(endpoint(base, "/experts.json"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
+      .then(r => r.ok ? r.json() : null).then(d => {
+        if (d?.experts) setAtlas(d.experts)
+      }).catch(() => {})
+  }, [baseUrl, apiKey])
 
   // track container size for responsive cell sizing
   useEffect(() => {

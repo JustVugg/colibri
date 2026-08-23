@@ -7,8 +7,10 @@
  */
 #include "deepseek_v4.h"
 
+#include <stdio.h>
 #include "tensor.h"
 #include "expert_store.h"
+#include "expert_store_registry.h"
 #include "native_quant.h"
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
@@ -73,6 +75,38 @@ int coli_st_streaming_direct_available(const ColiSafetensorsIndex *index,
 int coli_st_prefetch_at(const ColiSafetensorsIndex *index, int shard,
                         uint64_t offset, size_t length);
 const char *coli_st_dtype_name(ColiSafetensorsDType dtype);
+
+/* ==== begin dual-SSD mirror (COLI_MODEL_MIRROR / SNAP_MIRROR) ==== */
+
+/* Registers the read replicas listed in COLI_MODEL_MIRROR (or SNAP_MIRROR) on
+ * `index` and derives the per-drive expert read split from COLI_DISK_WEIGHTS
+ * or a startup bandwidth probe (colibri.c mirror_setup semantics). Runs after
+ * the index is open and before any expert load. Returns 1 when a usable mirror
+ * is active, 0 when none, -1 on error. */
+int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir,
+                         int experts_per_layer);
+int coli_st_streaming_direct_available_rep(const ColiSafetensorsIndex *index,
+                                           int shard, int rep);
+
+/* Replica (0 = primary, 1..nrep-1 = mirrors) serving expert (layer, eid). */
+int coli_st_expert_route(int layer, int eid);
+int coli_st_mirror_active(void);
+int coli_st_mirror_nrep(void);
+
+/* Rep-aware reads: route to the replica fd (falling back to the primary when
+ * the shard is absent there or on read error) and account bytes per drive. */
+int coli_st_read_at_rep(const ColiSafetensorsIndex *index, int shard, int rep,
+                        uint64_t offset, size_t length, void *destination);
+int coli_st_read_at_streaming_rep(const ColiSafetensorsIndex *index, int shard,
+                                  int rep, uint64_t offset, size_t length,
+                                  void *destination);
+int coli_st_prefetch_at_rep(const ColiSafetensorsIndex *index, int shard,
+                            int rep, uint64_t offset, size_t length);
+
+/* Per-drive I/O telemetry (bytes / read count), index [0] primary, [r] mirror. */
+extern uint64_t g_v4_mir_bytes[1 + ST_MAX_MIR];
+extern uint64_t g_v4_mir_nread[1 + ST_MAX_MIR];
+/* ==== end dual-SSD mirror ==== */
 
 int coli_tensor_load_fp8(ColiOwnedTensor *output,
                          const ColiSafetensorsIndex *index,
@@ -195,6 +229,9 @@ typedef struct {
     ColiDeepSeekV4LayerPlan plan;
     ColiDeepSeekV4LayerStats stats;
     void *data[COLI_V4_MAX_LAYER_TENSORS];
+    /* Optional per-tensor backend-resident mirrors (Dsv4CudaTensor* on the CUDA
+     * tier). Aligned 1:1 with plan.tensors[]; owned by the engine's GPU tier. */
+    void *gpu[COLI_V4_MAX_LAYER_TENSORS];
 } ColiDeepSeekV4LayerWeights;
 
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
@@ -214,6 +251,13 @@ void coli_v4_layer_free(ColiV4Engine *engine,
 const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
                                const char *name,
                                const ColiDeepSeekV4TensorSpec **spec);
+
+/* Backend-mirror accessors: the gpu handle attached to the tensor named
+ * "layers.<N>.<suffix>.weight", or NULL when the tier did not upload it. */
+void *coli_v4_layer_gpu(const ColiDeepSeekV4LayerWeights *weights,
+                        const char *suffix);
+int coli_v4_layer_gpu_set(ColiDeepSeekV4LayerWeights *weights,
+                          const char *suffix, void *handle);
 
 #ifdef __cplusplus
 }
@@ -310,6 +354,10 @@ extern "C" {
 typedef struct ColiDeepSeekV4WindowAttentionState
     ColiDeepSeekV4WindowAttentionState;
 
+int coli_v4_window_attention_prepare(ColiDeepSeekV4WindowAttentionState *state,
+                                     const ColiDeepSeekV4LayerWeights *weights,
+                                     const ColiDeepSeekV4Config *config,
+                                     char *error, size_t error_size);
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **state,
                                     const ColiDeepSeekV4Config *config);
 void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state);
@@ -357,6 +405,12 @@ int coli_v4_attention_snapshot_restore(
     ColiDeepSeekV4WindowAttentionState *state,
     const ColiV4AttentionSnapshot *snapshot);
 void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot);
+/* Disk (de)serialization of a snapshot (little-endian raw fields + arrays).
+ * write returns 0 on success; read allocates *output (0 on success). */
+int coli_v4_attention_snapshot_write(const ColiV4AttentionSnapshot *snapshot,
+                                     FILE *stream);
+int coli_v4_attention_snapshot_read(FILE *stream,
+                                    ColiV4AttentionSnapshot **output);
 /* ==== end deepseek_v4_attention_transaction.h ==== */
 
 /* ==== begin deepseek_v4_compressor.h ==== */
@@ -401,6 +455,14 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                             const float *input, int position,
                             char *error, size_t error_size);
 
+/* Like coli_v4_compressor_step, but consumes precomputed wkv/wgate matvec
+ * rows (projection_dim floats each, e.g. batched on the GPU) instead of
+ * projecting input itself. State updates are identical. */
+int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
+                               float *output, int *produced,
+                               const float *kv_proj, const float *gate_proj,
+                               int position, char *error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif
@@ -419,6 +481,10 @@ int coli_v4_compressor_snapshot_restore(
     ColiDeepSeekV4CompressorState *state,
     const ColiV4CompressorSnapshot *snapshot);
 void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot);
+int coli_v4_compressor_snapshot_write(const ColiV4CompressorSnapshot *snapshot,
+                                      FILE *stream);
+int coli_v4_compressor_snapshot_read(FILE *stream,
+                                     ColiV4CompressorSnapshot **output);
 /* ==== end deepseek_v4_compressor_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_indexer.h ==== */
@@ -446,6 +512,24 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
                          int index_capacity, const float *query_rank,
                          const float *input, int position,
                          char *error, size_t error_size);
+/* Like coli_v4_indexer_step, but consumes precomputed rows of the indexer
+ * compressor's wkv/wgate projections for this position. */
+int coli_v4_indexer_step_projected(ColiDeepSeekV4Indexer *state, int *indices,
+                                   int index_capacity, const float *query_rank,
+                                   const float *input, int position,
+                                   const float *kv_proj, const float *gate_proj,
+                                   char *error, size_t error_size);
+/* Batched prefill split of the step: advance per token (in order), then
+ * select for the whole chunk at once. */
+int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
+                            int position, const float *kv_proj,
+                            const float *gate_proj, char *error,
+                            size_t error_size);
+int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
+                                 int index_capacity, const float *query_ranks,
+                                 const float *inputs, int start_position,
+                                 int batch, const int *counts, int *selected,
+                                 char *error, size_t error_size);
 const float *coli_v4_indexer_compressed_values(
     const ColiDeepSeekV4Indexer *state);
 int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state);
@@ -462,6 +546,9 @@ int coli_v4_indexer_snapshot_create(const ColiDeepSeekV4Indexer *state,
 int coli_v4_indexer_snapshot_restore(ColiDeepSeekV4Indexer *state,
                                      const ColiV4IndexerSnapshot *snapshot);
 void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot);
+int coli_v4_indexer_snapshot_write(const ColiV4IndexerSnapshot *snapshot,
+                                   FILE *stream);
+int coli_v4_indexer_snapshot_read(FILE *stream, ColiV4IndexerSnapshot **output);
 /* ==== end deepseek_v4_indexer_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_expert.h ==== */
@@ -499,7 +586,7 @@ int coli_v4_shared_expert_forward_ref(float *output,
 extern "C" {
 #endif
 
-typedef struct {
+typedef struct ColiDeepSeekV4ExpertStoreOptions {
     const char *model_dir;
     int layers;
     int experts_per_layer;
@@ -645,6 +732,116 @@ typedef struct {
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
 
+#ifdef COLI_V4_GPU_TIER
+/* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
+ * Windows CUDA build; every call site elsewhere is guarded by COLI_V4_GPU_TIER
+ * so non-GPU objects never reference these symbols. */
+int coli_v4_gpu_engine_open(ColiV4Engine *engine);
+void coli_v4_gpu_engine_close(ColiV4Engine *engine);
+int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
+                             ColiDeepSeekV4LayerWeights *weights);
+int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
+                           const float *input);
+int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
+                                 const float *inputs, int batch);
+int coli_v4_gpu_kv_ring_append(const ColiDeepSeekV4LayerWeights *weights,
+                               const float *rows, int start_pos, int count,
+                               int window, int dim);
+int coli_v4_gpu_kv_comp_append(const ColiDeepSeekV4LayerWeights *weights,
+                               const float *rows, int start_idx, int count,
+                               int dim);
+int coli_v4_gpu_kv_cache_sync(const ColiDeepSeekV4LayerWeights *weights,
+                              const float *cpu_ring, int window, int head_dim,
+                              int start_position, const float *compressed,
+                              int comp_total);
+void coli_v4_gpu_kv_cache_advance(const ColiDeepSeekV4LayerWeights *weights,
+                                  const float *rows, int start_position,
+                                  int count, int window, int head_dim,
+                                  int comp_total);
+void coli_v4_gpu_kv_cache_poison(const ColiDeepSeekV4LayerWeights *weights);
+void coli_v4_gpu_kv_cache_invalidate_all(void);
+int coli_v4_gpu_sparse_attention_batch_cached(
+    const ColiDeepSeekV4LayerWeights *weights, float *attended,
+    const float *q, const float *chunk, int chunk_start, const float *sinks,
+    const int *meta, int abs_base, int comp_limit, int heads, int head_dim,
+    int batch);
+int coli_v4_gpu_fp8_ref_matmul(const ColiDeepSeekV4LayerWeights *weights,
+                               const ColiTensorView *w, const float *x_qdq,
+                               int tokens, float *y);
+int coli_v4_gpu_indexer_score_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *scores,
+    const float *queries, const float *keys, const float *head_w,
+    const int *counts, int tokens, int heads, int dim, int count);
+int coli_v4_gpu_sparse_attention_batch_cached_idx(
+    const ColiDeepSeekV4LayerWeights *weights, float *attended,
+    const float *q, const float *chunk, int chunk_start, const float *sinks,
+    const int *meta, const int *sel, int selstride, int abs_base,
+    int comp_limit, int heads, int head_dim, int batch);
+int coli_v4_gpu_moe_batch_wanted(void);
+void coli_v4_gpu_moe_batch_release(void);
+void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens);
+int coli_v4_gpu_moe_batch_union(float *outputs,
+                                const ColiDeepSeekV4LayerWeights *weights,
+                                const ColiDeepSeekV4Config *config,
+                                ColiExpertStore *store,
+                                const float *inputs, const int *tokens,
+                                int batch);
+int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
+                               const float *input, int groups);
+/* Batched GPU attention offloads for prefill (COLI_CUDA_ATTN_BATCH=1).
+ * Every entry returns non-zero on any refusal so the caller can fall back to
+ * the CPU reference for the whole chunk. */
+int coli_v4_gpu_attn_batch_wanted(void);
+/* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
+ * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
+int coli_v4_gpu_compressor_project_batch(
+    const ColiDeepSeekV4LayerWeights *weights, const char *wkv_key,
+    const char *wgate_key, int expected_rows, float *kv_proj,
+    float *gate_proj, const float *inputs, int batch);
+/* Sparse window attention over a linear KV slab; contract described at
+ * dsv4_cuda_sparse_attn_batch. */
+int coli_v4_gpu_sparse_attention_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *attended,
+    const float *q, const float *values, const float *sinks, const int *meta,
+    int value_rows, int comp_base, int heads, int head_dim, int batch);
+/* Grouped wo_a + wo_b over the whole chunk through the fp8-bf16 wo_a mirror.
+ * q_width = heads*head_dim (context row), hidden = output row. */
+int coli_v4_gpu_attention_wo_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *outputs,
+    const float *attended, int groups, int q_width, int hidden, int batch);
+/* Batched mHC: whole-chunk normalized_hc_pre / coli_v4_hc_post through the
+ * hc_<branch>_fn/scale/base and norm f32 mirrors (hc must be 4, hidden 4096).
+ * posts is [batch][hc], combs [batch][hc*hc]; layouts match the CPU arrays. */
+int coli_v4_gpu_mhc_pre_norm_batch(
+    const ColiDeepSeekV4LayerWeights *weights, const char *branch,
+    const char *norm_key, float *posts, float *combs, float *normalized,
+    const float *inputs_hc, int hc, int hidden, int batch);
+int coli_v4_gpu_mhc_post_batch(
+    const ColiDeepSeekV4LayerWeights *weights, float *outputs_hc,
+    const float *branch, const float *residual_hc, const float *posts,
+    const float *combs, int hc, int hidden, int batch);
+/* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
+ * Uses the resident layer's uploaded f32 gate/bias mirrors through
+ * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or
+ * mirror mismatch returns non-zero so the caller falls back to the CPU route. */
+int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
+                      const ColiDeepSeekV4LayerWeights *weights,
+                      const float *bias, const int *forced_indices,
+                      int experts, int dimension, int topk, float route_scale);
+/* Best-effort fp4 mirror attach for a routed expert. Returns 0 when all three
+ * of view->gate/up/down now carry Dsv4CudaTensor* handles (cached on first
+ * use), non-zero when the tier is inactive or the expert must stay on the CPU
+ * fp4 path. Only block_rows==1 views are mirrored; rows16-packed slots are
+ * skipped. */
+int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
+/* Dspark (MTP) resident-expert mirrors: a separate bounded LRU so drafting can
+ * never evict the target model's learned expert mirrors. ensure() lazily
+ * allocates the cache on the first V4_MTP_GPU=1 draft; attach mirrors one
+ * block_rows==1 fp4 expert view into it (returns non-zero to stay on CPU). */
+int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine);
+int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view);
+#endif
+
 struct ColiV4Engine {
     ColiDeepSeekV4Config config;
     ColiDeepSeekV4RuntimeOptions runtime;
@@ -663,6 +860,20 @@ struct ColiV4Engine {
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
     } dense_resident;
+    /* Optional CUDA tier (compiled in only when the engine build defines
+     * COLI_V4_GPU_TIER on Windows). enabled is 1 only after the loader resolved
+     * coli_cuda_dsv4.dll and dsv4_cuda_init succeeded; matvec dispatch then
+     * short-circuits the dense fp8 projections through backend_cuda_dsv4.cu. */
+    struct {
+        int enabled;
+        int device;
+        unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
+        long long uploaded_bytes;
+        /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
+         * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
+         * unless V4_MTP_GPU=1 and the tier opened successfully. */
+        void *dspark_mirrors;
+    } gpu;
     struct {
         uint16_t *markov_w1;
         uint16_t *markov_w2;
@@ -714,9 +925,13 @@ struct ColiV4Session {
     int spec_disabled;
 };
 
-/* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
+/* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap).
+ * `config` is the model geometry (== engine->config on the engine_open path);
+ * it is forwarded by the backend registry so engine-less callers (the standalone
+ * CLI) can use routed backends that only need geometry, not the engine. */
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
+    const ColiDeepSeekV4Config *config,
     const ColiDeepSeekV4ExpertStoreOptions *options,
     ColiExpertStore **store,
     char *error,

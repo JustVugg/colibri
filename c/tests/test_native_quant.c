@@ -78,7 +78,7 @@ int main(void) {
     ColiTensorView view = {
         COLI_TENSOR_FP4_NATIVE_BLOCK, COLI_SCALE_UE8M0,
         weights, scales, sizeof(weights), sizeof(scales),
-        1, 128, 1, 32
+        1, 128, 1, 32, NULL
     };
     float output;
     if (coli_fp4_matvec_ref(&output, &view, input) != 0 ||
@@ -90,7 +90,7 @@ int main(void) {
     ColiTensorView fp8_view = {
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
         fp8_weights, fp8_scales, sizeof(fp8_weights), sizeof(fp8_scales),
-        128, 128, 128, 128
+        128, 128, 128, 128, NULL
     };
     float fp8_output[128];
     if (coli_fp8_matvec_ref(fp8_output, &fp8_view, input) != 0)
@@ -113,7 +113,7 @@ int main(void) {
     ColiTensorView row_major_view = {
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
         row_major, fp8_scales, sizeof(row_major), sizeof(fp8_scales),
-        8, 128, 128, 128
+        8, 128, 128, 128, NULL
     };
     ColiTensorView rows8_view = row_major_view;
     rows8_view.data = rows8;
