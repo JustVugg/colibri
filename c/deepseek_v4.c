@@ -2791,8 +2791,6 @@ int coli_v4_attention_window_batch_ref(
 
 #ifdef COLI_V4_GPU_TIER
     int gpu_batch = coli_v4_gpu_attn_batch_wanted() && batch > 1;
-#else
-    int gpu_batch = 0;
 #endif
     /* Whole-chunk GPU projections for the compressor and the indexer's
      * compressor; the per-token state advance stays on the CPU. NULL means
@@ -5042,6 +5040,7 @@ static int moe_token_pipeline(float *output,
                     coli_expert_release(store, &jobs[slot].view);
             }
     }
+    (void)gpu_compute;
 #ifdef COLI_V4_GPU_TIER
     int hybrid_gpu_count = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */

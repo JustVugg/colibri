@@ -333,6 +333,8 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_LOAD_THREADS` | `4` | Loader threads for the pipe path. Clamped to [1,16]. |
 | `K3_DIRS` | unset | Extra shard directories (`;`/`,`-separated) for a multi-drive split, as `COLI_MODEL_DIRS` is for `colibri`. |
 | `K3_TOPP` | `0` (off) | Prune routed experts to this cumulative gate weight. A quality lever — A/B it against `K3_LOGITS`. |
+| `COLI_K3_CKPT` | `0` (off) | In serve mode, retain up to N recurrent-state checkpoints (maximum 8) at turn boundaries. A divergent prompt can restore the deepest matching checkpoint and re-prefill only its changed tail. Each in-memory checkpoint is about 434 MB on the full model and is included in the RAM budget. Checkpointing changes work, not generated tokens. |
+| `COLI_K3_CKPT_DIR` | unset | Store recurrent-state checkpoints as files in this directory instead of in RAM; the RAM budget then reserves one bounce buffer regardless of the slot count. Setting only the directory implies two slots; an explicit `COLI_K3_CKPT` value, including `0`, takes precedence. Files are process-local scratch because the required MLA rows do not survive restart. |
 | `K3_THINK` | `1` (on) | Emit a reasoning block. `=0` disables. |
 | `K3_VK` | `1` (on where built) | Vulkan expert tier. `=0` forces CPU-only. |
 | `K3_VK_GB` | `0` (driver budget) | VRAM cap (GB) for the K3 Vulkan expert tier. |

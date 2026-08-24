@@ -293,6 +293,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
+| `DSV4_HYBRID` (0) | `1` = on decode misses, split experts between concurrent GPU fill/compute and CPU compute using live bandwidth estimates instead of uploading every miss and falling back the whole token to CPU. Requires the GPU tier; cumulative split/upload counters are printed after each request. |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
 
 **Prefill / checkpoints**
@@ -304,6 +305,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PREFIX_LOG` | log hint boundary / reuse decisions |
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
+| `COLI_V4_SHARED_BATCH` (1) | batch the dense FP8 shared-expert matmuls across prefill rows while preserving each row's scalar accumulation order; `0` restores one shared-expert forward per row |
+| `COLI_V4_PREFILL_POOL` (1) | let each layer-major prefill borrow idle physical expert-cache partitions while retaining every layer's decode reserve; `0` restores fixed per-layer cache partitions. Speculative decode never uses the pooled policy. |
 | `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for all; numerics comparisons) |
 | `CTX` (4096) / `NGEN` | context window / generation ceiling (CLI + serve) |
 
