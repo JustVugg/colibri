@@ -473,7 +473,7 @@ static void stream_token(int id){
     if (g_openai){
         if (g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* TTFT on first token */
         if (!g_tok){
-            char jb[256];
+            char jb[512];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%d\"},\"finish_reason\":null}]}",
