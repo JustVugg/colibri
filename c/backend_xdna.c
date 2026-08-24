@@ -843,6 +843,31 @@ static unsigned short coli_xdna_f2b(float f){
     return (unsigned short)(u >> 16);
 }
 
+/* Convert ONE fmt=4 output column into the transposed BF16 destination.
+ *
+ * Extracted verbatim from the loop body that used to live inline in
+ * coli_xdna_prepare_from_fmt4, so the per-element arithmetic -- nibble order,
+ * (nib-8)*scale, the group index i/gs, the destination index i*O+o and the
+ * coli_xdna_f2b rounding -- is textually what the qualified version computed.
+ * Extracting it is what lets the failure-injection path stay serial while the
+ * ordinary path runs the same code across threads. */
+static void coli_xdna_convert_column(unsigned short *dst,
+                                     const unsigned char *q4,
+                                     const float *scale,
+                                     int o, int I, int O, int gs,
+                                     size_t rb, size_t ng)
+{
+    (void)ng;
+    const unsigned char *row = q4 + (size_t)o * rb;
+    const float *scl = scale + (size_t)o * ng;
+    for(int i = 0; i < I; i++){
+        unsigned char byte = row[(size_t)i >> 1];
+        int nib = (i & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
+        dst[(size_t)i * (size_t)O + (size_t)o] =
+            coli_xdna_f2b((float)(nib - 8) * scl[(size_t)i / (size_t)gs]);
+    }
+}
+
 ColiXdnaPrepResult coli_xdna_prepare_from_fmt4(ColiXdnaPrepared *p,
                                                int fmt,
                                                const unsigned char *q4,
@@ -874,21 +899,36 @@ ColiXdnaPrepResult coli_xdna_prepare_from_fmt4(ColiXdnaPrepared *p,
     const int fail_after = g_xdna_convert_fail_pct
                          ? (int)(((long)O * g_xdna_convert_fail_pct) / 100) : -1;
 
-    for(int o = 0; o < O; o++){
-        if(fail_after >= 0 && o == fail_after){
-            /* Deterministic mid-conversion failure: rows before this one are
-             * genuinely converted, the rest keep whatever they held. */
-            coli_xdna_prepare_publish_failure(p);
-            return COLI_XDNA_PREP_ERR_FAILED;
+    /* One output column per iteration. Every element of column o is written by
+     * exactly that iteration, so distinct o never touch the same destination
+     * byte -- which is what makes this loop safe to run in parallel. The
+     * arithmetic is unchanged; only which thread runs which o differs. */
+    if(fail_after >= 0){
+        /* Failure injection stays SERIAL and byte-for-byte as it was. The early
+         * return crosses a loop boundary, which an OpenMP structured block may
+         * not, and A4 qualified degraded behaviour against exactly this
+         * ordering. This path only runs when a test has armed
+         * g_xdna_convert_fail_pct, where speed is irrelevant. */
+        for(int o = 0; o < O; o++){
+            if(o == fail_after){
+                /* Deterministic mid-conversion failure: rows before this one are
+                 * genuinely converted, the rest keep whatever they held. */
+                coli_xdna_prepare_publish_failure(p);
+                return COLI_XDNA_PREP_ERR_FAILED;
+            }
+            coli_xdna_convert_column(dst, q4, scale, o, I, O, gs, rb, ng);
         }
-        const unsigned char *row = q4 + (size_t)o * rb;
-        const float *scl = scale + (size_t)o * ng;
-        for(int i = 0; i < I; i++){
-            unsigned char byte = row[(size_t)i >> 1];
-            int nib = (i & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
-            dst[(size_t)i * (size_t)O + (size_t)o] =
-                coli_xdna_f2b((float)(nib - 8) * scl[(size_t)i / (size_t)gs]);
-        }
+    } else {
+        /* This file is already compiled with -fopenmp and libgomp is linked
+         * statically, so this adds no flag, no import and no runtime
+         * dependency. N6-A2-Q1 measured this exact parallelisation and reported
+         * BF16_BIT_MISMATCH_COUNT = 0 at 1/4/8/16/32 threads: the output bytes
+         * depend on neither thread count nor completion order. */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for(int o = 0; o < O; o++)
+            coli_xdna_convert_column(dst, q4, scale, o, I, O, gs, rb, ng);
     }
 
     if(!coli_xdna_prepare_publish_success(p)){
