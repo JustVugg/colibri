@@ -124,6 +124,59 @@ When everything is in place you get the activation notice instead, once:
 
 All of this goes to stderr, so it never mixes into machine-readable output.
 
+
+## Producing the optional package (maintainers)
+
+CI cannot build this package. The helper needs the XRT SDK and the artifacts
+need the AIE toolchain, and the release runners have neither — which is why the
+Windows job builds an XDNA-capable host and stops there. The sidecar is produced
+on a qualified machine and attached to the same release.
+
+Everything below is owned by `c/tools/build_xdna_package.py`. It reads the
+expected artifact names and hashes out of `c/backend_xdna.c`, so the package can
+never drift from what the engine will accept at runtime.
+
+```bash
+python tools/build_xdna_package.py \
+    --helper   <path to the built coli_xdna.dll> \
+    --artifacts <directory holding the four qualified artifacts> \
+    --out      dist/xdna-pkg \
+    --release --dist dist
+```
+
+That verifies every input against the compiled registry *before* writing
+anything, then produces three files named from `version.py`:
+
+```
+colibri-<tag>-windows-x86_64-xdna.zip            the sidecar
+colibri-<tag>-windows-x86_64-xdna.manifest.txt   sizes, hashes, roles, version
+colibri-<tag>-windows-x86_64-xdna.sha256         sha256sum format
+```
+
+The name keeps the core archive's stem and adds `-xdna`, so it sits beside
+`colibri-<tag>-windows-x86_64.zip`, is matched by the release job's own
+`sha256sum colibri-*`, and cannot be mistaken for the core download.
+
+Before publishing, re-verify the built assets:
+
+```bash
+python tools/build_xdna_package.py --verify-release dist/colibri-<tag>-windows-x86_64-xdna.zip
+```
+
+This refuses to pass if the archive does not match its manifest, if the manifest
+names a different release version than the file does, or if any artifact digest
+disagrees with the compiled registry. Attach only after it prints `release
+assets OK` — the command to do so is printed by `--release`, and uses the same
+`gh release upload ... --clobber` the release workflow itself uses.
+
+**Never bundle** `xrt_core.dll`, `xrt_coreutil.dll`, the MSVC redistributable, the
+AIE toolchain or any SDK header. Those are the user's to install; the sidecar is
+only colibrì's own helper and artifacts.
+
+To confirm the ordinary download is unaffected, install the core archive on its
+own and run normally: no helper is loaded, no device is opened, and nothing
+about the default path changes.
+
 ## What this backend does not do
 
 - It is not enabled by having the hardware, the helper, or the package.
