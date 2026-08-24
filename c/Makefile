@@ -1137,7 +1137,10 @@ tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.
 # XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact
 # bytes, none of which a build machine may assume. Build and run it explicitly:
 #   make tests/xdna_physical_probe$(EXE)
-#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll>
+#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
+#
+# M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
+# the M256 bucket through the same owner.
 tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
 

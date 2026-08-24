@@ -10,7 +10,11 @@
  * candidate function that the GLM shared gate/up call sites invoke. This file
  * supplies only a synthetic tensor and synthetic activations, and the oracles.
  *
- *   usage: xdna_physical_probe <artifact-root> <helper-dll>
+ *   usage: xdna_physical_probe <artifact-root> <helper-dll> [M-list]
+ *
+ * M-list is a comma-separated list of M values; it defaults to the frozen
+ * 1,32,64 (the M64 bucket). Passing 65,130,256 qualifies the M256 bucket
+ * through this same owner, so neither bucket needs a throwaway probe.
  */
 
 #define main coli_glm_main_unused
@@ -22,6 +26,7 @@
 #define PK 6144      /* the frozen F3 K */
 #define PN 2048      /* the frozen F3 N */
 #define PGS 64
+#define COLI_PROBE_MAX_M 16
 
 static int g_bad = 0;
 
@@ -122,14 +127,35 @@ static int report_oracles(const float *y, const float *x, const unsigned short *
 }
 
 int main(int argc, char **argv){
-    if(argc < 3){ fprintf(stderr,"usage: xdna_physical_probe <artifact-root> <helper-dll>\n"); return 2; }
+    if(argc < 3){ fprintf(stderr,"usage: xdna_physical_probe <artifact-root> <helper-dll> [M-list]\n"); return 2; }
     const char *root = argv[1], *helper = argv[2];
+
+    /* Which M values to qualify. Default = the frozen M64 set; a caller may
+     * pass e.g. 65,130,256 to qualify the M256 bucket through this same
+     * owner. Only the shapes change -- every gate below is production. */
+    int Ms[COLI_PROBE_MAX_M]; size_t nM = 0;
+    if(argc > 3){
+        const char *p = argv[3];
+        while(*p && nM < COLI_PROBE_MAX_M){
+            char *end; long v = strtol(p, &end, 10);
+            if(end == p || v < 1 || v > 100000){
+                fprintf(stderr,"bad M-list: %s\n", argv[3]); return 2; }
+            Ms[nM++] = (int)v;
+            p = end; while(*p == ',' || *p == ' ') p++;
+        }
+        if(!nM){ fprintf(stderr,"bad M-list: %s\n", argv[3]); return 2; }
+    } else {
+        Ms[0] = 1; Ms[1] = 32; Ms[2] = 64; nM = 3;
+    }
 
     printf("W2-N7-I5 PHYSICAL XDNA QUALIFICATION\n");
     printf("PID              %lu\n", (unsigned long)GetCurrentProcessId());
     printf("ARTIFACT_ROOT    %s\n", root);
     printf("HELPER           %s\n", helper);
     printf("REGISTRY         production (not a test registry)\n");
+    printf("M_VALUES        ");
+    for(size_t c = 0; c < nM; c++) printf(" %d", Ms[c]);
+    printf("\n");
 
     coli_xdna_test_set_helper_path(helper);
     coli_xdna_test_set_artifact_root(root);
@@ -169,12 +195,11 @@ int main(int argc, char **argv){
 
     coli_xdna_test_set_force_execution(1);
 
-    int Ms[] = { 1, 32, 64 };
     const char *names[2] = { "sh_gate-like", "sh_up-like" };
-    unsigned long long hashes[2][3];
+    unsigned long long hashes[2][COLI_PROBE_MAX_M];
 
     for(int t = 0; t < 2; t++){
-        for(size_t c = 0; c < sizeof Ms/sizeof Ms[0]; c++){
+        for(size_t c = 0; c < nM; c++){
             int S = Ms[c];
             QT *w = ts[t];
             float *x = (float*)malloc((size_t)S*PK*4);
@@ -240,13 +265,13 @@ int main(int argc, char **argv){
     }
 
     printf("\n-- dynamic runtime weights --\n");
-    for(size_t c = 0; c < 3; c++)
+    for(size_t c = 0; c < nM; c++)
         printf("M=%-3d  gate=%016llx  up=%016llx  distinct=%s\n", Ms[c],
                hashes[0][c], hashes[1][c],
                hashes[0][c]!=hashes[1][c] ? "YES" : "NO");
-    for(size_t c = 0; c < 3; c++) if(hashes[0][c]==hashes[1][c]) g_bad = 1;
+    for(size_t c = 0; c < nM; c++) if(hashes[0][c]==hashes[1][c]) g_bad = 1;
 
-    printf("\nARTIFACT_OPENS_TOTAL %d  (one artifact serving every M and both weights)\n",
+    printf("\nARTIFACT_OPENS_TOTAL %d  (artifacts opened across every M and both weights)\n",
            coli_xdna_test_artifact_opens());
     printf("DISPATCHES_TOTAL     %d\n", coli_xdna_test_dispatches());
     printf("COMPLETIONS_TOTAL    %d\n", coli_xdna_test_completions());
