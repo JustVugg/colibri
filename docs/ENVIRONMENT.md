@@ -366,7 +366,8 @@ and the CPU/GPU execution split.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_DENSE_I8` | `1` (on) | Quantize resident dense matrices to per-row int8 at startup. `=0` keeps the f32 reference path for quality A/Bs. |
+| `COLI_DENSE_I8` | `1` (on) | Load the large projection, router-gate, shared-expert, and lm-head matrices one at a time as f32; immediately quantize each to signed per-row int8 with one f32 scale per row, then release its f32 source before loading the next. `=0` keeps and dispatches the exact f32 reference path for these matrices in quality A/Bs. |
+| `COLI_KEEP_F32` | unset | When dense int8 is enabled, retain each matrix's f32 source after quantization for debugging. Any set value enables this and restores the higher startup memory use. |
 | `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |

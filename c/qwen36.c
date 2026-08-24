@@ -9,9 +9,10 @@
  *     carried conv ring + state S[h]=[kdim,vdim], then per-head Gated RMSNorm.
  * Every layer (attention or DeltaNet) carries its own MoE/MLP block.
  *
- * DENSE (embed, attn/dn q/k/v/o & projections, q/k norms, RMSNorm, router gate,
- * shared expert, lm_head, final norm) resident in RAM (float32). Expert weights
- * read from disk on-demand via pread + posix_fadvise(DONTNEED), cached LRU
+ * Dense tensors stay resident in RAM: embed and norms in f32; the large
+ * projections, router, shared expert, and lm_head in signed per-row int8 by
+ * default, loaded and quantized one f32 source at a time. Expert weights read
+ * from disk on-demand via pread + posix_fadvise(DONTNEED), cached LRU
  * per-layer, with a PILOT prefetch thread -- the same mechanism that fits
  * GLM-5.2 in 15 GB.
  *
@@ -351,7 +352,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     return o;
 }
 
-/* Append b[0..n) into buf/*bn, extract as many LEADING complete UTF-8
+/* Append b[0..n) into buf at *bn, extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
  * sequence stays in buf. Returns bytes written to out. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){

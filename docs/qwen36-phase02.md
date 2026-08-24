@@ -43,7 +43,9 @@ Gated DeltaNet 子层(`HF Qwen3_5MoeGatedDeltaNet.forward`,`tools/hf_qwen3_5_moe
 - **KV cache 只为 attention 层分配**(DeltaNet 用递归状态,不占 KV cache,给 16GB 目标省 ~2GB)。
 - **容器**:所有层都按**原始索引** `model.layers.{i}` 存放(`active_of` 现在是恒等映射),
   `linear_attn.*` 由 `convert_qwen36.py` 的通用 f16 拷贝自动导出,
-  `st_read_f32` 自动转成 f32。`meta` 多出 `dn_*` 维度字段。
+  `st_read_f32` 在加载时自动转成 f32。`in_proj_qkv` / `in_proj_z` / `out_proj`
+  随后按 [`COLI_DENSE_I8` 契约](ENVIRONMENT.md#qwen36-engine-qwen36)立即转为常驻 per-row int8，
+  其余 DeltaNet 张量保持 f32。`meta` 多出 `dn_*` 维度字段。
 
 ## 验证策略
 

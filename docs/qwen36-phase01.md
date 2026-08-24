@@ -66,7 +66,7 @@ SNAP=/data/qwen36_i4 ./qwen36.exe 16 4 ref_qwen36.json
 ## 容器格式 / 张量约定
 
 `convert_qwen36.py` 输出一个 **safetensors 分片目录**(colibri 的"容器"就是目录):
-- 稠密权重(embed/attn qkv o/qk_norm/RMSNorm/router gate/shared expert/lm_head/final norm)保持原 dtype(F32 载入)。
+- 容器中的稠密张量保持原 dtype。运行时的投影/router/shared expert/lm_head 大矩阵逐张以 f32 读入，并默认立即转为常驻 per-row int8；embed、qk_norm、RMSNorm 和 final norm 保持 f32。精确的 f32 reference path 和调试保留开关见 [`ENVIRONMENT.md`](ENVIRONMENT.md#qwen36-engine-qwen36)。
 - 每个专家三矩阵合并为 `model.layers.{l}.mlp.experts.{e}.merged_weight`(int8,拼接顺序 **g|u|d**) + `...qs`(f32 scale,顺序 gs|us|ds)——**完全复用 olmoe.c 的 `load_expert_merged`/`Slot`,零改动**。
 - 附带 `qwen36_meta.json`:引擎所需的全部 Qwen3.6 专属维度(attn head_dim、rope_dim、MoE 分组、attn 层列表等)。缺失时引擎回退到 `i%4==3` + 默认值。
 
