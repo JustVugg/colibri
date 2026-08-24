@@ -920,6 +920,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0;
+    if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
     c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
 }
@@ -1075,6 +1076,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     int n_layers_from_config = m->c.n_layers;
     load_meta(&m->c, snap);
     validate_cfg(&m->c, n_layers_from_config);
+    /* load_cfg already guards n_layers ∈ [1,512], but the compiler can't see
+     * across function boundaries, so re-assert here to silence -Walloc-size-larger-than. */
+    if (m->c.n_layers <= 0) { fprintf(stderr, "model_init: n_layers=%d invalid\n", m->c.n_layers); exit(1); }
     if (m->c.rotary_dim > m->c.head_dim || m->c.rotary_dim % 2 != 0) {
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }
@@ -1153,9 +1157,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         m->cache[i].slots = calloc(cap, sizeof(Slot));
     }
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
-    if (c->n_layers <= 0) { fprintf(stderr, "model_init: n_layers=%d invalid\n", c->n_layers); exit(1); }
-    m->DN_rec = calloc((size_t)c->n_layers, sizeof(float*));
-    m->DN_conv = calloc((size_t)c->n_layers, sizeof(float*));
+    int n_layers = c->n_layers;
+    if (n_layers <= 0) n_layers = 1;  /* unreachable: validated above, silences compiler */
+    m->DN_rec = calloc((size_t)n_layers, sizeof(float*));
+    m->DN_conv = calloc((size_t)n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
