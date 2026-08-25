@@ -209,5 +209,93 @@ class TestSidecarReleaseProcess(unittest.TestCase):
             self.assertIn(flag, out)
 
 
+
+class TestDeterministicArchive(unittest.TestCase):
+    """The published sha256 must be a property of the CONTENT, not the builder.
+
+    ZipFile.write() stores each file's mtime and derives create_system and the
+    external attributes from the host, so two maintainers staging identical
+    bytes produced different archives. N8-A6-R1 and N8-F0 built the same five
+    files and published dcf30127... and 74551ed2... for them.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tool = load_tool()
+
+    def _tree(self, tmp, name, mtime, helper=b"synthetic-helper"):
+        """A staging tree whose files carry a chosen mtime."""
+        tool = self.tool
+        adir, hname = tool.artifact_dir_name(), tool.helper_name()
+        root = os.path.join(tmp, name)
+        os.makedirs(os.path.join(root, adir), exist_ok=True)
+        with open(os.path.join(root, hname), "wb") as f:
+            f.write(helper)
+        for artifact, _ in tool.required_files():
+            with open(os.path.join(root, adir, artifact), "wb") as f:
+                f.write(b"synthetic-" + artifact.encode())
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                os.utime(os.path.join(dirpath, f), (mtime, mtime))
+        return root
+
+    def _build(self, tmp, root, out):
+        tool = self.tool
+        path = os.path.join(tmp, out)
+        tool.write_archive(path, root, tool.artifact_dir_name(),
+                           tool.helper_name(), tool.required_files())
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest(), path
+
+    def test_archive_is_identical_across_staging_paths_and_mtimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._tree(tmp, "stage-a", 1_566_000_000)   # 2019
+            b = self._tree(tmp, "deeper/stage-b", 1_956_528_000)  # 2032
+            ha, _ = self._build(tmp, a, "a.zip")
+            hb, _ = self._build(tmp, b, "b.zip")
+            self.assertEqual(ha, hb,
+                             "archive hash still depends on staging mtime/path")
+
+    def test_a_changed_member_byte_changes_the_archive(self):
+        """Reproducibility must not mean insensitivity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._tree(tmp, "same", 1_566_000_000)
+            b = self._tree(tmp, "diff", 1_566_000_000, helper=b"synthetic-helpeR")
+            ha, _ = self._build(tmp, a, "a.zip")
+            hb, _ = self._build(tmp, b, "b.zip")
+            self.assertNotEqual(ha, hb)
+
+    def test_member_metadata_is_pinned_not_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp, "stage", 1_566_000_000)
+            _, path = self._build(tmp, root, "a.zip")
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    self.assertEqual(info.date_time, self.tool.ZIP_EPOCH)
+                    self.assertEqual(info.create_system, 0)
+                    self.assertEqual(info.external_attr,
+                                     self.tool.ZIP_MODE << 16)
+                    self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+
+    def test_member_order_is_sorted_not_filesystem_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp, "stage", 1_566_000_000)
+            _, path = self._build(tmp, root, "a.zip")
+            with zipfile.ZipFile(path) as z:
+                stored = [i.filename for i in z.infolist()]
+            self.assertEqual(stored, sorted(stored))
+
+    def test_deterministic_archive_still_holds_exactly_the_asset_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp, "stage", 1_566_000_000)
+            _, path = self._build(tmp, root, "a.zip")
+            adir = self.tool.artifact_dir_name()
+            expected = sorted(
+                [self.tool.helper_name()]
+                + ["%s/%s" % (adir, n) for n, _ in self.tool.required_files()])
+            with zipfile.ZipFile(path) as z:
+                self.assertEqual(sorted(z.namelist()), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

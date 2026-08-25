@@ -7,13 +7,27 @@ Works from cmd.exe, PowerShell, Git Bash, or MSYS2 — no `rm` or POSIX
 import glob
 import os
 import shutil
+import sys
+
+C_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if C_DIR not in sys.path:                   # `python tools/clean.py` puts tools/ first
+    sys.path.insert(0, C_DIR)
+from family_registry import all_families
+
+# The engines are DERIVED, not listed. family_registry is what the release job
+# already trusts to decide which engines an archive must contain (release.yml,
+# "Verify the packaged archive actually runs"), so deriving from it makes one
+# fact true by construction: nothing can be published that clean does not own.
+#
+# The hand-written list had qwen36 missing. `make clean` therefore left the old
+# qwen36 binary in place, and the release Package step copies whatever sits at
+# c/qwen36 without asking where it came from -- so a locally staged release
+# could ship an engine that was never rebuilt. CI never saw it (fresh runners);
+# a maintainer packaging on their own machine would have.
+ENGINES = sorted({family.engine_artifact for family in all_families()})
 
 # Files (relative to c/) to remove if present.
-FILES = [
-    "colibri", "colibri.exe",
-    "inkling", "inkling.exe",
-    "kimi_k3", "kimi_k3.exe",
-    "olmoe", "olmoe.exe",
+FILES = [name for engine in ENGINES for name in (engine, engine + ".exe")] + [
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o",
@@ -41,28 +55,44 @@ FILES = [
 # repo tracks under tests/ carries one of these extensions, and directories
 # (tests/fixtures/) are skipped by the isfile() check. Object files are not in
 # it, so COLI_V4_UNIT_*.o is removed by the same rule rather than a second one.
+#
+# tests/*_probe* is here for the same reason. The XDNA physical qualification
+# probe is built by an explicit `make tests/xdna_physical_probe$(EXE)` and
+# matched none of the test_/bench_/fuzz_ prefixes, so it survived every clean.
+# A stale probe does not just waste space -- it is the owner that PRODUCES
+# physical execution evidence, and a stale one reports PASS for code that is no
+# longer in the tree.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "COLI_V4_UNIT_*.o"]
+                  "tests/*_probe*", "COLI_V4_UNIT_*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
 # Directories to remove.
 DIRS = ["tests/__pycache__", "build/ownership"]
 
-removed = 0
-for f in FILES:
-    if os.path.exists(f):
-        os.remove(f)
-        removed += 1
-for pattern in ARTIFACT_GLOBS:
-    for f in glob.glob(pattern):
-        if not os.path.isfile(f):          # tests/fixtures/ and friends
-            continue
-        if f.endswith(KEEP_EXT):           # never a source file
-            continue
-        os.remove(f)
-        removed += 1
-for d in DIRS:
-    if os.path.isdir(d):
-        shutil.rmtree(d)
-        removed += 1
-print(f"clean: removed {removed} files/dirs")
+def clean():
+    """Remove everything above, relative to the current directory."""
+    removed = 0
+    for f in FILES:
+        if os.path.exists(f):
+            os.remove(f)
+            removed += 1
+    for pattern in ARTIFACT_GLOBS:
+        for f in glob.glob(pattern):
+            if not os.path.isfile(f):      # tests/fixtures/ and friends
+                continue
+            if f.endswith(KEEP_EXT):       # never a source file
+                continue
+            os.remove(f)
+            removed += 1
+    for d in DIRS:
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+            removed += 1
+    return removed
+
+
+# Guarded, so that reading FILES (which tests/test_clean_ownership.py does, to
+# check it against the release registry) cannot delete the build products the
+# rest of the suite is running against. Importing this module must be inert.
+if __name__ == "__main__":
+    print(f"clean: removed {clean()} files/dirs")

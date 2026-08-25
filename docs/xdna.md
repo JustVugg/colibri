@@ -157,6 +157,11 @@ The name keeps the core archive's stem and adds `-xdna`, so it sits beside
 `colibri-<tag>-windows-x86_64.zip`, is matched by the release job's own
 `sha256sum colibri-*`, and cannot be mistaken for the core download.
 
+The archive is reproducible: the same helper and the same qualified artifacts
+produce the same bytes, and therefore the same sha256, wherever they were staged
+from and whatever mtimes those files carry. If you rebuild the sidecar and the
+checksum moves, something in the *content* changed — that is a signal, not noise.
+
 Before publishing, re-verify the built assets:
 
 ```bash
@@ -181,5 +186,5 @@ about the default path changes.
 
 - It is not enabled by having the hardware, the helper, or the package.
 - It does not choose between the NPU and the normal path on speed or cost.
-- No speed claim is made here; none has been measured in a comparable way.
+- No speed claim is made here.
 - It does not extend to other models or other operations.

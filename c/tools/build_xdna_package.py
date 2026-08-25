@@ -236,6 +236,56 @@ def verify_release(archive, tag_expected=None):
     return problems
 
 
+# ---- the reproducible archive ------------------------------------------
+#
+# Two maintainers with the same helper and the same qualified artifacts must
+# produce the same archive, byte for byte -- otherwise the published sha256 is
+# a property of whoever built it rather than of what is inside.
+#
+# ZipFile.write() defeats that on its own: it reads each file's mtime and
+# stores it in the local header and the central directory, and it derives
+# create_system and external_attr from the host OS and the file mode. So the
+# same bytes staged from two directories produced two different archives --
+# which is exactly what happened between N8-A6-R1 (dcf30127...) and N8-F0
+# (74551ed2...), for content that was identical.
+#
+# Everything that varies is therefore pinned:
+ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)   # the earliest a ZIP timestamp can express
+ZIP_MODE = 0o644                    # not the staging file's mode
+ZIP_LEVEL = 9                       # explicit, not the zlib default
+
+
+def zip_members(root, adir, hname, need):
+    """(archive_path, source_path) in a fixed order, independent of the fs."""
+    members = [(hname, os.path.join(root, hname))]
+    for name, _ in need:
+        members.append(("%s/%s" % (adir, name), os.path.join(root, adir, name)))
+    return sorted(members)
+
+
+def write_archive(path, root, adir, hname, need):
+    """Write the sidecar archive deterministically.
+
+    Depends on nothing but the member paths and the member bytes: not the
+    staging mtimes, not the staging path, not the host OS, not the locale,
+    not the order the filesystem happens to return.
+
+    The one residual assumption is that zlib emits the same deflate stream for
+    the same input at the same level. That is true in practice and stable
+    across the versions this project builds against, but it is an assumption,
+    not a guarantee, so it is written down rather than left implicit.
+    """
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED,
+                         compresslevel=ZIP_LEVEL) as z:
+        for arcname, src in zip_members(root, adir, hname, need):
+            info = zipfile.ZipInfo(arcname, date_time=ZIP_EPOCH)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 0                    # always MS-DOS, never host
+            info.external_attr = ZIP_MODE << 16
+            with open(src, "rb") as fh:
+                z.writestr(info, fh.read())
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -315,10 +365,7 @@ def main():
         print("  %s/%-34s %s" % (adir, name, h))
 
     if a.zip:
-        with zipfile.ZipFile(a.zip, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(os.path.join(a.out, hname), hname)
-            for name, _ in need:
-                z.write(os.path.join(a.out, adir, name), "%s/%s" % (adir, name))
+        write_archive(a.zip, a.out, adir, hname, need)
         print("zip written: %s (%d bytes)" % (a.zip, os.path.getsize(a.zip)))
 
     if a.release is not None:
@@ -326,10 +373,7 @@ def main():
         os.makedirs(a.dist, exist_ok=True)
         stem = asset_stem(tag)
         archive = os.path.join(a.dist, stem + ".zip")
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(os.path.join(a.out, hname), hname)
-            for name, _ in need:
-                z.write(os.path.join(a.out, adir, name), "%s/%s" % (adir, name))
+        write_archive(archive, a.out, adir, hname, need)
         manifest = os.path.join(a.dist, stem + ".manifest.txt")
         with open(manifest, "w", encoding="utf-8", newline="\n") as f:
             f.write(manifest_text(tag, a.out, adir, hname, need, archive))
