@@ -48,7 +48,11 @@
  *                        experts skip disk AND CPU at decode. CPU fallback
  *                        everywhere; output identical.
  *   K3_VK_GB=N           VRAM cap for the tier (default: driver budget)
- *   K3_VK_UP=N           routed-expert uploads per step (default 8)
+ *   K3_VK_UP=N|auto      routed-expert uploads per step (default 8). `auto`
+ *                        bounds the inline upload time to a fraction of the
+ *                        measured decode step (K3_VK_FILL_FRAC, default 0.25)
+ *                        instead of a fixed count — a slow bus stops stalling
+ *                        decode, a fast one fills the tier sooner.
  *   K3_METAL=0|1         Metal tier (build with `make METAL=1 kimi_k3`; Phase 4:
  *                        scaffolding only — dispatch hooks present, forward NOT
  *                        IMPLEMENTED; all ops fall through to CPU).
@@ -108,7 +112,8 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
-#include "kv_prefix.h"                    /* KV prefix reuse (shared) */
+#include "kv_prefix.h"
+#include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
 
 /* ---------- config ---------- */
@@ -353,6 +358,10 @@ static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
 static VkExp *g_vkexp; static int64_t g_vkexp_n;
 static int g_vk_upcap=8, g_vk_up_left=0, g_vk_full=0;
+static int g_vk_up_auto=0;                /* K3_VK_UP=auto: measured budget */
+static double g_vk_fill_frac=0.25;        /* K3_VK_FILL_FRAC of step time */
+static double g_vk_step_ema, g_vk_upload_ema;  /* seconds, decode steps only */
+static int g_vk_cap_now=8;                /* last budget chosen (reporting) */
 static long g_vk_hit=0, g_vk_res=0;
 static double g_vk_gb=0;                  /* K3_VK_GB cap (0 = driver budget) */
 static const char *k3_vk_spv(char *buf, size_t n){
@@ -931,7 +940,13 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       }
       if(g_k3_vk){
         g_vk_gb=getenv("K3_VK_GB")?atof(getenv("K3_VK_GB")):0;
-        g_vk_upcap=getenv("K3_VK_UP")?atoi(getenv("K3_VK_UP")):8;
+        { const char *up=getenv("K3_VK_UP");
+          if(up&&!strcmp(up,"auto")){
+              g_vk_up_auto=1;             /* opt-in: measured budget below */
+              const char *fr=getenv("K3_VK_FILL_FRAC");
+              if(fr){ double f=atof(fr); if(f>0.0&&f<=1.0) g_vk_fill_frac=f; }
+          } else g_vk_upcap=up?atoi(up):8; }
+        g_vk_cap_now=g_vk_upcap;
         g_vkexp_n=(int64_t)c->n_layers*c->n_experts;
         g_vkexp=calloc((size_t)g_vkexp_n,sizeof(VkExp));
         if(!g_vkexp) g_k3_vk=0;
@@ -946,8 +961,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             nsh+=w_vk_upload(&sm2->sh_gate)+w_vk_upload(&sm2->sh_up)+w_vk_upload(&sm2->sh_down);
         }
         double used=0,budget=0; coli_vk_mem_budget(&used,&budget);
-        fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%d/step, cap %s)\n",
-                nsh,used,budget,g_vk_upcap,g_vk_gb>0?"K3_VK_GB":"driver budget");
+                char vk_cap_str[16]; snprintf(vk_cap_str,sizeof vk_cap_str,"%d",g_vk_upcap);
+        fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%s/step, cap %s)\n",
+                nsh,used,budget,g_vk_up_auto?"auto":vk_cap_str,g_vk_gb>0?"K3_VK_GB":"driver budget");
       }
     }
 #endif
@@ -1592,6 +1608,7 @@ static void vk_expert_try_upload(Model *m, int li, int eid, Slot *s){
         return; }
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+    double up_t0=now_s();                 /* whole upload incl. scale expand */
     int LT=m->c.latent, MI=m->c.moe_inter;
     int64_t n1=m->e_w1s, n2=m->e_w2s;          /* scale counts = scale bytes (u8) */
     float *sc=falloc(n1>n2?n1:n2);
@@ -1612,6 +1629,7 @@ static void vk_expert_try_upload(Model *m, int li, int eid, Slot *s){
         return;
     }
     g_vk_res++; g_vk_up_left--;
+    g_vk_upload_ema=coli_v4_hybrid_ema(g_vk_upload_ema,now_s()-up_t0);
 }
 #endif
 
@@ -1999,7 +2017,15 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     Cfg *c=&m->c; int D=c->hidden;
     if(cancelled) *cancelled=0;
 #ifdef COLI_VULKAN
-    g_vk_up_left=g_vk_upcap;              /* routed-tier upload budget per step */
+    /* Routed-tier upload budget for this step. Fixed cap by default;
+     * K3_VK_UP=auto bounds the inline upload time to a fraction of the
+     * measured decode step instead (hybrid_split.h) — legacy cap until both
+     * rates have samples, so enabling auto never starts worse. */
+    if(g_vk_up_auto&&!g_vk_full)
+        g_vk_cap_now=coli_k3_fill_budget(g_vk_step_ema,g_vk_upload_ema,
+                                         g_vk_fill_frac,g_vk_upcap);
+    g_vk_up_left=g_vk_up_auto?g_vk_cap_now:g_vk_upcap;
+    double vk_step_t0=(g_vk_up_auto&&C==1)?now_s():0.0;
 #endif
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
     float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
@@ -2093,6 +2119,10 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     }
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
     if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
+#ifdef COLI_VULKAN
+    if(g_vk_up_auto&&C==1&&vk_step_t0>0.0)
+        g_vk_step_ema=coli_v4_hybrid_ema(g_vk_step_ema,now_s()-vk_step_t0);
+#endif
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
 }
@@ -2889,8 +2919,16 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
     fflush(stdout);
 #ifdef COLI_VULKAN
-    if(g_k3_vk) fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
-                        g_vk_res,g_vk_hit);
+    if(g_k3_vk){
+        if(g_vk_up_auto)
+            fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits | "
+                           "fill auto cap=%d (step %.2fms, upload %.2fms, frac %.2f)\n",
+                    g_vk_res,g_vk_hit,g_vk_cap_now,
+                    g_vk_step_ema*1e3,g_vk_upload_ema*1e3,g_vk_fill_frac);
+        else
+            fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
+                    g_vk_res,g_vk_hit);
+    }
 #endif
     return 0;
 }
@@ -3109,6 +3147,11 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+#ifdef COLI_VULKAN
+    if(g_k3_vk&&g_vk_up_auto)
+        fprintf(stderr,"[K3-VK] fill auto: cap=%d (step %.2fms, upload %.2fms, frac %.2f) | %ld resident\n",
+                g_vk_cap_now,g_vk_step_ema*1e3,g_vk_upload_ema*1e3,g_vk_fill_frac,g_vk_res);
+#endif
     /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
      * needs tokens-and-elapsed to compare candidates. Before this only colibri
      * emitted a parseable throughput line (REPLAY decode), so the tuner was

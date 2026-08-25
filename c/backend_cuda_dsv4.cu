@@ -1952,48 +1952,58 @@ extern "C" int dsv4_cuda_stream_drain(int device){
     return ok(cudaStreamSynchronize(c->stream),"hybrid drain")?1:0;
 }
 
-extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,
+static int bank_upload_stream(Dsv4CudaExpertSet*set,int e,
         const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,const uint8_t*dw,const uint8_t*ds,
-        Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down){
+        Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down,int use_aux){
     if(!set||e<0||e>=set->count||!gw||!gs||!uw||!us||!dw||!ds||!gate||!up||!down||*gate||*up||*down||
        !ok(cudaSetDevice(set->device),"select expert bank upload device"))return 0;
     int H=set->H,I=set->I;size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
     uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
     uint8_t*fc2=set->bank_fc2+(size_t)e*w2,*fc2s=set->bank_fc2_scale+(size_t)e*s2;
-    Dev*c=ctx(set->device);
-    bool pinned=c&&host_pinned(gw,w1)&&host_pinned(uw,w1)&&host_pinned(gs,s1)&&
-                host_pinned(us,s1)&&host_pinned(dw,w2)&&host_pinned(ds,s2);
-    if(pinned){
-        /* Pure DMA on the device stream; the caller releases the host slab
-         * right after we return, so drain before returning. */
-        if(!ok(cudaMemcpyAsync(fc1,gw,w1,cudaMemcpyHostToDevice,c->stream),"expert gate upload")||
-           !ok(cudaMemcpyAsync(fc1+w1,uw,w1,cudaMemcpyHostToDevice,c->stream),"expert up upload")||
-           !ok(cudaMemcpyAsync(fc1s,gs,s1,cudaMemcpyHostToDevice,c->stream),"expert gate scale upload")||
-           !ok(cudaMemcpyAsync(fc1s+s1,us,s1,cudaMemcpyHostToDevice,c->stream),"expert up scale upload")||
-           !ok(cudaMemcpyAsync(fc2,dw,w2,cudaMemcpyHostToDevice,c->stream),"expert down upload")||
-           !ok(cudaMemcpyAsync(fc2s,ds,s2,cudaMemcpyHostToDevice,c->stream),"expert down scale upload")||
-           !ok(cudaStreamSynchronize(c->stream),"expert upload drain"))return 0;
-    }else
-    if(!ok(cudaMemcpy(fc1,gw,w1,cudaMemcpyHostToDevice),"expert gate upload")||
-       !ok(cudaMemcpy(fc1+w1,uw,w1,cudaMemcpyHostToDevice),"expert up upload")||
-       !ok(cudaMemcpy(fc1s,gs,s1,cudaMemcpyHostToDevice),"expert gate scale upload")||
-       !ok(cudaMemcpy(fc1s+s1,us,s1,cudaMemcpyHostToDevice),"expert up scale upload")||
-       !ok(cudaMemcpy(fc2,dw,w2,cudaMemcpyHostToDevice),"expert down upload")||
-       !ok(cudaMemcpy(fc2s,ds,s2,cudaMemcpyHostToDevice),"expert down scale upload"))return 0;
+    Dev*c=ctx(set->device);if(!c)return 0;
+    /* use_aux: the double-buffer prefetch worker uploads layer L+1 on the
+     * aux stream WHILE the compute stream chews layer L. Everything —
+     * copies, DeepGEMM scale packing, the pointer table — rides the chosen
+     * stream and drains it before returning, so the caller may release the
+     * host slab immediately and the compute stream never stalls. Pageable
+     * sources are safe under cudaMemcpyAsync (the copy is staged before it
+     * returns with respect to the host buffer). */
+    cudaStream_t s=use_aux?c->aux:c->stream;
+    if(!ok(cudaMemcpyAsync(fc1,gw,w1,cudaMemcpyHostToDevice,s),"expert gate upload")||
+       !ok(cudaMemcpyAsync(fc1+w1,uw,w1,cudaMemcpyHostToDevice,s),"expert up upload")||
+       !ok(cudaMemcpyAsync(fc1s,gs,s1,cudaMemcpyHostToDevice,s),"expert gate scale upload")||
+       !ok(cudaMemcpyAsync(fc1s+s1,us,s1,cudaMemcpyHostToDevice,s),"expert up scale upload")||
+       !ok(cudaMemcpyAsync(fc2,dw,w2,cudaMemcpyHostToDevice,s),"expert down upload")||
+       !ok(cudaMemcpyAsync(fc2s,ds,s2,cudaMemcpyHostToDevice,s),"expert down scale upload"))return 0;
 #ifdef COLI_DSV4_DEEPGEMM
-    dg_pack_weight_scale<<<(2*I*(H/32/4)+255)/256,256>>>(set->bank_fc1_dg_scale,fc1s,e,2*I,H/32);
-    dg_pack_weight_scale<<<(H*(I/32/4)+255)/256,256>>>(set->bank_fc2_dg_scale,fc2s,e,H,I/32);
+    dg_pack_weight_scale<<<(2*I*(H/32/4)+255)/256,256,0,s>>>(set->bank_fc1_dg_scale,fc1s,e,2*I,H/32);
+    dg_pack_weight_scale<<<(H*(I/32/4)+255)/256,256,0,s>>>(set->bank_fc2_dg_scale,fc2s,e,H,I/32);
     if(!ok(cudaGetLastError(),"expert DeepGEMM scale packing"))return 0;
 #endif
     Dsv4CudaTensor*g=expert_view(fc1,fc1s,I,H,set->device),*u=expert_view(fc1+w1,fc1s+s1,I,H,set->device),*d=expert_view(fc2,fc2s,H,I,set->device);
     if(!g||!u||!d){free(g);free(u);free(d);return 0;}
     ExpertPtr p[3]={{(uint8_t*)g->w,g->scale},{(uint8_t*)u->w,u->scale},{(uint8_t*)d->w,d->scale}};
-    if(!ok(cudaMemcpy(set->table+e,p,sizeof(*p),cudaMemcpyHostToDevice),"expert gate table upload")||
-       !ok(cudaMemcpy(set->table+set->count+e,p+1,sizeof(*p),cudaMemcpyHostToDevice),"expert up table upload")||
-       !ok(cudaMemcpy(set->table+2*set->count+e,p+2,sizeof(*p),cudaMemcpyHostToDevice),"expert down table upload")){
+    if(!ok(cudaMemcpyAsync(set->table+e,p,sizeof(*p),cudaMemcpyHostToDevice,s),"expert gate table upload")||
+       !ok(cudaMemcpyAsync(set->table+set->count+e,p+1,sizeof(*p),cudaMemcpyHostToDevice,s),"expert up table upload")||
+       !ok(cudaMemcpyAsync(set->table+2*set->count+e,p+2,sizeof(*p),cudaMemcpyHostToDevice,s),"expert down table upload")||
+       !ok(cudaStreamSynchronize(s),"expert upload drain")){
         free(g);free(u);free(d);return 0;
     }
     *gate=g;*up=u;*down=d;return 1;
+}
+
+extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,
+        const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,const uint8_t*dw,const uint8_t*ds,
+        Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down){
+    return bank_upload_stream(set,e,gw,gs,uw,us,dw,ds,gate,up,down,0);
+}
+
+/* Double-buffer prefetch: same upload, aux stream (overlaps the compute
+ * stream), drained before return. */
+extern "C" int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet*set,int e,
+        const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,const uint8_t*dw,const uint8_t*ds,
+        Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down){
+    return bank_upload_stream(set,e,gw,gs,uw,us,dw,ds,gate,up,down,1);
 }
 extern "C" int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet*set,int e,int rank,
         const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,const uint8_t*dw,const uint8_t*ds){

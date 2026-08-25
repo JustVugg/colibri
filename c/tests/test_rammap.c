@@ -9,6 +9,7 @@
 #endif
 #include <unistd.h>
 
+#define COLI_PILOT_HANDOFF_TEST 1
 #define main coli_glm_main_unused
 #include "../colibri.c"
 #undef main
@@ -85,6 +86,102 @@ static int64_t add_quant_expert(Model *m,int fd,long fs_magic,int fmt,
 static void free_quant_expert(Model *m){
     for(int i=0;i<m->S.n;i++) free(m->S.t[i].name);
     free(m->S.t);
+}
+
+static int check_uring_finalize_accounting(Model *m,st_tensor **expert,int eid,
+                                           int64_t expected,const char *label){
+    UringBatch batch={0}; ESlot slot={0}; UringLoad *load=&batch.load[0];
+    size_t wbytes=0,sbytes=0;
+    load->m=m; load->s=&slot; load->layer=0; load->eid=eid; load->done=1;
+    for(int k=0;k<3;k++){
+        load->tw[k]=expert[2*k]; load->tq[k]=expert[2*k+1];
+        load->pos[k]=(int64_t)wbytes;
+        wbytes+=(size_t)load->tw[k]->nbytes;
+        sbytes+=(size_t)load->tq[k]->nbytes;
+    }
+    slot.slab=calloc(1,wbytes); slot.fslab=calloc(1,sbytes);
+    if(!slot.slab||!slot.fslab){ compat_aligned_free(slot.slab); free(slot.fslab); return fail("io_uring telemetry fixture allocation"); }
+    int saved_drop=g_drop; g_drop=0;
+    atomic_store_explicit(&g_prof_io,0,memory_order_relaxed);
+    int rc=uring_finalize_load(&batch,0,1);
+    int bad=rc || slot.eid!=eid ||
+        atomic_load_explicit(&g_prof_io,memory_order_relaxed)!=expected;
+    g_drop=saved_drop;
+    compat_aligned_free(slot.slab); free(slot.fslab);
+    return bad?fail(label):0;
+}
+
+static pthread_mutex_t handoff_test_mx=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t handoff_test_cv=PTHREAD_COND_INITIALIZER;
+static int handoff_test_reached,handoff_test_release;
+
+static void pilot_handoff_pause(Model *m,int layer,int eid,ESlot *slot){
+    (void)m; (void)layer; (void)eid; (void)slot;
+    pthread_mutex_lock(&handoff_test_mx);
+    handoff_test_reached=1;
+    pthread_cond_broadcast(&handoff_test_cv);
+    while(!handoff_test_release) pthread_cond_wait(&handoff_test_cv,&handoff_test_mx);
+    pthread_mutex_unlock(&handoff_test_mx);
+}
+
+typedef struct { Model *m; int layer,eid; } PilotHandoffArg;
+static void *pilot_handoff_thread(void *opaque){
+    PilotHandoffArg *arg=(PilotHandoffArg*)opaque;
+    pilot_realload(arg->m,arg->layer,arg->eid);
+    return NULL;
+}
+
+static int check_pilot_handoff(Model *m,int layer,int eid){
+    int old_ecap=m->ecap;
+    m->ecap=1; m->ecn[layer]=0; m->ecache[layer]=calloc(1,sizeof(ESlot));
+    if(!m->ecache[layer]){ m->ecap=old_ecap; return fail("pilot handoff cache allocation"); }
+    int saved_pin=m->pin_slot_by_expert[layer][eid];
+    if(saved_pin>=0) pin_unindex(m,layer,&m->pin[layer][saved_pin]);
+    m->ecache_slot_by_expert[layer][eid]=-1;
+    atomic_store_explicit(&g_cur_moe_layer,-1,memory_order_release);
+    atomic_store_explicit(&g_pilot_loads,0,memory_order_relaxed);
+    atomic_store_explicit(&g_pilot_drops,0,memory_order_relaxed);
+    g_pilot_inflight[layer]=0;
+    pthread_mutex_lock(&handoff_test_mx);
+    handoff_test_reached=0; handoff_test_release=0;
+    pthread_mutex_unlock(&handoff_test_mx);
+    g_pilot_handoff_test_hook=pilot_handoff_pause;
+
+    PilotHandoffArg arg={m,layer,eid}; pthread_t thread;
+    if(pthread_create(&thread,NULL,pilot_handoff_thread,&arg)){
+        g_pilot_handoff_test_hook=NULL; free(m->ecache[layer]); m->ecache[layer]=NULL;
+        if(saved_pin>=0) pin_index(m,layer,&m->pin[layer][saved_pin]);
+        m->ecap=old_ecap; return fail("pilot handoff thread creation");
+    }
+    pthread_mutex_lock(&handoff_test_mx);
+    while(!handoff_test_reached) pthread_cond_wait(&handoff_test_cv,&handoff_test_mx);
+    pthread_mutex_unlock(&handoff_test_mx);
+
+    pthread_mutex_lock(&g_pilot_mx);
+    ESlot *slot=&m->ecache[layer][0];
+    int reserved_bad=m->ecn[layer]!=1 || slot->eid!=-(eid+2) ||
+        g_pilot_inflight[layer]!=1 ||
+        ecache_indexed(m,layer,eid,1)!=slot ||
+        expert_is_resident(m,layer,eid);
+    pthread_mutex_unlock(&g_pilot_mx);
+
+    pthread_mutex_lock(&handoff_test_mx);
+    handoff_test_release=1; pthread_cond_broadcast(&handoff_test_cv);
+    pthread_mutex_unlock(&handoff_test_mx);
+    pthread_join(thread,NULL); g_pilot_handoff_test_hook=NULL;
+
+    pthread_mutex_lock(&g_pilot_mx);
+    int published_bad=slot->eid!=eid || g_pilot_inflight[layer]!=0 ||
+        ecache_indexed(m,layer,eid,0)!=slot || !expert_is_resident(m,layer,eid) ||
+        atomic_load_explicit(&g_pilot_loads,memory_order_relaxed)!=1 ||
+        atomic_load_explicit(&g_pilot_drops,memory_order_relaxed)!=0;
+    ecache_hide(m,layer,slot); m->ecn[layer]=0;
+    pthread_mutex_unlock(&g_pilot_mx);
+    compat_aligned_free(slot->slab); free(slot->fslab); free(m->ecache[layer]);
+    m->ecache[layer]=NULL; m->ecap=old_ecap;
+    if(saved_pin>=0) pin_index(m,layer,&m->pin[layer][saved_pin]);
+    if(reserved_bad) return fail("pilot keeps negative reservation until locked publication");
+    return published_bad?fail("pilot publishes loaded expert under lock"):0;
 }
 
 static int check_direct_quant_format(int fd,long fs_magic,int fmt,int hidden,int moe_inter,
@@ -199,6 +296,21 @@ int main(void){
     add_expert(&m,0,tfd,tfd); add_expert(&m,1,tfd,rfd);
     m.pin=calloc(2,sizeof(ESlot*)); m.npin=calloc(2,sizeof(int));
     m.ecache=calloc(2,sizeof(ESlot*)); m.ecn=calloc(2,sizeof(int));
+    m.pin_slot_by_expert=calloc(2,sizeof(int*));
+    m.ecache_slot_by_expert=calloc(2,sizeof(int*));
+    if(!m.pin||!m.npin||!m.ecache||!m.ecn||
+       !m.pin_slot_by_expert||!m.ecache_slot_by_expert)
+        return fail("expert residency metadata allocation");
+    for(int l=0;l<2;l++){
+        m.pin_slot_by_expert[l]=malloc(2*sizeof(int));
+        m.ecache_slot_by_expert[l]=malloc(2*sizeof(int));
+        if(!m.pin_slot_by_expert[l]||!m.ecache_slot_by_expert[l])
+            return fail("expert residency index allocation");
+        for(int e=0;e<2;e++){
+            m.pin_slot_by_expert[l][e]=-1;
+            m.ecache_slot_by_expert[l][e]=-1;
+        }
+    }
 
     g_mmap=0; g_rammap=1; g_ram_prefault=0;
     rammap_build(&m);
@@ -250,6 +362,20 @@ int main(void){
         expert1[nexpert1]=&m.S.t[i]; expert1_fd[nexpert1]=m.S.t[i].fd; nexpert1++;
     }
     if(nexpert1!=6) return fail("expert1 tensor fixture");
+    for(int i=0;i<6;i++) expert1[i]->fd=tfd;
+    if(check_uring_finalize_accounting(&m,expert1,1,0,
+            "io_uring excludes six tmpfs descriptors from requested SSD bytes")) return 1;
+    for(int i=0;i<6;i++) expert1[i]->fd=expert1_fd[i];
+    if(!untracked_mixed){
+        if(check_uring_finalize_accounting(&m,expert1,1,16,
+                "io_uring counts only the hybrid SSD descriptor")) return 1;
+        for(int i=0;i<6;i++) expert1[i]->fd=rfd;
+        if(check_uring_finalize_accounting(&m,expert1,1,76,
+                "io_uring counts six non-tmpfs descriptors")) return 1;
+    }
+    for(int i=0;i<6;i++) expert1[i]->fd=expert1_fd[i];
+    if(check_pilot_handoff(&m,0,1)) return 1;
+
     ESlot ssd={0},full={0},mixed={0};
     for(int i=0;i<6;i++) expert1[i]->fd=rfd;
     atomic_store_explicit(&g_prof_io,0,memory_order_relaxed);
@@ -275,7 +401,9 @@ int main(void){
 
     m.pin[0]=realloc(m.pin[0],2*sizeof(ESlot)); memset(&m.pin[0][1],0,sizeof(ESlot));
     m.pin[0][1].eid=0; m.pin[0][1].backing=ESLOT_BACKING_OWNED; m.npin[0]=2;
-    m.ecache[0]=calloc(1,sizeof(ESlot)); m.ecache[0][0].eid=0; m.ecache[0][0].used=123; m.ecn[0]=1;
+    pin_index(&m,0,&m.pin[0][1]);
+    m.ecache[0]=calloc(1,sizeof(ESlot)); m.ecn[0]=1;
+    ecache_publish(&m,0,&m.ecache[0][0],0); m.ecache[0][0].used=123;
     atomic_store_explicit(&g_prof_io,777,memory_order_relaxed); m.rammap_calls=0;
     ESlot *direct=rammap_slot(&m,0,0);
     if(!expert_slot_is_pinned(&m,0,&m.pin[0][0]) ||
@@ -289,6 +417,10 @@ int main(void){
 
     compat_aligned_free(m.pin[0][0].slab); free(m.pin[0][0].fslab); free(m.pin[0]);
     free(m.ecache[0]); free(m.pin); free(m.npin); free(m.ecache); free(m.ecn);
+    for(int l=0;l<2;l++){
+        free(m.pin_slot_by_expert[l]); free(m.ecache_slot_by_expert[l]);
+    }
+    free(m.pin_slot_by_expert); free(m.ecache_slot_by_expert);
     free(m.rammap); free(m.L);
     for(int i=0;i<m.S.n;i++) free(m.S.t[i].name); free(m.S.t);
     for(int i=0;i<g_nmaps;i++) munmap(g_maps[i].base,g_maps[i].len);

@@ -42,6 +42,19 @@ class MachineInfoWin32Test(unittest.TestCase):
         self.assertEqual(info["ram"], "128 GB")
         self.assertTrue(info["os"].startswith("Windows"))
 
+    def test_win32_build_number_disambiguates_windows_11(self):
+        # platform.release() says "10" on Windows 11; build >= 22000 is the tell
+        import platform as plat
+        from unittest import mock as m2
+        with m2.patch.object(plat, "release", return_value="10"), \
+             m2.patch.object(plat, "version", return_value="10.0.26200"):
+            info = self._win32_info(memstatus_ok=True)
+        self.assertTrue(info["os"].startswith("Windows 11"), info["os"])
+        with m2.patch.object(plat, "release", return_value="10"), \
+             m2.patch.object(plat, "version", return_value="10.0.19045"):
+            info = self._win32_info(memstatus_ok=True)
+        self.assertTrue(info["os"].startswith("Windows 10"), info["os"])
+
     def test_win32_probe_failure_falls_back(self):
         """A failed probe keeps the old conservative default rather than 0.0 —
         an eviction write sized from 0 GB would silently evict nothing."""

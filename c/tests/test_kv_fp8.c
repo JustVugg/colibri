@@ -82,6 +82,41 @@ int main(void){
     CHECK(coli_kv_row8(buf,4,7)==buf+28, "coli_kv_row8 arithmetic");
     CHECK(coli_kv_row8(buf,0,7)==buf, "coli_kv_row8 row 0");
 
+    /* KV8_GS grouped scales: gs=0 is byte-identical to the per-row pair; a
+     * grouped row round-trips per group with each group's own amax bound —
+     * an outlier in one group must not dilate another group's grid */
+    {
+        enum { GN=32, GS=8 };
+        float grow[GN]; uint8_t gq[GN], gq0[GN]; float gsc[GN/GS], sc0;
+        for(int i=0;i<GN;i++) grow[i]=0.01f*(float)(i-15);
+        grow[3]=100.0f;                     /* outlier confined to group 0 */
+        coli_kv8_quant_row_gs(grow,gq,gsc,GN,GS);
+        sc0=coli_kv8_quant_row(grow,gq0,GN); (void)sc0;
+        CHECK(coli_kv8_nscale(GN,GS)==4, "nscale(32,8)==4");
+        CHECK(coli_kv8_nscale(GN,0)==1, "nscale(_,0)==1");
+        float gdeq[GN];
+        coli_kv8_dequant_row_gs(gq,gsc,gdeq,GN,GS);
+        for(int g=1;g<4;g++)                /* groups without the outlier: tight grid */
+            for(int i=g*GS;i<(g+1)*GS;i++){
+                float err=fabsf(gdeq[i]-grow[i]);
+                CHECK(err<=fabsf(grow[i])/16.f+gsc[g]*0x1p-10f+1e-7f,
+                      "gs elem %d: err %g too large", i, err);
+            }
+        /* the per-row version smears the outlier's scale across everything:
+         * grouped must beat it on the non-outlier groups */
+        float rdeq[GN]; coli_kv8_dequant_row(gq0,sc0,rdeq,GN);
+        double ge=0, re=0;
+        for(int i=GS;i<GN;i++){ ge+=fabs(gdeq[i]-grow[i]); re+=fabs(rdeq[i]-grow[i]); }
+        CHECK(ge<re, "grouped scales beat per-row off the outlier (%.3g vs %.3g)", ge, re);
+        /* gs=0 through the _gs entry points == the per-row functions, bit for bit */
+        uint8_t q0[GN]; float s0[1], d0[GN], d1[GN];
+        coli_kv8_quant_row_gs(grow,q0,s0,GN,0);
+        CHECK(memcmp(q0,gq0,GN)==0 && s0[0]==sc0, "gs=0 quant == per-row quant");
+        coli_kv8_dequant_row_gs(q0,s0,d0,GN,0);
+        coli_kv8_dequant_row(gq0,sc0,d1,GN);
+        CHECK(memcmp(d0,d1,sizeof d0)==0, "gs=0 dequant == per-row dequant");
+    }
+
     if(fails){ fprintf(stderr,"%d failure(s)\n",fails); return 1; }
     printf("OK kv_fp8 e4m3 (exhaustive roundtrip + RNE + row quant)\n");
     return 0;

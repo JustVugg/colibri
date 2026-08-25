@@ -205,6 +205,92 @@ def shard_record_digests(path):
     return digests, os.path.getsize(path)
 
 
+def census(outdir):
+    """Per-record layout census over an already-minted output directory
+    (#594): for every rANS record, the logical content length, the encoded
+    payload length, the framing bytes around it, and where it physically sits
+    in its shard. Written to rans-census.json next to the shards and printed
+    as a per-shard summary. Read-only.
+
+    Field semantics, pinned so the numbers are comparable across formats:
+      logical_bytes         packed int4 content the record decodes to
+                            (ceil(n_symbols/2) — the byte-exact logical length)
+      encoded_payload_bytes sum of the 256 stream lengths, before padding
+      framing_bytes         record bytes that are not encoded payload: the
+                            1044->round16 header plus the payload's round16 pad
+      physical_offset       absolute byte offset of the record in its shard
+      physical_extent_bytes the record's data_offsets span (== framed length)
+      alignment_bytes       0 by construction: records pack back to back in a
+                            safetensors data section with no per-record 4KiB
+                            padding — O_DIRECT alignment is the READER's page
+                            window, not a property of the stored bytes. The
+                            field exists so a cross-format comparison has an
+                            explicit zero rather than a missing column.
+    Invariant checked per record: header + padded payload == extent."""
+    shards = sorted(glob.glob(os.path.join(outdir, "out-rans-*.safetensors")))
+    if not shards:
+        print(f"ERROR: no out-rans-*.safetensors under {outdir} — nothing to "
+              f"census", file=sys.stderr)
+        sys.exit(1)
+    head_bytes = rf.record_header_bytes()
+    out = {"format": rf.FORMAT_NAME, "field_semantics": "see tools/repack_rans.py census()",
+           "shards": []}
+    bad = 0
+    for p in shards:
+        header, data_start = rf.read_header(p)
+        meta = header.get("__metadata__", {})
+        try:
+            fmt_map = json.loads(meta.get(rf.METADATA_KEY, "{}"))
+        except ValueError:
+            fmt_map = {}
+        rows = []
+        for name in sorted(n for n, v in fmt_map.items()
+                           if v == rf.FORMAT_NAME and n in header):
+            blob, info = rf.read_tensor_bytes(p, header, data_start, name)
+            rec = rf.parse_record(blob)
+            encoded = int(rec["offsets"][-1])
+            extent = len(blob)
+            framing = extent - encoded
+            row = {
+                "record_id": name,
+                "logical_bytes": int(rec["packed_bytes"]),
+                "encoded_payload_bytes": encoded,
+                "framing_bytes": framing,
+                "physical_offset": data_start + int(info["data_offsets"][0]),
+                "physical_extent_bytes": extent,
+                "alignment_bytes": 0,
+            }
+            # the record is exactly header + round16-padded payload; anything
+            # else means bytes this census failed to attribute
+            pad = extent - head_bytes - encoded
+            if pad < 0 or pad > 15:
+                row["UNATTRIBUTED_BYTES"] = pad
+                bad += 1
+            rows.append(row)
+        enc = sum(r["encoded_payload_bytes"] for r in rows)
+        log = sum(r["logical_bytes"] for r in rows)
+        ext = sum(r["physical_extent_bytes"] for r in rows)
+        out["shards"].append({"file": os.path.basename(p),
+                              "file_bytes": os.path.getsize(p),
+                              "n_records": len(rows),
+                              "sum_logical_bytes": log,
+                              "sum_encoded_payload_bytes": enc,
+                              "sum_physical_extent_bytes": ext,
+                              "records": rows})
+        print(f"[census] {os.path.basename(p)}: {len(rows)} record(s), "
+              f"logical {log} B, encoded {enc} B (r={enc/log:.4f}), "
+              f"framed extent {ext} B (+{ext-enc} B framing, "
+              f"{100.0*(ext-enc)/max(ext,1):.3f}%)")
+    path = os.path.join(outdir, "rans-census.json")
+    with open(path, "w") as fh:
+        json.dump(out, fh, indent=1, sort_keys=True)
+    print(f"[census] wrote {path}")
+    if bad:
+        print(f"ERROR: {bad} record(s) with unattributed bytes — see "
+              f"UNATTRIBUTED_BYTES rows", file=sys.stderr)
+        sys.exit(1)
+
+
 def manifest_only(outdir):
     """Retro-manifest: (re)generate repack-manifest.json for an already-
     minted output directory by hashing the existing shards in place — no
@@ -301,6 +387,11 @@ def main():
                     help="regenerate repack-manifest.json (incl. per-record "
                          "sha256 digests) for an already-minted output "
                          "directory, hashing shards in place — no re-encoding")
+    ap.add_argument("--census", metavar="DIR",
+                    help="per-record layout census of an already-minted output "
+                         "directory (#594): logical/encoded/framing bytes and "
+                         "physical placement per record, to rans-census.json — "
+                         "read-only, no re-encoding")
     a = ap.parse_args()
 
     if a.manifest_only:
@@ -309,6 +400,12 @@ def main():
                   file=sys.stderr)
             sys.exit(2)
         manifest_only(a.manifest_only)
+        return
+    if a.census:
+        if a.indir or a.outdir:
+            print("ERROR: --census takes no --indir/--outdir", file=sys.stderr)
+            sys.exit(2)
+        census(a.census)
         return
     if not a.indir or not a.outdir:
         ap.error("--indir and --outdir are required (unless --manifest-only)")

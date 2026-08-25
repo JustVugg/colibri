@@ -67,6 +67,7 @@ EXPORTS
     dsv4_cuda_expert_bank_upload
     dsv4_cuda_expert_bank_set_shared
     dsv4_cuda_expert_bank_upload_tp2
+    dsv4_cuda_expert_bank_upload_aux
     dsv4_cuda_expert_set_free
     dsv4_cuda_expert_set_upload_hash
     dsv4_cuda_route_moe

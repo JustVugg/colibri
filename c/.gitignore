@@ -22,6 +22,7 @@ tests/bench_omp_grain
 tests/mxfp4_ref.o
 mxfp4_cuda_test
 absorb_determinism_test
+cuda_fmt_trap_test
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped

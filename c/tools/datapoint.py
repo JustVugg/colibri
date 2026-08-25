@@ -126,7 +126,18 @@ def machine_info():
             winreg.CloseKey(k)
         except Exception:
             pass
-        info["os"] = f"Windows {platform.release()} {platform.version()}"
+        # platform.release() says "10" on Windows 11: Microsoft never moved the
+        # internal version off 10.0, so the BUILD number is the only tell —
+        # 22000 and up is Windows 11 (#1042 follow-up: every Win11 datapoint in
+        # the tracker was being filed as Windows 10).
+        release = platform.release()
+        try:
+            build = int(platform.version().split(".")[2])
+            if release == "10" and build >= 22000:
+                release = "11"
+        except (IndexError, ValueError):
+            pass
+        info["os"] = f"Windows {release} {platform.version()}"
     else:
         info["cpu"] = platform.processor() or "?"
         info["ram"] = "?"

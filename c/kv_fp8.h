@@ -64,4 +64,24 @@ static inline void coli_kv8_dequant_row(const uint8_t *src, float scale, float *
     for(int i=0;i<n;i++) dst[i]=coli_fp8_lut[src[i]]*scale;
 }
 
+/* KV8_GS: grouped-scale variants (FlashMLA keeps one f32 scale per 128 latent
+ * elements; one amax per 512-dim row lets a single outlier dilate the grid for
+ * the whole row). gs==0 -> the per-row functions above. The row's scales live
+ * consecutively: ceil(n/gs) floats per row. */
+static inline int coli_kv8_nscale(int n, int gs){ return gs>0 ? (n+gs-1)/gs : 1; }
+static inline void coli_kv8_quant_row_gs(const float *src, uint8_t *dst, float *sc, int n, int gs){
+    if(gs<=0){ sc[0]=coli_kv8_quant_row(src,dst,n); return; }
+    for(int g=0,k=0;g<n;g+=gs,k++){
+        int m=n-g<gs?n-g:gs;
+        sc[k]=coli_kv8_quant_row(src+g,dst+g,m);
+    }
+}
+static inline void coli_kv8_dequant_row_gs(const uint8_t *src, const float *sc, float *dst, int n, int gs){
+    if(gs<=0){ coli_kv8_dequant_row(src,sc[0],dst,n); return; }
+    for(int g=0,k=0;g<n;g+=gs,k++){
+        int m=n-g<gs?n-g:gs;
+        coli_kv8_dequant_row(src+g,sc[k],dst+g,m);
+    }
+}
+
 #endif

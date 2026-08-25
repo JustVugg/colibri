@@ -265,6 +265,42 @@ __device__ static inline float mx4_weight_at(const uint8_t *q, int i) {
     return mx4_decode((i & 1) ? (v >> 4) : (v & 15));
 }
 
+/* Generic per-element weight decode for the kernels that need one (the absorb
+ * kernels and the generic grouped-expert path). fmt=3 (int2) is now an EXPLICIT
+ * branch and the fall-through is a refusal.
+ *
+ * It used to be the other way round: int2 was the fall-through, so every format
+ * this function does not decode -- fmt=5 (int3-g64), fmt=6 (E8/IQ3), fmt=8
+ * (fp8-e4m3), and anything added later -- was read as 2-bit values and returned
+ * numbers. Meanwhile the CPU functions doing the same job on the same tensor,
+ * qt_addrow and qt_matvec_rows (colibri.c), both exit(1) naming the function and
+ * the fmt. Two backends, identical unsupported input, one refusing and one
+ * fabricating: that asymmetry is the defect, independent of any particular
+ * format's arrival.
+ *
+ * WHY __trap() AND NOT A DIAGNOSTIC. This is device code inside a running
+ * kernel; there is no stderr to name the tensor on and no way to unwind. __trap
+ * aborts the kernel and poisons the context, so the next cuda_ok() call on the
+ * host reports a failure instead of the caller consuming fabricated values --
+ * the same "stop rather than misread" outcome as the CPU's exit(1), reached the
+ * only way device code can reach it.
+ *
+ * IT IS A BACKSTOP, NOT THE PRIMARY GATE -- and the gates above it are several
+ * DIFFERENT checks, not one. Naming them exactly, because "every launcher checks
+ * coli_cuda_weight_at_supported" would be false and a reader will verify it:
+ *   - UPLOAD is the widest gate. coli_cuda_tensor_upload{,_g} refuse when
+ *     row_bytes(fmt,I) == 0, which is every fmt this file has no row stride for --
+ *     fmt=5 (int3-g64), every negative fmt, every unknown fmt. Those can never
+ *     become a ColiCudaTensor at all, so the uploadable set is {0,1,2,3,4,6,7,8}.
+ *   - quant_matmul dispatches 6, 7, 4 and 8 in explicit branches of its own, so
+ *     the generic else that calls this function sees only 0/1/2/3 out of that set.
+ *   - the generic grouped-expert path refuses gf>3 || uf>3 || df>3 on the host.
+ *   - the absorb call sites (the other caller of this function) are the ones
+ *     gated by coli_cuda_weight_at_supported, via absorb_fmt_ok below -- one
+ *     caller, not "every launcher".
+ * Each of those is sufficient on its own for the sites it covers; this trap
+ * exists because none of them is a property of THIS function. Reaching this line
+ * means a launch site got past its own gate, which is a bug in that gate. */
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
@@ -274,8 +310,12 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
         uint8_t v = q[i >> 1];
         int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n&8?n-16:n);
     }
-    uint8_t v = q[i >> 2];
-    return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
+    if (fmt == 3) {                                           /* int2 */
+        uint8_t v = q[i >> 2];
+        return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
+    }
+    __trap();
+    return 0.0f;   /* not reached: __trap() does not return */
 }
 
 /* Scale for output `row`, input element `k`. fmt=4 (grouped int4) stores ng
@@ -1949,7 +1989,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
          * than whitelist known offenders: a fmt=4 group that slipped the gates
          * above (odd gs) must NOT be silently decoded as int2 (#334), and any
          * group/block-scaled format that gains CUDA tensors later (fmt=5, fmt=8)
-         * would be mis-decoded by weight_at the same way. */
+         * carries scale geometry this kernel's epilogue does not apply.
+         * STRICTER than weight_at's own admissible set on purpose: fmt=4 belongs
+         * on the g4 path above, and returning 0 here keeps the CORRECT CPU
+         * fallback, which is the outcome we want — weight_at's device-side
+         * __trap backstop is for a launch that got past a gate like this one,
+         * not a substitute for having the gate. */
         for(int c=0;c<count;c++)
             if(host[c].gf>3||host[c].uf>3||host[c].df>3) return 0;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
@@ -2124,8 +2169,17 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
  * than mis-decode it — the caller keeps its CPU attention path. (`proj`
  * tensors are exempt: they run through quant_matmul, which dispatches every
  * format it uploads.) A dedicated block-scale absorb for fmt=8 is follow-up
- * work, same shape as routing fmt=4 through the grouped kernels was. */
-static int absorb_fmt_ok(const ColiCudaTensor *w){ return w && w->fmt <= 4; }
+ * work, same shape as routing fmt=4 through the grouped kernels was.
+ *
+ * The admissible set is weight_at's own, taken from the shared predicate rather
+ * than restated as `fmt <= 4`: this gate and weight_at's device-side backstop
+ * must not be able to drift apart, and the old inequality also admitted
+ * NEGATIVE fmt values, which weight_at would then have fallen through on. Same
+ * truth table for every fmt a container can actually carry (0..8), so no
+ * existing container changes behaviour here. */
+static int absorb_fmt_ok(const ColiCudaTensor *w){
+    return w && coli_cuda_weight_at_supported(w->fmt);
+}
 
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,

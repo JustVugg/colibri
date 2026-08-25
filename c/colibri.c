@@ -415,8 +415,12 @@ static int eslot_lru_victim(ESlot *slots,int n,int ecap){
     int lru=-1, empty=-1, live=0;
     for(int i=0;i<n;i++){
         ESlot *s=&slots[i];
-        if(s->slab || s->eid<-1) live++;
-        if(eslot_busy(s) || s->eid<-1) continue;
+        /* A PILOT reservation is protected by g_pilot_mx, but its payload is
+         * filled outside that mutex.  Short-circuit on the stable reservation
+         * before reading slab, which the loader may concurrently replace. */
+        int reserved=s->eid<-1;
+        if(reserved || s->slab) live++;
+        if(reserved || eslot_busy(s)) continue;
         if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
         if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
         if(lru<0 || s->used<slots[lru].used) lru=i;
@@ -455,6 +459,7 @@ typedef struct {
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
+    int **ecache_slot_by_expert;                 /* eid -> LRU slot (resident or PILOT reservation) */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
 #ifdef COLI_VULKAN
@@ -462,6 +467,7 @@ typedef struct {
 #endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
+    int **pin_slot_by_expert;                    /* eid -> hot-store slot, -1 if absent */
     ESlot *rammap;                               /* PR #377: immutable [layer][expert] tmpfs views */
     int rammap_experts; int64_t rammap_bytes; uint64_t rammap_calls;
     double rammap_prefault_s;
@@ -1325,6 +1331,10 @@ static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE s
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static ESlot *expert_resident_slot(Model *m, int layer, int eid, int touch); /* RAM map -> pin -> LRU */
 static int expert_is_resident(Model *m, int layer, int eid); /* defined near moe() */
+static int expert_is_resident_or_reserved(Model *m,int layer,int eid);
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_glm_prefetch_raw_calls;
+#endif
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
@@ -1401,6 +1411,9 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
 /* KV-cache quantization tier flags — defined here (before kv_persist.h) so the .coli_kv
  * disk format can see them; the full rationale comments live at their original site below. */
 static int g_kv8=0;                             /* KV8=1: fp8 e4m3 latent KV + per-row scale */
+static int g_kv8_gs=0;                          /* KV8_GS=<n>: one scale per n latent elements
+                                                 * instead of per row (FlashMLA uses 128 on the
+                                                 * 512-dim latent). 0 = per-row (unchanged). */
 static int g_tq=0, g_tq_bits=4, g_tq_codec=1;   /* KV_TQ: codec 1=rotated int4 (default), 0=PolarQuant */
 #include "kv_persist.h"
 #include "telemetry.h"
@@ -2678,6 +2691,7 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
+    m->ecache_slot_by_expert=calloc(NR,sizeof(int*));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
 #ifdef COLI_VULKAN
@@ -2685,6 +2699,17 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
 #endif
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
+    m->pin_slot_by_expert=calloc(NR,sizeof(int*));
+    if(!m->ecache_slot_by_expert||!m->pin_slot_by_expert){ fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+    for(int i=0;i<NR;i++){
+        m->ecache_slot_by_expert[i]=malloc((size_t)c->n_experts*sizeof(int));
+        m->pin_slot_by_expert[i]=malloc((size_t)c->n_experts*sizeof(int));
+        if(!m->ecache_slot_by_expert[i]||!m->pin_slot_by_expert[i]){ fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+        for(int e=0;e<c->n_experts;e++){
+            m->ecache_slot_by_expert[i][e]=-1;
+            m->pin_slot_by_expert[i][e]=-1;
+        }
+    }
     rt_init("glm_moe_dsa",c->n_layers,c->n_experts);   /* owns the counters + the format */
     m->eusage=rt_counts_all();                         /* alias: bump sites unchanged */
     m->eheat=calloc(NR,sizeof(uint32_t*));
@@ -3193,7 +3218,8 @@ static int expert_classify(Model *m, int layer, int eid){
     uint32_t age=m->eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
     return age>g_direct_heat_ticks ? DC_COLD : DC_WARM;         /* '>' not '>=': ties lean warm */
 }
-static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
+static int expert_load_impl_mode(Model *m, int layer, int eid, ESlot *s,
+                                 int fatal, int demand, int publish_eid){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
@@ -3224,7 +3250,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         int64_t ssd=0;
         for(int k=0;k<3;k++) ssd+=prof_ssd_tensor_bytes(&m->S,st_find(&m->S,nm[k]));
         atomic_fetch_add_explicit(&g_prof_io,ssd,memory_order_relaxed);
-        s->eid=eid; s->backing=ESLOT_BACKING_OWNED; return 0;
+        if(publish_eid) s->eid=eid;
+        s->backing=ESLOT_BACKING_OWNED; return 0;
     }
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
@@ -3287,7 +3314,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                 atomic_fetch_add_explicit(&g_mir_bytes[rep],tw[k]->nbytes+tq[k]->nbytes,memory_order_relaxed);
             }
             atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
-            s->eid=eid; s->backing=ESLOT_BACKING_MMAP; return 0;
+            if(publish_eid) s->eid=eid;
+            s->backing=ESLOT_BACKING_MMAP; return 0;
         }
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
@@ -3478,11 +3506,16 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
          * EN: slab-owned bytes -> planarize; clear the stale flag first. */
         qt[k]->planar=0; qt_planarize(qt[k]);
     }
-    s->eid=eid; s->backing=ESLOT_BACKING_OWNED; return 0;
+    if(publish_eid) s->eid=eid;
+    s->backing=ESLOT_BACKING_OWNED; return 0;
+}
+static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
+    return expert_load_impl_mode(m,layer,eid,s,fatal,demand,1);
 }
 /* Every expert read goes through here: time the whole load (pread/fault +
  * bookkeeping) on the thread that runs it, into the disk-service counter. */
-static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
+static int expert_load_mode(Model *m, int layer, int eid, ESlot *s,
+                            int fatal, int demand, int publish_eid){
     /* `demand` marks a routing-driven demand-load (moe()'s PIPE/OMP miss path, where the
      * pre-bump elast_pre snapshot moe() just wrote is valid) -- pass 0 from anywhere else
      * (pilot speculative loads, repin, startup PIN loading): those never run through THIS
@@ -3490,9 +3523,12 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
      * them, and DISK-CLASS deliberately leaves them unclassified -- see expert_classify()'s
      * call site. */
     double t0=now_s();
-    int rc=expert_load_impl(m,layer,eid,s,fatal,demand);
+    int rc=expert_load_impl_mode(m,layer,eid,s,fatal,demand,publish_eid);
     atomic_fetch_add_explicit(&g_edisk_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
     return rc;
+}
+static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
+    return expert_load_mode(m,layer,eid,s,fatal,demand,1);
 }
 
 #if !defined(_WIN32)
@@ -3943,9 +3979,11 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
-    atomic_fetch_add_explicit(&g_prof_io,
-        l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes+fo*4,
-        memory_order_relaxed);
+    int64_t ssd=0;
+    for(int k=0;k<3;k++)
+        ssd+=prof_ssd_tensor_bytes(&l->m->S,l->tw[k])+
+             prof_ssd_tensor_bytes(&l->m->S,l->tq[k]);
+    atomic_fetch_add_explicit(&g_prof_io,ssd,memory_order_relaxed);
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
 }
@@ -4175,8 +4213,10 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
  * is deterministic).
  * EN: under O_DIRECT the weights bypass the page cache, so their WILLNEED is wasted;
  * the .qs scales are always buffered, so keep theirs. Advisory hint -> output-preserving. */
-static void expert_prefetch(Model *m, int layer, int eid){
-    if(expert_is_resident(m,layer,eid)) return;          /* RAM map, pin, or ecache: nothing to prefetch */
+static void expert_prefetch_unchecked(Model *m, int layer, int eid){
+#ifdef COLI_CACHE_INDEX_TEST
+    g_glm_prefetch_raw_calls++;
+#endif
     char nm[300]; int rep=expert_route(layer,eid);
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
@@ -4184,6 +4224,18 @@ static void expert_prefetch(Model *m, int layer, int eid){
         if(!g_direct) st_prefetch_rep(&m->S,nm,rep);
         char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch_rep(&m->S,qs,rep);
     }
+}
+static void expert_prefetch(Model *m, int layer, int eid){
+    int found;
+    if(g_pilot_real){
+        /* SPEC can call this before moe() takes ownership of the current layer.
+         * Serialize its index probe with a PILOT_REAL reservation/publication. */
+        pthread_mutex_lock(&g_pilot_mx);
+        found=expert_is_resident_or_reserved(m,layer,eid);
+        pthread_mutex_unlock(&g_pilot_mx);
+    } else found=expert_is_resident(m,layer,eid);
+    if(found) return;                                  /* RAM map, pin, ecache, or reservation */
+    expert_prefetch_unchecked(m,layer,eid);
 }
 
 /* ---- helper per l'ABSORPTION: accesso per-riga ai QT quantizzati ---- */
@@ -4588,6 +4640,23 @@ static unsigned metal_fused_layer_fmt_miss(const Layer *l){
     return miss;
 }
 
+/* #1151 follow-up: the flash/gather kvb arms under quantized KV.
+ * kv_lc_rows_f32 dequantizes latent rows [t0, t0+n) into an f32 staging buffer
+ * (the same per-row codecs the one-shot path uses); the roped-key reads
+ * inline the one-shot path's three-way branch so each representation keeps
+ * its exact accumulation order. */
+static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *dst, Cfg *c){
+    if(g_tq){
+        int lbb=coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec);
+        for(int64_t t=t0;t<t0+n;t++)
+            coli_kvq_dequant_row(coli_kv_row8(m->Lc8[layer],t,lbb), m->Lsc[layer][t],
+                                 dst+(t-t0)*c->kv_lora, c->kv_lora, g_tq_bits, g_tq_codec);
+    } else {
+        for(int64_t t=t0;t<t0+n;t++)
+            coli_kv8_dequant_row(coli_kv_row8(m->Lc8[layer],t,c->kv_lora), m->Lsc[layer][t],
+                                 dst+(t-t0)*c->kv_lora, c->kv_lora);
+    }
+}
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -4776,7 +4845,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float *Ls=comp+(int64_t)s*cw, *Rs=Ls+c->kv_lora;
             rmsnorm(Ls, Ls, l->kv_a_ln, c->kv_lora, c->eps);      /* latente normato */
             rope_interleave(Rs, pos, c);                          /* k_rot roped */
-            ks->Lsc[layer][pos]=coli_kv8_quant_row(Ls, coli_kv_row8(ks->Lc8[layer],pos,c->kv_lora), c->kv_lora);
+            coli_kv8_quant_row_gs(Ls, coli_kv_row8(ks->Lc8[layer],pos,c->kv_lora),
+                                  ks->Lsc[layer]+(int64_t)pos*coli_kv8_nscale(c->kv_lora,g_kv8_gs),
+                                  c->kv_lora, g_kv8_gs);
             ks->Rsc[layer][pos]=coli_kv8_quant_row(Rs, coli_kv_row8(ks->Rc8[layer],pos,c->qk_rope), c->qk_rope);
         } else {
             float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
@@ -5088,13 +5159,27 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     for(int d=0;d<c->qk_rope;d++) a+=qr[d]*Rf[d];
                 } else if(g_kv8){
                     /* LUT-dequant inline nel dot; la scala per-riga esce dalla
-                     * somma: score = Lsc·Σ q·lut[b] + Rsc·Σ qr·lut[b] */
+                     * somma: score = Lsc·Σ q·lut[b] + Rsc·Σ qr·lut[b].
+                     * KV8_GS: per-group scales — partial dot per group, each
+                     * scaled before the sum (same math, tighter grid). */
                     const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
                     const uint8_t *kr=coli_kv_row8(ks->Rc8[layer],t,c->qk_rope);
-                    float al=0, ar=0;
-                    for(int i=0;i<kvl;i++) al+=qabs[i]*coli_fp8_lut[Lt[i]];
+                    int nsl=coli_kv8_nscale(kvl,g_kv8_gs);
+                    const float *Ls_t=ks->Lsc[layer]+(int64_t)t*nsl;
+                    float ar=0; a=0;
+                    if(g_kv8_gs){
+                        for(int g=0,k2=0;g<kvl;g+=g_kv8_gs,k2++){
+                            int m=kvl-g<g_kv8_gs?kvl-g:g_kv8_gs; float al=0;
+                            for(int i=0;i<m;i++) al+=qabs[g+i]*coli_fp8_lut[Lt[g+i]];
+                            a+=al*Ls_t[k2];
+                        }
+                    } else {
+                        float al=0;
+                        for(int i=0;i<kvl;i++) al+=qabs[i]*coli_fp8_lut[Lt[i]];
+                        a=al*Ls_t[0];
+                    }
                     for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
-                    a=al*ks->Lsc[layer][t]+ar*ks->Rsc[layer][t];
+                    a+=ar*ks->Rsc[layer][t];
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
@@ -5138,8 +5223,18 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     for(int i=0;i<kvl;i++) clat[i]+=a*Lf[i];
                 } else if(g_kv8){
                     const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
-                    float a=sc[jj]*ks->Lsc[layer][t];       /* la scala si fonde nel peso */
-                    for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
+                    int nsl=coli_kv8_nscale(kvl,g_kv8_gs);
+                    const float *Ls_t=ks->Lsc[layer]+(int64_t)t*nsl;
+                    if(g_kv8_gs){
+                        for(int g=0,k2=0;g<kvl;g+=g_kv8_gs,k2++){
+                            int m=kvl-g<g_kv8_gs?kvl-g:g_kv8_gs;
+                            float a=sc[jj]*Ls_t[k2];
+                            for(int i=0;i<m;i++) clat[g+i]+=a*coli_fp8_lut[Lt[g+i]];
+                        }
+                    } else {
+                        float a=sc[jj]*Ls_t[0];             /* la scala si fonde nel peso */
+                        for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
+                    }
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 /* MLA-absorb value mix: clat += sc[jj] * Lt (AXPY over kvl).
@@ -5195,11 +5290,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     int dsa_any=0; if(dnsel) for(int s=0;s<S && !dsa_any;s++) if(dnsel[s]>0) dsa_any=1;
     int64_t kvb_rows=(int64_t)Tk-stL, kvb_need=kvb_rows*kvb_dim*4;
     int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
-    int kv_quant = g_kv8 || g_tq;   /* KV8/KV_TQ read Lc via a dequant staging pass:
-                                     * they keep the one-shot path below for now (the
-                                     * flash/gather arms read f32 Lc rows directly). */
-    int use_flash=!dsa_any && !kv_quant && flash_mb>0 && kvb_need>flash_mb*1048576;
-    if(getenv("KVB_FLASH")) use_flash=!dsa_any && !kv_quant && atoi(getenv("KVB_FLASH"))!=0;
+    int use_flash=!dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576;
+    if(getenv("KVB_FLASH")) use_flash=!dsa_any && atoi(getenv("KVB_FLASH"))!=0;
     if(use_flash){
         int64_t tile_mb=getenv("KVB_TILE_MB")?atoll(getenv("KVB_TILE_MB")):512;
         int64_t tile=tile_mb*1048576/((int64_t)kvb_dim*4);
@@ -5211,6 +5303,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         m->t_kvb += now_s()-tk0;
         float *kvb_tile=falloc(tile*kvb_dim);
+        /* quantized KV: dequantize each tile's latent rows into an f32 staging
+         * buffer for the kv_b matmul — same codecs as the one-shot path, tile-
+         * sized instead of context-sized (#1151 follow-up) */
+        float *Lf_tile=(g_kv8||g_tq)?falloc(tile*c->kv_lora):NULL;
         float *ml=falloc((int64_t)S*H*2);              /* running (max, sum) per (row, head) */
         double tac=now_s(), kvb_acc=0;
         #pragma omp parallel for collapse(2) schedule(static)
@@ -5221,7 +5317,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int64_t t0=stL; t0<Tk; t0+=tile){
             int64_t tn=Tk-t0<tile?Tk-t0:tile;
             double tk1=now_s();
-            matmul_qt(kvb_tile, m->Lc[layer]+t0*c->kv_lora, &l->kv_b, (int)tn);
+            if(Lf_tile){
+                kv_lc_rows_f32(m,layer,t0,tn,Lf_tile,c);
+                matmul_qt(kvb_tile, Lf_tile, &l->kv_b, (int)tn);
+            } else
+                matmul_qt(kvb_tile, m->Lc[layer]+t0*c->kv_lora, &l->kv_b, (int)tn);
             kvb_acc+=now_s()-tk1;
             #pragma omp parallel for collapse(2) schedule(static,1)
             for(int s=0;s<S;s++) for(int h=0;h<H;h++){
@@ -5234,9 +5334,20 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 float mrun=st[0], lrun=st[1];
                 for(int64_t jj=0;jj<jn;jj++){
                     const float *kn=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh);
-                    const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
                     float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
-                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                    if(g_tq){
+                        float Rf[512];
+                        coli_kvq_dequant_row(coli_kv_row8(m->Rc8[layer],t0+jj,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)),
+                                             m->Rsc[layer][t0+jj], Rf, c->qk_rope, g_tq_bits, g_tq_codec);
+                        for(int d=0;d<c->qk_rope;d++) a+=qr[d]*Rf[d];
+                    } else if(g_kv8){
+                        const uint8_t *kr=coli_kv_row8(m->Rc8[layer],t0+jj,c->qk_rope);
+                        float ar=0; for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
+                        a+=ar*m->Rsc[layer][t0+jj];
+                    } else {
+                        const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
+                        for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                    }
                     a*=c->attn_scale;
                     const float *vv=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
                     if(a>mrun){
@@ -5256,7 +5367,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float *cx=ctx+((int64_t)s*H+h)*vh;
             if(lrun>0) for(int d=0;d<vh;d++) cx[d]/=lrun;
         }
-        free(kvb_tile); free(ml);
+        free(kvb_tile); free(Lf_tile); free(ml);
         m->t_kvb+=kvb_acc; m->t_acore+=now_s()-tac-kvb_acc; double tao=now_s();
         matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp);
@@ -5272,7 +5383,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * least halve the buffer, fall back to one-shot (gather overhead without the
      * memory win). kvb_map: row t -> compact index, -1 = not rebuilt (never read). */
     float *kvb_all=NULL; int32_t *kvb_map=NULL;
-    if(dsa_any && !kv_quant && flash_mb>0 && kvb_need>flash_mb*1048576){
+    if(dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576){
         uint8_t *want=calloc((size_t)kvb_rows,1);
         if(want){
             for(int s=0;s<S;s++){
@@ -5290,9 +5401,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 if(kvb_map){
                     float *Lg=falloc(un*c->kv_lora); int64_t w=0;
                     for(int64_t r=0;r<kvb_rows;r++){
-                        if(want[r]){ memcpy(Lg+w*c->kv_lora,
-                                m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
-                                (size_t)c->kv_lora*sizeof(float));
+                        if(want[r]){
+                            if(g_kv8||g_tq)              /* quantized latent: dequant the row (#1151 follow-up) */
+                                kv_lc_rows_f32(m,layer,(int64_t)stL+r,1,Lg+w*c->kv_lora,c);
+                            else
+                                memcpy(Lg+w*c->kv_lora,
+                                    m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
+                                    (size_t)c->kv_lora*sizeof(float));
                             kvb_map[r]=(int32_t)w; w++; }
                         else kvb_map[r]=-1;
                     }
@@ -5323,9 +5438,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             /* staging f32 del latente dequantizzato: kv_b vuole righe float. Il buffer
              * [Tk-stL,kvl] e' rumore rispetto a kvb_all [Tk,H*(nope+vh)] gia' allocato. */
             float *Lf=falloc((int64_t)(Tk-stL)*c->kv_lora);
-            for(int t=stL;t<Tk;t++)
-                coli_kv8_dequant_row(coli_kv_row8(m->Lc8[layer],t,c->kv_lora), m->Lsc[layer][t],
-                                     Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora);
+            { int nsl=coli_kv8_nscale(c->kv_lora,g_kv8_gs);
+              for(int t=stL;t<Tk;t++)
+                coli_kv8_dequant_row_gs(coli_kv_row8(m->Lc8[layer],t,c->kv_lora),
+                                        m->Lsc[layer]+(int64_t)t*nsl,
+                                        Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora, g_kv8_gs); }
             matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
             free(Lf);
         } else
@@ -5404,31 +5521,118 @@ static void *vk2_issue_worker(void *p){
 }
 #endif
 
-/* One precedence rule for every routed-expert consumer.  Direct tmpfs views are
- * immutable and win over any stale/duplicate pin or LRU entry.  `touch` is used
- * only by the actual MoE resolver: probes for routing/prefetch do not alter LRU
- * recency or call telemetry. */
-static ESlot *expert_resident_slot(Model *m, int layer, int eid, int touch){
-    if(layer<0 || layer>m->c.n_layers || eid<0 || eid>=m->c.n_experts) return NULL;
-    ESlot *r=rammap_slot(m,layer,eid);
-    if(r){ if(touch) m->rammap_calls++; return r; }
-    ESlot *P=m->pin[layer];
-    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return &P[z];
-    ESlot *Sl=m->ecache[layer];
-    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid){
-        if(touch) Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
-        return &Sl[z];
-    }
-    return NULL;
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_glm_slot_index_probes;
+#endif
+
+/* The hot store is immutable during a forward pass; REPIN updates this map on
+ * the main thread between passes.  Validate the slot identity so corrupt or
+ * stale bookkeeping degrades to a miss rather than serving wrong weights. */
+static ESlot *pin_indexed(Model *m,int layer,int eid){
+    if(layer<0||layer>m->c.n_layers||eid<0||eid>=m->c.n_experts||
+       !m->pin_slot_by_expert||!m->pin_slot_by_expert[layer]) return NULL;
+#ifdef COLI_CACHE_INDEX_TEST
+    g_glm_slot_index_probes++;
+#endif
+    int i=m->pin_slot_by_expert[layer][eid];
+    if(i<0||i>=m->npin[layer]||!m->pin[layer]||m->pin[layer][i].eid!=eid) return NULL;
+    return &m->pin[layer][i];
 }
+
+static void pin_unindex(Model *m,int layer,ESlot *s){
+    if(!m->pin_slot_by_expert||!m->pin_slot_by_expert[layer]||!m->pin[layer]) return;
+    int eid=s->eid, i=(int)(s-m->pin[layer]);
+    if(eid>=0&&eid<m->c.n_experts&&m->pin_slot_by_expert[layer][eid]==i)
+        m->pin_slot_by_expert[layer][eid]=-1;
+}
+
+static void pin_index(Model *m,int layer,ESlot *s){
+    if(!m->pin_slot_by_expert||!m->pin_slot_by_expert[layer]||!m->pin[layer]) return;
+    int eid=s->eid;
+    if(eid>=0&&eid<m->c.n_experts)
+        m->pin_slot_by_expert[layer][eid]=(int)(s-m->pin[layer]);
+}
+
+/* include_reserved is used only by PILOT de-duplication.  Runtime accesses to
+ * a future layer hold g_pilot_mx; the current MoE layer is frozen by the
+ * existing g_cur_moe_layer barrier before lock-free decode lookups begin. */
+static ESlot *ecache_indexed(Model *m,int layer,int eid,int include_reserved){
+    if(layer<0||layer>m->c.n_layers||eid<0||eid>=m->c.n_experts||
+       !m->ecache_slot_by_expert||!m->ecache_slot_by_expert[layer]) return NULL;
+#ifdef COLI_CACHE_INDEX_TEST
+    g_glm_slot_index_probes++;
+#endif
+    int i=m->ecache_slot_by_expert[layer][eid];
+    if(i<0||i>=m->ecn[layer]||!m->ecache[layer]) return NULL;
+    int actual=m->ecache[layer][i].eid;
+    if(actual!=eid && (!include_reserved||actual!=-(eid+2))) return NULL;
+    return &m->ecache[layer][i];
+}
+
+static int ecache_key(const ESlot *s){
+    if(s->eid>=0) return s->eid;
+    if(s->eid<=-2) return -(s->eid+2);             /* PILOT reservation -(eid+2) */
+    return -1;
+}
+
+static void ecache_unindex(Model *m,int layer,ESlot *s){
+    int eid=ecache_key(s), i=(int)(s-m->ecache[layer]);
+    if(eid>=0&&eid<m->c.n_experts&&m->ecache_slot_by_expert&&
+       m->ecache_slot_by_expert[layer]&&m->ecache_slot_by_expert[layer][eid]==i)
+        m->ecache_slot_by_expert[layer][eid]=-1;
+}
+
+static void ecache_publish(Model *m,int layer,ESlot *s,int eid){
+    ecache_unindex(m,layer,s);
+    s->eid=eid;
+    if(eid>=0&&eid<m->c.n_experts&&m->ecache_slot_by_expert&&
+       m->ecache_slot_by_expert[layer])
+        m->ecache_slot_by_expert[layer][eid]=(int)(s-m->ecache[layer]);
+}
+
+static void ecache_reserve(Model *m,int layer,ESlot *s,int eid){
+    ecache_unindex(m,layer,s);
+    s->eid=-(eid+2);
+    if(eid>=0&&eid<m->c.n_experts&&m->ecache_slot_by_expert&&
+       m->ecache_slot_by_expert[layer])
+        m->ecache_slot_by_expert[layer][eid]=(int)(s-m->ecache[layer]);
+}
+
+static void ecache_hide(Model *m,int layer,ESlot *s){
+    ecache_unindex(m,layer,s);
+    s->eid=-1;
+}
+
+/* One precedence rule for every routed-expert consumer. Direct tmpfs views are
+ * immutable and win over any stale/duplicate pin or LRU entry. Pin and LRU
+ * probes use the constant-time indices above. `touch` is used only by the
+ * actual MoE resolver: routing and prefetch probes do not alter recency or
+ * RAMMAP call telemetry. */
+static ESlot *expert_resident_slot(Model *m, int layer, int eid, int touch){
+    if(layer<0||layer>m->c.n_layers||eid<0||eid>=m->c.n_experts) return NULL;
+    ESlot *s=rammap_slot(m,layer,eid);
+    if(s){ if(touch) m->rammap_calls++; return s; }
+    s=pin_indexed(m,layer,eid);
+    if(s) return s;
+    s=ecache_indexed(m,layer,eid,0);
+    if(s&&touch) s->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+    return s;
+}
+
 static int expert_is_resident(Model *m, int layer, int eid){
     return expert_resident_slot(m,layer,eid,0)!=NULL;
 }
-static int expert_slot_is_pinned(const Model *m, int layer, const ESlot *slot){
-    if(!slot || !m->pin || !m->npin || layer<0 || layer>m->c.n_layers) return 0;
-    const ESlot *P=m->pin[layer];
-    for(int z=0;z<m->npin[layer];z++) if(slot==&P[z]) return 1;
-    return 0;
+
+/* Pilot de-duplication also treats an indexed negative reservation as present;
+ * ordinary consumers must never receive that not-yet-loaded slot. */
+static int expert_is_resident_or_reserved(Model *m,int layer,int eid){
+    if(layer<0||layer>m->c.n_layers||eid<0||eid>=m->c.n_experts) return 0;
+    if(rammap_slot(m,layer,eid)||pin_indexed(m,layer,eid)) return 1;
+    return ecache_indexed(m,layer,eid,1)!=NULL;
+}
+
+static int expert_slot_is_pinned(Model *m,int layer,const ESlot *slot){
+    return slot&&pin_indexed(m,layer,slot->eid)==slot;
 }
 
 /* I loop di selezione top-K partono da best=-1 e lo usano come indice appena il
@@ -5553,7 +5757,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                  * come il percorso router completo (riga ~3055), altrimenti elast/eaccess_clock
                  * si congelano a fine prefill e il tie-breaker LFRU di REPIN gira su punteggi
                  * stantii durante il decode su Metal. */
-                m->elast[layer][idxs[(int64_t)s*K+kk]]=++m->eaccess_clock;
+                uint32_t tick=__atomic_add_fetch(&m->eaccess_clock,1,__ATOMIC_RELAXED);
+                m->elast[layer][idxs[(int64_t)s*K+kk]]=tick;
             }
             for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
         }
@@ -5701,7 +5906,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->elast_dc[layer][idx[kk]]=++m->eaccess_clock_dc;
             }
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
-            m->elast[layer][idx[kk]]=++m->eaccess_clock;
+            uint32_t tick=__atomic_add_fetch(&m->eaccess_clock,1,__ATOMIC_RELAXED);
+            m->elast[layer][idx[kk]]=tick;
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
@@ -6009,6 +6215,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #ifdef COLI_VULKAN
                 if(vk_active && vk_reg_served(layer,eid)) served=1;   /* VK-tier-served at decode */
 #endif
+                /* expert_prefetch owns the composite RAMMAP/pin/LRU guard so
+                 * every caller gets the same rule without a duplicate probe. */
                 if(!served) expert_prefetch(m,layer,eid);
             }
         }
@@ -6553,7 +6761,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                          if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                          continue; }
                      dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+              ecache_unindex(m,layer,dst);
+              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
+              ecache_publish(m,layer,dst,dst->eid);
+              dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
@@ -6727,6 +6938,11 @@ static void la_predict(Model *m, int target, const float *h, int kind){
 static struct { _Atomic int l,e; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. */
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
+#ifdef COLI_PILOT_HANDOFF_TEST
+/* Deterministic regression hook: production builds compile this out.  Tests
+ * pause after payload completion, before the mutex-protected identity publish. */
+static void (*g_pilot_handoff_test_hook)(Model *,int,int,ESlot *);
+#endif
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
@@ -6736,14 +6952,14 @@ static void pilot_realload(Model *m, int layer, int eid){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
+    /* Gia' residente in RAMMAP, pin o ecache, oppure gia' prenotato? */
 #ifdef COLI_VULKAN
     if(vk_reg_served(layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }   /* VK-tier-served: no load */
 #endif
-    if(expert_is_resident(m,layer,eid)){                 /* RAM map, pin, or ecache: nothing to load */
+    if(expert_is_resident_or_reserved(m,layer,eid)){
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
     ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];   /* dedup contro residenti E prenotazioni in volo -(eid+2) */
-    for(int z=0;z<nn;z++) if(Sl[z].eid==-(eid+2)){ pthread_mutex_unlock(&g_pilot_mx); return; }
     /* SPMC (PILOT_WORKERS>1): scegli lo slot sotto lock e MARCALO prenotato prima di
      * rilasciarlo, cosi' gli altri worker non lo scelgono come vittima ne' ricaricano
      * lo stesso eid. Stesso schema del ramo URING (prenotazione visibile -(eid+2),
@@ -6762,13 +6978,14 @@ static void pilot_realload(Model *m, int layer, int eid){
         if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
             int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
-                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                uint32_t clock=__atomic_load_n(&m->eaccess_clock,__ATOMIC_RELAXED);
+                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],clock);
                 if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                                             pthread_mutex_unlock(&g_pilot_mx); return; } } }
     }
     ESlot *dst=&Sl[slot];
-    dst->eid=-(eid+2);                                  /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono (isnew) */
+    ecache_reserve(m,layer,dst,eid);                    /* prenotazione VISIBILE: dedup + vittima degli altri worker la vedono */
     (void)isnew;
     dst->used=(uint64_t)-1;                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
                                                          * (chiude la finestra eid-reale/used-vecchio: uno snapshot di eclock si sarebbe potuto
@@ -6776,10 +6993,17 @@ static void pilot_realload(Model *m, int layer, int eid){
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, concorrente fra worker (come i PIPE demand); fatal=0: una speculazione fallita NON uccide il server; demand=0: speculative, never classified. Al successo expert_load setta dst->eid=eid. */
+    /* Load the payload outside the mutex without publishing the real identity.
+     * Readers under g_pilot_mx continue to see the negative reservation until
+     * ecache_publish() performs the sole identity handoff below. */
+    int rc=expert_load_mode(m,layer,eid,dst,0,0,0);
+#ifdef COLI_PILOT_HANDOFF_TEST
+    if(g_pilot_handoff_test_hook) g_pilot_handoff_test_hook(m,layer,eid,dst);
+#endif
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
+        ecache_publish(m,layer,dst,eid);
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
@@ -6789,7 +7013,7 @@ static void pilot_realload(Model *m, int layer, int eid){
          * mai evictable: ogni speculazione fallita (disco lento, errore I/O transitorio)
          * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
          * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
-        dst->eid=-1;
+        ecache_hide(m,layer,dst);
         dst->used=0;
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
@@ -6818,9 +7042,8 @@ static void pilot_uring_batch(Model *m){
 #ifdef COLI_VULKAN
         if(vk_reg_served(layer,eid)) found=1;               /* VK-tier-served: no load */
 #endif
-        if(!found) found=expert_is_resident(m,layer,eid);
+        if(!found) found=expert_is_resident_or_reserved(m,layer,eid);
         ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-        for(int z=0;z<nn && !found;z++) if(Sl[z].eid==-(eid+2)) found=1;   /* URING reservation sentinel (the ==eid half moved into expert_is_resident) */
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
@@ -6831,18 +7054,19 @@ static void pilot_uring_batch(Model *m){
         if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
             int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
-                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                uint32_t clock=__atomic_load_n(&m->eaccess_clock,__ATOMIC_RELAXED);
+                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],clock);
                 if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                                             pthread_mutex_unlock(&g_pilot_mx); continue; } } }
         ESlot *dst=&Sl[slot];
-        dst->eid=-(eid+2);                         /* visible reservation; never considered resident/evictable */
+        ecache_reserve(m,layer,dst,eid);           /* visible reservation; never considered resident/evictable */
         g_pilot_inflight[layer]++;
         pthread_mutex_unlock(&g_pilot_mx);
 
         int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0);
         if(li<0){
-            pthread_mutex_lock(&g_pilot_mx); dst->eid=-1; g_pilot_inflight[layer]--;
+            pthread_mutex_lock(&g_pilot_mx); ecache_hide(m,layer,dst); g_pilot_inflight[layer]--;
             pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue;
         }
@@ -6861,11 +7085,11 @@ static void pilot_uring_batch(Model *m){
         int rc=uring_finalize_load(&g_ub_pilot,d->li,0);
         pthread_mutex_lock(&g_pilot_mx);
         if(rc==0){
-            d->dst->eid=d->eid;
+            ecache_publish(m,d->layer,d->dst,d->eid);
             d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
         }else{
-            d->dst->eid=-1;
+            ecache_hide(m,d->layer,d->dst);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
         }
         g_pilot_inflight[d->layer]--;
@@ -6912,7 +7136,10 @@ static void *pilot_worker(void *arg){
         int l,e;                                        /* blocking / hint path: SPMC, one item per worker */
         if(!pilot_ring_claim(&l,&e)){ usleep(200); continue; }
         if(g_pilot_real) pilot_realload(pilot_m, l, e); /* QD=N: N concurrent preads instead of 1 */
-        else             expert_prefetch(pilot_m, l, e);
+        /* Hint producers already filtered RAMMAP/pin/LRU under g_pilot_mx.
+         * Re-reading mutable residency indices here races demand promotion and
+         * REPIN; a post-enqueue transition only makes this advice redundant. */
+        else             expert_prefetch_unchecked(pilot_m, l, e);
     }
     return NULL;
 }
@@ -6992,10 +7219,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
 #ifdef COLI_VULKAN
             if(vk_reg_served(lt,best)) found=1;             /* VK-tier-served: no load */
 #endif
-            if(!found) found=expert_is_resident(m,lt,best);
-            ESlot *Sl=m->ecache[lt];
-            for(int z=0;z<m->ecn[lt] && !found;z++)
-                if(Sl[z].eid==-(best+2)) found=1;   /* URING sentinel (==best moved into expert_is_resident) */
+            if(!found) found=expert_is_resident_or_reserved(m,lt,best);
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -7056,10 +7280,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 #ifdef COLI_VULKAN
             if(vk_reg_served(lnext,best)) found=1;          /* VK-tier-served: no load */
 #endif
-            if(!found) found=expert_is_resident(m,lnext,best);
-            ESlot *Sl=m->ecache[lnext];
-            for(int z=0;z<m->ecn[lnext] && !found;z++)
-                if(Sl[z].eid==-(best+2)) found=1;   /* URING sentinel (==best moved into expert_is_resident) */
+            if(!found) found=expert_is_resident_or_reserved(m,lnext,best);
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -7465,7 +7686,8 @@ static void kv_alloc(Model *m, int max_t){
         for(int i=0;i<NR;i++){
             k->Lc8[i]=malloc((size_t)max_t*lb);
             k->Rc8[i]=malloc((size_t)max_t*rb);
-            k->Lsc[i]=falloc(max_t); k->Rsc[i]=falloc(max_t);
+            k->Lsc[i]=falloc((int64_t)max_t*(g_kv8?coli_kv8_nscale(c->kv_lora,g_kv8_gs):1));
+            k->Rsc[i]=falloc(max_t);
             if(!k->Lc8[i]||!k->Rc8[i]){fprintf(stderr,"OOM kv8\n");exit(1);}
         }
     } else
@@ -8688,7 +8910,7 @@ static void rss_guard(Model *m){
             }
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
             ESlot *s=&m->ecache[l][lru];
-            s->eid=-1;                                    /* nascosto: nessun hit/evict altrui */
+            ecache_hide(m,l,s);                            /* nascosto: nessun hit/evict altrui */
             int64_t sb=s->slab_cap + s->fslab_cap*4;
 #ifdef COLI_METAL
             if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -8744,9 +8966,7 @@ static void repin_pass_limit(Model *m,int limit){
         uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
 #ifdef COLI_CUDA
         if(cd[b].gpu_swap){
-            ESlot *hot=NULL;
-            for(int z=0;z<m->npin[cd[b].l];z++)
-                if(m->pin[cd[b].l][z].eid==cd[b].eid){hot=&m->pin[cd[b].l][z];break;}
+            ESlot *hot=pin_indexed(m,cd[b].l,cd[b].eid);
             if(!hot||hot->g.cuda_eligible) continue;
             double t0=now_s();
             QT *cq[3]={&s->g,&s->u,&s->d},*hq[3]={&hot->g,&hot->u,&hot->d};
@@ -8774,7 +8994,9 @@ static void repin_pass_limit(Model *m,int limit){
                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
 #endif
         double t0=now_s();
+        pin_unindex(m,cd[b].l,s);
         expert_load(m,cd[b].l,cd[b].eid,s,1,0);     /* disk -> RAM, same resident slot; demand=0: repin, never classified */
+        pin_index(m,cd[b].l,s);
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
@@ -9702,8 +9924,8 @@ static void vk_registry_fill(Model *m){
         if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
            && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
-        ESlot *src=NULL, *P=m->pin[layer];
-        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+        ESlot *src=pin_indexed(m,layer,eid);
+        if(src&&!src->slab) src=NULL;
         if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){   /* 0 = success (impl convention); demand=0: startup tier fill */
                 if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
                 if(loadfail>=64) break;                     /* disk trouble: stop burning time */
@@ -9744,8 +9966,8 @@ static void vk_registry_fill(Model *m){
             if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && coli_vk_mem_budget2(&u2,&b2)
                && b2-u2 < vkr2_reserve){ vkr2_stopped=1; break; }
             int layer=cand[i2].layer, eid=cand[i2].eid; tried2++;
-            ESlot *src=NULL, *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+            ESlot *src=pin_indexed(m,layer,eid);
+            if(src&&!src->slab) src=NULL;
             if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){
                     if(++loadfail>=64) break;
                     continue; } src=&tmp; }
@@ -10328,6 +10550,12 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
         for(int a=gpu_prefix;a<npin;a++)
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
         m->resident_bytes+=(int64_t)pin_range_bytes(m,r,gpu_prefix,npin);
+    }
+    /* Every startup load has completed. Publish the immutable hot-store map
+     * once; the session-local REPIN path maintains individual entries later. */
+    for(int a=0;a<npin;a++){
+        int l=r[a].l;
+        pin_index(m,l,&m->pin[l][slot_of[a]]);
     }
     double warm_b=pin_range_bytes(m,r,0,npin)-pin_host_released;
     if(warm_b<0.0) warm_b=0.0;
@@ -11530,7 +11758,13 @@ int main(int argc, char **argv){
         }
 #endif
         coli_fp8_lut_init();
-        fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM)\n");
+        { const char *gsv=getenv("KV8_GS"); g_kv8_gs = gsv?atoi(gsv):0; if(g_kv8_gs<0) g_kv8_gs=0; }
+        fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + %s scale (~3.9x less KV RAM)\n",
+                g_kv8_gs?"per-group":"per-row");
+        if(g_kv8_gs && (!getenv("KVSAVE")||atoi(getenv("KVSAVE")))){
+            fprintf(stderr,"[KV8] KV8_GS has no .coli_kv format yet: KV persistence disabled for this run\n");
+            setenv("KVSAVE","0",1);
+        }
     }
     /* KV_TQ=3|4: tier TurboQuant/PolarQuant (mutuamente esclusivo con KV8). CPU-only,
      * come KV8: si spegne dove i percorsi leggono righe f32. */

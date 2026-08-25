@@ -197,6 +197,12 @@ int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet *set,int expert,
                                  Dsv4CudaTensor **gate,Dsv4CudaTensor **up,Dsv4CudaTensor **down);
 int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet *set,Dsv4CudaTensor *sg,
                                      Dsv4CudaTensor *su,Dsv4CudaTensor *sd);
+/* Same upload on the device's aux stream: overlaps the compute stream (the
+ * double-buffer prefetch worker uses it), drained before returning. */
+int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet *set,int expert,
+        const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,
+        const uint8_t*dw,const uint8_t*ds,
+        Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down);
 int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *gate_weight,const uint8_t *gate_scale,
                                      const uint8_t *up_weight,const uint8_t *up_scale,

@@ -89,6 +89,14 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
 #define cudaMemsetAsync          hipMemsetAsync
+/* Device-side kernel abort (weight_at's undecodable-format backstop,
+ * backend_cuda.cu). CUDA's __trap() intrinsic has no HIP name-twin; HIP
+ * device code aborts via abort() -- the same mapping hipify applies. NVCC
+ * never sees this define, so the CUDA-side semantics the fmt trap test pins
+ * (kernel aborts, context poisoned) are untouched. Under HIP this makes the
+ * refusal COMPILE; its runtime behavior on AMD silicon is not verified by
+ * this repo's tests (same hardware caveat as the rest of this HIP arm). */
+#define __trap                   abort
 #else
 #include <cuda_runtime.h>
 #include <mma.h>

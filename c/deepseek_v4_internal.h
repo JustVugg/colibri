@@ -722,9 +722,10 @@ int coli_v4_resident_tier_plan(
 #include <stddef.h>
 #include <stdint.h>
 
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
+int coli_v4_head_cache_probe(const ColiSafetensorsIndex *index, uint64_t *bytes,
                              char *error, size_t error_size);
-int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
+int coli_v4_head_cache_load(ColiV4Engine *engine,
+                            const ColiSafetensorsIndex *index,
                             char *error, size_t error_size);
 uint64_t coli_v4_head_cache_bytes(const ColiV4Engine *engine);
 const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
@@ -745,6 +746,10 @@ typedef struct {
 } ColiDeepSeekV4RuntimeOptions;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
+
+/* engine open: seconds spent building target_index (printed by the auto
+ * store planner as the v4_open line). Defined in the engine unit. */
+extern double g_v4_open_index_seconds;
 
 #ifdef COLI_V4_GPU_TIER
 /* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the

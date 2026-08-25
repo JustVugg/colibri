@@ -1906,7 +1906,7 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
-def cap_for_arch(arch, cap):
+def cap_for_arch(arch, cap, env=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
     An absent cap (None) means different things across today's engines --
@@ -1928,6 +1928,17 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
+    # A measured profile records the exact argv cap used during calibration.
+    # The launcher passes it privately through the server process because cap
+    # is not an engine environment knob.  It remains below an explicit --cap
+    # in the precedence chain and is removed before the engine starts.
+    if env is not None:
+        try:
+            measured = int(env.get("COLI_PROFILE_CAP", ""))
+        except (TypeError, ValueError):
+            measured = 0
+        if measured >= 1:
+            return measured
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -2121,6 +2132,8 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        resolved_cap = cap_for_arch(arch, cap, child_env)
+        child_env.pop("COLI_PROFILE_CAP", None)
         try:
             ready_timeout = float(child_env.get("COLI_ENGINE_READY_TIMEOUT",
                                                 ENGINE_READY_TIMEOUT))
@@ -2129,7 +2142,7 @@ class Engine:
         if not math.isfinite(ready_timeout) or not 0 < ready_timeout <= 86400:
             raise ValueError("COLI_ENGINE_READY_TIMEOUT must be between 0 and 86400 seconds")
         command = list(command_prefix or ()) + [
-            str(executable), str(cap_for_arch(arch, cap))
+            str(executable), str(resolved_cap)
         ]
         self.process = self._spawn_process(
             command, child_env=child_env, stderr=stderr,

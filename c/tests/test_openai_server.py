@@ -1452,6 +1452,26 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
         self.assertEqual(cap_for_arch("glm", 0), 0)
 
+    def test_profile_cap_is_below_explicit_cap_and_above_implicit_default(self):
+        profiled = {"COLI_PROFILE_CAP": "24"}
+        self.assertEqual(cap_for_arch("inkling", None, profiled), 24)
+        self.assertEqual(cap_for_arch("inkling", 7, profiled), 7)
+        self.assertEqual(cap_for_arch("inkling", None,
+                                      {"COLI_PROFILE_CAP": "invalid"}), 8)
+
+    def test_engine_consumes_profile_cap_without_leaking_private_env(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        model = self._model("inkling")
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine("custom-engine", model,
+                            env={"COLI_PROFILE_CAP": "24", "KEEP": "yes"})
+            engine.close()
+        command = popen.call_args[0][0]
+        child_env = popen.call_args[1]["env"]
+        self.assertEqual(command, ["custom-engine", "24"])
+        self.assertNotIn("COLI_PROFILE_CAP", child_env)
+        self.assertEqual(child_env["KEEP"], "yes")
+
     def test_model_arch_reads_model_type(self):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
