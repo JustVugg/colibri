@@ -9814,11 +9814,31 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                     }
 #endif
                     if(uploaded){
+                        /* VRAM, not logical bytes (#687). The allocator rounds
+                         * every cudaMalloc up and nothing was charging the
+                         * difference, so `remaining` drifted optimistic by a
+                         * term that GREW with the tier: an int4-g64 scale array
+                         * is 0.75 MiB and lands in 1 MiB, three per expert, so
+                         * 0.75 MiB per expert uncounted (measured on sm_86;
+                         * #687 measured 0.741 +/- 0.019 on H100/H200 from the
+                         * other direction). At 6,235 experts that is 4.6 GB
+                         * against a flat 2 GB reserve, which is why auto could
+                         * claim the card to within 4 MiB and then fail every
+                         * lazy dense upload afterwards.
+                         *
+                         * m->gpu_expert_bytes stays LOGICAL: it is reported as
+                         * the tier's size and compared against `budget`, and
+                         * quoting padding to the user as model bytes would
+                         * trade one wrong number for another. */
                         int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                        int64_t vram  =(int64_t)coli_cuda_tensor_vram(s->g.cuda)
+                                      +(int64_t)coli_cuda_tensor_vram(s->u.cuda)
+                                      +(int64_t)coli_cuda_tensor_vram(s->d.cuda);
+                        if(vram<actual) vram=actual;
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        remaining[best]-=vram;   placed_b[best]+=actual; placed_n[best]++;
                         placed_w[best]+=(double)r[a].c;
                         if(g_cuda_release_host){ expert_host_release(m,s); pin_host_released+=(double)need; }
                         placed=1;

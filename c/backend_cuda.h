@@ -187,6 +187,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,
 
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
+COLI_CUDA_DLLEXPORT size_t coli_cuda_alloc_footprint(size_t bytes);
+COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
 /* Replace a resident tensor's contents without reallocating its device slot. */
