@@ -1231,6 +1231,27 @@ glm53$(EXE): glm53.c decode_batch.h pin_pool.h cli_args.h st.h json.h stop_ids.h
 kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h pin_pool.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
+GEMMA4_SRCS = gemma4_backend.c gemma4_gguf.c gemma4_model.c gemma4_sampling.c gemma4_tokenizer.c gemma4_tools.c gemma4_vision.c gemma4_cuda_stub.c
+GEMMA4_HDRS = gemma4_backend.h gemma4_gguf.h gemma4_model.h gemma4_sampling.h gemma4_tokenizer.h gemma4_tools.h gemma4_vision.h gemma4_cuda.h model.h json.h
+GEMMA4_PNG_CFLAGS  := $(if $(IS_WIN),,$(shell pkg-config --cflags libpng 2>/dev/null))
+GEMMA4_PNG_LIBS    := $(if $(IS_WIN),,$(shell pkg-config --libs libpng 2>/dev/null))
+GEMMA4_JPEG_CFLAGS := $(if $(IS_WIN),,$(shell pkg-config --cflags libjpeg 2>/dev/null))
+GEMMA4_JPEG_LIBS   := $(if $(IS_WIN),,$(shell pkg-config --libs libjpeg 2>/dev/null))
+GEMMA4_CODEC_FLAGS := $(if $(GEMMA4_PNG_LIBS),-DCOLI_GEMMA4_LIBPNG=1 $(GEMMA4_PNG_CFLAGS),) \
+                      $(if $(GEMMA4_JPEG_LIBS),-DCOLI_GEMMA4_LIBJPEG=1 $(GEMMA4_JPEG_CFLAGS),)
+GEMMA4_CPPFLAGS = -I.
+GEMMA4_LIBS = $(if $(IS_WIN),-lwindowscodecs -lole32,$(GEMMA4_PNG_LIBS) $(GEMMA4_JPEG_LIBS))
+
+gemma4$(EXE): gemma4.c gemma4_backend.h gemma4_model.h gemma4_sampling.h \
+	gemma4_tokenizer.h gemma4_tools.h gemma4_vision.h grammar.h schema_gbnf.h \
+	$(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) gemma4.c $(GEMMA4_SRCS) -o gemma4$(EXE) $(LDFLAGS) $(GEMMA4_LIBS)
+
+ifneq ($(EXE),)
+.PHONY: gemma4
+gemma4: gemma4$(EXE)
+endif
+
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
@@ -2031,6 +2052,26 @@ tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_ker
 # devbox that would otherwise always pick the AVX2 tier.
 tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_gemma4$(EXE): tests/test_gemma4.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
+
+tests/test_gemma4_model$(EXE): tests/test_gemma4_model.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
+
+tests/test_gemma4_attention$(EXE): tests/test_gemma4_attention.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
+
+tests/test_gemma4_tokenizer$(EXE): tests/test_gemma4_tokenizer.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
+
+tests/test_gemma4_tools$(EXE): tests/test_gemma4_tools.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
+
+tests/test_gemma4_sampling$(EXE): tests/test_gemma4_sampling.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
+
+tests/test_gemma4_vision$(EXE): tests/test_gemma4_vision.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
 
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
