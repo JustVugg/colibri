@@ -74,6 +74,7 @@ class FamilyDescriptor:
     capabilities: FamilyCapabilities
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
+    runtime_available: bool = True
     tune_prompt_template: str = "{prompt}"
 
 
@@ -393,6 +394,62 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _glm53_geometry(config, context, _model_dir):
+    """GLM-5.3-Flash: KDA/DSA hybrid with mHC and one MTP expert row.
+
+    The 45 text layers contain 34 recurrent KDA layers and 11 DSA layers.
+    KDA owns a fixed [heads, head_dim, head_dim] fp32 recurrence plus three
+    conv4 histories; DSA owns the growing MLA latent/index cache.  The MTP row
+    has routed experts but no independent attention state.
+    """
+    family = "glm53_flash"
+    layers = _required_int(config, "num_hidden_layers", family)
+    experts = _required_int(config, "n_routed_experts", family)
+    hidden = _required_int(config, "hidden_size", family)
+    heads = _required_int(config, "num_attention_heads", family)
+    q_lora = _required_int(config, "q_lora_rank", family)
+    kv_lora = _required_int(config, "kv_lora_rank", family)
+    qk_nope = _required_int(config, "qk_nope_head_dim", family)
+    qk_rope = _optional_int(config, "qk_rope_head_dim", 0)
+    value = _required_int(config, "v_head_dim", family)
+    index_dim = _required_int(config, "index_head_dim", family)
+    hc_mult = _required_int(config, "hc_mult", family)
+
+    kinds = config.get("layer_types")
+    if not isinstance(kinds, list) or len(kinds) != layers:
+        raise ValueError(f"{family}: layer_types must match num_hidden_layers")
+    n_kda = sum(kind == "linear_attention" for kind in kinds)
+    n_dsa = sum(kind == "deepseek_sparse_attention" for kind in kinds)
+    if n_kda + n_dsa != layers or not n_kda or not n_dsa:
+        raise ValueError(f"{family}: layer_types must contain KDA and DSA layers only")
+
+    linear = config.get("linear_attn_config")
+    if not isinstance(linear, dict):
+        raise ValueError(f"{family}: missing linear_attn_config")
+    kda_heads = _required_int(linear, "num_heads", family)
+    kda_dim = _required_int(linear, "head_dim", family)
+    conv_k = _required_int(linear, "short_conv_kernel_size", family, 2)
+    listed = linear.get("kda_layers")
+    if (not isinstance(listed, list) or
+            sorted(v for v in listed if isinstance(v, int)) !=
+            [i for i, kind in enumerate(kinds) if kind == "linear_attention"]):
+        raise ValueError(f"{family}: linear_attn_config.kda_layers disagrees with layer_types")
+
+    kda_proj = kda_heads * kda_dim
+    fixed = n_kda * (kda_heads * kda_dim * kda_dim +
+                     3 * kda_proj * (conv_k - 1)) * 4
+    # The DSA indexer persists packed [key, gate_scores, valid] rows, i.e.
+    # 2*index_dim+1 values in addition to the MLA latent cache.
+    state = n_dsa * context * (kv_lora + qk_rope + 2 * index_dim + 1) * 4
+
+    ws_kda = context * (6 * kda_proj + kda_dim + hidden) * 4
+    q_width = heads * (qk_nope + qk_rope)
+    ws_dsa = context * (q_lora + q_width + kv_lora + qk_rope +
+                        2 * heads * value) * 4
+    ws_mhc = context * hc_mult * hidden * 4
+    return PlannerGeometry(state, fixed, max(ws_kda, ws_dsa, ws_mhc), experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -401,6 +458,9 @@ _KIMI_EXPERT = re.compile(
     r"experts\.(\d+)\."
 )
 _V4_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
+_GLM53_EXPERT = re.compile(
+    r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+)
 _INKLING_EXPERT = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\."
     r"(?:gate_up_proj|down_proj)(?:\.|$)"
@@ -456,6 +516,31 @@ FAMILIES = (
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>",
+    ),
+    FamilyDescriptor(
+        id="glm53_flash",
+        model_types=("glm5_next", "glm5_next_text"),
+        display_name="GLM-5.3-Flash",
+        display_scale="320B",
+        engine_artifact="glm53_flash",
+        engine_aliases=(),
+        engine_group="glm53_flash",
+        internal_arch="glm53_flash",
+        build_target="glm53_flash",
+        process_names=("glm53_flash",),
+        default_model_id="glm-5.3-flash-colibri",
+        cli_adapter="glm53_flash",
+        gateway_adapter="glm53_flash",
+        planner_id="glm53_kda_dsa_mhc",
+        planner_geometry=_glm53_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM53_EXPERT),
+        config_section="text_config",
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "GLM53_MAXT"),
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=False,
+        has_cli_adapter=False,
+        runtime_available=False,
     ),
     FamilyDescriptor(
         id="inkling",
@@ -603,6 +688,7 @@ def _build_registry(families):
                 (not callable(family.planner_geometry) and
                   not family.planner_unsupported_reason) or
                 not callable(family.expert_inventory) or
+                not isinstance(family.runtime_available, bool) or
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
@@ -737,6 +823,7 @@ def public_metadata(family):
         "cli_adapter": family.cli_adapter,
         "gateway_adapter": family.gateway_adapter,
         "planner_id": family.planner_id,
+        "runtime_available": family.runtime_available,
         "limits": {
             "default_context": family.limits.default_context,
             "max_context": family.limits.max_context,

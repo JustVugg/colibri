@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "release_policy": "all_registered_families",
+  "release_policy": "all_runnable_families",
   "families": [
     {
       "family_id": "glm",

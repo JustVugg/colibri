@@ -1,5 +1,6 @@
 import json
 import re
+import struct
 import tempfile
 import unittest
 from dataclasses import replace
@@ -150,6 +151,117 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.fixed_state_bytes, 6 * (8 * 8 * 8 + 128 * 3) * 4)
         for model_type in ("qwen2", "qwen3_moe", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
+
+    def test_glm53_official_shape_models_kda_dsa_mhc_and_mtp_inventory(self):
+        config = {
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text", "num_hidden_layers": 45,
+                "hidden_size": 4096, "num_attention_heads": 64,
+                "q_lora_rank": 1536, "kv_lora_rank": 512,
+                "qk_nope_head_dim": 256, "qk_rope_head_dim": 0,
+                "v_head_dim": 256, "index_head_dim": 128, "hc_mult": 4,
+                "n_routed_experts": 288, "num_nextn_predict_layers": 1,
+                "layer_types": (["linear_attention"] * 3 +
+                                ["deepseek_sparse_attention"]) * 11 +
+                               ["linear_attention"],
+                "linear_attn_config": {
+                    "num_heads": 64, "head_dim": 128,
+                    "short_conv_kernel_size": 4,
+                    "kda_layers": [i for i in range(45) if (i + 1) % 4],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            resolved = resolve_model(root)
+        self.assertEqual(resolved.descriptor.id, "glm53_flash")
+        self.assertFalse(resolved.descriptor.runtime_available)
+        geometry = planner_geometry(resolved, 4096)
+        self.assertEqual(geometry.configured_experts, 288)
+        # 34 KDA recurrences + conv4 histories are fixed; 11 DSA latent/index
+        # caches grow with context. MTP contributes experts, not attention state.
+        self.assertEqual(geometry.fixed_state_bytes,
+                         34 * (64 * 128 * 128 + 3 * 8192 * 3) * 4)
+        self.assertEqual(geometry.context_state_bytes,
+                         11 * 4096 * (512 + 2 * 128 + 1) * 4)
+        self.assertEqual(geometry.workspace_bytes,
+                         4096 * (6 * 8192 + 128 + 4096) * 4)
+        self.assertEqual(
+            resolved.descriptor.expert_inventory(
+                "model.language_model.layers.45.mlp.experts.287.down_proj.weight",
+                123, resolved.family_config),
+            ((45, 287, 123),))
+
+    def test_glm53_rejects_disagreeing_kda_layer_contract(self):
+        config = {
+            "num_hidden_layers": 4, "hidden_size": 64,
+            "num_attention_heads": 2, "q_lora_rank": 8,
+            "kv_lora_rank": 8, "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 0, "v_head_dim": 8,
+            "index_head_dim": 4, "hc_mult": 4, "n_routed_experts": 8,
+            "layer_types": ["linear_attention"] * 3 +
+                           ["deepseek_sparse_attention"],
+            "linear_attn_config": {"num_heads": 2, "head_dim": 8,
+                                   "short_conv_kernel_size": 4,
+                                   "kda_layers": [1, 2, 3]},
+        }
+        family = next(f for f in FAMILIES if f.id == "glm53_flash")
+        resolved = type("R", (), {"descriptor": family,
+                                  "family_config": config, "model_dir": "."})()
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            planner_geometry(resolved, 32)
+
+    def test_glm53_doctor_plans_but_marks_runtime_pending(self):
+        from doctor import run_doctor
+
+        config = {
+            "model_type": "glm5_next", "text_config": {
+                "model_type": "glm5_next_text", "num_hidden_layers": 4,
+                "hidden_size": 64, "num_attention_heads": 2,
+                "q_lora_rank": 8, "kv_lora_rank": 8,
+                "qk_nope_head_dim": 8, "qk_rope_head_dim": 0,
+                "v_head_dim": 8, "index_head_dim": 4, "hc_mult": 4,
+                "n_routed_experts": 8,
+                "layer_types": ["linear_attention"] * 3 +
+                               ["deepseek_sparse_attention"],
+                "linear_attn_config": {"num_heads": 2, "head_dim": 8,
+                                       "short_conv_kernel_size": 4,
+                                       "kda_layers": [0, 1, 2]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+            # One complete expert spread across three tensors is sufficient to
+            # prove the nested official prefix reaches the inventory path.
+            tensors = [
+                ("model.language_model.embed_tokens.weight", 64),
+                ("model.language_model.layers.3.mlp.experts.0.gate_proj.weight", 32),
+                ("model.language_model.layers.3.mlp.experts.0.up_proj.weight", 32),
+                ("model.language_model.layers.3.mlp.experts.0.down_proj.weight", 32),
+                ("model.language_model.layers.45.mlp.experts.0.gate_proj.weight", 32),
+            ]
+            offset, header, payload = 0, {}, b""
+            for name, size in tensors:
+                header[name] = {"dtype": "U8", "shape": [size],
+                                "data_offsets": [offset, offset + size]}
+                payload += b"\0" * size
+                offset += size
+            raw = json.dumps(header).encode()
+            (root / "model.safetensors").write_bytes(
+                struct.pack("<Q", len(raw)) + raw + payload)
+            report = run_doctor(
+                root, engine_path=root / "glm53_flash",
+                available_memory=16_000_000_000, available_disk=100_000_000_000,
+                gpus=[], linkage={"linked": False, "missing": False})
+        checks = {item["id"]: item for item in report["checks"]}
+        self.assertEqual(checks["model.family"]["status"], "pass")
+        self.assertEqual(checks["engine.binary"]["status"], "skip")
+        self.assertEqual(checks["model.shards"]["status"], "pass")
+        self.assertEqual(report["plan"]["model"]["family_id"], "glm53_flash")
 
     def test_minimax_fixture_can_share_colibri_without_becoming_glm(self):
         config = {
@@ -834,6 +946,7 @@ class FamilyRegistryTest(unittest.TestCase):
         prompt = "hello {world}"
         expected = {
             "glm": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
+            "glm53_flash": "hello {world}",
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
@@ -906,6 +1019,10 @@ class FamilyRegistryTest(unittest.TestCase):
         install_prerequisites = install_rule.group(1).split("#", 1)[0]
         for family in FAMILIES:
             with self.subTest(family=family.id):
+                if not family.runtime_available:
+                    self.assertFalse(family.has_gateway_adapter)
+                    self.assertFalse(family.has_cli_adapter)
+                    continue
                 self.assertRegex(
                     makefile,
                     rf"(?m)^{re.escape(family.build_target)}(?:\$\(EXE\))?:")

@@ -71,6 +71,8 @@ class LauncherDispatchTest(unittest.TestCase):
         """Two families must not resolve to the same binary. That is the shape
         the bug took: everything unrecognised quietly became the GLM engine."""
         for family in all_families():
+            if not family.runtime_available:
+                continue
             model_type = family.model_types[0]
             with self.subTest(model_type=model_type):
                 engine = os.path.basename(

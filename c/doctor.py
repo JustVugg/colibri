@@ -495,7 +495,12 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         engine_ok = engine.is_file()
     else:
         engine_ok = engine.is_file() and os.access(engine, os.X_OK)
-    if engine_error:
+    runtime_pending = resolved is not None and not resolved.descriptor.runtime_available
+    if runtime_pending:
+        checks.append(_check("engine.binary", "skip",
+                             f"{resolved.descriptor.display_name} runtime is not implemented yet",
+                             path=str(engine), family_id=resolved.descriptor.id))
+    elif engine_error:
         checks.append(_check("engine.binary", "fail", str(engine_error), path=str(engine)))
     elif engine_ok:
         unresolved = missing_shared_libraries(engine)
@@ -519,7 +524,10 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         wanted = set(gpu_indices)
         selected_gpus = [gpu for gpu in detected_gpus if gpu["index"] in wanted]
 
-    if gpu_indices == []:
+    if runtime_pending:
+        checks.append(_check("accelerator.gpu", "skip",
+                             "accelerator support follows the CPU text runtime"))
+    elif gpu_indices == []:
         checks.append(_check("accelerator.gpu", "skip", "GPU use was explicitly disabled"))
     elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
         checks.append(_check("accelerator.gpu", "fail", "one or more requested GPUs were not detected",

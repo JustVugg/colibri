@@ -313,7 +313,8 @@ class PersistentDatapointTest(unittest.TestCase):
     def test_every_registered_family_has_the_shared_persistent_adapter(self):
         expected = {"glm", "inkling", "kimi", "olmoe", "qwen36", "deepseek_v4"}
         self.assertTrue(expected.issubset({family.id for family in FAMILIES}))
-        self.assertTrue(all(family.has_gateway_adapter for family in FAMILIES))
+        self.assertTrue(all(family.has_gateway_adapter for family in FAMILIES
+                            if family.runtime_available))
 
 
 class EvictCacheSpaceTest(unittest.TestCase):

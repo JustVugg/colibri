@@ -20,9 +20,10 @@ class SegmentConformanceManifestTest(unittest.TestCase):
     def test_is_all_registered_families_gate(self):
         self.assertEqual(self.manifest["version"], 1)
         self.assertEqual(
-            self.manifest["release_policy"], "all_registered_families")
+            self.manifest["release_policy"], "all_runnable_families")
         manifest_ids = [entry["family_id"] for entry in self.entries]
-        registry_ids = [family.id for family in FAMILIES]
+        registry_ids = [family.id for family in FAMILIES
+                        if family.runtime_available]
         self.assertEqual(manifest_ids, registry_ids)
         self.assertEqual(len(manifest_ids), len(set(manifest_ids)))
 
