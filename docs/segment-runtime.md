@@ -14,9 +14,10 @@ The ABI is deliberately separate from every model's internal structs:
   activations through `coli_segment_run`, and can stream snapshots for
   migration or recovery.
 
-No engine adapter is registered by this initial API change, so existing CLI,
-server and model behavior is unchanged. Adapters are added and validated per
-model family in later changes.
+All six model families have engine-owned CPU adapters, but no ordinary CLI or
+server links or registers them. A Segment host opts in by linking the dedicated
+adapter objects and calling the explicit registration functions. Existing
+standalone initialization and inference therefore remain unchanged.
 
 ## Lifecycle
 
@@ -49,6 +50,28 @@ that class.
 weights outside the requested range. Callers must not publish range-native
 residency when this bit is absent.
 
+## Real adapters
+
+`c/segment_adapters.h` exposes explicit registration for GLM-5.2, Inkling,
+Kimi K3, OLMoE, Qwen3.6 and DeepSeek V4. The adapters retain model weights in
+the engine and conversation state in isolated sessions:
+
+| Adapter | Boundary/state contract |
+| --- | --- |
+| GLM-5.2 | hidden activations; MLA latent and DSA index caches |
+| Inkling | hidden activations; global/sliding-ring KV and four conv rings |
+| Kimi K3 | hidden plus every AttnRes block residual; KDA, conv, MLA and DSA |
+| OLMoE | hidden activations and conventional KV |
+| Qwen3.6 | hidden activations; attention KV, DeltaNet recurrent and conv state |
+| DeepSeek V4 | expanded `hc_mult * hidden` mHC state; window/compressed attention, compressor and indexer |
+
+The current adapter build advertises CPU only. This is intentional capability
+truthfulness, not a limitation of the ABI: GPU flags will be added per engine
+only when the corresponding Colibri backend is executed by the adapter.
+`make -C c segment-adapters` builds all six together and verifies that their
+identities register in one runtime. They are never pulled into `colibri`,
+`inkling`, `kimi_k3`, `olmoe`, `qwen36` or `deepseek_v4` by that target.
+
 ## Run contract
 
 Input and output contain exactly `rows * state_width` values in the advertised
@@ -70,8 +93,8 @@ restore.
 
 ## All-family conformance gate
 
-`tests/test_segment_conformance` keeps the ABI universal before model adapters
-are connected. It registers six deterministic, stateful fixtures matching all
+`tests/test_segment_conformance` keeps the ABI universal independently of
+model files. It registers six deterministic, stateful fixtures matching all
 families in `family_registry.py`:
 
 | Family | Remote state represented by the fixture |
@@ -99,6 +122,23 @@ fixture alone must never be advertised as model support.
 
 `tests/segment_conformance_manifest.json` binds this matrix to the authoritative
 family registry. Adding a future Colibri family without adding its Segment
-state and oracle entry fails the Python suite. Five current families have a
-generated tiny checkpoint; OLMoE's existing oracle uses its real checkpoint and
-is labelled accordingly rather than being presented as a tiny-model result.
+state and oracle entry fails the Python suite.
+
+The second gate, `tests/test_segment_adapters_real`, runs actual model math. For
+each family it compares one full range with two chained ranges, checks isolated
+sessions, continues after snapshot/restore, and proves a corrupt restore is
+transactional. Tiny checkpoints come from the existing GLM, Inkling, Kimi,
+Qwen and DeepSeek generators plus `tools/make_olmoe_tiny.py`; Qwen and OLMoE
+are passed through their production Colibri converters before the test.
+
+Run the complete gate with the six generated container paths:
+
+```sh
+make -C c segment-adapters-real \
+  GLM_SEGMENT_MODEL=/path/to/glm_tiny \
+  INKLING_SEGMENT_MODEL=/path/to/tiny_inkling \
+  KIMI_SEGMENT_MODEL=/path/to/kimi_k3_tiny \
+  OLMOE_SEGMENT_MODEL=/path/to/olmoe_merged_tiny \
+  QWEN_SEGMENT_MODEL=/path/to/qwen36_converted_tiny \
+  DEEPSEEK_SEGMENT_MODEL=/path/to/deepseek_v4_tiny
+```

@@ -30,7 +30,8 @@ class FakeEngine:
         self.prompts = []
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None,
+                 on_tool=None):
         self.prompts.append(prompt)
         self.emitted = 0
         for chunk in self.script:

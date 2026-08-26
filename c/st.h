@@ -698,6 +698,31 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
 /* backward-compatible single-directory entry point */
 static void st_init(shards *S, const char *snap_dir) { st_init_multi(S, snap_dir, NULL); }
 
+/* Long-lived embedding consumers (the Segment runtime is the first one) can
+ * open and close several model ranges in one process.  The historical CLI
+ * exits after one model and intentionally relied on process teardown; expose a
+ * real cleanup path without changing that CLI lifecycle. */
+static void st_destroy(shards *S) {
+    if (!S) return;
+    st_mirror_reset(S);
+    for (int index = 0; index < S->nfd; index++) {
+        if (S->fds[index] >= 0) close(S->fds[index]);
+        if (S->dfds[index] >= 0 && S->dfds[index] != S->fds[index])
+            close(S->dfds[index]);
+        free(S->paths[index]);
+    }
+    for (int index = 0; index < S->n; index++) free(S->t[index].name);
+    for (int index = 0; index < S->fmt_n; index++) {
+        free(S->fmt_name[index]);
+        free(S->fmt_val[index]);
+    }
+    free(S->fmt_name);
+    free(S->fmt_val);
+    free(S->hidx);
+    free(S->t);
+    memset(S, 0, sizeof(*S));
+}
+
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {
         uint64_t h = st_hash(name) & (S->hcap - 1);

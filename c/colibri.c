@@ -84,6 +84,11 @@ static inline int omp_in_parallel(void){ return 0; }     /* no runtime: never in
 static inline void omp_set_num_threads(int n){ (void)n; }
 #endif
 #include "omp_tune.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -2672,8 +2677,11 @@ static void metal_fmt_gate_notice(Model *m){
         k>=5?"sparse ":"", nbad[k]==1?"":"s");
 }
 
-static void model_init(Model *m, const char *snap, const char *weights_dir,
-                       int cap, int ebits, int dbits){
+static void model_init_range(Model *m, const char *snap,
+                             const char *weights_dir, int cap,
+                             int ebits, int dbits, int layer_begin,
+                             int layer_end, int load_boundaries, int load_mtp,
+                             int init_telemetry){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     /* Configuration and tokenizer identity always stay rooted at SNAP.  Only the
      * safetensors namespace is replaceable (for a staged tmpfs + SSD-symlink
@@ -2682,12 +2690,18 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
       st_init_multi(&m->S,weights_dir,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
+    if(layer_end==0) layer_end=c->n_layers;
+    if(layer_begin<0||layer_begin>=layer_end||layer_end>c->n_layers){
+        fprintf(stderr,"invalid GLM layer range [%d,%d) for %d layers\n",
+                layer_begin,layer_end,c->n_layers); exit(1); }
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
     int io_bits = dbits>=8 ? 16 : dbits;
-    m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
-    m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
-    m->final_norm = ld(m,"model.norm.weight");
+    if(load_boundaries){
+        m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
+        m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
+        m->final_norm = ld(m,"model.norm.weight");
+    }
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
@@ -2710,14 +2724,20 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
             m->pin_slot_by_expert[i][e]=-1;
         }
     }
-    rt_init("glm_moe_dsa",c->n_layers,c->n_experts);   /* owns the counters + the format */
-    m->eusage=rt_counts_all();                         /* alias: bump sites unchanged */
+    if(init_telemetry){
+        rt_init("glm_moe_dsa",c->n_layers,c->n_experts); /* owns counters + format */
+        m->eusage=rt_counts_all();                       /* bump sites keep their shape */
+    }else{
+        /* Segment engines may coexist in one process. Do not let their
+         * telemetry aliases overwrite route_trace.h's process-global owner. */
+        m->eusage=calloc((size_t)NR,sizeof(*m->eusage));
+    }
     m->eheat=calloc(NR,sizeof(uint32_t*));
     m->elast=calloc(NR,sizeof(uint32_t*));
     m->elast_dc=calloc(NR,sizeof(uint32_t*)); m->elast_pre=calloc(NR,sizeof(uint32_t*));
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
-    for(int i=0;i<c->n_layers;i++){
+    for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
@@ -2767,7 +2787,7 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
     }
     metal_fmt_gate_notice(m);                     /* once per load, after all layer tensors resolved */
     /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
-    {
+    if(load_mtp){
         /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
          * conversione parziale ne esiste solo una parte). MTP=0 la disabilita comunque. */
         const char *req[]={"eh_proj.weight","enorm.weight","hnorm.weight","shared_head.norm.weight",
@@ -2824,7 +2844,7 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
     {
         m->has_dsa = (c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
         char inm[300];
-        for(int i=0;i<c->n_layers && m->has_dsa;i++){
+        for(int i=layer_begin;i<layer_end && m->has_dsa;i++){
             if(!c->idx_type[i]) continue;
             snprintf(inm,sizeof(inm),"model.layers.%d.self_attn.indexer.wq_b.weight",i);
             if(!st_has(&m->S,inm)) m->has_dsa=0;
@@ -2834,7 +2854,7 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
             m->ix_wq=calloc(c->n_layers,sizeof(QT)); m->ix_wk=calloc(c->n_layers,sizeof(QT));
             m->ix_wp=calloc(c->n_layers,sizeof(QT));
             m->ix_knw=calloc(c->n_layers,sizeof(float*)); m->ix_knb=calloc(c->n_layers,sizeof(float*));
-            for(int i=0;i<c->n_layers;i++){
+            for(int i=layer_begin;i<layer_end;i++){
                 if(!c->idx_type[i]) continue;
                 #define PI(s) (snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.indexer." s,i),nm)
                 m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->q_lora, dbits);
@@ -2847,11 +2867,13 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
                 c->index_topk, c->index_topk);
         }
     }
-    m->hlast=falloc(D); m->h_all=falloc((int64_t)512*D);
+    if(load_boundaries){
+        m->hlast=falloc(D); m->h_all=falloc((int64_t)512*D);
+    }
 
     /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+shared+norme) */
-    int64_t rb=qt_bytes(&m->embed)+qt_bytes(&m->lm_head);
-    for(int i=0;i<c->n_layers;i++){ Layer *l=&m->L[i];
+    int64_t rb=load_boundaries?(qt_bytes(&m->embed)+qt_bytes(&m->lm_head)):0;
+    for(int i=layer_begin;i<layer_end;i++){ Layer *l=&m->L[i];
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
         if(!l->sparse) rb+=qt_bytes(&l->gate_proj)+qt_bytes(&l->up_proj)+qt_bytes(&l->down_proj);
         else rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down);
@@ -2860,16 +2882,24 @@ static void model_init(Model *m, const char *snap, const char *weights_dir,
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
         rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down)+qt_bytes(&m->eh_proj);
     }
-    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
+    if(m->has_dsa) for(int i=layer_begin;i<layer_end;i++) if(c->idx_type[i])
         rb+=qt_bytes(&m->ix_wq[i])+qt_bytes(&m->ix_wk[i])+qt_bytes(&m->ix_wp[i]);
     /* Dense layers, and the MTP row when the model has none, do not route and so get no
      * counter row -- the exact shape eusage had before route_trace.h owned it. rt_init
      * cannot know this: sparsity is settled while the layers are built, above. A row is
      * the load admission rule, so dropping these is what keeps a history record naming a
      * dense layer from being absorbed and written back out. */
-    for(int i=0;i<c->n_layers;i++) if(!m->L[i].sparse) rt_drop_row(i);
-    if(!m->has_mtp) rt_drop_row(c->n_layers);
+    if(init_telemetry){
+        for(int i=0;i<c->n_layers;i++)
+            if(i<layer_begin||i>=layer_end||!m->L[i].sparse) rt_drop_row(i);
+        if(!m->has_mtp) rt_drop_row(c->n_layers);
+    }
     m->resident_bytes=rb;
+}
+
+static void model_init(Model *m, const char *snap, const char *weights_dir,
+                       int cap, int ebits, int dbits){
+    model_init_range(m,snap,weights_dir,cap,ebits,dbits,0,0,1,1,1);
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
@@ -5741,7 +5771,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int s=0;s<S;s++){
             m->ereq+=keff[s];
             for(int kk=0;kk<keff[s];kk++){
-                m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
+                if(m->eusage&&m->eusage[layer])
+                    m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
                 ehit_mark(m,layer,idxs[(int64_t)s*K+kk]);
                 if(need_classify){                /* DISK-CLASS private recency -- snapshot BEFORE this call's own bump,
                                                    * then tick. This path also bumps the REAL elast/eaccess_clock a few
@@ -5898,7 +5929,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         keff[s]=Ke; m->ereq+=Ke;
         for(int kk=0;kk<Ke;kk++){
-            m->eusage[layer][idx[kk]]++;
+            if(m->eusage&&m->eusage[layer]) m->eusage[layer][idx[kk]]++;
             ehit_mark(m,layer,idx[kk]);
             if(need_classify){                    /* DISK-CLASS private recency -- snapshot BEFORE this call's own bump,
                                                    * then tick (same rate as the real clock below: one per (s,kk)) */
@@ -7549,8 +7580,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     layer_forward_rows(m,l,li,x,S,pos_base,NULL,NULL,nrm,tmp);
 }
-static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
-                                KVState *const *kvs, const int *positions){
+static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
+                                      KVState *const *kvs,
+                                      const int *positions,
+                                      int layer_begin, int layer_end){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_pilot_real){   /* nuovo forward: il possesso-layer riparte da -1 (i layer si rifanno da 0) */
         pthread_mutex_lock(&g_pilot_mx);
@@ -7577,10 +7610,10 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
     double tl0=now_s();
-    for(int i=0;i<c->n_layers;i++){
+    for(int i=layer_begin;i<layer_end;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
-        if(S>=8 && (i%4==0 || i==c->n_layers-1))
+        if(S>=8 && (i%4==0 || i==layer_end-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token · +%.2fs\n", i+1, c->n_layers, S, now_s()-tl0);
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
@@ -7635,8 +7668,16 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
 #endif
     free(nrm); free(tmp);
 }
+static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
+                                KVState *const *kvs, const int *positions){
+    layers_forward_rows_range(m,x,S,pos_base,kvs,positions,0,m->c.n_layers);
+}
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     layers_forward_rows(m,x,S,pos_base,NULL,NULL);
+}
+static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+                                 int layer_begin, int layer_end){
+    layers_forward_rows_range(m,x,S,pos_base,NULL,NULL,layer_begin,layer_end);
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -11281,6 +11322,7 @@ static int state_dir_prepare(const char *path){
 #endif
 }
 
+#ifndef COLIBRI_NO_MAIN
 int main(int argc, char **argv){
 #ifdef __linux__
     /* The managed placement contract is independent of OMP tuning/re-exec.
@@ -12109,3 +12151,449 @@ int main(int argc, char **argv){
     if(stats) stats_dump(&m,stats);
     return 0;
 }
+#endif /* COLIBRI_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    KVState *base_kv;
+    uint32_t layer_begin, layer_end, context_tokens;
+    pthread_mutex_t run_lock;
+} GlmSegmentEngine;
+
+typedef struct {
+    GlmSegmentEngine *engine;
+    KVState kv;
+    uint32_t context_tokens, position;
+} GlmSegmentSession;
+
+static void glm_segment_qt_destroy(QT *tensor) {
+    if (!tensor) return;
+    free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
+    memset(tensor, 0, sizeof(*tensor));
+}
+
+static void glm_segment_layer_destroy(Layer *layer) {
+    if (!layer) return;
+    free(layer->in_ln); free(layer->post_ln);
+    free(layer->q_a_ln); free(layer->kv_a_ln);
+    glm_segment_qt_destroy(&layer->q_a);
+    glm_segment_qt_destroy(&layer->q_b);
+    glm_segment_qt_destroy(&layer->kv_a);
+    glm_segment_qt_destroy(&layer->kv_b);
+    glm_segment_qt_destroy(&layer->o);
+    if (layer->sparse) {
+        free(layer->router); free(layer->router_bias);
+        glm_segment_qt_destroy(&layer->sh_gate);
+        glm_segment_qt_destroy(&layer->sh_up);
+        glm_segment_qt_destroy(&layer->sh_down);
+    } else {
+        glm_segment_qt_destroy(&layer->gate_proj);
+        glm_segment_qt_destroy(&layer->up_proj);
+        glm_segment_qt_destroy(&layer->down_proj);
+    }
+}
+
+static void glm_segment_eslot_destroy(ESlot *slot) {
+    if (!slot) return;
+    if (slot->slab || slot->fslab || slot->aslab) {
+        if (slot->aslab) {
+            /* Segment adapters never build pin arenas, but avoid freeing an
+             * interior pointer if a future CPU tier attaches one. */
+            slot->slab = NULL; slot->fslab = NULL;
+        } else {
+            compat_aligned_free(slot->slab);
+            free(slot->fslab);
+        }
+    } else {
+        glm_segment_qt_destroy(&slot->g);
+        glm_segment_qt_destroy(&slot->u);
+        glm_segment_qt_destroy(&slot->d);
+    }
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void glm_segment_kv_destroy(KVState *state, int num_layers) {
+    if (!state) return;
+    int rows = num_layers + 1;
+    if (state->Lc || state->Rc)
+        for (int layer = 0; layer < rows; layer++) {
+            free(state->Lc ? state->Lc[layer] : NULL);
+            free(state->Rc ? state->Rc[layer] : NULL);
+        }
+    if (state->Lc8 || state->Rc8 || state->Lsc || state->Rsc)
+        for (int layer = 0; layer < rows; layer++) {
+            free(state->Lc8 ? state->Lc8[layer] : NULL);
+            free(state->Rc8 ? state->Rc8[layer] : NULL);
+            free(state->Lsc ? state->Lsc[layer] : NULL);
+            free(state->Rsc ? state->Rsc[layer] : NULL);
+        }
+    if (state->Ic)
+        for (int layer = 0; layer < num_layers; layer++) free(state->Ic[layer]);
+    free(state->Lc); free(state->Rc); free(state->Ic);
+    free(state->Lc8); free(state->Rc8);
+    free(state->Lsc); free(state->Rsc); free(state->kv_start);
+    if (state->disk_fp) fclose(state->disk_fp);
+    free(state->disk_buf);
+    memset(state, 0, sizeof(*state));
+}
+
+static void glm_segment_model_destroy(GlmSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    int rows = model->c.n_layers + 1;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        glm_segment_layer_destroy(&model->L[layer]);
+        if (model->ecache && model->ecache[layer])
+            for (int slot = 0; slot < model->ecap; slot++)
+                glm_segment_eslot_destroy(&model->ecache[layer][slot]);
+        if (model->pin && model->pin[layer])
+            for (int slot = 0; slot < model->npin[layer]; slot++)
+                glm_segment_eslot_destroy(&model->pin[layer][slot]);
+        free(model->ecache ? model->ecache[layer] : NULL);
+        free(model->pin ? model->pin[layer] : NULL);
+        free(model->eroute ? model->eroute[layer] : NULL);
+        free(model->eheat ? model->eheat[layer] : NULL);
+        free(model->elast ? model->elast[layer] : NULL);
+        free(model->elast_dc ? model->elast_dc[layer] : NULL);
+        free(model->elast_pre ? model->elast_pre[layer] : NULL);
+    }
+    for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
+         slot++) glm_segment_eslot_destroy(&model->ws[slot]);
+    for (int layer = 0; layer < rows; layer++) {
+        free(model->ecache_slot_by_expert
+                 ? model->ecache_slot_by_expert[layer] : NULL);
+        free(model->pin_slot_by_expert
+                 ? model->pin_slot_by_expert[layer] : NULL);
+    }
+    if (model->has_dsa) {
+        for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+             layer++) if (model->c.idx_type[layer]) {
+            glm_segment_qt_destroy(&model->ix_wq[layer]);
+            glm_segment_qt_destroy(&model->ix_wk[layer]);
+            glm_segment_qt_destroy(&model->ix_wp[layer]);
+            free(model->ix_knw[layer]); free(model->ix_knb[layer]);
+        }
+    }
+    glm_segment_qt_destroy(&model->embed);
+    glm_segment_qt_destroy(&model->lm_head);
+    free(model->final_norm); free(model->hlast); free(model->h_all);
+    free(model->ix_wq); free(model->ix_wk); free(model->ix_wp);
+    free(model->ix_knw); free(model->ix_knb);
+    free(model->dsa_sel); free(model->dsa_nsel);
+    glm_segment_kv_destroy(engine->base_kv, model->c.n_layers);
+    free(engine->base_kv);
+    free(model->ecache); free(model->ecn);
+    free(model->ecache_slot_by_expert);
+    free(model->pin); free(model->npin); free(model->pin_slot_by_expert);
+    free(model->eheat); free(model->elast);
+    free(model->elast_dc); free(model->elast_pre);
+    free(model->eroute); free(model->enr);
+    free(model->eusage);
+    free(model->kv_dev_L); free(model->kv_dev_R); free(model->kv_dev_valid);
+    free(model->ln_dev);
+#ifdef COLI_VULKAN
+    free(model->vk_kv_valid);
+#endif
+    free(model->L);
+    st_destroy(&model->S);
+    model->kv = NULL;
+}
+
+static int glm_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid GLM Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "GLM Segment currently supports CPU");
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "GLM Segment range exceeds model");
+    int ebits = getenv("GLM_SEGMENT_EBITS")
+        ? atoi(getenv("GLM_SEGMENT_EBITS")) : 8;
+    int dbits = getenv("GLM_SEGMENT_DBITS")
+        ? atoi(getenv("GLM_SEGMENT_DBITS")) : ebits;
+    if (ebits < 2 || ebits > 16 || dbits < 2 || dbits > 16)
+        return coli_segment_adapter_error(error, error_size,
+                                           "GLM Segment bit widths must be 2..16");
+    int sparse_layers = 0;
+    for (uint32_t layer = options->layer_begin; layer < options->layer_end;
+         layer++) sparse_layers += layer >= (uint32_t)config.first_dense;
+    int cap = 8;
+    if (options->memory_limit_bytes && sparse_layers) {
+        uint64_t values = 3u * (uint64_t)config.moe_inter * config.hidden;
+        uint64_t weight_bytes = ebits >= 16 ? values * sizeof(float)
+            : ebits >= 5 ? values : ebits >= 4 ? (values + 1u) / 2u
+            : ebits == 3 ? (values * 3u + 7u) / 8u
+            : (values + 3u) / 4u;
+        uint64_t scale_bytes =
+            (uint64_t)(2 * config.moe_inter + config.hidden) * sizeof(float);
+        uint64_t slot_bytes = weight_bytes + scale_bytes;
+        uint64_t slots = slot_bytes
+            ? options->memory_limit_bytes / slot_bytes /
+              (uint64_t)sparse_layers : 0;
+        cap = slots > (uint64_t)config.n_experts
+            ? config.n_experts : (int)slots;
+        if (cap < 1) cap = 1;
+    }
+
+    GlmSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening GLM Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize GLM Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir, options->model_dir,
+                     cap, ebits, dbits,
+                     (int)options->layer_begin, (int)options->layer_end,
+                     0, 0, 0);
+    engine->base_kv = engine->model.kv;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "glm");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "glm/mla-rope-dsa-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "glm/e%d-d%d-dsa%d-kvf32/cpu-v1",
+             ebits, dbits, engine->model.has_dsa != 0);
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config.hidden;
+    capabilities->max_batch_rows = 512;
+    capabilities->max_context_tokens = options->context_tokens;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void glm_segment_engine_destroy(void *engine_impl) {
+    GlmSegmentEngine *engine = (GlmSegmentEngine *)engine_impl;
+    if (!engine) return;
+    glm_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static void glm_segment_session_free(GlmSegmentSession *session) {
+    if (!session) return;
+    if (session->engine)
+        glm_segment_kv_destroy(&session->kv,
+                               session->engine->model.c.n_layers);
+    free(session);
+}
+
+static int glm_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    GlmSegmentEngine *engine = (GlmSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid GLM Segment session");
+    *session_impl = NULL;
+    GlmSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating GLM session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    int rows = engine->model.c.n_layers + 1;
+    session->kv.Lc = calloc((size_t)rows, sizeof(*session->kv.Lc));
+    session->kv.Rc = calloc((size_t)rows, sizeof(*session->kv.Rc));
+    session->kv.kv_start = calloc((size_t)rows,
+                                  sizeof(*session->kv.kv_start));
+    if (engine->model.has_dsa)
+        session->kv.Ic = calloc((size_t)engine->model.c.n_layers,
+                                sizeof(*session->kv.Ic));
+    if (!session->kv.Lc || !session->kv.Rc || !session->kv.kv_start ||
+        (engine->model.has_dsa && !session->kv.Ic)) goto oom;
+    session->kv.max_t = (int)options->context_tokens;
+    uint64_t state_bytes = 0;
+    Cfg *config = &engine->model.c;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        size_t cells;
+        if (coli_segment_size_mul(options->context_tokens,
+                                  (size_t)config->kv_lora, &cells)) goto oom;
+        session->kv.Lc[layer] = calloc(cells, sizeof(float));
+        state_bytes += (uint64_t)cells * sizeof(float);
+        if (coli_segment_size_mul(options->context_tokens,
+                                  (size_t)config->qk_rope, &cells)) goto oom;
+        session->kv.Rc[layer] = calloc(cells, sizeof(float));
+        state_bytes += (uint64_t)cells * sizeof(float);
+        if (engine->model.has_dsa && config->idx_type[layer]) {
+            if (coli_segment_size_mul(options->context_tokens,
+                                      (size_t)config->index_hd,
+                                      &cells)) goto oom;
+            session->kv.Ic[layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+        }
+        if (!session->kv.Lc[layer] || !session->kv.Rc[layer] ||
+            (engine->model.has_dsa && config->idx_type[layer] &&
+             !session->kv.Ic[layer])) goto oom;
+    }
+    if (options->memory_limit_bytes &&
+        state_bytes > options->memory_limit_bytes) {
+        glm_segment_session_free(session);
+        return coli_segment_adapter_error(error, error_size,
+                                           "GLM session state exceeds memory limit");
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    glm_segment_session_free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating GLM state");
+}
+
+static void glm_segment_session_destroy(void *session_impl) {
+    glm_segment_session_free((GlmSegmentSession *)session_impl);
+}
+
+static int glm_segment_session_run(void *session_impl,
+                                   const ColiSegmentRunRequest *request,
+                                   char *error, size_t error_size) {
+    GlmSegmentSession *session = (GlmSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "GLM Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "GLM Segment run cancelled");
+    GlmSegmentEngine *engine = session->engine;
+    if (request->output != request->input)
+        memcpy(request->output, request->input, request->input_bytes);
+    pthread_mutex_lock(&engine->run_lock);
+    kv_bind(&engine->model, &session->kv);
+    layers_forward_range(&engine->model, (float *)request->output,
+                         (int)request->rows, (int)request->position,
+                         (int)engine->layer_begin, (int)engine->layer_end);
+    kv_bind(&engine->model, engine->base_kv);
+    pthread_mutex_unlock(&engine->run_lock);
+    session->position += request->rows;
+    return 0;
+}
+
+static int glm_segment_spans(
+    GlmSegmentSession *session, uint32_t position,
+    ColiSegmentStateSpan **spans_output, size_t *count_output,
+    char *error, size_t error_size) {
+    size_t capacity = (size_t)(session->engine->layer_end -
+                               session->engine->layer_begin) * 3u;
+    ColiSegmentStateSpan *spans = capacity
+        ? calloc(capacity, sizeof(*spans)) : NULL;
+    if (capacity && !spans)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory describing GLM state");
+    Cfg *config = &session->engine->model.c;
+    size_t count = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        spans[count++] = (ColiSegmentStateSpan){
+            session->kv.Lc[layer],
+            (size_t)position * config->kv_lora * sizeof(float)};
+        spans[count++] = (ColiSegmentStateSpan){
+            session->kv.Rc[layer],
+            (size_t)position * config->qk_rope * sizeof(float)};
+        if (session->engine->model.has_dsa && config->idx_type[layer])
+            spans[count++] = (ColiSegmentStateSpan){
+                session->kv.Ic[layer],
+                (size_t)position * config->index_hd * sizeof(float)};
+    }
+    *spans_output = spans; *count_output = count;
+    return 0;
+}
+
+static int glm_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    GlmSegmentSession *session = (GlmSegmentSession *)session_impl;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (!session || glm_segment_spans(session, session->position, &spans,
+                                      &count, error, error_size))
+        return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes)) {
+        free(spans);
+        return coli_segment_adapter_error(error, error_size,
+                                           "GLM snapshot size overflow");
+    }
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "glm", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, coli_segment_spans_hash(spans, count));
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    if (!result)
+        result = coli_segment_spans_write(spans, count, write_fn,
+                                          write_user_data, error, error_size);
+    free(spans);
+    return result;
+}
+
+static int glm_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    GlmSegmentSession *session = (GlmSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (glm_segment_spans(session, header.position, &spans, &count,
+                          error, error_size)) return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "glm", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens,
+            payload_bytes, error, error_size)) {
+        free(spans); return -1;
+    }
+    int result = coli_segment_spans_restore(
+        spans, count, header.payload_hash, read_fn, read_user_data,
+        error, error_size);
+    free(spans);
+    if (!result) session->position = header.position;
+    return result;
+}
+
+static const ColiSegmentAdapter glm_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "glm",
+    glm_segment_engine_open, glm_segment_engine_destroy,
+    glm_segment_session_create, glm_segment_session_destroy,
+    glm_segment_session_run, glm_segment_session_snapshot,
+    glm_segment_session_restore, {0}
+};
+
+int coli_glm_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&glm_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */

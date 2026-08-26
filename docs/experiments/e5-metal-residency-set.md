@@ -223,7 +223,7 @@ existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stder
    across cap1/cap16 may legitimately differ (different dispatch composition, per the
    fix-plan's "Determinism side-finding").
 5. **`[METAL] residency-set: on` line present in stderr** at flag-on startup, and absent
-   (or the OS<15/create-failed fallback line) otherwise — cheap sanity check that a run
+   (or the `OS < 15`/create-failed fallback line) otherwise — cheap sanity check that a run
    actually exercised the intended path before trusting its numbers. Also read the
    **`METAL-RESSET: flush` line** (gate-on only): if that number is large, the deferred
    set-commit cost is eating the stall win from the dispatch side.

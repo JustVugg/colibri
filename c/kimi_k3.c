@@ -115,6 +115,11 @@
 #include "kv_prefix.h"
 #include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
 
 /* ---------- config ---------- */
 typedef struct {
@@ -772,11 +777,19 @@ static void expert_table_init(Model *m){
     if(missing) fprintf(stderr,"[K3] WARNING: %d expert tensors missing (incomplete download?) — touching one aborts\n",missing);
 }
 
-static void model_init(Model *m, const char *snap, int n_layers_env){
+static void model_init_range(Model *m, const char *snap, int layer_begin,
+                             int layer_end, int truncate_model,
+                             int load_boundaries, int allocate_state,
+                             int expert_cap_override, int context_hint,
+                             int segment_mode){
     memset(m,0,sizeof(*m));
     load_cfg(&m->c,snap);
     Cfg *c=&m->c;
-    if(n_layers_env>0&&n_layers_env<c->n_layers) c->n_layers=n_layers_env;
+    if(truncate_model&&layer_end>0&&layer_end<c->n_layers) c->n_layers=layer_end;
+    if(layer_end==0) layer_end=c->n_layers;
+    if(layer_begin<0||layer_end>c->n_layers||layer_begin>=layer_end){
+        fprintf(stderr,"invalid Kimi K3 layer range [%d,%d) for %d layers\n",
+                layer_begin,layer_end,c->n_layers); exit(1); }
     st_init_multi(&m->S,snap,getenv("K3_DIRS"));   /* K3_DIRS: extra shard dirs (multi-drive split) */
     m->pfx[0]=0;   /* probe a layer-0 tensor: embed/head live in one of the LAST shards */
     if(!st_has(&m->S,"model.layers.0.input_layernorm.weight")&&
@@ -813,17 +826,24 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
     { /* Recurrent-state checkpoints are strictly OPT-IN: unset or 0 keeps
        * the engine byte-identical to before the feature existed. */
-      const char *e=getenv("COLI_K3_CKPT");
+      const char *e=segment_mode?NULL:getenv("COLI_K3_CKPT");
       g_k3_ckpt_slots=e?atoi(e):0;
       if(g_k3_ckpt_slots<0) g_k3_ckpt_slots=0;
       if(g_k3_ckpt_slots>K3_CKPT_MAX) g_k3_ckpt_slots=K3_CKPT_MAX;
-      g_k3_ckpt_dir=getenv("COLI_K3_CKPT_DIR");
+      g_k3_ckpt_dir=segment_mode?NULL:getenv("COLI_K3_CKPT_DIR");
       if(g_k3_ckpt_dir&&!*g_k3_ckpt_dir) g_k3_ckpt_dir=NULL;
       /* a directory alone is a clear enough request: default to 2 slots
        * there, while an explicit COLI_K3_CKPT (0 included) always wins */
       if(g_k3_ckpt_dir&&!e) g_k3_ckpt_slots=2; }
-    g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
-    g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
+    /* The legacy loader pool is process-global and keeps a Model pointer.
+     * Segment hosts may own several engines, so their demand loads stay
+     * synchronous until the pool becomes engine-owned. */
+    g_k3_pipe  = segment_mode ? 0
+                              : (getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1);
+    /* Segment numeric classes are exact by default: do not inherit the
+     * standalone quality lever from a donor's environment. */
+    g_k3_topp  = segment_mode ? 0.f
+                              : (getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f);
     if(g_k3_topp>0.f)
         fprintf(stderr,"[K3] TOPP=%.2f: routed experts pruned to cumulative weight (quality lever — A/B with K3_LOGITS)\n",g_k3_topp);
     int bits   = getenv("K3_BITS")?atoi(getenv("K3_BITS")):4;
@@ -837,7 +857,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     m->cwv=calloc(c->n_layers,sizeof(float*));
     char nm[512];
     #define NM(...) (snprintf(nm,sizeof(nm),__VA_ARGS__),nm)
-    for(int i=0;i<c->n_layers;i++){
+    for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
         l->kda=c->is_kda[i];
         l->sparse=(i>=c->first_dense);
@@ -877,10 +897,12 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
               free(al); }
             /* afcalloc: 16 KB-aligned so Metal wraps these zero-copy and GPU state/window
              * updates persist across tokens (see afcalloc note). CPU path is unaffected. */
-            m->kstate[i]=afcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
-            m->cwq[i]=afcalloc((int64_t)P*c->conv_k);
-            m->cwk[i]=afcalloc((int64_t)P*c->conv_k);
-            m->cwv[i]=afcalloc((int64_t)P*c->conv_k);
+            if(allocate_state){
+                m->kstate[i]=afcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
+                m->cwq[i]=afcalloc((int64_t)P*c->conv_k);
+                m->cwk[i]=afcalloc((int64_t)P*c->conv_k);
+                m->cwv[i]=afcalloc((int64_t)P*c->conv_k);
+            }
         } else {
             Mla *a=&l->m;
             w_load(m,&a->qa,NM("model.layers.%d.self_attn.q_a_proj.weight",i),c->q_lora,c->hidden,mbits);
@@ -919,7 +941,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         if(i%8==0) fprintf(stderr,"[K3] loaded layer %d/%d (%.1fs, RSS %.1f GB)\n",i+1,c->n_layers,now_s()-t0,rss_gb());
     }
     snprintf(nm,sizeof(nm),"%smodel.norm.weight",m->pfx);
-    m->has_head = st_has(&m->S,nm);
+    m->has_head = load_boundaries&&st_has(&m->S,nm);
     if(m->has_head){
         m->final_norm=f32_load(m,"model.norm.weight",c->hidden);
         { float *rn=f32_load(m,"model.output_attn_res_norm.weight",c->hidden);
@@ -989,6 +1011,8 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * regardless of K3_EXPERT_GB. */
     if(cap<1) cap=1;
     if(cap>c->n_experts) cap=c->n_experts;
+    if(expert_cap_override>0 && cap>expert_cap_override)
+        cap=expert_cap_override;
 
     /* ---- RAM budget (#855) --------------------------------------------------
      * K3_EXPERT_GB used to be the whole story: cap = egb / slot / layers, with
@@ -1027,7 +1051,8 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         /* KV is allocated later, at the first request, so it has to be projected
          * here. n_layers x max_t x (kv_lora + qk_rope) x 4, skipping KDA layers,
          * with the same K3_MAXT default the serve path uses. */
-        int max_t = getenv("K3_MAXT") ? atoi(getenv("K3_MAXT")) : 8192;
+        int max_t = context_hint > 0 ? context_hint :
+                    (getenv("K3_MAXT") ? atoi(getenv("K3_MAXT")) : 8192);
         if(max_t < 1) max_t = 8192;
         int nkv = 0; for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda) nkv++;
         double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
@@ -1098,6 +1123,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         fprintf(stderr,"[K3-CKPT] enabled: %d recurrent-state slots (%.1f MB each, %s)\n",
                 g_k3_ckpt_slots,k3_ckpt_blob_floats(m)*sizeof(float)/1048576.0,
                 g_k3_ckpt_dir?g_k3_ckpt_dir:"RAM");
+    /* Validation/capture files are standalone diagnostics. A donor process
+     * must not inherit them or share their process-global FILE pointers. */
+    if(!segment_mode){
     /* Phase 9: layer validation init */
     { const char *vl=getenv("K3_VALIDATE_LAYER");
       const char *vt=getenv("K3_VALIDATE_TOKEN");
@@ -1136,6 +1164,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
           fprintf(stderr,"[K3-VAL-LOGITS] active: output %s (%d dims)\n",vl,c->vocab);
         }
       }
+    }
     }
     #undef NM
 }
@@ -2011,40 +2040,29 @@ static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out)
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
 static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
 typedef int (*K3CancelPoll)(void *context);
-static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
-                            K3CancelPoll poll_cancel, void *cancel_context,
-                            int *cancelled){
+
+/* Run an arbitrary contiguous layer range on boundary activations.  Kimi's
+ * AttnRes block residuals are part of that boundary state: hidden alone is
+ * insufficient whenever a range begins after layer zero.  `bres` therefore
+ * contains nbmax hidden-width rows per token and nb_io names the live prefix. */
+static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
+                                   int *nb_io, int pos0, int C,
+                                   int layer_begin, int layer_end,
+                                   K3CancelPoll poll_cancel,
+                                   void *cancel_context, int *cancelled){
     Cfg *c=&m->c; int D=c->hidden;
-    if(cancelled) *cancelled=0;
-#ifdef COLI_VULKAN
-    /* Routed-tier upload budget for this step. Fixed cap by default;
-     * K3_VK_UP=auto bounds the inline upload time to a fraction of the
-     * measured decode step instead (hybrid_split.h) — legacy cap until both
-     * rates have samples, so enabling auto never starts worse. */
-    if(g_vk_up_auto&&!g_vk_full)
-        g_vk_cap_now=coli_k3_fill_budget(g_vk_step_ema,g_vk_upload_ema,
-                                         g_vk_fill_frac,g_vk_upcap);
-    g_vk_up_left=g_vk_up_auto?g_vk_cap_now:g_vk_upcap;
-    double vk_step_t0=(g_vk_up_auto&&C==1)?now_s():0.0;
-#endif
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
-    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
+    int nb=*nb_io;
     float *prefix=falloc((int64_t)C*D), *nrm=falloc((int64_t)C*D);
     float *att=falloc((int64_t)C*D), *mix=falloc(D), *mlp=falloc((int64_t)C*D);
-    int nb=0;
-    for(int t=0;t<C;t++){
-        if(g_x0){
-            if(pos0+t>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos0+t,g_x0_n); exit(1); }
-            memcpy(hidden+(int64_t)t*D,g_x0+(int64_t)(pos0+t)*D,D*sizeof(float));
-        } else {
-            char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
-            st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
-        }
-    }
-    if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
-    for(int i=0;i<c->n_layers;i++){
+    if(cancelled) *cancelled=0;
+    for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
         int snap=(i%c->res_bs==0);                    /* block boundary: same for all t */
+        if(snap&&nb>=nbmax){
+            if(cancelled) *cancelled=1;
+            break;
+        }
         for(int t=0;t<C;t++){
             float *h=hidden+(int64_t)t*D, *p=prefix+(int64_t)t*D;
             memcpy(p,h,D*sizeof(float));              /* prefix_sum at entry */
@@ -2098,6 +2116,43 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
             break;
         }
     }
+    *nb_io=nb;
+    free(prefix);free(nrm);free(att);free(mix);free(mlp);
+    return cancelled&&*cancelled?-1:0;
+}
+
+static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
+                            K3CancelPoll poll_cancel, void *cancel_context,
+                            int *cancelled){
+    Cfg *c=&m->c; int D=c->hidden;
+    if(cancelled) *cancelled=0;
+#ifdef COLI_VULKAN
+    /* Routed-tier upload budget for this step. Fixed cap by default;
+     * K3_VK_UP=auto bounds the inline upload time to a fraction of the
+     * measured decode step instead (hybrid_split.h) — legacy cap until both
+     * rates have samples, so enabling auto never starts worse. */
+    if(g_vk_up_auto&&!g_vk_full)
+        g_vk_cap_now=coli_k3_fill_budget(g_vk_step_ema,g_vk_upload_ema,
+                                         g_vk_fill_frac,g_vk_upcap);
+    g_vk_up_left=g_vk_up_auto?g_vk_cap_now:g_vk_upcap;
+    double vk_step_t0=(g_vk_up_auto&&C==1)?now_s():0.0;
+#endif
+    int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
+    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
+    float *mix=falloc(D);
+    int nb=0;
+    for(int t=0;t<C;t++){
+        if(g_x0){
+            if(pos0+t>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos0+t,g_x0_n); exit(1); }
+            memcpy(hidden+(int64_t)t*D,g_x0+(int64_t)(pos0+t)*D,D*sizeof(float));
+        } else {
+            char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
+            st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
+        }
+    }
+    if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
+    k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,0,c->n_layers,
+                            poll_cancel,cancel_context,cancelled);
     float *logits=NULL;
     if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
@@ -2123,7 +2178,7 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     if(g_vk_up_auto&&C==1&&vk_step_t0>0.0)
         g_vk_step_ema=coli_v4_hybrid_ema(g_vk_step_ema,now_s()-vk_step_t0);
 #endif
-    free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
+    free(hidden);free(bres);free(mix);
     return logits;
 }
 
@@ -2177,6 +2232,10 @@ static void kv_alloc(Model *m, int max_t){
             a->Ic = falloc((int64_t)max_t * c->index_hd);
         }
     }
+}
+
+static void model_init(Model *m, const char *snap, int n_layers_env){
+    model_init_range(m,snap,0,n_layers_env,1,1,1,0,0,0);
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -2770,6 +2829,11 @@ static void serve_data(const char *id, const char *p, int n){
     coli_serve_write_data(stdout,id,p,(size_t)n);
 }
 
+static void serve_tool(const char *id, const char *p, int n){
+    if(n<0) return;
+    coli_serve_write_tool(stdout,id,p,(size_t)n);
+}
+
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
@@ -2802,6 +2866,10 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     coli_serve_write_accept(stdout,q->id,np);
+    /* Declare the structured sideband before any generated DATA. Even an
+     * empty sideband is meaningful: it tells the gateway that literal K3
+     * marker lookalikes in DATA are content, not engine-proven structure. */
+    if(chat) serve_tool(q->id,NULL,0);
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
      * re-process turns 1..N-1 from scratch — the cost of a message grew with
@@ -2850,7 +2918,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     /* Turn boundary: the state now covers exactly the prompt. A photo here is
      * what an agentic edit of the NEXT request restores from. */
     k3_ckpt_save(m);
-    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
+    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
     for(int s=0;s<q->max_tok&&!cancelled;s++){
@@ -2867,13 +2935,13 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
                     if(xopen&&!strcmp(xtag,"response")&&thinking)
                         serve_data(q->id,"</think>",8);
                     else if(k3_tool_tag(xtag)){
-                        /* #1143: re-emit tool-call structure literally so the gateway can
-                         * parse it back into OpenAI tool_calls. Everything else XTML stays
-                         * suppressed as before; the gateway strips these markers from the
-                         * client-visible deltas the same way the GLM path does. */
+                        /* #1147: preserve engine-proven special-token structure on the
+                         * TOOL sideband. Text that only resembles these markers remains
+                         * DATA and cannot be promoted by the gateway. */
                         char lb[352];
                         int n=snprintf(lb,sizeof lb,"%s%s<|sep|>",xopen?"<|open|>":"<|close|>",xtag);
-                        if(n>0&&n<(int)sizeof lb) serve_data(q->id,lb,n);
+                        if(n>0&&n<(int)sizeof lb) serve_tool(q->id,lb,n);
+                        if(!strcmp(xtag,"tools")) xtool=xopen;
                     }
                 }
                 show=0;
@@ -2885,7 +2953,8 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         }
         if(show){
             int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
-            serve_data(q->id,buf,nb);
+            if(xtool) serve_tool(q->id,buf,nb);
+            else serve_data(q->id,buf,nb);
         }
         if(!eos) gen++;
         while(serve_stdin_readable()){
@@ -2948,6 +3017,7 @@ static void serve_loop(Model *m, Tok *T){
     }
 }
 
+#ifndef KIMI_K3_NO_MAIN
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
@@ -3171,3 +3241,488 @@ int main(int argc, char **argv){
 #endif
     return 0;
 }
+#endif /* KIMI_K3_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens, state_width, nbmax;
+    pthread_mutex_t run_lock;
+} KimiSegmentEngine;
+
+typedef struct {
+    KimiSegmentEngine *engine;
+    float **kstate, **cwq, **cwk, **cwv;
+    float **Lc, **Rc, **Ic;
+    uint32_t context_tokens, position;
+} KimiSegmentSession;
+
+static void kimi_segment_layer_destroy(Layer *layer) {
+    if (!layer) return;
+    free(layer->in_ln); free(layer->post_ln);
+    free(layer->attn_sw); free(layer->mlp_sw);
+    if (layer->kda) {
+        Kda *a = &layer->a;
+        w_release_host(&a->q); w_release_host(&a->k);
+        w_release_host(&a->v); w_release_host(&a->o);
+        w_release_host(&a->g);
+        free(a->conv_q); free(a->conv_k); free(a->conv_v);
+        free(a->fa); free(a->fb); free(a->bp);
+        free(a->dt); free(a->A); free(a->onw);
+    } else {
+        Mla *a = &layer->m;
+        w_release_host(&a->qa); w_release_host(&a->qb);
+        w_release_host(&a->kva); w_release_host(&a->kvb);
+        w_release_host(&a->o); w_release_host(&a->g);
+        w_release_host(&a->wk); w_release_host(&a->wq);
+        w_release_host(&a->wp);
+        free(a->qa_ln); free(a->kva_ln);
+        free(a->knw); free(a->knb);
+    }
+    if (layer->sparse) {
+        Moe *moe = &layer->moe;
+        free(moe->router); free(moe->rbias); free(moe->lat_norm);
+        w_release_host(&moe->lat_down); w_release_host(&moe->lat_up);
+        w_release_host(&moe->sh_gate); w_release_host(&moe->sh_up);
+        w_release_host(&moe->sh_down);
+    } else {
+        w_release_host(&layer->d_gate); w_release_host(&layer->d_up);
+        w_release_host(&layer->d_down);
+    }
+}
+
+static void kimi_segment_model_destroy(KimiSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        kimi_segment_layer_destroy(&model->L[layer]);
+        if (model->ecache) {
+            LCache *cache = &model->ecache[layer];
+            for (int slot = 0; slot < cache->cap; slot++)
+                free(cache->s[slot].base);
+            free(cache->slot_by_expert); free(cache->s);
+        }
+    }
+    for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
+         slot++)
+        free(model->ws[slot].base);
+    free(model->final_norm); free(model->out_sw);
+    w_release_host(&model->lm_head);
+    free(model->kstate); free(model->cwq); free(model->cwk); free(model->cwv);
+    if (model->Lc || model->Rc) {
+        for (int layer = 0; layer < model->c.n_layers; layer++) {
+            free(model->Lc ? model->Lc[layer] : NULL);
+            free(model->Rc ? model->Rc[layer] : NULL);
+        }
+    }
+    free(model->Lc); free(model->Rc);
+    free(model->dsa_nsel); free(model->dsa_sel);
+    free(model->eref); free(model->ecache); free(model->L);
+    kv_prefix_free(&model->kvp);
+    st_destroy(&model->S);
+}
+
+static int kimi_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Kimi K3 Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi K3 Segment currently supports CPU");
+
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi K3 Segment range exceeds model");
+    uint64_t nbmax = ((uint64_t)config.n_layers + config.res_bs - 1u) /
+                     (uint64_t)config.res_bs;
+    uint64_t state_width = (uint64_t)config.hidden * (1u + nbmax);
+    if (state_width > UINT32_MAX)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi K3 boundary state is too wide");
+
+    int sparse_layers = 0;
+    for (uint32_t layer = options->layer_begin; layer < options->layer_end;
+         layer++)
+        if (layer >= (uint32_t)config.first_dense) sparse_layers++;
+    int expert_cap = 0;
+    if (options->memory_limit_bytes && sparse_layers) {
+        uint64_t w1p = (uint64_t)config.moe_inter *
+                       ((uint64_t)config.latent / 2u);
+        uint64_t w1s = (uint64_t)config.moe_inter *
+                       ((uint64_t)config.latent / 32u);
+        uint64_t w2p = (uint64_t)config.latent *
+                       ((uint64_t)config.moe_inter / 2u);
+        uint64_t w2s = (uint64_t)config.latent *
+                       ((uint64_t)config.moe_inter / 32u);
+        uint64_t slot_bytes = 2u * (w1p + w1s) + w2p + w2s;
+        uint64_t slots = slot_bytes
+            ? options->memory_limit_bytes / slot_bytes /
+              (uint64_t)sparse_layers : 0;
+        expert_cap = slots > (uint64_t)config.n_experts
+            ? config.n_experts : (int)slots;
+        if (expert_cap < 1) expert_cap = 1;
+    }
+
+    KimiSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening Kimi Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    engine->state_width = (uint32_t)state_width;
+    engine->nbmax = (uint32_t)nbmax;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize Kimi Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir,
+                     (int)options->layer_begin, (int)options->layer_end,
+                     0, 0, 0, expert_cap, (int)options->context_tokens, 1);
+    free(engine->model.kstate); free(engine->model.cwq);
+    free(engine->model.cwk); free(engine->model.cwv);
+    engine->model.kstate = NULL; engine->model.cwq = NULL;
+    engine->model.cwk = NULL; engine->model.cwv = NULL;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "kimi");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "kimi-k3/attnres-kda-mla-dsa-f32-v1");
+    int bits = getenv("K3_BITS") ? atoi(getenv("K3_BITS")) : 4;
+    int mla_bits = getenv("K3_MLA_BITS") ? atoi(getenv("K3_MLA_BITS")) : 8;
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "kimi-k3/q%d-mla%d-mxfp4-idot%d/f32/cpu-v1",
+             bits, mla_bits, g_k3_idot != 0);
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = options->context_tokens;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void kimi_segment_engine_destroy(void *engine_impl) {
+    KimiSegmentEngine *engine = (KimiSegmentEngine *)engine_impl;
+    if (!engine) return;
+    kimi_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static void kimi_segment_session_free(KimiSegmentSession *session) {
+    if (!session) return;
+    if (session->engine) {
+        for (uint32_t layer = session->engine->layer_begin;
+             layer < session->engine->layer_end; layer++) {
+            free(session->kstate ? session->kstate[layer] : NULL);
+            free(session->cwq ? session->cwq[layer] : NULL);
+            free(session->cwk ? session->cwk[layer] : NULL);
+            free(session->cwv ? session->cwv[layer] : NULL);
+            free(session->Lc ? session->Lc[layer] : NULL);
+            free(session->Rc ? session->Rc[layer] : NULL);
+            free(session->Ic ? session->Ic[layer] : NULL);
+        }
+    }
+    free(session->kstate); free(session->cwq); free(session->cwk);
+    free(session->cwv); free(session->Lc); free(session->Rc);
+    free(session->Ic); free(session);
+}
+
+static int kimi_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    KimiSegmentEngine *engine = (KimiSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Kimi Segment session");
+    *session_impl = NULL;
+    KimiSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating Kimi session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    size_t layers = (size_t)engine->model.c.n_layers;
+    session->kstate = calloc(layers, sizeof(*session->kstate));
+    session->cwq = calloc(layers, sizeof(*session->cwq));
+    session->cwk = calloc(layers, sizeof(*session->cwk));
+    session->cwv = calloc(layers, sizeof(*session->cwv));
+    session->Lc = calloc(layers, sizeof(*session->Lc));
+    session->Rc = calloc(layers, sizeof(*session->Rc));
+    session->Ic = calloc(layers, sizeof(*session->Ic));
+    if (!session->kstate || !session->cwq || !session->cwk ||
+        !session->cwv || !session->Lc || !session->Rc || !session->Ic)
+        goto oom;
+
+    Cfg *config = &engine->model.c;
+    uint64_t state_bytes = 0;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        size_t cells;
+        if (config->is_kda[layer]) {
+            if (coli_segment_size_mul((size_t)config->kda_heads,
+                                      (size_t)config->kda_hd, &cells) ||
+                coli_segment_size_mul(cells, (size_t)config->kda_hd,
+                                      &cells)) goto oom;
+            session->kstate[layer] = calloc(cells, sizeof(float));
+            if (coli_segment_size_mul((size_t)config->kda_proj,
+                                      (size_t)config->conv_k, &cells)) goto oom;
+            session->cwq[layer] = calloc(cells, sizeof(float));
+            session->cwk[layer] = calloc(cells, sizeof(float));
+            session->cwv[layer] = calloc(cells, sizeof(float));
+            state_bytes += ((uint64_t)config->kda_heads * config->kda_hd *
+                            config->kda_hd + 3u * (uint64_t)cells) *
+                           sizeof(float);
+            if (!session->kstate[layer] || !session->cwq[layer] ||
+                !session->cwk[layer] || !session->cwv[layer]) goto oom;
+        } else {
+            if (coli_segment_size_mul(options->context_tokens,
+                                      (size_t)config->kv_lora, &cells)) goto oom;
+            session->Lc[layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+            if (coli_segment_size_mul(options->context_tokens,
+                                      (size_t)config->qk_rope, &cells)) goto oom;
+            session->Rc[layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+            if (config->index_hd > 0 && config->idx_type[layer]) {
+                if (coli_segment_size_mul(options->context_tokens,
+                                          (size_t)config->index_hd,
+                                          &cells)) goto oom;
+                session->Ic[layer] = calloc(cells, sizeof(float));
+                state_bytes += (uint64_t)cells * sizeof(float);
+            }
+            if (!session->Lc[layer] || !session->Rc[layer] ||
+                (config->index_hd > 0 && config->idx_type[layer] &&
+                 !session->Ic[layer])) goto oom;
+        }
+    }
+    if (options->memory_limit_bytes &&
+        state_bytes > options->memory_limit_bytes) {
+        kimi_segment_session_free(session);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi session state exceeds memory limit");
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    kimi_segment_session_free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating Kimi state");
+}
+
+static void kimi_segment_session_destroy(void *session_impl) {
+    kimi_segment_session_free((KimiSegmentSession *)session_impl);
+}
+
+static int kimi_segment_session_run(void *session_impl,
+                                    const ColiSegmentRunRequest *request,
+                                    char *error, size_t error_size) {
+    KimiSegmentSession *session = (KimiSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "Kimi Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi Segment run cancelled");
+    KimiSegmentEngine *engine = session->engine;
+    Cfg *config = &engine->model.c;
+    size_t hidden_cells, residual_cells;
+    if (coli_segment_size_mul(request->rows, (size_t)config->hidden,
+                              &hidden_cells) ||
+        coli_segment_size_mul(hidden_cells, (size_t)engine->nbmax,
+                              &residual_cells))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi boundary state overflows");
+    float *hidden = calloc(hidden_cells, sizeof(float));
+    float *residuals = calloc(residual_cells, sizeof(float));
+    if (!hidden || !residuals) {
+        free(hidden); free(residuals);
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory running Kimi Segment");
+    }
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        memcpy(hidden + (size_t)row * config->hidden,
+               input + (size_t)row * engine->state_width,
+               (size_t)config->hidden * sizeof(float));
+        memcpy(residuals + (size_t)row * engine->nbmax * config->hidden,
+               input + (size_t)row * engine->state_width + config->hidden,
+               (size_t)engine->nbmax * config->hidden * sizeof(float));
+    }
+
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->kstate = session->kstate;
+    model->cwq = session->cwq; model->cwk = session->cwk;
+    model->cwv = session->cwv;
+    model->Lc = session->Lc; model->Rc = session->Rc;
+    model->max_t = (int)session->context_tokens;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++)
+        if (!config->is_kda[layer]) model->L[layer].m.Ic = session->Ic[layer];
+    int nb = ((int)engine->layer_begin + config->res_bs - 1) / config->res_bs;
+    int cancelled = 0;
+    int result = k3_layers_forward_range(
+        model, hidden, residuals, &nb, (int)request->position,
+        (int)request->rows, (int)engine->layer_begin,
+        (int)engine->layer_end, NULL, NULL, &cancelled);
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++)
+        if (!config->is_kda[layer]) model->L[layer].m.Ic = NULL;
+    model->kstate = NULL; model->cwq = NULL; model->cwk = NULL;
+    model->cwv = NULL; model->Lc = NULL; model->Rc = NULL; model->max_t = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    if (result) {
+        free(hidden); free(residuals);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi Segment layer run failed");
+    }
+
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        memcpy(output + (size_t)row * engine->state_width,
+               hidden + (size_t)row * config->hidden,
+               (size_t)config->hidden * sizeof(float));
+        memcpy(output + (size_t)row * engine->state_width + config->hidden,
+               residuals + (size_t)row * engine->nbmax * config->hidden,
+               (size_t)engine->nbmax * config->hidden * sizeof(float));
+    }
+    free(hidden); free(residuals);
+    session->position += request->rows;
+    return 0;
+}
+
+static int kimi_segment_spans(
+    KimiSegmentSession *session, uint32_t position,
+    ColiSegmentStateSpan **spans_output, size_t *count_output,
+    char *error, size_t error_size) {
+    size_t capacity = (size_t)(session->engine->layer_end -
+                               session->engine->layer_begin) * 4u;
+    ColiSegmentStateSpan *spans = capacity
+        ? calloc(capacity, sizeof(*spans)) : NULL;
+    if (capacity && !spans)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory describing Kimi state");
+    Cfg *config = &session->engine->model.c;
+    size_t count = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        if (config->is_kda[layer]) {
+            size_t rec_cells = (size_t)config->kda_heads * config->kda_hd *
+                               config->kda_hd;
+            size_t conv_cells = (size_t)config->kda_proj * config->conv_k;
+            spans[count++] = (ColiSegmentStateSpan){
+                session->kstate[layer], rec_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cwq[layer], conv_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cwk[layer], conv_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cwv[layer], conv_cells * sizeof(float)};
+        } else {
+            spans[count++] = (ColiSegmentStateSpan){
+                session->Lc[layer],
+                (size_t)position * config->kv_lora * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->Rc[layer],
+                (size_t)position * config->qk_rope * sizeof(float)};
+            if (config->index_hd > 0 && config->idx_type[layer])
+                spans[count++] = (ColiSegmentStateSpan){
+                    session->Ic[layer],
+                    (size_t)position * config->index_hd * sizeof(float)};
+        }
+    }
+    *spans_output = spans; *count_output = count;
+    return 0;
+}
+
+static int kimi_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    KimiSegmentSession *session = (KimiSegmentSession *)session_impl;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (!session || kimi_segment_spans(session, session->position, &spans,
+                                       &count, error, error_size))
+        return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes)) {
+        free(spans);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi snapshot size overflow");
+    }
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "kimi", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, coli_segment_spans_hash(spans, count));
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    if (!result)
+        result = coli_segment_spans_write(spans, count, write_fn,
+                                          write_user_data, error, error_size);
+    free(spans);
+    return result;
+}
+
+static int kimi_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    KimiSegmentSession *session = (KimiSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (kimi_segment_spans(session, header.position, &spans, &count,
+                           error, error_size)) return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "kimi", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens,
+            payload_bytes, error, error_size)) {
+        free(spans); return -1;
+    }
+    int result = coli_segment_spans_restore(
+        spans, count, header.payload_hash, read_fn, read_user_data,
+        error, error_size);
+    free(spans);
+    if (!result) session->position = header.position;
+    return result;
+}
+
+static const ColiSegmentAdapter kimi_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "kimi",
+    kimi_segment_engine_open, kimi_segment_engine_destroy,
+    kimi_segment_session_create, kimi_segment_session_destroy,
+    kimi_segment_session_run, kimi_segment_session_snapshot,
+    kimi_segment_session_restore, {0}
+};
+
+int coli_kimi_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&kimi_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */

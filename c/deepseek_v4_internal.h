@@ -603,9 +603,21 @@ typedef struct ColiDeepSeekV4ExpertStoreOptions {
     /* Optional hot-pin policy (-1 / 0 => implementation default). */
     int pin_slots_per_layer;
     uint64_t repin_interval;
+    /* Internal range executors must not benchmark arbitrary bytes from a
+     * complete checkpoint while opening one layer slice. */
+    int skip_mirror_setup;
 } ColiDeepSeekV4ExpertStoreOptions;
 
 int coli_deepseek_v4_expert_store_open(
+    const ColiDeepSeekV4ExpertStoreOptions *options,
+    ColiExpertStore **store,
+    char *error,
+    size_t error_size);
+
+/* Plain SSD implementation underneath the optional hot-row/autopin wrapper.
+ * Segment adapters use it so opening a layer range never warms experts from
+ * layers outside that range.  It remains an internal symbol, not public ABI. */
+int coli_deepseek_v4_expert_store_open_base(
     const ColiDeepSeekV4ExpertStoreOptions *options,
     ColiExpertStore **store,
     char *error,

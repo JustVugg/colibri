@@ -169,6 +169,8 @@ static void test_writer_golden_bytes(void)
     assert(coli_serve_write_accept(output, "req-7", 12));
     static const unsigned char data[] = {'A', '\n', 0, 'B'};
     assert(coli_serve_write_data(output, "req-7", data, sizeof(data)));
+    assert(coli_serve_write_tool(output, "req-7", NULL, 0));
+    assert(coli_serve_write_tool(output, "req-7", data, sizeof(data)));
     assert(coli_serve_write_error(output, "req-7", "bad\r\nframe"));
     ColiServeDone done = {3, 1.25, 50.0, 1.25, 7, 1};
     assert(coli_serve_write_done(output, "req-7", &done));
@@ -183,6 +185,8 @@ static void test_writer_golden_bytes(void)
         "\x01\x01READY\x01\x01\nSTAT 0 0.0 0.0 1.25 0 0\n"
         "ACCEPT req-7 12\n"
         "DATA req-7 4\nA\n\0B\n"
+        "TOOL req-7 0\n\n"
+        "TOOL req-7 4\nA\n\0B\n"
         "ERROR req-7 bad  frame\n"
         "DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n"
         "DONE req-v4 STAT 3 1.250 50.0 1.25 7 1 5\n";

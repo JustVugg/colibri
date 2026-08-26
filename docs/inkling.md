@@ -84,9 +84,9 @@ help in proportion to the RAM you can give them.
 | Invocation | What it does |
 |---|---|
 | `-p "text" [-n N]` | streaming greedy generation (stops at eos or N tokens) |
-| `--chat -p "text"` | wraps the prompt in Inkling's chat template (role tokens + `<|content_text|>`, `<|message_model|>` as the generation prompt). Instruct models fed raw text are out of distribution and answer badly. `THINK=<0..1>` raises the reasoning effort (default 0) |
+| `--chat -p "text"` | wraps the prompt in Inkling's chat template (role tokens + `<\|content_text\|>`, `<\|message_model\|>` as the generation prompt). Instruct models fed raw text are out of distribution and answer badly. `THINK=<0..1>` raises the reasoning effort (default 0) |
 | `-f prompts.txt [-n N]` | one prompt per line (`#` comments skipped), single model load, state reset between prompts — the cache-warming workflow below |
-| `--audio file.dmel [-p "text"]` | spoken input: raw u8 DMel frames `[n_frames, 80]`, one `<|audio|>` position per frame (implies `--chat`) |
+| `--audio file.dmel [-p "text"]` | spoken input: raw u8 DMel frames `[n_frames, 80]`, one `<\|audio\|>` position per frame (implies `--chat`) |
 | `[cap] [bits] [ref.json]` | token-exact oracle harness against a `tools/make_tiny_inkling.py` fixture (CI-style validation; `tools/make_tiny_inkling_audio.py` for the audio path) |
 
 `coli chat` / `coli serve` / `coli web` render the same template through the

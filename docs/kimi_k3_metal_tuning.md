@@ -53,7 +53,7 @@ for equal-split scheduling — so including all 18 helps rather than drags.
 
 Swept 8→96. The **cache-driven metrics are monotonic**: hit rate 4→53%, bytes
 streamed and `eload` fall as the budget grows. But `eload` hits its floor
-(~10 s) and hit-rate gains flatten around **44 GB** — beyond that you buy <1% hit
+(~10 s) and hit-rate gains flatten around **44 GB** — beyond that you buy less than 1% hit
 for more memory. On the CPU path the equivalent knee is ~48 GB; Metal sits a
 touch lower because GPU-wired buffers trim the headroom.
 

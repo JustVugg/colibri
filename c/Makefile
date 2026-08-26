@@ -402,9 +402,6 @@ endif
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
-# tests/mxfp4_ref.c is compiled by $(CC) with OpenMP. Its object therefore
-# needs the host OpenMP runtime when the GPU compiler performs the final link.
-GPU_OMP_LINK = -Xcompiler=-fopenmp
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
 # triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
@@ -451,7 +448,8 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
-TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
+	test_segment_adapters_registration test_segment_adapters_real
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -459,7 +457,8 @@ endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
-	tests/test_v4_serve_framing$(EXE)
+	tests/test_v4_serve_framing$(EXE) \
+	tests/test_segment_adapters_registration$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -552,7 +551,6 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
-GPU_OMP_LINK = -fopenmp
 # rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
 # headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
 # let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
@@ -911,8 +909,21 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
-	$(CC) $(CFLAGS) -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
+	# Built WITHOUT OpenMP (#971). This is a correctness oracle over matrices of
+	# at most S=4 I=2048 O=64, so threading it buys nothing measurable, while the
+	# dependency it creates has blocked this target on two hosts: a Linux box
+	# whose libgomp is absent (undefined reference to GOMP_parallel, at this very
+	# link step) and MSVC, whose OpenMP predates C99 loop declarations in C mode.
+	# It was also the only reason the final nvcc/hipcc link here had to drag in
+	# the host OpenMP runtime, so GPU_OMP_LINK goes with it.
+	# The OpenMP flags are FILTERED OUT rather than overridden with -fno-openmp
+	# alone: on macOS they arrive as `-Xclang -fopenmp`, which goes straight to
+	# the frontend and is not necessarily undone by a driver-level -fno-openmp.
+	# Getting that wrong would leave OpenMP symbols in the object while the link
+	# below no longer pulls the runtime, and CI could not catch it because CI
+	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
 	./mxfp4_cuda_test$(EXE)
 
 
@@ -1271,6 +1282,92 @@ tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_qu
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
+
+# Real engine-owned Segment adapters. These are CPU-baseline embedding
+# objects: ordinary Colibri executables do not link them, and GPU capability
+# is advertised only after an adapter has a real backend implementation.
+SEGMENT_BUILD_DIR = build/segment
+SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
+	-DCOLI_VULKAN,$(CFLAGS)) -D_GNU_SOURCE -include pthread.h \
+	-DCOLI_SEGMENT_ADAPTER
+SEGMENT_ENGINE_OBJS = \
+	$(SEGMENT_BUILD_DIR)/glm.o \
+	$(SEGMENT_BUILD_DIR)/inkling.o \
+	$(SEGMENT_BUILD_DIR)/kimi.o \
+	$(SEGMENT_BUILD_DIR)/olmoe.o \
+	$(SEGMENT_BUILD_DIR)/qwen36.o
+SEGMENT_V4_UNITS = $(filter-out COLI_V4_UNIT_PROMPT \
+	COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS)) $(V4_SEGMENT_UNIT)
+SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_UNITS)))
+SEGMENT_V4_REGISTRY_OBJ = $(SEGMENT_BUILD_DIR)/expert_store_registry.o
+SEGMENT_ALL_OBJS = $(SEGMENT_ENGINE_OBJS) $(SEGMENT_V4_OBJS) \
+	$(SEGMENT_V4_REGISTRY_OBJ)
+
+$(SEGMENT_BUILD_DIR):
+	mkdir -p $@
+
+$(SEGMENT_BUILD_DIR)/glm.o: colibri.c segment_runtime.h \
+		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLIBRI_NO_MAIN -c colibri.c -o $@
+
+$(SEGMENT_BUILD_DIR)/inkling.o: inkling.c segment_runtime.h \
+		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DINKLING_NO_MAIN -c inkling.c -o $@
+
+$(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c segment_runtime.h \
+		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DKIMI_K3_NO_MAIN -c kimi_k3.c -o $@
+
+$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c segment_runtime.h \
+		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DOLMOE_NO_MAIN -c olmoe.c -o $@
+
+$(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c segment_runtime.h \
+		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
+
+$(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h segment_runtime.h segment_adapters.h \
+		segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+$(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h \
+		expert_store.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
+
+tests/test_segment_adapters_registration$(EXE): \
+		tests/test_segment_adapters_registration.c segment_runtime.c \
+		segment_runtime.h segment_adapters.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_registration.c \
+		segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_segment_adapters_real$(EXE): tests/test_segment_adapters_real.c \
+		segment_runtime.c segment_runtime.h segment_adapters.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_real.c \
+		segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+.PHONY: segment-adapters segment-adapters-real
+segment-adapters: tests/test_segment_adapters_registration$(EXE)
+	./tests/test_segment_adapters_registration$(EXE)
+
+# Maintainer/release gate. Paths point at generated/converted tiny Colibri
+# containers; see docs/segment-runtime.md for the exact generators.
+# OMP_NUM_THREADS defaults to a stable, non-single-threaded 2 for reproducible
+# reductions, but callers can override it to exercise a different schedule.
+segment-adapters-real: tests/test_segment_adapters_real$(EXE)
+	@test -n "$(GLM_SEGMENT_MODEL)" || { echo "set GLM_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(INKLING_SEGMENT_MODEL)" || { echo "set INKLING_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(KIMI_SEGMENT_MODEL)" || { echo "set KIMI_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(OLMOE_SEGMENT_MODEL)" || { echo "set OLMOE_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(QWEN_SEGMENT_MODEL)" || { echo "set QWEN_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(DEEPSEEK_SEGMENT_MODEL)" || { echo "set DEEPSEEK_SEGMENT_MODEL" >&2; exit 2; }
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm "$(GLM_SEGMENT_MODEL)" 0 3 5 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) inkling "$(INKLING_SEGMENT_MODEL)" 0 4 8 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) kimi "$(KIMI_SEGMENT_MODEL)" 0 3 6 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) olmoe "$(OLMOE_SEGMENT_MODEL)" 0 2 4 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen36 "$(QWEN_SEGMENT_MODEL)" 0 4 8 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_SEGMENT_MODEL)" 0 1 3 8
+
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
 V4_TEST_LINK_OBJS = \

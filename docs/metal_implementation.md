@@ -149,7 +149,7 @@ Ported all operations already implemented in the shared backend (backend_metal).
 - CPU fallbacks preserved in both paths when Metal unavailable
 
 **Standalone op battery test (Phase 5 expanded coverage):**
-All ops verified against CPU reference — 33 standalone op tests, all pass (maxAbs <= 4.77e-7, MAE <= 5.87e-8 across all RMSNorm cases; exact match on all add cases; maxAbs <= 3.58e-7, MAE <= 1.35e-8 on silu_mul).
+All ops verified against CPU reference — 33 standalone op tests, all pass (maxAbs ≤ 4.77e-7, MAE ≤ 5.87e-8 across all RMSNorm cases; exact match on all add cases; maxAbs ≤ 3.58e-7, MAE ≤ 1.35e-8 on silu_mul).
 
 | Op | Shapes tested | MaxAbs | MAE |
 |---|---|---|---|

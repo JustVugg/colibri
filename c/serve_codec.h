@@ -299,6 +299,20 @@ static inline int coli_serve_write_data(
     return fflush(output) == 0;
 }
 
+/* Engine-authenticated structured tool output. The payload is opaque to this
+ * transport; the gateway applies the active family parser. A zero-byte frame
+ * declares the sideband authoritative for the request, so ordinary DATA that
+ * merely resembles a tool marker is never promoted into a tool call. */
+static inline int coli_serve_write_tool(
+    FILE *output, const char *id, const void *data, size_t bytes)
+{
+    if (fprintf(output, "TOOL %s %zu\n", id, bytes) < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
 static inline int coli_serve_write_error(FILE *output, const char *id, const char *message)
 {
     if (fprintf(output, "ERROR %s ", id && *id ? id : "0") < 0) return 0;

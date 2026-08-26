@@ -151,7 +151,7 @@ pair's current restack, base dev `292ed4c`):
   stamp already resolves to `int8-row` since the #528 INVERSION, and a
   stamp's role there is instead letting a genuinely-stamped `fmt=8` tensor
   override that default — see "The metadata stamp" below for the exact
-  rule in both cases. FMT_NAMES table (name string <-> fmt int):
+  rule in both cases. FMT_NAMES table (`name string` to `fmt int`):
   `c/colibri.c:1316`.
 - **no ordinal** (`int4-rans256-g0`, merged tools-only tier — line numbers
   at dev `7fb1159`, post-#671 merge `a3a5a75`, not at this PR pair's

@@ -619,7 +619,7 @@ static int test_expert_store(void) {
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 7, 306, -1, 0
+        directory, 1, 7, 306, -1, 0, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -820,7 +820,7 @@ static int test_expert_store_prefill_pool(void) {
     }
     ColiDeepSeekV4ExpertStoreOptions options = {
         directory, LAYERS, EXPERTS,
-        (uint64_t)LAYERS * SLOTS_PER_LAYER * 51, -1, UINT64_MAX
+        (uint64_t)LAYERS * SLOTS_PER_LAYER * 51, -1, UINT64_MAX, 0
     };
     /* Deterministic A/B.  With the ordinary six-slot partition, iterating an
      * eight-expert union in the same order twice is a cyclic 0%%-hit workload:
@@ -968,7 +968,7 @@ static int run_expert_miss_scaling_case(const char *directory, int experts,
                                         int slots) {
     char error[256];
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, experts, (uint64_t)slots * 51, -1, UINT64_MAX
+        directory, 1, experts, (uint64_t)slots * 51, -1, UINT64_MAX, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,

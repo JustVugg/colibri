@@ -38,6 +38,11 @@
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "serve_codec.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -383,19 +388,30 @@ static float *load_t(Model *m, const char *name) {
     return p;
 }
 
-static void model_init(Model *m, const char *snap, int cap, int bits) {
+static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                             int layer_begin, int layer_end,
+                             int load_boundaries, int init_telemetry) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
     st_init(&m->S, snap);
     Cfg *c = &m->c;
+    if (layer_end == 0) layer_end = c->n_layers;
+    if (layer_begin < 0 || layer_end > c->n_layers ||
+        layer_begin >= layer_end) {
+        fprintf(stderr, "invalid OLMoE layer range [%d,%d) for %d layers\n",
+                layer_begin, layer_end, c->n_layers);
+        exit(1);
+    }
     double t0 = now_s();
-    m->embed      = load_t(m, "model.embed_tokens.weight");
-    m->lm_head    = load_t(m, "lm_head.weight");
-    m->final_norm = load_t(m, "model.norm.weight");
+    if (load_boundaries) {
+        m->embed      = load_t(m, "model.embed_tokens.weight");
+        m->lm_head    = load_t(m, "lm_head.weight");
+        m->final_norm = load_t(m, "model.norm.weight");
+    }
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
         LD(in_ln,  "input_layernorm.weight");
@@ -407,7 +423,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         #undef LD
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
         m->cache[i].slots = calloc(cap, sizeof(Slot));
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
@@ -415,13 +431,23 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
     }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
-    rt_init("olmoe", c->n_layers, c->n_experts);
-    rt_drop_row(c->n_layers);                     /* every olmoe layer routes; no MTP row */
-    m->freq = rt_counts_all();                    /* alias: the read sites keep their shape */
-    { const char *up = getenv("COLI_USAGE");      /* optional history to seed from */
-      if (up && *up) { int64_t h = rt_load(up);
-        if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
-                           (long long)h, up); } }
+    if (init_telemetry) {
+        rt_init("olmoe", c->n_layers, c->n_experts);
+        rt_drop_row(c->n_layers);                 /* every layer routes; no MTP row */
+        m->freq = rt_counts_all();                /* read sites keep their shape */
+        const char *up = getenv("COLI_USAGE");    /* optional history seed */
+        if (up && *up) {
+            int64_t h = rt_load(up);
+            if (h > 0)
+                fprintf(stderr,
+                        "[USAGE] expert history: %lld selections (%s)\n",
+                        (long long)h, up);
+        }
+    } else {
+        /* A process can host several ranges. Keep their optional counters
+         * detached from route_trace.h's process-global singleton. */
+        m->freq = calloc((size_t)c->n_layers, sizeof(*m->freq));
+    }
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -440,10 +466,11 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->pilot_conf_limit = cl;
     m->dense_load_s = now_s() - t0;
 
-    // Persistent Hot Pinning: try to load hot_pinned.bin
+    /* Persistent hot pinning belongs to the standalone runtime. A Segment
+     * range must never enqueue expert reads for layers it does not own. */
     char pinpath[512];
     snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
-    FILE *pinf = fopen(pinpath, "rb");
+    FILE *pinf = init_telemetry ? fopen(pinpath, "rb") : NULL;
     if (pinf) {
         size_t expected_size = (size_t)c->n_layers * c->n_experts;
         if (fread(m->is_pinned, 1, expected_size, pinf) == expected_size) {
@@ -480,6 +507,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
         fclose(pinf);
     }
+}
+
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
@@ -805,6 +836,35 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     free(logits); free(g); free(u); free(hh);
 }
 
+static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+                                 int layer_begin, int layer_end,
+                                 int allow_prefetch) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = layer_begin; i < layer_end; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        attention(m, l, i, nrm, S, pos_base, tmp);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        /* IMPROVEMENT 1: PILOT=1 -> 1-layer lookahead */
+        if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
+            pilot_prefetch(m, i + 1, x, S);
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        moe(m, l, i, nrm, S, tmp);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+
+        /* PREDICTION IMPROVEMENT C (Residual gate trick):
+         * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
+        if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
+            pilot_prefetch(m, i + 2, x, S);
+        if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
+            pilot_prefetch(m, i + 3, x, S);
+        
+    }
+    free(nrm); free(tmp);
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
@@ -821,27 +881,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        attention(m, l, i, nrm, S, pos_base, tmp);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-        /* IMPROVEMENT 1: PILOT=1 -> 1-layer lookahead */
-        if (g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
-            pilot_prefetch(m, i + 1, x, S);
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        moe(m, l, i, nrm, S, tmp);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-
-        /* PREDICTION IMPROVEMENT C (Residual gate trick):
-         * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
-        if (g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
-            pilot_prefetch(m, i + 2, x, S);
-        if (g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
-            pilot_prefetch(m, i + 3, x, S);
-        
-    }
+    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
@@ -851,7 +891,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     matmul(logit, last, m->lm_head, 1, D, c->vocab);
-    free(x); free(nrm); free(tmp); free(last);
+    free(x); free(last);
     return logit;
 }
 
@@ -1417,6 +1457,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
+#ifndef OLMOE_NO_MAIN
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
@@ -1569,3 +1610,335 @@ int main(int argc, char **argv) {
     free(buf); free(arena);
     return 0;
 }
+#endif /* OLMOE_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens;
+    pthread_mutex_t run_lock;
+} OlmoeSegmentEngine;
+
+typedef struct {
+    OlmoeSegmentEngine *engine;
+    float **K, **V;
+    uint32_t context_tokens, position;
+} OlmoeSegmentSession;
+
+static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        Layer *weights = &model->L[layer];
+        free(weights->in_ln); free(weights->post_ln);
+        free(weights->q); free(weights->k); free(weights->v); free(weights->o);
+        free(weights->qn); free(weights->kn); free(weights->gate);
+        LCache *cache = &model->cache[layer];
+        for (int slot = 0; slot < cache->n; slot++) {
+            free(cache->slots[slot].g);
+            free(cache->slots[slot].gs);
+        }
+        free(cache->slot_by_expert);
+        free(cache->slots);
+    }
+    free(model->last_access); free(model->is_queued); free(model->is_pinned);
+    free(model->freq);
+    free(model->momentum_logits);
+    free(model->cache); free(model->L);
+    st_destroy(&model->S);
+}
+
+static int olmoe_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid OLMoE Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment supports CPU only");
+    if (options->context_tokens > 4096)
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment context exceeds 4096");
+
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment range exceeds model");
+    int range_layers = (int)(options->layer_end - options->layer_begin);
+    int cap = 16;
+    if (options->memory_limit_bytes) {
+        uint64_t weights = (uint64_t)config.hidden * config.inter * 3u;
+        uint64_t scales = (uint64_t)(config.inter * 2 + config.hidden) *
+                          sizeof(float);
+        uint64_t per_slot = weights + scales;
+        uint64_t slots = per_slot && range_layers > 0
+            ? options->memory_limit_bytes / per_slot / (uint64_t)range_layers
+            : 0;
+        cap = slots > (uint64_t)config.n_experts ? config.n_experts : (int)slots;
+        if (cap < 1) cap = 1;
+    }
+
+    OlmoeSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening OLMoE Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize OLMoE Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir, cap, 8,
+                     (int)options->layer_begin, (int)options->layer_end, 0, 0);
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "olmoe");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "olmoe/kv-f32-v1");
+    coli_segment_capability_string(capabilities->numeric_class,
+                                   sizeof(capabilities->numeric_class),
+                                   "olmoe/f32-int8/cpu-v1");
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config.hidden;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = 4096;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void olmoe_segment_engine_destroy(void *engine_impl) {
+    OlmoeSegmentEngine *engine = (OlmoeSegmentEngine *)engine_impl;
+    if (!engine) return;
+    olmoe_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static int olmoe_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    OlmoeSegmentEngine *engine = (OlmoeSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid OLMoE Segment session");
+    *session_impl = NULL;
+    OlmoeSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating OLMoE session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    int layers = engine->model.c.n_layers;
+    session->K = calloc((size_t)layers, sizeof(*session->K));
+    session->V = calloc((size_t)layers, sizeof(*session->V));
+    if (!session->K || !session->V) goto oom;
+    size_t cells;
+    if (coli_segment_size_mul((size_t)engine->model.c.n_heads,
+                              options->context_tokens, &cells) ||
+        coli_segment_size_mul(cells, (size_t)engine->model.c.head_dim,
+                              &cells)) goto oom;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        session->K[layer] = calloc(cells, sizeof(float));
+        session->V[layer] = calloc(cells, sizeof(float));
+        if (!session->K[layer] || !session->V[layer]) goto oom;
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    if (session->K && session->V)
+        for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+             layer++) {
+            free(session->K[layer]); free(session->V[layer]);
+        }
+    free(session->K); free(session->V); free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating OLMoE KV");
+}
+
+static void olmoe_segment_session_destroy(void *session_impl) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    if (!session) return;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        free(session->K[layer]); free(session->V[layer]);
+    }
+    free(session->K); free(session->V); free(session);
+}
+
+static int olmoe_segment_session_run(void *session_impl,
+                                     const ColiSegmentRunRequest *request,
+                                     char *error, size_t error_size) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "OLMoE Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment run cancelled");
+    OlmoeSegmentEngine *engine = session->engine;
+    if (request->output != request->input)
+        memcpy(request->output, request->input, request->input_bytes);
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->K = session->K; model->V = session->V;
+    model->max_t = (int)session->context_tokens;
+    model->kv_len = (int)session->position;
+    layers_forward_range(model, (float *)request->output, (int)request->rows,
+                         (int)request->position, (int)engine->layer_begin,
+                         (int)engine->layer_end, 0);
+    model->K = NULL; model->V = NULL; model->max_t = 0; model->kv_len = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    session->position += request->rows;
+    return 0;
+}
+
+static int olmoe_segment_payload_size(const OlmoeSegmentSession *session,
+                                      uint32_t position, size_t *bytes) {
+    size_t cells = (size_t)(session->engine->layer_end -
+                            session->engine->layer_begin);
+    if (coli_segment_size_mul(cells, 2, &cells) ||
+        coli_segment_size_mul(cells,
+                              (size_t)session->engine->model.c.n_heads,
+                              &cells) ||
+        coli_segment_size_mul(cells, position, &cells) ||
+        coli_segment_size_mul(cells,
+                              (size_t)session->engine->model.c.head_dim,
+                              &cells) ||
+        coli_segment_size_mul(cells, sizeof(float), bytes)) return -1;
+    return 0;
+}
+
+static uint64_t olmoe_segment_state_hash(const OlmoeSegmentSession *session) {
+    uint64_t hash = COLI_SEGMENT_HASH_INIT;
+    size_t row_bytes = (size_t)session->position *
+                       session->engine->model.c.head_dim * sizeof(float);
+    int heads = session->engine->model.c.n_heads;
+    size_t stride = (size_t)session->context_tokens *
+                    session->engine->model.c.head_dim;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *state = kv ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < heads; head++)
+                hash = coli_segment_hash_update(hash, state + head * stride,
+                                                row_bytes);
+        }
+    return hash;
+}
+
+static int olmoe_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    size_t payload_bytes;
+    if (!session || olmoe_segment_payload_size(session, session->position,
+                                               &payload_bytes))
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE snapshot size overflow");
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "olmoe", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, olmoe_segment_state_hash(session));
+    if (coli_segment_stream_write(write_fn, write_user_data, &header,
+                                  sizeof(header), error, error_size)) return -1;
+    size_t row_bytes = (size_t)session->position *
+                       session->engine->model.c.head_dim * sizeof(float);
+    int heads = session->engine->model.c.n_heads;
+    size_t stride = (size_t)session->context_tokens *
+                    session->engine->model.c.head_dim;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *state = kv ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < heads; head++)
+                if (coli_segment_stream_write(
+                        write_fn, write_user_data, state + head * stride,
+                        row_bytes, error, error_size)) return -1;
+        }
+    return 0;
+}
+
+static int olmoe_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    size_t payload_bytes;
+    if (olmoe_segment_payload_size(session, header.position, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "olmoe", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens, payload_bytes,
+            error, error_size)) return -1;
+    unsigned char *payload = payload_bytes ? malloc(payload_bytes) : NULL;
+    if (payload_bytes && !payload)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory restoring OLMoE KV");
+    if (coli_segment_stream_read(read_fn, read_user_data, payload, payload_bytes,
+                                 error, error_size)) {
+        free(payload);
+        return -1;
+    }
+    if (coli_segment_hash_update(COLI_SEGMENT_HASH_INIT, payload,
+                                 payload_bytes) != header.payload_hash) {
+        free(payload);
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE snapshot checksum mismatch");
+    }
+    size_t row_bytes = (size_t)header.position *
+                       session->engine->model.c.head_dim * sizeof(float);
+    int heads = session->engine->model.c.n_heads;
+    size_t stride = (size_t)session->context_tokens *
+                    session->engine->model.c.head_dim;
+    unsigned char *cursor = payload;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *state = kv ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < heads; head++) {
+                memcpy(state + head * stride, cursor, row_bytes);
+                cursor += row_bytes;
+            }
+        }
+    session->position = header.position;
+    free(payload);
+    return 0;
+}
+
+static const ColiSegmentAdapter olmoe_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "olmoe",
+    olmoe_segment_engine_open, olmoe_segment_engine_destroy,
+    olmoe_segment_session_create, olmoe_segment_session_destroy,
+    olmoe_segment_session_run, olmoe_segment_session_snapshot,
+    olmoe_segment_session_restore, {0}
+};
+
+int coli_olmoe_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&olmoe_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */

@@ -1,0 +1,43 @@
+---
+title: "colibrì documentation"
+description: "Run frontier mixture-of-experts models across storage, RAM, and VRAM."
+---
+
+colibrì is a dependency-light inference engine for running large mixture-of-experts models on consumer and heterogeneous hardware. It treats storage, RAM, and VRAM as one inference hierarchy while keeping model semantics explicit and measurable.
+
+<CardGroup cols={2}>
+  <Card title="Run your first model" icon="rocket" href="/quickstart">
+    Build the engine, prepare a model, and start an interactive chat.
+  </Card>
+  <Card title="Expose an HTTP API" icon="server" href="/api-reference/overview">
+    Serve OpenAI- and Anthropic-compatible endpoints from one persistent model process.
+  </Card>
+  <Card title="Explore the API" icon="brackets-curly" href="/api-reference/endpoints">
+    Browse request schemas, responses, authentication, and live examples by endpoint.
+  </Card>
+  <Card title="Tune the memory hierarchy" icon="gauge-high" href="/tuning">
+    Measure and tune placement across VRAM, RAM, and storage without silently changing precision.
+  </Card>
+</CardGroup>
+
+## What you can run
+
+The repository currently includes engines for GLM, DeepSeek, Kimi, Qwen, Inkling, and OLMoE families. Each engine uses the same `coli chat`, `coli serve`, and `coli web` front end.
+
+<Note>
+colibrì is an inference engine and research platform, not a hosted service. Throughput depends heavily on model format, memory placement, storage, and prompt size.
+</Note>
+
+## Common entry points
+
+| Command | Use it for |
+| --- | --- |
+| `coli chat` | Interactive terminal inference |
+| `coli serve` | OpenAI- and Anthropic-compatible HTTP endpoints |
+| `coli web` | HTTP endpoints plus the local web dashboard |
+| `coli doctor` | Environment and dependency diagnostics |
+| `coli tune` | Measured placement and performance tuning |
+
+<Warning>
+Set `COLI_API_KEY` before exposing the HTTP server beyond a trusted local machine. Keep raw browser and telemetry endpoints behind the same network boundary.
+</Warning>

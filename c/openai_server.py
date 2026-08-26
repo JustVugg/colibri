@@ -456,8 +456,9 @@ def parse_dsv4_tool_calls(reply):
     return content.strip(), calls
 
 
-# K3 tool-call markers as re-emitted literally by kimi_k3.c's serve loop (#1143): the
-# structural XTML runs the engine would otherwise suppress come through as literal text.
+# K3 tool-call XTML carried on the engine-authenticated TOOL sideband (#1147).
+# Older #1144 engines placed the same bytes on DATA; parse_arch_tool_calls keeps
+# that path only when a request did not declare an authoritative sideband.
 K3_TOOLS_OPEN = "<|open|>tools<|sep|>"
 _K3_TOOLS_RE = re.compile(r"<\|open\|>tools<\|sep\|>(.*?)<\|close\|>tools<\|sep\|>", re.DOTALL)
 _K3_CALL_RE = re.compile(
@@ -474,7 +475,7 @@ def _k3_unescape_attr(s):
 
 
 def parse_k3_tool_calls(reply, tools=None):
-    """Return (content, tool_calls) from K3's literally re-emitted XTML tool block."""
+    """Return (content, tool_calls) from K3's engine-proven XTML tool block."""
     calls = []
     blocks = [m.group(1) for m in _K3_TOOLS_RE.finditer(reply)]
     text = _K3_TOOLS_RE.sub("", reply)
@@ -520,12 +521,15 @@ def parse_k3_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def parse_arch_tool_calls(reply, tools):
+def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply)
     if ARCH == "kimi":
-        return parse_k3_tool_calls(reply, tools)
+        if tool_reply is not None:
+            _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
+            return reply.strip(), calls
+        return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
     return parse_tool_calls(reply, tools)
 
 
@@ -1749,6 +1753,30 @@ class StopFilter:
     def stopped(self):
         return self.matched is not None
 
+
+class ToolSideband:
+    """Request-scoped K3 TOOL frames with the same stop policy as DATA."""
+    def __init__(self, enabled, sequences, ignore_leading=False):
+        self.enabled = enabled
+        self.seen = False
+        self.parts = []
+        self.filter = (StopFilter(sequences, self.parts.append, ignore_leading)
+                       if enabled else None)
+
+    def feed(self, chunk):
+        self.seen = True
+        self.filter.feed(chunk)
+
+    def stopped(self):
+        return bool(self.filter and self.filter.stopped())
+
+    def finish(self):
+        if self.filter:
+            self.filter.finish()
+
+    def reply(self):
+        return "".join(self.parts) if self.seen else None
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -2248,6 +2276,21 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("data", data))
+                elif kind == "TOOL" and len(fields) == 3:
+                    # Opaque, request-scoped structured output. K3 emits an
+                    # initial zero-byte frame before generation so DATA marker
+                    # lookalikes can never be mistaken for engine structure.
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine TOOL size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine TOOL terminator")
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("tool", data))
                 elif kind == "ECHO" and len(fields) >= 6:
                     # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
                     # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
@@ -2469,7 +2512,8 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
+                 on_tool=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2485,11 +2529,19 @@ class Engine:
         if gpayload and apayload:
             raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        tool_decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def decode(data):
             text = decoder.decode(data)
             if text:
                 on_text(text)
+
+        def decode_tool(data):
+            text = tool_decoder.decode(data)
+            if on_tool is not None:
+                # Call on zero-byte frames too: that frame declares this
+                # request's sideband authoritative even when no call follows.
+                on_tool(text)
 
         events = queue.Queue()
         with self.pending_lock:
@@ -2592,6 +2644,20 @@ class Engine:
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
+            elif kind == "tool":
+                _accept({"prompt_tokens": None})
+                if not cancel_sent and not stop_sent:
+                    decode_tool(value)
+                    if stopped and stopped():
+                        stop_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"STOP {request_id}\n".encode())
+                            self.process.stdin.flush()
+                    elif cancelled and cancelled():
+                        cancel_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -2603,6 +2669,9 @@ class Engine:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
+                tool_tail = tool_decoder.decode(b"", final=True)
+                if tool_tail and on_tool is not None:
+                    on_tool(tool_tail)
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 raise ClientCancelled()
@@ -3215,11 +3284,19 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                sideband = ToolSideband(ARCH == "kimi" and chat and bool(tools),
+                                        stop_sequences, ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}))
                 stop_filter.finish()
+                sideband.finish()
                 text = "".join(output)
                 reasoning = ""
                 if ARCH == "inkling":
@@ -3231,7 +3308,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_arch_tool_calls(text, tools)
+                    content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -3358,8 +3435,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 sp = {"buf": "", "tool": False}
                 hold = _tool_hold()
                 raw = []
+                sideband = ToolSideband(ARCH == "kimi", stop_sequences,
+                                        ignore_leading_stop)
+
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
+                    if sideband.seen:
+                        emit(chunk)
+                        return
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
@@ -3384,16 +3467,23 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (think.feed if think else feed_content)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
+                sideband.finish()
                 if think:
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_arch_tool_calls("".join(raw), tools)
+                _content, calls = parse_arch_tool_calls("".join(raw), tools,
+                                                        sideband.reply())
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -3552,7 +3642,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
 
-        def blocks_and_stop(text, stats):
+        def blocks_and_stop(text, stats, tool_reply=None):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
             reasoning = ""
@@ -3565,7 +3655,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_arch_tool_calls(text, tools)
+                text, calls = parse_arch_tool_calls(text, tools, tool_reply)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -3585,11 +3675,20 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
+                                        ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}))
                 stop_filter.finish()
-                content, stop_reason = blocks_and_stop("".join(output), stats)
+                sideband.finish()
+                content, stop_reason = blocks_and_stop("".join(output), stats,
+                                                       sideband.reply())
                 self.send_json(200, {
                     "id": message_id, "type": "message", "role": "assistant",
                     "model": self.server.model_id, "content": content,
@@ -3653,6 +3752,8 @@ class APIHandler(BaseHTTPRequestHandler):
             ka_thread.start()
 
             raw = []
+            sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
+                                    ignore_leading_stop)
             state = {"buf": "", "in_tool": False}
             hold = _tool_hold()
 
@@ -3668,6 +3769,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             def emit_answer(chunk):
                 if not tools:
+                    emit_text(chunk)
+                    return
+                if sideband.seen:
                     emit_text(chunk)
                     return
                 if state["in_tool"]:
@@ -3711,10 +3815,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 (split.feed if split else emit_answer)(chunk)
 
             stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
+
+            def generation_stopped():
+                return stop_filter.stopped() or sideband.stopped()
+
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
+                lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
+                **({"on_tool": sideband.feed} if sideband.enabled else {}))
             stop_filter.finish()
+            sideband.finish()
             if split:
                 split.close()
                 close_thinking()               # budget exhaustion before </think>
@@ -3726,7 +3836,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop",
                                                   "index": text_index})
 
-            content, stop_reason = blocks_and_stop("".join(raw), stats)
+            content, stop_reason = blocks_and_stop("".join(raw), stats,
+                                                   sideband.reply())
             index = text_index + 1 if stream_state["text_started"] else 1
             for block in content:
                 if block["type"] != "tool_use":

@@ -62,12 +62,19 @@ Per request, in order:
 
 ```
 DATA <id> <n>\n<n bytes of UTF-8>\n        # a decoded token's text; repeated
+TOOL <id> <n>\n<n bytes of UTF-8>\n        # engine-authenticated tool structure; Kimi K3 only
 TOPK <id> 5 <logprob> <hextext> ... ×5     # candidates for the sampled token (SERVE_TOPK=1)
 HITS <rows> <cols> <hex>                   # ~every 6 tokens: routed-expert bitmap since last HITS
 REPIN <layer> <eid> <old_tier> <gpu>       # live re-pin swap events, as they happen
 ...
 DONE <id> STAT <emitted> <tok_s> <hit_pct> <rss_gb> <prompt_tokens> <length_limited>
 ```
+
+Kimi K3 emits a zero-byte `TOOL` frame immediately after `ACCEPT` for every
+chat request. That frame declares the sideband authoritative even when no tool
+call follows. Real K3 special-token structure and its enclosed tool payload use
+subsequent `TOOL` frames; ordinary decoded text remains on `DATA`, so text that
+only resembles an XTML marker cannot be promoted into a client tool call.
 
 Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
 `SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `NOT_FOUND` (CANCEL of unknown id),

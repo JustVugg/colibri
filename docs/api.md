@@ -276,7 +276,7 @@ telemetry stack — hardware, scheduler, tier bar, per-turn time breakdown, tok/
 trend and per-GPU expert counts:
 
 <p align="center">
-  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport">
+  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
   &nbsp;&nbsp;
-  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar">
+  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar" />
 </p>

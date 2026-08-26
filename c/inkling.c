@@ -27,6 +27,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/select.h>                              /* serve-loop stdin poll (POSIX); inkling serves on Linux */
@@ -40,6 +41,11 @@
 #include "route_trace.h"
 #include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -881,7 +887,10 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
 
 static double mem_avail_bytes(void);
 
-static void model_init(Model *m, const char *snap, int cap, int bits) {
+static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                             int layer_begin, int layer_end,
+                             int load_boundaries, int allocate_state,
+                             int init_telemetry) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
@@ -899,6 +908,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
     Cfg *c = &m->c;
+    if (layer_end == 0) layer_end = c->n_layers;
+    if (layer_begin < 0 || layer_begin >= layer_end ||
+        layer_end > c->n_layers) {
+        fprintf(stderr, "invalid Inkling layer range [%d,%d) for %d layers\n",
+                layer_begin, layer_end, c->n_layers);
+        exit(1);
+    }
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
 #ifdef COLI_CUDA
@@ -925,15 +941,17 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
 #endif
-    m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-    m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
-    m->final_norm = load_t(m, "model.norm.weight");
-    m->lm_head    = load_w(m, "lm_head.weight", 1);
+    if (load_boundaries) {
+        m->embed      = load_w(m, "model.embed_tokens.weight", 0);
+        m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+        m->final_norm = load_t(m, "model.norm.weight");
+        m->lm_head    = load_w(m, "lm_head.weight", 1);
+    }
     /* Inkling's audio "tower" is one embedding table + one RMSNorm. The int4
      * containers are text-only, so these usually arrive via an audio.safetensors
      * sidecar dropped in the snapshot dir (st_init indexes every *.safetensors).
      * Absent tensors = text-only engine, exactly as before. */
-    if (st_has(&m->S, "model.audio.encoder.weight")) {
+    if (load_boundaries && st_has(&m->S, "model.audio.encoder.weight")) {
         /* SEC (GHSA-w696): mel_bins/mel_vocab come straight from config.json with
          * no bounds. audio_embed_row indexes the table at (b*mel_vocab+v)*D with
          * b<mel_bins, v<mel_vocab — so the table must have exactly
@@ -955,8 +973,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 c->mel_bins, c->mel_vocab, D);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
+    for (int j = 0; j < 4; j++)
+        m->cs[j] = calloc(c->n_layers, sizeof(float*));
     char nm[320];
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
         #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
@@ -1008,8 +1028,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         #undef LDW
         /* conv states: raw inputs of the previous K-1 steps, zero-init */
         int kvdim = L_KV(c,i) * L_HD(c,i);
-        for (int j = 0; j < 4; j++) {
-            if (!m->cs[j]) m->cs[j] = calloc(c->n_layers, sizeof(float*));
+        for (int j = 0; j < 4; j++) if (allocate_state) {
             int C = (j < 2) ? kvdim : D;
             m->cs[j][i] = calloc((int64_t)C * (K-1), sizeof(float));
         }
@@ -1017,7 +1036,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     /* container detection: converted snapshots store experts as U8 + .qs.
      * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
     int64_t I = c->moe_inter, E = c->n_experts;
-    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+    for (int i = layer_begin; i < layer_end; i++) if (c->sparse[i]) {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
         st_tensor *t = st_find(&m->S, nm);
         if (t && t->dtype == 3) {
@@ -1030,7 +1049,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
         break;
     }
-    int nsp = 0; for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
+    int nsp = 0; for (int i = layer_begin; i < layer_end; i++) nsp += c->sparse[i];
     int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
     if (cap <= 0) {   /* auto: fit the LRU in available RAM, 20% + 4 GB headroom */
@@ -1042,10 +1061,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 cap, (double)cap*slotb*nsp/1e9);
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         LCache *lc = &m->cache[i];
         lc->cap = cap;
-        lc->slots = calloc(cap, sizeof(Slot));
+        if (c->sparse[i]) lc->slots = calloc(cap, sizeof(Slot));
         if (c->sparse[i]) {
             lc->slot_by_expert = malloc((size_t)E * sizeof(int));
             if (!lc->slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
@@ -1062,7 +1081,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         size_t pg = 16384;
         size_t wlen = ((size_t)cap*(st13+st2) + pg - 1) / pg * pg;
         size_t slen = ((size_t)cap*(2*I+D)*4 + pg - 1) / pg * pg;
-        for (int i = 0; i < c->n_layers; i++) {
+        for (int i = layer_begin; i < layer_end; i++) {
             if (!c->sparse[i]) continue;
             void *wsl = NULL, *ssl = NULL;
             if (posix_memalign(&wsl, pg, wlen) || posix_memalign(&ssl, pg, slen)) {
@@ -1080,11 +1099,17 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
     /* usage counters; seeded from a previous run's history when present */
-    rt_init("inkling", c->n_layers, E);
-    for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
-    rt_drop_row(c->n_layers);                     /* inkling has no MTP row */
-    m->eusage = rt_counts_all();                  /* alias: the bump sites stay as they are */
+    if (init_telemetry) {
+        rt_init("inkling", c->n_layers, E);
+        for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
+        rt_drop_row(c->n_layers);                 /* inkling has no MTP row */
+        m->eusage = rt_counts_all();              /* alias: the bump sites stay as they are */
+    }
     m->dense_load_s = now_s() - t0;
+}
+
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    model_init_range(m, snap, cap, bits, 0, 0, 1, 1, 1);
 }
 
 static double mem_avail_bytes(void) {
@@ -1596,7 +1621,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             int s = (int)(t / K), kk = (int)(t % K);
             if (kk >= keff[s]) { use[t - base] = NULL; continue; }   /* scartato da TOPP */
             int eid = idx[(int64_t)s*K + kk];
-            if (m->eusage[layer]) m->eusage[layer][eid]++;
+            if (m->eusage && m->eusage[layer]) m->eusage[layer][eid]++;
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
             else {
@@ -1771,6 +1796,31 @@ static int audio_tok_count(Model *m, const int *ids, int n) {
     return k;
 }
 
+static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
+                                          int layer_begin, int layer_end) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = layer_begin; i < layer_end; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D,
+                        l->in_ln, D, c->eps);
+        double ta = now_s();
+        attention(m, l, i, nrm, S, pos0, tmp);
+        m->t_attn += now_s() - ta;
+        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D,
+                        l->post_ln, D, c->eps);
+        if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
+        else dense_mlp(m, l, nrm, S, tmp);
+        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+    }
+    free(nrm); free(tmp);
+}
+
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
  * non-NULL also writes the per-position argmax (teacher-forcing check).
@@ -1792,21 +1842,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, x + (int64_t)s*D, m->embed_norm, D, c->eps);
     }
     free(arow);
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        double ta = now_s();
-        attention(m, l, i, nrm, S, pos0, tmp);
-        m->t_attn += now_s() - ta;
-        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
-        else dense_mlp(m, l, nrm, S, tmp);
-        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-    }
+    inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
     m->kv_len = pos0 + S;
     /* record what was just fed, at the positions it went to (kv_prefix.h).
      * Audio taints the record: every frame carries the same token id while the
@@ -1827,7 +1863,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     for (int d = 0; d < D; d++) last[d] /= c->mup;
     matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
-    free(x); free(nrm); free(tmp); free(last);
+    free(x); free(last);
     return logit;
 }
 
@@ -2326,6 +2362,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
+#ifndef INKLING_NO_MAIN
 int main(int argc, char **argv) {
     /* OpenMP hot-thread tuning, same trick (and rationale) as glm.c: the
      * per-expert matmul regions are tiny and back-to-back; the default passive
@@ -2551,3 +2588,394 @@ int main(int argc, char **argv) {
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;
 }
+#endif /* INKLING_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens;
+    pthread_mutex_t run_lock;
+} InklingSegmentEngine;
+
+typedef struct {
+    InklingSegmentEngine *engine;
+    float **K, **V;
+    float **cs[4];
+    uint32_t context_tokens, position;
+} InklingSegmentSession;
+
+static void inkling_segment_wt_destroy(Wt *weight) {
+    if (!weight) return;
+    free(weight->f); free(weight->h);
+    free(weight->q4); free(weight->qs);
+    memset(weight, 0, sizeof(*weight));
+}
+
+static void inkling_segment_layer_destroy(Layer *layer) {
+    if (!layer) return;
+    free(layer->in_ln); free(layer->post_ln);
+    inkling_segment_wt_destroy(&layer->q);
+    inkling_segment_wt_destroy(&layer->k);
+    inkling_segment_wt_destroy(&layer->v);
+    inkling_segment_wt_destroy(&layer->r);
+    inkling_segment_wt_destroy(&layer->o);
+    free(layer->qn); free(layer->kn); free(layer->relp);
+    free(layer->k_cw); free(layer->v_cw);
+    free(layer->a_cw); free(layer->m_cw);
+    inkling_segment_wt_destroy(&layer->dg);
+    inkling_segment_wt_destroy(&layer->du);
+    inkling_segment_wt_destroy(&layer->dd);
+    free(layer->router); free(layer->rbias);
+    inkling_segment_wt_destroy(&layer->sh_g);
+    inkling_segment_wt_destroy(&layer->sh_u);
+    inkling_segment_wt_destroy(&layer->sh_d);
+}
+
+static void inkling_segment_model_destroy(InklingSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        inkling_segment_layer_destroy(&model->L[layer]);
+        LCache *cache = &model->cache[layer];
+        if (model->xq && cache->cap > 0 && cache->slots) {
+            free(cache->slots[0].p13);
+            free(cache->slots[0].s13);
+        } else if (cache->slots) {
+            for (int slot = 0; slot < cache->cap; slot++) {
+                free(cache->slots[slot].q13); free(cache->slots[slot].q2);
+                free(cache->slots[slot].s13); free(cache->slots[slot].s2);
+                free(cache->slots[slot].f13); free(cache->slots[slot].f2);
+            }
+        }
+        free(cache->slot_by_expert); free(cache->slots);
+    }
+    inkling_segment_wt_destroy(&model->embed);
+    inkling_segment_wt_destroy(&model->lm_head);
+    inkling_segment_wt_destroy(&model->audio_enc);
+    free(model->embed_norm); free(model->final_norm); free(model->audio_norm);
+    free(model->K); free(model->V);
+    for (int state = 0; state < 4; state++) free(model->cs[state]);
+    free(model->cache); free(model->L);
+    kv_prefix_free(&model->kvp);
+    st_destroy(&model->Sq); st_destroy(&model->S);
+}
+
+static int inkling_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Inkling Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling Segment currently supports CPU");
+
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling Segment range exceeds model");
+    int bits = getenv("INK_SEGMENT_BITS")
+        ? atoi(getenv("INK_SEGMENT_BITS")) : 0;
+    if (bits && (bits < 2 || bits > 8))
+        return coli_segment_adapter_error(error, error_size,
+                                           "INK_SEGMENT_BITS must be 0 or 2..8");
+    int sparse_layers = 0;
+    for (uint32_t layer = options->layer_begin; layer < options->layer_end;
+         layer++) sparse_layers += config.sparse[layer] != 0;
+    int cap = 0;
+    if (options->memory_limit_bytes && sparse_layers) {
+        uint64_t slot_bytes = bits
+            ? 3u * (uint64_t)config.moe_inter * config.hidden +
+              (uint64_t)(2 * config.moe_inter + config.hidden) * sizeof(float)
+            : 3u * (uint64_t)config.moe_inter * config.hidden * sizeof(float);
+        uint64_t slots = slot_bytes
+            ? options->memory_limit_bytes / slot_bytes /
+              (uint64_t)sparse_layers : 0;
+        cap = slots > (uint64_t)config.n_experts
+            ? config.n_experts : (int)slots;
+        if (cap < 1) cap = 1;
+    }
+
+    InklingSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening Inkling Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize Inkling Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir, cap, bits,
+                     (int)options->layer_begin, (int)options->layer_end,
+                     0, 0, 0);
+    for (int state = 0; state < 4; state++) {
+        free(engine->model.cs[state]);
+        engine->model.cs[state] = NULL;
+    }
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "inkling");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "inkling/kv-ring-conv-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "inkling/expert-q%d/f32/cpu-v1", bits);
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config.hidden;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = options->context_tokens;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void inkling_segment_engine_destroy(void *engine_impl) {
+    InklingSegmentEngine *engine = (InklingSegmentEngine *)engine_impl;
+    if (!engine) return;
+    inkling_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static void inkling_segment_session_free(InklingSegmentSession *session) {
+    if (!session) return;
+    if (session->engine) {
+        for (uint32_t layer = session->engine->layer_begin;
+             layer < session->engine->layer_end; layer++) {
+            free(session->K ? session->K[layer] : NULL);
+            free(session->V ? session->V[layer] : NULL);
+            for (int state = 0; state < 4; state++)
+                free(session->cs[state] ? session->cs[state][layer] : NULL);
+        }
+    }
+    free(session->K); free(session->V);
+    for (int state = 0; state < 4; state++) free(session->cs[state]);
+    free(session);
+}
+
+static int inkling_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    InklingSegmentEngine *engine = (InklingSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Inkling Segment session");
+    *session_impl = NULL;
+    InklingSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating Inkling session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    size_t layers = (size_t)engine->model.c.n_layers;
+    session->K = calloc(layers, sizeof(*session->K));
+    session->V = calloc(layers, sizeof(*session->V));
+    for (int state = 0; state < 4; state++)
+        session->cs[state] = calloc(layers, sizeof(*session->cs[state]));
+    if (!session->K || !session->V || !session->cs[0] || !session->cs[1] ||
+        !session->cs[2] || !session->cs[3]) goto oom;
+
+    Cfg *config = &engine->model.c;
+    uint64_t state_bytes = 0;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        size_t cells;
+        int kvdim = L_KV(config, layer) * L_HD(config, layer);
+        int rows = kv_ring_rows(config, (int)layer,
+                                (int)options->context_tokens);
+        if (coli_segment_size_mul((size_t)L_KV(config, layer),
+                                  (size_t)rows, &cells) ||
+            coli_segment_size_mul(cells, (size_t)L_HD(config, layer),
+                                  &cells)) goto oom;
+        session->K[layer] = calloc(cells, sizeof(float));
+        session->V[layer] = calloc(cells, sizeof(float));
+        state_bytes += 2u * (uint64_t)cells * sizeof(float);
+        for (int state = 0; state < 4; state++) {
+            int width = state < 2 ? kvdim : config->hidden;
+            if (coli_segment_size_mul((size_t)width,
+                                      (size_t)(config->conv_k - 1),
+                                      &cells)) goto oom;
+            session->cs[state][layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+        }
+        if (!session->K[layer] || !session->V[layer] ||
+            !session->cs[0][layer] || !session->cs[1][layer] ||
+            !session->cs[2][layer] || !session->cs[3][layer]) goto oom;
+    }
+    if (options->memory_limit_bytes &&
+        state_bytes > options->memory_limit_bytes) {
+        inkling_segment_session_free(session);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling session state exceeds memory limit");
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    inkling_segment_session_free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating Inkling state");
+}
+
+static void inkling_segment_session_destroy(void *session_impl) {
+    inkling_segment_session_free((InklingSegmentSession *)session_impl);
+}
+
+static int inkling_segment_session_run(void *session_impl,
+                                       const ColiSegmentRunRequest *request,
+                                       char *error, size_t error_size) {
+    InklingSegmentSession *session = (InklingSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "Inkling Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling Segment run cancelled");
+    InklingSegmentEngine *engine = session->engine;
+    if (request->output != request->input)
+        memcpy(request->output, request->input, request->input_bytes);
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->K = session->K; model->V = session->V;
+    for (int state = 0; state < 4; state++) model->cs[state] = session->cs[state];
+    model->max_t = (int)session->context_tokens;
+    model->kv_len = (int)session->position;
+    inkling_layers_forward_range(model, (float *)request->output,
+                                  (int)request->rows, (int)request->position,
+                                  (int)engine->layer_begin,
+                                  (int)engine->layer_end);
+    model->K = NULL; model->V = NULL;
+    for (int state = 0; state < 4; state++) model->cs[state] = NULL;
+    model->max_t = 0; model->kv_len = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    session->position += request->rows;
+    return 0;
+}
+
+static int inkling_segment_spans(
+    InklingSegmentSession *session, uint32_t position,
+    ColiSegmentStateSpan **spans_output, size_t *count_output,
+    char *error, size_t error_size) {
+    Cfg *config = &session->engine->model.c;
+    size_t capacity = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        capacity += (size_t)(2 * L_KV(config, layer) + 4);
+    ColiSegmentStateSpan *spans = capacity
+        ? calloc(capacity, sizeof(*spans)) : NULL;
+    if (capacity && !spans)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory describing Inkling state");
+    size_t count = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        int kv = L_KV(config, layer), hd = L_HD(config, layer);
+        int rows = kv_ring_rows(config, (int)layer,
+                                (int)session->context_tokens);
+        size_t live_rows = config->local[layer] ? (size_t)rows : position;
+        size_t stride = (size_t)rows * hd;
+        size_t row_bytes = live_rows * hd * sizeof(float);
+        for (int which = 0; which < 2; which++) {
+            float *state = which ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < kv; head++)
+                spans[count++] = (ColiSegmentStateSpan){
+                    state + (size_t)head * stride, row_bytes};
+        }
+        int kvdim = kv * hd;
+        for (int state = 0; state < 4; state++) {
+            int width = state < 2 ? kvdim : config->hidden;
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cs[state][layer],
+                (size_t)width * (config->conv_k - 1) * sizeof(float)};
+        }
+    }
+    *spans_output = spans; *count_output = count;
+    return 0;
+}
+
+static int inkling_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    InklingSegmentSession *session = (InklingSegmentSession *)session_impl;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (!session || inkling_segment_spans(session, session->position, &spans,
+                                          &count, error, error_size))
+        return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes)) {
+        free(spans);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling snapshot size overflow");
+    }
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "inkling", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, coli_segment_spans_hash(spans, count));
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    if (!result)
+        result = coli_segment_spans_write(spans, count, write_fn,
+                                          write_user_data, error, error_size);
+    free(spans);
+    return result;
+}
+
+static int inkling_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    InklingSegmentSession *session = (InklingSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (inkling_segment_spans(session, header.position, &spans, &count,
+                              error, error_size)) return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "inkling", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens,
+            payload_bytes, error, error_size)) {
+        free(spans); return -1;
+    }
+    int result = coli_segment_spans_restore(
+        spans, count, header.payload_hash, read_fn, read_user_data,
+        error, error_size);
+    free(spans);
+    if (!result) session->position = header.position;
+    return result;
+}
+
+static const ColiSegmentAdapter inkling_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "inkling",
+    inkling_segment_engine_open, inkling_segment_engine_destroy,
+    inkling_segment_session_create, inkling_segment_session_destroy,
+    inkling_segment_session_run, inkling_segment_session_snapshot,
+    inkling_segment_session_restore, {0}
+};
+
+int coli_inkling_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&inkling_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */

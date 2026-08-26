@@ -60,6 +60,11 @@ static int qwen36_max_ctx(void) {
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1209,7 +1214,9 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
     return p;
 }
 
-static void model_init(Model *m, const char *snap, int cap, int bits) {
+static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                             int layer_begin, int layer_end,
+                             int load_boundaries, int allocate_state) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
@@ -1221,10 +1228,19 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     }
     st_init(&m->S, snap);
     Cfg *c = &m->c;
+    if (layer_end == 0) layer_end = c->n_layers;
+    if (layer_begin < 0 || layer_end > c->n_layers ||
+        layer_begin >= layer_end) {
+        fprintf(stderr, "invalid Qwen3.6 layer range [%d,%d) for %d layers\n",
+                layer_begin, layer_end, c->n_layers);
+        exit(1);
+    }
     double t0 = now_s();
-    m->embed      = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
-    m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
-    m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
+    if (load_boundaries) {
+        m->embed      = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+        m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
+        m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
+    }
     m->L = calloc(c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
      * under its OWN original index model.layers.{i}. So active_of is the identity
@@ -1232,7 +1248,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->active_of = malloc((size_t)c->n_layers * sizeof(int));
     for (int i = 0; i < c->n_layers; i++) m->active_of[i] = i;
     char nm[256];
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
         /* input/post layernorms + MoE exist for every layer */
@@ -1289,7 +1305,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
         m->cache[i].slots = calloc(cap, sizeof(Slot));
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
@@ -1299,7 +1315,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
     m->DN_rec = calloc(c->n_layers, sizeof(float*));
     m->DN_conv = calloc(c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
         m->DN_rec[i]  = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
@@ -1324,6 +1340,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
     m->pilot_conf_limit = cl;
     m->dense_load_s = now_s() - t0;
+}
+
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 }
 
 /* scale counts per expert matrix: per-row (gs=0) or grouped along input dim */
@@ -1416,12 +1436,13 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
  * mislabeled meta.ebits — cf. load_expert_merged).  Returns 1 if the container
  * stores true int4 packed weights, 0 otherwise.  Used to pick the Vulkan
  * pipeline at init time. */
-static int container_is_int4(Model *m) {
+static int container_layer_is_int4(Model *m, int layer) {
     Cfg *cc = &m->c;
     int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
     int64_t want_w = ng + ng + nd;
     char nm[256];
-    snprintf(nm, sizeof(nm), "model.layers.0.mlp.experts.0.merged_weight");
+    snprintf(nm, sizeof(nm),
+             "model.layers.%d.mlp.experts.0.merged_weight", layer);
     st_tensor *tw = st_find(&m->S, nm);
     if (!tw) return 0;
     return (tw->nbytes == want_w / 2) ? 1 : 0;
@@ -2058,6 +2079,42 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
 }
 
+static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+                                 int layer_begin, int layer_end,
+                                 int allow_prefetch, FILE *lf) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = layer_begin; i < layer_end; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        double _t0 = tm_on() ? tm_now() : 0.0;
+        if (c->is_attn[i]) {
+            attention(m, l, i, nrm, S, pos_base, tmp);
+            if (tm_on()) tm_add(S, 1, tm_now()-_t0);
+        } else {
+            deltanet(m, l, i, nrm, S, pos_base, tmp);
+            if (tm_on()) tm_add(S, 0, tm_now()-_t0);
+        }
+        if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
+        if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
+            pilot_prefetch(m, i + 1, x, S);
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        _t0 = tm_on() ? tm_now() : 0.0;
+        moe(m, l, i, nrm, S, tmp);
+        if (tm_on()) tm_add(S, 2, tm_now()-_t0);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
+        if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
+            pilot_prefetch(m, i + 2, x, S);
+        if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
+            pilot_prefetch(m, i + 3, x, S);
+    }
+    free(nrm); free(tmp);
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
@@ -2083,34 +2140,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        double _t0 = tm_on() ? tm_now() : 0.0;
-        if (c->is_attn[i]) {
-            attention(m, l, i, nrm, S, pos_base, tmp);
-            if (tm_on()) tm_add(S, 1, tm_now()-_t0);
-        } else {
-            deltanet(m, l, i, nrm, S, pos_base, tmp);
-            if (tm_on()) tm_add(S, 0, tm_now()-_t0);
-        }
-        if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-        if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
-        if (g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
-            pilot_prefetch(m, i + 1, x, S);
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        _t0 = tm_on() ? tm_now() : 0.0;
-        moe(m, l, i, nrm, S, tmp);
-        if (tm_on()) tm_add(S, 2, tm_now()-_t0);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-        if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
-        if (g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
-            pilot_prefetch(m, i + 2, x, S);
-        if (g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
-            pilot_prefetch(m, i + 3, x, S);
-    }
+    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
@@ -2120,7 +2150,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     double _th = tm_on() ? tm_now() : 0.0;
     matmul_d(logit, last, m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
-    free(x); free(nrm); free(tmp); free(last);
+    free(x); free(last);
     if (lf) fclose(lf);
     if (m->resident_collecting) {
         int prefill_end = m->first_step;
@@ -2743,3 +2773,388 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* QWEN36_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens;
+    pthread_mutex_t run_lock;
+} Qwen36SegmentEngine;
+
+typedef struct {
+    Qwen36SegmentEngine *engine;
+    float **K, **V, **DN_rec, **DN_conv;
+    uint32_t context_tokens, position;
+} Qwen36SegmentSession;
+
+static void qwen36_segment_layer_free(Layer *layer) {
+    free(layer->in_ln); free(layer->post_ln);
+    free(layer->q); free(layer->k); free(layer->v); free(layer->o);
+    free(layer->qn); free(layer->kn); free(layer->gate); free(layer->gate_bias);
+    free(layer->sh_g); free(layer->sh_u); free(layer->sh_d); free(layer->sh_gate);
+    free(layer->dn_qkv); free(layer->dn_z); free(layer->dn_b); free(layer->dn_a);
+    free(layer->dn_conv); free(layer->dn_dtbias); free(layer->dn_alog);
+    free(layer->dn_norm); free(layer->dn_out);
+}
+
+static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        qwen36_segment_layer_free(&model->L[layer]);
+        LCache *cache = &model->cache[layer];
+        for (int slot = 0; slot < cache->n; slot++) {
+            free(cache->slots[slot].g);
+            free(cache->slots[slot].gs);
+            free(cache->slots[slot].g4);
+            free(cache->slots[slot].u4);
+            free(cache->slots[slot].d4);
+        }
+        free(cache->slot_by_expert); free(cache->slots);
+    }
+    free(model->attn_sc);
+    free(model->seen); free(model->is_queued); free(model->is_pinned);
+    free(model->momentum_logits); free(model->freq);
+    free(model->DN_conv); free(model->DN_rec);
+    free(model->cache); free(model->active_of); free(model->L);
+    free(model->c.is_attn);
+    st_destroy(&model->S);
+}
+
+static int qwen36_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Qwen3.6 Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 Segment currently supports CPU");
+    if (options->context_tokens > QWEN36_ATTN_MAX_CTX)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 Segment context exceeds model limit");
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    int configured_layers = config.n_layers;
+    load_meta(&config, options->model_dir);
+    validate_cfg(&config, configured_layers);
+    if (options->layer_end > (uint32_t)config.n_layers) {
+        free(config.is_attn);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 Segment range exceeds model");
+    }
+    int range_layers = (int)(options->layer_end - options->layer_begin);
+    int cap = 16;
+    if (options->memory_limit_bytes) {
+        uint64_t weights = (uint64_t)config.hidden * config.inter * 3u;
+        uint64_t per_slot = weights +
+            (uint64_t)(config.inter * 2 + config.hidden) * sizeof(float);
+        uint64_t slots = per_slot && range_layers > 0
+            ? options->memory_limit_bytes / per_slot / (uint64_t)range_layers
+            : 0;
+        cap = slots > (uint64_t)config.n_experts ? config.n_experts : (int)slots;
+        if (cap < 1) cap = 1;
+    }
+    Qwen36SegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine) {
+        free(config.is_attn);
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening Qwen3.6 Segment");
+    }
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(config.is_attn); free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize Qwen3.6 Segment lock");
+    }
+    free(config.is_attn);
+    model_init_range(&engine->model, options->model_dir, cap, 8,
+                     (int)options->layer_begin, (int)options->layer_end, 0, 0);
+    engine->model.quant_bits = container_layer_is_int4(
+        &engine->model, (int)options->layer_begin) ? 4 : 8;
+    free(engine->model.DN_rec); free(engine->model.DN_conv);
+    engine->model.DN_rec = NULL; engine->model.DN_conv = NULL;
+    engine->model.max_t = (int)options->context_tokens;
+    engine->model.kv_cap = (int)options->context_tokens;
+    engine->model.attn_sc_thr = 1;
+#ifdef _OPENMP
+    engine->model.attn_sc_thr = omp_get_max_threads();
+    if (engine->model.attn_sc_thr < 1) engine->model.attn_sc_thr = 1;
+#endif
+    size_t scratch_cells;
+    if (coli_segment_size_mul((size_t)engine->model.attn_sc_thr,
+                              options->context_tokens, &scratch_cells)) {
+        qwen36_segment_model_destroy(engine);
+        pthread_mutex_destroy(&engine->run_lock); free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 attention scratch overflows");
+    }
+    engine->model.attn_sc = calloc(scratch_cells, sizeof(float));
+    if (!engine->model.attn_sc) {
+        qwen36_segment_model_destroy(engine);
+        pthread_mutex_destroy(&engine->run_lock); free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory for Qwen3.6 attention");
+    }
+    engine->model.resident_mode = 0;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "qwen36");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "qwen36/kv-deltanet-conv-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "qwen36/f32-int%d/cpu-v1", engine->model.quant_bits);
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = (uint32_t)engine->model.c.hidden;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = QWEN36_ATTN_MAX_CTX;
+    capabilities->num_layers = (uint32_t)engine->model.c.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void qwen36_segment_engine_destroy(void *engine_impl) {
+    Qwen36SegmentEngine *engine = (Qwen36SegmentEngine *)engine_impl;
+    if (!engine) return;
+    qwen36_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static int qwen36_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    Qwen36SegmentEngine *engine = (Qwen36SegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Qwen3.6 Segment session");
+    *session_impl = NULL;
+    Qwen36SegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating Qwen3.6 session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    int layers = engine->model.c.n_layers;
+    session->K = calloc((size_t)layers, sizeof(*session->K));
+    session->V = calloc((size_t)layers, sizeof(*session->V));
+    session->DN_rec = calloc((size_t)layers, sizeof(*session->DN_rec));
+    session->DN_conv = calloc((size_t)layers, sizeof(*session->DN_conv));
+    if (!session->K || !session->V || !session->DN_rec || !session->DN_conv)
+        goto oom;
+    Cfg *config = &engine->model.c;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        size_t cells;
+        if (config->is_attn[layer]) {
+            if (coli_segment_size_mul((size_t)config->kv_heads,
+                                      options->context_tokens, &cells) ||
+                coli_segment_size_mul(cells, (size_t)config->k_head_dim,
+                                      &cells)) goto oom;
+            session->K[layer] = calloc(cells, sizeof(float));
+            session->V[layer] = calloc(cells, sizeof(float));
+            if (!session->K[layer] || !session->V[layer]) goto oom;
+        } else {
+            if (coli_segment_size_mul((size_t)config->dn_vheads,
+                                      (size_t)config->dn_kdim, &cells) ||
+                coli_segment_size_mul(cells, (size_t)config->dn_vdim,
+                                      &cells)) goto oom;
+            session->DN_rec[layer] = calloc(cells, sizeof(float));
+            if (coli_segment_size_mul((size_t)config->dn_conv_dim,
+                                      (size_t)(config->dn_convk - 1),
+                                      &cells)) goto oom;
+            session->DN_conv[layer] = calloc(cells, sizeof(float));
+            if (!session->DN_rec[layer] || !session->DN_conv[layer]) goto oom;
+        }
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        free(session->K ? session->K[layer] : NULL);
+        free(session->V ? session->V[layer] : NULL);
+        free(session->DN_rec ? session->DN_rec[layer] : NULL);
+        free(session->DN_conv ? session->DN_conv[layer] : NULL);
+    }
+    free(session->K); free(session->V);
+    free(session->DN_rec); free(session->DN_conv); free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating Qwen3.6 state");
+}
+
+static void qwen36_segment_session_destroy(void *session_impl) {
+    Qwen36SegmentSession *session = (Qwen36SegmentSession *)session_impl;
+    if (!session) return;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        free(session->K[layer]); free(session->V[layer]);
+        free(session->DN_rec[layer]); free(session->DN_conv[layer]);
+    }
+    free(session->K); free(session->V);
+    free(session->DN_rec); free(session->DN_conv); free(session);
+}
+
+static int qwen36_segment_session_run(void *session_impl,
+                                      const ColiSegmentRunRequest *request,
+                                      char *error, size_t error_size) {
+    Qwen36SegmentSession *session = (Qwen36SegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "Qwen3.6 Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 Segment run cancelled");
+    Qwen36SegmentEngine *engine = session->engine;
+    if (request->output != request->input)
+        memcpy(request->output, request->input, request->input_bytes);
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->K = session->K; model->V = session->V;
+    model->DN_rec = session->DN_rec; model->DN_conv = session->DN_conv;
+    model->max_t = (int)session->context_tokens;
+    model->kv_len = (int)session->position;
+    layers_forward_range(model, (float *)request->output, (int)request->rows,
+                         (int)request->position, (int)engine->layer_begin,
+                         (int)engine->layer_end, 0, NULL);
+    model->K = NULL; model->V = NULL;
+    model->DN_rec = NULL; model->DN_conv = NULL;
+    model->kv_len = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    session->position += request->rows;
+    return 0;
+}
+
+static int qwen36_segment_spans(
+    Qwen36SegmentSession *session, uint32_t position,
+    ColiSegmentStateSpan **spans_output, size_t *count_output,
+    char *error, size_t error_size) {
+    Cfg *config = &session->engine->model.c;
+    size_t capacity = (size_t)(session->engine->layer_end -
+                               session->engine->layer_begin) *
+                      (size_t)(2 * config->kv_heads + 2);
+    ColiSegmentStateSpan *spans = capacity
+        ? calloc(capacity, sizeof(*spans)) : NULL;
+    if (capacity && !spans)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory describing Qwen3.6 state");
+    size_t count = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        if (config->is_attn[layer]) {
+            size_t row_bytes = (size_t)position * config->k_head_dim *
+                               sizeof(float);
+            size_t stride = (size_t)session->context_tokens *
+                            config->k_head_dim;
+            for (int kv = 0; kv < 2; kv++) {
+                float *state = kv ? session->V[layer] : session->K[layer];
+                for (int head = 0; head < config->kv_heads; head++)
+                    spans[count++] = (ColiSegmentStateSpan){
+                        state + head * stride, row_bytes};
+            }
+        } else {
+            size_t rec_cells, conv_cells;
+            if (coli_segment_size_mul((size_t)config->dn_vheads,
+                                      (size_t)config->dn_kdim, &rec_cells) ||
+                coli_segment_size_mul(rec_cells, (size_t)config->dn_vdim,
+                                      &rec_cells) ||
+                coli_segment_size_mul((size_t)config->dn_conv_dim,
+                                      (size_t)(config->dn_convk - 1),
+                                      &conv_cells)) {
+                free(spans);
+                return coli_segment_adapter_error(error, error_size,
+                                                   "Qwen3.6 state size overflow");
+            }
+            spans[count++] = (ColiSegmentStateSpan){
+                session->DN_rec[layer], rec_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->DN_conv[layer], conv_cells * sizeof(float)};
+        }
+    }
+    *spans_output = spans; *count_output = count;
+    return 0;
+}
+
+static int qwen36_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    Qwen36SegmentSession *session = (Qwen36SegmentSession *)session_impl;
+    ColiSegmentStateSpan *spans = NULL; size_t count = 0, payload_bytes;
+    if (!session || qwen36_segment_spans(session, session->position, &spans,
+                                         &count, error, error_size) ||
+        coli_segment_spans_size(spans, count, &payload_bytes)) {
+        free(spans);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 snapshot size overflow");
+    }
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "qwen36", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, coli_segment_spans_hash(spans, count));
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    if (!result)
+        result = coli_segment_spans_write(spans, count, write_fn,
+                                          write_user_data, error, error_size);
+    free(spans);
+    return result;
+}
+
+static int qwen36_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    Qwen36SegmentSession *session = (Qwen36SegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    ColiSegmentStateSpan *spans = NULL; size_t count = 0, payload_bytes;
+    if (qwen36_segment_spans(session, header.position, &spans, &count,
+                             error, error_size) ||
+        coli_segment_spans_size(spans, count, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "qwen36", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens, payload_bytes,
+            error, error_size)) {
+        free(spans); return -1;
+    }
+    int result = coli_segment_spans_restore(
+        spans, count, header.payload_hash, read_fn, read_user_data,
+        error, error_size);
+    free(spans);
+    if (!result) session->position = header.position;
+    return result;
+}
+
+static const ColiSegmentAdapter qwen36_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "qwen36",
+    qwen36_segment_engine_open, qwen36_segment_engine_destroy,
+    qwen36_segment_session_create, qwen36_segment_session_destroy,
+    qwen36_segment_session_run, qwen36_segment_session_snapshot,
+    qwen36_segment_session_restore, {0}
+};
+
+int coli_qwen36_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&qwen36_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */
