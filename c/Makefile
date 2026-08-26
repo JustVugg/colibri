@@ -624,6 +624,13 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 
+.PHONY: glm53-tiny-generate glm53-tiny-check
+glm53-tiny-generate:
+	$(PYTHON) tools/make_glm53_tiny.py --output ./glm53_tiny --force
+
+glm53-tiny-check: glm53-tiny-generate
+	$(PYTHON) tests/test_glm53_tiny.py --fixture ./glm53_tiny
+
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)

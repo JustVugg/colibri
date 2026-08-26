@@ -25,6 +25,8 @@ passes a generated tiny oracle and a real-checkpoint generation test.
 ## Implementation order
 
 1. Generate a tiny Transformers oracle and pin tensor names, shapes and math.
+   `make -C c glm53-tiny-check` now gates this contract against Transformers
+   5.16.1, including cached versus full-forward parity.
 2. Compose the CPU text path from the existing Kimi KDA and DeepSeek V4
    mHC/DSA primitives; do not copy either full engine.
 3. Add FP8-to-streaming conversion and token/logit validation on the real

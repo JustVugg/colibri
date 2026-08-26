@@ -1,5 +1,6 @@
 *.exe
 glm_tiny/
+glm53_tiny/
 olmoe_hf/
 olmoe_i4/
 .build-config
