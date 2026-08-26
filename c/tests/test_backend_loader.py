@@ -874,7 +874,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 4 optional, parsed from backend_loader.c.
+        """47 mandatory + 6 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -885,8 +885,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 4)
-        self.assertEqual(len(f.exports), 51)
+        self.assertEqual(len(f.optional), 6)
+        self.assertEqual(len(f.exports), 53)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -896,6 +896,13 @@ class LoaderStubFixtureTest(unittest.TestCase):
         self.assertIn("coli_cuda_fp8_set_lut", f.optional)
         # expert_group_pinned: old DLLs remain usable outside SPEC_PIN (#689).
         self.assertIn("coli_cuda_expert_group_pinned", f.optional)
+        # tensor_vram / alloc_footprint: allocator padding in the expert-tier
+        # budget (#687). OPTIONAL on purpose - a DLL predating them leaves the
+        # pointers NULL and the wrappers fall back to the logical byte count,
+        # which is what the tier charged before. As mandatory, one older DLL
+        # would take the entire CUDA backend down over a sizing refinement.
+        self.assertIn("coli_cuda_tensor_vram", f.optional)
+        self.assertIn("coli_cuda_alloc_footprint", f.optional)
 
     def test_both_runtimes_exist_with_the_production_basename(self):
         """Same basename, different directories — the conflict precondition."""
