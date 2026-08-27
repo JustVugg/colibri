@@ -3,7 +3,11 @@ import argparse
 import os
 import subprocess
 import sys
+import unittest
 from pathlib import Path
+
+if __name__ != "__main__":
+    raise unittest.SkipTest("command-line GLM-5.3 gateway driver")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--binary", type=Path, required=True)

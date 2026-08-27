@@ -316,7 +316,7 @@ jobs:
           # step with "Version not available" before nvcc is ever reached.
           cuda: '12.6.2'
           method: network
-          sub-packages: '["nvcc"]'
+          sub-packages: '["nvcc", "cudart", "cublas"]'
       - name: Compile backend_cuda.cu (syntax only, no GPU)
         run: |
           cd c

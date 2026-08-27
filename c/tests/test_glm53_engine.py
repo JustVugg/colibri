@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import unittest
 import json
 import subprocess
 from pathlib import Path
+
+if __name__ != "__main__":
+    raise unittest.SkipTest("command-line GLM-5.3 oracle driver")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--binary", type=Path, required=True)

@@ -678,6 +678,11 @@ glm53_flash$(EXE): glm53_flash.c glm53_kda.c glm53_indexer.c \
 	$(CC) $(CFLAGS) glm53_flash.c glm53_kda.c glm53_indexer.c \
 		glm53_sparse_attention.c glm53_mhc.c glm53_fp8.c $(CUDA_OBJ) $(METAL_OBJ) -o $@ -lm $(LDFLAGS)
 
+ifneq ($(IS_WIN),)
+.PHONY: glm53_flash
+glm53_flash: glm53_flash$(EXE)
+endif
+
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)

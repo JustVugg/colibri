@@ -10,6 +10,13 @@
       "real_adapter_required": true
     },
     {
+      "family_id": "glm53_flash",
+      "state_schema": "fixture/glm53-kda-dsa-mhc-v1",
+      "state_components": ["kda_recurrent", "convolution", "dsa_kv", "dsa_indexer", "mhc"],
+      "oracle": {"kind": "generated_tiny", "path": "tools/make_glm53_tiny.py"},
+      "real_adapter_required": true
+    },
+    {
       "family_id": "inkling",
       "state_schema": "fixture/inkling-kv-ring-conv-v1",
       "state_components": ["global_kv", "sliding_kv_ring", "convolution"],
