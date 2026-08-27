@@ -650,6 +650,14 @@ glm53-tiny-check: glm53-tiny-generate glm53-fp8-tiny-generate
 	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_fp8.c glm53_fp8.c \
 		-o ./tests/test_glm53_fp8$(EXE) -lm $(LDFLAGS)
 	./tests/test_glm53_fp8$(EXE)
+	$(CC) $(NOCUDA_CFLAGS) -I. -I./glm53_tiny tests/test_glm53_cuda_dispatch.c \
+		glm53_kda.c glm53_indexer.c glm53_sparse_attention.c glm53_mhc.c glm53_fp8.c \
+		-o ./tests/test_glm53_cuda_dispatch$(EXE) -lm $(NOCUDA_LDFLAGS)
+	./tests/test_glm53_cuda_dispatch$(EXE)
+	$(CC) $(NOCUDA_CFLAGS) -I. -I./glm53_tiny tests/test_glm53_metal_dispatch.c \
+		glm53_kda.c glm53_indexer.c glm53_sparse_attention.c glm53_mhc.c glm53_fp8.c \
+		-o ./tests/test_glm53_metal_dispatch$(EXE) -lm $(NOCUDA_LDFLAGS)
+	./tests/test_glm53_metal_dispatch$(EXE)
 	$(MAKE) glm53_flash$(EXE)
 	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
 		--fixture ./glm53_tiny
