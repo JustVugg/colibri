@@ -1,6 +1,5 @@
 #include "glm53_fp8.h"
 
-#include <float.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -20,16 +19,18 @@ static uint8_t e4m3fn_encode(float value) {
     float magnitude = fabsf(value);
     if (!magnitude) return negative ? 0x80 : 0;
     if (magnitude >= 448.0f) return (uint8_t)((negative ? 0x80 : 0) | 0x7e);
-    uint8_t best = 0;
-    float distance = FLT_MAX;
-    for (uint8_t code = 0; code <= 0x7e; code++) {
-        float candidate = e4m3fn_decode(code);
-        float next = fabsf(candidate - magnitude);
-        if (next < distance || (next == distance && !(code & 1) && (best & 1))) {
-            best = code;
-            distance = next;
-        }
+    int low = 0, high = 0x7e;
+    while (low < high) {
+        int middle = (low + high) / 2;
+        if (e4m3fn_decode((uint8_t)middle) < magnitude) low = middle + 1;
+        else high = middle;
     }
+    uint8_t upper = (uint8_t)low;
+    uint8_t lower = upper ? (uint8_t)(upper - 1) : upper;
+    float lower_distance = fabsf(e4m3fn_decode(lower) - magnitude);
+    float upper_distance = fabsf(e4m3fn_decode(upper) - magnitude);
+    uint8_t best = lower_distance < upper_distance ? lower : upper;
+    if (lower_distance == upper_distance) best = !(lower & 1) ? lower : upper;
     return (uint8_t)(best | (negative ? 0x80 : 0));
 }
 
