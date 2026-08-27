@@ -38,6 +38,17 @@ typedef struct {
     Layer *layer;
 } Model;
 
+typedef struct {
+    float *kda_state, *kda_window;
+    float *keys, *values, *index_keys, *index_gates;
+    int capacity;
+} LayerCache;
+
+typedef struct {
+    LayerCache *layers;
+    int length;
+} RuntimeCache;
+
 static void die(const char *message) {
     fprintf(stderr, "%s\n", message);
     exit(1);
@@ -503,6 +514,213 @@ static void ffn_forward(const Config *c, const Layer *l, const float *x, int n, 
     free(score);
 }
 
+static void cache_init(RuntimeCache *cache, const Config *config) {
+    memset(cache, 0, sizeof(*cache));
+    cache->layers = calloc((size_t)config->layers, sizeof(*cache->layers));
+    if (!cache->layers) die("glm53: cache allocation failed");
+    for (int i = 0; i < config->layers; i++) {
+        if ((i % 4) == 3) continue;
+        cache->layers[i].kda_state = alloc_floats((size_t)config->kda_heads * config->kda_dim * config->kda_dim);
+        cache->layers[i].kda_window =
+            alloc_floats((size_t)3 * config->kda_heads * config->kda_dim * config->conv_kernel);
+    }
+}
+
+static void cache_free(RuntimeCache *cache, const Config *config) {
+    for (int i = 0; i < config->layers; i++) {
+        LayerCache *layer = &cache->layers[i];
+        free(layer->kda_state);
+        free(layer->kda_window);
+        free(layer->keys);
+        free(layer->values);
+        free(layer->index_keys);
+        free(layer->index_gates);
+    }
+    free(cache->layers);
+}
+
+static void kda_step_forward(const Config *c, const Layer *l, LayerCache *cache, const float *x, float *out) {
+    int width = c->kda_heads * c->kda_dim;
+    float *qkv = alloc_floats((size_t)3 * width);
+    float *tmp = alloc_floats((size_t)c->kda_dim);
+    float *decay = alloc_floats((size_t)width);
+    float *beta = alloc_floats((size_t)c->kda_heads);
+    float *gate = alloc_floats((size_t)width);
+    float *core = alloc_floats((size_t)width);
+    float *normed = alloc_floats((size_t)width);
+
+    matmul(qkv, x, l->q, 1, c->hidden, width);
+    matmul(qkv + width, x, l->k, 1, c->hidden, width);
+    matmul(qkv + 2 * width, x, l->v, 1, c->hidden, width);
+    matmul(tmp, x, l->fa, 1, c->hidden, c->kda_dim);
+    matmul(decay, tmp, l->fb, 1, c->kda_dim, width);
+    for (int h = 0; h < c->kda_heads; h++)
+        for (int d = 0; d < c->kda_dim; d++) {
+            int i = h * c->kda_dim + d;
+            decay[i] = c->gate_lower_bound * sigmoid(expf(l->alog[h]) * (decay[i] + l->dt[i]));
+        }
+    matmul(beta, x, l->beta, 1, c->hidden, c->kda_heads);
+    for (int h = 0; h < c->kda_heads; h++) beta[h] = sigmoid(beta[h]);
+    matmul(tmp, x, l->ga, 1, c->hidden, c->kda_dim);
+    matmul(gate, tmp, l->gb, 1, c->kda_dim, width);
+    coli_glm53_kda_step(core, cache->kda_state, cache->kda_window, qkv, l->conv, decay, beta, c->kda_heads, c->kda_dim,
+                        c->conv_kernel);
+    for (int h = 0; h < c->kda_heads; h++) {
+        float sum = 0.0f;
+        for (int d = 0; d < c->kda_dim; d++) sum += core[h * c->kda_dim + d] * core[h * c->kda_dim + d];
+        float inv = 1.0f / sqrtf(sum / c->kda_dim + c->eps);
+        for (int d = 0; d < c->kda_dim; d++) {
+            int i = h * c->kda_dim + d;
+            normed[i] = core[i] * inv * l->onorm[d] * sigmoid(gate[i]);
+        }
+    }
+    matmul(out, normed, l->op, 1, width, c->hidden);
+    free(normed);
+    free(core);
+    free(gate);
+    free(beta);
+    free(decay);
+    free(tmp);
+    free(qkv);
+}
+
+static void dsa_cache_reserve(const Config *c, LayerCache *cache, int needed) {
+    if (needed <= cache->capacity) return;
+    int capacity = cache->capacity ? cache->capacity * 2 : 16;
+    while (capacity < needed) capacity *= 2;
+    cache->keys = realloc(cache->keys, (size_t)capacity * c->heads * c->key_dim * sizeof(float));
+    cache->values = realloc(cache->values, (size_t)capacity * c->heads * c->value_dim * sizeof(float));
+    cache->index_keys = realloc(cache->index_keys, (size_t)capacity * c->index_dim * sizeof(float));
+    cache->index_gates = realloc(cache->index_gates, (size_t)capacity * c->index_dim * sizeof(float));
+    if (!cache->keys || !cache->values || !cache->index_keys || !cache->index_gates)
+        die("glm53: DSA cache allocation failed");
+    cache->capacity = capacity;
+}
+
+static void dsa_step_forward(const Config *c, const Layer *l, LayerCache *cache, int position, const float *x,
+                             float *out) {
+    int length = position + 1;
+    int qwidth = c->heads * c->key_dim;
+    int kvwidth = c->heads * (c->key_dim + c->value_dim);
+    int index_width = c->index_topk + c->index_pool - 1;
+    float *q_resid = alloc_floats((size_t)c->q_rank);
+    float *q_norm = alloc_floats((size_t)c->q_rank);
+    float *query = alloc_floats((size_t)qwidth);
+    float *latent = alloc_floats((size_t)c->kv_rank);
+    float *latent_norm = alloc_floats((size_t)c->kv_rank);
+    float *expanded = alloc_floats((size_t)kvwidth);
+    float *index_query = alloc_floats((size_t)c->index_heads * c->index_dim);
+    float *index_raw = alloc_floats((size_t)c->index_dim);
+    float *head_weight = alloc_floats((size_t)c->index_heads);
+
+    matmul(q_resid, x, l->qa, 1, c->hidden, c->q_rank);
+    rmsnorm(q_norm, q_resid, l->qan, 1, c->q_rank, c->eps);
+    matmul(query, q_norm, l->qb, 1, c->q_rank, qwidth);
+    matmul(latent, x, l->kva, 1, c->hidden, c->kv_rank);
+    rmsnorm(latent_norm, latent, l->kvan, 1, c->kv_rank, c->eps);
+    matmul(expanded, latent_norm, l->kvb, 1, c->kv_rank, kvwidth);
+    matmul(index_query, q_norm, l->iwq, 1, c->q_rank, c->index_heads * c->index_dim);
+    matmul(index_raw, x, l->iwk, 1, c->hidden, c->index_dim);
+    matmul(head_weight, x, l->iweight, 1, c->hidden, c->index_heads);
+    for (int h = 0; h < c->index_heads; h++) head_weight[h] /= sqrtf((float)c->index_heads);
+
+    dsa_cache_reserve(c, cache, length);
+    float *key_row = cache->keys + (size_t)position * c->heads * c->key_dim;
+    float *value_row = cache->values + (size_t)position * c->heads * c->value_dim;
+    for (int h = 0; h < c->heads; h++) {
+        const float *source = expanded + h * (c->key_dim + c->value_dim);
+        memcpy(key_row + h * c->key_dim, source, (size_t)c->key_dim * sizeof(float));
+        memcpy(value_row + h * c->value_dim, source + c->key_dim, (size_t)c->value_dim * sizeof(float));
+    }
+    layernorm(cache->index_keys + (size_t)position * c->index_dim, index_raw, l->iknw, l->iknb, 1, c->index_dim);
+    matmul(cache->index_gates + (size_t)position * c->index_dim, x, l->igate, 1, c->hidden, c->index_dim);
+
+    float *queries = alloc_floats((size_t)length * qwidth);
+    float *index_queries = alloc_floats((size_t)length * c->index_heads * c->index_dim);
+    float *head_weights = alloc_floats((size_t)length * c->index_heads);
+    unsigned char *valid = malloc((size_t)length);
+    int *indices = malloc((size_t)length * index_width * sizeof(int));
+    float *context = alloc_floats((size_t)length * c->heads * c->value_dim);
+    if (!valid || !indices) die("glm53: DSA scratch allocation failed");
+    memcpy(queries + (size_t)position * qwidth, query, (size_t)qwidth * sizeof(float));
+    memcpy(index_queries + (size_t)position * c->index_heads * c->index_dim, index_query,
+           (size_t)c->index_heads * c->index_dim * sizeof(float));
+    memcpy(head_weights + (size_t)position * c->index_heads, head_weight, (size_t)c->index_heads * sizeof(float));
+    memset(valid, 1, (size_t)length);
+    coli_glm53_index_select(indices, index_queries, cache->index_keys, cache->index_gates, head_weights, l->iape, valid,
+                            length, c->index_heads, c->index_dim, c->index_pool, c->index_topk);
+    coli_glm53_sparse_attention(context, queries, cache->keys, cache->values, indices, length, index_width, c->heads,
+                                c->key_dim, c->value_dim);
+    matmul(out, context + (size_t)position * c->heads * c->value_dim, l->op, 1, c->heads * c->value_dim, c->hidden);
+    free(context);
+    free(indices);
+    free(valid);
+    free(head_weights);
+    free(index_queries);
+    free(queries);
+    free(head_weight);
+    free(index_raw);
+    free(index_query);
+    free(expanded);
+    free(latent_norm);
+    free(latent);
+    free(query);
+    free(q_norm);
+    free(q_resid);
+}
+
+static float *forward_cached_step(Model *model, RuntimeCache *cache, int token) {
+    Config *c = &model->c;
+    float *streams = alloc_floats((size_t)c->hc * c->hidden);
+    float *next = alloc_floats((size_t)c->hc * c->hidden);
+    float *collapsed = alloc_floats((size_t)c->hidden);
+    float *normed = alloc_floats((size_t)c->hidden);
+    float *branch = alloc_floats((size_t)c->hidden);
+    float *post = alloc_floats((size_t)c->hc);
+    float *comb = alloc_floats((size_t)c->hc * c->hc);
+    for (int h = 0; h < c->hc; h++)
+        memcpy(streams + (size_t)h * c->hidden, model->embed + (size_t)token * c->hidden,
+               (size_t)c->hidden * sizeof(float));
+    for (int i = 0; i < c->layers; i++) {
+        Layer *layer = &model->layer[i];
+        coli_glm53_mhc_pre(collapsed, post, comb, streams, layer->ah_fn, layer->ah_scale, layer->ah_base, c->hc,
+                           c->hidden, c->hc_iters, c->eps, c->hc_eps);
+        rmsnorm(normed, collapsed, layer->norm1, 1, c->hidden, c->eps);
+        if (layer->kda) kda_step_forward(c, layer, &cache->layers[i], normed, branch);
+        else dsa_step_forward(c, layer, &cache->layers[i], cache->length, normed, branch);
+        coli_glm53_mhc_post(next, branch, streams, post, comb, c->hc, c->hidden);
+        float *swap = streams;
+        streams = next;
+        next = swap;
+        coli_glm53_mhc_pre(collapsed, post, comb, streams, layer->fh_fn, layer->fh_scale, layer->fh_base, c->hc,
+                           c->hidden, c->hc_iters, c->eps, c->hc_eps);
+        rmsnorm(normed, collapsed, layer->norm2, 1, c->hidden, c->eps);
+        memset(branch, 0, (size_t)c->hidden * sizeof(float));
+        ffn_forward(c, layer, normed, 1, branch);
+        coli_glm53_mhc_post(next, branch, streams, post, comb, c->hc, c->hidden);
+        swap = streams;
+        streams = next;
+        next = swap;
+    }
+    for (int d = 0; d < c->hidden; d++) {
+        float sum = 0.0f;
+        for (int h = 0; h < c->hc; h++) sum += streams[(size_t)h * c->hidden + d];
+        collapsed[d] = sum / c->hc;
+    }
+    rmsnorm(normed, collapsed, model->norm, 1, c->hidden, c->eps);
+    float *logits = alloc_floats((size_t)c->vocab);
+    matmul(logits, normed, model->head, 1, c->hidden, c->vocab);
+    cache->length++;
+    free(comb);
+    free(post);
+    free(branch);
+    free(normed);
+    free(collapsed);
+    free(next);
+    free(streams);
+    return logits;
+}
+
 static float *forward(Model *m, const int *tokens, int n) {
     Config *c = &m->c;
     size_t streams_count = (size_t)n * c->hc * c->hidden;
@@ -589,14 +807,51 @@ static int parse_ids(const char *text, int **output) {
 }
 int main(int argc, char **argv) {
     if (argc < 4 || strcmp(argv[2], "--ids")) {
-        fprintf(stderr, "usage: %s MODEL --ids 1,2,3 [--greedy N]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL --ids 1,2,3 [--greedy N] [--cached]\n", argv[0]);
         return 2;
     }
     Model model;
     model_load(&model, argv[1]);
     int *ids = NULL, n = parse_ids(argv[3], &ids);
-    int greedy = 0;
-    if (argc == 6 && !strcmp(argv[4], "--greedy")) greedy = atoi(argv[5]);
+    int greedy = 0, cached = 0;
+    for (int arg = 4; arg < argc; arg++) {
+        if (!strcmp(argv[arg], "--cached")) cached = 1;
+        else if (!strcmp(argv[arg], "--greedy") && arg + 1 < argc) greedy = atoi(argv[++arg]);
+        else {
+            fprintf(stderr, "glm53: unknown argument %s\n", argv[arg]);
+            return 2;
+        }
+    }
+    if (cached) {
+        RuntimeCache cache;
+        cache_init(&cache, &model.c);
+        float *logits = NULL;
+        printf("teacher");
+        for (int i = 0; i < n; i++) {
+            free(logits);
+            logits = forward_cached_step(&model, &cache, ids[i]);
+            int best = 0;
+            for (int v = 1; v < model.c.vocab; v++)
+                if (logits[v] > logits[best]) best = v;
+            printf(" %d", best);
+        }
+        printf("\nlast_logits");
+        for (int v = 0; v < model.c.vocab; v++) printf(" %.9g", logits[v]);
+        printf("\n");
+        for (int step = 0; step < greedy; step++) {
+            int best = 0;
+            for (int v = 1; v < model.c.vocab; v++)
+                if (logits[v] > logits[best]) best = v;
+            printf("greedy %d\n", best);
+            free(logits);
+            logits = forward_cached_step(&model, &cache, best);
+        }
+        free(logits);
+        cache_free(&cache, &model.c);
+        free(ids);
+        model_free(&model);
+        return 0;
+    }
     for (int step = 0; step <= greedy; step++) {
         float *logits = forward(&model, ids, n);
         if (!step) {

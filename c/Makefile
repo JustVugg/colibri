@@ -646,6 +646,8 @@ glm53-tiny-check: glm53-tiny-generate
 	$(MAKE) glm53_flash$(EXE)
 	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
 		--fixture ./glm53_tiny
+	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
+		--fixture ./glm53_tiny --cached
 
 glm53_flash$(EXE): glm53_flash.c glm53_kda.c glm53_indexer.c \
 		glm53_sparse_attention.c glm53_mhc.c st.h json.h

@@ -7,12 +7,16 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument("--binary", type=Path, required=True)
 parser.add_argument("--fixture", type=Path, required=True)
+parser.add_argument("--cached", action="store_true")
 args = parser.parse_args()
 reference = json.loads((args.fixture / "ref.json").read_text())
 prompt = ",".join(str(token) for token in reference["prompt_ids"])
+command = [args.binary.resolve().as_posix(), args.fixture.resolve().as_posix(), "--ids", prompt,
+           "--greedy", str(len(reference["greedy_new_ids"]))]
+if args.cached:
+    command.append("--cached")
 result = subprocess.run(
-    [args.binary.resolve().as_posix(), args.fixture.resolve().as_posix(), "--ids", prompt,
-     "--greedy", str(len(reference["greedy_new_ids"]))],
+    command,
     text=True, capture_output=True, timeout=180,
 )
 if result.returncode:
@@ -32,5 +36,6 @@ if logit_error > 2e-4:
 greedy = [int(line.split()[1]) for line in result.stdout.splitlines() if line.startswith("greedy ")]
 if greedy != reference["greedy_new_ids"]:
     raise SystemExit(f"greedy mismatch\nactual:   {greedy}\nexpected: {reference['greedy_new_ids']}")
-print(f"PASS GLM-5.3 CPU engine: {len(actual)}/{len(expected)} teacher positions exact, "
+mode = "cached" if args.cached else "full"
+print(f"PASS GLM-5.3 CPU {mode} engine: {len(actual)}/{len(expected)} teacher positions exact, "
       f"{len(greedy)} greedy tokens exact, logits max abs {logit_error:.3g}")
