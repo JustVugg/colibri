@@ -316,7 +316,9 @@ jobs:
           # step with "Version not available" before nvcc is ever reached.
           cuda: '12.6.2'
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas"]'
+          sub-packages: '["nvcc", "cudart"]'
+      - name: Install CUDA BLAS link libraries
+        run: sudo apt-get install -y libcublas-dev-12-6
       - name: Compile backend_cuda.cu (syntax only, no GPU)
         run: |
           cd c
