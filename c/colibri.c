@@ -1508,7 +1508,13 @@ static void qt_fill(QT *t, const float *w, int bits){
 }
 
 /* ARCH_M3 numeric conventions, set once at model_init from the config. Both default
- * to the GLM behavior so every existing path is bit-identical when they stay 0. */
+ * to the GLM behavior so every existing path is bit-identical when they stay 0.
+ * These are PROCESS-wide, which was safe while a process held one model. The Segment
+ * and Edge runtimes (#1227/#1245) can keep several engines open at once, and a GLM
+ * segment beside an M3 segment would fight over all four: last model_init wins and the
+ * loser silently gets the other's norm and activation. Latent today -- no shipping
+ * binary registers those adapters -- but M3's segment adapter cannot land until these
+ * hang off the Model rather than the process. */
 static int g_gemma_norm=0;                        /* rmsnorm scales by (1+w) instead of w */
 static int g_act_swigluoai=0;                     /* glu = clamp+alpha-sigmoid, (up+1)*glu */
 static float g_swiglu_alpha=1.702f, g_swiglu_limit=7.0f;
@@ -4251,9 +4257,14 @@ static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *ds
  * KV rows in the Lc/Rc aliases (K = Lc, V = Rc, both n_kv_heads*head_dim wide — set
  * up by load_cfg); score/softmax/value with H/n_kv_heads query heads per KV head;
  * o_proj at the end. Mirrors attention_rows' ragged contract (kvs/positions per-row
- * KV target, else pos_base+s). MSA block selection is NOT implemented: full causal
- * attention — EXACT for windows up to sparse_topk_blocks*block = 2048 tokens (the
- * indexer selects every block then), an approximation beyond. */
+ * KV target, else pos_base+s). On sparse layers (idx_type[], for M3 exactly the MoE
+ * layers) the MSA Lightning Indexer picks the top-k key blocks per query and `sel`
+ * gates both the score loop and the value accumulation, so only the selected blocks
+ * are attended; dense layers, checkpoints without the indexer weights, and COLI_MSA=0
+ * take the full causal path. Selection is a no-op while the window fits in
+ * sparse_topk_blocks*block = 2048 tokens (every causal block is selected then, so the
+ * key set is full attention's, summation order aside); past that it is the model's own
+ * trained approximation, which is how MiniMax runs it. */
 static void rope_half_neox(float *v, int rot, int pos, float theta){
     int h2=rot/2;
     for(int j=0;j<h2;j++){

@@ -68,8 +68,9 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         _version = "unknown"
 
-from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, resolve_model, tuning_replay_prompt)
+from family_registry import (COLIBRI_CORE_GROUP, FamilyConfigError, UnknownFamilyError,
+                             all_families, family_by_id, resolve_model,
+                             tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
     "A service has high median throughput but poor tail latency. Explain how "
@@ -323,7 +324,7 @@ def colibri_core(family):
     id == "glm" so a future third family on this binary inherits the same
     handling by declaring the group, not by being added to a tuple here."""
     if isinstance(family, str): family = family_by_id(family)
-    return family.engine_group == family_by_id("glm").engine_group
+    return family.engine_group == COLIBRI_CORE_GROUP
 
 def engine_for(model):
     family = resolve_model(model).descriptor
