@@ -210,7 +210,7 @@ jobs:
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3; do
+          for t in colibri glm53_flash inkling kimi_k3; do
             echo "::group::$t METAL=1"
             make clean >/dev/null 2>&1 || true
             make $t METAL=1 || { echo "FAILED: $t METAL=1"; rc=1; }

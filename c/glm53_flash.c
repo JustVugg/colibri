@@ -16,6 +16,9 @@
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_METAL
+#include "backend_metal.h"
+#endif
 
 typedef struct {
     ColiTensorView view;
@@ -26,6 +29,9 @@ typedef struct {
     int streamed;
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
+#endif
+#ifdef COLI_METAL
+    ColiMetalTensor *metal;
 #endif
 } Matrix;
 
@@ -61,8 +67,46 @@ static int glm53_cuda_init(void) {
     return 1;
 }
 #else
-static int glm53_cuda_init(void) { return 1; }
+static int glm53_cuda_init(void) {
+    const char *enabled = getenv("COLI_CUDA");
+    return !enabled || !atoi(enabled);
+}
 #endif
+
+#ifdef COLI_METAL
+static int g_metal_enabled;
+
+static int glm53_metal_init(void) {
+    const char *enabled = getenv("COLI_METAL");
+    if (!enabled || !atoi(enabled)) return 1;
+    if (!coli_metal_init()) return 0;
+    g_metal_enabled = 1;
+    fprintf(stderr, "[Metal] GLM-5.3 native FP8 matmul active\n");
+    return 1;
+}
+#else
+static int glm53_metal_init(void) {
+    const char *enabled = getenv("COLI_METAL");
+    return !enabled || !atoi(enabled);
+}
+#endif
+
+static int glm53_accelerator_init(void) {
+    if (getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA")) && getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))) {
+        fprintf(stderr, "glm53: choose COLI_CUDA or COLI_METAL, not both\n");
+        return 0;
+    }
+    return glm53_cuda_init() && glm53_metal_init();
+}
+
+static void glm53_accelerator_shutdown(void) {
+#ifdef COLI_CUDA
+    if (g_cuda_enabled) coli_cuda_shutdown();
+#endif
+#ifdef COLI_METAL
+    if (g_metal_enabled) coli_metal_shutdown();
+#endif
+}
 
 typedef struct {
     int hidden, layers, vocab, max_position, dense_inter, moe_inter, experts, topk, shared;
@@ -288,6 +332,9 @@ static void matrix_free(Matrix *matrix) {
 #ifdef COLI_CUDA
     coli_cuda_tensor_free(matrix->cuda);
 #endif
+#ifdef COLI_METAL
+    coli_metal_tensor_free(matrix->metal);
+#endif
     free(matrix->data);
     free(matrix->scales);
     free(matrix->name);
@@ -333,6 +380,22 @@ static void matrix_multiply(float *output, const float *input, Matrix *weight, i
         int done =
             valid && coli_cuda_matmul(&weight->cuda, output, activation, weight->view.data, weight->view.scales, 8,
                                       rows, (int)weight->view.columns, (int)weight->view.rows, g_cuda_device, 0);
+        free(activation);
+        if (done) return;
+    }
+#endif
+#ifdef COLI_METAL
+    if (g_metal_enabled) {
+        size_t count = (size_t)rows * weight->view.columns;
+        float *activation = alloc_floats(count);
+        int valid = 1;
+        for (int row = 0; row < rows; row++)
+            valid &= !coli_glm53_fp8_quantize_activation(activation + (size_t)row * weight->view.columns,
+                                                         input + (size_t)row * weight->view.columns,
+                                                         (int)weight->view.columns);
+        int done =
+            valid && coli_metal_matmul(&weight->metal, output, activation, weight->view.data, weight->view.scales, 8,
+                                       rows, (int)weight->view.columns, (int)weight->view.rows, 0);
         free(activation);
         if (done) return;
     }
@@ -1212,14 +1275,12 @@ static int run_text_prompt(Model *model, const char *directory, const char *prom
 int main(int argc, char **argv) {
     const char *serve_directory = getenv("SNAP");
     if (getenv("SERVE") && serve_directory && *serve_directory) {
-        if (!glm53_cuda_init()) die("glm53: requested CUDA backend is unavailable");
+        if (!glm53_accelerator_init()) die("glm53: requested accelerator backend is unavailable");
         Model model;
         model_load(&model, serve_directory);
         serve_model(&model, serve_directory);
         model_free(&model);
-#ifdef COLI_CUDA
-        if (g_cuda_enabled) coli_cuda_shutdown();
-#endif
+        glm53_accelerator_shutdown();
         return 0;
     }
     if (argc >= 4 && !strcmp(argv[2], "--prompt")) {
@@ -1234,21 +1295,19 @@ int main(int argc, char **argv) {
                 return 2;
             }
         }
-        if (!glm53_cuda_init()) die("glm53: requested CUDA backend is unavailable");
+        if (!glm53_accelerator_init()) die("glm53: requested accelerator backend is unavailable");
         Model model;
         model_load(&model, argv[1]);
         int result = run_text_prompt(&model, argv[1], argv[3], max_tokens, temperature, top_p);
         model_free(&model);
-#ifdef COLI_CUDA
-        if (g_cuda_enabled) coli_cuda_shutdown();
-#endif
+        glm53_accelerator_shutdown();
         return result;
     }
     if (argc < 4 || strcmp(argv[2], "--ids")) {
         fprintf(stderr, "usage: %s MODEL --ids 1,2,3 [--greedy N] [--cached]\n", argv[0]);
         return 2;
     }
-    if (!glm53_cuda_init()) die("glm53: requested CUDA backend is unavailable");
+    if (!glm53_accelerator_init()) die("glm53: requested accelerator backend is unavailable");
     Model model;
     model_load(&model, argv[1]);
     int *ids = NULL, n = parse_ids(argv[3], &ids);
@@ -1319,8 +1378,6 @@ int main(int argc, char **argv) {
     }
     free(ids);
     model_free(&model);
-#ifdef COLI_CUDA
-    if (g_cuda_enabled) coli_cuda_shutdown();
-#endif
+    glm53_accelerator_shutdown();
     return 0;
 }
