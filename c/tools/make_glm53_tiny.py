@@ -94,6 +94,7 @@ def runtime_config(version: str) -> dict[str, object]:
             "num_heads": HEADS,
             "head_dim": HEAD_DIM,
             "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
             "kda_layers": [0, 1, 2],
         },
         "num_nextn_predict_layers": 0,
@@ -108,7 +109,7 @@ def runtime_config(version: str) -> dict[str, object]:
 
 
 def production_layout(torch, model, head) -> OrderedDict[str, object]:
-    """Use production prefixes and split HF's fused tiny expert tensors."""
+    """Recreate the official checkpoint's pre-Transformers disk layout."""
     output: OrderedDict[str, object] = OrderedDict()
     for name, tensor in model.state_dict().items():
         prefix = "model.language_model."
@@ -121,8 +122,22 @@ def production_layout(torch, model, head) -> OrderedDict[str, object]:
             base = prefix + name.removesuffix("down_proj")
             for expert in range(EXPERTS):
                 output[f"{base}{expert}.down_proj.weight"] = tensor[expert].contiguous()
+        elif name.endswith("self_attn.conv1d.weight"):
+            base = prefix + name.removesuffix("conv1d.weight")
+            q_conv, k_conv, v_conv = tensor.chunk(3, dim=0)
+            output[f"{base}q_conv1d.weight"] = q_conv.contiguous()
+            output[f"{base}k_conv1d.weight"] = k_conv.contiguous()
+            output[f"{base}v_conv1d.weight"] = v_conv.contiguous()
         else:
-            output[prefix + name] = tensor.detach().contiguous()
+            disk_name = name
+            disk_name = disk_name.replace("attn_hc.fn", "hc_attn_fn")
+            disk_name = disk_name.replace("attn_hc.base", "hc_attn_base")
+            disk_name = disk_name.replace("attn_hc.scale", "hc_attn_scale")
+            disk_name = disk_name.replace("ffn_hc.fn", "hc_ffn_fn")
+            disk_name = disk_name.replace("ffn_hc.base", "hc_ffn_base")
+            disk_name = disk_name.replace("ffn_hc.scale", "hc_ffn_scale")
+            disk_name = disk_name.replace("self_attn.forget_gate.", "self_attn.")
+            output[prefix + disk_name] = tensor.detach().contiguous()
     output["lm_head.weight"] = head.weight.detach().contiguous()
     return output
 

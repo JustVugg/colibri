@@ -38,7 +38,10 @@ def main() -> int:
     header = safetensors_header(args.fixture / "model.safetensors")
     required = {
         "model.language_model.layers.0.self_attn.q_proj.weight",
-        "model.language_model.layers.0.self_attn.conv1d.weight",
+        "model.language_model.layers.0.self_attn.q_conv1d.weight",
+        "model.language_model.layers.0.self_attn.k_conv1d.weight",
+        "model.language_model.layers.0.self_attn.v_conv1d.weight",
+        "model.language_model.layers.0.hc_attn_fn",
         "model.language_model.layers.3.self_attn.indexer.wk.weight",
         "model.language_model.layers.3.mlp.experts.0.gate_proj.weight",
         "model.language_model.layers.3.mlp.experts.3.down_proj.weight",
@@ -48,6 +51,7 @@ def main() -> int:
     missing = required - header.keys()
     assert not missing, f"missing production-layout tensors: {sorted(missing)}"
     assert not any("experts.gate_up_proj" in name for name in header)
+    assert not any("self_attn.conv1d.weight" in name for name in header)
     print("PASS GLM-5.3 tiny oracle contract")
     return 0
 

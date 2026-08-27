@@ -15,7 +15,8 @@ typedef struct {
     int heads, q_rank, kv_rank, key_dim, value_dim;
     int kda_heads, kda_dim, conv_kernel;
     int index_heads, index_dim, index_topk, index_pool;
-    int hc, hc_iters, dense_layers;
+    int hc, hc_iters;
+    unsigned char *layer_kda, *layer_sparse;
     float eps, hc_eps, route_scale, swiglu_limit, gate_lower_bound;
 } Config;
 
@@ -123,11 +124,26 @@ static void load_config(Config *c, const char *directory) {
     c->hc_eps = (float)required_number(text, "hc_eps");
     c->route_scale = (float)required_number(text, "routed_scaling_factor");
     c->swiglu_limit = (float)required_number(text, "swiglu_limit");
-    c->gate_lower_bound = -5.0f;
-    jval *dense = json_get(text, "mlp_layer_types");
-    c->dense_layers = 0;
-    if (!dense || dense->t != J_ARR || dense->len != c->layers) die("glm53 config: invalid mlp_layer_types");
-    while (c->dense_layers < c->layers && !strcmp(dense->kids[c->dense_layers]->str, "dense")) c->dense_layers++;
+    c->gate_lower_bound = (float)required_number(linear, "gate_lower_bound");
+    jval *layer_types = json_get(text, "layer_types");
+    jval *mlp_types = json_get(text, "mlp_layer_types");
+    if (!layer_types || layer_types->t != J_ARR || layer_types->len != c->layers || !mlp_types ||
+        mlp_types->t != J_ARR || mlp_types->len != c->layers)
+        die("glm53 config: invalid layer type arrays");
+    c->layer_kda = calloc((size_t)c->layers, 1);
+    c->layer_sparse = calloc((size_t)c->layers, 1);
+    if (!c->layer_kda || !c->layer_sparse) die("glm53 config: layer type allocation failed");
+    for (int i = 0; i < c->layers; i++) {
+        jval *attention = layer_types->kids[i];
+        jval *mlp = mlp_types->kids[i];
+        if (!attention || attention->t != J_STR ||
+            (strcmp(attention->str, "linear_attention") && strcmp(attention->str, "deepseek_sparse_attention")))
+            die("glm53 config: unsupported layer_types value");
+        if (!mlp || mlp->t != J_STR || (strcmp(mlp->str, "dense") && strcmp(mlp->str, "sparse")))
+            die("glm53 config: unsupported mlp_layer_types value");
+        c->layer_kda[i] = !strcmp(attention->str, "linear_attention");
+        c->layer_sparse[i] = !strcmp(mlp->str, "sparse");
+    }
     if (c->hidden < 1 || c->layers < 1 || c->layers > 128 || c->heads < 1 || c->experts < 1 || c->topk < 1 ||
         c->topk > c->experts || c->kda_heads * c->kda_dim <= 0 || c->hc < 1 || c->hc > 16)
         die("glm53 config: dimension out of range");
@@ -151,6 +167,25 @@ static float *load_named(Model *m, int layer, const char *suffix) {
     snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", layer, suffix);
     return load_tensor(m, name);
 }
+static float *load_conv(Model *model, int layer) {
+    const char *parts[] = {"q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"};
+    int64_t counts[3], total = 0;
+    char name[512];
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.%s", layer, parts[i]);
+        counts[i] = st_numel(&model->tensors, name);
+        if (counts[i] < 0 || (i && counts[i] != counts[0])) die("glm53: invalid split q/k/v conv tensors");
+        total += counts[i];
+    }
+    float *result = alloc_floats((size_t)total);
+    int64_t offset = 0;
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.%s", layer, parts[i]);
+        st_read_f32_cap(&model->tensors, name, result + offset, counts[i], 0);
+        offset += counts[i];
+    }
+    return result;
+}
 static void model_load(Model *m, const char *directory) {
     memset(m, 0, sizeof(*m));
     load_config(&m->c, directory);
@@ -163,25 +198,25 @@ static void model_load(Model *m, const char *directory) {
     if (!m->layer) die("glm53: layer allocation failed");
     for (int i = 0; i < c->layers; i++) {
         Layer *l = &m->layer[i];
-        l->kda = (i % 4) != 3;
-        l->sparse = i >= c->dense_layers;
+        l->kda = c->layer_kda[i];
+        l->sparse = c->layer_sparse[i];
         l->norm1 = load_named(m, i, "input_layernorm.weight");
         l->norm2 = load_named(m, i, "post_attention_layernorm.weight");
-        l->ah_fn = load_named(m, i, "attn_hc.fn");
-        l->ah_base = load_named(m, i, "attn_hc.base");
-        l->ah_scale = load_named(m, i, "attn_hc.scale");
-        l->fh_fn = load_named(m, i, "ffn_hc.fn");
-        l->fh_base = load_named(m, i, "ffn_hc.base");
-        l->fh_scale = load_named(m, i, "ffn_hc.scale");
+        l->ah_fn = load_named(m, i, "hc_attn_fn");
+        l->ah_base = load_named(m, i, "hc_attn_base");
+        l->ah_scale = load_named(m, i, "hc_attn_scale");
+        l->fh_fn = load_named(m, i, "hc_ffn_fn");
+        l->fh_base = load_named(m, i, "hc_ffn_base");
+        l->fh_scale = load_named(m, i, "hc_ffn_scale");
         if (l->kda) {
             l->q = load_named(m, i, "self_attn.q_proj.weight");
             l->k = load_named(m, i, "self_attn.k_proj.weight");
             l->v = load_named(m, i, "self_attn.v_proj.weight");
-            l->conv = load_named(m, i, "self_attn.conv1d.weight");
-            l->fa = load_named(m, i, "self_attn.forget_gate.f_a_proj.weight");
-            l->fb = load_named(m, i, "self_attn.forget_gate.f_b_proj.weight");
-            l->dt = load_named(m, i, "self_attn.forget_gate.dt_bias");
-            l->alog = load_named(m, i, "self_attn.forget_gate.A_log");
+            l->conv = load_conv(m, i);
+            l->fa = load_named(m, i, "self_attn.f_a_proj.weight");
+            l->fb = load_named(m, i, "self_attn.f_b_proj.weight");
+            l->dt = load_named(m, i, "self_attn.dt_bias");
+            l->alog = load_named(m, i, "self_attn.A_log");
             l->beta = load_named(m, i, "self_attn.b_proj.weight");
             l->ga = load_named(m, i, "self_attn.g_a_proj.weight");
             l->gb = load_named(m, i, "self_attn.g_b_proj.weight");
@@ -288,6 +323,8 @@ static void model_free(Model *model) {
     free(model->embed);
     free(model->norm);
     free(model->head);
+    free(model->c.layer_kda);
+    free(model->c.layer_sparse);
     st_destroy(&model->tensors);
 }
 
@@ -519,7 +556,7 @@ static void cache_init(RuntimeCache *cache, const Config *config) {
     cache->layers = calloc((size_t)config->layers, sizeof(*cache->layers));
     if (!cache->layers) die("glm53: cache allocation failed");
     for (int i = 0; i < config->layers; i++) {
-        if ((i % 4) == 3) continue;
+        if (!config->layer_kda[i]) continue;
         cache->layers[i].kda_state = alloc_floats((size_t)config->kda_heads * config->kda_dim * config->kda_dim);
         cache->layers[i].kda_window =
             alloc_floats((size_t)3 * config->kda_heads * config->kda_dim * config->conv_kernel);
