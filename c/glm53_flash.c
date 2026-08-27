@@ -9,6 +9,17 @@
 #include "glm53_kda.h"
 #include "glm53_mhc.h"
 #include "glm53_sparse_attention.h"
+#include "glm53_fp8.h"
+#include "tensor.h"
+
+typedef struct {
+    ColiTensorView view;
+    void *data;
+    float *scales;
+    shards *source;
+    char *name;
+    int streamed;
+} Matrix;
 
 typedef struct {
     int hidden, layers, vocab, dense_inter, moe_inter, experts, topk, shared;
@@ -25,11 +36,13 @@ typedef struct {
     float *ah_fn, *ah_base, *ah_scale, *fh_fn, *fh_base, *fh_scale;
     int kda, sparse;
     float *q, *k, *v, *conv, *fa, *fb, *dt, *alog, *beta, *ga, *gb, *onorm, *op;
-    float *qa, *qan, *qb, *kva, *kvan, *kvb;
+    Matrix dqa, dqb, dkva, dop;
+    float *qan, *kvan, *kvb;
     float *iwq, *iwk, *iknw, *iknb, *igate, *iweight, *iape;
-    float *fg, *fu, *fd;
-    float *router, *router_bias, *sg, *su, *sd;
-    float **eg, **eu, **ed;
+    Matrix fg, fu, fd;
+    float *router, *router_bias;
+    Matrix sg, su, sd;
+    Matrix *eg, *eu, *ed;
 } Layer;
 
 typedef struct {
@@ -49,6 +62,8 @@ typedef struct {
     LayerCache *layers;
     int length;
 } RuntimeCache;
+
+static void matmul(float *out, const float *input, const float *weight, int rows, int in, int columns);
 
 static void die(const char *message) {
     fprintf(stderr, "%s\n", message);
@@ -167,6 +182,105 @@ static float *load_named(Model *m, int layer, const char *suffix) {
     snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", layer, suffix);
     return load_tensor(m, name);
 }
+static Matrix load_matrix_mode(Model *model, const char *name, int streamed) {
+    st_tensor *tensor = st_find(&model->tensors, name);
+    if (!tensor || tensor->rank != 2 || tensor->shape[0] < 1 || tensor->shape[1] < 1)
+        die("glm53: invalid matrix tensor");
+    Matrix matrix = {0};
+    matrix.view.rows = tensor->shape[0];
+    matrix.view.columns = tensor->shape[1];
+    matrix.source = &model->tensors;
+    matrix.streamed = streamed;
+    matrix.name = strdup(name);
+    if (!matrix.name) die("glm53: matrix name allocation failed");
+    if (tensor->dtype <= 2) {
+        matrix.view.format = COLI_TENSOR_F32;
+        matrix.view.data_bytes = (size_t)tensor->numel * sizeof(float);
+        if (!streamed) {
+            matrix.data = alloc_floats((size_t)tensor->numel);
+            st_read_f32_cap(&model->tensors, name, matrix.data, tensor->numel, 0);
+            matrix.view.data = matrix.data;
+        }
+        return matrix;
+    }
+    if (tensor->dtype != 4 || tensor->nbytes != tensor->numel) die("glm53: matrix must be float or F8_E4M3");
+    char scale_name[640];
+    snprintf(scale_name, sizeof(scale_name), "%s_scale_inv", name);
+    st_tensor *scale = st_find(&model->tensors, scale_name);
+    int64_t scale_rows = (tensor->shape[0] + 127) / 128;
+    int64_t scale_columns = (tensor->shape[1] + 127) / 128;
+    if (!scale || scale->dtype > 2 || scale->rank != 2 || scale->shape[0] != scale_rows ||
+        scale->shape[1] != scale_columns)
+        die("glm53: invalid FP8 weight_scale_inv tensor");
+    matrix.view.format = COLI_TENSOR_FP8_E4M3_BLOCK;
+    matrix.view.scale_format = COLI_SCALE_F32;
+    matrix.view.data_bytes = (size_t)tensor->nbytes;
+    matrix.view.scale_bytes = (size_t)scale->numel * sizeof(float);
+    matrix.view.block_rows = 128;
+    matrix.view.block_columns = 128;
+    if (!streamed) {
+        matrix.data = malloc((size_t)tensor->nbytes);
+        matrix.scales = alloc_floats((size_t)scale->numel);
+        if (!matrix.data) die("glm53: FP8 matrix allocation failed");
+        st_read_raw_cap(&model->tensors, name, matrix.data, tensor->nbytes, 0);
+        st_read_f32_cap(&model->tensors, scale_name, matrix.scales, scale->numel, 0);
+        matrix.view.data = matrix.data;
+        matrix.view.scales = matrix.scales;
+    }
+    return matrix;
+}
+static Matrix load_matrix(Model *model, const char *name) { return load_matrix_mode(model, name, 0); }
+static Matrix load_named_matrix(Model *model, int layer, const char *suffix) {
+    char name[512];
+    snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", layer, suffix);
+    return load_matrix(model, name);
+}
+static Matrix load_named_streamed_matrix(Model *model, int layer, const char *suffix) {
+    char name[512];
+    snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", layer, suffix);
+    return load_matrix_mode(model, name, 1);
+}
+static void matrix_free(Matrix *matrix) {
+    free(matrix->data);
+    free(matrix->scales);
+    free(matrix->name);
+    memset(matrix, 0, sizeof(*matrix));
+}
+static void matrix_multiply(float *output, const float *input, const Matrix *weight, int rows) {
+    if (weight->streamed) {
+        Matrix loaded = *weight;
+        loaded.streamed = 0;
+        loaded.name = NULL;
+        loaded.data = malloc(weight->view.data_bytes);
+        if (!loaded.data) die("glm53: streamed matrix allocation failed");
+        loaded.view.data = loaded.data;
+        if (weight->view.format == COLI_TENSOR_F32) {
+            st_read_f32_cap(weight->source, weight->name, loaded.data,
+                            (int64_t)(weight->view.data_bytes / sizeof(float)), 1);
+        } else {
+            loaded.scales = alloc_floats(weight->view.scale_bytes / sizeof(float));
+            loaded.view.scales = loaded.scales;
+            st_read_raw_cap(weight->source, weight->name, loaded.data, (int64_t)weight->view.data_bytes, 1);
+            char scale_name[640];
+            snprintf(scale_name, sizeof(scale_name), "%s_scale_inv", weight->name);
+            st_read_f32_cap(weight->source, scale_name, loaded.scales,
+                            (int64_t)(weight->view.scale_bytes / sizeof(float)), 1);
+        }
+        matrix_multiply(output, input, &loaded, rows);
+        free(loaded.scales);
+        free(loaded.data);
+        return;
+    }
+    if (weight->view.format == COLI_TENSOR_F32) {
+        matmul(output, input, weight->data, rows, (int)weight->view.columns, (int)weight->view.rows);
+        return;
+    }
+    for (int row = 0; row < rows; row++)
+        if (coli_glm53_fp8_matvec(output + (size_t)row * weight->view.rows, weight->view.data, weight->view.scales,
+                                  input + (size_t)row * weight->view.columns, (int)weight->view.rows,
+                                  (int)weight->view.columns))
+            die("glm53: FP8 matrix multiply failed");
+}
 static float *load_conv(Model *model, int layer) {
     const char *parts[] = {"q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"};
     int64_t counts[3], total = 0;
@@ -223,13 +337,13 @@ static void model_load(Model *m, const char *directory) {
             l->onorm = load_named(m, i, "self_attn.o_norm.weight");
             l->op = load_named(m, i, "self_attn.o_proj.weight");
         } else {
-            l->qa = load_named(m, i, "self_attn.q_a_proj.weight");
+            l->dqa = load_named_matrix(m, i, "self_attn.q_a_proj.weight");
             l->qan = load_named(m, i, "self_attn.q_a_layernorm.weight");
-            l->qb = load_named(m, i, "self_attn.q_b_proj.weight");
-            l->kva = load_named(m, i, "self_attn.kv_a_proj_with_mqa.weight");
+            l->dqb = load_named_matrix(m, i, "self_attn.q_b_proj.weight");
+            l->dkva = load_named_matrix(m, i, "self_attn.kv_a_proj_with_mqa.weight");
             l->kvan = load_named(m, i, "self_attn.kv_a_layernorm.weight");
             l->kvb = load_named(m, i, "self_attn.kv_b_proj.weight");
-            l->op = load_named(m, i, "self_attn.o_proj.weight");
+            l->dop = load_named_matrix(m, i, "self_attn.o_proj.weight");
             l->iwq = load_named(m, i, "self_attn.indexer.wq_b.weight");
             l->iwk = load_named(m, i, "self_attn.indexer.wk.weight");
             l->iknw = load_named(m, i, "self_attn.indexer.k_norm.weight");
@@ -239,26 +353,26 @@ static void model_load(Model *m, const char *directory) {
             l->iape = load_named(m, i, "self_attn.indexer.index_kpool_compress_ape");
         }
         if (!l->sparse) {
-            l->fg = load_named(m, i, "mlp.gate_proj.weight");
-            l->fu = load_named(m, i, "mlp.up_proj.weight");
-            l->fd = load_named(m, i, "mlp.down_proj.weight");
+            l->fg = load_named_matrix(m, i, "mlp.gate_proj.weight");
+            l->fu = load_named_matrix(m, i, "mlp.up_proj.weight");
+            l->fd = load_named_matrix(m, i, "mlp.down_proj.weight");
         } else {
             l->router = load_named(m, i, "mlp.gate.weight");
             l->router_bias = load_named(m, i, "mlp.gate.e_score_correction_bias");
-            l->sg = load_named(m, i, "mlp.shared_experts.gate_proj.weight");
-            l->su = load_named(m, i, "mlp.shared_experts.up_proj.weight");
-            l->sd = load_named(m, i, "mlp.shared_experts.down_proj.weight");
-            l->eg = calloc((size_t)c->experts, sizeof(float *));
-            l->eu = calloc((size_t)c->experts, sizeof(float *));
-            l->ed = calloc((size_t)c->experts, sizeof(float *));
+            l->sg = load_named_matrix(m, i, "mlp.shared_experts.gate_proj.weight");
+            l->su = load_named_matrix(m, i, "mlp.shared_experts.up_proj.weight");
+            l->sd = load_named_matrix(m, i, "mlp.shared_experts.down_proj.weight");
+            l->eg = calloc((size_t)c->experts, sizeof(Matrix));
+            l->eu = calloc((size_t)c->experts, sizeof(Matrix));
+            l->ed = calloc((size_t)c->experts, sizeof(Matrix));
             for (int e = 0; e < c->experts; e++) {
                 char name[128];
                 snprintf(name, sizeof(name), "mlp.experts.%d.gate_proj.weight", e);
-                l->eg[e] = load_named(m, i, name);
+                l->eg[e] = load_named_streamed_matrix(m, i, name);
                 snprintf(name, sizeof(name), "mlp.experts.%d.up_proj.weight", e);
-                l->eu[e] = load_named(m, i, name);
+                l->eu[e] = load_named_streamed_matrix(m, i, name);
                 snprintf(name, sizeof(name), "mlp.experts.%d.down_proj.weight", e);
-                l->ed[e] = load_named(m, i, name);
+                l->ed[e] = load_named_streamed_matrix(m, i, name);
             }
         }
     }
@@ -286,12 +400,13 @@ static void layer_free(Layer *layer, int experts) {
     free(layer->gb);
     free(layer->onorm);
     free(layer->op);
-    free(layer->qa);
+    matrix_free(&layer->dqa);
     free(layer->qan);
-    free(layer->qb);
-    free(layer->kva);
+    matrix_free(&layer->dqb);
+    matrix_free(&layer->dkva);
     free(layer->kvan);
     free(layer->kvb);
+    matrix_free(&layer->dop);
     free(layer->iwq);
     free(layer->iwk);
     free(layer->iknw);
@@ -299,18 +414,18 @@ static void layer_free(Layer *layer, int experts) {
     free(layer->igate);
     free(layer->iweight);
     free(layer->iape);
-    free(layer->fg);
-    free(layer->fu);
-    free(layer->fd);
+    matrix_free(&layer->fg);
+    matrix_free(&layer->fu);
+    matrix_free(&layer->fd);
     free(layer->router);
     free(layer->router_bias);
-    free(layer->sg);
-    free(layer->su);
-    free(layer->sd);
+    matrix_free(&layer->sg);
+    matrix_free(&layer->su);
+    matrix_free(&layer->sd);
     for (int expert = 0; expert < experts; expert++) {
-        free(layer->eg ? layer->eg[expert] : NULL);
-        free(layer->eu ? layer->eu[expert] : NULL);
-        free(layer->ed ? layer->ed[expert] : NULL);
+        if (layer->eg) matrix_free(&layer->eg[expert]);
+        if (layer->eu) matrix_free(&layer->eu[expert]);
+        if (layer->ed) matrix_free(&layer->ed[expert]);
     }
     free(layer->eg);
     free(layer->eu);
@@ -441,10 +556,10 @@ static void dsa_forward(const Config *c, const Layer *l, const float *x, int n, 
           *queries = alloc_floats((size_t)n * qwidth);
     float *latent = alloc_floats((size_t)n * c->kv_rank), *ln = alloc_floats((size_t)n * c->kv_rank),
           *expanded = alloc_floats((size_t)n * kvwidth);
-    matmul(qr, x, l->qa, n, c->hidden, c->q_rank);
+    matrix_multiply(qr, x, &l->dqa, n);
     rmsnorm(qn, qr, l->qan, n, c->q_rank, c->eps);
-    matmul(queries, qn, l->qb, n, c->q_rank, qwidth);
-    matmul(latent, x, l->kva, n, c->hidden, c->kv_rank);
+    matrix_multiply(queries, qn, &l->dqb, n);
+    matrix_multiply(latent, x, &l->dkva, n);
     rmsnorm(ln, latent, l->kvan, n, c->kv_rank, c->eps);
     matmul(expanded, ln, l->kvb, n, c->kv_rank, kvwidth);
     float *keys = alloc_floats((size_t)n * c->heads * c->key_dim),
@@ -477,7 +592,7 @@ static void dsa_forward(const Config *c, const Layer *l, const float *x, int n, 
     }
     float *context = alloc_floats((size_t)n * c->heads * c->value_dim);
     coli_glm53_sparse_attention(context, queries, keys, values, indices, n, iwidth, c->heads, c->key_dim, c->value_dim);
-    matmul(out, context, l->op, n, c->heads * c->value_dim, c->hidden);
+    matrix_multiply(out, context, &l->dop, n);
     free(context);
     free(indices);
     free(valid);
@@ -496,24 +611,24 @@ static void dsa_forward(const Config *c, const Layer *l, const float *x, int n, 
     free(qr);
 }
 
-static void mlp3(float *out, const float *x, const float *wg, const float *wu, const float *wd, int n, int hidden,
-                 int inter, float limit) {
+static void mlp3(float *out, const float *x, const Matrix *wg, const Matrix *wu, const Matrix *wd, int n, int inter,
+                 float limit) {
     float *g = alloc_floats((size_t)n * inter), *u = alloc_floats((size_t)n * inter),
           *a = alloc_floats((size_t)n * inter);
-    matmul(g, x, wg, n, hidden, inter);
-    matmul(u, x, wu, n, hidden, inter);
+    matrix_multiply(g, x, wg, n);
+    matrix_multiply(u, x, wu, n);
     for (int i = 0; i < n * inter; i++) a[i] = swiglu(g[i], u[i], limit);
-    matmul(out, a, wd, n, inter, hidden);
+    matrix_multiply(out, a, wd, n);
     free(a);
     free(u);
     free(g);
 }
 static void ffn_forward(const Config *c, const Layer *l, const float *x, int n, float *out) {
     if (!l->sparse) {
-        mlp3(out, x, l->fg, l->fu, l->fd, n, c->hidden, c->dense_inter, c->swiglu_limit);
+        mlp3(out, x, &l->fg, &l->fu, &l->fd, n, c->dense_inter, c->swiglu_limit);
         return;
     }
-    mlp3(out, x, l->sg, l->su, l->sd, n, c->hidden, c->moe_inter * c->shared, c->swiglu_limit);
+    mlp3(out, x, &l->sg, &l->su, &l->sd, n, c->moe_inter * c->shared, c->swiglu_limit);
     float *score = alloc_floats((size_t)c->experts), *temp = alloc_floats((size_t)c->hidden);
     for (int t = 0; t < n; t++) {
         const float *row = x + (size_t)t * c->hidden;
@@ -543,7 +658,7 @@ static void ffn_forward(const Config *c, const Layer *l, const float *x, int n, 
         }
         for (int k = 0; k < c->topk; k++) {
             weights[k] = weights[k] / (total + 1e-20f) * c->route_scale;
-            mlp3(temp, row, l->eg[ids[k]], l->eu[ids[k]], l->ed[ids[k]], 1, c->hidden, c->moe_inter, c->swiglu_limit);
+            mlp3(temp, row, &l->eg[ids[k]], &l->eu[ids[k]], &l->ed[ids[k]], 1, c->moe_inter, c->swiglu_limit);
             for (int d = 0; d < c->hidden; d++) out[(size_t)t * c->hidden + d] += weights[k] * temp[d];
         }
     }
@@ -650,10 +765,10 @@ static void dsa_step_forward(const Config *c, const Layer *l, LayerCache *cache,
     float *index_raw = alloc_floats((size_t)c->index_dim);
     float *head_weight = alloc_floats((size_t)c->index_heads);
 
-    matmul(q_resid, x, l->qa, 1, c->hidden, c->q_rank);
+    matrix_multiply(q_resid, x, &l->dqa, 1);
     rmsnorm(q_norm, q_resid, l->qan, 1, c->q_rank, c->eps);
-    matmul(query, q_norm, l->qb, 1, c->q_rank, qwidth);
-    matmul(latent, x, l->kva, 1, c->hidden, c->kv_rank);
+    matrix_multiply(query, q_norm, &l->dqb, 1);
+    matrix_multiply(latent, x, &l->dkva, 1);
     rmsnorm(latent_norm, latent, l->kvan, 1, c->kv_rank, c->eps);
     matmul(expanded, latent_norm, l->kvb, 1, c->kv_rank, kvwidth);
     matmul(index_query, q_norm, l->iwq, 1, c->q_rank, c->index_heads * c->index_dim);
@@ -688,7 +803,7 @@ static void dsa_step_forward(const Config *c, const Layer *l, LayerCache *cache,
                             length, c->index_heads, c->index_dim, c->index_pool, c->index_topk);
     coli_glm53_sparse_attention(context, queries, cache->keys, cache->values, indices, length, index_width, c->heads,
                                 c->key_dim, c->value_dim);
-    matmul(out, context + (size_t)position * c->heads * c->value_dim, l->op, 1, c->heads * c->value_dim, c->hidden);
+    matrix_multiply(out, context + (size_t)position * c->heads * c->value_dim, &l->dop, 1);
     free(context);
     free(indices);
     free(valid);

@@ -624,12 +624,16 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 
-.PHONY: glm53-tiny-generate glm53-tiny-check
+.PHONY: glm53-tiny-generate glm53-fp8-tiny-generate glm53-tiny-check
 glm53-tiny-generate:
 	$(PYTHON) tools/make_glm53_tiny.py --output ./glm53_tiny --force
 
-glm53-tiny-check: glm53-tiny-generate
+glm53-fp8-tiny-generate:
+	$(PYTHON) tools/make_glm53_tiny.py --output ./glm53_fp8_tiny --force --fp8-mlp
+
+glm53-tiny-check: glm53-tiny-generate glm53-fp8-tiny-generate
 	$(PYTHON) tests/test_glm53_tiny.py --fixture ./glm53_tiny
+	$(PYTHON) tools/check_glm53_checkpoint.py --model ./glm53_tiny
 	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_kda.c glm53_kda.c \
 		-o ./tests/test_glm53_kda$(EXE) -lm $(LDFLAGS)
 	./tests/test_glm53_kda$(EXE)
@@ -643,16 +647,25 @@ glm53-tiny-check: glm53-tiny-generate
 	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_mhc.c glm53_mhc.c \
 		-o ./tests/test_glm53_mhc$(EXE) -lm $(LDFLAGS)
 	./tests/test_glm53_mhc$(EXE)
+	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_fp8.c glm53_fp8.c \
+		-o ./tests/test_glm53_fp8$(EXE) -lm $(LDFLAGS)
+	./tests/test_glm53_fp8$(EXE)
 	$(MAKE) glm53_flash$(EXE)
 	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
 		--fixture ./glm53_tiny
 	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
 		--fixture ./glm53_tiny --cached
+	$(PYTHON) tests/test_glm53_tiny.py --fixture ./glm53_fp8_tiny --expect-fp8
+	$(PYTHON) tools/check_glm53_checkpoint.py --model ./glm53_fp8_tiny --require-fp8
+	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
+		--fixture ./glm53_fp8_tiny
+	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
+		--fixture ./glm53_fp8_tiny --cached
 
 glm53_flash$(EXE): glm53_flash.c glm53_kda.c glm53_indexer.c \
-		glm53_sparse_attention.c glm53_mhc.c st.h json.h
+		glm53_sparse_attention.c glm53_mhc.c glm53_fp8.c st.h json.h
 	$(CC) $(CFLAGS) glm53_flash.c glm53_kda.c glm53_indexer.c \
-		glm53_sparse_attention.c glm53_mhc.c -o $@ -lm $(LDFLAGS)
+		glm53_sparse_attention.c glm53_mhc.c glm53_fp8.c -o $@ -lm $(LDFLAGS)
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean

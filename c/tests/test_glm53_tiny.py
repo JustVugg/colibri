@@ -17,6 +17,7 @@ def safetensors_header(path: Path) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--expect-fp8", action="store_true")
     args = parser.parse_args()
     config = json.loads((args.fixture / "config.json").read_text())
     text = config["text_config"]
@@ -52,6 +53,11 @@ def main() -> int:
     assert not missing, f"missing production-layout tensors: {sorted(missing)}"
     assert not any("experts.gate_up_proj" in name for name in header)
     assert not any("self_attn.conv1d.weight" in name for name in header)
+    if args.expect_fp8:
+        assert config["quantization_config"]["weight_block_size"] == [128, 128]
+        matrix = "model.language_model.layers.0.mlp.gate_proj.weight"
+        assert header[matrix]["dtype"] == "F8_E4M3"
+        assert header[matrix + "_scale_inv"]["dtype"] == "F32"
     print("PASS GLM-5.3 tiny oracle contract")
     return 0
 

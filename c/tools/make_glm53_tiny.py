@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import types
 from collections import OrderedDict
 from pathlib import Path
 
@@ -86,7 +87,7 @@ def config_kwargs() -> dict[str, object]:
     }
 
 
-def runtime_config(version: str) -> dict[str, object]:
+def runtime_config(version: str, fp8_mlp: bool = False) -> dict[str, object]:
     text = config_kwargs()
     text.update({
         "model_type": "glm5_next_text",
@@ -99,13 +100,21 @@ def runtime_config(version: str) -> dict[str, object]:
         },
         "num_nextn_predict_layers": 0,
     })
-    return {
+    result = {
         "architectures": ["Glm5NextForConditionalGeneration"],
         "model_type": "glm5_next",
         "transformers_version": version,
         "torch_dtype": "float32",
         "text_config": text,
     }
+    if fp8_mlp:
+        result["quantization_config"] = {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        }
+    return result
 
 
 def production_layout(torch, model, head) -> OrderedDict[str, object]:
@@ -170,6 +179,101 @@ def initialize_contract_weights(torch, model, head) -> None:
             indexer.wk.weight[dim, dim] = 1.0
             for index_head in range(indexer.n_heads):
                 indexer.wq_b.weight[index_head * indexer.head_dim + dim, dim] = 1.0
+
+
+def quantize_block_weight(torch, weight):
+    import torch.nn.functional as F
+
+    rows, columns = weight.shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_columns = (columns + 127) // 128 * 128
+    padded = F.pad(weight.float(), (0, padded_columns - columns, 0, padded_rows - rows))
+    blocks = padded.reshape(padded_rows // 128, 128, padded_columns // 128, 128)
+    maximum = blocks.abs().amax(dim=(1, 3))
+    scales = torch.where(maximum > 0, maximum / 448.0, torch.ones_like(maximum))
+    quantized = (blocks / scales[:, None, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    quantized_padded = quantized.reshape(padded_rows, padded_columns)
+    dequantized_padded = (quantized.float() * scales[:, None, :, None]).reshape(padded_rows, padded_columns)
+    quantized = quantized_padded[:rows, :columns].contiguous()
+    dequantized = dequantized_padded[:rows, :columns].contiguous()
+    return quantized, scales, dequantized
+
+
+def dynamic_fp8_qdq(torch, value):
+    shape = value.shape
+    blocks = value.float().reshape(-1, shape[-1] // 128, 128)
+    maximum = blocks.abs().amax(dim=-1)
+    scales = torch.where(maximum > 0, maximum / 448.0, torch.ones_like(maximum))
+    result = (blocks / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+    return (result * scales[..., None]).reshape(shape)
+
+
+def apply_fp8_mlp_oracle(torch, model) -> None:
+    import torch.nn.functional as F
+
+    def quantized_linear(module):
+        _, _, dequantized = quantize_block_weight(torch, module.weight.detach())
+        module.weight.copy_(dequantized)
+
+        def forward(self, value):
+            return F.linear(dynamic_fp8_qdq(torch, value), self.weight)
+
+        module.forward = types.MethodType(forward, module)
+
+    with torch.no_grad():
+        for layer in model.layers:
+            if layer.block_type == "deepseek_sparse_attention":
+                quantized_linear(layer.self_attn.q_a_proj)
+                quantized_linear(layer.self_attn.q_b_proj)
+                quantized_linear(layer.self_attn.kv_a_proj_with_mqa)
+                quantized_linear(layer.self_attn.o_proj)
+            mlp = layer.mlp
+            if hasattr(mlp, "experts"):
+                quantized_linear(mlp.shared_experts.gate_proj)
+                quantized_linear(mlp.shared_experts.up_proj)
+                quantized_linear(mlp.shared_experts.down_proj)
+                experts = mlp.experts
+                gate, up = experts.gate_up_proj.chunk(2, dim=1)
+                for expert in range(EXPERTS):
+                    _, _, gate[expert] = quantize_block_weight(torch, gate[expert])
+                    _, _, up[expert] = quantize_block_weight(torch, up[expert])
+                    _, _, experts.down_proj[expert] = quantize_block_weight(torch, experts.down_proj[expert])
+
+                def expert_forward(self, hidden_states, top_k_index, top_k_weights):
+                    final = torch.zeros_like(hidden_states)
+                    mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+                    for expert_index in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero().flatten():
+                        top_k_pos, token_index = torch.where(mask[expert_index])
+                        current = dynamic_fp8_qdq(torch, hidden_states[token_index])
+                        current = self._apply_gate(F.linear(current, self.gate_up_proj[expert_index]))
+                        current = F.linear(
+                            dynamic_fp8_qdq(torch, current), self.down_proj[expert_index]
+                        ) * top_k_weights[token_index, top_k_pos, None]
+                        final.index_add_(0, token_index, current.to(final.dtype))
+                    return final
+
+                experts.forward = types.MethodType(expert_forward, experts)
+            else:
+                quantized_linear(mlp.gate_proj)
+                quantized_linear(mlp.up_proj)
+                quantized_linear(mlp.down_proj)
+
+
+def quantize_disk_weights(torch, model, weights: OrderedDict[str, object]) -> None:
+    replacements = []
+    for name, tensor in weights.items():
+        mlp = name.endswith(("gate_proj.weight", "up_proj.weight", "down_proj.weight"))
+        dsa_suffix = name.endswith(("self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight",
+                                    "self_attn.kv_a_proj_with_mqa.weight", "self_attn.o_proj.weight"))
+        layer_index = int(name.split(".layers.", 1)[1].split(".", 1)[0]) if ".layers." in name else -1
+        dsa = dsa_suffix and layer_index >= 0 and model.layers[layer_index].block_type == "deepseek_sparse_attention"
+        if not (mlp or dsa):
+            continue
+        quantized, scales, _ = quantize_block_weight(torch, tensor)
+        replacements.append((name, quantized, scales))
+    for name, quantized, scales in replacements:
+        weights[name] = quantized
+        weights[name + "_scale_inv"] = scales
 
 
 def make_tokenizer() -> dict[str, object]:
@@ -263,6 +367,47 @@ def write_c_array(stream, name: str, tensor, dimensions: str) -> None:
         row = ", ".join(literals)
         stream.write(f"  {row},\n")
     stream.write("};\n\n")
+
+
+def write_u8_array(torch, stream, name: str, tensor, dimensions: str) -> None:
+    values = tensor.detach().view(torch.uint8).reshape(-1).tolist()
+    stream.write(f"static const unsigned char {name}{dimensions} = {{\n")
+    for start in range(0, len(values), 16):
+        stream.write("  " + ", ".join(str(value) for value in values[start:start + 16]) + ",\n")
+    stream.write("};\n\n")
+
+
+def write_fp8_case(torch, model, output: Path) -> None:
+    weight = model.layers[0].mlp.gate_proj.weight.detach().float()
+    rows, columns = weight.shape
+    blocks = weight.reshape(rows // 128, 128, columns // 128, 128)
+    maximum = blocks.abs().amax(dim=(1, 3))
+    scales = torch.where(maximum > 0, maximum / 448.0, torch.ones_like(maximum))
+    quantized = (blocks / scales[:, None, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    quantized = quantized.reshape_as(weight)
+    activation = torch.linspace(-1.25, 1.75, columns)
+    activation_blocks = activation.reshape(-1, 128)
+    activation_maximum = activation_blocks.abs().amax(dim=1)
+    activation_scales = torch.where(
+        activation_maximum > 0, activation_maximum / 448.0, torch.ones_like(activation_maximum)
+    )
+    activation_qdq = (
+        (activation_blocks / activation_scales[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        * activation_scales[:, None]
+    ).reshape(-1)
+    dequantized = quantized.float().reshape(rows // 128, 128, columns // 128, 128)
+    dequantized = (dequantized * scales[:, None, :, None]).reshape_as(weight)
+    expected = torch.mv(dequantized, activation_qdq)
+    with output.open("w", encoding="utf-8") as stream:
+        stream.write("#ifndef COLIBRI_GLM53_FP8_CASE_H\n#define COLIBRI_GLM53_FP8_CASE_H\n\n")
+        stream.write(f"#define GLM53_FP8_ROWS {rows}\n#define GLM53_FP8_COLUMNS {columns}\n\n")
+        write_u8_array(torch, stream, "glm53_fp8_weight", quantized,
+                       "[GLM53_FP8_ROWS * GLM53_FP8_COLUMNS]")
+        write_c_array(stream, "glm53_fp8_scales", scales,
+                      "[(GLM53_FP8_ROWS / 128) * (GLM53_FP8_COLUMNS / 128)]")
+        write_c_array(stream, "glm53_fp8_input", activation, "[GLM53_FP8_COLUMNS]")
+        write_c_array(stream, "glm53_fp8_expected", expected, "[GLM53_FP8_ROWS]")
+        stream.write("#endif\n")
 
 
 def write_kda_case(torch, model, output: Path) -> None:
@@ -448,6 +593,7 @@ def main() -> int:
     default = Path(__file__).resolve().parents[1] / "glm53_tiny"
     parser.add_argument("--output", type=Path, default=default)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--fp8-mlp", action="store_true")
     args = parser.parse_args()
     torch, transformers, save_file, Config, Model = require_dependencies()
     torch.manual_seed(SEED)
@@ -455,7 +601,11 @@ def main() -> int:
     model = Model(Config(**config_kwargs())).eval()
     head = torch.nn.Linear(HIDDEN, VOCAB, bias=False).eval()
     initialize_contract_weights(torch, model, head)
+    if args.fp8_mlp:
+        apply_fp8_mlp_oracle(torch, model)
     weights = production_layout(torch, model, head)
+    if args.fp8_mlp:
+        quantize_disk_weights(torch, model, weights)
     reference = oracle(torch, transformers, model, head)
     output = args.output.resolve()
     if output.exists():
@@ -464,7 +614,7 @@ def main() -> int:
         shutil.rmtree(output)
     output.mkdir(parents=True)
     (output / "config.json").write_text(
-        json.dumps(runtime_config(transformers.__version__), indent=2) + "\n",
+        json.dumps(runtime_config(transformers.__version__, args.fp8_mlp), indent=2) + "\n",
         encoding="utf-8",
     )
     (output / "tokenizer.json").write_text(
@@ -480,6 +630,7 @@ def main() -> int:
     write_sparse_attention_case(torch, model, output / "glm53_sparse_attention_case.h")
     write_mhc_case(torch, model, output / "glm53_mhc_case.h")
     write_indexer_case(torch, model, output / "glm53_indexer_case.h")
+    write_fp8_case(torch, model, output / "glm53_fp8_case.h")
     size = sum(path.stat().st_size for path in output.iterdir())
     print(f"wrote {output} ({len(weights)} tensors, {size} bytes)")
     return 0
