@@ -630,6 +630,9 @@ glm53-tiny-generate:
 
 glm53-tiny-check: glm53-tiny-generate
 	$(PYTHON) tests/test_glm53_tiny.py --fixture ./glm53_tiny
+	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_kda.c glm53_kda.c \
+		-o ./tests/test_glm53_kda$(EXE) -lm $(LDFLAGS)
+	./tests/test_glm53_kda$(EXE)
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean

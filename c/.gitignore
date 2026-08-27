@@ -26,6 +26,7 @@ absorb_determinism_test
 cuda_fmt_trap_test
 tests/*.dSYM/
 tests/test_dsa_select
+tests/test_glm53_kda
 tests/test_i4_grouped
 tests/test_kv_alloc
 tests/test_kv_disk

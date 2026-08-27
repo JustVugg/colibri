@@ -185,6 +185,55 @@ def oracle(torch, transformers, model, head) -> dict[str, object]:
     }
 
 
+def write_c_array(stream, name: str, tensor, dimensions: str) -> None:
+    values = tensor.detach().float().reshape(-1).tolist()
+    stream.write(f"static const float {name}{dimensions} = {{\n")
+    for start in range(0, len(values), 8):
+        row = ", ".join(f"{value:.9g}f" for value in values[start:start + 8])
+        stream.write(f"  {row},\n")
+    stream.write("};\n\n")
+
+
+def write_kda_case(torch, model, output: Path) -> None:
+    """Emit a C fixture from the official recurrent KDA fallback."""
+    from transformers.models.glm5_next.modeling_glm5_next import (
+        causal_conv1d_fn, recurrent_kimi_delta_attention,
+    )
+    attention = model.layers[0].self_attn
+    hidden = model.embed_tokens(torch.tensor([[5, 7]], dtype=torch.long))
+    raw = torch.cat([
+        attention.q_proj(hidden), attention.k_proj(hidden), attention.v_proj(hidden)
+    ], dim=-1)
+    convolved = causal_conv1d_fn(
+        raw.transpose(1, 2), attention.conv1d.weight.squeeze(1),
+        bias=None, activation=attention.activation,
+    ).transpose(1, 2)
+    query, key, value = convolved.split(HEADS * HEAD_DIM, dim=-1)
+    decay = attention.forget_gate(hidden).view(1, 2, HEADS, HEAD_DIM)
+    beta = torch.sigmoid(attention.b_proj(hidden))
+    expected, _ = recurrent_kimi_delta_attention(
+        query.view(1, 2, HEADS, HEAD_DIM),
+        key.view(1, 2, HEADS, HEAD_DIM),
+        value.view(1, 2, HEADS, HEAD_DIM),
+        g=decay, beta=beta, initial_state=None, output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    with output.open("w", encoding="utf-8") as stream:
+        stream.write("#ifndef COLIBRI_GLM53_KDA_CASE_H\n#define COLIBRI_GLM53_KDA_CASE_H\n\n")
+        stream.write(f"#define GLM53_KDA_STEPS 2\n#define GLM53_KDA_HEADS {HEADS}\n")
+        stream.write(f"#define GLM53_KDA_DIM {HEAD_DIM}\n#define GLM53_KDA_KERNEL 4\n\n")
+        write_c_array(stream, "glm53_kda_qkv", raw[0],
+                      "[2 * 3 * GLM53_KDA_HEADS * GLM53_KDA_DIM]")
+        write_c_array(stream, "glm53_kda_conv", attention.conv1d.weight.squeeze(1),
+                      "[3 * GLM53_KDA_HEADS * GLM53_KDA_DIM * GLM53_KDA_KERNEL]")
+        write_c_array(stream, "glm53_kda_decay", decay[0],
+                      "[2 * GLM53_KDA_HEADS * GLM53_KDA_DIM]")
+        write_c_array(stream, "glm53_kda_beta", beta[0], "[2 * GLM53_KDA_HEADS]")
+        write_c_array(stream, "glm53_kda_output", expected[0],
+                      "[2 * GLM53_KDA_HEADS * GLM53_KDA_DIM]")
+        stream.write("#endif\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     default = Path(__file__).resolve().parents[1] / "glm53_tiny"
@@ -217,6 +266,7 @@ def main() -> int:
     (output / "ref.json").write_text(
         json.dumps(reference, indent=2) + "\n", encoding="utf-8"
     )
+    write_kda_case(torch, model, output / "glm53_kda_case.h")
     size = sum(path.stat().st_size for path in output.iterdir())
     print(f"wrote {output} ({len(weights)} tensors, {size} bytes)")
     return 0
