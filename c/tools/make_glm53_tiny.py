@@ -189,7 +189,13 @@ def write_c_array(stream, name: str, tensor, dimensions: str) -> None:
     values = tensor.detach().float().reshape(-1).tolist()
     stream.write(f"static const float {name}{dimensions} = {{\n")
     for start in range(0, len(values), 8):
-        row = ", ".join(f"{value:.9g}f" for value in values[start:start + 8])
+        literals = []
+        for value in values[start:start + 8]:
+            literal = f"{value:.9g}"
+            if "." not in literal and "e" not in literal:
+                literal += ".0"
+            literals.append(literal + "f")
+        row = ", ".join(literals)
         stream.write(f"  {row},\n")
     stream.write("};\n\n")
 
@@ -234,6 +240,72 @@ def write_kda_case(torch, model, output: Path) -> None:
         stream.write("#endif\n")
 
 
+def write_indexer_case(torch, model, output: Path) -> None:
+    attention = model.layers[3].self_attn
+    indexer = attention.indexer
+    ids = torch.arange(8).view(1, -1)
+    values = torch.arange(8 * HIDDEN, dtype=torch.float32).view(1, 8, HIDDEN)
+    hidden = torch.sin(values * 0.013) + 0.2 * torch.cos(values * 0.031)
+    base = torch.linspace(-1.0, 1.0, indexer.head_dim)
+    perturb = torch.sin(torch.arange(indexer.head_dim, dtype=torch.float32) * 0.37)
+    for token in range(ids.shape[1]):
+        hidden[0, token, :indexer.head_dim] = base + (token + 1) * 0.01 * perturb
+    q_resid = torch.zeros_like(hidden)
+    q_resid[..., :indexer.head_dim] = base
+    with torch.no_grad():
+        indexer.wk.weight.zero_()
+        indexer.wq_b.weight.zero_()
+        for dim in range(indexer.head_dim):
+            indexer.wk.weight[dim, dim] = 1.0
+            for head in range(indexer.n_heads):
+                indexer.wq_b.weight[head * indexer.head_dim + dim, dim] = 1.0
+        indexer.weights_proj.weight.copy_(
+            torch.linspace(0.001, 0.01, indexer.weights_proj.weight.numel()).view_as(
+                indexer.weights_proj.weight
+            )
+        )
+        indexer.index_kpool_compress_gate.copy_(
+            torch.linspace(-0.01, 0.01, indexer.index_kpool_compress_gate.numel()).view_as(
+                indexer.index_kpool_compress_gate
+            )
+        )
+        indexer.index_kpool_compress_ape.copy_(
+            torch.linspace(-0.1, 0.1, indexer.index_kpool_compress_ape.numel()).view_as(
+                indexer.index_kpool_compress_ape
+            )
+        )
+    queries = indexer.wq_b(q_resid).view(1, ids.shape[1], indexer.n_heads, indexer.head_dim)
+    keys = indexer.k_norm(indexer.wk(hidden))
+    gates = torch.nn.functional.linear(hidden, indexer.index_kpool_compress_gate)
+    weights = indexer.weights_proj(hidden) * (indexer.n_heads ** -0.5)
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    with torch.no_grad():
+        expected = indexer(hidden, q_resid, valid, None)
+    with output.open("w", encoding="utf-8") as stream:
+        stream.write("#ifndef COLIBRI_GLM53_INDEXER_CASE_H\n#define COLIBRI_GLM53_INDEXER_CASE_H\n\n")
+        stream.write(f"#define GLM53_INDEX_SEQUENCE {ids.shape[1]}\n")
+        stream.write(f"#define GLM53_INDEX_HEADS {indexer.n_heads}\n")
+        stream.write(f"#define GLM53_INDEX_DIM {indexer.head_dim}\n")
+        stream.write(f"#define GLM53_INDEX_POOL {indexer.index_kpool}\n")
+        stream.write(f"#define GLM53_INDEX_TOPK {indexer.index_topk}\n")
+        stream.write("#define GLM53_INDEX_WIDTH (GLM53_INDEX_TOPK + GLM53_INDEX_POOL - 1)\n\n")
+        write_c_array(stream, "glm53_index_queries", queries,
+                      "[GLM53_INDEX_SEQUENCE * GLM53_INDEX_HEADS * GLM53_INDEX_DIM]")
+        write_c_array(stream, "glm53_index_keys", keys,
+                      "[GLM53_INDEX_SEQUENCE * GLM53_INDEX_DIM]")
+        write_c_array(stream, "glm53_index_gates", gates,
+                      "[GLM53_INDEX_SEQUENCE * GLM53_INDEX_DIM]")
+        write_c_array(stream, "glm53_index_weights", weights,
+                      "[GLM53_INDEX_SEQUENCE * GLM53_INDEX_HEADS]")
+        write_c_array(stream, "glm53_index_ape", indexer.index_kpool_compress_ape,
+                      "[GLM53_INDEX_POOL * GLM53_INDEX_DIM]")
+        valid_values = ", ".join("1" if value else "0" for value in valid.reshape(-1).tolist())
+        stream.write(f"static const unsigned char glm53_index_valid[GLM53_INDEX_SEQUENCE] = {{{valid_values}}};\n")
+        expected_values = ", ".join(str(value) for value in expected.reshape(-1).tolist())
+        stream.write("static const int glm53_index_expected[GLM53_INDEX_SEQUENCE * GLM53_INDEX_WIDTH] = {\n")
+        stream.write(f"  {expected_values}\n}};\n\n#endif\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     default = Path(__file__).resolve().parents[1] / "glm53_tiny"
@@ -267,6 +339,7 @@ def main() -> int:
         json.dumps(reference, indent=2) + "\n", encoding="utf-8"
     )
     write_kda_case(torch, model, output / "glm53_kda_case.h")
+    write_indexer_case(torch, model, output / "glm53_indexer_case.h")
     size = sum(path.stat().st_size for path in output.iterdir())
     print(f"wrote {output} ({len(weights)} tensors, {size} bytes)")
     return 0
