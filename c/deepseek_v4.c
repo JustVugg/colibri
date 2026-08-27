@@ -14028,6 +14028,7 @@ int main(int argc, char **argv) {
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
+    if (argc < 2) { coli_print_launcher_help("DeepSeek V4"); return 1; }
     if (v4_cli_parse(argc, argv, &cli)) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;

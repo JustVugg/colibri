@@ -3,6 +3,28 @@
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
 ---
+
+## If you downloaded a release archive, start here
+
+The archive contains **`coli.cmd`**: that is the program to run. Double-click it
+for the quick start, or from cmd/PowerShell:
+
+```
+coli.cmd chat   --model D:\models\glm52_i4
+coli.cmd serve  --model D:\models\glm52_i4
+coli.cmd doctor --model D:\models\glm52_i4
+```
+
+`colibri.exe`, `kimi_k3.exe` and the other `.exe` files are the **engines**.
+They are selected by the launcher from the model's `config.json`; started on
+their own they have no model to load, print how to launch and exit, which from
+Explorer looks like a window that flashes and disappears (#1241). The launcher
+needs Python 3 from https://www.python.org/downloads/ with "Add python.exe to
+PATH" ticked; the engines themselves need nothing.
+
+The rest of this page is for building from source.
+
+---
 > **2026-08-11: Additional validation with detailed steps for laptop setup** \
 Lenovo Thinkpad P16v (Intel Core i7 ultra (155H 1.4GHz), 64GB RAM, 2Tb NVME drive, Nvidia RTX 2000 Ada generation 8GB (AD107, 2023)).
 Windows 11 pro english.\

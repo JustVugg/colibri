@@ -3028,6 +3028,7 @@ int main(int argc, char **argv){
      * below, so an error says what to do instead of only what went wrong. */
     if(!serving && (argc<2 || !strcmp(argv[1],"--help") || !strcmp(argv[1],"-h")
                           || !strcmp(argv[1],"help"))){
+        if(argc<2){ coli_print_launcher_help("Kimi K3"); return 1; }
         k3_usage(argv[0]);
         return argc<2 ? 1 : 0;          /* asking for help is not a failure */
     }

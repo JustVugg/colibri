@@ -1461,7 +1461,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (!snap) { coli_print_launcher_help("OLMoE"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;

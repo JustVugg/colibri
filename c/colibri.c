@@ -11457,7 +11457,8 @@ int main(int argc, char **argv){
         puts("AVX512 i3 selftest: ok"); return 0;
     }
 #endif
-    const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    const char *snap=getenv("SNAP");
+    if(!snap){ coli_print_launcher_help("GLM-5.2"); return 1; }
     const char *weights_dir=getenv("COLI_WEIGHTS_DIR");
     const char *state_env=getenv("COLI_STATE_DIR");
     const char *state_dir=state_env;

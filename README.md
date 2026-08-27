@@ -457,7 +457,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
-On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
+On Windows a release archive ships `coli.cmd`: double-click it for the quick
+start, or run `coli.cmd chat --model D:\glm52_i4` from cmd or PowerShell.
+From a source checkout the same commands work with `python coli chat --model
+D:\glm52_i4`. The `.exe` files are the engines, not the launcher: started on
+their own they have no model to load and exit immediately.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 

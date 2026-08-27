@@ -2390,7 +2390,7 @@ int main(int argc, char **argv) {
 #endif  /* !COLI_CUDA && !__APPLE__ */
     coli_omp_tune_threads("inkling");
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (!snap) { coli_print_launcher_help("Inkling"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
     if (g_topp > 0.f && g_topp < 1.f)
         fprintf(stderr, "[TOPP] %.2f: routed experts kept to cumulative weight — "

@@ -136,6 +136,11 @@ jobs:
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
           cp c/coli dist/
+          # Windows has nothing to click otherwise: `coli` is an extensionless
+          # Python script, and the .exe files are engines that exit at once
+          # without a model (#1241). coli.cmd is both the double-click entry
+          # point and what `coli chat ...` resolves to in cmd/PowerShell.
+          if [ "${{ matrix.ext }}" = ".exe" ]; then cp c/coli.cmd dist/; fi
           cp c/version.py dist/
           cp c/openai_server.py dist/
           cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import
