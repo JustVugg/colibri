@@ -75,6 +75,10 @@ def config_kwargs() -> dict[str, object]:
         "linear_conv_kernel_dim": 4,
         "hc_mult": 2,
         "hc_sinkhorn_iters": 3,
+        "hc_eps": 1.0e-6,
+        "rms_norm_eps": 1.0e-5,
+        "routed_scaling_factor": 2.5,
+        "swiglu_limit": 10.0,
         "pad_token_id": None,
         "bos_token_id": 0,
         "eos_token_id": 1,
@@ -123,6 +127,36 @@ def production_layout(torch, model, head) -> OrderedDict[str, object]:
     return output
 
 
+def initialize_contract_weights(torch, model, head) -> None:
+    """Remove random-init degeneracies that make top-k ties implementation-defined."""
+    with torch.no_grad():
+        embeddings = model.embed_tokens.weight.detach().clone()
+        for token in range(VOCAB):
+            head.weight[(token + 1) % VOCAB].copy_(embeddings[token])
+        indexer = model.layers[3].self_attn.indexer
+        indexer.index_kpool_compress_gate.copy_(
+            torch.linspace(-0.01, 0.01, indexer.index_kpool_compress_gate.numel()).view_as(
+                indexer.index_kpool_compress_gate
+            )
+        )
+        indexer.index_kpool_compress_ape.copy_(
+            torch.linspace(-0.1, 0.1, indexer.index_kpool_compress_ape.numel()).view_as(
+                indexer.index_kpool_compress_ape
+            )
+        )
+        indexer.weights_proj.weight.copy_(
+            torch.linspace(-0.02, 0.03, indexer.weights_proj.weight.numel()).view_as(
+                indexer.weights_proj.weight
+            )
+        )
+        indexer.wq_b.weight.zero_()
+        indexer.wk.weight.zero_()
+        for dim in range(indexer.head_dim):
+            indexer.wk.weight[dim, dim] = 1.0
+            for index_head in range(indexer.n_heads):
+                indexer.wq_b.weight[index_head * indexer.head_dim + dim, dim] = 1.0
+
+
 def make_tokenizer() -> dict[str, object]:
     added = [
         {"id": token, "content": f"<t{token:03d}>", "single_word": False,
@@ -144,7 +178,8 @@ def oracle(torch, transformers, model, head) -> dict[str, object]:
     prompt = [5, 7, 9, 11, 13, 17, 19, 23]
     ids = torch.tensor([prompt], dtype=torch.long)
     with torch.no_grad():
-        full_hidden = model(ids, use_cache=False).last_hidden_state
+        full_output = model(ids, use_cache=False, output_hidden_states=True)
+        full_hidden = full_output.last_hidden_state
         full_logits = head(full_hidden)
         prefix = model(ids[:, :-1], use_cache=True)
         incremental = model(
@@ -155,6 +190,15 @@ def oracle(torch, transformers, model, head) -> dict[str, object]:
     if delta > 1e-5:
         raise RuntimeError(f"prefill/incremental cache mismatch: {delta}")
     top_values, top_indices = full_logits[0, -1].topk(8)
+    generated = []
+    sequence = list(prompt)
+    with torch.no_grad():
+        for _ in range(4):
+            greedy_ids = torch.tensor([sequence], dtype=torch.long)
+            next_logits = head(model(greedy_ids, use_cache=False).last_hidden_state)[0, -1]
+            token = int(next_logits.argmax())
+            generated.append(token)
+            sequence.append(token)
     cache_shapes = []
     for layer in prefix.past_key_values.layers:
         if hasattr(layer, "recurrent_states"):
@@ -180,6 +224,12 @@ def oracle(torch, transformers, model, head) -> dict[str, object]:
         "teacher_forcing_ids": full_logits[0].argmax(-1).tolist(),
         "last_logits_top_ids": top_indices.tolist(),
         "last_logits_top_values": top_values.tolist(),
+        "last_logits": full_logits[0, -1].tolist(),
+        "greedy_new_ids": generated,
+        "hidden_state_stats": [
+            {"sum": float(state.float().sum()), "square_sum": float(state.float().square().sum())}
+            for state in full_output.hidden_states
+        ],
         "cache_max_abs_delta": delta,
         "cache_shapes": cache_shapes,
     }
@@ -389,6 +439,7 @@ def main() -> int:
     torch.set_num_threads(1)
     model = Model(Config(**config_kwargs())).eval()
     head = torch.nn.Linear(HIDDEN, VOCAB, bias=False).eval()
+    initialize_contract_weights(torch, model, head)
     weights = production_layout(torch, model, head)
     reference = oracle(torch, transformers, model, head)
     output = args.output.resolve()

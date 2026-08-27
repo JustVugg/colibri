@@ -643,6 +643,14 @@ glm53-tiny-check: glm53-tiny-generate
 	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_mhc.c glm53_mhc.c \
 		-o ./tests/test_glm53_mhc$(EXE) -lm $(LDFLAGS)
 	./tests/test_glm53_mhc$(EXE)
+	$(MAKE) glm53_flash$(EXE)
+	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
+		--fixture ./glm53_tiny
+
+glm53_flash$(EXE): glm53_flash.c glm53_kda.c glm53_indexer.c \
+		glm53_sparse_attention.c glm53_mhc.c st.h json.h
+	$(CC) $(CFLAGS) glm53_flash.c glm53_kda.c glm53_indexer.c \
+		glm53_sparse_attention.c glm53_mhc.c -o $@ -lm $(LDFLAGS)
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
