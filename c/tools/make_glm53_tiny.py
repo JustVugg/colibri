@@ -348,6 +348,36 @@ def write_sparse_attention_case(torch, model, output: Path) -> None:
         stream.write("#endif\n")
 
 
+def write_mhc_case(torch, model, output: Path) -> None:
+    mhc = model.layers[0].attn_hc
+    streams = model.embed_tokens(torch.tensor([[5]])).unsqueeze(2).expand(-1, -1, 2, -1).contiguous()
+    with torch.no_grad():
+        post, comb, collapsed = mhc(streams)
+        branch = torch.sin(torch.arange(HIDDEN, dtype=torch.float32) * 0.07).view(1, 1, HIDDEN)
+        expanded = post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(-2) + torch.matmul(
+            comb.to(streams.dtype), streams.unsqueeze(-3)
+        ).squeeze(-2)
+    with output.open("w", encoding="utf-8") as stream:
+        stream.write("#ifndef COLIBRI_GLM53_MHC_CASE_H\n#define COLIBRI_GLM53_MHC_CASE_H\n\n")
+        stream.write(f"#define GLM53_MHC_COPIES 2\n#define GLM53_MHC_DIM {HIDDEN}\n")
+        stream.write("#define GLM53_MHC_ITERATIONS 3\n\n")
+        write_c_array(stream, "glm53_mhc_streams", streams,
+                      "[GLM53_MHC_COPIES * GLM53_MHC_DIM]")
+        write_c_array(stream, "glm53_mhc_function", mhc.fn,
+                      "[((2 + GLM53_MHC_COPIES) * GLM53_MHC_COPIES) * GLM53_MHC_COPIES * GLM53_MHC_DIM]")
+        write_c_array(stream, "glm53_mhc_scale", mhc.scale, "[3]")
+        write_c_array(stream, "glm53_mhc_base", mhc.base,
+                      "[(2 + GLM53_MHC_COPIES) * GLM53_MHC_COPIES]")
+        write_c_array(stream, "glm53_mhc_branch", branch, "[GLM53_MHC_DIM]")
+        write_c_array(stream, "glm53_mhc_collapsed", collapsed, "[GLM53_MHC_DIM]")
+        write_c_array(stream, "glm53_mhc_post", post, "[GLM53_MHC_COPIES]")
+        write_c_array(stream, "glm53_mhc_comb", comb,
+                      "[GLM53_MHC_COPIES * GLM53_MHC_COPIES]")
+        write_c_array(stream, "glm53_mhc_output", expanded,
+                      "[GLM53_MHC_COPIES * GLM53_MHC_DIM]")
+        stream.write("#endif\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     default = Path(__file__).resolve().parents[1] / "glm53_tiny"
@@ -382,6 +412,7 @@ def main() -> int:
     )
     write_kda_case(torch, model, output / "glm53_kda_case.h")
     write_sparse_attention_case(torch, model, output / "glm53_sparse_attention_case.h")
+    write_mhc_case(torch, model, output / "glm53_mhc_case.h")
     write_indexer_case(torch, model, output / "glm53_indexer_case.h")
     size = sum(path.stat().st_size for path in output.iterdir())
     print(f"wrote {output} ({len(weights)} tensors, {size} bytes)")
