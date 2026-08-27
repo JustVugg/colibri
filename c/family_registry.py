@@ -538,9 +538,9 @@ FAMILIES = (
         config_section="text_config",
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "GLM53_MAXT"),
         capabilities=FamilyCapabilities(True, False, False, True),
-        has_gateway_adapter=False,
-        has_cli_adapter=False,
-        runtime_available=False,
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        runtime_available=True,
     ),
     FamilyDescriptor(
         id="inkling",

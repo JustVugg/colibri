@@ -11,6 +11,7 @@
 #include "glm53_sparse_attention.h"
 #include "glm53_fp8.h"
 #include "tensor.h"
+#include "tok.h"
 
 typedef struct {
     ColiTensorView view;
@@ -22,7 +23,7 @@ typedef struct {
 } Matrix;
 
 typedef struct {
-    int hidden, layers, vocab, dense_inter, moe_inter, experts, topk, shared;
+    int hidden, layers, vocab, max_position, dense_inter, moe_inter, experts, topk, shared;
     int heads, q_rank, kv_rank, key_dim, value_dim;
     int kda_heads, kda_dim, conv_kernel;
     int index_heads, index_dim, index_topk, index_pool;
@@ -116,6 +117,7 @@ static void load_config(Config *c, const char *directory) {
     c->hidden = (int)required_number(text, "hidden_size");
     c->layers = (int)required_number(text, "num_hidden_layers");
     c->vocab = (int)required_number(text, "vocab_size");
+    c->max_position = (int)required_number(text, "max_position_embeddings");
     c->dense_inter = (int)required_number(text, "intermediate_size");
     c->moe_inter = (int)required_number(text, "moe_intermediate_size");
     c->experts = (int)required_number(text, "n_routed_experts");
@@ -957,7 +959,225 @@ static int parse_ids(const char *text, int **output) {
     *output = ids;
     return n;
 }
+
+typedef struct {
+    char id[64];
+    int max_tokens, payload_size;
+    float temperature, top_p;
+    char *payload;
+} ServeRequest;
+
+static int serve_read_request(ServeRequest *request) {
+    char line[512], command[16], id[64];
+    if (!fgets(line, sizeof(line), stdin)) return -1;
+    if (sscanf(line, "%15s %63s", command, id) < 2) return 0;
+    if (!strcmp(command, "CANCEL") || !strcmp(command, "STOP")) return 0;
+    if (strcmp(command, "SUBMIT")) return 0;
+    int slot, payload_size, max_tokens;
+    float temperature, top_p;
+    if (sscanf(line, "%*s %*s %d %d %d %f %f", &slot, &payload_size, &max_tokens, &temperature, &top_p) != 5 ||
+        payload_size < 0 || payload_size > (1 << 24) || max_tokens < 1) {
+        printf("ERROR %s bad submit header\n", id);
+        fflush(stdout);
+        return 0;
+    }
+    (void)slot;
+    char *payload = malloc((size_t)payload_size + 1);
+    if (!payload) die("glm53: serve payload allocation failed");
+    if (fread(payload, 1, (size_t)payload_size, stdin) != (size_t)payload_size) {
+        free(payload);
+        return -1;
+    }
+    (void)fgetc(stdin);
+    payload[payload_size] = 0;
+    snprintf(request->id, sizeof(request->id), "%s", id);
+    request->max_tokens = max_tokens;
+    request->payload_size = payload_size;
+    request->temperature = temperature;
+    request->top_p = top_p;
+    request->payload = payload;
+    return 1;
+}
+
+typedef struct {
+    float probability;
+    int token;
+} SampleProbability;
+
+static int probability_descending(const void *left, const void *right) {
+    float a = ((const SampleProbability *)left)->probability;
+    float b = ((const SampleProbability *)right)->probability;
+    return (b > a) - (a > b);
+}
+
+static int sample_token(const float *logits, int vocab, float temperature, float top_p) {
+    if (temperature <= 0.0f) {
+        int best = 0;
+        for (int token = 1; token < vocab; token++)
+            if (logits[token] > logits[best]) best = token;
+        return best;
+    }
+    SampleProbability *ranked = malloc((size_t)vocab * sizeof(*ranked));
+    if (!ranked) die("glm53: sampler allocation failed");
+    float maximum = logits[0];
+    for (int token = 1; token < vocab; token++) maximum = fmaxf(maximum, logits[token]);
+    double total = 0.0;
+    for (int token = 0; token < vocab; token++) {
+        float probability = expf((logits[token] - maximum) / temperature);
+        ranked[token] = (SampleProbability){probability, token};
+        total += probability;
+    }
+    qsort(ranked, (size_t)vocab, sizeof(*ranked), probability_descending);
+    double cutoff = top_p > 0.0f && top_p < 1.0f ? top_p * total : total;
+    double kept = 0.0;
+    int count = 0;
+    while (count < vocab && kept < cutoff) kept += ranked[count++].probability;
+    double target = (double)rand() / RAND_MAX * kept;
+    double cumulative = 0.0;
+    int selected = ranked[0].token;
+    for (int i = 0; i < count; i++) {
+        cumulative += ranked[i].probability;
+        if (cumulative >= target) {
+            selected = ranked[i].token;
+            break;
+        }
+    }
+    free(ranked);
+    return selected;
+}
+
+static void serve_data(const char *id, const char *data, int size) {
+    if (size <= 0) return;
+    printf("DATA %s %d\n", id, size);
+    fwrite(data, 1, (size_t)size, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+static void serve_model(Model *model, const char *directory) {
+    char tokenizer_path[2048];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", directory);
+    Tok tokenizer;
+    tok_load(&tokenizer, tokenizer_path);
+    printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 0.0\n");
+    fflush(stdout);
+    for (;;) {
+        ServeRequest request = {0};
+        int status = serve_read_request(&request);
+        if (status < 0) break;
+        if (!status) continue;
+        int capacity = request.payload_size + 64;
+        int *ids = malloc((size_t)capacity * sizeof(*ids));
+        if (!ids) die("glm53: token buffer allocation failed");
+        int prompt_tokens = tok_encode(&tokenizer, request.payload, request.payload_size, ids, capacity);
+        if (prompt_tokens < 1 || prompt_tokens + request.max_tokens > model->c.max_position) {
+            printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n", request.id, prompt_tokens,
+                   request.max_tokens, model->c.max_position);
+            fflush(stdout);
+            free(ids);
+            free(request.payload);
+            continue;
+        }
+        printf("ACCEPT %s %d\n", request.id, prompt_tokens);
+        fflush(stdout);
+        RuntimeCache cache;
+        cache_init(&cache, &model->c);
+        float *logits = NULL;
+        for (int i = 0; i < prompt_tokens; i++) {
+            free(logits);
+            logits = forward_cached_step(model, &cache, ids[i]);
+        }
+        int generated = 0, limited = 1;
+        for (; generated < request.max_tokens; generated++) {
+            int token = sample_token(logits, model->c.vocab, request.temperature, request.top_p);
+            if (token == 154820) {
+                limited = 0;
+                break;
+            }
+            char bytes[65536];
+            int size = tok_decode(&tokenizer, &token, 1, bytes, (int)sizeof(bytes));
+            serve_data(request.id, bytes, size);
+            free(logits);
+            logits = forward_cached_step(model, &cache, token);
+        }
+        printf("DONE %s STAT %d 0.00 0.0 0.0 %d %d\n", request.id, generated, prompt_tokens, limited);
+        fflush(stdout);
+        free(logits);
+        cache_free(&cache, &model->c);
+        free(ids);
+        free(request.payload);
+    }
+    tok_free(&tokenizer);
+}
+
+static int run_text_prompt(Model *model, const char *directory, const char *prompt, int max_tokens, float temperature,
+                           float top_p) {
+    char tokenizer_path[2048];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", directory);
+    Tok tokenizer;
+    tok_load(&tokenizer, tokenizer_path);
+    int capacity = (int)strlen(prompt) + 64;
+    int *ids = malloc((size_t)capacity * sizeof(*ids));
+    if (!ids) die("glm53: token buffer allocation failed");
+    int prompt_tokens = tok_encode(&tokenizer, prompt, (int)strlen(prompt), ids, capacity);
+    if (prompt_tokens < 1 || prompt_tokens + max_tokens > model->c.max_position) {
+        fprintf(stderr, "glm53: prompt exceeds context capacity\n");
+        free(ids);
+        tok_free(&tokenizer);
+        return 2;
+    }
+    RuntimeCache cache;
+    cache_init(&cache, &model->c);
+    float *logits = NULL;
+    for (int i = 0; i < prompt_tokens; i++) {
+        free(logits);
+        logits = forward_cached_step(model, &cache, ids[i]);
+    }
+    for (int generated = 0; generated < max_tokens; generated++) {
+        int token = sample_token(logits, model->c.vocab, temperature, top_p);
+        if (token == 154820) break;
+        char bytes[65536];
+        int size = tok_decode(&tokenizer, &token, 1, bytes, (int)sizeof(bytes));
+        fwrite(bytes, 1, (size_t)size, stdout);
+        fflush(stdout);
+        free(logits);
+        logits = forward_cached_step(model, &cache, token);
+    }
+    fputc('\n', stdout);
+    free(logits);
+    cache_free(&cache, &model->c);
+    free(ids);
+    tok_free(&tokenizer);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    const char *serve_directory = getenv("SNAP");
+    if (getenv("SERVE") && serve_directory && *serve_directory) {
+        Model model;
+        model_load(&model, serve_directory);
+        serve_model(&model, serve_directory);
+        model_free(&model);
+        return 0;
+    }
+    if (argc >= 4 && !strcmp(argv[2], "--prompt")) {
+        int max_tokens = 1024;
+        float temperature = 0.0f, top_p = 1.0f;
+        for (int arg = 4; arg < argc; arg++) {
+            if (!strcmp(argv[arg], "--max-tokens") && arg + 1 < argc) max_tokens = atoi(argv[++arg]);
+            else if (!strcmp(argv[arg], "--temperature") && arg + 1 < argc) temperature = strtof(argv[++arg], NULL);
+            else if (!strcmp(argv[arg], "--top-p") && arg + 1 < argc) top_p = strtof(argv[++arg], NULL);
+            else {
+                fprintf(stderr, "glm53: unknown argument %s\n", argv[arg]);
+                return 2;
+            }
+        }
+        Model model;
+        model_load(&model, argv[1]);
+        int result = run_text_prompt(&model, argv[1], argv[3], max_tokens, temperature, top_p);
+        model_free(&model);
+        return result;
+    }
     if (argc < 4 || strcmp(argv[2], "--ids")) {
         fprintf(stderr, "usage: %s MODEL --ids 1,2,3 [--greedy N] [--cached]\n", argv[0]);
         return 2;

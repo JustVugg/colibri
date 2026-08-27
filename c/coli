@@ -1208,6 +1208,16 @@ def cmd_run(a):
                 try: os.unlink(prompt_path)
                 except OSError: pass
         sys.exit(result)
+    if arch=="glm53_flash":
+        thinking=os.environ.get("THINK","0")=="1"
+        suffix="<think>" if thinking else "<think></think>"
+        rendered=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{suffix}"
+        e=env_for_engine(a,arch)
+        command=[engine,os.path.abspath(a.model),"--prompt",rendered,
+                 "--max-tokens",str(ngen_for(a,interactive=True,family=family)),
+                 "--temperature",str(a.temp if a.temp is not None else 1.0),
+                 "--top-p",str(a.topp if a.topp else 0.95)]
+        sys.exit(subprocess.call(command,env=e))
     if arch=="olmoe":
         # olmoe.c now speaks the gateway's SERVE protocol too (`coli chat`/
         # `coli web`/`coli serve` use it), but `coli run` predates that and

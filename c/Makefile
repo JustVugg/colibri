@@ -661,6 +661,8 @@ glm53-tiny-check: glm53-tiny-generate glm53-fp8-tiny-generate
 		--fixture ./glm53_fp8_tiny
 	$(PYTHON) tests/test_glm53_engine.py --binary ./glm53_flash$(EXE) \
 		--fixture ./glm53_fp8_tiny --cached
+	$(PYTHON) tests/test_glm53_serve.py --binary ./glm53_flash$(EXE) \
+		--fixture ./glm53_fp8_tiny
 
 glm53_flash$(EXE): glm53_flash.c glm53_kda.c glm53_indexer.c \
 		glm53_sparse_attention.c glm53_mhc.c glm53_fp8.c st.h json.h
@@ -1715,13 +1717,14 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) \
+install: colibri$(EXE) glm53_flash$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
+	$(INSTALL) -m 755 glm53_flash$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm53_flash$(EXE)
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)

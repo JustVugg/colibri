@@ -1276,7 +1276,7 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
 
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
-    """Render the text-only subset of the official GLM-5.2 chat template."""
+    """Render the shared text subset of the official GLM-5.2/5.3 templates."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]

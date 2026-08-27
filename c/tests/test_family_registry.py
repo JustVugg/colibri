@@ -177,7 +177,7 @@ class FamilyRegistryTest(unittest.TestCase):
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
             resolved = resolve_model(root)
         self.assertEqual(resolved.descriptor.id, "glm53_flash")
-        self.assertFalse(resolved.descriptor.runtime_available)
+        self.assertTrue(resolved.descriptor.runtime_available)
         geometry = planner_geometry(resolved, 4096)
         self.assertEqual(geometry.configured_experts, 288)
         # 34 KDA recurrences + conv4 histories are fixed; 11 DSA latent/index
@@ -213,7 +213,7 @@ class FamilyRegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "disagrees"):
             planner_geometry(resolved, 32)
 
-    def test_glm53_doctor_plans_but_marks_runtime_pending(self):
+    def test_glm53_doctor_requires_the_runtime_binary(self):
         from doctor import run_doctor
 
         config = {
@@ -259,7 +259,7 @@ class FamilyRegistryTest(unittest.TestCase):
                 gpus=[], linkage={"linked": False, "missing": False})
         checks = {item["id"]: item for item in report["checks"]}
         self.assertEqual(checks["model.family"]["status"], "pass")
-        self.assertEqual(checks["engine.binary"]["status"], "skip")
+        self.assertEqual(checks["engine.binary"]["status"], "fail")
         self.assertEqual(checks["model.shards"]["status"], "pass")
         self.assertEqual(report["plan"]["model"]["family_id"], "glm53_flash")
 
