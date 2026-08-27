@@ -335,6 +335,11 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+      - name: Link GLM-5.3 CUDA host against the shared backend
+        run: |
+          cd c
+          make glm53_flash CUDA=1 CUDA_ARCH=sm_80
+          test -x glm53_flash || { echo "GLM-5.3 CUDA host was not produced" >&2; exit 1; }
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
@@ -701,6 +706,13 @@ jobs:
           make colibri CUDA_DLL=1
           test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "colibri.exe built against the DLL loader"
+      - name: make glm53_flash CUDA_DLL=1
+        shell: msys2 {0}
+        run: |
+          cd c
+          make glm53_flash CUDA_DLL=1
+          test -f glm53_flash.exe || { echo "glm53_flash CUDA_DLL=1 produced no exe" >&2; exit 1; }
+          echo "glm53_flash.exe built against the DLL loader"
 
   web:
     name: Web UI

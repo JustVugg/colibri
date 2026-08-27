@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,9 @@
 #include "glm53_fp8.h"
 #include "tensor.h"
 #include "tok.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
 
 typedef struct {
     ColiTensorView view;
@@ -20,7 +24,45 @@ typedef struct {
     shards *source;
     char *name;
     int streamed;
+#ifdef COLI_CUDA
+    ColiCudaTensor *cuda;
+#endif
 } Matrix;
+
+#ifdef COLI_CUDA
+static int g_cuda_enabled, g_cuda_device;
+
+static int glm53_cuda_init(void) {
+    const char *enabled = getenv("COLI_CUDA");
+    if (!enabled || !atoi(enabled)) return 1;
+    if (getenv("COLI_GPU") && getenv("COLI_GPUS")) {
+        fprintf(stderr, "glm53: use COLI_GPU or COLI_GPUS, not both\n");
+        return 0;
+    }
+    const char *selected = getenv("COLI_GPU");
+    if (!selected) selected = getenv("COLI_GPUS");
+    char *end = NULL;
+    long parsed = selected ? strtol(selected, &end, 10) : 0;
+    if (parsed < 0 || parsed > INT_MAX || (selected && (!end || *end))) {
+        fprintf(stderr, "glm53: COLI_GPU/COLI_GPUS must select exactly one CUDA device\n");
+        return 0;
+    }
+    int device = (int)parsed;
+    float lut[256];
+    coli_glm53_fp8_decode_table(lut);
+    if (!coli_cuda_init(&device, 1)) return 0;
+    if (!coli_cuda_fp8_set_lut(lut)) {
+        coli_cuda_shutdown();
+        return 0;
+    }
+    g_cuda_enabled = 1;
+    g_cuda_device = device;
+    fprintf(stderr, "[CUDA] GLM-5.3 native FP8 matmul active on device %d\n", device);
+    return 1;
+}
+#else
+static int glm53_cuda_init(void) { return 1; }
+#endif
 
 typedef struct {
     int hidden, layers, vocab, max_position, dense_inter, moe_inter, experts, topk, shared;
@@ -243,12 +285,15 @@ static Matrix load_named_streamed_matrix(Model *model, int layer, const char *su
     return load_matrix_mode(model, name, 1);
 }
 static void matrix_free(Matrix *matrix) {
+#ifdef COLI_CUDA
+    coli_cuda_tensor_free(matrix->cuda);
+#endif
     free(matrix->data);
     free(matrix->scales);
     free(matrix->name);
     memset(matrix, 0, sizeof(*matrix));
 }
-static void matrix_multiply(float *output, const float *input, const Matrix *weight, int rows) {
+static void matrix_multiply(float *output, const float *input, Matrix *weight, int rows) {
     if (weight->streamed) {
         Matrix loaded = *weight;
         loaded.streamed = 0;
@@ -269,14 +314,29 @@ static void matrix_multiply(float *output, const float *input, const Matrix *wei
                             (int64_t)(weight->view.scale_bytes / sizeof(float)), 1);
         }
         matrix_multiply(output, input, &loaded, rows);
-        free(loaded.scales);
-        free(loaded.data);
+        matrix_free(&loaded);
         return;
     }
     if (weight->view.format == COLI_TENSOR_F32) {
         matmul(output, input, weight->data, rows, (int)weight->view.columns, (int)weight->view.rows);
         return;
     }
+#ifdef COLI_CUDA
+    if (g_cuda_enabled) {
+        size_t count = (size_t)rows * weight->view.columns;
+        float *activation = alloc_floats(count);
+        int valid = 1;
+        for (int row = 0; row < rows; row++)
+            valid &= !coli_glm53_fp8_quantize_activation(activation + (size_t)row * weight->view.columns,
+                                                         input + (size_t)row * weight->view.columns,
+                                                         (int)weight->view.columns);
+        int done =
+            valid && coli_cuda_matmul(&weight->cuda, output, activation, weight->view.data, weight->view.scales, 8,
+                                      rows, (int)weight->view.columns, (int)weight->view.rows, g_cuda_device, 0);
+        free(activation);
+        if (done) return;
+    }
+#endif
     for (int row = 0; row < rows; row++)
         if (coli_glm53_fp8_matvec(output + (size_t)row * weight->view.rows, weight->view.data, weight->view.scales,
                                   input + (size_t)row * weight->view.columns, (int)weight->view.rows,
@@ -551,7 +611,7 @@ static void kda_forward(const Config *c, const Layer *l, const float *x, int n, 
     free(qkv);
 }
 
-static void dsa_forward(const Config *c, const Layer *l, const float *x, int n, float *out) {
+static void dsa_forward(const Config *c, Layer *l, const float *x, int n, float *out) {
     int qwidth = c->heads * c->key_dim, kvwidth = c->heads * (c->key_dim + c->value_dim),
         iwidth = c->index_topk + c->index_pool - 1;
     float *qr = alloc_floats((size_t)n * c->q_rank), *qn = alloc_floats((size_t)n * c->q_rank),
@@ -613,8 +673,7 @@ static void dsa_forward(const Config *c, const Layer *l, const float *x, int n, 
     free(qr);
 }
 
-static void mlp3(float *out, const float *x, const Matrix *wg, const Matrix *wu, const Matrix *wd, int n, int inter,
-                 float limit) {
+static void mlp3(float *out, const float *x, Matrix *wg, Matrix *wu, Matrix *wd, int n, int inter, float limit) {
     float *g = alloc_floats((size_t)n * inter), *u = alloc_floats((size_t)n * inter),
           *a = alloc_floats((size_t)n * inter);
     matrix_multiply(g, x, wg, n);
@@ -625,7 +684,7 @@ static void mlp3(float *out, const float *x, const Matrix *wg, const Matrix *wu,
     free(u);
     free(g);
 }
-static void ffn_forward(const Config *c, const Layer *l, const float *x, int n, float *out) {
+static void ffn_forward(const Config *c, Layer *l, const float *x, int n, float *out) {
     if (!l->sparse) {
         mlp3(out, x, &l->fg, &l->fu, &l->fd, n, c->dense_inter, c->swiglu_limit);
         return;
@@ -751,8 +810,7 @@ static void dsa_cache_reserve(const Config *c, LayerCache *cache, int needed) {
     cache->capacity = capacity;
 }
 
-static void dsa_step_forward(const Config *c, const Layer *l, LayerCache *cache, int position, const float *x,
-                             float *out) {
+static void dsa_step_forward(const Config *c, Layer *l, LayerCache *cache, int position, const float *x, float *out) {
     int length = position + 1;
     int qwidth = c->heads * c->key_dim;
     int kvwidth = c->heads * (c->key_dim + c->value_dim);
@@ -1154,10 +1212,14 @@ static int run_text_prompt(Model *model, const char *directory, const char *prom
 int main(int argc, char **argv) {
     const char *serve_directory = getenv("SNAP");
     if (getenv("SERVE") && serve_directory && *serve_directory) {
+        if (!glm53_cuda_init()) die("glm53: requested CUDA backend is unavailable");
         Model model;
         model_load(&model, serve_directory);
         serve_model(&model, serve_directory);
         model_free(&model);
+#ifdef COLI_CUDA
+        if (g_cuda_enabled) coli_cuda_shutdown();
+#endif
         return 0;
     }
     if (argc >= 4 && !strcmp(argv[2], "--prompt")) {
@@ -1172,16 +1234,21 @@ int main(int argc, char **argv) {
                 return 2;
             }
         }
+        if (!glm53_cuda_init()) die("glm53: requested CUDA backend is unavailable");
         Model model;
         model_load(&model, argv[1]);
         int result = run_text_prompt(&model, argv[1], argv[3], max_tokens, temperature, top_p);
         model_free(&model);
+#ifdef COLI_CUDA
+        if (g_cuda_enabled) coli_cuda_shutdown();
+#endif
         return result;
     }
     if (argc < 4 || strcmp(argv[2], "--ids")) {
         fprintf(stderr, "usage: %s MODEL --ids 1,2,3 [--greedy N] [--cached]\n", argv[0]);
         return 2;
     }
+    if (!glm53_cuda_init()) die("glm53: requested CUDA backend is unavailable");
     Model model;
     model_load(&model, argv[1]);
     int *ids = NULL, n = parse_ids(argv[3], &ids);
@@ -1252,5 +1319,8 @@ int main(int argc, char **argv) {
     }
     free(ids);
     model_free(&model);
+#ifdef COLI_CUDA
+    if (g_cuda_enabled) coli_cuda_shutdown();
+#endif
     return 0;
 }
