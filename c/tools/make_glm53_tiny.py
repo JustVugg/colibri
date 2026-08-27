@@ -306,6 +306,48 @@ def write_indexer_case(torch, model, output: Path) -> None:
         stream.write(f"  {expected_values}\n}};\n\n#endif\n")
 
 
+def write_sparse_attention_case(torch, model, output: Path) -> None:
+    attention = model.layers[3].self_attn
+    ids = torch.tensor([[5, 7, 9, 11, 13, 17, 19, 23]], dtype=torch.long)
+    hidden = model.embed_tokens(ids)
+    q_resid = attention.q_a_layernorm(attention.q_a_proj(hidden))
+    queries = attention.q_b_proj(q_resid).view(1, 8, HEADS, HEAD_DIM)
+    compressed = attention.kv_a_proj_with_mqa(hidden)
+    latent = attention.kv_a_layernorm(compressed).view(1, 1, 8, 64)
+    keys, values = attention.expand_kv(latent, compressed.new_empty(1, 1, 8, 0))
+    keys = keys.transpose(1, 2).contiguous()
+    values = values.transpose(1, 2).contiguous()
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    indices = attention.indexer(hidden, q_resid, valid, None)
+    width = indices.shape[-1]
+    expected = torch.zeros(1, 8, HEADS, HEAD_DIM)
+    with torch.no_grad():
+        for position in range(8):
+            selected = indices[0, position]
+            selected = selected[selected.ge(0)]
+            for head in range(HEADS):
+                scores = queries[0, position, head] @ keys[0, selected, head].T
+                probabilities = torch.softmax(scores.float() / (HEAD_DIM ** 0.5), dim=-1)
+                expected[0, position, head] = probabilities @ values[0, selected, head].float()
+    with output.open("w", encoding="utf-8") as stream:
+        stream.write("#ifndef COLIBRI_GLM53_SPARSE_ATTENTION_CASE_H\n#define COLIBRI_GLM53_SPARSE_ATTENTION_CASE_H\n\n")
+        stream.write("#define GLM53_SA_SEQUENCE 8\n")
+        stream.write(f"#define GLM53_SA_HEADS {HEADS}\n#define GLM53_SA_KEY_DIM {HEAD_DIM}\n")
+        stream.write(f"#define GLM53_SA_VALUE_DIM {HEAD_DIM}\n#define GLM53_SA_WIDTH {width}\n\n")
+        write_c_array(stream, "glm53_sa_queries", queries,
+                      "[GLM53_SA_SEQUENCE * GLM53_SA_HEADS * GLM53_SA_KEY_DIM]")
+        write_c_array(stream, "glm53_sa_keys", keys,
+                      "[GLM53_SA_SEQUENCE * GLM53_SA_HEADS * GLM53_SA_KEY_DIM]")
+        write_c_array(stream, "glm53_sa_values", values,
+                      "[GLM53_SA_SEQUENCE * GLM53_SA_HEADS * GLM53_SA_VALUE_DIM]")
+        index_values = ", ".join(str(value) for value in indices.reshape(-1).tolist())
+        stream.write("static const int glm53_sa_indices[GLM53_SA_SEQUENCE * GLM53_SA_WIDTH] = {\n")
+        stream.write(f"  {index_values}\n}};\n\n")
+        write_c_array(stream, "glm53_sa_expected", expected,
+                      "[GLM53_SA_SEQUENCE * GLM53_SA_HEADS * GLM53_SA_VALUE_DIM]")
+        stream.write("#endif\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     default = Path(__file__).resolve().parents[1] / "glm53_tiny"
@@ -339,6 +381,7 @@ def main() -> int:
         json.dumps(reference, indent=2) + "\n", encoding="utf-8"
     )
     write_kda_case(torch, model, output / "glm53_kda_case.h")
+    write_sparse_attention_case(torch, model, output / "glm53_sparse_attention_case.h")
     write_indexer_case(torch, model, output / "glm53_indexer_case.h")
     size = sum(path.stat().st_size for path in output.iterdir())
     print(f"wrote {output} ({len(weights)} tensors, {size} bytes)")

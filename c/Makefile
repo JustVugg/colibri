@@ -636,6 +636,10 @@ glm53-tiny-check: glm53-tiny-generate
 	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_indexer.c glm53_indexer.c \
 		-o ./tests/test_glm53_indexer$(EXE) -lm $(LDFLAGS)
 	./tests/test_glm53_indexer$(EXE)
+	$(CC) $(CFLAGS) -I. -I./glm53_tiny tests/test_glm53_sparse_attention.c \
+		glm53_sparse_attention.c -o ./tests/test_glm53_sparse_attention$(EXE) \
+		-lm $(LDFLAGS)
+	./tests/test_glm53_sparse_attention$(EXE)
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
