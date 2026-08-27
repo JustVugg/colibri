@@ -53,6 +53,7 @@ EXPORTS
     dsv4_cuda_backend_name
     dsv4_cuda_kv_ring_append
     dsv4_cuda_mem_free_mb
+    dsv4_cuda_stream_drain
     dsv4_cuda_kv_comp_append
     dsv4_cuda_head_argmax
     dsv4_cuda_final_argmax
@@ -66,6 +67,7 @@ EXPORTS
     dsv4_cuda_expert_bank_upload
     dsv4_cuda_expert_bank_set_shared
     dsv4_cuda_expert_bank_upload_tp2
+    dsv4_cuda_expert_bank_upload_aux
     dsv4_cuda_expert_set_free
     dsv4_cuda_expert_set_upload_hash
     dsv4_cuda_route_moe

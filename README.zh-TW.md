@@ -24,7 +24,7 @@ Colibrì 刻意用於驗證激進的系統構想——因此**對速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.8.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -217,7 +217,7 @@ MTP head 必須是 **int8**（int4 head 的接受率會崩落到 0–4%，見
 [Releases](https://github.com/JustVugg/colibri/releases) 下載對應平台的壓縮檔並解壓：
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+mkdir colibri && tar xzf colibri-v1.8.0-linux-x86_64.tar.gz -C colibri && cd colibri
 python3 coli info                         # engine ready ✓
 ```
 
@@ -290,8 +290,9 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
   配置、排程、I/O、CPU/GPU 核心、異質重疊、KV 狀態與路由感知推測。目標是降低硬體要求
   和每個有效 token 的成本，所有成果都以端到端測量為準、經審查並公開開發。
 - **支援更多開放模型。**階層演算法與模型無關，任何帶路由專家的 MoE 都能用相同方式分層。
-  GLM-5.2 與 OLMoE 目前可用；**Kimi K2**、**Qwen3 MoE**、**MiniMax** 等開放權重模型
-  已列入路線圖。
+  目前已有六個模型家族可用（GLM-5.2、Inkling、Kimi K3、DeepSeek V4 Flash、
+  Qwen3.6、OLMoE）；更多開放權重家族（候選包括 **MiniMax**）將沿用同樣的
+  規則獲得引擎支援：有人完成端到端實測之後。
 
 ## 支持專案
 

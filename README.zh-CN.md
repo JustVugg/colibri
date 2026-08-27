@@ -24,7 +24,7 @@ Colibrì 刻意用于验证激进的系统思路——因此**对速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.8.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -216,7 +216,7 @@ MTP head 必须是 **int8**（int4 head 的接受率会崩塌到 0–4%，见
 [Releases](https://github.com/JustVugg/colibri/releases) 下载对应平台的压缩包并解压：
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+mkdir colibri && tar xzf colibri-v1.8.0-linux-x86_64.tar.gz -C colibri && cd colibri
 python3 coli info                         # engine ready ✓
 ```
 
@@ -285,10 +285,12 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 
 ## DeepSeek V4
 
-实验性的 **DeepSeek V4 Flash** CPU 路径使用原生 FP4 专家、自动 RAM
-规划、共享的 `st.h`／`quant.h` 基础设施，以及常驻 target engine。
-DSpark 有意保留给紧随其后的独立 stacked PR。本 target engine 支持
-x86-64／aarch64 Linux 与 Windows／MSYS2。
+**DeepSeek V4 Flash** 直接流式读取官方 checkpoint，无需转换：路由专家
+保持原生 FP4，稠密部分保持 fp8-e4m3。支持 x86-64／aarch64 Linux 与
+Windows／MSYS2（CPU），并提供可选的 CUDA 层（Windows 运行时 DLL；Linux
+`CUDA=1` 直接链接）——GTX 10 系及更新的 NVIDIA 显卡均可使用（Pascal/Turing
+需 `CUDA_ARCH=portable-pre-ampere NO_TC=1` 构建），每个阶段都保持 CPU 语义一致并可
+逐阶段回退。
 
 ```bash
 cd c
@@ -308,8 +310,9 @@ oracle 说明，请参阅[中文版 DeepSeek V4 文档](docs/deepseek-v4.zh-CN.m
   放置、调度、I/O、CPU/GPU 内核、异构重叠、KV 状态与路由感知推测。目标是降低硬件要求
   和每个有效 token 的成本，所有成果都以端到端测量为准、经审查并公开开发。
 - **支持更多开放模型。**层级算法与模型无关，任何带路由专家的 MoE 都能用相同方式分层。
-  GLM-5.2 与 OLMoE 目前可用；**Kimi K2**、**Qwen3 MoE**、**MiniMax** 等开放权重模型
-  已列入路线图。
+  目前已有六个模型家族可用（GLM-5.2、Inkling、Kimi K3、DeepSeek V4 Flash、
+  Qwen3.6、OLMoE）；更多开放权重家族（候选包括 **MiniMax**）将沿用同样的
+  规则获得引擎支持：有人完成端到端实测之后。
 
 ## 支持项目
 

@@ -21,12 +21,44 @@ extern "C" {
 
 #define COLI_CUDA_MAX_DEVICES 16
 
+/* Weight formats the generic per-element device decoder (weight_at,
+ * backend_cuda.cu) can actually decode: f32, int8-row, int4 nibbles (fmt=2 and
+ * the grouped fmt=4, same packing), and int2. Nothing else.
+ *
+ * WHY THIS IS A PREDICATE AND NOT A COMMENT. weight_at used to END in the int2
+ * decode as an unguarded fall-through, so ANY other format handed to it -- a
+ * format with a different element width, a different scale geometry, or no
+ * device decoder at all -- was silently read as 2-bit values and returned
+ * plausible-looking numbers. The CPU twins refuse the same input loudly:
+ * qt_addrow and qt_matvec_rows (colibri.c) both exit(1) naming the function and
+ * the fmt. Two backends given identical unsupported input, one refusing and one
+ * fabricating, is the defect -- not the missing decoder.
+ *
+ * Defined here, in the host header, rather than inside the .cu: the host gates
+ * that keep unsupported formats off the device (absorb_fmt_ok and friends) and
+ * the device-side backstop must agree by construction rather than by two people
+ * writing the same list twice, and a CPU test build can then unit-test the truth
+ * table without a GPU or a CUDA toolchain (tests/test_cuda_fmt_guard.c) -- the
+ * same arrangement colibri.c uses for metal_fused_fmt_ok.
+ *
+ * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
+ * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4) and fmt=8
+ * (fp8-e4m3) that never route through weight_at. This predicate is scoped to
+ * weight_at's own dispatch, which is what the absorb and grouped-expert kernels
+ * decode through. */
+static inline int coli_cuda_weight_at_supported(int fmt) {
+    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4;
+}
+
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
+/* Number of CUDA devices visible to this process, before a device list is
+ * selected. Returns 0 when the runtime cannot discover any device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_available_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);

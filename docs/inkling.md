@@ -191,6 +191,7 @@ SNAP=~/Models/inkling_i4 ./c/inkling -f warmup_prompts.txt -n 32
 | `USAGE_SAVE=0` | don't rewrite the history (benchmark runs) |
 | `NOGPU=1` / `GPU_DEV=<n>` | disable CUDA / select device |
 | `IDOT=0` | byte-exact scalar int kernels (debugging) |
+| `INK_SHARED_BATCH=0` | disable shared-expert prefill batching for a controlled A/B; positive values cap rows per chunk. The default uses up to 64 MiB of bounded scratch and never changes decode (`S=1`) |
 | `TOPP=<p>` | adaptive routing: keep routed experts up to cumulative weight `p`, drop the tail. **Trims the routing** — fewer experts read per token (the lever that matters on a disk-bound host), but a different computation from the declared top-k. Off by default; the run reports `[topp] … N/M routed used (X% trimmed)` so the trade is measurable. Same semantics as `TOPP` in `colibri.c` and `K3_TOPP` in `kimi_k3.c` |
 | First positional arg | expert-cache cap per layer (`0` = auto-size from free RAM) |
 

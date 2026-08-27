@@ -166,16 +166,32 @@ class TinyEfficiencyTest(unittest.TestCase):
     def test_cpu_vs_cpu_determinism(self):
         """Two greedy REPLAY runs with the same seed produce identical telemetry.
 
-        TEMP=0 = greedy (no sampling), so tok/s and hit-rate must be reproducible.
+        TEMP=0 = greedy (no sampling), so the hit-rate must be reproducible.
         A drift here means non-determinism crept into the decode path (stray
         threading, uninitialized state) — which on a real model would make A/B
-        comparisons meaningless."""
+        comparisons meaningless. Deliberately NO timing assertion: determinism
+        is about what is computed, not how fast (that lives in the stability
+        test below), which is what lets this one run on shared CI runners."""
         a = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         b = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         self.assertEqual(a["returncode"], 0)
         self.assertEqual(b["returncode"], 0)
         self.assertEqual(a["hit_pct"], b["hit_pct"], "greedy hit-rate drifted between runs")
-        # tok/s within 25% — exact equality is too strict across scheduler noise.
+
+    def test_cpu_vs_cpu_tok_s_stability(self):
+        """Two identical runs land within 25% in tok/s.
+
+        A wall-clock bound, NOT a determinism check: the tiny replay is ~15 ms
+        end to end, so a single scheduler stall can blow the band (38.8%
+        measured between identical runs on a quiet box; ~10x observed under
+        WSL2). Kept for quiet local machines, where a huge gap still flags a
+        real problem (a run that reloaded weights, a poisoned cache) — but it
+        is expected to be noisy on shared or virtualized hosts, and CI does
+        not run it."""
+        a = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
+        b = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
+        self.assertEqual(a["returncode"], 0)
+        self.assertEqual(b["returncode"], 0)
         self.assertLess(abs(a["tok_s"] - b["tok_s"]) / max(a["tok_s"], b["tok_s"]), 0.25)
 
 

@@ -36,6 +36,7 @@ static int cap_v150(double egb){
     return cap;
 }
 static double peak_gb(int cap){ return RESIDENT + RESERVE + (double)cap*SLOT_GB*NMOE; }
+static double peak_ckpt_gb(int cap, double ckpt){ return peak_gb(cap) + ckpt; }
 
 int main(void){
     /* ---- the reported failure, reproduced ---------------------------------- */
@@ -58,6 +59,38 @@ int main(void){
     /* It must not overshoot in the other direction either: a cache so small it
      * defeats the point would be a different bug, not a fix. */
     CHECK(cap > old/2);
+
+    /* ---- opt-in recurrent checkpoints are part of the same ceiling ------- */
+    /* Full K3 geometry: 69 KDA rows, 24 heads x 256 recurrent state and three
+     * 6144x4 conv windows. This is the ~434 MiB/photo stated by COLI_K3_CKPT.
+     * The planner runs before photos are allocated, so it must reserve every
+     * enabled slot or RAM_GB will be exceeded later in the conversation. */
+    Model cm={0}; cm.c.n_layers=69; cm.c.kda_heads=24; cm.c.kda_hd=256;
+    cm.c.kda_proj=6144; cm.c.conv_k=4;
+    cm.L=calloc((size_t)cm.c.n_layers,sizeof(Layer));
+    for(int i=0;i<cm.c.n_layers;i++) cm.L[i].kda=1;
+    double one_ckpt=k3_ckpt_reserve_gb(&cm,1);
+    double four_ckpt=k3_ckpt_reserve_gb(&cm,4);
+    printf("        COLI_K3_CKPT=1 -> %.1f MiB; 4 slots -> %.2f GB reserved\n",
+           one_ckpt*1e9/1048576.0,four_ckpt);
+    CHECK(k3_ckpt_reserve_gb(&cm,0)==0.0);
+    CHECK(one_ckpt>0.42&&one_ckpt<0.47);
+    CHECK(four_ckpt>1.7&&four_ckpt<1.9);
+    /* disk-parked photos (COLI_K3_CKPT_DIR): one bounce buffer in RAM no
+     * matter how many slots -- the low-RAM machine must not be charged N. */
+    g_k3_ckpt_dir="/anywhere";
+    CHECK(k3_ckpt_reserve_gb(&cm,4)==one_ckpt);
+    g_k3_ckpt_dir=NULL;
+    int with_ckpt=k3_cap_for_ram(242.0,RESIDENT,RESERVE+four_ckpt,
+                                 SLOT_GB,NMOE,old,N_EXPERTS,&left);
+    printf("        --ram 242 + 4 checkpoints -> cap %d/layer, peak %.1f GB\n",
+           with_ckpt,peak_ckpt_gb(with_ckpt,four_ckpt));
+    CHECK(with_ckpt<cap);
+    CHECK(peak_ckpt_gb(with_ckpt,four_ckpt)<=242.0+0.1);
+    double one_slot_peak=RESIDENT+RESERVE+four_ckpt+SLOT_GB*NMOE;
+    CHECK(k3_cap_for_ram(one_slot_peak-0.01,RESIDENT,RESERVE+four_ckpt,
+                          SLOT_GB,NMOE,old,N_EXPERTS,NULL)==0);
+    free(cm.L);
 
     /* ---- the flag has to mean something ------------------------------------ */
     /* Two budgets, everything else equal: a bigger --ram must buy more cache.

@@ -172,6 +172,7 @@ typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
+typedef int             (*fn_stream_drain)(int device);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -214,6 +215,10 @@ typedef int             (*fn_expert_bank_upload)(Dsv4CudaExpertSet *set, int exp
                                                  Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down);
 typedef int             (*fn_expert_bank_set_shared)(Dsv4CudaExpertSet *set, Dsv4CudaTensor *sg,
                                                      Dsv4CudaTensor *su, Dsv4CudaTensor *sd);
+typedef int             (*fn_expert_bank_upload_aux)(Dsv4CudaExpertSet *set, int expert,
+                            const uint8_t *gw, const uint8_t *gs, const uint8_t *uw, const uint8_t *us,
+                            const uint8_t *dw, const uint8_t *ds,
+                            Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down);
 typedef int             (*fn_expert_bank_upload_tp2)(Dsv4CudaExpertSet *set, int expert, int rank,
                                                      const uint8_t *gate_weight, const uint8_t *gate_scale,
                                                      const uint8_t *up_weight, const uint8_t *up_scale,
@@ -307,6 +312,7 @@ static struct {
     fn_backend_name backend_name;         /* optional */
     char loaded_name[64];
     fn_mem_free_mb mem_free_mb;
+    fn_stream_drain stream_drain;                /* optional (older DLLs) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -321,6 +327,7 @@ static struct {
     fn_expert_bank_upload expert_bank_upload;
     fn_expert_bank_set_shared expert_bank_set_shared;
     fn_expert_bank_upload_tp2 expert_bank_upload_tp2;
+    fn_expert_bank_upload_aux expert_bank_upload_aux; /* optional (older DLLs) */
     fn_expert_set_free expert_set_free;
     fn_expert_set_upload_hash expert_set_upload_hash;
     fn_route_moe       route_moe;
@@ -485,6 +492,10 @@ static int dsv4_cuda_resolve(const char *dllname){
     _Pragma("GCC diagnostic push")
     _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
     g_dsv4.backend_arch_ok = (fn_backend_arch_ok)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_arch_ok");
+    /* optional: an older DLL without the export keeps the whole tier alive;
+     * the engine probes this and simply stays on synchronous attaches. */
+    g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
     _Pragma("GCC diagnostic pop")
     return 1;
@@ -832,6 +843,16 @@ long long dsv4_cuda_mem_free_mb(int device){
     return g_dsv4.mem_free_mb(device);
 }
 
+int dsv4_cuda_stream_drain(int device){
+    /* Without the DLL there is never in-flight DMA to wait for, so a drain
+     * trivially succeeds. With an older DLL that lacks the export, report
+     * failure instead: the engine probes this once and keeps every attach
+     * synchronous, so nothing is ever enqueued that could not be drained. */
+    if(!g_dsv4.available) return 1;
+    if(!g_dsv4.stream_drain) return 0;
+    return g_dsv4.stream_drain(device);
+}
+
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,
                              int count, int window, int dim){
     if(!g_dsv4.available) return 0;
@@ -915,6 +936,18 @@ int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet *set, int expert,
     if(!g_dsv4.available) return 0;
     return g_dsv4.expert_bank_upload(set, expert, gate_weight, gate_scale, up_weight, up_scale,
                                      down_weight, down_scale, gate, up, down);
+}
+
+int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet *set, int expert,
+                                     const uint8_t *gate_weight, const uint8_t *gate_scale,
+                                     const uint8_t *up_weight, const uint8_t *up_scale,
+                                     const uint8_t *down_weight, const uint8_t *down_scale,
+                                     Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down){
+    /* Optional export: an older DLL simply fails the first prefetch upload,
+     * and the engine falls back to the single-bank path for good. */
+    if(!g_dsv4.available || !g_dsv4.expert_bank_upload_aux) return 0;
+    return g_dsv4.expert_bank_upload_aux(set, expert, gate_weight, gate_scale, up_weight, up_scale,
+                                         down_weight, down_scale, gate, up, down);
 }
 
 int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet *set, Dsv4CudaTensor *sg,

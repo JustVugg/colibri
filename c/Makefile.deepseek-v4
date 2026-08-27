@@ -96,6 +96,10 @@ V4_BINARY := deepseek_v4
 V4_WIN_EXTRA_OBJS =
 endif
 
+# Keep recursive builds (notably the parent test-asan target) instrumented.
+CFLAGS += $(EXTRA_CFLAGS)
+LDFLAGS += $(EXTRA_LDFLAGS)
+
 LTO ?= 1
 ifeq ($(LTO),1)
 CFLAGS += -flto
@@ -107,7 +111,8 @@ endif
 # backend_loader_dsv4.o. Elsewhere there is no loader: the same
 # backend_cuda_dsv4.cu is compiled by nvcc and linked straight into the
 # engine, so the dsv4_cuda_* symbols are the real ones. Defaults to the
-# GENERIC kernels (any sm_80+; CUDA_ARCH=native|portable|sm_XX);
+# GENERIC kernels (CUDA_ARCH=native|portable|portable-pre-ampere|sm_XX;
+# portable covers sm_80+, portable-pre-ampere adds sm_61/sm_75 and needs NO_TC=1);
 # DEEPGEMM=1 adds the sm_120a DeepGEMM tensor-core paths and needs the
 # patched sm120 DeepGEMM checkout at DEEPGEMM_HOME (see
 # patches-deepgemm-sm120-msvc.patch and docs/deepseek-v4.md). Untested here
@@ -138,6 +143,34 @@ ifeq ($(CUDA_ARCH),portable)
 V4_CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
                   -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
                   -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120
+else ifeq ($(CUDA_ARCH),portable-pre-ampere)
+# Adds Pascal (sm_61) and Turing (sm_75) to the portable set. The generic
+# kernels do not need Ampere: bf16 appears only as storage (every use is
+# __bfloat162float / __float2bfloat16, and the compute is fp32), and fp8 is
+# weights are decoded through the 256-entry constant lookup table the engine
+# already carries -- not fp8 tensor-core MMA. The two activation-quantise
+# kernels in the generic build (fp8_sim64, fp8_sim64_dynamic) do call
+# __nv_cvt_float_to_fp8, but cuda_fp8.h resolves that to native cvt PTX only
+# at __CUDA_ARCH__ >= 890 and to its own software path below, so it builds
+# and runs on older silicon. All of it compiles for sm_61/sm_75 unchanged.
+#
+# Requires NO_TC=1: the DSV4_CUDA_TC path calls cuBLASLt block-scaling APIs
+# (CUBLASLT_MATMUL_DESC_A_SCALE_MODE and friends) that need CUDA >= 12.8, and
+# those are a TOOLKIT dependency rather than an architecture one.
+#
+# DEEPGEMM is unavailable here and cannot be made available: it calls
+# cuTensorMapEncodeTiled (TMA), a hardware unit introduced in sm_90, so there
+# is nothing to fall back to on older silicon.
+#
+# Deliberately stops at sm_90 rather than mirroring `portable` all the way to
+# sm_120: compute_120 needs CUDA >= 12.8, which is the very toolkit floor the
+# NO_TC=1 companion exists to stay below, so including it would make this
+# preset unbuildable by the toolkits its users are most likely to have. The
+# trailing compute_90 PTX keeps newer cards working through driver JIT.
+V4_CUDA_GENCODE = -gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75 \
+                  -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+                  -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
+                  -gencode arch=compute_90,code=compute_90
 else
 V4_CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
@@ -165,6 +198,8 @@ include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
+V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
 V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
 REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
@@ -199,6 +234,17 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
+$(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+		st.h json.h compat.h tensor.h quant.h route_trace.h \
+		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
+		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
+
+$(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+		tensor.h quant.h native_quant.h native_quant_batch.h
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
+		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
+
 COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
 
 $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
@@ -230,4 +276,6 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_SERVE_TEST) test_expert_store_registry
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) \
+		$(V4_SERVE_TEST) test_expert_store_registry

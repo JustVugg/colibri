@@ -71,6 +71,11 @@ except ModuleNotFoundError:
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
                              family_by_id, resolve_model, tuning_replay_prompt)
 
+_TUNE_ROTATION_PROMPT = (
+    "A service has high median throughput but poor tail latency. Explain how "
+    "you would distinguish a CPU, memory, and storage bottleneck."
+)
+
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
 # tools/ all live next to this script — unchanged from before.
@@ -363,10 +368,49 @@ def ngen_for(a, interactive=False, family=None):
         return limits.interactive_max_output if interactive else limits.default_max_output
     return 16384 if interactive else 1024
 
-def env_for_engine(a, arch):
+_PROFILE_CAP_ENV = "COLI_PROFILE_CAP"
+
+def apply_measured_profile(env, profile, explicit_env, explicit_cap):
+    """Apply scheduling/resource results while preserving CLI precedence."""
+    from autotune import apply_profile
+    result=apply_profile(env,profile,explicit_env)
+    # This is a launcher-private bridge for engines whose cache capacity is an
+    # argv value rather than an environment variable. It must never leak from a
+    # parent shell or override an explicit --cap.
+    result.pop(_PROFILE_CAP_ENV,None)
+    measured=profile.get("winner",{}).get("cap")
+    if explicit_cap is None and isinstance(measured,int) and not isinstance(measured,bool):
+        result[_PROFILE_CAP_ENV]=str(measured)
+    return result
+
+def cap_for_launch(explicit_cap, env, fallback):
+    """Resolve a measured cap for direct-engine launchers; --cap always wins."""
+    if explicit_cap is not None:
+        return explicit_cap
+    try:
+        measured=int(env.pop(_PROFILE_CAP_ENV,""))
+    except (TypeError,ValueError):
+        measured=0
+    return measured if measured>=1 else fallback
+
+def operator_cap(a, arch):
+    """Return a real operator cap, including GLM's documented CAP channel."""
+    cap=getattr(a,"cap",None)
+    if cap is not None or arch!="glm":
+        return cap
+    try:
+        cap=int(os.environ.get("CAP","0"))
+    except (TypeError,ValueError):
+        cap=0
+    return cap if cap else None
+
+def env_for_engine(a, arch, plan=None):
     if arch == "glm":
         return env_for(a)
+    explicit_env = set(os.environ)
     env = os.environ.copy()
+    env.pop(_PROFILE_CAP_ENV,None)
+    if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
     # #805 set this from physical cores "on every platform" -- but only inside
@@ -446,7 +490,7 @@ def env_for_engine(a, arch):
         else:
             if arch == "deepseek_v4":
                 if not dsv4_cuda_available(a.model):
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
             elif not cuda_binary():
                 sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
             env["COLI_CUDA"] = "1"
@@ -456,19 +500,74 @@ def env_for_engine(a, arch):
     if vram and gpu != "none":
         if arch == "deepseek_v4":
             if not dsv4_cuda_available(a.model):
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
         elif not cuda_binary():
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
+    if getattr(a, "auto_tier", False):
+        # GLM has historically applied both the resource plan and its measured
+        # profile inside env_for().  The sibling launcher returned above that
+        # code path, so #1196 could measure and save a perfectly valid Kimi,
+        # Inkling, OLMoE, Qwen or V4 profile that chat/serve never loaded.
+        from resource_plan import build_plan, environment_for_plan
+        if plan is None:
+            ram,ctx,devices,vram=resource_request(a,env)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                            kv_slots=requested_kv_slots(a,env))
+        # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
+        # selects a capable build above. Merely asking for auto-tier must not
+        # turn a CPU-only sibling binary into an attempted CUDA launch.
+        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
+                                  and (arch == "deepseek_v4"
+                                       or env.get("COLI_NO_OMP_TUNE")))
+        env=environment_for_plan(plan,env,
+                                 cuda_enabled=env.get("COLI_CUDA") == "1")
+        if plan_must_not_choose_omp:
+            # environment_for_plan supplies the physical-core default used by
+            # the other engines. V4 deliberately computes logical CPUs minus
+            # its loader reservation at startup; COLI_NO_OMP_TUNE likewise
+            # promises no automatic team. Keep those baselines unless a
+            # measured profile (V4 only, below) or the user explicitly chooses
+            # a team.
+            env.pop("OMP_NUM_THREADS",None)
+        if not getattr(a, "no_tune_profile", False):
+            from autotune import load_profile
+            profile=load_profile(plan,a.model,engine_for(a.model))
+            if profile:
+                env=apply_measured_profile(env,profile,explicit_env,
+                                           getattr(a,"cap",None))
+                gain=100.0*profile["gain"]
+                print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% "
+                      f"calibration throughput{C.r}",file=sys.stderr)
     return env
 
 def dsv4_cuda_available(model=None):
-    if sys.platform != "win32":
-        return False
+    # Windows loads the tier as a runtime DLL next to the engine; Linux links
+    # it straight into the binary (nvcc, -lcudart), so the DLL check there
+    # rejected every valid `make deepseek-v4 CUDA=1` build (#1219). Detect the
+    # Linux build through the dynamic libcudart entry added by the in-tree
+    # CUDA=1 target. DeepSeek V4 has no HIP backend, so libamdhip64 alone must
+    # not make a CPU engine look GPU-capable.
     eng = engine_for(model) if model else GLM
-    dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
-    return os.path.exists(dll)
+    if sys.platform == "win32":
+        dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
+        return os.path.exists(dll)
+    if sys.platform == "linux" and os.path.exists(eng):
+        try:
+            linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
+            return any("libcudart" in line and "not found" not in line
+                       for line in linked.stdout.splitlines())
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return False
+
+def dsv4_cuda_build_hint():
+    if sys.platform == "win32":
+        return "build coli_cuda_dsv4.dll (make cuda-dsv4-dll)"
+    if sys.platform == "linux":
+        return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
+    return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
 def need_worker_model(model):
     require_model(model, file="config.json")
@@ -529,6 +628,13 @@ def requested_kv_slots(a, env):
 def env_for(a):
     explicit_env = set(os.environ)
     e = dict(os.environ, SNAP=a.model)
+    e.pop(_PROFILE_CAP_ENV,None)
+    if getattr(a,"ram",0): explicit_env.add("RAM_GB")
+    # A GLM resource winner is a measured pair (RAM ceiling + argv cap). An
+    # explicit cap asks the engine to size against the current RAM plan, not a
+    # smaller ceiling remembered from that old pair.
+    requested_cap=operator_cap(a,"glm")
+    if requested_cap is not None: explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS on EVERY platform, not only Windows.
     #
     # glm.c's self-exec tuning (colibri.c, the COLI_OMP_TUNED block) sets
@@ -611,15 +717,25 @@ def env_for(a):
         has_cuda=cuda_binary()
         e=environment_for_plan(plan,e,has_cuda)
         if not getattr(a, "no_tune_profile", False):
-            from autotune import apply_profile, load_profile
+            from autotune import load_profile
             profile=load_profile(plan,a.model,GLM)
             if profile:
-                e=apply_profile(e,profile,explicit_env)
+                e=apply_measured_profile(e,profile,explicit_env,requested_cap)
                 gain=100.0*profile["gain"]
                 print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% calibration throughput{C.r}",
                       file=sys.stderr)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
-        gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
+        # The plan label used to derive the backend from CUDA alone, so on
+        # Apple Silicon it printed " · CPU" even when the calibration child
+        # processes ran on Metal (COLI_METAL is inherited through env_for and
+        # environment_for_plan, so the measurements are real). Report the
+        # active backend: CUDA VRAM first, then Metal, then CPU.
+        if has_cuda and vt["devices"]:
+            gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}"
+        elif str(e.get("COLI_METAL","")).strip() not in ("","0"):
+            gpu=" · Metal (unified memory)"
+        else:
+            gpu=" · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
         # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
@@ -1005,19 +1121,38 @@ def cmd_tune(a):
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
-    base_env=env_for_engine(a,arch) if arch!="glm" else env_for(a)
-    # The replay prompt has to be the engine's own template: GLM's [gMASK]<sop>
-    # markers are ordinary text to every other tokenizer, so the sweep would have
-    # measured a different workload than the one users run.
-    prompt=tuning_replay_prompt(family,a.prompt)
+    base_env=(env_for_engine(a,arch,plan=plan) if arch!="glm" else env_for(a))
+    # Prompts have to use the engine's own template: GLM's [gMASK]<sop>
+    # markers are ordinary text to every other tokenizer. Sibling engines keep
+    # one serve process alive per candidate and alternate these prompts; this
+    # preserves their real expert-cache state without training it on one exact
+    # request. GLM retains its stronger fixed-token replay protocol.
+    raw_prompts=[a.prompt,*(a.rotate_prompt or [_TUNE_ROTATION_PROMPT])]
+    if len(set(raw_prompts)) < 2:
+        sys.exit(f"{C.yel}tuning rotation needs at least two distinct prompts{C.r}")
+    prompts=[tuning_replay_prompt(family,item) for item in raw_prompts]
+    prompt=prompts[0]
     banner("tune · measured execution profile", model=a.model)
-    print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
+    if arch=="glm":
+        print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
+    else:
+        active=min(a.repeats,len(prompts))
+        print(f"  persistent rotation: {a.tokens} tokens · {a.repeats} request(s) "
+              f"per candidate · {active} distinct prompt(s)")
     print("  only quality-preserving scheduling knobs are eligible\n")
     try:
+        explicit_resources={key for key in ("RAM_GB","K3_EXPERT_GB")
+                            if key in os.environ}
+        if a.ram: explicit_resources.add("RAM_GB")
+        tuning_cap=operator_cap(a,arch)
+        if tuning_cap is not None: explicit_resources.add("cap")
         profile,path=run_tune(
-            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,tokens=a.tokens,
+            engine,tuning_cap,base_env,plan,a.model,prompt,arch=arch,family=family,
+            tokens=a.tokens,
             repeats=a.repeats,timeout=a.timeout,min_gain=a.min_gain,
             profile_dir=a.profile_dir,
+            prompts=prompts,
+            explicit_resources=explicit_resources,
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
         )
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
@@ -1028,7 +1163,10 @@ def cmd_tune(a):
         print(f"\n  {C.grn}✓ accepted{C.r} {winner['name']}: "
               f"{baseline:.2f} → {winner['tok_s']:.2f} tok/s "
               f"(+{100*profile['gain']:.1f}%)")
-        print(f"  env: {' '.join(f'{key}={value}' for key,value in winner['env'].items())}")
+        if winner["env"]:
+            print(f"  env: {' '.join(f'{key}={value}' for key,value in winner['env'].items())}")
+        if "cap" in winner:
+            print(f"  cache cap: {winner['cap']} slots/layer")
     else:
         print(f"\n  {C.grn}✓ baseline retained{C.r}: no candidate cleared the "
               f"{100*a.min_gain:.1f}% gain and safety gates")
@@ -1048,6 +1186,7 @@ def cmd_run(a):
     if arch=="deepseek_v4":
         prompt_path=None
         try:
+            e=env_for_engine(a,arch)
             cmd=[engine,os.path.abspath(a.model)]
             if sys.platform in ("win32", "msys", "cygwin"):
                 with tempfile.NamedTemporaryFile(
@@ -1059,9 +1198,11 @@ def cmd_run(a):
             else:
                 cmd.append(prompt)
             cmd += ["--max-tokens",str(ngen_for(a,interactive=True,family=family))]
-            if a.ram: cmd += ["--memory-gb",str(a.ram)]
+            try: memory_gb=float(e.get("RAM_GB","0"))
+            except (TypeError,ValueError): memory_gb=0.0
+            if memory_gb>0: cmd += ["--memory-gb",str(e["RAM_GB"])]
             if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
-            result=subprocess.call(cmd,env=env_for_engine(a,arch))
+            result=subprocess.call(cmd,env=e)
         finally:
             if prompt_path:
                 try: os.unlink(prompt_path)
@@ -1074,16 +1215,17 @@ def cmd_run(a):
         # over the engine's plain stdin chat loop and close stdin, the engine
         # emits the answer and exits cleanly. No reason to spin up the gateway
         # for a single non-interactive prompt.
+        e=env_for_engine(a,arch)
         result=subprocess.run(
-            [engine, str(a.cap if a.cap is not None else 16), "8"],
-            input=prompt+"\n", text=True, env=env_for_engine(a,arch), check=False)
+            [engine, str(cap_for_launch(a.cap,e,16)), "8"],
+            input=prompt+"\n", text=True, env=e, check=False)
         sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.
     tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
-    sys.exit(subprocess.call([GLM, str(a.cap if a.cap is not None else 0)], env=e))
+    sys.exit(subprocess.call([GLM, str(cap_for_launch(a.cap,e,0))], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
     """Is a coli serve alive at `base`? Returns its model_id, or None.
@@ -1302,7 +1444,7 @@ def cmd_chat(a):
     # once the READY sentinel arrives, so the status-line display below works
     # exactly as before. (Do NOT add a concurrent stderr drain thread: on
     # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
-    p=subprocess.Popen([GLM,str(a.cap if a.cap is not None else 0)], env=e, stdin=subprocess.PIPE,
+    p=subprocess.Popen([GLM,str(cap_for_launch(a.cap,e,0))], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
     # Keep the pre-READY stdout preamble instead of discarding it: the engine's
@@ -1786,8 +1928,11 @@ def main():
                       description="measure and save the fastest quality-preserving execution profile",
                       help="measure and save the fastest quality-preserving execution profile")
     pt.add_argument("--prompt",default="Explain why fixed-token replay makes a benchmark reproducible.")
+    pt.add_argument("--rotate-prompt",action="append",default=None,
+                    help="additional persistent-workload prompt; repeat for a custom rotation")
     pt.add_argument("--tokens",type=int,default=16,help="calibration continuation length")
-    pt.add_argument("--repeats",type=int,choices=range(1,6),default=2)
+    pt.add_argument("--repeats",type=int,choices=range(1,6),default=2,
+                    help="requests per candidate (one persistent engine on non-GLM)")
     pt.add_argument("--timeout",type=int,default=900,help="seconds allowed for each engine run")
     pt.add_argument("--min-gain",type=float,default=0.03,
                     help="minimum fractional throughput gain required to accept a candidate")

@@ -38,7 +38,7 @@ may reduce speed; it must not quietly redefine the model.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.8.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -343,7 +343,7 @@ Take the archive for your platform from
 [Releases](https://github.com/JustVugg/colibri/releases) and unpack it:
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+mkdir colibri && tar xzf colibri-v1.8.0-linux-x86_64.tar.gz -C colibri && cd colibri
 python3 coli info                         # engine ready ✓
 ```
 
@@ -406,7 +406,7 @@ the model's `config.json`):
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
-> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; an NVIDIA card (any sm_80+, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
+> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
 > | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
@@ -432,6 +432,14 @@ without a code path of its own. With `CUDA=1` the VRAM expert tier measured
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
+Long agent sessions can opt into recurrent-state checkpoints (`COLI_K3_CKPT=N`
+slots in RAM, or parked on disk with `COLI_K3_CKPT_DIR`): an edited or follow-up
+prompt restores the deepest surviving checkpoint and re-prefills only the tail,
+instead of replaying the whole conversation through the SSM layers. On Vulkan
+hosts `K3_VK_UP=auto` sizes the expert tier upload from measured bandwidth. The
+engine's KDA and MLA paths are validated token-exact in CI against the vendor
+implementation.
+
 Inkling ships int4 experts but **bf16 dense weights** (49.4 GB resident); on a host
 that cannot hold those, [inkling.md](docs/inkling.md) has a one-pass tool that brings
 the dense set to 15.3 GB and lets the 975B run on a 25 GB box — with the honest
@@ -519,6 +527,15 @@ python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 32
 # Windows CUDA tier: make cuda-dsv4-dll CUDA_ARCH=portable  (+ make cuda-dsv4-dg-dll on RTX 50)
 ```
 
+Two opt-in GPU levers are new and looking for community numbers, both default
+off and byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses
+between the GPU fill branch and the CPU branch using bandwidths measured at
+runtime, and `COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`)
+prefetches the next layer's full expert set into a second VRAM bank while the
+current layer computes, falling back to the single bank when VRAM is short.
+The CUDA tier also runs on Pascal and Turing cards now (GTX 10 / RTX 20
+series): build with `CUDA_ARCH=portable-pre-ampere NO_TC=1`.
+
 Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
 with V4's native prompt and DSML call blocks; grammar is not supported. See the
 [per-engine API matrix](docs/api.md#tool-calling-support). Prefix checkpoints
@@ -554,9 +571,10 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+  routed experts can be staged the same way. Six families run today (GLM-5.2,
+  Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.6, OLMoE); further open-weight
+  families — **MiniMax** among the candidates — earn an engine the way the
+  first six did: when someone measures one end to end.
 
 ## Supporting the project
 

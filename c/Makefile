@@ -457,6 +457,7 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE)
 endif
@@ -606,6 +607,23 @@ endif
 
 all: colibri$(EXE)
 
+# Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
+# deterministic; ref.json is committed and comes from Moonshot's own modeling
+# code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
+# needs neither torch nor network.  kimi_k3 builds on every platform, so
+# unlike the V4 targets this needs no support gate.
+.PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
+kimi-k3-tiny-generate:
+	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+
+kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
+	$(PYTHON) tests/test_kimi_k3_tiny.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
@@ -681,7 +699,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -847,12 +865,19 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
 	./ragged_attention_test$(EXE)
+	# weight_at's device-side refusal (the __trap()) on real silicon. The
+	# host-side half is tests/test_cuda_fmt_guard.c, which runs in the CPU
+	# suite and cannot execute device code. Includes backend_cuda.cu itself:
+	# weight_at is file-static, and the trap is unreachable through the public
+	# API by design. Re-execs itself per probe (the trap poisons the context).
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
+	./cuda_fmt_trap_test$(EXE)
 	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
 	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
 	# itself (kernel-level oracle), so only the test file is compiled.
@@ -920,6 +945,7 @@ gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -973,6 +999,13 @@ qwen36$(EXE): qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(C
 # inline stubs cover it and both are empty).
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Reproducible local timing evidence; intentionally not a noisy CI perf gate.
+tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 inkling$(EXE): inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
@@ -1104,7 +1137,23 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c serve_codec.h compat.h
 tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+
+# Reproducible local A/B for the shared-expert prefill path.  This is timing
+# evidence, not a CI gate: build and run it explicitly on the target CPU.
+tests/bench_inkling_shared_batch$(EXE): tests/bench_inkling_shared_batch.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+
+tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_kimi_cache_index$(EXE): tests/test_kimi_cache_index.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
@@ -1115,6 +1164,12 @@ tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h
 
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1142,7 +1197,16 @@ tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json
 tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h kv_fp8.h kv_tq.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c kv_fp8.h decode_batch.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_tq$(EXE): tests/test_kv_tq.c kv_tq.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h kv_fp8.h kv_tq.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # fmt=6 kernel oracle: needs the generated grid table, and its fixture comes from
@@ -1174,6 +1238,12 @@ tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h
 tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Host-only: backend_cuda.h's format predicate is plain C, so its truth table is
+# a portable gate even where there is no CUDA toolchain. Same arrangement as
+# metal_fused_fmt_ok's CPU-testable truth table.
+tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c backend_cuda.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1200,6 +1270,8 @@ tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_qu
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
+V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
 V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_ST.o \
 	COLI_V4_UNIT_CONFIG.o \
@@ -1207,8 +1279,13 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
-	$(addsuffix .o,$(V4_TEST_UNITS)) \
-	COLI_V4_UNIT_NATIVE_QUANT.o
+	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o COLI_V4_UNIT_EXPERT.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
+	$(V4_HOT_TEST_OBJ) \
+	$(V4_BATCH_TEST_OBJ) \
+	COLI_V4_UNIT_EXPERT_ROWS16.o \
+	COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_DUAL.o \
+	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
 # Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
 # is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
 # native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
@@ -1219,12 +1296,17 @@ V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
-		Makefile.deepseek-v4.units
+		Makefile.deepseek-v4.units Makefile.deepseek-v4
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o \
+		$(V4_HOT_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) \
 		$(V4_TEST_EXTRA_TARGETS)
-	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) \
+		-o $@ -pthread $(LDFLAGS)
 
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
@@ -1279,11 +1361,25 @@ tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h 
 
 tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c deepseek_v4_hybrid.h hybrid_split.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c hybrid_split.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c deepseek_v4_bank_pair.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_eslot_inflight$(EXE): tests/test_eslot_inflight.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_glm_cache_index$(EXE): tests/test_glm_cache_index.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
@@ -1408,7 +1504,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) \
+install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)

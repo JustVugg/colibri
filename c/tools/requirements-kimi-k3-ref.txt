@@ -1,0 +1,10 @@
+# maintainer-only: regenerate kimi_k3_tiny/ref.json from Moonshot's own
+# modeling code (tools/make_kimi_k3_ref.py). CI never needs these.
+# transformers is pinned to the version the vendor code targets
+# (OutputRecorder and friends moved in 5.x).
+torch
+transformers==4.56.2
+einops
+fla-core
+numpy
+packaging

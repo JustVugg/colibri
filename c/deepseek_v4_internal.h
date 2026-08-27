@@ -563,6 +563,15 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit);
 
+/* Batch-major routed-expert forward.  The row-major FP4 path streams each
+ * matrix once for all items; unsupported packed layouts fall back to the
+ * scalar entry point without changing its numerical contract. */
+int coli_v4_expert_forward_batch_ref(float *outputs,
+                                     const ColiExpertView *expert,
+                                     const float *inputs,
+                                     const float *route_weights,
+                                     int batch, float swiglu_limit);
+
 int coli_v4_shared_expert_forward_ref(float *output,
                                       const ColiTensorView *gate,
                                       const ColiTensorView *down,
@@ -601,6 +610,11 @@ int coli_deepseek_v4_expert_store_open(
     ColiExpertStore **store,
     char *error,
     size_t error_size);
+
+/* Batched CPU prefill only: `layer` borrows the complete expert-cache pool;
+ * a negative value restores ordinary per-layer miss allocation for decode.
+ * Alternative registered ExpertStore backends safely ignore the request. */
+void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
 #ifdef __cplusplus
 }
@@ -708,9 +722,10 @@ int coli_v4_resident_tier_plan(
 #include <stddef.h>
 #include <stdint.h>
 
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
+int coli_v4_head_cache_probe(const ColiSafetensorsIndex *index, uint64_t *bytes,
                              char *error, size_t error_size);
-int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
+int coli_v4_head_cache_load(ColiV4Engine *engine,
+                            const ColiSafetensorsIndex *index,
                             char *error, size_t error_size);
 uint64_t coli_v4_head_cache_bytes(const ColiV4Engine *engine);
 const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
@@ -731,6 +746,10 @@ typedef struct {
 } ColiDeepSeekV4RuntimeOptions;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
+
+/* engine open: seconds spent building target_index (printed by the auto
+ * store planner as the v4_open line). Defined in the engine unit. */
+extern double g_v4_open_index_seconds;
 
 #ifdef COLI_V4_GPU_TIER
 /* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
@@ -834,6 +853,18 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
  * fp4 path. Only block_rows==1 views are mirrored; rows16-packed slots are
  * skipped. */
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
+/* lookup-only twin: reports residency, never uploads (hybrid q* split) */
+int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+/* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
+ * unit, read by the serve unit's per-turn stderr line. */
+int coli_v4_hybrid_enabled(void);
+/* async attach (enqueue only; drain closes the pipeline before compute) */
+int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
+                                    ColiExpertView *view);
+int coli_v4_gpu_expert_drain(ColiExpertStore *store);
+extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
+extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
+extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
 /* Dspark (MTP) resident-expert mirrors: a separate bounded LRU so drafting can
  * never evict the target model's learned expert mirrors. ensure() lazily
  * allocates the cache on the first V4_MTP_GPU=1 draft; attach mirrors one
@@ -954,6 +985,11 @@ int coli_st_read_at_engine(ColiV4Engine *engine,
 extern int coli_v4_test_fail_expert_store_open;
 extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
+extern void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
+extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
+extern uint64_t coli_v4_test_fp4_batch_calls;
+extern uint64_t coli_v4_test_expert_victim_probes;
+int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);

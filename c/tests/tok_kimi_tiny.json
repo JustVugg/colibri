@@ -20,6 +20,42 @@
    "rstrip": false,
    "normalized": false,
    "special": true
+  },
+  {
+   "id": 276,
+   "content": "<|open|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 277,
+   "content": "<|close|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 278,
+   "content": "<|sep|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 279,
+   "content": "<|end_of_msg|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
   }
  ],
  "normalizer": null,

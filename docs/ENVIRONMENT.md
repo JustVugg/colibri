@@ -6,7 +6,7 @@ Reference for the environment variables read by the colibrì engine.
 
 ## Which program reads these?
 
-**There are five engine binaries, and they do not share a knob set.** The main
+**There are six engine binaries, and they do not share a knob set.** The main
 engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
 what follows, but the sister engines read their own:
 
@@ -15,6 +15,7 @@ what follows, but the sister engines read their own:
 | `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
+| `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, and its dense/CUDA-tier controls — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 
@@ -49,6 +50,8 @@ Format: `VAR` — default — effect.
 | `SEED` | unset → seeded from clock + PID | RNG seed for sampling. **Unset = different every run.** Set a fixed value for reproducible sampling. |
 | `KVSAVE` | `1` (on) | Persist the KV cache to `<model>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
 | `KV_SLOTS` | `1` | Number of independent KV conversation slots (1–16), used in serve mode. |
+| `KV8` | `0` (off) | Store the MLA latent KV cache in fp8 e4m3 with a per-row scale: ~3.9× less KV RAM, and `.coli_kv` shrinks ~4× (saved as the v2 format; f32 v1 files are quantized on resume and rewritten). Adds DeepSeek-V3-class KV quantization noise to attention. CPU attention path only for now: the CUDA/Metal fused-attention fast paths read f32 KV rows, so under KV8 they fall back to the CPU consumer (native fp8 decode; a one-time notice is printed under `COLI_CUDA_ATTN=1`). Forces `COLI_CUDA_PIPE=0`. Native CUDA/Metal fp8-KV kernels are follow-up PRs. |
+| `KV_TQ` | `0` (off) | Sub-byte MLA latent KV quantization, mutually exclusive with `KV8` (`KV_TQ` wins). `KV_TQ=4` is the recommended tier: rotated-int4 codec (randomized-Hadamard rotation + Lloyd codebook, per-row radius as the scale), ~7.6× less KV RAM than f32. `KV_TQ=2|3|5|6` selects the PolarQuant codec at that bit width (`KV_TQ_POLAR=1` forces PolarQuant at 4 bits too). Requires power-of-two row widths (`kv_lora`/`qk_rope`; the GLM MLA shapes 512/64 qualify) — on a model whose shapes don't, the engine refuses to start rather than silently zeroing the cache. A value below the 2–6 grid (e.g. `KV_TQ=1`) is treated as the recommended `4` with a notice, not as the most aggressive tier. `.coli_kv` is saved as the v3 format; a file saved under a different KV mode, codec, or bit width is refused with an explicit message and the cache restarts. Same CPU-only status as `KV8`: GPU fast paths fall back to the CPU consumer; native kernels are follow-up PRs. Forces `COLI_CUDA_PIPE=0`. |
 | `THINK` | `0` (off) | Emit a `<think>` reasoning block. `THINK=1` turns on visible reasoning. |
 | `MTP` | on | Multi-Token Prediction (speculative draft head). `MTP=0` disables it. |
 
@@ -73,6 +76,9 @@ Format: `VAR` — default — effect.
 | `RSS_GUARD_GB` | the resolved RAM budget | Resident-set ceiling (GB) checked every 16 emitted tokens; the cache is trimmed when it is crossed. Set explicitly to guard tighter or looser than the RAM budget. |
 | `XEXP` | `0` (off) | `=1` runs ONE OpenMP region across all experts of a batch-union block instead of ~2 fork/joins per expert. Engages only at S=1 with an all-resident int4 block, off the speculation window, and with the int4-IDOT S=1 family (`I4S<=1`); output is byte-identical to that family. Measured +11.6% on a 2-socket 48-core Ice Lake, but neutral-to-negative on a 24-core box — hence opt-in. Measure on your host. |
 | `COLI_KV_SHARE` | `0` (off) | `=1` lets a new serve slot adopt an existing slot's KV prefix instead of re-prefilling it. Measured on 6x5090 with a 675-token shared prefix: slot TTFT 50.1s → 1.7s, generated tokens identical. |
+| `KVB_FLASH_MB` | `2048` | Ceiling (MB) for the one-shot `kvb_all` k/v reconstruction buffer in prefill attention (#768 — 30.1 GB at ctx 262144, and `cap_for_ram` reserved it permanently). Above the ceiling the reconstruction is tiled with an online (flash-style) softmax: same rebuild total, ~tile-sized transient, output may differ from one-shot by rounding (same divergence class as the CUDA/Metal attention arms). `=0` disables tiling (always one-shot). DSA-selected rows always take the one-shot path. |
+| `KVB_TILE_MB` | `512` | Tile size (MB) for the tiled reconstruction above. |
+| `KVB_FLASH` | unset | `=1` forces the tiled path at any size, `=0` forces one-shot — overrides the `KVB_FLASH_MB` trigger (A/B switch). |
 | `COLI_GROUP_ASYNC` | `0` (off) | `=1` issues and collects CUDA expert groups asynchronously so CPU and GPU overlap at decode (S≤4). |
 | `COLI_DISKCLASS_WINDOW` | see source | Recency window (in ticks) for the DISK-CLASS heat statistic. |
 | `URING` | `0` (off) | Linux-only queued expert I/O. `URING=1` implies `PIPE=1`, forces cold reads through io-wq (`IOSQE_ASYNC`), replaces blocking loader pthreads and spin waits with batched SQEs/CQEs, and batches `PILOT_REAL` loads on a separate ring. Use `DIRECT=1` for cold NVMe to avoid page-cache copy/readahead limits. Fails clearly if the kernel denies io_uring; incompatible with `COLI_MMAP=1`. |
@@ -349,10 +355,23 @@ Read **only** by `c/inkling.c`.
 | `PIN_N` | `cap / 2` | Experts pinned per layer. Measured on the 975B: `cap/4` (19/layer) gave 83.6% hit / 0.32 tok/s, 40/layer gave 95.6% / 0.80 tok/s — decode fills run at queue depth ~1, so every pinned expert removes a ~35 ms stall. Clamped to `cap - 8`. |
 | `REP_PEN` | `1.1` | Repetition penalty over a 128-token history (prompt tail + emitted). |
 | `INK_DENSE_Q4` | auto | Use the `dense-int4g64/` sidecar for dense weights when that directory exists. `=0` forces the unquantized dense path. |
+| `INK_SHARED_BATCH` | auto | Prefill rows per shared-expert batch, bounded to 64 MiB of scratch. `=0` restores the scalar per-token path for A/B/debugging; a positive value caps the chunk size. Decode (`S=1`) is unchanged. |
 | `INK_METAL_MIN_S` | `1` | Minimum batch S to send the MoE block to Metal. `=2` restores the prefill-only gate (which mattered when the residency set was absent and per-block `useResource` churn cost ~135 ms). |
 | `INK_PREFIX_LOG` | unset | Log the KV-prefix reuse decision and its reason, as `K3_PREFIX_LOG` does for K3. |
 | `GPU_DEV` | `0` | CUDA device index for the inkling CUDA backend. |
 | `NOGPU` | unset | If set, skip GPU init entirely (both CUDA and Metal), regardless of the other GPU variables. |
+
+## Qwen3.6 engine (`qwen36`)
+
+Read **only** by `c/qwen36.c`. See [qwen36.md](qwen36.md) for the model layout
+and the CPU/GPU execution split.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_DENSE_I8` | `1` (on) | Quantize resident dense matrices to per-row int8 at startup. `=0` keeps the f32 reference path for quality A/Bs. |
+| `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
+| `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
+| `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
 
 ## DeepSeek V4 engine (`deepseek_v4`)
 
@@ -365,6 +384,23 @@ the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
 `V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
 `COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
 usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_V4_ROWS16` | `1` (on) | Repack hot-pinned experts into the vectorized `rows16` layout. **While this is on, greedy output varies run to run on the same machine** (#1136): rows16 and the reference matvec accumulate in different orders, and which experts take which kernel follows the expert-cache state. `=0` runs the reference matvec for every expert — slower, but the kernel variable is gone. **Set `=0` for any quality A/B on this engine**; throughput A/Bs do not need it. |
+
+**Reproducible greedy runs (#1136):** greedy text on this engine varies with
+the expert-cache state — hot experts run the vectorized `rows16` kernel, cold
+ones run the reference matvec, the two accumulate in different orders, and
+which experts are hot follows the autopin history (`.coli_usage`, rewritten by
+every run). This is a known defect, not a documented trade-off — the house
+rule since the olmoe/inkling IDOT cases (#1044, #1080) is that a fast path
+which changes tokens is opt-in, and a convergence fix (reference path adopting
+rows16's accumulation order) is planned under #1136. Until it lands: for
+byte-identical output across runs, either freeze the history (`USAGE_SAVE=0`,
+after seeding it once) or remove the variable entirely
+(`COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 USAGE_SAVE=0`: reference kernels only, no
+history). Details in [deepseek-v4.md — CPU-only behaviour](deepseek-v4.md).
 
 ## OLMoE engine (`olmoe`)
 

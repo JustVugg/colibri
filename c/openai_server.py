@@ -455,10 +455,76 @@ def parse_dsv4_tool_calls(reply):
     return content.strip(), calls
 
 
+# K3 tool-call markers as re-emitted literally by kimi_k3.c's serve loop (#1143): the
+# structural XTML runs the engine would otherwise suppress come through as literal text.
+K3_TOOLS_OPEN = "<|open|>tools<|sep|>"
+_K3_TOOLS_RE = re.compile(r"<\|open\|>tools<\|sep\|>(.*?)<\|close\|>tools<\|sep\|>", re.DOTALL)
+_K3_CALL_RE = re.compile(
+    r'<\|open\|>call tool="([^"]*)" index="(\d+)"<\|sep\|>(.*?)<\|close\|>call<\|sep\|>', re.DOTALL)
+_K3_ARG_RE = re.compile(
+    r'<\|open\|>argument key="([^"]*)" type="([^"]*)"<\|sep\|>(.*?)<\|close\|>argument<\|sep\|>',
+    re.DOTALL)
+_K3_JSON_RE = re.compile(r'<\|open\|>json type="object"<\|sep\|>(.*?)<\|close\|>json<\|sep\|>',
+                         re.DOTALL)
+
+
+def _k3_unescape_attr(s):
+    return s.replace("&quot;", '"').replace("&amp;", "&")   # &amp; last, mirroring the escape
+
+
+def parse_k3_tool_calls(reply, tools=None):
+    """Return (content, tool_calls) from K3's literally re-emitted XTML tool block."""
+    calls = []
+    blocks = [m.group(1) for m in _K3_TOOLS_RE.finditer(reply)]
+    text = _K3_TOOLS_RE.sub("", reply)
+    # An opened-but-unclosed tools block (token budget ran out): parse the complete
+    # calls inside it, drop the fragment from the visible text — same recovery
+    # posture as the GLM path's _unclosed_tail.
+    tail_at = text.rfind(K3_TOOLS_OPEN)
+    if tail_at >= 0:
+        blocks.append(text[tail_at + len(K3_TOOLS_OPEN):])
+        text = text[:tail_at]
+    for block in blocks:
+        for m in _K3_CALL_RE.finditer(block):
+            name = _k3_unescape_attr(m.group(1))
+            inner = m.group(3)
+            jm = _K3_JSON_RE.search(inner)
+            if jm is not None:
+                arguments = jm.group(1)
+            else:
+                args = {}
+                for am in _K3_ARG_RE.finditer(inner):
+                    key = _k3_unescape_attr(am.group(1))
+                    typ, val = am.group(2), am.group(3)
+                    if typ == "string":
+                        args[key] = val
+                    else:
+                        try:
+                            args[key] = json.loads(val)
+                        except (json.JSONDecodeError, ValueError):
+                            args[key] = val
+                arguments = json.dumps(args, ensure_ascii=False)
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name, "arguments": arguments}})
+    if THINK_CLOSE in text:
+        text = text.split(THINK_CLOSE, 1)[1]
+    text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    if calls:
+        sys.stderr.write("[api] tool-calls: %d total (kimi_k3 XTML)\n" % len(calls))
+        sys.stderr.flush()
+    elif tools and K3_TOOLS_OPEN in reply:
+        sys.stderr.write("[api] K3 tool markers present but no call parsed -- "
+                         "possibly truncated or mangled output\n")
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
 def parse_arch_tool_calls(reply, tools):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply)
+    if ARCH == "kimi":
+        return parse_k3_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -466,6 +532,8 @@ def _tool_stream_markers():
     """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
     if ARCH == "deepseek_v4":
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    if ARCH == "kimi":
+        return (K3_TOOLS_OPEN,)
     return (BOX_START,)
 
 
@@ -735,6 +803,136 @@ def inkling_content_segments(content, param, audio_out):
     return segments
 
 
+# ---- Kimi K3 tool calling (#1143) ----------------------------------------------------------
+# K3's normative renderer is encoding_k3.py in the checkpoint repo: tools are pure XTML over
+# the four special tokens. The gateway ships typed K3CHAT1 records; kimi_k3.c constructs the
+# XTML (tags/attrs are ordinary text whose segment boundaries are token boundaries).
+#   Y <type-len> <body-len>       typed system message (tool-declare / tool-choice)
+#   O <index> <name-len> <n>      tool-result message
+#   B <think> <nr> <nt> <ncalls>  assistant turn with tool calls, then per call
+#     F <name-len> <nargs>          + nargs of  V <key-len> <type-len> <val-len>
+#     J <name-len> <json-len>       json fallback for an unparseable arguments string
+
+def _k3_xtml_type(value):
+    if isinstance(value, bool): return "boolean"
+    if value is None: return "null"
+    if isinstance(value, (int, float)): return "number"
+    if isinstance(value, str): return "string"
+    if isinstance(value, dict): return "object"
+    return "array"
+
+
+def _k3_parse_arguments(raw):
+    """OpenAI `arguments` -> list of (key, xtml_type, text), or None for the json fallback.
+
+    Mirrors the reference's one-level-deep parse: non-string values keep their exact JSON
+    bytes (1e2 stays 1e2), string values are the decoded string. A dict input is rendered
+    per-argument with compact re-serialization for nested values (no original bytes exist).
+    """
+    if isinstance(raw, dict):
+        return [(k, _k3_xtml_type(v),
+                 v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+                for k, v in raw.items()]
+    if raw is None or raw == "":
+        return []
+    if not isinstance(raw, str):
+        return None
+    s, idx = raw, 0
+    dec = json.JSONDecoder(strict=False)
+    def skip():
+        nonlocal idx
+        while idx < len(s) and s[idx] in " \t\n\r": idx += 1
+    skip()
+    if idx >= len(s) or s[idx] != "{": return None
+    idx += 1; skip()
+    if idx < len(s) and s[idx] == "}": return []
+    out = []
+    try:
+        while True:
+            key, idx = dec.raw_decode(s, idx)
+            if not isinstance(key, str): return None
+            skip()
+            if idx >= len(s) or s[idx] != ":": return None
+            idx += 1; skip()
+            vstart = idx
+            value, idx = dec.raw_decode(s, idx)
+            text = value if isinstance(value, str) else s[vstart:idx]
+            out.append((key, _k3_xtml_type(value), text))
+            skip()
+            if idx >= len(s): return None
+            c = s[idx]; idx += 1; skip()
+            if c == "}": return out
+            if c != ",": return None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _k3_call_records(tool_calls, where):
+    """K3CHAT1 records for one assistant message's tool_calls (F/V or J per call)."""
+    parts = []
+    for ci, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            raise APIError(400, "Each tool call must be an object.", f"{where}.{ci}")
+        fn = tc.get("function", tc)
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name or len(name.encode("utf-8")) > 256:
+            raise APIError(400, "Tool call needs a function name (<=256 bytes).",
+                           f"{where}.{ci}.function.name")
+        args = _k3_parse_arguments(fn.get("arguments") if isinstance(fn, dict) else None)
+        nb = name.encode("utf-8")
+        if args is None:
+            js = fn.get("arguments")
+            js = js if isinstance(js, str) else json.dumps(js or {}, ensure_ascii=False)
+            jb = js.encode("utf-8")
+            parts.append(f"J {len(nb)} {len(jb)}\n{name}{js}")
+        else:
+            if len(args) > 64:
+                raise APIError(400, "Too many arguments for one tool call (max 64).",
+                               f"{where}.{ci}.function.arguments")
+            parts.append(f"F {len(nb)} {len(args)}\n{name}")
+            for key, typ, text in args:
+                kb, tb, vb = key.encode("utf-8"), typ.encode("utf-8"), text.encode("utf-8")
+                if len(kb) < 1 or len(kb) > 256:
+                    raise APIError(400, "Argument keys must be 1..256 bytes.",
+                                   f"{where}.{ci}.function.arguments")
+                parts.append(f"V {len(kb)} {len(tb)} {len(vb)}\n{key}{typ}{text}")
+    return parts
+
+
+def _k3_order_tool_results(messages):
+    """Re-sort each run of tool messages into the preceding assistant's tool_calls order,
+    resolving names from tool_call_id — the reference renderer's normalization. A run with
+    any unresolvable id is left untouched (order-based name fallback still applies)."""
+    out, index_map, i = [], {}, 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            index_map = {}
+            for pos, tc in enumerate(msg.get("tool_calls") or [], start=1):
+                if isinstance(tc, dict) and tc.get("id") is not None:
+                    fn = tc.get("function", tc)
+                    nm = fn.get("name") if isinstance(fn, dict) else None
+                    index_map[str(tc["id"])] = (pos, nm)
+            out.append(msg); i += 1; continue
+        if not (isinstance(msg, dict) and msg.get("role") == "tool"):
+            out.append(msg); i += 1; continue
+        run = []
+        while i < len(messages) and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+            tm = messages[i]
+            hit = index_map.get(str(tm.get("tool_call_id"))) if tm.get("tool_call_id") is not None else None
+            run.append((hit[0] if hit else None, len(run), tm, hit[1] if hit else None))
+            i += 1
+        if any(pos is None for pos, _, _, _ in run):
+            out.extend(tm for _, _, tm, _ in run)
+        else:
+            run.sort()
+            for _, _, tm, nm in run:
+                fixed = dict(tm)
+                if nm: fixed["name"] = nm
+                out.append(fixed)
+    return out
+
+
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None):
     """Validated multi-turn K3 payload for the C engine.
@@ -745,28 +943,78 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the Kimi K3 engine yet.",
-                       "tools", "unsupported_parameter")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    messages = _k3_order_tool_results(messages)
     parts = ["K3CHAT1\n"]
+    if tools:
+        body = ("# Tools\nHere are the available tools, described in JSONSchema.\n\n"
+                "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
+                                         sort_keys=True) + "\n```")
+        parts.append(f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}")
+    tool_index = 0
+    last_calls = []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
+        if role not in ("system", "developer", "user", "assistant", "tool"):
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            tool_index += 1
+            name = message.get("name") or message.get("tool")
+            if not name and tool_index <= len(last_calls):
+                fn = last_calls[tool_index - 1]
+                fn = fn.get("function", fn) if isinstance(fn, dict) else {}
+                name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                raise APIError(400, "Kimi K3 tool messages need a resolvable tool name: "
+                               "carry `name`, or match a preceding assistant tool_call "
+                               "by id or order.", f"messages.{index}.name")
+            nb = name.encode("utf-8")
+            if len(nb) > 256:
+                raise APIError(400, "Tool name too long (max 256 bytes).", f"messages.{index}.name")
+            parts.append(f"O {tool_index} {len(nb)} {len(text.encode('utf-8'))}\n{name}{text}")
+            continue
         reasoning = message.get("reasoning_content") if role == "assistant" else None
         if reasoning is not None and not isinstance(reasoning, str):
             raise APIError(400, "`reasoning_content` must be a string.",
                            f"messages.{index}.reasoning_content")
-        if role == "assistant" and enable_thinking:
+        calls = message.get("tool_calls") if role == "assistant" else None
+        if role == "assistant":
+            last_calls = calls or []
+            tool_index = 0
+        if calls:
+            if len(calls) > 64:
+                raise APIError(400, "Too many tool calls in one message (max 64).",
+                               f"messages.{index}.tool_calls")
+            reasoning = reasoning or ""
+            parts.append(f"B {1 if enable_thinking else 0} {len(reasoning.encode('utf-8'))} "
+                         f"{len(text.encode('utf-8'))} {len(calls)}\n{reasoning}{text}")
+            parts.extend(_k3_call_records(calls, f"messages.{index}.tool_calls"))
+        elif role == "assistant" and enable_thinking:
             reasoning = reasoning or ""
             parts.append(f"A {len(reasoning.encode('utf-8'))} {len(text.encode('utf-8'))}\n"
                          f"{reasoning or ''}{text}")
         else:
-            parts.append(f"M {role} {len(text.encode('utf-8'))}\n{text}")
+            r = "system" if role == "developer" else role
+            parts.append(f"M {r} {len(text.encode('utf-8'))}\n{text}")
+    if tool_choice == "required" and tools:
+        body = ("The system is invoked with `tool_choice=required`.\n"
+                "You MUST call tools in the next message.")
+        parts.append(f"Y 11 {len(body.encode('utf-8'))}\ntool-choice{body}")
+    elif forced and tools:
+        body = (f"The system is invoked with a forced tool choice.\n"
+                f"You MUST call the tool `{forced}` in the next message.")
+        parts.append(f"Y 11 {len(body.encode('utf-8'))}\ntool-choice{body}")
     parts.append(f"G {1 if enable_thinking else 0}\n")
     return "".join(parts)
 
@@ -1657,7 +1905,7 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
-def cap_for_arch(arch, cap):
+def cap_for_arch(arch, cap, env=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
     An absent cap (None) means different things across today's engines --
@@ -1679,6 +1927,17 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
+    # A measured profile records the exact argv cap used during calibration.
+    # The launcher passes it privately through the server process because cap
+    # is not an engine environment knob.  It remains below an explicit --cap
+    # in the precedence chain and is removed before the engine starts.
+    if env is not None:
+        try:
+            measured = int(env.get("COLI_PROFILE_CAP", ""))
+        except (TypeError, ValueError):
+            measured = 0
+        if measured >= 1:
+            return measured
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -1817,8 +2076,10 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        resolved_cap = cap_for_arch(arch, cap, child_env)
+        child_env.pop("COLI_PROFILE_CAP", None)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
+            [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         # Keep the job handle on the instance: KILL_ON_JOB_CLOSE fires when the
@@ -1889,7 +2150,14 @@ class Engine:
                 if not fields:
                     continue
                 kind = fields[0]
-                if kind == "DATA" and len(fields) == 3:
+                if kind == "DATA" and len(fields) >= 3:
+                    # 3 fields: the legacy frame. More: the U7a per-token
+                    # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),
+                    # emitted only for requests that opted in via the SUBMIT
+                    # logprobs field. The payload framing is identical; the
+                    # numeric fields are consumed by the server feature half
+                    # (U7b) -- accepted here so the frame never kills the
+                    # dispatcher (and with it every in-flight request).
                     request_id = fields[1]
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
@@ -1901,6 +2169,19 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("data", data))
+                elif kind == "ECHO" and len(fields) >= 6:
+                    # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
+                    # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
+                    # Emitted only for opted-in requests; no current request
+                    # path opts in, so the frame is read (to keep the stream
+                    # in sync) and dropped -- U7b delivers it to the response
+                    # assembly when it wires the opt-in.
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine DATA size")
+                    self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DATA terminator")
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -2113,8 +2394,17 @@ class Engine:
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                # A large resident cache (e.g. 111 GB at --memory-gb 126) can
+                # take longer than the grace period to unmap and free on
+                # SIGTERM. SIGKILL cannot be caught, so the process is already
+                # on its way out; a second timeout only means the reap has not
+                # landed yet. Teardown is best-effort: never raise from here, or
+                # a completed measurement is lost to a shutdown that succeeded.
                 self.process.kill()
-                self.process.wait(timeout=5)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 

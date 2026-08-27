@@ -48,7 +48,11 @@
  *                        experts skip disk AND CPU at decode. CPU fallback
  *                        everywhere; output identical.
  *   K3_VK_GB=N           VRAM cap for the tier (default: driver budget)
- *   K3_VK_UP=N           routed-expert uploads per step (default 8)
+ *   K3_VK_UP=N|auto      routed-expert uploads per step (default 8). `auto`
+ *                        bounds the inline upload time to a fraction of the
+ *                        measured decode step (K3_VK_FILL_FRAC, default 0.25)
+ *                        instead of a fixed count — a slow bus stops stalling
+ *                        decode, a fast one fills the tier sooner.
  *   K3_METAL=0|1         Metal tier (build with `make METAL=1 kimi_k3`; Phase 4:
  *                        scaffolding only — dispatch hooks present, forward NOT
  *                        IMPLEMENTED; all ops fall through to CPU).
@@ -64,6 +68,20 @@
  *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
  *                        bit-width comparisons; use with --ngen 0)
  *   K3_MAXT=N            KV/context capacity (default prompt+ngen)
+ *   COLI_K3_CKPT=N       OPT-IN recurrent-state checkpoints for serve: keep N
+ *                        photos of the KDA state at turn boundaries so a
+ *                        divergent prompt (agentic edit) resumes from the
+ *                        deepest valid photo instead of re-prefilling from
+ *                        token 0. Unset/0 (default) = feature off, engine
+ *                        byte-identical to before. ~434 MB per photo on the
+ *                        full model, which is why it is opt-in.
+ *   COLI_K3_CKPT_DIR=dir park the photos in files under dir instead of RAM
+ *                        (low-RAM machines: ~0.4s of sequential I/O per
+ *                        restore against minutes of avoided re-prefill).
+ *                        Alone it implies COLI_K3_CKPT=2; an explicit
+ *                        COLI_K3_CKPT (0 included) always wins. Photos never
+ *                        outlive the process: after a restart the MLA rows
+ *                        are gone, so no restore could be valid.
  *   COLI_TEMP=F          0 = greedy (default), else softmax temperature
  */
 #define _GNU_SOURCE
@@ -94,7 +112,8 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
-#include "kv_prefix.h"                    /* KV prefix reuse (shared) */
+#include "kv_prefix.h"
+#include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
 
 /* ---------- config ---------- */
@@ -167,7 +186,11 @@ typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot
  * tok/s when the pins came from a single prompt). */
                           /* base = 4K-aligned allocation (O_DIRECT target);
                            * buf = expert data view inside it (= base + off%4K) */
-typedef struct { Slot *s; int n, cap; } LCache;
+typedef struct {
+    Slot *s;
+    int *slot_by_expert;                  /* expert id -> local slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -207,9 +230,9 @@ static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
  * reported numbers without a 600 GB checkpoint. Returns the cap; writes the
  * bytes left for experts through `for_experts_out` when non-NULL.
  *
- * reserve = page cache + activations + KV, all in GB. `cap_requested` is what
- * K3_EXPERT_GB asked for: this only ever LOWERS it, never raises it, so an
- * explicit small cache stays small. */
+ * reserve = page cache + activations + KV + optional recurrent checkpoints,
+ * all in GB. `cap_requested` is what K3_EXPERT_GB asked for: this only ever
+ * LOWERS it, never raises it, so an explicit small cache stays small. */
 static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_gb,
                           double slot_gb, int nmoe, int cap_requested,
                           int n_experts, double *for_experts_out){
@@ -335,6 +358,10 @@ static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
 static VkExp *g_vkexp; static int64_t g_vkexp_n;
 static int g_vk_upcap=8, g_vk_up_left=0, g_vk_full=0;
+static int g_vk_up_auto=0;                /* K3_VK_UP=auto: measured budget */
+static double g_vk_fill_frac=0.25;        /* K3_VK_FILL_FRAC of step time */
+static double g_vk_step_ema, g_vk_upload_ema;  /* seconds, decode steps only */
+static int g_vk_cap_now=8;                /* last budget chosen (reporting) */
 static long g_vk_hit=0, g_vk_res=0;
 static double g_vk_gb=0;                  /* K3_VK_GB cap (0 = driver budget) */
 static const char *k3_vk_spv(char *buf, size_t n){
@@ -470,6 +497,16 @@ static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
 static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
+enum { K3_CKPT_MAX = 8 };
+static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
+static double k3_ckpt_reserve_gb(const Model *m, int slots);
+static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
+                                          * slots. STRICTLY OPT-IN, 0 = off (default,
+                                          * engine behaves exactly as before). */
+static const char *g_k3_ckpt_dir=NULL;   /* COLI_K3_CKPT_DIR: park the photos in
+                                          * files instead of RAM (low-RAM machines:
+                                          * ~0.4s of sequential I/O per restore
+                                          * against minutes of avoided re-prefill). */
 
 static int k3_mmap_backend_allowed(int mmap_enabled, int vk_enabled, int cuda_enabled){
     return !mmap_enabled || (!vk_enabled && !cuda_enabled);
@@ -774,6 +811,17 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
 #endif
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
     g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
+    { /* Recurrent-state checkpoints are strictly OPT-IN: unset or 0 keeps
+       * the engine byte-identical to before the feature existed. */
+      const char *e=getenv("COLI_K3_CKPT");
+      g_k3_ckpt_slots=e?atoi(e):0;
+      if(g_k3_ckpt_slots<0) g_k3_ckpt_slots=0;
+      if(g_k3_ckpt_slots>K3_CKPT_MAX) g_k3_ckpt_slots=K3_CKPT_MAX;
+      g_k3_ckpt_dir=getenv("COLI_K3_CKPT_DIR");
+      if(g_k3_ckpt_dir&&!*g_k3_ckpt_dir) g_k3_ckpt_dir=NULL;
+      /* a directory alone is a clear enough request: default to 2 slots
+       * there, while an explicit COLI_K3_CKPT (0 included) always wins */
+      if(g_k3_ckpt_dir&&!e) g_k3_ckpt_slots=2; }
     g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
     g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
     if(g_k3_topp>0.f)
@@ -892,7 +940,13 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       }
       if(g_k3_vk){
         g_vk_gb=getenv("K3_VK_GB")?atof(getenv("K3_VK_GB")):0;
-        g_vk_upcap=getenv("K3_VK_UP")?atoi(getenv("K3_VK_UP")):8;
+        { const char *up=getenv("K3_VK_UP");
+          if(up&&!strcmp(up,"auto")){
+              g_vk_up_auto=1;             /* opt-in: measured budget below */
+              const char *fr=getenv("K3_VK_FILL_FRAC");
+              if(fr){ double f=atof(fr); if(f>0.0&&f<=1.0) g_vk_fill_frac=f; }
+          } else g_vk_upcap=up?atoi(up):8; }
+        g_vk_cap_now=g_vk_upcap;
         g_vkexp_n=(int64_t)c->n_layers*c->n_experts;
         g_vkexp=calloc((size_t)g_vkexp_n,sizeof(VkExp));
         if(!g_vkexp) g_k3_vk=0;
@@ -907,8 +961,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             nsh+=w_vk_upload(&sm2->sh_gate)+w_vk_upload(&sm2->sh_up)+w_vk_upload(&sm2->sh_down);
         }
         double used=0,budget=0; coli_vk_mem_budget(&used,&budget);
-        fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%d/step, cap %s)\n",
-                nsh,used,budget,g_vk_upcap,g_vk_gb>0?"K3_VK_GB":"driver budget");
+                char vk_cap_str[16]; snprintf(vk_cap_str,sizeof vk_cap_str,"%d",g_vk_upcap);
+        fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%s/step, cap %s)\n",
+                nsh,used,budget,g_vk_up_auto?"auto":vk_cap_str,g_vk_gb>0?"K3_VK_GB":"driver budget");
       }
     }
 #endif
@@ -978,8 +1033,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
         /* 2.5 GB page cache -- measured on Linux 2026-07-06: strangling it drops
          * buffered pread from ~800 to ~180 MB/s and the last GB of LRU costs
-         * more in lost bandwidth than it returns. 1.2 GB activations/logits. */
-        double reserve = 2.5 + 1.2 + kv_gb;
+         * more in lost bandwidth than it returns. 1.2 GB activations/logits.
+         * Checkpoints allocate lazily after this plan, so reserve all enabled
+         * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
+        double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
+        double reserve = 2.5 + 1.2 + kv_gb + ckpt_gb;
         double for_experts = 0.0;
 
         double slot_gb = (double)m->e_slot/1e9;
@@ -990,9 +1048,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             /* Name every term. The user's number is not being ignored, it is
              * being clamped, and they cannot check the clamp without the parts. */
             fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
-                "(page cache 2.5, activations 1.2, KV %dx%d %.1f) -> %.1f GB for experts; "
+                "(page cache 2.5, activations 1.2, KV %dx%d %.1f, checkpoints %d %.1f) "
+                "-> %.1f GB for experts; "
                 "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
                 budget, ram_env>0?"":" auto", resident, reserve, nkv, max_t, kv_gb,
+                g_k3_ckpt_slots,ckpt_gb,
                 for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
                 slot_gb*1000.0, nmoe,
                 resident + reserve + (double)(cap_fit>0?cap_fit:1)*slot_gb*nmoe);
@@ -1026,10 +1086,18 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       m->ecache=calloc((size_t)ncl,sizeof(LCache)); }
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
         m->ecache[i].cap=cap; m->ecache[i].s=calloc(cap,sizeof(Slot));
+        m->ecache[i].slot_by_expert=malloc((size_t)c->n_experts*sizeof(int));
+        if(!m->ecache[i].s||!m->ecache[i].slot_by_expert){
+            fprintf(stderr,"OOM expert cache/index\n"); exit(1); }
         for(int j2=0;j2<cap;j2++) m->ecache[i].s[j2].eid=-1;
+        for(int e=0;e<c->n_experts;e++) m->ecache[i].slot_by_expert[e]=-1;
     }
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
+    if(g_k3_ckpt_slots>0)
+        fprintf(stderr,"[K3-CKPT] enabled: %d recurrent-state slots (%.1f MB each, %s)\n",
+                g_k3_ckpt_slots,k3_ckpt_blob_floats(m)*sizeof(float)/1048576.0,
+                g_k3_ckpt_dir?g_k3_ckpt_dir:"RAM");
     /* Phase 9: layer validation init */
     { const char *vl=getenv("K3_VALIDATE_LAYER");
       const char *vt=getenv("K3_VALIDATE_TOKEN");
@@ -1367,10 +1435,45 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
  * slots) and, when K3_DIRECT=1 (default) and st.h has an O_DIRECT twin fd,
  * bypass the page cache: measured on the box 7.1 GB/s direct vs 2.9 buffered
  * (and ~1.8 effective once the resident weights leave no cache headroom). */
-static Slot *slot_find(Model *m, int li, int eid){
+/* Cache slots are serially published by cache_promote() or pin_seed(). Expert
+ * reads land in ws[] first and never enter this index until their bytes are
+ * complete. Validate both the local range and identity before returning: a
+ * broken invariant must become a miss, never another expert's weights. */
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#define SLOT_INDEX_PROBE() (g_slot_index_probes++)
+#else
+#define SLOT_INDEX_PROBE() ((void)0)
+#endif
+static Slot *slot_indexed(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
-    for(int i=0;i<lc->n;i++) if(lc->s[i].eid==eid){ m->hits++; lc->s[i].used=++m->clock; return &lc->s[i]; }
-    return NULL;
+    if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
+    SLOT_INDEX_PROBE();
+    int i=lc->slot_by_expert[eid];
+    if(i<0||i>=lc->n||lc->s[i].eid!=eid) return NULL;
+    return &lc->s[i];
+}
+static Slot *slot_find(Model *m, int li, int eid){
+    Slot *s=slot_indexed(m,li,eid);
+    if(s){ m->hits++; s->used=++m->clock; }
+    return s;
+}
+static void cache_unindex(Model *m,int li,Slot *s){
+    LCache *lc=&m->ecache[li]; int i=(int)(s-lc->s);
+    if(s->eid>=0&&s->eid<m->c.n_experts&&lc->slot_by_expert[s->eid]==i)
+        lc->slot_by_expert[s->eid]=-1;
+}
+static void cache_index(Model *m,int li,Slot *s){
+    LCache *lc=&m->ecache[li]; int i=(int)(s-lc->s);
+    if(s->eid<0||s->eid>=m->c.n_experts||i<0||i>=lc->n){
+        fprintf(stderr,"layer %d: invalid expert cache publication\n",li); exit(1); }
+    lc->slot_by_expert[s->eid]=i;
+}
+static void cache_promote(Model *m,int li,Slot *dst,Slot *loaded){
+    cache_unindex(m,li,dst);
+    Slot tmp=*dst; *dst=*loaded; *loaded=tmp;
+    dst->used=++m->clock;
+    cache_index(m,li,dst);
 }
 static void expert_read(Model *m, int li, int eid, Slot *s){
     if(!s->base){
@@ -1505,6 +1608,7 @@ static void vk_expert_try_upload(Model *m, int li, int eid, Slot *s){
         return; }
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+    double up_t0=now_s();                 /* whole upload incl. scale expand */
     int LT=m->c.latent, MI=m->c.moe_inter;
     int64_t n1=m->e_w1s, n2=m->e_w2s;          /* scale counts = scale bytes (u8) */
     float *sc=falloc(n1>n2?n1:n2);
@@ -1525,6 +1629,7 @@ static void vk_expert_try_upload(Model *m, int li, int eid, Slot *s){
         return;
     }
     g_vk_res++; g_vk_up_left--;
+    g_vk_upload_ema=coli_v4_hybrid_ema(g_vk_upload_ema,now_s()-up_t0);
 }
 #endif
 
@@ -1683,8 +1788,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 if(lru<0) break;                    /* every slot pinned: keep the read */
                 dst=&lc->s[lru];
             }
-            Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
-            dst->used=++m->clock;
+            cache_promote(m,li,dst,&m->ws[q]);
         }
     }
     free(zq_all); free(zsc_all);
@@ -1748,15 +1852,14 @@ static void pin_seed(Model *m, int64_t hist){
             int best=-1; uint32_t bestc=0;
             for(int e=0;e<c->n_experts;e++){
                 if(u[e]<=bestc) continue;
-                int taken=0;
-                for(int i=0;i<lc->n;i++) if(lc->s[i].eid==e){ taken=1; break; }
+                int taken=slot_indexed(m,li,e)!=NULL;
                 if(!taken){ best=e; bestc=u[e]; }
             }
             if(best<0) break;                       /* history is exhausted */
             Slot *d=&lc->s[lc->n];
             expert_read(m,li,best,d);
             d->eid=best; d->used=++m->clock; d->pinned=1;
-            lc->n++; pinned_total++;
+            lc->n++; cache_index(m,li,d); pinned_total++;
         }
     }
     if(pinned_total)
@@ -1914,7 +2017,15 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     Cfg *c=&m->c; int D=c->hidden;
     if(cancelled) *cancelled=0;
 #ifdef COLI_VULKAN
-    g_vk_up_left=g_vk_upcap;              /* routed-tier upload budget per step */
+    /* Routed-tier upload budget for this step. Fixed cap by default;
+     * K3_VK_UP=auto bounds the inline upload time to a fraction of the
+     * measured decode step instead (hybrid_split.h) — legacy cap until both
+     * rates have samples, so enabling auto never starts worse. */
+    if(g_vk_up_auto&&!g_vk_full)
+        g_vk_cap_now=coli_k3_fill_budget(g_vk_step_ema,g_vk_upload_ema,
+                                         g_vk_fill_frac,g_vk_upcap);
+    g_vk_up_left=g_vk_up_auto?g_vk_cap_now:g_vk_upcap;
+    double vk_step_t0=(g_vk_up_auto&&C==1)?now_s():0.0;
 #endif
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
     float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
@@ -2008,6 +2119,10 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     }
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
     if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
+#ifdef COLI_VULKAN
+    if(g_vk_up_auto&&C==1&&vk_step_t0>0.0)
+        g_vk_step_ema=coli_v4_hybrid_ema(g_vk_step_ema,now_s()-vk_step_t0);
+#endif
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
 }
@@ -2155,6 +2270,41 @@ static void chat_assistant(ChatB *b, const char *reasoning, const char *text){
     cb_close(b,"message"); cb_special(b,b->sp_eom);
 }
 
+/* ---- tool-call XTML (#1143) -----------------------------------------------
+ * Attribute segmentation mirrors the reference renderer (encoding_k3.py):
+ * " key", "=\"", the escaped value, and "\"" are each their OWN text segment.
+ * Segment boundaries are token boundaries under K3's rank-BPE, so the split
+ * is part of the format, not a style choice. Values escape & -> &amp; and
+ * " -> &quot;, exactly the reference's _escape_attr_value. */
+static void cb_attr(ChatB *b, const char *key, const char *val){
+    char kb[80]; snprintf(kb,sizeof kb," %s",key); cb_text(b,kb);
+    cb_text(b,"=\"");
+    size_t n=strlen(val), extra=0;
+    for(size_t i=0;i<n;i++) extra += val[i]=='&'?4u : val[i]=='"'?5u : 0u;
+    char *esc=malloc(n+extra+1);
+    if(!esc){ fprintf(stderr,"OOM chat attr\n"); exit(1); }
+    char *w=esc;
+    for(size_t i=0;i<n;i++){
+        if(val[i]=='&'){ memcpy(w,"&amp;",5); w+=5; }
+        else if(val[i]=='"'){ memcpy(w,"&quot;",6); w+=6; }
+        else *w++=val[i];
+    }
+    *w=0; cb_text(b,esc); free(esc);
+    cb_text(b,"\"");
+}
+/* open tag with caller-supplied attributes: cb_open_begin, cb_attr..., cb_end */
+static void cb_open_begin(ChatB *b, const char *tag){ cb_special(b,b->sp_open); cb_text(b,tag); }
+static void cb_end(ChatB *b){ cb_special(b,b->sp_sep); }
+
+/* Is a generated XTML tag part of the tool-call structure? Open tags carry
+ * attributes ("call tool=\"x\" index=\"1\""), close tags are the bare name. */
+static int k3_tool_tag(const char *t){
+    return (!strncmp(t,"tools",5)   &&(t[5]==0||t[5]==' ')) ||
+           (!strncmp(t,"call",4)    &&(t[4]==0||t[4]==' ')) ||
+           (!strncmp(t,"argument",8)&&(t[8]==0||t[8]==' ')) ||
+           (!strncmp(t,"json",4)    &&(t[4]==0||t[4]==' '));
+}
+
 /* Internal gateway payload. Length framing keeps arbitrary UTF-8/newlines in
  * message content while preserving the segment boundaries required by K3's
  * rank-BPE chat template:
@@ -2194,6 +2344,93 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
             memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
             chat_assistant(&b,reason,text);
             free(reason); free(text); p=nl+1+nr+nt; continue;
+        }
+        if(*p=='Y'){                /* typed system message (#1143): tool-declare / tool-choice */
+            int ntp=-1, nb=-1;
+            if(sscanf(p,"Y %d %d",&ntp,&nb)!=2||ntp<1||ntp>64||nb<0||nl+1+ntp+nb>end) return -1;
+            char *typ=malloc((size_t)ntp+1), *body=malloc((size_t)nb+1);
+            if(!typ||!body){ fprintf(stderr,"OOM chat typed-system\n"); exit(1); }
+            memcpy(typ,nl+1,(size_t)ntp); typ[ntp]=0;
+            memcpy(body,nl+1+ntp,(size_t)nb); body[nb]=0;
+            cb_open_begin(&b,"message"); cb_attr(&b,"role","system"); cb_attr(&b,"type",typ); cb_end(&b);
+            cb_text(&b,body);
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            free(typ); free(body); p=nl+1+ntp+nb; continue;
+        }
+        if(*p=='O'){                /* tool result (#1143): O <index> <name-len> <content-len> */
+            int idx=-1, nn=-1, nb=-1;
+            if(sscanf(p,"O %d %d %d",&idx,&nn,&nb)!=3||idx<1||nn<1||nn>256||nb<0||nl+1+nn+nb>end) return -1;
+            char *name=malloc((size_t)nn+1), *body=malloc((size_t)nb+1);
+            if(!name||!body){ fprintf(stderr,"OOM chat tool-result\n"); exit(1); }
+            memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+            memcpy(body,nl+1+nn,(size_t)nb); body[nb]=0;
+            char ib[16]; snprintf(ib,sizeof ib,"%d",idx);
+            cb_open_begin(&b,"message"); cb_attr(&b,"role","tool");
+            cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+            cb_text(&b,body);
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            free(name); free(body); p=nl+1+nn+nb; continue;
+        }
+        if(*p=='B'){                /* assistant WITH tool calls (#1143):
+                                     * B <think> <nr> <nt> <ncalls>\n<reason><text>
+                                     * then ncalls of  F <name-len> <nargs>\n<name>
+                                     *                   (+ nargs of V <key-len> <type-len> <val-len>\n<key><type><val>)
+                                     * or               J <name-len> <json-len>\n<name><json> */
+            int th=-1, nr=-1, nt=-1, nc=-1;
+            if(sscanf(p,"B %d %d %d %d",&th,&nr,&nt,&nc)!=4||th<0||th>1||nr<0||nt<0||
+               nc<1||nc>64||nl+1+nr+nt>end) return -1;
+            char *reason=malloc((size_t)nr+1), *text=malloc((size_t)nt+1);
+            if(!reason||!text){ fprintf(stderr,"OOM chat assistant-tools\n"); exit(1); }
+            memcpy(reason,nl+1,(size_t)nr); reason[nr]=0;
+            memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
+            cb_open(&b,"message","assistant");
+            if(th){ cb_open(&b,"think",NULL); cb_text(&b,reason); cb_close(&b,"think"); }
+            cb_open(&b,"response",NULL); cb_text(&b,text); cb_close(&b,"response");
+            free(reason); free(text);
+            cb_open(&b,"tools",NULL);
+            p=nl+1+nr+nt;
+            for(int ci=0;ci<nc;ci++){
+                nl=memchr(p,'\n',(size_t)(end-p)); if(!nl) return -1;
+                char ib[16]; snprintf(ib,sizeof ib,"%d",ci+1);
+                if(*p=='J'){
+                    int nn=-1, nj=-1;
+                    if(sscanf(p,"J %d %d",&nn,&nj)!=2||nn<1||nn>256||nj<0||nl+1+nn+nj>end) return -1;
+                    char *name=malloc((size_t)nn+1), *js=malloc((size_t)nj+1);
+                    if(!name||!js){ fprintf(stderr,"OOM chat tool-call\n"); exit(1); }
+                    memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+                    memcpy(js,nl+1+nn,(size_t)nj); js[nj]=0;
+                    cb_open_begin(&b,"call"); cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+                    cb_open_begin(&b,"json"); cb_attr(&b,"type","object"); cb_end(&b);
+                    cb_text(&b,js); cb_close(&b,"json"); cb_close(&b,"call");
+                    free(name); free(js); p=nl+1+nn+nj;
+                } else if(*p=='F'){
+                    int nn=-1, na=-1;
+                    if(sscanf(p,"F %d %d",&nn,&na)!=2||nn<1||nn>256||na<0||na>64||nl+1+nn>end) return -1;
+                    char *name=malloc((size_t)nn+1);
+                    if(!name){ fprintf(stderr,"OOM chat tool-call\n"); exit(1); }
+                    memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+                    cb_open_begin(&b,"call"); cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+                    free(name); p=nl+1+nn;
+                    for(int ai=0;ai<na;ai++){
+                        nl=memchr(p,'\n',(size_t)(end-p)); if(!nl) return -1;
+                        int nk=-1, ntp=-1, nv=-1;
+                        if(sscanf(p,"V %d %d %d",&nk,&ntp,&nv)!=3||nk<1||nk>256||ntp<1||ntp>16||
+                           nv<0||nl+1+nk+ntp+nv>end) return -1;
+                        char *key=malloc((size_t)nk+1), *typ=malloc((size_t)ntp+1), *val=malloc((size_t)nv+1);
+                        if(!key||!typ||!val){ fprintf(stderr,"OOM chat tool-arg\n"); exit(1); }
+                        memcpy(key,nl+1,(size_t)nk); key[nk]=0;
+                        memcpy(typ,nl+1+nk,(size_t)ntp); typ[ntp]=0;
+                        memcpy(val,nl+1+nk+ntp,(size_t)nv); val[nv]=0;
+                        cb_open_begin(&b,"argument"); cb_attr(&b,"key",key); cb_attr(&b,"type",typ); cb_end(&b);
+                        cb_text(&b,val); cb_close(&b,"argument");
+                        free(key); free(typ); free(val); p=nl+1+nk+ntp+nv;
+                    }
+                    cb_close(&b,"call");
+                } else return -1;
+            }
+            cb_close(&b,"tools");
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            continue;
         }
         char role[16]; int nb=-1;
         if(sscanf(p,"M %15s %d",role,&nb)!=2||nb<0||nl+1+nb>end) return -1;
@@ -2267,6 +2504,188 @@ static void model_state_reset(Model *m){
     }
 }
 
+/* ---------- recurrent-state checkpoints (OPT-IN, COLI_K3_CKPT=N) ----------
+ *
+ * kv_prefix reuse is all-or-nothing because the 69 KDA layers carry a single
+ * RECURRENT state that exists only at "now": a prompt that diverges anywhere
+ * before the fed length cannot be resumed, so today it resets everything and
+ * re-prefills from token 0 — on a streaming engine that is minutes of disk
+ * reads for an agentic edit that changed one tool result near the end.
+ *
+ * A checkpoint is a photograph of that recurrent state (kstate + the three
+ * conv windows of every KDA layer) taken at a turn boundary, together with
+ * its OWN copy of the token ids that produced it. On a divergent prompt the
+ * deepest photo still valid for the shared prefix is restored and only the
+ * tail is re-prefilled.
+ *
+ * Validity needs BOTH checks, not one: the photo's ids must prefix-match the
+ * new prompt (KDA side), and the restore position must not exceed the live
+ * common prefix of the CURRENT record (the MLA Lc/Rc rows are per-position
+ * and only valid while the record still describes them — after a reset the
+ * record is empty and no restore can happen, which is correct because
+ * model_state_reset also freed those rows).
+ *
+ * With COLI_K3_CKPT unset or 0 (the default), none of this code runs and the
+ * engine is byte-identical to before the feature existed. */
+typedef struct {
+    int pos;            /* state covers ids[0..pos-1] */
+    int *fed;           /* own copy of those ids */
+    float *blob;        /* packed kstate + cwq/cwk/cwv of every KDA layer */
+    uint64_t used;      /* LRU stamp */
+} K3Ckpt;
+static K3Ckpt g_k3_ckpt[K3_CKPT_MAX];
+static uint64_t g_k3_ckpt_clock=0;
+
+static size_t k3_ckpt_blob_floats(const Model *m){
+    const Cfg *c=&m->c;
+    size_t per=(size_t)c->kda_heads*c->kda_hd*c->kda_hd
+              +3u*(size_t)c->kda_proj*c->conv_k, n=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda) n+=per;
+    return n;
+}
+
+static double k3_ckpt_reserve_gb(const Model *m, int slots){
+    if(slots<1) return 0.0;
+    /* Disk-parked photos keep ONE bounce buffer in RAM regardless of slot
+     * count -- that is the whole point of COLI_K3_CKPT_DIR on a low-RAM
+     * machine. RAM slots each hold a full blob. */
+    int resident_blobs = g_k3_ckpt_dir ? 1 : slots;
+    return (double)resident_blobs*(double)k3_ckpt_blob_floats(m)*sizeof(float)/1e9;
+}
+
+static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
+    Cfg *c=&m->c; size_t o=0;
+    size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd;
+    size_t cw=(size_t)c->kda_proj*c->conv_k;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        float *live[4]={m->kstate[i],m->cwq[i],m->cwk[i],m->cwv[i]};
+        size_t len[4]={ks,cw,cw,cw};
+        for(int j=0;j<4;j++){
+            if(to_blob) memcpy(blob+o,live[j],len[j]*sizeof(float));
+            else        memcpy(live[j],blob+o,len[j]*sizeof(float));
+            o+=len[j];
+        }
+    }
+}
+
+/* Disk-parked photos: same photos, same validity rules, but the blob lives
+ * in a file so the RAM cost is one bounce buffer instead of N slots. Slot
+ * metadata (pos, fed ids, LRU stamp) stays in memory: photos never survive
+ * the process, because after a restart the per-position MLA rows are gone
+ * and no restore could ever be valid. Stale files from a previous run are
+ * simply overwritten. Writes are atomic (tmp + rename); any I/O failure
+ * drops the photo, never the request. */
+static float *g_k3_ckpt_iobuf=NULL;
+#define K3_CKPT_FILE_MAGIC ((((uint64_t)0x504B4333)<<32)|1u) /* "3CKP" v1 */
+
+static void k3_ckpt_file(char *out, size_t n, int slot){
+    snprintf(out,n,"%s/k3_ckpt_%d.bin",g_k3_ckpt_dir,slot);
+}
+
+static int k3_ckpt_iobuf_ready(const Model *m){
+    if(!g_k3_ckpt_iobuf)
+        g_k3_ckpt_iobuf=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
+    return g_k3_ckpt_iobuf!=NULL;
+}
+
+static int k3_ckpt_disk_write(Model *m, int slot, int pos){
+    char path[512], tmp[524];
+    k3_ckpt_file(path,sizeof path,slot);
+    snprintf(tmp,sizeof tmp,"%s.tmp",path);
+    size_t floats=k3_ckpt_blob_floats(m);
+    if(!k3_ckpt_iobuf_ready(m)) return 0;
+    k3_ckpt_copy(g_k3_ckpt_iobuf,m,1);
+    FILE *f=fopen(tmp,"wb"); if(!f) return 0;
+    uint64_t header[3]={K3_CKPT_FILE_MAGIC,(uint64_t)pos,(uint64_t)floats};
+    int ok=fwrite(header,sizeof header,1,f)==1 &&
+           fwrite(g_k3_ckpt_iobuf,sizeof(float),floats,f)==floats;
+    ok=!fclose(f)&&ok;
+    if(ok){ remove(path); ok=!rename(tmp,path); }
+    if(!ok) remove(tmp);
+    return ok;
+}
+
+static int k3_ckpt_disk_read(Model *m, int slot, int pos){
+    char path[512];
+    k3_ckpt_file(path,sizeof path,slot);
+    size_t floats=k3_ckpt_blob_floats(m);
+    if(!k3_ckpt_iobuf_ready(m)) return 0;
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    uint64_t header[3]={0,0,0};
+    int ok=fread(header,sizeof header,1,f)==1 &&
+           header[0]==K3_CKPT_FILE_MAGIC &&
+           header[1]==(uint64_t)pos && header[2]==(uint64_t)floats &&
+           fread(g_k3_ckpt_iobuf,sizeof(float),floats,f)==floats;
+    fclose(f);
+    if(ok) k3_ckpt_copy(g_k3_ckpt_iobuf,m,0);
+    return ok;
+}
+
+/* A slot holds a photo: in RAM mode the blob pointer says so, in disk mode
+ * the committed position does (the file is only trusted through it). */
+static int k3_ckpt_slot_full(const K3Ckpt *k){
+    return g_k3_ckpt_dir ? k->pos>0 : k->blob!=NULL;
+}
+
+static void k3_ckpt_save(Model *m){
+    if(g_k3_ckpt_slots<1) return;
+    int pos=m->kvp.len;
+    if(pos<1||m->kvp.tainted||!m->kvp.fed) return;
+    for(int s=0;s<g_k3_ckpt_slots;s++){       /* identical photo: refresh LRU */
+        K3Ckpt *k=&g_k3_ckpt[s];
+        if(k3_ckpt_slot_full(k)&&k->pos==pos&&
+           !memcmp(k->fed,m->kvp.fed,(size_t)pos*sizeof(int))){
+            k->used=++g_k3_ckpt_clock; return; }
+    }
+    int victim=0;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        if(!k3_ckpt_slot_full(&g_k3_ckpt[s])){ victim=s; break; }
+        if(g_k3_ckpt[s].used<g_k3_ckpt[victim].used) victim=s;
+    }
+    K3Ckpt *k=&g_k3_ckpt[victim];
+    if(!g_k3_ckpt_dir&&!k->blob){
+        k->blob=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
+        if(!k->blob) return;                  /* optimisation, never a failure */
+    }
+    int *fed=realloc(k->fed,(size_t)pos*sizeof(int));
+    if(!fed) return;                          /* slot keeps its old photo */
+    k->fed=fed;
+    memcpy(k->fed,m->kvp.fed,(size_t)pos*sizeof(int));
+    if(g_k3_ckpt_dir){
+        if(!k3_ckpt_disk_write(m,victim,pos)){ k->pos=0; return; }
+    } else k3_ckpt_copy(k->blob,m,1);
+    k->pos=pos; k->used=++g_k3_ckpt_clock;
+    if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[K3-CKPT] saved pos=%d slot=%d\n",pos,victim);
+}
+
+/* Deepest valid photo for this prompt; restores it and returns the covered
+ * positions (the caller prefills only ids[pos..np)), or 0 when none fits. */
+static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
+    if(g_k3_ckpt_slots<1||m->kvp.tainted||!m->kvp.fed) return 0;
+    int live=0, lim=m->kvp.len<np?m->kvp.len:np;
+    while(live<lim&&m->kvp.fed[live]==ids[live]) live++;
+    if(live>=np) live=np-1;   /* at least one new token must be prefilled */
+    int best=-1;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        K3Ckpt *k=&g_k3_ckpt[s];
+        if(!k3_ckpt_slot_full(k)||k->pos<1||k->pos>live) continue;
+        if(memcmp(k->fed,ids,(size_t)k->pos*sizeof(int))) continue;
+        if(best<0||k->pos>g_k3_ckpt[best].pos) best=s;
+    }
+    if(best<0) return 0;
+    K3Ckpt *k=&g_k3_ckpt[best];
+    if(g_k3_ckpt_dir){
+        if(!k3_ckpt_disk_read(m,best,k->pos)){ k->pos=0; return 0; }
+    } else k3_ckpt_copy(k->blob,m,0);
+    m->kvp.len=k->pos;        /* the record truncates with the state it describes */
+    k->used=++g_k3_ckpt_clock;
+    if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[K3-CKPT] restored pos=%d of %d prompt tokens "
+                       "(recompute %d)\n",k->pos,np,np-k->pos);
+    return k->pos;
+}
+
 /* Decide reuse before changing the state it describes. A miss discards the
  * old recurrent/KV state first and allocates a fresh target; a hit grows the
  * existing target while preserving its prefix. The old order allocated first,
@@ -2274,6 +2693,9 @@ static void model_state_reset(Model *m){
  * MLA prefill immediately indexed them (#855). */
 static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     int reuse=kv_prefix_reuse(&m->kvp,ids,np);
+    /* Divergent prompt: before surrendering to a full reset, try the
+     * checkpoint pool (a no-op unless COLI_K3_CKPT enabled it). */
+    if(!reuse) reuse=k3_ckpt_restore_best(m,ids,np);
     if(!reuse) model_state_reset(m);
     kv_alloc(m,max_t);
     return reuse;
@@ -2425,8 +2847,11 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         if(!poll.fatal) coli_serve_write_error(stdout,q->id,"CANCELLED");
         return poll.fatal?-1:0;
     }
+    /* Turn boundary: the state now covers exactly the prompt. A photo here is
+     * what an agentic edit of the NEXT request restores from. */
+    k3_ckpt_save(m);
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
-    char buf[512], xtag[64];
+    char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
     for(int s=0;s<q->max_tok&&!cancelled;s++){
         int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
@@ -2441,6 +2866,15 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
                     xsup=0; xtag[xtl]=0;
                     if(xopen&&!strcmp(xtag,"response")&&thinking)
                         serve_data(q->id,"</think>",8);
+                    else if(k3_tool_tag(xtag)){
+                        /* #1143: re-emit tool-call structure literally so the gateway can
+                         * parse it back into OpenAI tool_calls. Everything else XTML stays
+                         * suppressed as before; the gateway strips these markers from the
+                         * client-visible deltas the same way the GLM path does. */
+                        char lb[352];
+                        int n=snprintf(lb,sizeof lb,"%s%s<|sep|>",xopen?"<|open|>":"<|close|>",xtag);
+                        if(n>0&&n<(int)sizeof lb) serve_data(q->id,lb,n);
+                    }
                 }
                 show=0;
             } else if(xsup){
@@ -2470,6 +2904,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
+    /* End of the reply: the next turn's transcript extends THIS state, and an
+     * edited retry of this turn restores the prompt-boundary photo above. */
+    k3_ckpt_save(m);
     double dt=now_s()-t0, decode=now_s()-tg;
     uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
     ColiServeDone done={gen,decode>0?gen/decode:0.0,
@@ -2482,8 +2919,16 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
     fflush(stdout);
 #ifdef COLI_VULKAN
-    if(g_k3_vk) fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
-                        g_vk_res,g_vk_hit);
+    if(g_k3_vk){
+        if(g_vk_up_auto)
+            fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits | "
+                           "fill auto cap=%d (step %.2fms, upload %.2fms, frac %.2f)\n",
+                    g_vk_res,g_vk_hit,g_vk_cap_now,
+                    g_vk_step_ema*1e3,g_vk_upload_ema*1e3,g_vk_fill_frac);
+        else
+            fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
+                    g_vk_res,g_vk_hit);
+    }
 #endif
     return 0;
 }
@@ -2702,6 +3147,11 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+#ifdef COLI_VULKAN
+    if(g_k3_vk&&g_vk_up_auto)
+        fprintf(stderr,"[K3-VK] fill auto: cap=%d (step %.2fms, upload %.2fms, frac %.2f) | %ld resident\n",
+                g_vk_cap_now,g_vk_step_ema*1e3,g_vk_upload_ema*1e3,g_vk_fill_frac,g_vk_res);
+#endif
     /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
      * needs tokens-and-elapsed to compare candidates. Before this only colibri
      * emitted a parseable throughput line (REPLAY decode), so the tuner was

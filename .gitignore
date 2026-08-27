@@ -137,3 +137,7 @@ c/*.obj
 
 # compiled objects
 *.o
+
+# vendor modeling cache for the tiny K3 oracle (maintainer tool)
+c/kimi_k3_tiny/.vendor_kimi_k3/
+c/kimi_k3_tiny/.coli_usage

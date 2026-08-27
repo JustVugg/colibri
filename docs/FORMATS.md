@@ -22,8 +22,9 @@ kernel, and collision/refusal logic for `fmt=8`. **Post-INVERSION** (the
 UNSTAMPED tensor at the fmt=1-vs-fmt=8 ambiguous shape (THE DESIGN LANDMINE)
 no longer refuses — it resolves to `int8-row`, the incumbent,
 already-on-disk, decodable format, and the writer (`repack_fp8_passthrough.py`)
-refuses to ever EMIT an `fmt=8` container at that same ambiguous shape, so an
-unstamped collision is never silently misread either way. This PR stacks on
+refuses to EMIT an `fmt=8` tensor at that same ambiguous shape **unless the
+reader will consult a stamp for it** (see "Emitting at the collision shape"
+below), so an unstamped collision is never silently misread either way. This PR stacks on
 top of that and adds the stamp (writer + reader): a stamp's role here is
 letting a genuinely-STAMPED `fmt=8` tensor at an ambiguous shape still be
 read as `fmt=8` (overriding the unstamped-case default) — and, for every
@@ -317,6 +318,106 @@ writes one. An absent stamp is therefore never itself a signal that
 anything is wrong with a container; it is the default, expected state for
 everything that predates this convention (which, as of this PR, is
 everything).
+
+### Emitting at the collision shape
+
+The writer-side rule the INVERSION made load bearing is **"never emit an
+`fmt=8` tensor at the collision shape that the reader cannot resolve"** — not
+"never emit at the collision shape". The two coincided while
+`repack_fp8_passthrough.py` emitted only tensors it stamped and refused the
+shape outright; they stop coinciding as soon as the tool emits anything the
+reader will not consult a stamp for.
+
+Which tensors those are is a **reader-side fact**, and the split runs exactly
+along the resident/routed line:
+
+- **Residents** load through `qt_from_disk`, which looks the tensor's name up
+  with `st_fmt_stamp` and passes the result into `qt_resolve_fmt` as
+  `stamped_name`. At the collision shape, `qt_resolve_fmt`'s *"THE STAMPED CASE
+  IS UNCHANGED by this inversion"* branch resolves such a tensor to `fmt=8`
+  through TRUST-VERIFY-REFUSE. **Emitting a stamped `fmt=8` resident at the
+  collision shape uses the stamp mechanism as designed; it does not relax
+  #528's invariant.** GLM-5.2's `self_attn.o_proj.weight` (`[6144,16384]`) is
+  the one shape family in that checkpoint where this matters.
+- **Routed experts** load through `expert_load_impl` and its two siblings,
+  every one of which calls `qt_resolve_fmt` with `stamped_name = NULL`. A stamp
+  on a routed expert is written and never read — and the `ST_FMT_STAMP_MAX` cap
+  below is sized on precisely that premise. So routed experts are emitted
+  **unstamped**, and for them the collision refusal stays unconditional.
+
+`repack_fp8_passthrough.py` enforces this twice, deliberately: once in
+`_check_geometry` (selection time, per tensor, with the `stampable` verdict) and
+once in `_emission_stamp_gate`, which re-derives the collision predicate from
+the **output tensors' own `[O,I]`** immediately before `save_file`. The second
+check is what makes the guarantee structural rather than procedural: a refactor
+that reclassifies a tensor or drops a stamp between selection and write trips a
+gate that does not share the selection code's assumptions.
+
+### Container-level format declaration
+
+Alongside the per-tensor stamp, a container may carry
+`__metadata__["colibri.container.formats"]` — JSON text holding a sorted array
+of format NAME strings (never ordinals, same rule as the stamp) that the
+container declares it carries residents in. `repack_fp8_passthrough.py` writes
+`["fp8-e4m3-b128"]` on every shard it emits.
+
+**No engine reads this key today.** It exists to close the one hole the
+per-tensor stamp cannot close by itself: a stamp lives in `__metadata__`, and
+any downstream tool that rewrites shards without preserving `__metadata__`
+turns a stamped `fmt=8` tensor at the collision shape into an unstamped one,
+which then resolves to `int8-row` silently — garbage weights, no error, the same
+failure class the INVERSION is otherwise safe against. A reader that knows a
+container **declares** fp8-e4m3 residents has the standing to treat an unstamped
+ambiguous tensor *inside that container* as an ERROR rather than an int8
+default, which converts a procedural guarantee back into a structural one.
+
+The declaration lands first and the check lands second on purpose: an unknown
+`__metadata__` key is inert to every existing engine (`st_fmt_stamp_ingest`
+looks up `"colibri.fmt"` alone and returns early on anything else;
+`st_init_multi` skips the whole `"__metadata__"` entry when indexing tensors),
+so containers minted now already carry the declaration before anything enforces
+it, and the enforcement has data to act on from the day it lands.
+`tests/test_fp8_e2e_repack_load.py` pins the inertness: a container carrying the
+key loads through the real `st_init`/`qt_from_disk` with no diagnostic.
+
+**Known window:** between a writer emitting the declaration and a reader
+enforcing it, containers declare and nothing checks — so the stamp-loss hole
+stays open in that interval. That is no worse than the status quo, which has no
+declaration at all.
+
+### Full-family emission and the `kv_b_proj` decode constraint
+
+`repack_fp8_passthrough.py` emits the **full tensor family**, making its
+`--outdir` a standalone-loadable model directory rather than a partial overlay:
+
+- **fp8-repacked** (byte-preserved weight + renamed `.qs` scale sidecar):
+  routed experts (unstamped, see above) and the resident projections —
+  `o_proj`, `q_a`/`q_b`/`kv_a`, `kv_b_proj`, shared-expert and dense-MLP
+  weights (stamped).
+- **Raw pass-through** (byte-identical copy, original BF16/F32 dtype, no
+  `.qs`, no stamp): norms, router (`mlp.gate.weight`), `e_score_correction_bias`,
+  `embed_tokens`, `lm_head`. This exercises nothing new on the read side — it
+  is exactly the plain `st_read_f32` fallback path `qt_from_disk` already takes
+  for any tensor without a `.qs` sidecar.
+- **Non-tensor files**: `config.json` and `tokenizer.json` are copied from
+  `--indir` (both are mandatory — the engine `exit(1)`s without either, so the
+  tool refuses to mint if `--indir` lacks them); `generation_config.json` is
+  copied best-effort, matching `load_cfg`'s own optional handling. No
+  `model.safetensors.index.json` is copied or needed: `st_init_multi` globs
+  `*.safetensors` and builds its own index, and a copied index would describe
+  the *source* shard layout, not the minted one.
+
+**Decode constraint on the minted `kv_b_proj`:** the container-side work is
+deliberately ahead of the engine-side work. A minted `kv_b_proj` **loads**
+today exactly like `o_proj` (same `qt_from_disk` path, same stamp), but the
+MLA-absorption paths that consume it — `qt_addrow`/`qt_matvec_rows` on CPU and
+the CUDA absorb kernels — have **no `fmt=8` case yet**; that support is being
+built in parallel on `f8/absorb-fmt8`. Until it lands, a container minted with
+`kv_b_proj` must not be used for decode that reaches the batched
+(`kvs`-non-NULL) serving path. The failure mode is a **loud crash, not a
+silent misread** (`ABSORB=0` cannot bypass absorb there), and sequencing —
+engine support before such a container serves decode — is release-gate work,
+not something the tool can enforce from the write side.
 
 ### Duplicate claims, locality, coverage
 

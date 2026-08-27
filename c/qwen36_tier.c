@@ -121,11 +121,19 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs){
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
 
-    /* devices: COLI_GPUS="0,1" (default: 0,1 when present, else 0) */
+    /* devices: COLI_GPUS="0,1" (default: first two visible devices) */
     const char *gl=getenv("COLI_GPUS");
-    char buf[128]; snprintf(buf,sizeof buf,"%s", gl?gl:"0,1");
-    for(char *t=strtok(buf,","); t && G.ndev<QT_MAX_DEV; t=strtok(NULL,","))
-        G.dev[G.ndev++]=atoi(t);
+    if (gl && *gl) {
+        char buf[128]; snprintf(buf,sizeof buf,"%s",gl);
+        for(char *t=strtok(buf,","); t && G.ndev<QT_MAX_DEV; t=strtok(NULL,","))
+            G.dev[G.ndev++]=atoi(t);
+    } else {
+        int available=coli_cuda_available_device_count();
+        int want=available<2?available:2;
+        for(int i=0;i<want && i<QT_MAX_DEV;i++) G.dev[G.ndev++]=i;
+        fprintf(stderr,"[qtier] COLI_GPUS unset: selecting %d visible device(s)\n",G.ndev);
+    }
+    if(G.ndev<1){ fprintf(stderr,"[qtier] no visible CUDA devices -> CPU path\n"); return 0; }
     if(!coli_cuda_init(G.dev,G.ndev)){ fprintf(stderr,"[qtier] coli_cuda_init failed -> CPU path\n"); return 0; }
     int have=coli_cuda_device_count();
     if(have<G.ndev){ G.ndev=have; }

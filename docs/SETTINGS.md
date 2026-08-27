@@ -79,7 +79,9 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 
 **`tune`**: `--prompt <text>`, `--tokens 16`, `--repeats 2`,
 `--timeout 900`, `--min-gain 0.03`. The command uses fixed-token replay and
-only tests quality-preserving execution scheduling.
+only tests quality-preserving execution scheduling. For disk-backed MoE it also
+tests smaller, planner-bounded RAM/cache allocations; output, hit rate, TTFT,
+and tail-latency gates prevent a decode-only win from degrading real chat.
 
 **`doctor`**: `--deep` strictly checks every safetensors header and tensor
 layout, filename-declared shard completeness, required core tensors, an

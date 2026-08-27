@@ -133,6 +133,74 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("RAM_GB", env)
 
+    def test_auto_tier_applies_saved_profile_to_sibling_engine(self):
+        """#1196 saved sibling profiles, but only GLM's env_for() loaded them.
+        A measured V4 lane winner must reach the real chat/serve child, while
+        an explicit environment override remains authoritative."""
+        directory, root = self.make_model()
+        args = argparse.Namespace(
+            model=str(root), ngen=8, temp=0.0, ram=0, ctx=0,
+            gpu=None, vram=0, auto_tier=True, no_tune_profile=False,
+            policy="quality", kv_slots=1,
+        )
+        measured = {
+            "gain": 0.20,
+            "winner": {"env": {"V4_LOADER_LANES": "3", "RAM_GB": "32.000"}},
+        }
+        planned = {"sentinel": "same plan used by tune and launch"}
+        def passthrough(_plan, env, cuda_enabled):
+            result = dict(env)
+            result.setdefault("OMP_NUM_THREADS", "16")
+            return result
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["V4_LOADER_LANES"], "3")
+            self.assertEqual(env["RAM_GB"], "32.000")
+            self.assertNotIn("OMP_NUM_THREADS", env)
+
+            with mock.patch.dict(os.environ, {"V4_LOADER_LANES": "12"}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["V4_LOADER_LANES"], "12")
+
+            args.ram = 64
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["RAM_GB"], "64")
+        finally:
+            directory.cleanup()
+
+    def test_measured_cap_is_private_and_never_overrides_cli_cap(self):
+        measured = {"winner": {"env": {"OMP_NUM_THREADS": "4"}, "cap": 12}}
+        env = self.cli.apply_measured_profile({}, measured, set(), None)
+        self.assertEqual(env["COLI_PROFILE_CAP"], "12")
+        self.assertEqual(env["OMP_NUM_THREADS"], "4")
+        explicit = self.cli.apply_measured_profile({}, measured, set(), 7)
+        self.assertNotIn("COLI_PROFILE_CAP", explicit)
+        self.assertEqual(self.cli.cap_for_launch(None, env, 8), 12)
+        self.assertEqual(self.cli.cap_for_launch(7, env, 8), 7)
+        with mock.patch.dict(os.environ, {"CAP": "9"}, clear=True):
+            args = argparse.Namespace(cap=None)
+            self.assertEqual(self.cli.operator_cap(args, "glm"), 9)
+            explicit_env = self.cli.apply_measured_profile(
+                {}, measured, set(), self.cli.operator_cap(args, "glm"))
+            self.assertNotIn("COLI_PROFILE_CAP", explicit_env)
+
     def test_ngen_default_differs_for_interactive_commands(self):
         """#889: `coli web` passed --max-tokens 1024, and openai_server clamps a
         request to that ceiling (#260), so the browser's own "max output tokens"
@@ -192,6 +260,37 @@ class V4CliTest(unittest.TestCase):
             self.assertEqual(captured["bytes"], prompt.encode("utf-8"))
             self.assertNotIn(prompt, captured["command"])
             self.assertFalse(captured["path"].exists())
+        finally:
+            directory.cleanup()
+
+    def test_v4_one_shot_translates_profiled_ram_to_cli_memory_limit(self):
+        directory, root = self.make_model()
+        args = argparse.Namespace(
+            model=str(root), prompt=["hello"], ngen=4, ram=0,
+            temp=None, ctx=0,
+        )
+        captured = {}
+
+        def fake_call(command, env):
+            captured["command"] = command
+            captured["env"] = env
+            return 0
+
+        try:
+            with mock.patch.object(self.cli.sys, "platform", "linux"), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"), \
+                 mock.patch.object(self.cli, "need_model"), \
+                 mock.patch.object(self.cli, "banner"), \
+                 mock.patch.object(self.cli, "env_for_engine",
+                                   return_value={"RAM_GB": "32.000"}), \
+                 mock.patch.object(self.cli.subprocess, "call",
+                                   side_effect=fake_call):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.cli.cmd_run(args)
+            self.assertEqual(stopped.exception.code, 0)
+            at = captured["command"].index("--memory-gb")
+            self.assertEqual(captured["command"][at + 1], "32.000")
         finally:
             directory.cleanup()
 

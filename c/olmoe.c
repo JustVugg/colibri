@@ -71,7 +71,11 @@ typedef struct {
  * not be evicted during normal LRU eviction, but may be displaced under extreme
  * cache pressure when all slots are pinned or in-flight. */
 typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
-typedef struct { Slot *slots; int n, cap; } LCache;
+typedef struct {
+    Slot *slots;
+    int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -122,6 +126,46 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
+
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#endif
+
+/* Runtime callers hold g_pilot_mx.  The defensive eid check is intentional:
+ * an index bug must degrade to a miss, never serve another expert's weights. */
+static Slot *slot_indexed(Model *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 ||
+        eid >= m->c.n_experts) return NULL;
+    LCache *lc = &m->cache[layer];
+    if (!lc->slot_by_expert) return NULL;
+#ifdef COLI_CACHE_INDEX_TEST
+    g_slot_index_probes++;
+#endif
+    int i = lc->slot_by_expert[eid];
+    if (i < 0 || i >= lc->n || lc->slots[i].eid != eid) return NULL;
+    return &lc->slots[i];
+}
+
+static void cache_unindex(Model *m, int layer, Slot *s) {
+    LCache *lc = &m->cache[layer];
+    int eid = s->eid, i = (int)(s - lc->slots);
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts &&
+        lc->slot_by_expert[eid] == i)
+        lc->slot_by_expert[eid] = -1;
+}
+
+static void cache_hide(Model *m, int layer, Slot *s) {
+    cache_unindex(m, layer, s);
+    s->eid = -1;
+}
+
+static void cache_publish(Model *m, int layer, Slot *s, int eid) {
+    LCache *lc = &m->cache[layer];
+    cache_unindex(m, layer, s);
+    s->eid = eid;
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
+        lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
 
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
@@ -366,6 +410,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     for (int i = 0; i < c->n_layers; i++) {
         m->cache[i].cap = cap;
         m->cache[i].slots = calloc(cap, sizeof(Slot));
+        m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
+        if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+        for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
     }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
     rt_init("olmoe", c->n_layers, c->n_experts);
@@ -486,8 +533,9 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
-    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+    Slot *hit = slot_indexed(m, layer, eid);
+    if (hit) {
+        m->hits++; hit->used = ++m->clock; *out = hit;
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -532,14 +580,14 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lru];
         s->pinned = 0;
     }
-    s->eid = -1;
+    cache_hide(m, layer, s);
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
 
     pthread_mutex_lock(&g_pilot_mx);
-    s->eid = eid;
+    cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
@@ -590,12 +638,10 @@ static void pin_hot_experts(Model *m) {
             int eid = hot_eids[k];
             m->is_pinned[l * c->n_experts + eid] = 1;
 
-            LCache *lc = &m->cache[l];
             int found = 0;
             pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid == eid) { lc->slots[i].pinned = 1; found = 1; break; }
-            }
+            Slot *resident = slot_indexed(m, l, eid);
+            if (resident) { resident->pinned = 1; found = 1; }
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found && g_pilot > 0) {
                 /* Only enqueue when the prefetch worker is active (PILOT>0). */
@@ -819,12 +865,10 @@ static void pilot_realload(Model *m, int layer, int eid) {
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
-    for (int i = 0; i < lc->n; i++) {
-        if (lc->slots[i].eid == eid) {
-            m->is_queued[layer * c->n_experts + eid] = 0;
-            pthread_mutex_unlock(&g_pilot_mx);
-            return;
-        }
+    if (slot_indexed(m, layer, eid)) {
+        m->is_queued[layer * c->n_experts + eid] = 0;
+        pthread_mutex_unlock(&g_pilot_mx);
+        return;
     }
     Slot *s;
     if (lc->n < lc->cap) {
@@ -858,13 +902,13 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
         s = &lc->slots[lru]; s->pinned = 0;
     }
-    s->eid = -1; s->used = ++m->clock;
+    cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
 
     pthread_mutex_lock(&g_pilot_mx);
-    s->eid = eid;
+    cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
@@ -976,10 +1020,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             if (eid < 0) continue;
             int found = 0;
             pthread_mutex_lock(&g_pilot_mx);
-            LCache *lc = &m->cache[lnext];
-            for (int z = 0; z < lc->n; z++) {
-                if (lc->slots[z].eid == eid) { found = 1; break; }
-            }
+            found = slot_indexed(m, lnext, eid) != NULL;
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found) {
                 int gidx = lnext * E + eid;

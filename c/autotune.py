@@ -1,14 +1,16 @@
 """Measured, quality-preserving execution tuning for colibri.
 
 The tuner changes execution scheduling only.  It never sweeps quantization,
-expert selection, sampling, or model weights.  A calibration continuation is
-generated once and then teacher-forced for every candidate so every run sees
-the same token and routing inputs.
+expert selection, sampling, or model weights.  GLM uses its fixed-token replay
+protocol.  The sibling engines keep one serve process alive per candidate and
+rotate deterministic prompts, so their expert caches behave like a real chat
+instead of being reset between every sample.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -36,8 +38,12 @@ LATENCY_RE = re.compile(r"latency p50\s+([0-9.]+)\s*ms.*?p99\s+([0-9.]+)\s*ms")
 # as TOPK, TOPP, DRAFT, quantization and CACHE_ROUTE are intentionally excluded.
 TUNABLE_KEYS = frozenset({
     "OMP_NUM_THREADS", "COLI_NUMA", "PIPE", "DIRECT",
-    "COLI_CUDA_PIPE", "COLI_CUDA_ASYNC",
+    "COLI_CUDA_PIPE", "COLI_CUDA_ASYNC", "V4_LOADER_LANES",
+    "RAM_GB", "K3_EXPERT_GB",
 })
+
+GIB = 1024 ** 3
+CAP_ARCHES = frozenset({"glm", "inkling", "olmoe", "qwen36"})
 
 
 def _config_path(profile_dir: str | None, fingerprint: str) -> Path:
@@ -105,9 +111,37 @@ def load_profile(plan: dict, model: str, engine: str, profile_dir: str | None = 
             or profile.get("fingerprint") != fingerprint
             or not profile.get("accepted")):
         return None
-    env = profile.get("winner", {}).get("env", {})
+    winner = profile.get("winner", {})
+    env = winner.get("env", {}) if isinstance(winner, dict) else None
     if not isinstance(env, dict) or any(key not in TUNABLE_KEYS for key in env):
         return None
+    # Available RAM is deliberately absent from the machine fingerprint: it is
+    # volatile, so including it would create a new profile whenever another
+    # application opened.  Resource winners therefore need a second admission
+    # gate at load time.  A profile measured yesterday may be reused today only
+    # when its cap/budget still fits the freshly-built safe plan.
+    ram = plan.get("tiers", {}).get("ram", {})
+    cap = winner.get("cap")
+    if cap is not None:
+        safe_cap = ram.get("cache_slots_per_layer")
+        if (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1
+                or not isinstance(safe_cap, int) or cap > safe_cap):
+            return None
+    for key, divisor, plan_key in (
+            ("RAM_GB", GIB, "budget_bytes"),
+            ("K3_EXPERT_GB", 1_000_000_000, "expert_cache_bytes")):
+        if key not in env:
+            continue
+        try:
+            requested = float(env[key])
+            safe = float(ram[plan_key]) / divisor
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        # Values are persisted to three decimals, hence the one-MiB-ish
+        # rounding allowance.  NaN/inf and zero are never useful budgets.
+        if (not math.isfinite(requested) or requested <= 0
+                or requested > safe + 0.001):
+            return None
     return profile
 
 
@@ -153,9 +187,10 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
     steps = []
     cores = max(1, int(plan.get("cpu", {}).get("physical_cores", os.cpu_count() or 1)))
     current_threads = int(base_env.get("OMP_NUM_THREADS", cores))
-    for threads in dict.fromkeys((cores, max(1, cores // 2))):
-        if threads != current_threads:
-            steps.append((f"omp-{threads}", {"OMP_NUM_THREADS": str(threads)}))
+    if not base_env.get("COLI_NO_OMP_TUNE"):
+        for threads in dict.fromkeys((cores, max(1, cores // 2))):
+            if threads != current_threads:
+                steps.append((f"omp-{threads}", {"OMP_NUM_THREADS": str(threads)}))
     sockets = int(plan.get("cpu", {}).get("sockets", 1))
     if sockets > 1 and base_env.get("COLI_NUMA") != "1":
         steps.append(("numa-on", {"COLI_NUMA": "1"}))
@@ -173,7 +208,107 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
         pipe = int(base_env.get("PIPE", "0"))
         if pipe != 1:
             steps.append(("io-pipe-on", {"PIPE": "1"}))
+    if (arch == "deepseek_v4"
+            and plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) > 0):
+        # The pool default (9) was measured on one CPU/NVMe pair.  GPU-tier
+        # systems often prefer 3 because a deeper reader pool contends with
+        # bank refill, while other SSDs keep scaling past 9.  Sweep a bounded
+        # set around both measured optima; lanes block in pread and therefore
+        # do not need one CPU apiece.
+        current_lanes = int(base_env.get("V4_LOADER_LANES", "9"))
+        lane_values = (3, 6, 9, 12)
+        for lanes in lane_values:
+            if lanes != current_lanes:
+                steps.append((f"v4-loader-{lanes}",
+                              {"V4_LOADER_LANES": str(lanes)}))
     return steps
+
+
+def _scaled_ram_budget(plan: dict, fraction: float) -> float | None:
+    """Scale only the expert-cache portion, never dense/runtime reservations."""
+    ram = plan.get("tiers", {}).get("ram", {})
+    try:
+        budget = int(ram["budget_bytes"])
+        cache = max(0, int(ram["expert_cache_bytes"]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    fixed = max(0, budget - cache)
+    return (fixed + int(cache * fraction)) / GIB
+
+
+def resource_candidate_steps(plan: dict, base_env: dict, arch: str, cap: int,
+                             explicit_resources=()) -> list[tuple[str, dict, int]]:
+    """Return bounded, never-larger RAM/cache candidates for disk-backed MoE.
+
+    The planner's current result is the upper bound.  We only remove 25% or
+    50% of the expert-cache portion, leaving dense weights, KV, workspaces and
+    OS reserve untouched.  This can recover page-cache/I/O throughput on a
+    memory-pressured host, but the ordinary hit/TTFT/tail gates decide whether
+    that trade is actually worthwhile on this model and workload.
+    """
+    if plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) <= 0:
+        return []
+    explicit = set(explicit_resources)
+    fractions = (0.75, 0.50)
+    steps = []
+
+    if arch in CAP_ARCHES:
+        if ("cap" in explicit or cap <= 1
+                or (arch == "glm" and "RAM_GB" in explicit)):
+            return []
+        seen = set()
+        for fraction in fractions:
+            candidate_cap = max(1, int(cap * fraction))
+            if candidate_cap == cap or candidate_cap in seen:
+                continue
+            seen.add(candidate_cap)
+            overlay = {}
+            if arch == "glm" and "RAM_GB" not in explicit:
+                budget = _scaled_ram_budget(plan, fraction)
+                if budget is not None:
+                    overlay["RAM_GB"] = f"{budget:.3f}"
+            steps.append((f"cache-{int(fraction * 100)}", overlay, candidate_cap))
+        return steps
+
+    if arch == "deepseek_v4":
+        if "RAM_GB" in explicit:
+            return []
+        seen = set()
+        for fraction in fractions:
+            budget = _scaled_ram_budget(plan, fraction)
+            if budget is None:
+                continue
+            value = f"{budget:.3f}"
+            if value == base_env.get("RAM_GB") or value in seen:
+                continue
+            seen.add(value)
+            steps.append((f"ram-cache-{int(fraction * 100)}",
+                          {"RAM_GB": value}, cap))
+        return steps
+
+    if arch == "kimi":
+        if "K3_EXPERT_GB" in explicit:
+            return []
+        try:
+            requested = float(base_env.get("K3_EXPERT_GB", "8"))
+            planned = (float(plan["tiers"]["ram"]["expert_cache_bytes"])
+                       / 1_000_000_000)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return []
+        baseline = min(requested, planned)
+        if not math.isfinite(baseline) or baseline <= 0:
+            return []
+        seen = set()
+        for fraction in fractions:
+            value = f"{baseline * fraction:.3f}"
+            if value in seen:
+                continue
+            seen.add(value)
+            steps.append((f"k3-cache-{int(fraction * 100)}",
+                          {"K3_EXPERT_GB": value}, cap))
+        return steps
+
+    return []
 
 
 def parse_replay(output: str) -> dict:
@@ -197,6 +332,51 @@ def parse_replay(output: str) -> dict:
         "p50_ms": float(latency.group(1)) if latency else None,
         "p99_ms": float(latency.group(2)) if latency else None,
     }
+
+
+def _summarize_measurement(name: str, overlay: dict, samples: list[dict],
+                           cap: int | None = None) -> dict:
+    """Reduce one candidate's fixed request budget to comparable medians."""
+    summary = {
+        "name": name,
+        "env": dict(overlay),
+        "tok_s": statistics.median(sample["tok_s"] for sample in samples),
+        "hit_pct": statistics.median(
+            sample["hit_pct"] for sample in samples
+            if sample["hit_pct"] is not None
+        ) if any(sample["hit_pct"] is not None for sample in samples) else None,
+        "p99_ms": statistics.median(
+            sample["p99_ms"] for sample in samples
+            if sample["p99_ms"] is not None
+        ) if any(sample["p99_ms"] is not None for sample in samples) else None,
+        "ttft_s": statistics.median(
+            sample["ttft_s"] for sample in samples
+            if sample.get("ttft_s") is not None
+        ) if any(sample.get("ttft_s") is not None for sample in samples) else None,
+        "samples": samples,
+    }
+    if cap is not None:
+        summary["cap"] = cap
+    return summary
+
+
+def _safety_gates(baseline: dict, trial: dict) -> dict:
+    return {
+        "hit_gate": (baseline["hit_pct"] is None or trial["hit_pct"] is None
+                     or trial["hit_pct"] >= baseline["hit_pct"] - 0.5),
+        "tail_gate": (baseline["p99_ms"] is None or trial["p99_ms"] is None
+                      or trial["p99_ms"] <= baseline["p99_ms"] * 1.20),
+        "ttft_gate": (baseline.get("ttft_s") is None or trial.get("ttft_s") is None
+                      or trial["ttft_s"] <= baseline["ttft_s"] * 1.20),
+    }
+
+
+class OutputDrift(RuntimeError):
+    """A run produced different tokens than the session's first run.
+
+    The sweep only offers quality-preserving scheduling knobs, so any output
+    change disqualifies that candidate outright (or, on the baseline itself,
+    proves the engine is not deterministic and cannot be tuned this way)."""
 
 
 def _run(command: list[str], env: dict, timeout: int) -> subprocess.CompletedProcess:
@@ -226,56 +406,164 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
              prompt: str, arch: str = "glm",
              tokens: int = 16, repeats: int = 2, timeout: int = 900,
              min_gain: float = 0.03, profile_dir: str | None = None,
-             progress=None) -> tuple[dict, Path]:
+             progress=None, family=None, engine_cls=None,
+             prompts=None, explicit_resources=()) -> tuple[dict, Path]:
     """Coordinate-descent tuning with a reverse-order confirmation gate."""
     progress = progress or (lambda _message: None)
-    replay, _ = create_replay(engine, cap, base_env, prompt, tokens, timeout)
-    with tempfile.TemporaryDirectory(prefix="coli-tune-") as directory:
-        ref = Path(directory) / "replay.json"
-        ref.write_text(json.dumps(replay), encoding="utf-8")
+    if cap is None:
+        # --cap has default=None ("auto"). str(None) used to reach the engine
+        # as argv[1]="None", which atoi() turns into 0: qwen36 refuses it and
+        # tuning dies with "calibration failed (1)", while GLM silently swept
+        # its platform default instead of the cap the plan just resolved
+        # (#1190). The plan is authoritative here, exactly like `coli chat`;
+        # a plan without a resolved cap is a loud error, never "None".
+        cap = plan.get("tiers", {}).get("ram", {}).get("cache_slots_per_layer")
+        if cap is None:
+            raise ValueError(
+                "--cap not given and the resource plan carries no resolved "
+                "cache_slots_per_layer")
+    import contextlib
+    # GLM measures through its native replay protocol (REF/REF_FORCE/REPLAY,
+    # the strongest fixed-workload guarantee). The sibling engines implement
+    # none of it (#1191) but ALL of them speak the serve protocol -- it is how
+    # the gateway and tools/datapoint.py drive every engine in production --
+    # so their measurement runs go through openai_server.Engine instead: one
+    # greedy request per run (COLI_TEMP=0, a deterministic fixed workload) with
+    # the DONE frame supplying decode tok/s and cache hit%. Quality is not
+    # assumed but enforced: the first run's bytes are the contract, and any
+    # run that emits different bytes raises OutputDrift -- a drifting
+    # candidate is disqualified, a drifting baseline aborts the tune.
+    if arch == "glm":
+        replay, _ = create_replay(engine, cap, base_env, prompt, tokens, timeout)
+        context = tempfile.TemporaryDirectory(prefix="coli-tune-")
+    else:
+        replay = None
+        context = contextlib.nullcontext()
+    serving_prompts = tuple(prompts or (prompt,))
+    if not serving_prompts or any(not isinstance(item, str) or not item
+                                  for item in serving_prompts):
+        raise ValueError("tuning prompts must be non-empty strings")
+    with context as directory:
+        if arch == "glm":
+            ref = Path(directory) / "replay.json"
+            ref.write_text(json.dumps(replay), encoding="utf-8")
 
-        def measure(name, overlay):
-            samples = []
-            for repeat in range(repeats):
-                progress(f"{name} ({repeat + 1}/{repeats})")
+            def run_once(name, overlay, launch_cap):
                 env = dict(base_env)
                 env.update(overlay)
                 env.update({"REF": str(ref), "REF_FORCE": "1", "REPLAY": "1", "PROF": "1"})
                 env.pop("PROMPT", None); env.pop("TOKENS", None)
-                proc = _run([engine, str(cap)], env, timeout)
+                proc = _run([engine, str(launch_cap)], env, timeout)
                 output = proc.stdout + "\n" + proc.stderr
                 if proc.returncode:
                     raise RuntimeError(f"{name} failed ({proc.returncode})\n{output[-2000:]}")
-                samples.append(parse_replay(output))
-            return {
-                "name": name,
-                "env": dict(overlay),
-                "tok_s": statistics.median(sample["tok_s"] for sample in samples),
-                "hit_pct": statistics.median(
-                    sample["hit_pct"] for sample in samples if sample["hit_pct"] is not None
-                ) if any(sample["hit_pct"] is not None for sample in samples) else None,
-                "p99_ms": statistics.median(
-                    sample["p99_ms"] for sample in samples if sample["p99_ms"] is not None
-                ) if any(sample["p99_ms"] is not None for sample in samples) else None,
-                "samples": samples,
-            }
+                return parse_replay(output)
+        else:
+            if engine_cls is None:
+                from openai_server import Engine as engine_cls
+            # One expected byte stream per prompt. Different prompts naturally
+            # produce different text; the same prompt changing across
+            # candidates is the quality violation.
+            expected = {}
 
-        baseline = measure("baseline", {})
+            def measure(name, overlay, launch_cap):
+                env = dict(base_env)
+                env.update(overlay)
+                env["COLI_TEMP"] = "0"
+                served = engine_cls(engine, model, launch_cap, tokens, env, 1, family)
+                samples = []
+                try:
+                    # Keep this engine alive for the whole candidate. `repeats`
+                    # is still the request budget, but requests now rotate
+                    # instead of repeatedly teaching the cache one prompt.
+                    for repeat in range(repeats):
+                        active_prompt = serving_prompts[repeat % len(serving_prompts)]
+                        progress(f"{name} ({repeat + 1}/{repeats}, prompt "
+                                 f"{repeat % len(serving_prompts) + 1}/"
+                                 f"{len(serving_prompts)})")
+                        pieces = []
+                        started = time.perf_counter()
+                        first_text_at = [None]
+
+                        def collect(piece):
+                            if piece and first_text_at[0] is None:
+                                first_text_at[0] = time.perf_counter()
+                            pieces.append(piece)
+
+                        result = served.generate(active_prompt, tokens, 0.0, 1.0,
+                                                 collect)
+                        finished = time.perf_counter()
+                        text = "".join(pieces)
+                        contract = expected.get(active_prompt)
+                        if contract is None:
+                            expected[active_prompt] = text
+                        elif text != contract:
+                            raise OutputDrift(
+                                f"{name} changed the generated tokens for prompt "
+                                f"{repeat % len(serving_prompts) + 1}; a scheduling "
+                                f"knob must never do that")
+                        tok_s = float(result.get("tokens_per_second") or 0.0)
+                        if tok_s <= 0:
+                            raise RuntimeError(
+                                f"{name}: engine reported no decode speed")
+                        reported_ttft = result.get("time_to_first_token")
+                        if reported_ttft is None:
+                            ttft = ((first_text_at[0] or finished) - started)
+                        else:
+                            ttft = float(reported_ttft)
+                        if not math.isfinite(ttft) or ttft < 0:
+                            raise RuntimeError(f"{name}: engine reported invalid TTFT")
+                        samples.append({
+                            "tok_s": tok_s,
+                            "hit_pct": result.get("cache_hit_percent"),
+                            "p50_ms": None,
+                            "p99_ms": None,
+                            "ttft_s": ttft,
+                        })
+                finally:
+                    served.close()
+                recorded_cap = launch_cap if arch in CAP_ARCHES else None
+                return _summarize_measurement(name, overlay, samples, recorded_cap)
+
+        if arch == "glm":
+            def measure(name, overlay, launch_cap):
+                samples = []
+                for repeat in range(repeats):
+                    progress(f"{name} ({repeat + 1}/{repeats})")
+                    sample = run_once(name, overlay, launch_cap)
+                    sample["ttft_s"] = None
+                    samples.append(sample)
+                recorded_cap = launch_cap if arch in CAP_ARCHES else None
+                return _summarize_measurement(name, overlay, samples, recorded_cap)
+
+        baseline = measure("baseline", {}, cap)
         winner = baseline
         accumulated = {}
+        winner_cap = cap
         candidates = [baseline]
-        for name, change in candidate_steps(plan, base_env, arch):
+
+        def consider(name, change, trial_cap):
+            nonlocal winner, accumulated, winner_cap
             trial_env = dict(accumulated)
             trial_env.update(change)
-            trial = measure(name, trial_env)
+            try:
+                trial = measure(name, trial_env, trial_cap)
+            except OutputDrift as drift:
+                progress(f"{name}: {drift} -- disqualified")
+                return
             candidates.append(trial)
-            hit_ok = (baseline["hit_pct"] is None or trial["hit_pct"] is None
-                      or trial["hit_pct"] >= baseline["hit_pct"] - 0.5)
-            tail_ok = (baseline["p99_ms"] is None or trial["p99_ms"] is None
-                       or trial["p99_ms"] <= baseline["p99_ms"] * 1.20)
-            if hit_ok and tail_ok and trial["tok_s"] > winner["tok_s"] * (1.0 + min_gain):
+            gates = _safety_gates(baseline, trial)
+            if (all(gates.values())
+                    and trial["tok_s"] > winner["tok_s"] * (1.0 + min_gain)):
                 winner = trial
                 accumulated = trial_env
+                winner_cap = trial_cap
+
+        for name, change in candidate_steps(plan, base_env, arch):
+            consider(name, change, winner_cap)
+        for name, change, trial_cap in resource_candidate_steps(
+                plan, base_env, arch, cap, explicit_resources):
+            consider(name, change, trial_cap)
 
         validation = None
         accepted = False
@@ -286,25 +574,31 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
             # order: winner first, baseline last.  This is deliberately
             # conservative — a later baseline gets any remaining warm-cache
             # advantage.  A profile is accepted only if it still wins.
-            confirmed_winner = measure("confirm-winner", winner["env"])
-            confirmed_winner["name"] = winner["name"]
-            confirmed_baseline = measure("confirm-baseline", {})
-            hit_ok = (confirmed_baseline["hit_pct"] is None
-                      or confirmed_winner["hit_pct"] is None
-                      or confirmed_winner["hit_pct"] >= confirmed_baseline["hit_pct"] - 0.5)
-            tail_ok = (confirmed_baseline["p99_ms"] is None
-                       or confirmed_winner["p99_ms"] is None
-                       or confirmed_winner["p99_ms"] <= confirmed_baseline["p99_ms"] * 1.20)
-            gain = confirmed_winner["tok_s"] / confirmed_baseline["tok_s"] - 1.0
-            accepted = hit_ok and tail_ok and gain >= min_gain
-            validation = {
-                "winner": confirmed_winner,
-                "baseline": confirmed_baseline,
-                "hit_gate": hit_ok,
-                "tail_gate": tail_ok,
-            }
-            if accepted:
-                winner = confirmed_winner
+            try:
+                confirmed_winner = measure("confirm-winner", winner["env"], winner_cap)
+            except OutputDrift as drift:
+                progress(f"confirm-winner: {drift} -- profile rejected")
+                confirmed_winner = None
+            if confirmed_winner is None:
+                winner = baseline
+                validation = {"winner": None, "baseline": None,
+                              "hit_gate": False, "tail_gate": False,
+                              "ttft_gate": False}
+                accepted = False
+                gain = 0.0
+            else:
+                confirmed_winner["name"] = winner["name"]
+                confirmed_baseline = measure("confirm-baseline", {}, cap)
+                gates = _safety_gates(confirmed_baseline, confirmed_winner)
+                gain = confirmed_winner["tok_s"] / confirmed_baseline["tok_s"] - 1.0
+                accepted = all(gates.values()) and gain >= min_gain
+                validation = {
+                    "winner": confirmed_winner,
+                    "baseline": confirmed_baseline,
+                    **gates,
+                }
+                if accepted:
+                    winner = confirmed_winner
     fingerprint = machine_fingerprint(plan, model, engine)
     profile = {
         "schema_version": SCHEMA_VERSION,

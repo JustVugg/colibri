@@ -364,17 +364,17 @@ def _dsv4_geometry(config, context, _model_dir):
     index_hd = _required_int(config, "index_head_dim", "deepseek_v4")
 
     ratios = config.get("compress_ratios")
-    if not isinstance(ratios, list) or len(ratios) != layers:
+    if not isinstance(ratios, list) or len(ratios) < layers:
         raise ValueError(
-            "deepseek_v4: compress_ratios must be a list matching "
-            "num_hidden_layers")
+            "deepseek_v4: compress_ratios must be a list of at least "
+            "num_hidden_layers entries")
 
     # Fixed window ring: n_layers * window * head_dim fp32.
     fixed = layers * window * head_dim * 4
 
     # Compressor + indexer states, scaling with context / ratio.
     state = 0
-    for ratio in ratios:
+    for ratio in ratios[:layers]:
         if not isinstance(ratio, bool) and isinstance(ratio, int) and ratio > 0:
             compressed = (context + ratio - 1) // ratio
             state += compressed * head_dim * 4
@@ -483,7 +483,11 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="kimi",
-        model_types=("kimi_k3",),
+        # "kimi_linear" is Moonshot's model_type for the text model itself
+        # (the real checkpoint's text_config carries it; the root "kimi_k3"
+        # belongs to the vision wrapper). A text-only export -- the tiny
+        # fixture included -- is therefore kimi_linear at top level.
+        model_types=("kimi_k3", "kimi_linear"),
         display_name="Kimi K3",
         display_scale="2.8T",
         engine_artifact="kimi_k3",

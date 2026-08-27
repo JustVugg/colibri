@@ -59,6 +59,22 @@ jobs:
           name: colibri-windows-exe
           path: c/colibri.exe
 
+  k3-tiny:
+    name: Linux (generated tiny K3 vendor oracle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-kimi-k3-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-kimi-k3-tiny.txt
+      - name: Generate fixture and run vendor oracle
+        run: make -C c kimi-k3-tiny-check
+
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
     runs-on: ubuntu-latest

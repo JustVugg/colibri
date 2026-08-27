@@ -64,6 +64,10 @@ int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
 long long dsv4_cuda_mem_free_mb(int device);
+/* Drain the device's expert stream (hybrid split: async fill DMA is enqueued,
+ * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
+ * success, 0 when the backend is unavailable. */
+int dsv4_cuda_stream_drain(int device);
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
@@ -193,6 +197,12 @@ int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet *set,int expert,
                                  Dsv4CudaTensor **gate,Dsv4CudaTensor **up,Dsv4CudaTensor **down);
 int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet *set,Dsv4CudaTensor *sg,
                                      Dsv4CudaTensor *su,Dsv4CudaTensor *sd);
+/* Same upload on the device's aux stream: overlaps the compute stream (the
+ * double-buffer prefetch worker uses it), drained before returning. */
+int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet *set,int expert,
+        const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,
+        const uint8_t*dw,const uint8_t*ds,
+        Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down);
 int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *gate_weight,const uint8_t *gate_scale,
                                      const uint8_t *up_weight,const uint8_t *up_scale,

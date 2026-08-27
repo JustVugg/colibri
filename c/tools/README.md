@@ -7,8 +7,18 @@ not runtime dependencies of the C engine.
 - `convert_fmt4_to_fmt2.py`: fmt=4 (grouped int4) -> fmt=2 (per-row int4)
   re-quant of a GLM-5.2 container, for Metal-backend compatibility
   (see `docs/METAL-M1ULTRA-FMT2-REPORT.md`)
-- `repack_fp8_passthrough.py`: fmt=8 repack (byte-preserved FP8, resident kinds only;
-  see the module docstring -- synthetic-fixture-tested only, no real-shard runs yet)
+- `repack_fp8_passthrough.py`: fmt=8 repack (byte-preserved FP8) minting a
+  standalone-loadable model directory: routed experts plus the full resident
+  family (attention projections including `kv_b_proj`, shared-expert and
+  dense-MLP weights), norms/router/embed/lm_head copied byte-identically in
+  their original BF16/F32, and the non-tensor files the loader opens at
+  runtime (`config.json`, `tokenizer.json`; `generation_config.json`
+  best-effort). `--mtp` repacks the multi-token-prediction head as a separate
+  pass into the same outdir. Caveat: the minted `kv_b_proj` loads today but
+  must not serve batched-path decode until the engine's fmt=8 absorb support
+  lands (branch `f8/absorb-fmt8`); the failure is a loud crash, not silent
+  corruption -- see the module docstring and `docs/FORMATS.md`.
+  Synthetic-fixture-tested only, no real-shard runs yet.
 - `make_glm_oracle.py`, `make_glm_bench_model.py`: deterministic fixtures
 - `benchmark_cuda_fixture.py`, `eval_glm.py`, `fetch_benchmarks.py`: benchmarks
 - `gen_unicode.py`: tokenizer table generation
