@@ -62,10 +62,10 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri inkling kimi_k3 olmoe qwen36; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36; do
             make $t ${{ matrix.make_args }}
           done
-          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is

@@ -923,6 +923,19 @@ class FamilyRegistryTest(unittest.TestCase):
                     self.assertIn(family.build_target,
                                   re.search(r'ENGINES="([^"]+)"', ci).group(1).split())
                     self.assertIn(f"cp c/{family.engine_artifact}", release)
+                    # Copiarlo non basta: va anche COSTRUITO. Il contratto
+                    # verificava solo meta', e con quella meta' la v1.9.0 e'
+                    # uscita col nome di GLM-5.3-Flash e senza il suo binario,
+                    # esattamente come la v1.5.0 con DeepSeek V4 (#858). Un
+                    # `cp` di un file che nessuno ha compilato fallisce a
+                    # release gia' pubblicata, cioe' nel momento peggiore.
+                    build_step = re.search(r"for t in ([a-z0-9_ ]+); do",
+                                           release)
+                    self.assertIsNotNone(build_step,
+                                         "release.yml: build loop not found")
+                    self.assertIn(family.build_target, build_step.group(1).split(),
+                                  f"{family.id}: release.yml copies "
+                                  f"c/{family.engine_artifact} but never builds it")
                     self.assertIn(f"$(LIBEXECDIR)/{family.engine_artifact}", makefile)
                 else:
                     self.assertIn("deepseek-v4", ci)

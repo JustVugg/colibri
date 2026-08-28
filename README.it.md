@@ -336,10 +336,10 @@ e per il gateway API opzionale.
   end-to-end, revisionati e sviluppati apertamente.
 - **Più modelli aperti.** L'algoritmo di tiering è indipendente dal modello:
   qualsiasi MoE con expert instradati può essere organizzato allo stesso modo.
-  Sei famiglie funzionano già (GLM-5.2, Inkling, Kimi K3, DeepSeek V4 Flash,
-  Qwen3.6, OLMoE); altre famiglie open-weight, **MiniMax** tra le candidate,
-  si guadagnano un engine come le prime sei: quando qualcuno le misura
-  end-to-end.
+  Sette famiglie funzionano già (GLM-5.2, GLM-5.3-Flash con la vision,
+  Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.6, OLMoE); altre famiglie
+  open-weight, **MiniMax** tra le candidate, si guadagnano un engine come le
+  prime sette: quando qualcuno le misura end-to-end.
 
 ## Sostenere il progetto
 
