@@ -797,6 +797,40 @@ memInfo.free:                     23.50 GB (97%)
         self.assertIn("quality-preserving yes", format_plan(plan))
         self.assertIn("expected_bottleneck", plan)
 
+    def test_disk_plan_requires_probe_and_recommends_measured_tuning(self):
+        info = analyze_model(self.model)
+        info.update(expert_bytes=40 * GB, typical_expert_bytes=1 * GB,
+                    max_expert_bytes=1 * GB, per_cap_bytes=2 * GB)
+        with mock.patch("resource_plan.ssd_probe_state",
+                        return_value=("missing", None)), \
+             mock.patch("resource_plan.analyze_model", return_value=info):
+            plan = build_plan(self.model, ram_gb=4, available_memory=4 * GB,
+                              available_disk=1, gpus=[])
+        self.assertEqual([action["id"] for action in plan["next_actions"]],
+                         ["measure-storage", "measure-residency"])
+        self.assertEqual(plan["next_actions"][0]["priority"], "required")
+        text = format_plan(plan)
+        self.assertIn("next actions:", text)
+        self.assertIn("coli tune --model <model>", text)
+
+    def test_trusted_storage_probe_removes_probe_action(self):
+        info = analyze_model(self.model)
+        info.update(expert_bytes=40 * GB, typical_expert_bytes=1 * GB,
+                    max_expert_bytes=1 * GB, per_cap_bytes=2 * GB)
+        with mock.patch("resource_plan.ssd_probe_state",
+                        return_value=("trusted", 7.5)), \
+             mock.patch("resource_plan.analyze_model", return_value=info):
+            plan = build_plan(self.model, ram_gb=4, available_memory=4 * GB,
+                              available_disk=1, gpus=[])
+        self.assertEqual([action["id"] for action in plan["next_actions"]],
+                         ["measure-residency"])
+
+    def test_resident_plan_recommends_kernel_measurement(self):
+        plan = build_plan(self.model, ram_gb=64, available_memory=64 * GB,
+                          available_disk=1, gpus=[])
+        self.assertEqual(plan["bottleneck_class"], "compute")
+        self.assertEqual(plan["next_actions"][0]["id"], "measure-kernels")
+
 
 class PhysicalCpuCountTest(unittest.TestCase):
     """Regression for #325: --auto-tier pinned decode to one core because

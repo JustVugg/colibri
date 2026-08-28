@@ -10,7 +10,9 @@ more GPUs and computed there through the existing shared CUDA backend
 
 - **Home device:** expert `eid` lives on GPU `eid % n_gpus`; no duplicates.
 - **Placement:** routing heat decides who earns VRAM (LFRU semantics from
-  `tier.h`, 25%+4 hysteresis). A parallel **warmstart** fills the per-device
+  `tier.h`, 25%+4 hysteresis). Runtime heat is halved every 1024 decode ticks,
+  so a long-lived process can replace experts from an old workload instead of
+  permanently freezing its initial hot set. A parallel **warmstart** fills the per-device
   budget before the first token — ordered by a persisted heat table
   (`HEAT_FILE`) when present, so a second run starts fully placed.
 - **Decode:** per (token, layer) the resident experts are issued as async

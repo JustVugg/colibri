@@ -1836,11 +1836,12 @@ static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
     grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
 }
 
-extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
-                                        ColiCudaTensor *const *ups,
-                                        ColiCudaTensor *const *downs,
-                                        const int *rows, int count,
-                                        float *y, const float *x) {
+static int expert_group_impl(ColiCudaTensor *const *gates,
+                             ColiCudaTensor *const *ups,
+                             ColiCudaTensor *const *downs,
+                             const int *rows, int count,
+                             float *y, const float *x,
+                             int pin_small_batch) {
     if (fault_injected()) return 0;
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
     ColiCudaTensor *first=gates[0];
@@ -1906,7 +1907,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
      * WMMA kernels are compiled out (COLI_HIP_NO_WMMA) the launch would
      * succeed with an EMPTY kernel and the output buffer would silently keep
      * stale data. Gate the branch like TC_W4A16 below does. */
-    tc=tc&&COLI_GPU_HAS_WMMA&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
+    tc=tc&&!pin_small_batch&&COLI_GPU_HAS_WMMA&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(all_e8){
@@ -1928,7 +1929,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
-    }else if(all_s4&&COLI_GPU_HAS_WMMA&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
+    }else if(!pin_small_batch&&all_s4&&COLI_GPU_HAS_WMMA&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
              atoi(getenv("COLI_CUDA_TC_W4A16"))&&
              [&]{ int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
                   for(int c=0;c<count;c++) if(rows[c]>=tc16_min) return 1;
@@ -2028,6 +2029,23 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
       g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
       g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
+}
+
+extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
+                                        ColiCudaTensor *const *ups,
+                                        ColiCudaTensor *const *downs,
+                                        const int *rows, int count,
+                                        float *y, const float *x) {
+    return expert_group_impl(gates,ups,downs,rows,count,y,x,0);
+}
+
+extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                                               ColiCudaTensor *const *ups,
+                                               ColiCudaTensor *const *downs,
+                                               const int *rows, int count,
+                                               float *y, const float *x,
+                                               int pin_small_batch) {
+    return expert_group_impl(gates,ups,downs,rows,count,y,x,pin_small_batch);
 }
 
 /* ---- Async expert group (Inc.4): issue/take split of coli_cuda_expert_group ----

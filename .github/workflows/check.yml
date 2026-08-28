@@ -34,7 +34,13 @@ jobs:
     # (MSYS2/UCRT64), the exact toolchain the README's Windows port targets.
     name: Windows UCRT64
     runs-on: windows-latest
-    timeout-minutes: 20
+    # Measured, not guessed: this job now runs 19-21 minutes, so a 20-minute
+    # limit decided the result by runner luck. Three consecutive runs on
+    # 2026-08-27 took 19m21s (passed), 20m18s and 20m32s (both cancelled at the
+    # limit and reported as failures), including one on dev itself. The suite
+    # has grown - segment conformance and adapters, the edge runtime, per-engine
+    # cache indices - and MinGW is the slowest toolchain we build on.
+    timeout-minutes: 35
     defaults:
       run:
         shell: msys2 {0}
@@ -90,6 +96,24 @@ jobs:
         run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: Generate fixture and run target oracle
         run: make -C c deepseek-v4-tiny-check
+
+  glm53-oracle:
+    name: Linux (generated GLM-5.3 oracle contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-glm53-tiny.txt
+      - name: Install pinned oracle dependencies
+        run: python -m pip install -r c/tools/requirements-glm53-tiny.txt
+      - name: Generate and validate oracle contract
+        run: |
+          python c/tools/make_glm53_tiny.py --output /tmp/glm53_tiny
+          python c/tools/check_glm53_checkpoint.py --model /tmp/glm53_tiny
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

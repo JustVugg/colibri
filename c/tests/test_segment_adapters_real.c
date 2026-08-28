@@ -42,6 +42,7 @@ static int memory_read(void *user_data, void *data, size_t size) {
 
 static int register_all(void) {
     return coli_glm_segment_adapter_register() ||
+           coli_glm53_segment_adapter_register() ||
            coli_inkling_segment_adapter_register() ||
            coli_kimi_segment_adapter_register() ||
            coli_olmoe_segment_adapter_register() ||

@@ -43,6 +43,12 @@
 #include "segment_adapters.h"
 #include "segment_adapter_internal.h"
 #endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "tok.h"
+#include "edge_tok_internal.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1942,3 +1948,191 @@ int coli_olmoe_segment_adapter_register(void) {
     return coli_segment_adapter_register(&olmoe_segment_adapter);
 }
 #endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+} OlmoeEdgeEngine;
+
+static void olmoe_edge_engine_destroy(void *engine_impl) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    if (!engine) return;
+    free(engine->model.embed);
+    free(engine->model.lm_head);
+    free(engine->model.final_norm);
+    st_destroy(&engine->model.S);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int olmoe_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid OLMoE Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "OLMoE Edge supports CPU only");
+    OlmoeEdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening OLMoE Edge");
+    load_cfg(&engine->model.c, options->model_dir);
+    st_init(&engine->model.S, options->model_dir);
+    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight");
+    engine->model.lm_head = load_t(&engine->model, "lm_head.weight");
+    engine->model.final_norm = load_t(&engine->model, "model.norm.weight");
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    Cfg *config = &engine->model.c;
+    uint64_t cells = (uint64_t)config->vocab * config->hidden;
+    uint64_t resident = (2u * cells + (uint64_t)config->hidden) * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        olmoe_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "OLMoE Edge exceeds memory limit");
+    }
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "olmoe");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "olmoe/kv-f32-v1");
+    coli_edge_capability_string(capabilities->numeric_class,
+                                sizeof(capabilities->numeric_class),
+                                "olmoe/f32-int8/cpu-v1");
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "olmoe/byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config->hidden;
+    capabilities->vocab_size = (uint32_t)config->vocab;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = 4096;
+    capabilities->num_layers = (uint32_t)config->n_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int olmoe_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int olmoe_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int olmoe_edge_embed(void *engine_impl,
+                            const ColiEdgeEmbedRequest *request,
+                            char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= config->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE token ID is out of range");
+        memcpy(output + (size_t)row * config->hidden,
+               engine->model.embed + (size_t)token * config->hidden,
+               (size_t)config->hidden * sizeof(float));
+    }
+    return 0;
+}
+
+static int olmoe_edge_select(void *engine_impl,
+                             const ColiEdgeSelectRequest *request,
+                             char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    float *logits = falloc(config->vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge selection cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul(logits, normalized, engine->model.lm_head,
+               1, config->hidden, config->vocab);
+        if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge head failed");
+        }
+    }
+    free(logits); free(normalized);
+    return 0;
+}
+
+static int olmoe_edge_logits(void *engine_impl,
+                             const ColiEdgeLogitsRequest *request,
+                             char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul(request->logits + (size_t)row * config->vocab,
+               normalized, engine->model.lm_head,
+               1, config->hidden, config->vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
+static const ColiEdgeAdapter olmoe_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "olmoe",
+    olmoe_edge_engine_open, olmoe_edge_engine_destroy,
+    olmoe_edge_tokenize, olmoe_edge_detokenize,
+    olmoe_edge_embed, olmoe_edge_select, olmoe_edge_logits, {0}
+};
+
+int coli_olmoe_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&olmoe_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

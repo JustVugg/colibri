@@ -114,6 +114,7 @@ jobs:
           # "engine is not built. Run: coli build" -- with the engine sitting right there.
           # The version lives in the ARCHIVE name, which is where a downloader looks for it.
           cp c/colibri${{ matrix.ext }} dist/colibri${{ matrix.ext }}
+          cp c/glm53${{ matrix.ext }} dist/glm53${{ matrix.ext }}
           # The sibling engines go in under their plain names too: `coli` resolves the
           # engine from the model's config.json and looks for kimi_k3/inkling next to
           # itself (c/coli, engine_for()). ~830 KB for all four.

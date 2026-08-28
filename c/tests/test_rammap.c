@@ -23,6 +23,33 @@ static int test_mixed_tier_accounting(void){
     return 0;
 }
 
+static int test_exclusive_tier_accounting(void){
+    ColiRamOverlap none={0};
+    ColiRamTier ram=tiers_ram_exclusive(
+        (ColiRamTier){1,90},(ColiRamTier){0,0},none);
+    if(ram.experts!=1 || ram.bytes!=90)
+        return fail("disk-sourced VRAM does not remove an unrelated host resident");
+
+    ColiRamOverlap host_overlap={.host={1,130}};
+    ram=tiers_ram_exclusive(
+        (ColiRamTier){2,220},(ColiRamTier){0,0},host_overlap);
+    if(ram.experts!=1 || ram.bytes!=90)
+        return fail("VRAM-host overlap removes the matching host row only");
+
+    ColiRamOverlap direct_overlap={.rammap={1,70}};
+    ram=tiers_ram_exclusive(
+        (ColiRamTier){0,0},(ColiRamTier){2,110},direct_overlap);
+    if(ram.experts!=1 || ram.bytes!=40)
+        return fail("VRAM-RAMMAP overlap removes the matching direct view only");
+
+    ColiRamOverlap mixed_overlap={.host={1,130},.rammap={1,70}};
+    ram=tiers_ram_exclusive(
+        (ColiRamTier){2,220},(ColiRamTier){2,110},mixed_overlap);
+    if(ram.experts!=2 || ram.bytes!=130)
+        return fail("mixed nonuniform VRAM overlap accounting");
+    return 0;
+}
+
 #ifdef __linux__
 static int expert_greedy_token(ESlot *slot,const float x[4],float out[4]){
     float gate[3],up[3],hidden[3];
@@ -208,6 +235,7 @@ static int check_direct_quant_format(int fd,long fs_magic,int fmt,int hidden,int
 
 int main(void){
     if(test_mixed_tier_accounting()) return 1;
+    if(test_exclusive_tier_accounting()) return 1;
 #ifndef __linux__
     puts("test_rammap: skipped (Linux only)"); return 0;
 #else

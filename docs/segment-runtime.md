@@ -4,6 +4,8 @@
 execute a contiguous, half-open layer range (`begin <= layer < end`). It is a
 local C ABI, not a network protocol. A distributed caller remains responsible
 for peer identity, transport, leases, request IDs, placement and retry policy.
+The companion [`edge_runtime.h`](../c/edge_runtime.h) supplies the model-owned
+tokenizer, embedding and final head needed to drive a complete Segment chain.
 
 The ABI is deliberately separate from every model's internal structs:
 

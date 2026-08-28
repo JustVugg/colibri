@@ -3,6 +3,16 @@
 
 #include <stdint.h>
 
+/* Shared admission contract for every adaptive resident tier.  Widen before
+ * adding the margin: a saturated uint32 heat counter must become sticky, not
+ * wrap the threshold and admit a colder expert. */
+static int tier_should_promote(uint32_t hot, uint32_t cold){
+    uint64_t threshold=(uint64_t)cold+((uint64_t)cold>>2)+4u;
+    return (uint64_t)hot>threshold;
+}
+
+static uint32_t tier_decay_value(uint32_t heat){ return heat>>1; }
+
 /* Pick one RAM/VRAM hot-store slot to replace from recent routing heat.
  * The fixed margin handles tiny samples; the 25% margin prevents ping-pong. */
 static int tier_pick_swap(const uint32_t *heat, int nexpert,
@@ -19,7 +29,7 @@ static int tier_pick_swap(const uint32_t *heat, int nexpert,
     }
     if(hot<0) return 0;
     uint32_t fc=heat[pinned[cold]];
-    if(fh<=fc+(fc>>2)+4) return 0;
+    if(!tier_should_promote(fh,fc)) return 0;
     *slot=cold; *eid=hot; *gain=(long)fh-(long)fc;
     return 1;
 }
@@ -54,7 +64,7 @@ static int tier_pick_lfru(const uint32_t *heat, const uint32_t *last, uint32_t c
 }
 
 static void tier_decay(uint32_t *heat, int nexpert){
-    for(int e=0;e<nexpert;e++) heat[e]>>=1;
+    for(int e=0;e<nexpert;e++) heat[e]=tier_decay_value(heat[e]);
 }
 
 #endif

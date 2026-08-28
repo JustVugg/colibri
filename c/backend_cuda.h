@@ -151,6 +151,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,
                            float *y, const float *x);
+/* Same operation, but force the small-batch grouped kernel family when
+ * pin_small_batch is nonzero.  Speculative verification uses this to keep
+ * CUDA on the same numeric family as S=1 regardless of accepted draft depth. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x, int pin_small_batch);
 
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,

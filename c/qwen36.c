@@ -65,6 +65,12 @@ static int qwen36_max_ctx(void) {
 #include "segment_adapters.h"
 #include "segment_adapter_internal.h"
 #endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "edge_adapter_internal.h"
+#include <limits.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -342,7 +348,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     int o = 0;
     for (int i=0;i<n;i++){
         unsigned char c = s[i];
-        if (c == '"'){ if(o+2<outsz){ out[o++]='"'; out[o++]='"'; } }
+        if (c == '"'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='"'; } }
         else if (c == '\\'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='\\'; } }
         else if (c == '\n'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='n'; } }
         else if (c == '\r'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='r'; } }
@@ -3158,3 +3164,266 @@ int coli_qwen36_segment_adapter_register(void) {
     return coli_segment_adapter_register(&qwen36_segment_adapter);
 }
 #endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+} Qwen36EdgeEngine;
+
+static void qwen36_edge_tokenizer_destroy(void) {
+    for (int item = 0; item < g_tok_n; item++) free(g_tok[item]);
+    free(g_tok); g_tok = NULL; g_tok_n = 0;
+    for (int slot = 0; slot < g_merge.cap; slot++)
+        if (g_merge.used && g_merge.used[slot]) free(g_merge.keys[slot]);
+    free(g_rev.keys); free(g_rev.vals); free(g_rev.used);
+    free(g_merge.keys); free(g_merge.vals); free(g_merge.used);
+    memset(&g_rev, 0, sizeof(g_rev)); memset(&g_merge, 0, sizeof(g_merge));
+    for (int item = 0; item < g_nspecial; item++) free(g_sp_str[item]);
+    free(g_sp_str); free(g_sp_id); free(g_sp_len);
+    g_sp_str = NULL; g_sp_id = NULL; g_sp_len = NULL; g_nspecial = 0;
+}
+
+static void qwen36_edge_engine_destroy(void *engine_impl) {
+    Qwen36EdgeEngine *engine = (Qwen36EdgeEngine *)engine_impl;
+    if (!engine) return;
+    free(engine->model.embed);
+    free(engine->model.lm_head);
+    free(engine->model.final_norm);
+    free(engine->model.c.is_attn);
+    st_destroy(&engine->model.S);
+    qwen36_edge_tokenizer_destroy();
+    free(engine);
+}
+
+static int qwen36_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid Qwen3.6 Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "Qwen3.6 Edge supports CPU only");
+    /* qwen36.c's production tokenizer is process-global. The Edge runtime
+     * makes that limitation explicit instead of silently cross-wiring two
+     * model vocabularies in one process. Lumabri hosts one active model per
+     * chatter process; a future tokenizer refactor can lift this restriction. */
+    if (g_tok)
+        return coli_edge_adapter_error(error, error_size,
+                                       "a Qwen3.6 tokenizer is already active");
+    Qwen36EdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening Qwen3.6 Edge");
+    load_cfg(&engine->model.c, options->model_dir);
+    int config_layers = engine->model.c.n_layers;
+    load_meta(&engine->model.c, options->model_dir);
+    validate_cfg(&engine->model.c, config_layers);
+    st_init(&engine->model.S, options->model_dir);
+    Cfg *config = &engine->model.c;
+    engine->model.embed = load_t_n(
+        &engine->model, "model.embed_tokens.weight",
+        (int64_t)config->vocab * config->hidden);
+    engine->model.lm_head = load_t_n(
+        &engine->model, "lm_head.weight",
+        (int64_t)config->vocab * config->hidden);
+    engine->model.final_norm = load_t_n(
+        &engine->model, "model.norm.weight", config->hidden);
+    engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    load_tokenizer(tokenizer_path);
+    if (!g_tok) {
+        qwen36_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "cannot load Qwen3.6 tokenizer");
+    }
+    uint64_t cells = (uint64_t)config->vocab * config->hidden;
+    uint64_t resident = (2u * cells + (uint64_t)config->hidden) * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        qwen36_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Qwen3.6 Edge exceeds memory limit");
+    }
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "qwen36");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "qwen36/kv-deltanet-conv-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "qwen36/f32-int%d/cpu-v1", engine->model.quant_bits);
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "qwen36/hf-byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config->hidden;
+    capabilities->vocab_size = (uint32_t)config->vocab;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = QWEN36_ATTN_MAX_CTX;
+    capabilities->num_layers = (uint32_t)config->n_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int qwen36_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    (void)engine_impl;
+    if (!text || !token_count || text_bytes > INT_MAX)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid Qwen3.6 tokenizer input");
+    char *copy = malloc(text_bytes + 1u);
+    if (!copy)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory tokenizing Qwen3.6 text");
+    memcpy(copy, text, text_bytes); copy[text_bytes] = '\0';
+    int *ids = NULL, count = 0;
+    encode_text(copy, &ids, &count);
+    free(copy);
+    if (count < 0 || (token_ids && token_capacity < (size_t)count)) {
+        free(ids);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Qwen3.6 token output buffer is too small");
+    }
+    *token_count = (size_t)count;
+    if (token_ids)
+        for (int item = 0; item < count; item++) token_ids[item] = ids[item];
+    free(ids);
+    return 0;
+}
+
+static int qwen36_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    (void)engine_impl;
+    if (!token_ids || !token_count || !text_bytes || token_count > INT_MAX ||
+        token_count > (SIZE_MAX - 1u) / 255u ||
+        token_count > ((size_t)INT_MAX - 1u) / 255u)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid Qwen3.6 detokenizer input");
+    int *ids = malloc(token_count * sizeof(*ids));
+    size_t capacity = token_count * 255u + 1u;
+    char *temporary = malloc(capacity);
+    if (!ids || !temporary) {
+        free(temporary); free(ids);
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory detokenizing Qwen3.6 tokens");
+    }
+    for (size_t item = 0; item < token_count; item++) ids[item] = token_ids[item];
+    int count = decode_range(ids, 0, (int)token_count,
+                             temporary, (int)capacity);
+    free(ids);
+    *text_bytes = (size_t)count;
+    if (text && text_capacity < (size_t)count + 1u) {
+        free(temporary);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Qwen3.6 text output buffer is too small");
+    }
+    if (text) memcpy(text, temporary, (size_t)count + 1u);
+    free(temporary);
+    return 0;
+}
+
+static int qwen36_edge_embed(void *engine_impl,
+                             const ColiEdgeEmbedRequest *request,
+                             char *error, size_t error_size) {
+    Qwen36EdgeEngine *engine = (Qwen36EdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= config->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "Qwen3.6 token ID is out of range");
+        memcpy(output + (size_t)row * config->hidden,
+               engine->model.embed + (size_t)token * config->hidden,
+               (size_t)config->hidden * sizeof(float));
+    }
+    return 0;
+}
+
+static int qwen36_edge_select(void *engine_impl,
+                              const ColiEdgeSelectRequest *request,
+                              char *error, size_t error_size) {
+    Qwen36EdgeEngine *engine = (Qwen36EdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    float *logits = falloc(config->vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Qwen3.6 Edge selection cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul_d(logits, normalized, engine->model.lm_head,
+                 1, config->hidden, config->vocab);
+        if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Qwen3.6 Edge head failed");
+        }
+    }
+    free(logits); free(normalized);
+    return 0;
+}
+
+static int qwen36_edge_logits(void *engine_impl,
+                              const ColiEdgeLogitsRequest *request,
+                              char *error, size_t error_size) {
+    Qwen36EdgeEngine *engine = (Qwen36EdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Qwen3.6 Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul_d(request->logits + (size_t)row * config->vocab,
+                 normalized, engine->model.lm_head,
+                 1, config->hidden, config->vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
+static const ColiEdgeAdapter qwen36_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "qwen36",
+    qwen36_edge_engine_open, qwen36_edge_engine_destroy,
+    qwen36_edge_tokenize, qwen36_edge_detokenize,
+    qwen36_edge_embed, qwen36_edge_select, qwen36_edge_logits, {0}
+};
+
+int coli_qwen36_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&qwen36_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

@@ -256,6 +256,19 @@ static void hwinfo_emit(Model *m){
     }
     if(g_cuda_ndev>0)
         snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+#elif defined(COLI_VULKAN)
+    double used=0, budget=0;
+    ngpu=coli_vk_available()?1:0;
+    if(ngpu){
+        if(coli_vk_mem_budget(&used,&budget)) vram_total=budget;
+        snprintf(gpu_name,sizeof(gpu_name),"Vulkan device%s",
+                 coli_vk_dev2_available()?" x2":"");
+        if(coli_vk_dev2_available()){
+            double used2=0, budget2=0;
+            if(coli_vk_mem_budget2(&used2,&budget2)) vram_total+=budget2;
+            ngpu=2;
+        }
+    }
 #endif
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
         cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
@@ -283,6 +296,59 @@ static ColiRamTier tiers_ram_account(double priced_bytes, int anon_ram,
     return ram;
 }
 
+typedef struct {
+    ColiRamTier host;
+    ColiRamTier rammap;
+} ColiRamOverlap;
+
+/* Vulkan registry entries are keyed independently of the host tiers: an upload
+ * may come from a pin, a direct RAMMAP view, or a transient disk load.  Remove
+ * only the physical host/direct copies that share a Vulkan-served identity;
+ * subtracting the whole Vulkan count would charge an unrelated RAM resident. */
+static ColiRamTier tiers_ram_exclusive(ColiRamTier host, ColiRamTier rammap,
+                                       ColiRamOverlap overlap){
+    host.experts=overlap.host.experts>=host.experts
+        ?0:host.experts-overlap.host.experts;
+    host.bytes=overlap.host.bytes>=host.bytes ? 0:host.bytes-overlap.host.bytes;
+    rammap.experts=overlap.rammap.experts>=rammap.experts
+        ?0:rammap.experts-overlap.rammap.experts;
+    rammap.bytes=overlap.rammap.bytes>=rammap.bytes
+        ?0:rammap.bytes-overlap.rammap.bytes;
+    return (ColiRamTier){host.experts+rammap.experts,host.bytes+rammap.bytes};
+}
+
+#ifdef COLI_VULKAN
+static ColiRamOverlap tiers_vk_ram_overlap(Model *m){
+    Cfg *c=&m->c;
+    ColiRamOverlap overlap={0};
+    for(int i=0;i<=c->n_layers;i++){
+        double row_bytes=(double)expert_bytes_row(m,i,m->ebits);
+        ESlot *pin=m->pin?m->pin[i]:NULL;
+        int npin=m->npin?m->npin[i]:0;
+        for(int z=0;z<npin;z++) if(vk_reg_served(i,pin[z].eid)){
+            overlap.host.experts++;
+            overlap.host.bytes+=row_bytes;
+        }
+        ESlot *cache=m->ecache?m->ecache[i]:NULL;
+        int ncache=m->ecn?m->ecn[i]:0;
+        for(int z=0;z<ncache;z++) if(vk_reg_served(i,cache[z].eid)){
+            overlap.host.experts++;
+            overlap.host.bytes+=row_bytes;
+        }
+        if(!m->rammap) continue;
+        for(int e=0;e<c->n_experts;e++){
+            ESlot *direct=rammap_slot(m,i,e);
+            if(direct && vk_reg_served(i,e)){
+                overlap.rammap.experts++;
+                overlap.rammap.bytes+=(double)(qt_bytes(&direct->g)+
+                    qt_bytes(&direct->u)+qt_bytes(&direct->d));
+            }
+        }
+    }
+    return overlap;
+}
+#endif
+
 static void tiers_emit(Model *m){
     Cfg *c=&m->c; int nsp=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
@@ -292,8 +358,15 @@ static void tiers_emit(Model *m){
     int vram=0; double vram_gb=0;
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
+#elif defined(COLI_VULKAN)
+    vram=g_vk_reg_n+g_vk_reg_n2;
+    int64_t bytes=0;
+    if(g_vk_reg) for(int i=0;i<g_vk_reg_NL;i++) for(int e=0;e<g_vk_reg_E;e++){
+        ColiVkTensor **slot=vk_reg_at(i,e);
+        for(int j=0;j<3;j++) if(slot[j]) bytes+=(int64_t)coli_vk_tensor_bytes(slot[j]);
+    }
+    vram_gb=(double)bytes/1e9;
 #endif
-    int anon_ram=pinned-vram+lru; if(anon_ram<0) anon_ram=0;
     /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
      * box where Windows still showed 140 GB free, because every resident expert was
      * being priced as an int8 MTP one (#856). A tier figure that disagrees with the
@@ -303,8 +376,15 @@ static void tiers_emit(Model *m){
         int64_t w=expert_bytes_row(m,i,m->ebits);
         ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
     }
-    ColiRamTier ram=tiers_ram_account(
-        ram_b,anon_ram,m->rammap_experts,vram,m->rammap_bytes);
+    ColiRamTier ram;
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    ColiRamTier host={pinned+lru,ram_b};
+    ColiRamTier direct={m->rammap_experts,(double)m->rammap_bytes};
+    ram=tiers_ram_exclusive(host,direct,tiers_vk_ram_overlap(m));
+#else
+    int anon_ram=pinned-vram+lru; if(anon_ram<0) anon_ram=0;
+    ram=tiers_ram_account(ram_b,anon_ram,m->rammap_experts,vram,m->rammap_bytes);
+#endif
     int disk=total-vram-ram.experts; if(disk<0) disk=0;
     printf("TIERS %d %d %d %.2f %.2f\n",
         vram,ram.experts,disk,vram_gb,ram.bytes/1e9);
@@ -324,6 +404,9 @@ static void emap_emit(Model *m){
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
             int tier=rammap_slot(m,i,e)?1:0;
+#ifdef COLI_VULKAN
+            if(vk_reg_served(i,e)) tier=2;
+#endif
             ESlot *P=m->pin[i];
             for(int z=0;!tier && z<m->npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA

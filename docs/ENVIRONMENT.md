@@ -313,6 +313,23 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 
 ---
 
+## GLM-5.3-Flash engine (`glm53`)
+
+Read **only** by `c/glm53.c`. Like the other siblings it has its own loader,
+cache and precision selection and shares none of the `colibri` knobs above.
+See `docs/glm53-flash.md`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GLM53_BITS` | `4` | Precision of the resident dense weights: 4, 8 or 32. Routed experts are not affected — they arrive already quantized in the container and are never requantized. |
+| `GLM53_EXPERT_GB` | measured | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. Unset, it is taken from `MemAvailable` after the weights are loaded, minus a 3 GB margin. A fixed number is wrong in both directions: too small on a large machine leaves memory idle while the disk does all the work. |
+| `GLM53_MAXT` | `8192` | KV state capacity in tokens, and the session size in serve mode. |
+| `GLM53_PREFILL_CHUNK` | `128` | Prefill chunk size in tokens. Smaller keeps the workspace smaller; too small re-reads experts once per chunk per layer instead of amortizing them. |
+| `GLM53_MAX_IMAGE_TOKENS` | checkpoint's (8000) | Ceiling on tokens per image. Each covers 28×28 pixels, so 256 keeps ordinary text legible and 64 keeps shapes and colours. The image is shrunk, not cropped. Lower it: 8000 is 2691 tokens for a 1080p photo, i.e. a prefill nobody will sit through. |
+| `GLM53_VERBOSE` | unset | Print the parsed geometry, the expert budget and the per-token cache cost to stderr. |
+| `GLM53_DUMP_INDEX` | unset | Print the rows the sparse indexer selected. The first place to look when the engine diverges only at certain lengths. |
+| `COLI_VULKAN` | `0` | Route the resident matrices through the shared Vulkan backend. Needs a `VK=1` build and the compiled shaders (`COLI_VK_SHADERS`). Experts stay on the CPU: they arrive from disk on every use, so uploading one costs what reading it costs. |
+
 ## Kimi K3 engine (`kimi_k3`)
 
 Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quantization selection, so it does not share the `colibri` knobs above.

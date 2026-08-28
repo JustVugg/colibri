@@ -17,6 +17,7 @@ import {
   Link2,
   LoaderCircle,
   MemoryStick,
+  ImagePlus,
   MessageSquareText,
   MonitorDot,
   RefreshCw,
@@ -67,6 +68,29 @@ export default function App() {
   const [healthError, setHealthError] = useState("")
   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
   const [draft, setDraft] = useState("")
+  /* Immagini in attesa di partire col prossimo messaggio. Si tengono come
+     data: URI perche' e' quello che il server accetta e quello che il browser
+     puo' mostrare in anteprima senza inventarsi un percorso su disco. */
+  const [attachments, setAttachments] = useState<{ name: string; url: string }[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const attachFiles = async (files: FileList | File[] | null) => {
+    if (!files) return
+    const images = Array.from(files).filter((file) => file.type.startsWith("image/"))
+    if (!images.length) return
+    const read = await Promise.all(
+      images.map(
+        (file) =>
+          new Promise<{ name: string; url: string }>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve({ name: file.name, url: String(reader.result) })
+            reader.onerror = () => reject(reader.error)
+            reader.readAsDataURL(file)
+          }),
+      ),
+    )
+    setAttachments((current) => [...current, ...read])
+  }
   const [loading, setLoading] = useState(false)
   const [streamStart, setStreamStart] = useState<number | null>(null)
   const [tokenCount, setTokenCount] = useState(0)
@@ -183,11 +207,15 @@ export default function App() {
 
   const send = async () => {
     const content = draft.trim()
-    if (!content || loading) return
+    /* Un'immagine da sola e' una domanda valida: "questa cosa e'?" si puo'
+       chiedere anche senza scrivere niente. */
+    if ((!content && !attachments.length) || loading) return
     const user = message("user", content)
+    if (attachments.length) user.images = attachments.map((item) => item.url)
     const assistant = message("assistant", "")
     const history = [...messages, user]
     setDraft("")
+    setAttachments([])
     setError("")
     updateMessages([...history, assistant])
     setLoading(true)
@@ -399,8 +427,22 @@ export default function App() {
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
           <div className="composer">
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
-            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
+            <Textarea value={draft}
+              onPaste={(event) => { const files = Array.from(event.clipboardData.files); if (files.length) { event.preventDefault(); void attachFiles(files) } }}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => { if (event.dataTransfer.files.length) { event.preventDefault(); void attachFiles(event.dataTransfer.files) } }} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+            {attachments.length > 0 && (
+              <div className="attachments">
+                {attachments.map((item, index) => (
+                  <span key={item.url + index} className="attachment">
+                    <img src={item.url} alt={item.name} />
+                    <button type="button" aria-label={t("chat.removeImage")}
+                      onClick={() => setAttachments((current) => current.filter((_, at) => at !== index))}>x</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { void attachFiles(event.target.files); event.target.value = "" }} /><Button variant="ghost" size="icon" aria-label={t("chat.attachImage")} onClick={() => fileInputRef.current?.click()}><ImagePlus className="size-4" /></Button>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
           </div>
         </div>
         </>}

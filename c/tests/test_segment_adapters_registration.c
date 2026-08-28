@@ -6,18 +6,19 @@
 
 int main(void) {
     assert(coli_glm_segment_adapter_register() == 0);
+    assert(coli_glm53_segment_adapter_register() == 0);
     assert(coli_inkling_segment_adapter_register() == 0);
     assert(coli_kimi_segment_adapter_register() == 0);
     assert(coli_olmoe_segment_adapter_register() == 0);
     assert(coli_qwen36_segment_adapter_register() == 0);
     assert(coli_deepseek_v4_segment_adapter_register() == 0);
-    assert(coli_segment_adapter_count() == 6);
+    assert(coli_segment_adapter_count() == 7);
 
     static const char *expected[] = {
-        "glm", "inkling", "kimi", "olmoe", "qwen36", "deepseek_v4"
+        "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "deepseek_v4"
     };
     for (size_t item = 0; item < sizeof(expected) / sizeof(expected[0]); item++)
         assert(coli_segment_adapter_lookup(expected[item]) != NULL);
-    puts("all six real Segment adapters register: ok");
+    puts("every real Segment adapter registers: ok");
     return 0;
 }
