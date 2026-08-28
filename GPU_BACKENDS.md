@@ -464,6 +464,13 @@ DLL through the loader, which is `LoadLibraryExA`. Off Windows the loader answer
 ABSENT by design, so there is nothing for them to bind to. The registry, prepared
 state and QT state owners have no loader in them and run on every platform.
 
+The prepared-state owner has three cases that ask the allocator for a buffer it
+cannot satisfy, to prove the refusal is reported as an allocation failure rather
+than an arithmetic one. AddressSanitizer replaces the allocator with one that
+treats an oversized request as fatal instead of refusing it, so those three are
+skipped under ASan and say so; the arithmetic-overflow cases, which never reach
+the allocator, still run there.
+
 The binding contract is qualified against *synthetic* helper DLLs built by the
 tests with the same MinGW gcc the loader tests already require. Those fixtures
 contain no XRT and do no accelerator work; the contract under test is the

@@ -19,6 +19,20 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+/* AddressSanitizer replaces the allocator with one that treats an oversized
+ * request as a FATAL error instead of refusing it, so the two cases below that
+ * deliberately ask for an unsatisfiable buffer cannot be expressed under it:
+ * the process aborts inside posix_memalign before prepare_begin can return.
+ * The arithmetic-overflow cases, which never reach the allocator, still run. */
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define COLI_TEST_ASAN 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#  define COLI_TEST_ASAN 1
+#endif
+
 static int g_fail = 0;
 
 static void ck(int cond, const char *what){
@@ -95,15 +109,21 @@ static void test_size_safety(void){
      * possible outcome, because it succeeds. */
     ck(coli_xdna_prepare_begin(p, 0xFFFFFFFFu, 0xFFFFFFFFu, COLI_XDNA_DT_BF16) == 0,
        "product exceeding SIZE_MAX rejected");
-    ck(coli_xdna_prepare_begin(p, 0xFFFFFFFFu, 0x80000000u, COLI_XDNA_DT_BF16) == 0,
-       "product whose doubling exceeds SIZE_MAX rejected");
 
-    /* Representable but unsatisfiable. Not an arithmetic error, so it must not
-     * be reported as one: the allocator refuses and the object stays clean.
+    /* Representable but unsatisfiable. Not arithmetic errors, so they must not
+     * be reported as such: the allocator refuses and the object stays clean.
      * (No arbitrary size cap is imposed here -- a ceiling would be policy, and
-     * policy is not this slice's to invent.) */
+     * policy is not this slice's to invent. That is exactly why these two need
+     * a real allocator refusal, and why ASan cannot host them.) */
+#ifndef COLI_TEST_ASAN
+    ck(coli_xdna_prepare_begin(p, 0xFFFFFFFFu, 0x80000000u, COLI_XDNA_DT_BF16) == 0,
+       "unsatisfiable allocation near SIZE_MAX fails cleanly");
     ck(coli_xdna_prepare_begin(p, 0xFFFFFFFu, 0xFFFFFFFu, COLI_XDNA_DT_BF16) == 0,
        "unsatisfiable allocation fails cleanly");
+#else
+    printf("  %-60s %s\n",
+           "unsatisfiable allocation (2 cases)", "skipped under ASan");
+#endif
     ck(coli_xdna_prepare_begin(p, K_, N_, COLI_XDNA_DT_F32) == 0,
        "non-BF16 prepared dtype rejected");
     ck(coli_xdna_prepare_begin(p, K_, N_, COLI_XDNA_DT_NONE) == 0,
@@ -522,8 +542,15 @@ static void test_source_rejection(void){
      * defence for platforms with a narrower size_t. What is reachable is an
      * enormous but representable request, and that must fail as an allocation
      * failure rather than be misreported as an arithmetic one. */
+#ifndef COLI_TEST_ASAN
     ck(coli_xdna_prepare_from_fmt4(p, 4, q4, scale, 0x40000000, 0x40000000, gs)
        == COLI_XDNA_PREP_ERR_ALLOC, "unsatisfiable request fails as ALLOC, not SIZE");
+#else
+    /* Same reason as in test_size_safety: ASan aborts on the request instead of
+     * letting the allocator refuse it. */
+    printf("  %-60s %s\n",
+           "unsatisfiable request fails as ALLOC", "skipped under ASan");
+#endif
 
     ck(coli_xdna_prepared_state(p) == COLI_XDNA_PREP_UNPREPARED,
        "every rejection leaves the object UNPREPARED");
