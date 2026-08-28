@@ -448,12 +448,23 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
+#
+# test_xdna_execution and test_xdna_failure are Windows-only for the same kind
+# of reason: they load tests/xdna_fake_helper.dll through the XDNA loader, which
+# is LoadLibraryExA. Off Windows the loader answers ABSENT by design, so there
+# is nothing for them to bind to, and the synthetic helper is a __declspec DLL
+# that gcc and clang refuse to compile. The other three XDNA owners (registry,
+# prepared state, QT state) touch no loader and stay portable gates.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
-	test_edge_adapters_registration test_edge_adapters_real
+	test_edge_adapters_registration test_edge_adapters_real \
+	test_xdna_execution test_xdna_failure
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+endif
+ifneq (,$(IS_WIN))
+TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)

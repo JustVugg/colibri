@@ -459,6 +459,11 @@ make tests/test_xdna_execution      && ./tests/test_xdna_execution
 make tests/test_xdna_failure        && ./tests/test_xdna_failure
 ```
 
+The last two are **Windows gates**, and only there: they bind a synthetic helper
+DLL through the loader, which is `LoadLibraryExA`. Off Windows the loader answers
+ABSENT by design, so there is nothing for them to bind to. The registry, prepared
+state and QT state owners have no loader in them and run on every platform.
+
 The binding contract is qualified against *synthetic* helper DLLs built by the
 tests with the same MinGW gcc the loader tests already require. Those fixtures
 contain no XRT and do no accelerator work; the contract under test is the
