@@ -65,6 +65,7 @@
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
+#include "lora.h"                                 /* ADAPTER=<dir>: LoRA residual on frozen base */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
@@ -521,6 +522,7 @@ typedef struct {
     uint64_t miss_draft, miss_absorb;            /* miss in moe() per contesto */
     uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
     uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
+    LoraAdapter *lora;                           /* ADAPTER=<dir>: NULL = base behavior, bit-exact */
 } Model;
 
 #include "quant.h"
@@ -1708,6 +1710,17 @@ static void load_cfg(Cfg *c, const char *snap){
     free(ar);
 }
 
+/* fingerprint dell'architettura per gli adapter LoRA: stessi campi, stesso ordine,
+ * anche in tools/lora (prepare/train). EN: same fields+order everywhere. */
+static uint64_t cfg_fingerprint(const Cfg *c){
+    uint64_t h=LORA_FP_SEED;
+    h=lora_fp_mix(h,c->hidden);   h=lora_fp_mix(h,c->n_layers); h=lora_fp_mix(h,c->n_heads);
+    h=lora_fp_mix(h,c->n_experts);h=lora_fp_mix(h,c->q_lora);   h=lora_fp_mix(h,c->kv_lora);
+    h=lora_fp_mix(h,c->qk_nope);  h=lora_fp_mix(h,c->qk_rope);  h=lora_fp_mix(h,c->v_head);
+    h=lora_fp_mix(h,c->vocab);
+    return h;
+}
+
 /* Derive the fmt=4 group size from the scale-array byte count. A grouped-int4
  * tensor stores ceil(I/gs) f32 scales per output row, so:
  *     ns_bytes == O * ceil(I/gs) * 4   =>   gs == I * 4 / (ns_bytes/O - ... )
@@ -2464,6 +2477,42 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(!m->has_mtp) rt_drop_row(c->n_layers);
     }
     m->resident_bytes=rb;
+
+    /* ADAPTER=<dir>: LoRA sopra la base congelata. Fingerprint = architettura del
+     * config; mismatch -> rifiuto (LORA_UNSAFE=1 per forzare). Dimensioni di ogni
+     * tensore verificate contro il QT bersaglio: un adapter di un altro modello
+     * non puo' superare questo punto. EN: dims checked against the target QT. */
+    const char *ad=getenv("ADAPTER");
+    if(ad&&*ad){
+#ifdef COLI_CUDA
+        /* il path PIPE2/pilot calcola o_proj interamente su device: il residuo LoRA
+         * verrebbe saltato in silenzio. Meglio rifiutare che degradare senza dirlo. */
+        fprintf(stderr,"[LORA] ADAPTER not supported in CUDA builds yet (o_proj runs on-device)\n");
+        exit(1);
+#endif
+        m->lora=lora_load(ad,cfg_fingerprint(c),getenv("LORA_UNSAFE")?1:0);
+        if(!m->lora){ fprintf(stderr,"[LORA] adapter load failed: %s\n",ad); exit(1); }
+        for(int i=0;i<m->lora->n;i++){
+            LoraTensor *t=&m->lora->t[i];
+            if(t->layer>=c->n_layers){ fprintf(stderr,"[LORA] layer %d >= n_layers %d\n",t->layer,c->n_layers); exit(1); }
+            if(t->tgt!=LORA_T_O){ fprintf(stderr,"[LORA] target %s: only self_attn.o_proj is applied in v1\n",
+                lora_tgt_suffix[t->tgt]); exit(1); }
+            QT *base=&m->L[t->layer].o;
+            if(t->O!=base->O||t->I!=base->I){
+                fprintf(stderr,"[LORA] layer %d o_proj: adapter [%d,%d]x[%d] vs base [%d,%d]\n",
+                    t->layer,t->O,t->rank,t->I,base->O,base->I); exit(1); }
+        }
+        fprintf(stderr,"[LORA] adapter %s: %d tensor(s), rank=%d alpha=%g (%s)\n",
+            ad,m->lora->n,m->lora->rank,m->lora->alpha,
+            m->lora->base_model[0]?m->lora->base_model:"?");
+    }
+}
+
+/* residuo LoRA dopo il matmul base: no-op esatto senza adapter o senza target */
+static inline void lora_hook(Model *m,int layer,int tgt,const float *x,float *y,int S){
+    if(!m->lora) return;
+    const LoraTensor *t=lora_find(m->lora,layer,tgt);
+    if(t) lora_apply(t,x,y,S);
 }
 
 static void model_init(Model *m, const char *snap, int cap,
@@ -4693,7 +4742,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             if(!vk_matmul_qt(&l->o, out, ctx, S))
 #endif
             matmul_qt(out, ctx, &l->o, S);
-        } m->t_aout+=now_s()-tao;
+        }
+        lora_hook(m,layer,LORA_T_O,ctx,out,S); m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp); free(sc_all);
         m->t_attn += now_s()-ta0;
         return;
@@ -4918,7 +4968,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
-    matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
+    matmul_qt(out, ctx, &l->o, S);
+    lora_hook(m,layer,LORA_T_O,ctx,out,S); m->t_aout+=now_s()-tao;
     free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(kvb_map); free(sc_all);
     m->t_attn += now_s()-ta0;
 }

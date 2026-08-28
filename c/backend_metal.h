@@ -131,6 +131,30 @@ int coli_metal_gemm(float *y, const float *x, const void *weights, const float *
 int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
                      int Ksel, float topp, int normk, float rscale,
                      int *idx, float *w, int *keff);
+
+/*
+ * Training kernels (QLoRA, M6). Synchronous, correctness-first; each has a CPU
+ * reference in train/qlora_ops.h and a parity test in metal-test. Returns 1 on
+ * success, 0 -> caller must run the CPU path.
+ *
+ *   train_tmul:      dx[S,I] += dequant(W[O,I])^T dy[S,O]  (fmt 0=f32 no-scale,
+ *                    1=int8, 2=int4 per-row scale, 4=int4 grouped — gs columns
+ *                    per scale, scale[o*ng+i/gs]; the dequantized matrix is
+ *                    never materialized. gs ignored unless fmt=4)
+ *   train_lora_fwd:  z = x A^T ; y += scale * z B^T        (f32, z cached for bwd)
+ *   train_lora_bwd:  dz = scale * dy B ; dB += scale * dy^T z ; dA += dz^T x ;
+ *                    dx += dz A  (dx may be NULL to skip)
+ */
+int coli_metal_train_tmul(float *dx, const float *dy, const void *weights, const float *scales,
+                          int fmt, int gs, int S, int I, int O);
+int coli_metal_train_lora_fwd(float *y, float *z, const float *x,
+                              const float *A, const float *B, float scale,
+                              int S, int I, int O, int rank);
+int coli_metal_train_lora_bwd(float *dA, float *dB, float *dx,
+                              const float *x, const float *z, const float *dy,
+                              const float *A, const float *B, float scale,
+                              int S, int I, int O, int rank);
+
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 void coli_metal_attn_lat(double *ksched, double *gsched);
 int coli_metal_attn_decode(const float *x,
