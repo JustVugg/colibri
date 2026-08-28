@@ -13,6 +13,10 @@ Without `--xdna` nothing changes: no helper is loaded, no device is opened, and
 the engine produces exactly the results it produces today. Installing the
 optional package does not enable anything on its own.
 
+`--xdna` works by setting `COLI_XDNA=1` for the engine, and the engine reads that
+variable directly — so if you export it yourself it has the same effect, with or
+without the flag. That is the only other way in.
+
 ## What runs on the NPU
 
 Only the **MoE shared-expert gate/up projection** for GLM

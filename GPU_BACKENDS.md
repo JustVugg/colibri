@@ -188,12 +188,14 @@ on real hardware is for (matrix below).
 
 ## Optional XDNA2 (Ryzen AI NPU) lane
 
-Status: **binding foundation only.** There is no NPU compute path yet.
-
 XDNA2 is an *optional compute lane*, not an engine and not a GPU. Colibri keeps
 model semantics, routing, expert identity, weight ownership, scheduling and
-fallback; the lane would only ever execute one already-selected, already
-qualified operation. Nothing about it is required to build or run Colibri.
+fallback; the lane executes one already-selected, already-qualified operation
+family and nothing else. Nothing about it is required to build or run Colibri.
+
+It is **Windows-only**, **off by default**, and **explicitly requested**. The
+qualified operations run in BF16, which is not the arithmetic the normal path
+uses, so output may differ.
 
 ### What is optional, and how
 
@@ -202,250 +204,99 @@ qualified operation. Nothing about it is required to build or run Colibri.
 | does ordinary Colibri need XRT? | **no** — no header, no import library, no DLL import |
 | does the default build need an XDNA SDK? | **no** |
 | does a machine need an NPU? | **no** — absence is a normal machine, not an error |
+| does the default path use the lane? | **no** — it is never enabled by discovery |
 | where does XRT live? | only inside an optional native helper, `coli_xdna.dll` |
-| how is the helper reached? | resolved at runtime, exactly like `coli_cuda.dll` / `coli_hip.dll` in `backend_loader.c` |
+| how is the helper reached? | resolved at runtime by absolute path beside the executable |
 
-`c/backend_xdna.h` and `c/backend_xdna.c` are the host-side owners. They never
-include or link XRT. `colibri` does not link them yet either: there is no caller
-until an operation seam lands, so the default binary is byte-for-byte what it
-was. `make xdna-obj` compiles the host side on its own.
+`c/backend_xdna.h` and `c/backend_xdna.c` are the host-side owners, and they
+never include or link XRT. `XDNA=1` compiles them into the host and defines
+`COLI_XDNA`; the Windows release build uses it (`.github/workflows/release.yml`),
+because an `XDNA=1` host has the same import table as a default one and starts
+normally on a machine with no NPU.
 
-### What this slice implements
-
-- a versioned C ABI boundary (`COLI_XDNA_ABI_VERSION`) to an optional helper
-- runtime discovery and binding of `coli_xdna.dll`, looked up by absolute path
-  beside the executable — no PATH search, no current-directory search
-- **all-or-nothing binding**: a helper is usable only when it loads, reports the
-  expected ABI generation, and exports every entry point this host requires. Any
-  failure leaves nothing callable behind
-- a sticky verdict, so a machine without a helper pays one lookup, not one per
-  operation
-- safe shutdown: before probing, after a failed probe, after a good bind, and
-  repeatedly
-
-A successful bind means `HELPER_ABI_AVAILABLE` and nothing more.
-
-### What this slice does NOT implement
-
-Device discovery, XRT initialization, artifact registry, `.xclbin` loading,
-weight preparation, buffer wrapping, dispatch, matmul interception, scheduling
-policy, and any user-facing switch. There is deliberately no `--xdna` flag and
-no `COLI_XDNA*` environment variable: the lane has no operation to offer yet, so
-advertising a control would be premature.
-
-**No real XRT-linked helper is built by this slice.** The XRT-owning helper
-source is not compiled here, because binding is fully qualified without it (see
-below) and dead XRT-linked code would contaminate the build for no gain.
-
-### Validation (no NPU, no XRT, no hardware)
-
-The whole binding contract is qualified against *synthetic* helper DLLs built by
-the tests with the same MinGW gcc the loader tests already require. Those
-fixtures contain no XRT and do no accelerator work; the contract under test is
-the loader's verdict, which is reached long before any real runtime would be.
+### Turning it on
 
 ```
-python -m unittest test_backend_loader.XdnaLoaderOwnerTest \
-                   test_backend_loader.XdnaOptionalBindingTest \
-                   test_backend_loader.XdnaDefaultBuildIndependenceTest
+coli run   --xdna --model <glm-model> "..."
+coli chat  --xdna --model <glm-model>
+coli serve --xdna --model <glm-model>
 ```
 
-Covered: helper absent, good helper, wrong ABI generation, missing required
-entry point, present-but-unloadable helper (a deleted dependency), repeated
-probes, the three shutdown orders, and a dependency inspection asserting the
-ordinary `colibri` binary imports neither XRT nor the helper.
-
-### Artifact registry (engine-owned)
-
-Colibri decides which artifact answers which operation, and whether that artifact
-can be trusted. The helper decides neither, and never sees a choice it did not
-receive.
-
-A registry row records what the research programme established about one
-artifact: its semantic family, the exact M bucket it was compiled for, K and N,
-the activation/prepared-weight/output dtypes, the target device family, logical
-filenames for the `.xclbin` and its instruction stream, the SHA256 of each, and
-four independent qualification facts.
-
-**Lookup requires an explicit semantic family.** Two operations with identical
-M/K/N are still different operations, and one may never inherit the other's
-qualification. Shape alone is not eligibility.
-
-**Buckets are exact.** A row describes the M the program was compiled and
-qualified for. Nothing interpolates between qualified buckets.
-
-**Integrity is byte identity.** Both files must exist and both SHA256 values must
-match before an artifact is usable. Presence and integrity are separate verdicts:
-a missing file means this build does not ship that artifact, a hash mismatch
-means the bytes are not the bytes that were qualified.
-
-**Compiling is not qualifying.** Four research facts are required — runtime
-weight, correctness, userptr and structural — and they are checked *before* the
-filesystem, so a row that was never correctness-qualified declines whether or not
-its bytes are present and intact. This matters: research measured a design that
-compiled, loaded, dispatched to completion, returned finite numbers and was
-numerically wrong. A successful dispatch is not evidence of a correct one.
-
-SHA256 is implemented in `backend_xdna.c` rather than taken from a system
-library, so the registry stays portable and the host acquires no new link
-dependency. It is covered by the standard NIST vectors.
-
-### What STATIC_ARTIFACT_QUALIFIED means
-
-It means Colibri knows this operation, holds a matching qualified artifact
-definition, and the bytes on disk are the bytes that were qualified.
-
-It does **not** mean a device exists, a context can be created, a weight has been
-prepared, a pointer is aligned, memory is available, or that running on the NPU
-would be preferable. Those gates do not exist yet. Helper availability, artifact
-qualification, device readiness, prepared-weight validity and economic preference
-are five independent concepts and are not collapsed into one flag.
-
-### Artifacts are not shipped
-
-The registry names the qualified artifacts for the first family; the build does
-not contain them. Where they should live is a packaging decision that has not
-been made. An absent artifact yields `ARTIFACT_UNAVAILABLE` and the operation
-continues on its current path — that is the intended state, not an error, and no
-startup path can fail because of it.
-
-Logical filenames resolve under a caller-supplied root. There is no PATH search,
-no current-directory fallback, and a name that tries to escape its root is
-rejected during registry validation, before it can reach the filesystem.
-
-### Prepared host state (engine-owned)
-
-The prepared BF16 image is **derived, disposable host state**. The stored fmt=4
-tensor stays authoritative and is never replaced, mutated or freed by anything in
-the prepared-state path.
-
-Three properties vary independently and are never collapsed into one flag:
-
-| property | question |
-|---|---|
-| allocation | is a buffer held? |
-| validity | are its contents usable? |
-| consumption | how many host bytes does it cost? |
-
-An invalid buffer still costs memory, and no amount of successful allocation
-makes contents valid.
+`--xdna` sets `COLI_XDNA=1` in the engine's environment, and the engine enables
+the lane when `COLI_XDNA` parses as a non-zero integer. Both halves are worth
+stating exactly, because a harness that drives the engine directly uses the
+second one:
 
 ```
-UNPREPARED ──begin──> PREPARING ──publish success──> PREPARED_VALID
-                          │                                │
-                          └──publish failure──> PREPARED_INVALID <──invalidate──┘
+--xdna absent, COLI_XDNA unset       disabled, silent
+--xdna present                       coli sets COLI_XDNA=1
+COLI_XDNA inherited from the shell   passed through unchanged
+COLI_XDNA = 0 / empty / non-numeric  disabled
 ```
 
-`PREPARED_VALID` is reachable **only** through an explicit success publication
-after `PREPARING`. An `INVALID` image can never shortcut back to valid: it must
-go through a complete new cycle. A writable destination exists only while
-`PREPARING`, so a published image cannot be rewritten behind its own back.
+`--xdna` therefore wins when it is present, because it assigns `1` over whatever
+was inherited; when it is absent the inherited value stands. `--xdna` lives on
+the shared parent parser so it appears on every subcommand, but it reaches an
+engine only for GLM models, and only the `colibri` engine is built with the lane.
 
-Allocation is 4096-byte aligned, reusing the repository's existing
-`posix_memalign` / `compat_aligned_free` pair from `c/compat.h`. The **payload
-size need not be a page multiple** and is never rounded up behind the caller: a
-30-byte payload reports 30 bytes and still gets an aligned pointer. Sizes are
-computed with checked arithmetic, so a product that would exceed `SIZE_MAX`
-is refused rather than wrapping into a small, plausible and far-too-small
-allocation.
-
-A defensive alignment validator exists alongside the allocator guarantee,
-because a buffer that arrives from a pool or at an offset does not carry that
-guarantee — and a misaligned pointer fails at the XRT boundary with a message
-about video memory, which points at entirely the wrong subsystem.
-
-Bytes are **host memory**. They are not VRAM, not NPU memory and not an XRT
-device allocation, and they are not reported to any GPU accounting.
-
-### What PREPARED_VALID does not mean
-
-It means the derived host image was published successfully by its producer. It
-does **not** mean a device exists, a pointer has been wrapped, an artifact is
-loaded, or an operation can run. No XRT call, no helper call and no device open
-is involved anywhere in this path — the whole contract is exercised with the
-helper absent.
-
-Prepared state attaches to a tensor as a single opaque pointer that starts
-`NULL`. Loading a model allocates none of it; a registry query allocates none of
-it; only an explicit preparation request does. When an expert slot is reused for
-a different expert the derived image is dropped, exactly as the GPU tiers drop
-theirs — a stale prepared image would be a silently wrong weight rather than a
-missing one.
-
-There is still **no fmt4 → BF16 conversion**: filling the destination is the next
-slice's work.
-
-### fmt4 to BF16 preparation
-
-The converter turns the authoritative fmt=4 grouped-int4 weight into the prepared
-BF16 image, writing straight into the aligned destination. The source is read and
-never modified.
-
-Semantics are taken from the production kernel (`quant.h`, `matmul_i4_grouped`),
-not from a description of it:
+On success — and only after the package has been resolved and every qualified
+artifact verified — the engine prints, to **stderr**:
 
 ```
-rb    = (I+1)/2                       bytes per output row
-ng    = (I+gs-1)/gs                   groups per output row
-row   = q4    + o*rb                  weights are stored [O][I]
-scl   = scale + o*ng
-byte  = row[i>>1]
-nib   = (i&1) ? byte>>4 : byte&0x0F   even i low nibble, odd i high nibble
-value = (nib - 8) * scl[i/gs]
+[XDNA] experimental: qualified GLM shared expert operations will use the
+[XDNA] native NPU with a reduced-precision BF16 compute path. Model output
+[XDNA] may differ from the normal path, and generated text has been observed
+[XDNA] to diverge. Operations this lane does not support continue to use the
+[XDNA] normal path.
 ```
 
-The destination is BF16 `B[K,N]` with `K = I` and `N = O`, so each value is
-written to `dst[i*O + o]`. The `[O,I]` to `[I,O]` transform is inherent in that
-addressing and needs no intermediate matrix: values pass through a single float
-scalar, so **no full-sized FP32 image is ever allocated**. The only allocation a
-conversion makes is the BF16 destination itself.
+The ordering is deliberate. An earlier revision announced the lane as soon as the
+request was parsed, and then dispatched zero times because no artifact package
+existed — a promise the run did not keep. Anything short of a fully provisioned
+lane now gets its own diagnostic and the normal path.
 
-Float to BF16 uses round-to-nearest-even, not truncation. The two differ on
-exact ties, and the qualified image rounds.
+Every `[XDNA]` line goes to stderr, never stdout. SCORE mode writes
+machine-readable results to stdout and its parser consumes any line starting with
+a digit or a minus sign, so a diagnostic there would be read as a score.
 
-### Publication and failure
+A build without `-DCOLI_XDNA` still answers an explicit request rather than
+ignoring it: *"requested, but this build has no XDNA support"*.
 
-```
-validate source -> begin -> PREPARING -> convert -> publish success -> PREPARED_VALID
-                                              \
-                                               -> publish failure -> PREPARED_INVALID
-```
+### Qualified scope
 
-Everything that can be rejected is rejected *before* the cycle opens, so a bad
-source never strands an object in `PREPARING`, and no path returns while still
-`PREPARING`.
-
-A mid-conversion failure leaves genuinely partial bytes — some elements
-converted, the rest whatever they held — and forces `PREPARED_INVALID`. Those
-bytes carry no authority: state decides validity, not contents, and the partial
-image cannot be published. The authoritative fmt=4 weight is untouched by any of
-this.
-
-A failed buffer keeps its capacity and can be reused, but only through a
-**complete** re-preparation: `INVALID -> PREPARING -> VALID`, never a shortcut.
-A re-prepared image is bit-identical to one prepared from scratch.
-
-The conversion is currently serial. The frozen contract permits parallelisation
-but does not require it, and correctness and publication semantics come first; a
-6144x2048 weight converts in well under a tenth of a second.
-
-Conversion needs no helper, no artifact, no XRT and no device — it is engine
-representation logic, and the helper knows nothing about nibble packing or group
-scales. 
-### Native execution: the GLM shared gate/up lane
-
-Colibri can now execute one real operation on the NPU: the **MoE shared-expert
-gate and up projections**, and nothing else. This is the whole supported surface,
-and the constraints below are hard gates rather than guidance.
+These are hard gates, not guidance.
 
 ```
+platform      Windows, AMD XDNA2 (Ryzen AI) NPU
 family        MoE shared-expert gate / up  (sh_gate, sh_up)
 K             6144
 N             2048
 stored format fmt=4 grouped int4, group size 64, PAIR nibble layout
-logical M     1..64, zero-padded to the artifact's M=64
+logical M     1..64    -> the M64 artifact,  rows zero-padded to 64
+              65..256  -> the M256 artifact, rows zero-padded to 256
+              >256     -> declines to the current path
 execution     blocking, one operation at a time
 ```
+
+Eligibility is evaluated in this order, cheapest and most semantic first. Every
+gate returns; none merely records, so no later gate can excuse an earlier
+refusal:
+
+```
+1   semantic family — passed in by the call site, never inferred
+2   logical M within the range some compiled bucket serves
+3   K / N positive
+4   stored format is fmt=4
+5   group size is the qualified 64
+5b  in-memory layout is the pair layout, not K1 planar
+6   a qualified artifact exists for exactly this family, bucket, shape and
+    dtypes, and its bytes match the SHA256 compiled into the engine
+```
+
+There is no bucket between 64 and 256, so an `M=65` operation runs on the M256
+artifact with 191 padded rows. Padding is legitimate because `C = A x B` is
+row-independent: output row *i* depends only on input row *i* and on B. Only the
+logical rows are copied out, and padded rows never reach anything downstream.
 
 The layout constraint is not decoration. `fmt=4` has two in-memory layouts: the
 classic **pair** layout (elements `2j` and `2j+1` in byte `j`) and the K1
@@ -453,9 +304,9 @@ classic **pair** layout (elements `2j` and `2j+1` in byte `j`) and the K1
 which `qt_planarize()` writes in place when the grouped planar IDOT path is
 opted into with `IDOT_GS=1`. The prepared-weight converter was qualified against
 the pair layout only, and planar bytes would decode to plausible-looking nonsense
-rather than fail — so a planar tensor is refused (`LAYOUT_UNSUPPORTED`) and falls
-back to the current path. Supporting the planar layout is a separate question
-with its own qualification.
+rather than fail — so a planar tensor is refused (`LAYOUT_UNSUPPORTED`) and runs
+the current path. Supporting the planar layout is a separate question with its
+own qualification.
 
 `sh_down` is deliberately **not** accelerated: its orientation is `I=2048,
 O=6144`, which is not what the qualified artifact computes. Nor is the generic
@@ -463,38 +314,87 @@ O=6144`, which is not what the qualified artifact computes. Nor is the generic
 site and never inferred from a shape, so an unrelated operation that happens to
 be 6144x2048 cannot inherit this one's qualification.
 
-Row padding is legitimate because `C = A x B` is row-independent: output row *i*
-depends only on input row *i* and on B. Only the logical rows are copied out;
-padded rows never reach anything downstream. Logical M above 64 declines to the
-current path — row tiling is a qualified strategy but is not implemented here.
+### Artifact registry
 
-**There is no automatic selection.** No `--xdna` flag, no `COLI_XDNA`
-environment variable and no economic policy exists. An ordinary build with a
-helper, a device and valid artifacts present still runs exactly the path it runs
-today; the lane is reachable only from an internal test control. Deciding *when*
-XDNA is preferable is a separate concern with a separate owner.
+Colibri decides which artifact answers which operation, and whether that
+artifact may be trusted. The registry is a table compiled into
+`c/backend_xdna.c` carrying, per artifact, the logical filenames for the
+`.xclbin` and its instruction stream and the SHA256 of each.
 
-Hard eligibility is evaluated in this order, cheapest and most semantic first,
-and no later gate can excuse an earlier refusal:
+**Integrity is byte identity.** Both files must exist and both SHA256 values must
+match, or the operation declines. There is no tolerance and no "close enough".
+SHA256 is implemented in `backend_xdna.c` rather than taken from a system library
+so that the check has no external dependency.
+
+`STATIC_ARTIFACT_QUALIFIED` means Colibri knows this operation, holds a matching
+qualified artifact definition, and the bytes on disk are the bytes that were
+qualified. It does **not** mean a device exists, a context can be created, a
+weight has been prepared, a pointer is aligned, or that running on the NPU would
+be preferable. Helper availability, artifact qualification, device readiness,
+prepared-weight validity and economic preference are five independent concepts
+and are not collapsed into one flag.
+
+Logical filenames resolve under the package root beside the executable. There is
+no PATH search, no current-directory fallback, and a name that tries to escape
+its root is rejected during registry validation, before it can reach the
+filesystem.
+
+### Prepared host state
+
+The prepared BF16 image is **derived, disposable host state**. The stored fmt=4
+tensor stays authoritative and is never replaced, mutated or freed by anything in
+the prepared-state path. A prepared image is published only when the whole
+conversion succeeded; a failure leaves the previous state untouched rather than
+half-written, so partially converted bytes can never reach the device.
+
+The image is aligned for the helper's userptr wrapping, and that alignment is a
+hard gate rather than an assumption.
+
+### Failure and fallback
+
+The invariant the lane is built around: **a failure anywhere is the current
+path, never a partial result.** The candidate returns "not handled" and
+`matmul_qt` computes the answer, exactly as it would have without the lane.
+
+Each provisioning failure has its own diagnostic, because they have different
+fixes:
 
 ```
-family -> logical M -> K/N -> fmt -> group size -> byte layout -> registry row
-       -> artifact qualification -> artifact present -> artifact SHA256
-       -> helper ABI -> prepared weight VALID -> 4096-byte alignment
-       -> device/runtime -> artifact runtime object -> userptr wrap -> execute
+PACKAGE_MISSING       the package was not found
+PACKAGE_INCOMPLETE    missing <named artifact>
+INTEGRITY_FAILED      <named artifact> does not match its expected hash
+HELPER_UNAVAILABLE    coli_xdna.dll is not usable beside the executable
+REGISTRY_INVALID      this build's artifact registry is invalid
 ```
 
-Any refusal, and any helper failure at any stage, returns "not handled" and the
-caller runs its current `matmul_qt` path. The candidate never calls `matmul_qt`
-itself, so there is no recursion and no double dispatch, and the caller's output
-buffer is written only after the helper reports successful completion — a
-failure cannot leave a half-written result behind.
+The package gate runs **before** the helper is loaded, so unknown or corrupt
+bytes never reach execution. Restoring the correct bytes restores the lane with
+no residue: no cached verdict, no disabled flag, no retry counter.
+
+### The optional package
+
+The helper and the qualified artifacts are **not** in the core archive. They ship
+as an optional sidecar built on a machine that has the XRT SDK and the AIE
+toolchain, which the release runners do not:
+
+```
+coli_xdna.dll
+xdna/wa_F3_M64_K6144_N2048.xclbin
+xdna/wa_F3_M64_K6144_N2048_insts.bin
+xdna/wa_F3_M256_K6144_N2048.xclbin
+xdna/wa_F3_M256_K6144_N2048_insts.bin
+```
+
+Unpacked beside the executable. `c/tools/build_xdna_package.py` owns producing
+and verifying it, and `docs/xdna.md` carries the user- and maintainer-facing
+procedure. XRT and the MSVC redistributable are the user's to install and are
+never bundled.
 
 ### Building the optional helper
 
-The helper is the only component that links XRT, and it is **opt-in**: an
-ordinary build compiles without XRT headers, links without XRT, imports no XRT
-DLL, and does not require `coli_xdna.dll` to exist.
+The helper is the only component that links XRT, and it is opt-in: an ordinary
+build compiles without XRT headers, links without XRT, imports no XRT DLL, and
+does not require `coli_xdna.dll` to exist.
 
 Tested provenance:
 
@@ -519,161 +419,61 @@ The host looks for `coli_xdna.dll` **beside the executable, by absolute path
 only** — no PATH search, no current directory, no application-directory
 fallback. A helper that is not there is simply absent, which is a normal state.
 
-The helper ABI is generation **2**. Generation 1 is refused outright rather than
-partially bound: it exports two of the seven entry points generation 2 requires
-and cannot execute anything, so binding it would produce a helper that reports
-availability and then fails. Binding is all-or-nothing.
-
-### Artifacts are not shipped
-
-The qualified `.xclbin` and instruction-stream bytes are **not** distributed with
-Colibri, and how they eventually should be is still an open question. The
-registry carries their SHA256, and a missing, unreadable or hash-mismatched
-artifact fails closed before the device is opened or any byte reaches the
-helper. With no artifact root configured — the default, and the only production
-value — every request declines.
+The helper ABI is generation **2**, and binding is all-or-nothing: a helper is
+usable only when it loads, reports the expected ABI generation, and exports every
+entry point this host requires. Generation 1 is refused outright rather than
+partially bound — it exports two of the seven entry points generation 2 requires,
+so binding it would produce a helper that reports availability and then fails.
+The verdict is sticky, so a machine without a helper pays one lookup rather than
+one per operation.
 
 ### What is not claimed
 
 No full-model acceleration, no token-throughput figure, no general XDNA backend,
 no routed-expert support, no concurrency with the GPU, and no scheduler. One
-family, one shape, one bucket, one dispatch at a time.
+family, one shape, two buckets, one dispatch at a time.
 
-### Failure and fallback
+Nothing here chooses between the NPU and the normal path on speed or cost, and
+no speed claim is made.
 
-The invariant the lane is built around:
+Device execution is qualified against a BF16 oracle. That is **not** a claim that
+the lane is numerically interchangeable with `matmul_qt`: the current path
+accumulates f32 activations against dequantised int4, the lane is BF16
+throughout, and the two legitimately differ. Whether substituting BF16 activation
+semantics is acceptable *for a model* is a separate question, and it is not
+answered by inventing an elementwise tolerance.
 
-> **Optional XDNA work may fail. Current Colibri operation semantics may not.**
+### Validation
 
-Every decline and every runtime failure ends the same way: the candidate returns
-"not handled" and the caller runs the exact `matmul_qt` call that stood at that
-site before the lane existed. There is no special CPU fallback, no alternative
-dequantisation path, no partial-result salvage, and no helper-side recovery. The
-candidate never calls `matmul_qt` itself, so the call graph stays acyclic and no
-operation can be computed twice.
-
-Failure stages are classified rather than collapsed, because they call for
-different actions:
+Without an NPU, XRT or any hardware — this is what CI runs:
 
 ```
-DECLINED                      not eligible -- never an error
-HELPER_UNAVAILABLE            absent, or would not load
-HELPER_ABI_INCOMPATIBLE       loaded, wrong generation or incomplete
-ARTIFACT_UNAVAILABLE          this build does not ship those bytes
-ARTIFACT_INTEGRITY_FAILED     the bytes are not the bytes that were qualified
-ARTIFACT_UNQUALIFIED          a known artifact that was never correctness-qualified
-LAYOUT_UNSUPPORTED            fmt=4 bytes are in the K1 planar layout, not pairs
-REGISTRY_INVALID              the registry itself is malformed
-WEIGHT_PREPARE_FAILED         fmt4 to BF16 conversion failed
-PREPARED_INVALID              no usable prepared image
-ALIGNMENT_INVALID             prepared pointer not 4096-aligned
-DEVICE_INIT_FAILED            the device would not initialise
-ARTIFACT_OPEN_FAILED          verified bytes, but the runtime would not open them
-WEIGHT_WRAP_FAILED            the userptr wrap was refused
-EXECUTE_FAILED                dispatch refused or threw
-COMPLETION_FAILED             dispatched, did not complete cleanly
+python -m unittest test_backend_loader.XdnaLoaderOwnerTest \
+                   test_backend_loader.XdnaOptionalBindingTest \
+                   test_backend_loader.XdnaDefaultBuildIndependenceTest
+python -m unittest tests.test_xdna_package
+make tests/test_xdna_registry       && ./tests/test_xdna_registry
+make tests/test_xdna_prepared_state && ./tests/test_xdna_prepared_state
+make tests/test_xdna_qt_state       && ./tests/test_xdna_qt_state
+make tests/test_xdna_execution      && ./tests/test_xdna_execution
+make tests/test_xdna_failure        && ./tests/test_xdna_failure
 ```
 
-An absent artifact and a *tampered* one are deliberately different verdicts. So
-are a missing helper and an incompatible one.
+The binding contract is qualified against *synthetic* helper DLLs built by the
+tests with the same MinGW gcc the loader tests already require. Those fixtures
+contain no XRT and do no accelerator work; the contract under test is the
+loader's verdict, which is reached long before any real runtime would be. One of
+those tests inspects the ordinary `colibri` binary and asserts it imports neither
+XRT nor the helper.
 
-### Output validity is a state, not a measurement
-
-XDNA output is valid **only** after the helper reports successful completion.
-A failure at any stage — including one that occurs after the helper has already
-written a full, finite, entirely plausible result — leaves the output invalid,
-and the caller's buffer untouched. Nothing about the bytes themselves can raise
-that verdict: there is no NaN scan, no finiteness check and no plausibility
-heuristic anywhere in the lane, because none of them would be evidence.
-
-Structurally, the caller's output buffer is never passed to the helper at all.
-The helper writes into a lane-owned staging buffer, and only a successful
-completion causes the logical rows to be copied out. A late failure therefore
-cannot leave a half-written result behind even in principle.
-
-### Lane health
-
-The narrowest model the observed failures justify:
-
-| failure | scope |
-|---|---|
-| helper absent / unloadable / ABI mismatch | sticky loader verdict, never retried |
-| **device init** | **process-scoped** — the lane is marked unavailable |
-| artifact runtime open | one shape; the lane stays healthy |
-| weight wrap, dispatch, completion | one operation; the lane stays healthy |
-
-There is no retry, backoff or quarantine policy beyond this. A full
-`coli_xdna_execution_shutdown()` is the only thing that clears an unavailable
-lane, because a fresh attempt after a complete teardown is meaningful and a
-fresh attempt on every operation is not.
-
-### Prepared state survives runtime failure
-
-Whether the prepared BF16 image is **correct** and whether the runtime
-**succeeded** are separate facts, and a runtime failure does not invalidate a
-correct image. A wrap, dispatch or completion failure leaves the prepared weight
-`PREPARED_VALID` and reusable; only a conversion failure produces
-`PREPARED_INVALID`. This matters for any future cache policy, which would
-otherwise throw away good work on unrelated news.
-
-### Userptr wrapper lifetime
-
-The helper-owned wrapper is **persistent runtime state**: it is created on
-demand, reused across operations, and released when it is replaced, when the
-engine frees or invalidates the memory it borrows, or at shutdown.
-
-It is keyed on **(pointer, publication generation)**, not on the pointer alone.
-Retained prepared capacity is reused in place, so a different weight can occupy
-the same address — and because the helper snapshots at wrap time via
-`sync(BO_TO_DEVICE)`, keying on the address alone left the device computing
-against a view that no longer matched the engine's image. That was measured on
-real XDNA2 hardware. Every publication now bumps a generation, and the engine
-tells the lane to release a wrapper before freeing or invalidating the memory it
-borrows, so a wrapper can never outlive or alias released engine memory.
-
-### Two internal modes, neither of them public
+With the hardware, the helper and the qualified artifacts, one more owner runs
+the production registry, integrity check, loader, weight preparation, eligibility
+gates and candidate function against the real device:
 
 ```
-AUTO-LIKE   coli_xdna_try_matmul()    decline or failure -> current path
-EXPLICIT    coli_xdna_test_attempt()  decline or failure -> classified failure,
-                                      no fallback, no output claimed
+make tests/xdna_physical_probe
+tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
 ```
 
-Both share one implementation so their gate order and classification cannot
-drift apart. Explicit mode is a separate entry point rather than a mode flag, so
-no global state can leave the production seam in a no-fallback configuration.
-
-**Default behaviour is unchanged and remains so.** With a helper present, a
-device available and valid artifacts staged, an ordinary build still runs the
-current path and dispatches zero XDNA operations. Automatic selection needs an
-economic policy that does not exist, and a semantic qualification that has not
-been done — see below.
-
-### What successful XDNA execution does and does not mean
-
-```
-SUCCESSFUL_XDNA_CORRECTNESS_OWNER  = the qualified BF16 oracle
-FAILED_XDNA_FALLBACK_CORRECTNESS_OWNER = the current matmul_qt path
-```
-
-These are different contracts and must not be conflated. Device execution is
-qualified against a BF16 oracle under a criterion frozen by the research
-programme. It is **not** a claim that the lane is numerically interchangeable
-with `matmul_qt`: the current path accumulates f32 activations against
-dequantised int4, the lane is BF16 throughout, and the two legitimately differ.
-
-```
-MODEL_LEVEL_BF16_REPLACEMENT_ACCEPTABILITY = NOT YET QUALIFIED
-```
-
-Whether substituting BF16 activation semantics is acceptable *for a model* is an
-open question, and answering it is a prerequisite for any automatic selection.
-It is not answered by inventing an elementwise tolerance.
-
-### A note on the registry
-
-The compiled-in production registry is now covered by a regression that reads it
-with no test rows installed. An earlier revision initialised its row count to
-zero, leaving the table present but empty; every caller at the time was a test
-that installed its own registry, so nothing noticed until the first production
-consumer arrived.
+`M-list` defaults to `1,32,64`; pass `65,130,256` to qualify the M256 bucket
+through the same binary, or a value above 256 to see the decline.
