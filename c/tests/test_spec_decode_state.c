@@ -162,6 +162,40 @@ static int test_persisted_tail(void) {
     return 0;
 }
 
+/* U7a: spec_decode's emit callback receives the logit row its token was
+ * picked/verified from -- including ACCEPTED DRAFT tokens, which bypass every
+ * pick_tok call site in the mux loop (the speculative-gap hazard the packet's
+ * Fork 5 flags). Greedy contract: no row may be NULL, and every row's argmax
+ * must be the emitted token -- proving the row really is that token's scoring
+ * distribution, not a stale or shifted one. */
+typedef struct { int n, null_rows, mismatches; } EmitProbe;
+static void emit_probe(int t, const float *lo, void *ud) {
+    EmitProbe *e = (EmitProbe *)ud;
+    e->n++;
+    if (!lo) { e->null_rows++; return; }
+    if (argmax_v(lo, V) != t) e->mismatches++;
+}
+
+static int test_emit_carries_scoring_logits_for_accepted_drafts(void) {
+    const int next[V] = {0, 2, 3, 1, 4, 5, 6, 7};
+    Toy t;
+    toy_init(&t, next);
+    reset_decode_globals(2);
+
+    /* Same shape as test_accepted_speculative_tokens: the repeated [1,2]
+     * bigram proposes [3,1]; one picked token + two accepted drafts. */
+    int all[12] = {1, 2, 3, 1};
+    EmitProbe probe = {0, 0, 0};
+    int kv = -1;
+    CHECK(spec_decode(&t.m, all, 4, 3, -1, choose(2), emit_probe, &probe, &kv, NULL) == 3);
+    CHECK(probe.n == 3);          /* 1 pick_tok token + 2 accepted draft tokens */
+    CHECK(probe.null_rows == 0);  /* the draft-accept arm has no numeric gap */
+    CHECK(probe.mismatches == 0); /* each row scores exactly its own token */
+
+    toy_free(&t);
+    return 0;
+}
+
 static int test_accepted_speculative_tokens(void) {
     const int next[V] = {0, 2, 3, 1, 4, 5, 6, 7};
     Toy t;
@@ -217,6 +251,7 @@ int main(void) {
     CHECK(test_ngen_zero_and_one_shot() == 0);
     CHECK(test_stateful_ngen_and_more() == 0);
     CHECK(test_persisted_tail() == 0);
+    CHECK(test_emit_carries_scoring_logits_for_accepted_drafts() == 0);
     CHECK(test_accepted_speculative_tokens() == 0);
     CHECK(test_eos_and_non_limit_stop() == 0);
     puts("spec_decode state tests: ok");

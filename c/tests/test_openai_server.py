@@ -18,9 +18,11 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
-                           generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
-                           split_thinking_reply, stop_policy, tune_child_env)
+                           generation_options, parse_tool_calls, parse_dsv4_tool_calls,
+                           parse_arch_tool_calls, parse_k3_tool_calls,
+                           read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
+                           render_chat_v4, _dsv4_tool_calls, serve, split_thinking_reply,
+                           stop_policy, tune_child_env)
 
 
 class FakeEngine:
@@ -100,12 +102,109 @@ class TemplateTest(unittest.TestCase):
             "G 1\n",
         )
 
-    def test_kimi_rejects_tools_and_unknown_roles(self):
-        with self.assertRaisesRegex(APIError, "Tool use"):
-            render_chat_kimi([{"role": "user", "content": "Hi"}],
-                             tools=[{"type": "function"}])
+    def test_kimi_renders_tool_declaration_and_choice(self):
+        tools = [{"type": "function", "function": {
+            "name": "get_weather", "parameters": {"type": "object"}}}]
+        body = ("# Tools\nHere are the available tools, described in JSONSchema.\n\n"
+                "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
+                                         sort_keys=True) + "\n```")
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], tools=tools)
+        self.assertEqual(prompt, "K3CHAT1\n"
+                         f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}"
+                         "M user 2\nHi"
+                         "G 0\n")
+        # tool_choice=none: the tools are not offered at all
+        self.assertEqual(render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                          tools=tools, tool_choice="none"),
+                         "K3CHAT1\nM user 2\nHiG 0\n")
+        # tool_choice=required appends the reference's tool-choice system message
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                  tools=tools, tool_choice="required")
+        self.assertIn("\ntool-choiceThe system is invoked with `tool_choice=required`.", prompt)
+        self.assertTrue(prompt.endswith("G 0\n"))
+
+    def test_kimi_renders_tool_calls_and_results(self):
+        messages = [
+            {"role": "user", "content": "Weather in Rome?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Rome", "days": 1e2, "metric": true}'}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+        ]
+        prompt = render_chat_kimi(messages)
+        # B: assistant turn carrying the call; V records keep the exact JSON
+        # literal for non-strings (1e2 stays 1e2) and decode strings.
+        self.assertIn("B 0 0 0 1\n", prompt)
+        self.assertIn("F 11 3\nget_weather", prompt)
+        self.assertIn("V 4 6 4\ncitystringRome", prompt)
+        self.assertIn("V 4 6 3\ndaysnumber1e2", prompt)
+        self.assertIn("V 6 7 4\nmetricbooleantrue", prompt)
+        # O: the result resolves its name through tool_call_id
+        self.assertIn("O 1 11 5\nget_weathersunny", prompt)
+
+    def test_kimi_tool_results_resort_by_call_id(self):
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function",
+                 "function": {"name": "first", "arguments": "{}"}},
+                {"id": "b", "type": "function",
+                 "function": {"name": "second", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "b", "content": "B"},
+            {"role": "tool", "tool_call_id": "a", "content": "A"},
+        ]
+        prompt = render_chat_kimi(messages)
+        # Results are re-sorted into tool_calls order, names resolved from ids.
+        self.assertIn("O 1 5 1\nfirstA", prompt)
+        self.assertIn("O 2 6 1\nsecondB", prompt)
+        self.assertLess(prompt.index("O 1 5 1"), prompt.index("O 2 6 1"))
+
+    def test_kimi_json_fallback_for_unparseable_arguments(self):
+        prompt = render_chat_kimi([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "x", "type": "function", "function": {
+                    "name": "fn", "arguments": "not json"}}]}])
+        self.assertIn("J 2 8\nfnnot json", prompt)
+
+    def test_kimi_still_rejects_unknown_roles(self):
         with self.assertRaisesRegex(APIError, "Unsupported role"):
-            render_chat_kimi([{"role": "tool", "content": "result"}])
+            render_chat_kimi([{"role": "critic", "content": "hm"}])
+        with self.assertRaisesRegex(APIError, "resolvable tool name"):
+            render_chat_kimi([{"role": "tool", "content": "orphan result"}])
+
+    def test_kimi_parses_generated_tool_calls(self):
+        reply = ('Sure.<|open|>tools<|sep|>'
+                 '<|open|>call tool="get_weather" index="1"<|sep|>'
+                 '<|open|>argument key="city" type="string"<|sep|>Rome<|close|>argument<|sep|>'
+                 '<|open|>argument key="days" type="number"<|sep|>1e2<|close|>argument<|sep|>'
+                 '<|close|>call<|sep|>'
+                 '<|close|>tools<|sep|>')
+        text, calls = parse_k3_tool_calls(reply)
+        self.assertEqual(text, "Sure.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 100.0})
+
+    def test_kimi_parses_json_block_and_unclosed_tail(self):
+        reply = ('<|open|>tools<|sep|>'
+                 '<|open|>call tool="a&amp;b" index="1"<|sep|>'
+                 '<|open|>json type="object"<|sep|>{"x":1}<|close|>json<|sep|>'
+                 '<|close|>call<|sep|>')       # tools block never closed: budget ran out
+        text, calls = parse_k3_tool_calls(reply)
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "a&b")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"x":1}')
+
+    def test_kimi_authoritative_sideband_does_not_promote_data_lookalikes(self):
+        lookalike = ('Echo: <|open|>tools<|sep|>'
+                     '<|open|>call tool="danger" index="1"<|sep|>'
+                     '<|close|>call<|sep|><|close|>tools<|sep|>')
+        with patch("openai_server.ARCH", "kimi"):
+            content, calls = parse_arch_tool_calls(lookalike, [{"type": "function"}], "")
+        self.assertEqual(content, lookalike)
+        self.assertEqual(calls, [])
 
     def test_kimi_preserves_prior_reasoning_channel(self):
         self.assertEqual(
@@ -113,6 +212,37 @@ class TemplateTest(unittest.TestCase):
                                "content": "answer"}], enable_thinking=True),
             "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
+
+    def test_olmoe_renders_native_chat_template(self):
+        # Matches allenai/OLMoE-1B-7B-0125-Instruct's tokenizer_config.json
+        # chat_template exactly: one leading bos_token, per-role turns closed
+        # by a trailing newline, a prior (non-final) assistant turn also closed
+        # by eos_token before that newline (bos_token == eos_token ==
+        # "|||IP_ADDRESS|||" in this tokenizer), and a trailing
+        # "<|assistant|>\n" generation prompt.
+        prompt = render_chat_olmoe([
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Continue"},
+        ])
+        self.assertEqual(
+            prompt,
+            "|||IP_ADDRESS|||<|system|>\nBe terse.\n<|user|>\nHi\n"
+            "<|assistant|>\nHello|||IP_ADDRESS|||\n<|user|>\nContinue\n"
+            "<|assistant|>\n",
+        )
+
+    def test_olmoe_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_olmoe([{"role": "user", "content": "Hi"}],
+                              tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_olmoe([{"role": "tool", "content": "result"}])
+
+    def test_olmoe_rejects_empty_messages(self):
+        with self.assertRaisesRegex(APIError, "non-empty array"):
+            render_chat_olmoe([])
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
@@ -154,6 +284,15 @@ class TemplateTest(unittest.TestCase):
         # (draft source only — bad grammar costs the speedup, never the request)
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
+
+    def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
+        with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
+            self.assertEqual(generation_options({}, 8)[1], 0.25)
+            self.assertEqual(generation_options({"temperature": 0}, 8)[1], 0.0)
+        for invalid in ("malformed", "5", "-1", "nan", "1e999"):
+            with self.subTest(invalid=invalid):
+                with patch.dict("openai_server.os.environ", {"COLI_TEMP": invalid}):
+                    self.assertEqual(generation_options({}, 8)[1], 0.7)
 
     def test_validates_stop_sequences(self):
         self.assertEqual(generation_options({"stop": "END"}, 8)[4], ("END",))
@@ -293,6 +432,21 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(stats["timed_out"], 1)
         self.assertEqual(stats["cancelled"], 1)
 
+    def test_counts_admitted_client_cancellation_without_completion(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
+        with self.assertRaises(ClientCancelled):
+            with scheduler.admit():
+                raise ClientCancelled()
+        stats = scheduler.snapshot()
+        self.assertEqual(stats["active"], 0)
+        self.assertEqual(stats["admitted"], 1)
+        self.assertEqual(stats["completed"], 0)
+        self.assertEqual(stats["cancelled"], 1)
+
+        with scheduler.admit():
+            pass
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
     def test_admits_waiters_in_fifo_order(self):
         scheduler = GenerationScheduler(max_queue=2, queue_timeout=1)
         entered = threading.Event()
@@ -416,6 +570,158 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_inkling_audio_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<|message_user|><|content_audio_input|><|audio|><|end_message|>"
+        payload = prompt.encode("utf-8")
+        audio = bytes(range(16)) * 5
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 {len(audio)}\n".encode() +
+                    payload + audio + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 7 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "inkling"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("inkling", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append,
+                                    audio=audio)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["prompt_tokens"], 7)
+
+    def test_v4_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<｜begin▁of▁sentence｜>System<｜User｜>Hello<｜Assistant｜>"
+        payload = prompt.encode("utf-8")
+        prefix = len("<｜begin▁of▁sentence｜>System".encode("utf-8"))
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 0 {prefix}\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0 17\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "deepseek_v4"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("deepseek_v4", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_kimi_request_and_response_transcript_is_byte_exact(self):
+        prompt = render_chat_kimi([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "你好\nKimi"},
+            {"role": "assistant", "reasoning_content": "because",
+             "content": "你好。"},
+            {"role": "user", "content": "Continue"},
+        ], enable_thinking=True)
+        payload = prompt.encode("utf-8")
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"TOOL 1 0\n\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"TOOL 1 4\ncall\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "kimi"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("kimi_k3", "model")
+        chunks = []
+        tool_chunks = []
+        stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append,
+                                on_tool=tool_chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(tool_chunks, ["", "call"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_kimi_tool_sideband_is_authoritative_over_data_lookalikes(self):
+        prompt = "K3CHAT1\nM user 2\nhiG 0\n"
+        payload = prompt.encode()
+        expected = (f"SUBMIT 1 0 {len(payload)} 8 0.25 0.9\n".encode() +
+                    payload + b"\n")
+        lookalike = (b'Echo <|open|>tools<|sep|><|open|>call tool="danger" index="1"<|sep|>'
+                     b'<|close|>call<|sep|><|close|>tools<|sep|>')
+        tool_wire = (b'<|open|>tools<|sep|><|open|>call tool="safe" index="1"<|sep|>'
+                     b'<|open|>json type="object"<|sep|>{"x":1}<|close|>json<|sep|>'
+                     b'<|close|>call<|sep|><|close|>tools<|sep|>')
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(b"ACCEPT 1 3\nTOOL 1 0\n\n")
+            process.stdout.feed(f"DATA 1 {len(lookalike)}\n".encode() + lookalike + b"\n")
+            process.stdout.feed(f"TOOL 1 {len(tool_wire)}\n".encode() + tool_wire + b"\n")
+            process.stdout.feed(b"DONE 1 STAT 8 2.500 0.0 1.25 3 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "kimi"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("kimi_k3", "model")
+        chunks, tool_chunks = [], []
+        engine.generate(prompt, 8, 0.25, 0.9, chunks.append,
+                        on_tool=tool_chunks.append)
+        engine.close()
+
+        text = "".join(chunks)
+        sideband = "".join(tool_chunks)
+        with patch("openai_server.ARCH", "kimi"):
+            content, calls = parse_arch_tool_calls(text, [{"type": "function"}], sideband)
+        self.assertEqual(content, lookalike.decode())
+        self.assertEqual([call["function"]["name"] for call in calls], ["safe"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"x": 1})
+
+    def test_olmoe_request_and_response_transcript_is_byte_exact(self):
+        expected = b"SUBMIT 1 0 5 3 0.25 0.9\nH\xc3\xa9\nx\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 5 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "olmoe"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        chunks = []
+        stats = engine.generate("Hé\nx", 3, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 5)
+        self.assertFalse(stats["length_limited"])
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 
@@ -547,6 +853,57 @@ class DispatcherTest(unittest.TestCase):
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
         }])
 
+    def test_accepts_u7a_echo_and_extended_data_frames(self):
+        # U7a forward-compat: the engine's opt-in per-token numeric channel --
+        # ECHO frames for echoed prompt positions and DATA frames extended
+        # with "<lp> <k> [tid tlp]*k" -- must NOT trip the dispatcher's
+        # catch-all (which kills every in-flight request). Text delivery and
+        # the DONE stats stay exactly as for legacy frames; the numeric
+        # fields are consumed by the server feature half (U7b).
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + request_id + b" 3\n")
+            process.stdout.feed(b"ECHO " + request_id + b" 2 0 nan 0\nHi\n")
+            process.stdout.feed(
+                b"ECHO " + request_id +
+                b" 6 1 -0.105361 2 7 -0.105361 9 -2.302585\n world\n")
+            process.stdout.feed(
+                b"ECHO " + request_id +
+                b" 1 2 -1.203973 2 4 -0.803973 6 -1.203973\n!\n")
+            process.stdout.feed(
+                b"DATA " + request_id +
+                b" 2 -0.223144 2 3 -0.223144 8 -1.723144\nok\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 3 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        stats = engine.generate("Hi world!", 4, 0.0, 1.0, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 3)
+        self.assertIsNone(engine.dispatcher_error)
+        engine.close()
+
+    def test_unknown_frame_still_stops_dispatcher(self):
+        # The catch-all that makes an unrecognized frame a hard failure is
+        # load-bearing for the U7a compatibility asymmetry (a new engine's
+        # frame reaching an OLD server kills the dispatcher -- the reason the
+        # engine half ships first and stays opt-in). Accepting ECHO/extended
+        # DATA must not have widened acceptance beyond those frames.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"LOGPROB " + request_id + b" 0.5\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine response: LOGPROB"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
@@ -568,6 +925,50 @@ class DispatcherTest(unittest.TestCase):
             engine.generate("hello", 8, 0.7, 0.9, output.append, cancelled=lambda: True)
         engine.close()
         self.assertEqual(output, ["x"])
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
+    def test_cancels_generation_before_first_frame(self):
+        # #908: a client that disconnects while the engine is still prefilling
+        # (no DATA frame has arrived) must cancel too. cancelled() used to be
+        # polled only in the "data" branch, so the CANCEL never went out and
+        # the turn ran to its token limit while this thread stayed blocked.
+        # The fake engine emits nothing until it sees CANCEL -- exactly the
+        # pre-first-frame regime -- and must still get one.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        flag = {"cancelled": False}
+        outcome = []
+
+        def generate():
+            try:
+                engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                outcome.append("cancelled")
+
+        thread = threading.Thread(target=generate)
+        thread.start()
+        for _ in range(200):
+            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                break
+            time.sleep(0.01)
+        flag["cancelled"] = True
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        engine.close()
+        self.assertEqual(outcome, ["cancelled"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
     def test_stops_generation_through_successful_done_path(self):
@@ -648,43 +1049,80 @@ class CapSentinelShimTest(unittest.TestCase):
                     [executable, want],
                     f"arch={model_type} exe={executable} kwargs={kwargs}")
 
-    def test_missing_or_unreadable_config_is_glm(self):
-        # historic default: anything that cannot be classified is glm
+    def test_synthetic_engine_without_config_uses_explicit_arch(self):
         self.assertEqual(self._spawn_argv("engine", "/nonexistent/model"),
                          ["engine", "0"])
         model = Path(self.tmp.name) / "model-broken"
         model.mkdir()
         (model / "config.json").write_text("{not json")
-        self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
+        with self.assertRaisesRegex(ValueError, "invalid config.json"):
+            self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
         self.assertEqual(cap_for_arch("glm", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
+        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
         self.assertEqual(cap_for_arch("glm", 0), 0)
+
+    def test_profile_cap_is_below_explicit_cap_and_above_implicit_default(self):
+        profiled = {"COLI_PROFILE_CAP": "24"}
+        self.assertEqual(cap_for_arch("inkling", None, profiled), 24)
+        self.assertEqual(cap_for_arch("inkling", 7, profiled), 7)
+        self.assertEqual(cap_for_arch("inkling", None,
+                                      {"COLI_PROFILE_CAP": "invalid"}), 8)
+
+    def test_engine_consumes_profile_cap_without_leaking_private_env(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        model = self._model("inkling")
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine("custom-engine", model,
+                            env={"COLI_PROFILE_CAP": "24", "KEEP": "yes"})
+            engine.close()
+        command = popen.call_args[0][0]
+        child_env = popen.call_args[1]["env"]
+        self.assertEqual(command, ["custom-engine", "24"])
+        self.assertNotIn("COLI_PROFILE_CAP", child_env)
+        self.assertEqual(child_env["KEEP"], "yes")
 
     def test_model_arch_reads_model_type(self):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
-        self.assertEqual(model_arch("/nonexistent"), "glm")
+        self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
+        with self.assertRaisesRegex(ValueError, "cannot read config.json"):
+            model_arch("/nonexistent")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}
-        with patch("resource_plan.physical_cpu_count", return_value=6), \
+        with patch("resource_plan.physical_cpu_count",
+                   side_effect=AssertionError("V4 server sized the team")), \
              patch("openai_server.sys.platform", "linux"):
             tune_child_env(env, "deepseek_v4")
-        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertNotIn("OMP_NUM_THREADS", env)
         self.assertEqual(env["OMP_PROC_BIND"], "close")
         self.assertEqual(env["V4_DRAFT"], "0")
         self.assertEqual(env["V4_MTP"], "0")
         self.assertEqual(env["V4_MTP_DRAFT"], "3")
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+        self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
+
+    def test_direct_v4_server_preserves_explicit_omp_threads(self):
+        env = {"OMP_NUM_THREADS": "3"}
+        tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+
+    def test_direct_v4_server_honours_omp_kill_switch(self):
+        env = {"COLI_NO_OMP_TUNE": "1"}
+        tune_child_env(env, "deepseek_v4")
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+                    "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
+            self.assertNotIn(key, env)
 
 
 class HTTPTest(unittest.TestCase):
@@ -716,6 +1154,7 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/models", key="wrong")
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_health_reports_scheduler_and_kv_slots(self):
@@ -826,6 +1265,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stop": "H", "x_colibri_ignore_leading_stop": "yes",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_rejects_invalid_cache_slot(self):
@@ -834,7 +1274,38 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "cache_slot": 2,
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
+
+    def test_olmoe_never_files_the_answer_as_reasoning(self):
+        # #984: OLMoE has no thinking mode, so its engine never emits </think>.
+        # With thinking left on, the reasoning splitter kept the whole answer in
+        # reasoning_content and streamed an empty `content` -- content dropped.
+        # Forcing thinking off for olmoe must return the answer as content
+        # whether or not the client asked for reasoning, streaming or not.
+        for streaming in (False, True):
+            with self.subTest(stream=streaming), \
+                 patch("openai_server.ARCH", "olmoe"):
+                with self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "reasoning_effort": "high",   # a client asking to think
+                    "stream": streaming,
+                }) as response:
+                    raw = response.read().decode()
+                if streaming:
+                    payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                                if line.startswith("data: ") and line != "data: [DONE]"]
+                    content = "".join((c.get("delta") or {}).get("content", "")
+                                      for p in payloads for c in p["choices"])
+                    reasoning = "".join((c.get("delta") or {}).get("reasoning_content", "")
+                                        for p in payloads for c in p["choices"])
+                else:
+                    msg = json.loads(raw)["choices"][0]["message"]
+                    content = msg.get("content") or ""
+                    reasoning = msg.get("reasoning_content") or ""
+                self.assertIn("Hé", content, "the answer must arrive as content")
+                self.assertEqual(reasoning, "", "olmoe must not produce reasoning")
 
     def test_streaming_chat_completion(self):
         with self.request("/v1/chat/completions", {
@@ -875,6 +1346,7 @@ class HTTPTest(unittest.TestCase):
     def test_rejects_empty_legacy_completion(self):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/completions", {"model": "test-model", "prompt": ""})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
         self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
 
@@ -884,6 +1356,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True, "stream_options": "usage",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
 
@@ -938,6 +1411,49 @@ class ClientHangupTest(unittest.TestCase):
                      timeout=2) as response:
             self.assertEqual(json.load(response)["status"], "ok")
 
+    def _abort(self, *args):
+        """Windows' spelling of the same disconnect, raised where it really lands.
+
+        In #854's log the traceback runs do_GET -> send_json -> end_headers ->
+        flush_headers -> wfile.write -> sendall, so raising from end_headers
+        reproduces the exact shape on any platform.
+        """
+        raise ConnectionAbortedError(
+            10053, "An established connection was aborted by the software in your "
+                   "host machine")
+
+    def test_windows_aborted_connection_is_not_an_error(self):
+        """ConnectionAbortedError is a SIBLING of BrokenPipeError and
+        ConnectionResetError under ConnectionError, not a subclass of either --
+        so catching the pair caught the POSIX spellings and let the Windows one
+        escape. #854 is pages of WinError 10053 tracebacks from a healthy start.
+        """
+        self.assertFalse(
+            issubclass(ConnectionAbortedError, (BrokenPipeError, ConnectionResetError)),
+            "the old except clause would have covered this; the test proves nothing")
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
+            except Exception:
+                pass                      # the client sees a broken response; that is fine
+            time.sleep(0.3)
+        self.assertEqual(self.errors, [],
+                         "WinError 10053 surfaced as a server error (#854)")
+
+    def test_the_server_survives_an_aborted_connection(self):
+        """Same as the hangup case: the damage is a lost handler, not the log."""
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
+            except Exception:
+                pass
+            time.sleep(0.3)
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
+
 
 class StaticServingTest(unittest.TestCase):
     def setUp(self):
@@ -969,6 +1485,7 @@ class StaticServingTest(unittest.TestCase):
             self.assertEqual(response.read(), b"dashboard")
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
 
 
@@ -1004,6 +1521,7 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertTrue(self.engine.entered.wait(1))
         with self.assertRaises(HTTPError) as caught:
             self.request()
+        self.addCleanup(caught.exception.close)
         error = json.loads(caught.exception.read())["error"]
         self.assertEqual(caught.exception.code, 429)
         self.assertEqual(caught.exception.headers["Retry-After"], "1")
@@ -1050,6 +1568,101 @@ class ToolArgumentTypeTest(unittest.TestCase):
         args = self._args("<tool_call>lookup_order"
                           "<arg_key>extra</arg_key><arg_value>7</arg_value></tool_call>")
         self.assertEqual(args["extra"], 7)
+
+
+class DeepSeekV4ToolCallTest(unittest.TestCase):
+    """DeepSeek V4 (#916): DSML tool blocks. Schemas render into the first system/developer
+    message, assistant tool_calls render as <｜DSML｜invoke> blocks, tool results merge into
+    user turns as <tool_result>, and model output parses back into OpenAI tool_calls."""
+
+    DSML = "｜DSML｜"
+    WEATHER = [{"type": "function", "function": {
+        "name": "get_weather", "description": "current weather",
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"]}}}]
+    CALL = [{"id": "call_1", "type": "function", "function": {
+        "name": "get_weather",
+        "arguments": json.dumps({"city": "Paris", "days": 3})}}]
+
+    def test_tools_declared_on_first_system_message(self):
+        prompt = render_chat_v4([{"role": "system", "content": "Be brief."},
+                                 {"role": "user", "content": "Weather?"}], tools=self.WEATHER)
+        self.assertLess(prompt.index("Be brief."), prompt.index("## Tools"))
+        self.assertIn(f'"{self.WEATHER[0]["function"]["name"]}"', prompt)
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>"))
+
+    def test_tools_prepended_when_no_system_message(self):
+        prompt = render_chat_v4([{"role": "user", "content": "hi"}], tools=self.WEATHER)
+        # The official encoder renders tools on an empty system message: bos + "\n\n" + tools.
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>\n\n## Tools"))
+
+    def test_tool_choice_none_suppresses_declaration(self):
+        prompt = render_chat_v4([{"role": "user", "content": "hi"}],
+                                tools=self.WEATHER, tool_choice="none")
+        self.assertNotIn("## Tools", prompt)
+
+    def test_developer_message_is_wrapped_in_user_token(self):
+        # encoding_dsv4.py wraps developer content in <｜User｜>; system stays bare.
+        prompt = render_chat_v4([{"role": "developer", "content": "Be terse."},
+                                 {"role": "user", "content": "hi"}], tools=self.WEATHER)
+        self.assertIn("<｜User｜>Be terse.", prompt)
+        self.assertNotIn("<｜User｜>## Tools", prompt)
+
+    def test_thinking_mode_prepends_effort_prompt(self):
+        # encoding_dsv4.py prepends the level prompt after BOS in thinking mode.
+        prompt = render_chat_v4([{"role": "user", "content": "hi"}], enable_thinking=True,
+                                reasoning_effort="high")
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: High."))
+        self.assertTrue(prompt.endswith("<｜Assistant｜><think>"))
+        # V4-native level names work too; low adds nothing.
+        self.assertTrue(render_chat_v4([{"role": "user", "content": "hi"}],
+                                       enable_thinking=True, reasoning_effort="max").startswith(
+            "<｜begin▁of▁sentence｜>Reasoning Effort: Maximum."))
+        self.assertFalse(render_chat_v4([{"role": "user", "content": "hi"}],
+                                        enable_thinking=True, reasoning_effort="low").startswith(
+            "<｜begin▁of▁sentence｜>Reasoning Effort:"))
+
+    def test_assistant_tool_calls_render_as_dsml(self):
+        prompt = render_chat_v4([{"role": "user", "content": "Paris?"},
+                                 {"role": "assistant", "content": None,
+                                  "tool_calls": self.CALL}])
+        self.assertIn(f'<{self.DSML}invoke name="get_weather">', prompt)
+        self.assertIn(f'<{self.DSML}parameter name="city" string="true">Paris</{self.DSML}parameter>',
+                      prompt)
+        self.assertIn(f'<{self.DSML}parameter name="days" string="false">3</{self.DSML}parameter>',
+                      prompt)
+        self.assertTrue(prompt.endswith("</think>"))
+
+    def test_tool_results_merge_into_one_user_turn(self):
+        prompt = render_chat_v4([{"role": "user", "content": "Paris?"},
+                                 {"role": "assistant", "content": None, "tool_calls": self.CALL},
+                                 {"role": "tool", "tool_call_id": "call_1", "content": "21c"},
+                                 {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                                 {"role": "user", "content": "And London?"}])
+        self.assertEqual(prompt.count("<｜User｜>"), 2)
+        self.assertIn("<tool_result>21c</tool_result>", prompt)
+        self.assertIn("<tool_result>sunny</tool_result>", prompt)
+        self.assertIn("And London?", prompt)
+
+    def test_parse_dsml_reply_to_openai_tool_calls(self):
+        raw = (f"Here you go.\n\n<{self.DSML}tool_calls>\n"
+               f"<{self.DSML}invoke name=\"get_weather\">\n"
+               f"<{self.DSML}parameter name=\"city\" string=\"true\">Paris</{self.DSML}parameter>\n"
+               f"<{self.DSML}parameter name=\"days\" string=\"false\">3</{self.DSML}parameter>\n"
+               f"</{self.DSML}invoke>\n</{self.DSML}tool_calls><｜end▁of▁sentence｜>")
+        content, calls = parse_dsv4_tool_calls(raw)
+        self.assertEqual(content, "Here you go.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Paris", "days": 3})
+
+    def test_parse_truncated_block_leaks_no_markers(self):
+        content, calls = parse_dsv4_tool_calls("Almost.\n\n<｜DSML｜tool_calls><｜DSML｜invoke na")
+        self.assertEqual(calls, [])
+        self.assertEqual(content, "Almost.")
+        self.assertNotIn("DSML", content)
 
 
 class EngineErrorFrameTest(unittest.TestCase):
@@ -1219,6 +1832,31 @@ class AllowedHostsTest(unittest.TestCase):
     def test_untrusted_host_still_rejected_with_allowlist(self):
         server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
         self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+    def test_wildcard_accepts_any_host(self):
+        # #990: a Docker/LAN bind reached by an unpredictable IP. The wildcard is
+        # an explicit operator opt-out, so ANY host passes -- but loopback and a
+        # real name still work, i.e. it widens rather than replaces.
+        server = self._make_server(allowed_hosts=("*",))
+        port = server.server_port
+        self.assertEqual(self._get_models(port, "10.20.30.40:36873"), 200)
+        self.assertEqual(self._get_models(port, "colibri.example.com"), 200)
+        self.assertEqual(self._get_models(port, "localhost"), 200)
+
+    def test_rejection_message_names_the_host_and_the_fix(self):
+        server = self._make_server()
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            conn.putrequest("GET", "/v1/models", skip_host=True)
+            conn.putheader("Host", "myserver.lan:36873")
+            conn.endheaders()
+            resp = conn.getresponse()
+            body = resp.read().decode()
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 403)
+        self.assertIn("myserver.lan", body)          # the offending host, so the user can copy it
+        self.assertIn("--allowed-host", body)        # and how to fix it
 
 
 class ThinkingSplitUnitTest(unittest.TestCase):
@@ -1455,6 +2093,7 @@ class StreamingContextRejectTest(unittest.TestCase):
                       headers={"Content-Type": "application/json"})
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=3)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
         body = json.load(caught.exception)
         self.assertEqual(body["error"]["code"], "context_length_exceeded")
@@ -1746,6 +2385,45 @@ class ConnectionLimitTest(unittest.TestCase):
         time.sleep(APIHandler.READ_DEADLINE + 1.5)
         self.assertEqual(self.server._conn_live, 0,
                          "dripping connections were never reclaimed")
+
+
+class ReasoningEffortTest(unittest.TestCase):
+    """render_chat mapped every level except "high" onto Max (#809).
+
+    The endpoint accepts none/minimal/low/medium/high/xhigh. Four of the five
+    that enable thinking rendered Max, so a client asking for `minimal` got
+    more reasoning than one asking for `high` -- and on a single machine
+    unrequested reasoning spends the token budget before the answer starts.
+    """
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def effort(self, level):
+        import re
+        text = render_chat(self.MESSAGES, enable_thinking=True,
+                           reasoning_effort=level)
+        found = re.search(r"Reasoning Effort: (\w+)", text)
+        return found.group(1) if found else None
+
+    def test_levels_are_distinct_and_ordered(self):
+        rendered = [self.effort(l) for l in
+                    ("minimal", "low", "medium", "high", "xhigh")]
+        rank = {"Low": 0, "Medium": 1, "High": 2, "Max": 3}
+        scores = [rank[r] for r in rendered]
+        self.assertEqual(scores, sorted(scores), rendered)
+        self.assertLess(scores[0], scores[-1],
+                        "minimal and xhigh render the same effort")
+
+    def test_minimal_is_not_max(self):
+        """The reported symptom, pinned on its own."""
+        self.assertNotEqual(self.effort("minimal"), "Max")
+        self.assertNotEqual(self.effort("low"), "Max")
+        self.assertNotEqual(self.effort("medium"), "Max")
+
+    def test_thinking_off_emits_no_effort_line(self):
+        text = render_chat(self.MESSAGES, enable_thinking=False,
+                           reasoning_effort="xhigh")
+        self.assertNotIn("Reasoning Effort", text)
 
 
 if __name__ == "__main__":

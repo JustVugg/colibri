@@ -38,11 +38,12 @@ WORKDIR /app
 # The engine binary plus the launcher and the files it resolves at runtime
 # (version.py, the gateway, resource planner, doctor, tokenizer headers, tools).
 COPY --from=build /src/c/colibri            ./colibri
-COPY c/coli c/version.py c/openai_server.py c/resource_plan.py c/doctor.py c/autotune.py ./
+COPY c/coli c/version.py c/openai_server.py c/v4_dsml.py c/family_registry.py c/resource_plan.py c/doctor.py c/autotune.py ./
 COPY c/tools/ ./tools/
 
 ENV COLI_MODEL=/model \
     COLI_ENGINE=/app/colibri \
+    COLI_DOCKER_GLM_ONLY=1 \
     PYTHONUNBUFFERED=1
 # A bind-mounted model lands here; declaring the volume documents the contract.
 VOLUME ["/model"]

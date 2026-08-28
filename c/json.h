@@ -53,7 +53,11 @@ static jval *j_new(jtype t) {
 static jval *j_parse_val(jparser *p);
 
 static char *j_parse_str_raw(jparser *p) {
-    /* assume *p->s == '"' */
+    /* SEC (GHSA-2qrj): fail closed if not actually at a quote. The old comment
+     * "assume *p->s == '\"'" was violated on the object-key path, and the
+     * unconditional p->s++ would step past the buffer's NUL terminator and scan
+     * adjacent heap (OOB read leaking into tensor names). */
+    if (*p->s != '"') return j_dup(p, "", 0);
     p->s++;
     /* buffer su heap che CRESCE: niente troncamento silenzioso a 64KB (le stringhe
      * lunghe di tokenizer.json/config venivano tagliate) e niente 64KB di stack. */
@@ -103,15 +107,26 @@ static jval *j_parse_val(jparser *p) {
     if (c == '{') {
         if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_OBJ);
-        int cap = 8; v->keys = malloc(cap * sizeof(char*)); v->kids = malloc(cap * sizeof(jval*));
+        int cap = 8;
+        v->keys = malloc(cap * sizeof(char*));
+        if (!v->keys) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
+        v->kids = malloc(cap * sizeof(jval*));
+        if (!v->kids) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
         j_ws(p);
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
             j_ws(p);
+            if (*p->s != '"') break;   /* SEC (GHSA-2qrj): object key must be a quoted string; stop on malformed input */
             char *key = j_parse_str_raw(p);
             j_ws(p); if (*p->s == ':') p->s++;
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->keys = realloc(v->keys, cap*sizeof(char*)); v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (v->len == cap) { cap *= 2;
+                char **nk = (char**)realloc(v->keys, cap*sizeof(char*));
+                if (!nk) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
+                v->keys = nk;
+                jval **nc = (jval**)realloc(v->kids, cap*sizeof(jval*));
+                if (!nc) { fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
+                v->kids = nc; }
             v->keys[v->len] = key; v->kids[v->len] = val; v->len++;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
@@ -124,12 +139,17 @@ static jval *j_parse_val(jparser *p) {
     if (c == '[') {
         if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_ARR);
-        int cap = 8; v->kids = malloc(cap * sizeof(jval*));
+        int cap = 8;
+        v->kids = malloc(cap * sizeof(jval*));
+        if (!v->kids) { fprintf(stderr, "OOM parsing JSON array\n"); exit(1); }
         j_ws(p);
         if (*p->s == ']') { p->s++; p->depth--; return v; }
         for (;;) {
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (v->len == cap) { cap *= 2;
+                jval **nc = (jval**)realloc(v->kids, cap*sizeof(jval*));
+                if (!nc) { fprintf(stderr, "OOM parsing JSON array\n"); exit(1); }
+                v->kids = nc; }
             v->kids[v->len++] = val;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }

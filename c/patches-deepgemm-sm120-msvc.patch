@@ -1,0 +1,69 @@
+diff --git a/deep_gemm/include/deep_gemm/common/math.cuh b/deep_gemm/include/deep_gemm/common/math.cuh
+index 0f0d250..4d44ea7 100644
+--- a/deep_gemm/include/deep_gemm/common/math.cuh
++++ b/deep_gemm/include/deep_gemm/common/math.cuh
+@@ -63,9 +63,15 @@ CUTLASS_DEVICE float2 fma2(const float2& a, const float2& b, const float2& c) {
+ }
+ 
+ CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
++#ifdef __CUDA_ARCH__
+     float ret;
+     asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(ret) : "f"(x));
+     return ret;
++#else
++    /* MSVC x64 host pass has no inline asm; the host fallback only needs to
++     * be arithmetically reasonable, it is never on the kernel path. */
++    return 1.0f / x;
++#endif
+ }
+ 
+ /// Casting
+diff --git a/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh b/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh
+index 4f2d312..1b594ae 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh
+@@ -26,6 +26,11 @@
+ 
+ namespace deep_gemm {
+ 
++// See the tma_param_pad parameter note below: 12 x uint32_t = 48 bytes of
++// kernel-parameter padding so the by-value CUtensorMap descriptors start at a
++// 64-byte-aligned offset under MSVC's parameter layout too.
++struct TmaParamPad48 { uint32_t _pad[12]; };
++
+ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+           uint32_t kGranKA, uint32_t kGranKB,
+           uint32_t kNumGroups,
+@@ -53,6 +58,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
+                              float* gmem_workspace,
+                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                              uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
++                             /* Windows port: MSVC/nvcc lays out by-value kernel
++                              * parameters without honouring CUtensorMap's
++                              * alignas(64), so the __grid_constant__ descriptors
++                              * below landed at +0x50 and every TMA access faulted
++                              * (misaligned address). 48 bytes of explicit padding
++                              * pushes them to +0x80; on Linux the compiler already
++                              * padded to +0x80, so the layout is unchanged there. */
++                             TmaParamPad48 tma_param_pad,
+                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
+                              const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
+                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+diff --git a/deep_gemm/include/deep_gemm/ptx/ld_st.cuh b/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
+index 806a4c2..aa520bb 100644
+--- a/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
++++ b/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
+@@ -149,9 +149,13 @@ CUTLASS_DEVICE void st_shared(const void* ptr, uint32_t x, uint32_t y, uint32_t
+     asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(__cvta_generic_to_shared(ptr)), "r"(x), "r"(y), "r"(z), "r"(w));
+ }
+ 
++#ifndef _MSC_VER
++/* MSVC has no __int128; nothing in the sm120 impls instantiates this
++ * overload, so hide it from the MSVC host pass (Windows DLL build). */
+ CUTLASS_DEVICE void st_shared(const __int128_t* ptr, __int128_t val) {
+     asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
+ }
++#endif
+ 
+ CUTLASS_DEVICE uint32_t mapa_shared(const uint32_t& ptr, const uint32_t& dst_cta_idx) {
+     uint32_t mapped;

@@ -43,13 +43,47 @@ static int64_t expert_bytes_layer(Model *m, int layer){
  *   118 GB. The projection's shape was right; only this constant was wrong.
  *
  * nsp += 2 in cap_for_ram() already nods at the MTP row costing double, but that
- * corrects one row out of nsp; the slabs grow on all of them. */
+ * corrects one row out of nsp; the slabs grow on all of them.
+ *
+ * #856 SCOPE: this is the right width for the ws[64] working set, whose slots ARE
+ * shared across rows, and for nothing else. Sizing the per-row LRU caches with it
+ * is what expert_cache_row_bytes() below replaces. */
 static int64_t expert_bytes_probe(Model *m, int ebits){
     Cfg *c=&m->c;
     int64_t eb=expert_bytes_layer(m,c->first_dense);
     if(m->has_mtp){ int64_t mtp=expert_bytes_layer(m,c->n_layers); if(mtp>eb) eb=mtp; }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
     return eb;
+}
+
+/* Width of the experts ONE row actually holds; same fallback as the probe above.
+ *
+ * Every row has its own ecache[layer] and its own pin arena, so a row costs the
+ * width IT holds. Charging all of them the container's widest halved the cache on
+ * GLM-5.2 shipped as int4 routed + int8 MTP: 154 -> 77 slots per row, with the
+ * 5,852 experts that left RAM reappearing one-for-one on disk (#856). Diagnosis by
+ * @terrizoaguimor from @brad-evony's dashboard screenshots. */
+static int64_t expert_bytes_row(Model *m, int layer, int ebits){
+    Cfg *c=&m->c;
+    int64_t eb=expert_bytes_layer(m,layer);
+    if(eb>0) return eb;
+    eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
+    /* Header unreadable. For the MTP row keep the old "counts double" approximation
+     * (nsp+=2 in cap_for_ram) rather than assume it is as narrow as a routed row:
+     * under-reserving is the direction that ends in an OOM-kill. */
+    return layer==c->n_layers ? eb*2 : eb;
+}
+
+/* What ONE slot per row costs across EVERY row -- the divisor of the expert budget.
+ * Stateless on purpose: st_find is a hash lookup, so this is ~6 probes per layer
+ * and a few hundred for a 78-layer model, called a handful of times at startup.
+ * A memo keyed on anything less than (model, ebits) is a staleness bug waiting for
+ * whoever next changes has_mtp or the layer map. */
+static double expert_cache_row_bytes(Model *m, int ebits){
+    Cfg *c=&m->c; double sum=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) sum+=(double)expert_bytes_row(m,i,ebits);
+    if(m->has_mtp) sum+=(double)expert_bytes_row(m,c->n_layers,ebits);
+    return sum;
 }
 
 /* BRAIN MAP: per-turn expert hit bitmap for the dashboard. */
@@ -130,6 +164,19 @@ static void hwinfo_emit(Model *m){
     }
     if(g_cuda_ndev>0)
         snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+#elif defined(COLI_VULKAN)
+    double used=0, budget=0;
+    ngpu=coli_vk_available()?1:0;
+    if(ngpu){
+        if(coli_vk_mem_budget(&used,&budget)) vram_total=budget;
+        snprintf(gpu_name,sizeof(gpu_name),"Vulkan device%s",
+                 coli_vk_dev2_available()?" x2":"");
+        if(coli_vk_dev2_available()){
+            double used2=0, budget2=0;
+            if(coli_vk_mem_budget2(&used2,&budget2)) vram_total+=budget2;
+            ngpu=2;
+        }
+    }
 #endif
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
         cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
@@ -145,11 +192,31 @@ static void tiers_emit(Model *m){
     int vram=0; double vram_gb=0;
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
+#elif defined(COLI_VULKAN)
+    vram=g_vk_reg_n+g_vk_reg_n2;
+    int64_t bytes=0;
+    if(g_vk_reg) for(int i=0;i<g_vk_reg_NL;i++) for(int e=0;e<g_vk_reg_E;e++){
+        ColiVkTensor **slot=vk_reg_at(i,e);
+        for(int j=0;j<3;j++) if(slot[j]) bytes+=(int64_t)coli_vk_tensor_bytes(slot[j]);
+    }
+    vram_gb=(double)bytes/1e9;
 #endif
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
-    double eb=(double)expert_bytes_probe(m,m->ebits);
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
+    /* Per-row widths, not count x widest. The dashboard read "RAM tier ~221 GB" on a
+     * box where Windows still showed 140 GB free, because every resident expert was
+     * being priced as an int8 MTP one (#856). A tier figure that disagrees with the
+     * operating system teaches people to distrust the panel. */
+    double ram_b=0;
+    for(int i=0;i<=c->n_layers;i++){
+        int64_t w=expert_bytes_row(m,i,m->ebits);
+        ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
+    }
+    if(vram>0){                       /* the VRAM tier's host copies are not RAM-tier bytes */
+        double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;
+        ram_b -= avg*(double)vram; if(ram_b<0) ram_b=0;
+    }
+    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram_b/1e9);
     fflush(stdout);
 }
 
@@ -166,8 +233,11 @@ static void emap_emit(Model *m){
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
             int tier=0;
+#ifdef COLI_VULKAN
+            if(vk_reg_served(i,e)) tier=2;
+#endif
             ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+            for(int z=0;!tier&&z<m->npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
 #else

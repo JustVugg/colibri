@@ -1,18 +1,18 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì——小巧引擎，龐大模型">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì——小巧引擎，龐大模型">
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
 </p>
 
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
 2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-目前可執行四個模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
-（2.8T）與 **OLMoE**（7B）——各自一個 C 檔案，共用同一套 `coli chat` /
-`coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
+目前可執行六個模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
+（2.8T）、**DeepSeek V4 Flash**（284B）、**Qwen3.6**（35B-A3B）與 **OLMoE**（7B）
+——各自一個 C 檔案，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
 
 > **Colibrì 既是今天就能執行的推論引擎，也是一個開放的研究平台。**它的首要目標是在
 > 完整的軟硬體邊界上追求推論側效能——模型格式、記憶體階層、儲存 I/O、配置、排程、核心、
@@ -24,7 +24,7 @@ Colibrì 刻意用於驗證激進的系統構想——因此**對速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.8.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -217,7 +217,7 @@ MTP head 必須是 **int8**（int4 head 的接受率會崩落到 0–4%，見
 [Releases](https://github.com/JustVugg/colibri/releases) 下載對應平台的壓縮檔並解壓：
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+mkdir colibri && tar xzf colibri-v1.8.0-linux-x86_64.tar.gz -C colibri && cd colibri
 python3 coli info                         # engine ready ✓
 ```
 
@@ -290,8 +290,9 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
   配置、排程、I/O、CPU/GPU 核心、異質重疊、KV 狀態與路由感知推測。目標是降低硬體要求
   和每個有效 token 的成本，所有成果都以端到端測量為準、經審查並公開開發。
 - **支援更多開放模型。**階層演算法與模型無關，任何帶路由專家的 MoE 都能用相同方式分層。
-  GLM-5.2 與 OLMoE 目前可用；**Kimi K2**、**Qwen3 MoE**、**MiniMax** 等開放權重模型
-  已列入路線圖。
+  目前已有六個模型家族可用（GLM-5.2、Inkling、Kimi K3、DeepSeek V4 Flash、
+  Qwen3.6、OLMoE）；更多開放權重家族（候選包括 **MiniMax**）將沿用同樣的
+  規則獲得引擎支援：有人完成端到端實測之後。
 
 ## 支持專案
 
@@ -300,7 +301,7 @@ colibrì 最初是由一人使用 12 核心、25 GB RAM 的筆電開發；
 
 - ⭐ 為儲存庫加星並分享；
 - 🐛 以 issue 提交你的硬體 benchmark 數據——實測資料比任何其他事都更能推動專案；
-- 💬 加入 [Discord 社群](https://discord.gg/fpQxKnRb)，討論實驗、硬體數據與研究方向；
+- 💬 加入 [Discord 社群](https://discord.gg/MAaKtQRc)，討論實驗、硬體數據與研究方向；
 - 💬 若想贊助開發或捐贈硬體，請透過 GitHub issues 聯絡。
 
 ## 儲存庫結構

@@ -23,6 +23,13 @@ int main(void) {
         !close_enough(coli_e8m0_decode(0x7f), 1.0f) ||
         !close_enough(coli_e8m0_decode(0x80), 2.0f) ||
         !isnan(coli_e8m0_decode(0xff))) return 1;
+    const float *e8m0 = coli_e8m0_table();
+    if (!e8m0 || e8m0 != coli_e8m0_table()) return 1;
+    for (int code = 0; code < 255; code++) {
+        float decoded = coli_e8m0_decode((uint8_t)code);
+        if (memcmp(&e8m0[code], &decoded, sizeof(decoded)) != 0) return 1;
+    }
+    if (!isnan(e8m0[255])) return 1;
 
     static const float representable[] = {
         0.0f, 0.001953125f, 0.5f, 1.0f, 1.5f, 6.0f,
@@ -78,7 +85,7 @@ int main(void) {
     ColiTensorView view = {
         COLI_TENSOR_FP4_NATIVE_BLOCK, COLI_SCALE_UE8M0,
         weights, scales, sizeof(weights), sizeof(scales),
-        1, 128, 1, 32
+        1, 128, 1, 32, NULL
     };
     float output;
     if (coli_fp4_matvec_ref(&output, &view, input) != 0 ||
@@ -90,7 +97,7 @@ int main(void) {
     ColiTensorView fp8_view = {
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
         fp8_weights, fp8_scales, sizeof(fp8_weights), sizeof(fp8_scales),
-        128, 128, 128, 128
+        128, 128, 128, 128, NULL
     };
     float fp8_output[128];
     if (coli_fp8_matvec_ref(fp8_output, &fp8_view, input) != 0)
@@ -113,7 +120,7 @@ int main(void) {
     ColiTensorView row_major_view = {
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
         row_major, fp8_scales, sizeof(row_major), sizeof(fp8_scales),
-        8, 128, 128, 128
+        8, 128, 128, 128, NULL
     };
     ColiTensorView rows8_view = row_major_view;
     rows8_view.data = rows8;

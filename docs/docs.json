@@ -1,0 +1,74 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "colibrì",
+  "description": "Run frontier mixture-of-experts models on consumer and heterogeneous hardware.",
+  "colors": {
+    "primary": "#00afaf",
+    "light": "#5fd7d7",
+    "dark": "#008b8b"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["index", "quickstart"]
+          },
+          {
+            "group": "Serve models",
+            "pages": ["api-reference/overview", "api", "serve_protocol"]
+          },
+          {
+            "group": "Model engines",
+            "pages": ["deepseek-v4", "kimi_k3", "qwen36", "inkling"]
+          },
+          {
+            "group": "Configure and tune",
+            "pages": ["SETTINGS", "ENVIRONMENT", "tuning", "CACHE_ROUTE"]
+          },
+          {
+            "group": "Hardware backends",
+            "pages": ["cuda", "metal", "vulkan", "windows"]
+          },
+          {
+            "group": "Contribute",
+            "pages": ["benchmarks", "MAINTAINING-DOCS"]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": {
+          "source": "./api-reference/openapi.json",
+          "directory": "api-reference/endpoints"
+        }
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Website",
+        "href": "https://justvugg.github.io/colibri"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/JustVugg/colibri",
+        "icon": "github"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Quickstart",
+      "href": "/quickstart"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/JustVugg/colibri"
+    }
+  }
+}

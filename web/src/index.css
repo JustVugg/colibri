@@ -79,6 +79,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .suggestions { width: 100%; display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-top: 38px; }.suggestions button { display: flex; justify-content: space-between; align-items: center; min-height: 62px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 11px; color: #a5b0b4; background: rgba(13,18,21,.75); text-align: left; font-size: 11px; line-height: 1.4; transition: .2s; }.suggestions button:hover { border-color: rgba(78,214,165,.35); color: var(--foreground); transform: translateY(-2px); }
 .message-list { width: min(820px, calc(100% - 48px)); margin: 0 auto; padding: 44px 0 20px; }
 .message { display: grid; grid-template-columns: 34px minmax(0,1fr); gap: 14px; margin-bottom: 34px; }.avatar { display: grid; place-items: center; width: 31px; height: 31px; border: 1px solid var(--border); border-radius: 9px; color: #aeb8bc; background: var(--card); font-size: 11px; font-weight: 700; }.message.assistant .avatar { color: var(--primary); border-color: rgba(78,214,165,.25); background: rgba(78,214,165,.06); }.message-meta { height: 27px; color: #7f8c91; font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }.message-body { color: #d8e0e2; font-size: 14px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }.message.user .message-body { color: #aeb9bd; }
+/* Reasoning models stream their thinking before the answer. It is folded away
+   once the answer starts arriving (open={!item.content} in App.tsx), so a long
+   chain of thought does not push the reply off the screen. */
+.reasoning { margin-bottom: 14px; border-left: 2px solid rgba(78,214,165,.28); padding-left: 12px; }
+.reasoning > summary { color: #7f8c91; font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; cursor: pointer; list-style: none; }
+.reasoning > summary::-webkit-details-marker { display: none; }
+.reasoning > summary::before { content: "\25B8 "; display: inline-block; transition: transform .15s; }
+.reasoning[open] > summary::before { transform: rotate(90deg); }
+.reasoning > summary:hover { color: #aeb9bd; }
+.reasoning-body { margin-top: 8px; color: #8d989c; font-size: 13px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
 .typing { display: inline-flex; gap: 4px; padding-top: 6px; }.typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--primary); animation: pulse 1.1s infinite; }.typing i:nth-child(2) { animation-delay: .15s; }.typing i:nth-child(3) { animation-delay: .3s; }
 .composer-wrap { padding: 10px 32px 24px; background: linear-gradient(transparent, var(--background) 24%); }.composer { width: min(820px, 100%); margin: 0 auto; overflow: hidden; border: 1px solid #2a353a; border-radius: 15px; background: rgba(13,18,21,.94); box-shadow: 0 18px 55px rgba(0,0,0,.24); }.composer textarea { min-height: 74px; border: 0; }.composer-foot { display: flex; align-items: center; justify-content: space-between; padding: 0 9px 9px 15px; }.composer-foot > span { display: flex; align-items: center; gap: 6px; color: #56646a; font-size: 9px; }.error-banner { width: min(820px, 100%); margin: 0 auto 8px; padding: 9px 12px; border: 1px solid rgba(255,118,111,.25); border-radius: 9px; color: #ff9d98; background: rgba(255,118,111,.07); font-size: 11px; }
 @keyframes pulse { 0%, 70%, 100% { opacity: .25; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-3px); } }
@@ -190,3 +200,47 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .prof-tiles { grid-template-columns: 1fr 1fr; }
   .prof-charts { grid-template-columns: 1fr; }
 }
+
+/* --- markdown in the chat pane -------------------------------------------
+ * Matches what coli chat's TUI renders: fenced code in a labelled box, real
+ * bold, coloured inline code, headings and bullets. The pane sets
+ * white-space: pre-wrap for raw text; markdown blocks manage their own
+ * whitespace, so .md resets it and the code block turns it back on. */
+.md { white-space: normal; }
+.md > * + * { margin-top: 10px; }
+.md-p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.md-h { margin: 0; color: var(--primary); font-weight: 700; font-size: 14px; letter-spacing: .01em; }
+.md-li { display: grid; grid-template-columns: 14px minmax(0,1fr); gap: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.md-bullet { color: var(--primary); line-height: 1.75; }
+.md-inline { padding: 1px 5px; border: 1px solid var(--border); border-radius: 5px; background: rgba(255,255,255,.04); color: #f0b429; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+.md-code { border: 1px solid var(--border); border-radius: 9px; background: rgba(0,0,0,.28); overflow: hidden; }
+.md-code-head { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; border-bottom: 1px solid var(--border); color: #7f8c91; font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.md-code-head button { display: grid; place-items: center; padding: 3px; border: 0; border-radius: 5px; background: transparent; color: #7f8c91; cursor: pointer; }
+.md-code-head button:hover { color: #d8e0e2; background: rgba(255,255,255,.06); }
+/* overflow-x on the pre, never on the page: a long line must scroll inside
+ * its own box rather than widening the chat column. */
+.md-code pre { margin: 0; padding: 10px 12px; overflow-x: auto; }
+.md-code code { display: block; white-space: pre; color: #cfd8db; font-size: 12.5px; line-height: 1.6; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.tok-kw  { color: #7aa2f7; }
+.tok-str { color: #9ece6a; }
+.tok-num { color: #ff9e64; }
+.tok-com { color: #6b7780; font-style: italic; }
+.md-caret { display: inline-block; width: 7px; height: 13px; margin-left: 1px; background: var(--primary); opacity: .75; animation: md-blink 1s steps(2) infinite; vertical-align: text-bottom; }
+@keyframes md-blink { 50% { opacity: 0; } }
+
+/* Anteprime delle immagini allegate al messaggio in scrittura. Piccole di
+   proposito: servono a ricordare cosa si sta mandando, non a guardarle. */
+.attachments { display: flex; flex-wrap: wrap; gap: .4rem; padding: .4rem .1rem 0; }
+.attachment { position: relative; display: inline-flex; }
+.attachment img {
+  width: 3rem; height: 3rem; object-fit: cover; border-radius: .375rem;
+  border: 1px solid hsl(var(--border));
+}
+.attachment button {
+  position: absolute; top: -.35rem; right: -.35rem; width: 1.15rem; height: 1.15rem;
+  line-height: 1; border-radius: 999px; border: 1px solid hsl(var(--border));
+  background: hsl(var(--background)); color: hsl(var(--muted-foreground));
+  font-size: .7rem; cursor: pointer;
+}
+.attachment button:hover { color: hsl(var(--foreground)); }

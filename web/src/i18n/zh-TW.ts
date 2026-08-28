@@ -63,6 +63,8 @@ const zhTW: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "傳送訊息給 colibrì…",
   "chat.inputHint": "Enter 傳送 · Shift+Enter 換行",
+  "chat.attachImage": "附加圖片",
+  "chat.removeImage": "移除圖片",
   "chat.stop": "停止生成",
   "chat.send": "傳送訊息",
 

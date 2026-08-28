@@ -21,12 +21,44 @@ extern "C" {
 
 #define COLI_CUDA_MAX_DEVICES 16
 
+/* Weight formats the generic per-element device decoder (weight_at,
+ * backend_cuda.cu) can actually decode: f32, int8-row, int4 nibbles (fmt=2 and
+ * the grouped fmt=4, same packing), and int2. Nothing else.
+ *
+ * WHY THIS IS A PREDICATE AND NOT A COMMENT. weight_at used to END in the int2
+ * decode as an unguarded fall-through, so ANY other format handed to it -- a
+ * format with a different element width, a different scale geometry, or no
+ * device decoder at all -- was silently read as 2-bit values and returned
+ * plausible-looking numbers. The CPU twins refuse the same input loudly:
+ * qt_addrow and qt_matvec_rows (colibri.c) both exit(1) naming the function and
+ * the fmt. Two backends given identical unsupported input, one refusing and one
+ * fabricating, is the defect -- not the missing decoder.
+ *
+ * Defined here, in the host header, rather than inside the .cu: the host gates
+ * that keep unsupported formats off the device (absorb_fmt_ok and friends) and
+ * the device-side backstop must agree by construction rather than by two people
+ * writing the same list twice, and a CPU test build can then unit-test the truth
+ * table without a GPU or a CUDA toolchain (tests/test_cuda_fmt_guard.c) -- the
+ * same arrangement colibri.c uses for metal_fused_fmt_ok.
+ *
+ * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
+ * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4) and fmt=8
+ * (fp8-e4m3) that never route through weight_at. This predicate is scoped to
+ * weight_at's own dispatch, which is what the absorb and grouped-expert kernels
+ * decode through. */
+static inline int coli_cuda_weight_at_supported(int fmt) {
+    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4;
+}
+
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
+/* Number of CUDA devices visible to this process, before a device list is
+ * selected. Returns 0 when the runtime cannot discover any device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_available_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
@@ -73,6 +105,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tens
  * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
+/* y[S,O] = x[S,I] @ dequant_mxfp4(W[O,I])^T, fmt=7 (OCP microscaling FP4).
+ * q4 is [O, ceil(I/2)] e2m1 nibbles, e8s is [O, ceil(I/32)] ue8m0 exponents --
+ * BYTES, not floats, which is why this is not folded into coli_cuda_matmul.
+ * Stateless: weights are uploaded per call, matching the streaming expert tier
+ * Kimi K3 uses. Returns 1 on success, 0 (y untouched) to fall back to CPU. */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
+                                               const unsigned char *q4,
+                                               const unsigned char *e8s,
+                                               int S, int I, int O);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
@@ -109,6 +151,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,
                            float *y, const float *x);
+/* Same operation, but force the small-batch grouped kernel family when
+ * pin_small_batch is nonzero.  Speculative verification uses this to keep
+ * CUDA on the same numeric family as S=1 regardless of accepted draft depth. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x, int pin_small_batch);
 
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,

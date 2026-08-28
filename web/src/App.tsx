@@ -17,6 +17,7 @@ import {
   Link2,
   LoaderCircle,
   MemoryStick,
+  ImagePlus,
   MessageSquareText,
   MonitorDot,
   RefreshCw,
@@ -35,6 +36,7 @@ import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
+import { Markdown } from "@/components/Markdown"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
@@ -66,6 +68,29 @@ export default function App() {
   const [healthError, setHealthError] = useState("")
   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
   const [draft, setDraft] = useState("")
+  /* Immagini in attesa di partire col prossimo messaggio. Si tengono come
+     data: URI perche' e' quello che il server accetta e quello che il browser
+     puo' mostrare in anteprima senza inventarsi un percorso su disco. */
+  const [attachments, setAttachments] = useState<{ name: string; url: string }[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const attachFiles = async (files: FileList | File[] | null) => {
+    if (!files) return
+    const images = Array.from(files).filter((file) => file.type.startsWith("image/"))
+    if (!images.length) return
+    const read = await Promise.all(
+      images.map(
+        (file) =>
+          new Promise<{ name: string; url: string }>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve({ name: file.name, url: String(reader.result) })
+            reader.onerror = () => reject(reader.error)
+            reader.readAsDataURL(file)
+          }),
+      ),
+    )
+    setAttachments((current) => [...current, ...read])
+  }
   const [loading, setLoading] = useState(false)
   const [streamStart, setStreamStart] = useState<number | null>(null)
   const [tokenCount, setTokenCount] = useState(0)
@@ -167,20 +192,30 @@ export default function App() {
     }
   }
 
-  if (servedByEngine && !autoConnected.current && !connected) {
-    autoConnected.current = true
-    setTimeout(() => connect(), 0)
-  }
+  // Auto-connect once when the UI is served by the engine itself. In an
+  // effect, not in the render body: a side effect during render breaks under
+  // StrictMode double-rendering and concurrent re-renders.
+  useEffect(() => {
+    if (servedByEngine && !autoConnected.current && !connected) {
+      autoConnected.current = true
+      connect()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servedByEngine, connected])
 
   const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
 
   const send = async () => {
     const content = draft.trim()
-    if (!content || loading) return
+    /* Un'immagine da sola e' una domanda valida: "questa cosa e'?" si puo'
+       chiedere anche senza scrivere niente. */
+    if ((!content && !attachments.length) || loading) return
     const user = message("user", content)
+    if (attachments.length) user.images = attachments.map((item) => item.url)
     const assistant = message("assistant", "")
     const history = [...messages, user]
     setDraft("")
+    setAttachments([])
     setError("")
     updateMessages([...history, assistant])
     setLoading(true)
@@ -204,11 +239,24 @@ export default function App() {
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
+        /* Reasoning tokens are tokens: they count toward the rate, and the
+           first one is the real time-to-first-token — the answer's first
+           token arrives much later on a reasoning model. */
+        onReasoning: (delta) => {
+          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
+          count++
+          setTokenCount(count)
+          const elapsed = (performance.now() - t0) / 1000
+          if (elapsed > 0.3) setTokPerSec(count / elapsed)
+          updateMessages((current) => current.map((item) =>
+            item.id === assistant.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
+          ))
+        },
         onDelta: (delta) => {
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
           count++
           setTokenCount(count)
-          const elapsed = (performance.now() - (firstToken ? t0 : t0)) / 1000
+          const elapsed = (performance.now() - t0) / 1000
           if (elapsed > 0.3) setTokPerSec(count / ((performance.now() - t0) / 1000))
           updateMessages((current) => current.map((item) =>
             item.id === assistant.id ? { ...item, content: item.content + delta } : item,
@@ -225,10 +273,10 @@ export default function App() {
       setConnected(true)
     } catch (cause) {
       if (controller.signal.aborted) {
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
       } else {
         setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
       }
     } finally {
       abortRef.current = null
@@ -356,7 +404,19 @@ export default function App() {
               {messages.map((item) => (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.content || <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
+                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.reasoning
+                    ? <details className="reasoning" open={!item.content}>
+                        <summary>{t("sidebar.reasoning")}</summary>
+                        <div className="reasoning-body">{item.reasoning}</div>
+                      </details>
+                    : null}{item.content
+                    ? (item.role === "assistant"
+                        /* User turns stay literal: the person typed those
+                           characters and expects to see them back. Only the
+                           model's output is markdown. */
+                        ? <Markdown source={item.content} />
+                        : item.content)
+                    : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
                 </article>
               ))}
               <div ref={bottomRef} />
@@ -367,8 +427,22 @@ export default function App() {
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
           <div className="composer">
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
-            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
+            <Textarea value={draft}
+              onPaste={(event) => { const files = Array.from(event.clipboardData.files); if (files.length) { event.preventDefault(); void attachFiles(files) } }}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => { if (event.dataTransfer.files.length) { event.preventDefault(); void attachFiles(event.dataTransfer.files) } }} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+            {attachments.length > 0 && (
+              <div className="attachments">
+                {attachments.map((item, index) => (
+                  <span key={item.url + index} className="attachment">
+                    <img src={item.url} alt={item.name} />
+                    <button type="button" aria-label={t("chat.removeImage")}
+                      onClick={() => setAttachments((current) => current.filter((_, at) => at !== index))}>x</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { void attachFiles(event.target.files); event.target.value = "" }} /><Button variant="ghost" size="icon" aria-label={t("chat.attachImage")} onClick={() => fileInputRef.current?.click()}><ImagePlus className="size-4" /></Button>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
           </div>
         </div>
         </>}

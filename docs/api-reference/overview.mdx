@@ -1,0 +1,58 @@
+---
+title: "API overview"
+description: "Start colibrì's persistent HTTP server and connect OpenAI- or Anthropic-compatible clients."
+---
+
+`coli serve` keeps one model process loaded and exposes OpenAI- and Anthropic-compatible HTTP endpoints through a Python standard-library gateway.
+
+## Start the server
+
+```bash
+COLI_MODEL=/nvme/glm52_i4 \
+COLI_API_KEY=local-secret \
+./coli serve --host 127.0.0.1 --port 8000 --model-id glm-5.2-colibri
+```
+
+The default base URL is `http://127.0.0.1:8000`. OpenAI-compatible clients normally use `http://127.0.0.1:8000/v1`.
+
+## Authenticate
+
+When `COLI_API_KEY` is set, send either of these headers:
+
+```http
+Authorization: Bearer local-secret
+```
+
+```http
+x-api-key: local-secret
+```
+
+<Note>
+`GET /health`, `GET /experts`, and `GET /profile` remain reachable for local dashboards. Without valid authentication they return only public or empty data; authenticated requests include scheduler, routing, or per-turn telemetry.
+</Note>
+
+## Choose a protocol
+
+<Tabs>
+  <Tab title="OpenAI">
+    Use `POST /v1/chat/completions` for messages or legacy `POST /v1/completions` for a text prompt. Both support JSON and server-sent event responses.
+  </Tab>
+  <Tab title="Anthropic">
+    Use `POST /v1/messages`. The gateway translates supported message, thinking, and tool-use fields into the active engine's native prompt protocol.
+  </Tab>
+</Tabs>
+
+## Concurrency and backpressure
+
+One engine process generates one sequence at a time. Concurrent HTTP requests enter a bounded FIFO queue instead of loading duplicate model copies. Configure it with `--max-queue` and `--queue-timeout`, or `COLI_MAX_QUEUE` and `COLI_QUEUE_TIMEOUT`.
+
+Saturated or expired requests receive HTTP `429`. Successful generation responses include `x-colibri-queue-wait-ms`.
+
+## Compatibility boundaries
+
+- Images, log probabilities, and token penalties return explicit errors instead of being ignored.
+- Audio is accepted only by Inkling checkpoints with audio support.
+- Tool calling depends on the active model engine.
+- `stop_sequences`, `top_k`, and non-text Anthropic content blocks are rejected explicitly.
+
+Read the [full API guide](/api) for engine-specific tool support, KV cache slots, coding-client examples, and performance expectations.

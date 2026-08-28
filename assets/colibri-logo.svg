@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1236" height="240" viewBox="0 0 1236 240">
+  <title>colibri — tiny engine, immense model</title>
+  <g transform="translate(46 34) scale(1.0)" shape-rendering="crispEdges">
+    <rect x="56" y="0" width="14" height="14" fill="#d75fd7"/>
+    <rect x="70" y="0" width="14" height="14" fill="#d75fd7"/>
+    <rect x="84" y="0" width="14" height="14" fill="#d75fd7"/>
+    <rect x="42" y="14" width="14" height="14" fill="#d75fd7"/>
+    <rect x="56" y="14" width="14" height="14" fill="#d75fd7"/>
+    <rect x="70" y="14" width="14" height="14" fill="#d75fd7"/>
+    <rect x="84" y="14" width="14" height="14" fill="#d75fd7"/>
+    <rect x="98" y="14" width="14" height="14" fill="#d75fd7"/>
+    <rect x="140" y="14" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="56" y="28" width="14" height="14" fill="#d75fd7"/>
+    <rect x="70" y="28" width="14" height="14" fill="#d75fd7"/>
+    <rect x="84" y="28" width="14" height="14" fill="#d75fd7"/>
+    <rect x="98" y="28" width="14" height="14" fill="#d75fd7"/>
+    <rect x="126" y="28" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="140" y="28" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="0" y="42" width="14" height="14" fill="#ff8700"/>
+    <rect x="14" y="42" width="14" height="14" fill="#ff8700"/>
+    <rect x="28" y="42" width="14" height="14" fill="#ff8700"/>
+    <rect x="42" y="42" width="14" height="14" fill="#ff8700"/>
+    <rect x="56" y="42" width="14" height="14" fill="#00afaf"/>
+    <rect x="70" y="42" width="14" height="14" fill="#00afaf"/>
+    <rect x="84" y="42" width="14" height="14" fill="#ffffff"/>
+    <rect x="98" y="42" width="14" height="14" fill="#00afaf"/>
+    <rect x="112" y="42" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="126" y="42" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="56" y="56" width="14" height="14" fill="#00afaf"/>
+    <rect x="70" y="56" width="14" height="14" fill="#00afaf"/>
+    <rect x="84" y="56" width="14" height="14" fill="#00afaf"/>
+    <rect x="98" y="56" width="14" height="14" fill="#00afaf"/>
+    <rect x="112" y="56" width="14" height="14" fill="#00afaf"/>
+    <rect x="126" y="56" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="140" y="56" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="70" y="70" width="14" height="14" fill="#00afaf"/>
+    <rect x="84" y="70" width="14" height="14" fill="#00afaf"/>
+    <rect x="98" y="70" width="14" height="14" fill="#00afaf"/>
+    <rect x="112" y="70" width="14" height="14" fill="#00afaf"/>
+    <rect x="126" y="70" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="140" y="70" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="84" y="84" width="14" height="14" fill="#00afaf"/>
+    <rect x="98" y="84" width="14" height="14" fill="#00afaf"/>
+    <rect x="112" y="84" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="126" y="84" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="98" y="98" width="14" height="14" fill="#00afaf"/>
+    <rect x="112" y="98" width="14" height="14" fill="#5fd7d7"/>
+    <rect x="112" y="112" width="14" height="14" fill="#5fd7d7"/>
+  </g>
+  <g transform="translate(260.0 127.0) scale(15.0000 -15.0000)" shape-rendering="crispEdges" fill="#00afaf"><path transform="translate(0,0)" d="M6 6V4H2V6ZM2 4V0H0V4ZM6 0V-2H2V0Z"/><path transform="translate(9,0)" d="M6 6V-2H0V6ZM2 4V0H4V4Z"/><path transform="translate(18,0)" d="M2 6V0H6V-2H0V6Z"/><path transform="translate(27,0)" d="M6 6V4H4V0H6V-2H0V0H2V4H0V6Z"/><path transform="translate(36,0)" d="M4 6V4H6V-2H0V6ZM2 2V0H4V2Z"/><path transform="translate(45,0)" d="M6 6V2H4V4H2V2H4V0H2V-2H0V6ZM6 0V-2H4V0Z"/><path transform="translate(54,0)" d="M6 6V4H4V0H6V-2H0V0H2V4H0V6Z"/></g>
+  <text x="262" y="196" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="26" fill="#808080" font-style="italic">tiny engine, immense model</text>
+</svg>

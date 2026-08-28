@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — motore piccolo, modello immenso">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì — motore piccolo, modello immenso">
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
@@ -12,9 +12,9 @@ miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogen
 in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
-Oggi girano quattro famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia `coli chat` /
-`coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+Oggi girano sei famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2,8T), **DeepSeek V4 Flash** (284B), **Qwen3.6** (35B-A3B) e **OLMoE** (7B) — un
+file C ciascuna, la stessa interfaccia `coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
 
 > **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
 > ricerca aperta.** Il suo obiettivo principale è migliorare le prestazioni di
@@ -32,7 +32,7 @@ ma non ridefinire il modello di nascosto.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.8.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -254,7 +254,7 @@ compilatore necessario. Prendi l'archivio della tua piattaforma dalla pagina
 [Releases](https://github.com/JustVugg/colibri/releases) e scompattalo:
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+mkdir colibri && tar xzf colibri-v1.8.0-linux-x86_64.tar.gz -C colibri && cd colibri
 python3 coli info                         # engine ready ✓
 ```
 
@@ -336,8 +336,10 @@ e per il gateway API opzionale.
   end-to-end, revisionati e sviluppati apertamente.
 - **Più modelli aperti.** L'algoritmo di tiering è indipendente dal modello:
   qualsiasi MoE con expert instradati può essere organizzato allo stesso modo.
-  GLM-5.2 e OLMoE funzionano già; **Kimi K2**, **Qwen3 MoE** e **MiniMax** sono
-  nella roadmap.
+  Sei famiglie funzionano già (GLM-5.2, Inkling, Kimi K3, DeepSeek V4 Flash,
+  Qwen3.6, OLMoE); altre famiglie open-weight, **MiniMax** tra le candidate,
+  si guadagnano un engine come le prime sei: quando qualcuno le misura
+  end-to-end.
 
 ## Sostenere il progetto
 
@@ -348,7 +350,7 @@ Se ti è utile:
 - ⭐ metti una stella al repository e condividilo;
 - 🐛 apri issue con i numeri di benchmark del tuo hardware — i datapoint
   fanno avanzare questo progetto più di qualsiasi altra cosa;
-- 💬 entra nella [comunità Discord](https://discord.gg/fpQxKnRb) per discutere
+- 💬 entra nella [comunità Discord](https://discord.gg/MAaKtQRc) per discutere
   esperimenti, risultati hardware e direzioni di ricerca;
 - 💬 contattaci via GitHub issues per sponsorizzare lo sviluppo o donare hardware.
 

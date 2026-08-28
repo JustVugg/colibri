@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifdef _WIN32
 /* MSVC has no POSIX setenv/unsetenv */
@@ -272,13 +273,39 @@ int main(int argc, char **argv) {
         coli_cuda_stats(-1, &c0, &b0);
         ColiCudaTensor *bad = nullptr;
         if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 4, 2, 9999)) return 1;
-        if (coli_cuda_tensor_upload(&bad, q8, s8, 7, 4, 2, d0)) return 1;
+        /* 99, not 7: this line asserted "unknown format must fail" with 7 back
+         * when 7 WAS unknown. db0c80f made fmt=7 (MXFP4) real for Kimi K3's
+         * CUDA tier and the expectation silently inverted -- v1.6.0's first
+         * real-GPU run failed exactly here (#971). Unknown must stay unknown. */
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 99, 4, 2, d0)) return 1;
         if (coli_cuda_tensor_upload(&bad, q8, nullptr, 1, 4, 2, d0)) return 1;
         if (coli_cuda_tensor_upload(&bad, nullptr, s8, 1, 4, 2, d0)) return 1;
+        /* Deliberate ~16 TB ask: the backend PRINTS its out-of-memory line
+         * here and that is the expected outcome, not a swallowed failure --
+         * announce it so the stderr does not read like a bug (#971 round 1). */
+        std::fprintf(stderr, "expecting one out-of-memory line next (deliberate ~16 TB negative case):\n");
         if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 1 << 20, 1 << 24, d0)) return 1; /* ~16 TB */
         if (bad) return 1;
         coli_cuda_stats(-1, &c1, &b1);
         if (c0 != c1 || b0 != b1) return 1;
+        /* fmt=7 is REAL now (db0c80f): a valid MXFP4 upload must succeed.
+         * Smoke, not correctness -- e2m1 nibbles 2/byte, one ue8m0 exponent
+         * per 32 columns; all-zero payload decodes to zeros, which is enough
+         * to prove the format is accepted and accounted. The matmul-level
+         * correctness case mirrors fmt=6's harness and is tracked in #971. */
+        {
+            const int I7 = 64, O7 = 4, NG7 = (I7 + 31) / 32;
+            std::vector<uint8_t> w7((size_t)O7 * ((I7 + 1) / 2), 0);
+            std::vector<uint8_t> s7((size_t)O7 * NG7, 127); /* e8m0 127 = scale 1.0 */
+            ColiCudaTensor *t7 = nullptr;
+            if (!coli_cuda_tensor_upload(&t7, w7.data(),
+                                         reinterpret_cast<const float *>(s7.data()),
+                                         7, I7, O7, d0) || !t7) {
+                std::fprintf(stderr, "fmt=7 (MXFP4) upload rejected -- the format is real since db0c80f\n");
+                return 1;
+            }
+            coli_cuda_tensor_free(t7);
+        }
         /* healthy launch immediately after the failed allocation */
         if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0, 0) ||
             !close_enough(got, want8, 4)) return 1;
@@ -348,7 +375,7 @@ int main(int argc, char **argv) {
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */
-    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], async4[64], tensor4[64];
+    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], async4[64], tensor4[64], pinned4[64];
     for(int i=0;i<(int)sizeof(w4);i++){
         int lo=((i%15)-7)&15,hi=(((i*3)%15)-7)&15;
         w4[i]=(uint8_t)(lo|(hi<<4));
@@ -373,12 +400,26 @@ int main(int argc, char **argv) {
     setenv("COLI_CUDA_TC_MIN_ROWS","1",1);
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,tensor4,gx4)||
        !relative_rms(tensor4,scalar4,64,0.30f))return 1;
+    if(!coli_cuda_expert_group_pinned(gg4,ug4,dg4,group_rows,2,pinned4,gx4,1)||
+       std::memcmp(pinned4,scalar4,sizeof(pinned4))){
+        std::fprintf(stderr,"pinned CUDA group did not bypass W4A4 Tensor Cores\n");
+        return 1;
+    }
     unsetenv("COLI_CUDA_TC_INT4");
     unsetenv("COLI_CUDA_TC_MIN_ROWS");
+    setenv("COLI_CUDA_TC_W4A16","1",1);
+    setenv("COLI_CUDA_TC_W4A16_MIN","1",1);
+    if(!coli_cuda_expert_group_pinned(gg4,ug4,dg4,group_rows,2,pinned4,gx4,1)||
+       std::memcmp(pinned4,scalar4,sizeof(pinned4))){
+        std::fprintf(stderr,"pinned CUDA group did not bypass W4A16 Tensor Cores\n");
+        return 1;
+    }
+    unsetenv("COLI_CUDA_TC_W4A16");
+    unsetenv("COLI_CUDA_TC_W4A16_MIN");
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    if(group_calls!=4||group_experts!=8||group_total_rows!=8) return 1;
+    if(group_calls!=6||group_experts!=12||group_total_rows!=12) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {

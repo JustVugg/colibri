@@ -24,6 +24,7 @@
 #include <unistd.h>   /* close() dopo mkstemp */
 #endif
 #include "../compat.h"
+#include "../serve_codec.h"
 
 #define SENTINEL "\x01\x01READY\x01\x01\n"
 
@@ -55,8 +56,7 @@ int main(void)
     _setmode(_fileno(f), _O_BINARY);
 #endif
 
-    fputs(SENTINEL, f);
-    fprintf(f, "STAT 0 0.0 0.0 %.2f 0 0\n", 1.0);
+    check(coli_serve_write_ready(f, 1.0), "shared READY writer succeeds");
     fclose(f);
 
     FILE *r = fopen(path, "rb");         /* rb: read the bytes as they landed */

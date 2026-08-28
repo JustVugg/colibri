@@ -7,6 +7,11 @@ static int fail(const char *message){
 }
 
 int main(void){
+    if(!tier_should_promote(130,100)) return fail("shared hysteresis admits hot expert");
+    if(tier_should_promote(129,100)) return fail("shared hysteresis blocks marginal expert");
+    if(tier_should_promote(UINT32_MAX-1,UINT32_MAX))
+        return fail("saturated hysteresis threshold wrapped");
+    if(tier_decay_value(9)!=4) return fail("shared heat decay");
     uint32_t heat[6]={20,2,8,3,30,1};
     int pinned[2]={0,1}, slot=-1, eid=-1; long gain=0;
     if(!tier_pick_swap(heat,6,pinned,2,&slot,&eid,&gain)) return fail("hot expert not promoted");

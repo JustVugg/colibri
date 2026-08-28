@@ -33,6 +33,7 @@ recognize**; that is the protocol's forward-compatibility rule.
 
 ```
 SUBMIT <id> <slot> <bytes> <max_tokens> <temperature> <top_p>\n<payload>\n
+IMAGE <id> <bytes> <grid_h> <grid_w>\n<payload>\n
 STOP <id>\n
 CANCEL <id>\n
 ```
@@ -45,6 +46,14 @@ CANCEL <id>\n
 - `bytes` — exact byte length of `payload` (UTF-8, may contain newlines). The engine
   reads exactly that many bytes after the header line, then one trailing `\n`.
 - `payload` — the fully rendered prompt (the server owns the chat template).
+- `IMAGE` (GLM-5.3-Flash) announces the pre-extracted patches of one image for
+  the request with the same `id`, and must arrive immediately before its
+  `SUBMIT`. `payload` is `bytes` of little-endian f32 in the tower's patch
+  order; the server owns the preprocessing (`c/tools/glm53_image.py`). The
+  prompt must already contain one `<|image|>` placeholder per output token,
+  i.e. `(grid_h/merge) x (grid_w/merge)` of them: the engine refuses a mismatch
+  rather than answering about a different picture. An engine holds one pending
+  image and discards an earlier one.
 - `STOP` ends generation through the normal successful `DONE` path. Statistics,
   usage history, and KV state are persisted; the HTTP gateway uses it after a
   client-provided stop sequence matches.
@@ -60,12 +69,19 @@ Per request, in order:
 
 ```
 DATA <id> <n>\n<n bytes of UTF-8>\n        # a decoded token's text; repeated
+TOOL <id> <n>\n<n bytes of UTF-8>\n        # engine-authenticated tool structure; Kimi K3 only
 TOPK <id> 5 <logprob> <hextext> ... ×5     # candidates for the sampled token (SERVE_TOPK=1)
 HITS <rows> <cols> <hex>                   # ~every 6 tokens: routed-expert bitmap since last HITS
 REPIN <layer> <eid> <old_tier> <gpu>       # live re-pin swap events, as they happen
 ...
 DONE <id> STAT <emitted> <tok_s> <hit_pct> <rss_gb> <prompt_tokens> <length_limited>
 ```
+
+Kimi K3 emits a zero-byte `TOOL` frame immediately after `ACCEPT` for every
+chat request. That frame declares the sideband authoritative even when no tool
+call follows. Real K3 special-token structure and its enclosed tool payload use
+subsequent `TOOL` frames; ordinary decoded text remains on `DATA`, so text that
+only resembles an XTML marker cannot be promoted into a client tool call.
 
 Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
 `SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `NOT_FOUND` (CANCEL of unknown id),

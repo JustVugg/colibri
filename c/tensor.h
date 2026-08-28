@@ -38,6 +38,10 @@ typedef struct {
     int64_t columns;
     uint32_t block_rows;
     uint32_t block_columns;
+    /* Optional backend-resident mirror of this weight (e.g. a Dsv4CudaTensor*).
+     * NULL on the CPU-only paths; owned and freed by the backend tier, never by
+     * the view. */
+    void *gpu;
 } ColiTensorView;
 
 #ifdef __cplusplus

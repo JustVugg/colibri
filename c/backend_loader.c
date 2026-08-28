@@ -20,6 +20,15 @@
  */
 #ifdef _WIN32
 
+/* FILE_ID_INFO / FileIdInfo (coli_win32_loader_probe, below) are gated behind
+ * _WIN32_WINNT >= _WIN32_WINNT_WIN8 in mingw-w64's winbase.h. MSVC exposes
+ * them unconditionally, so this only bites the MinGW build -- and only where
+ * the file-identity block is actually compiled, i.e. under COLI_HIP_DLL or
+ * COLI_LOADER_TEST_API. Set the floor before <windows.h> is pulled in. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602   /* Windows 8 */
+#endif
+
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -68,6 +77,12 @@ typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x);
+typedef int            (*fn_expert_group_pinned)(ColiCudaTensor *const *gates,
+                                                 ColiCudaTensor *const *ups,
+                                                 ColiCudaTensor *const *downs,
+                                                 const int *rows, int count,
+                                                 float *y, const float *x,
+                                                 int pin_small_batch);
 typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
                                                 ColiCudaTensor *const *ups,
                                                 ColiCudaTensor *const *downs,
@@ -148,6 +163,7 @@ static struct {
     fn_group_stats_device group_stats_device;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
+    fn_expert_group_pinned expert_group_pinned;
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_take expert_group_take;
     fn_attention_absorb attention_absorb;
@@ -1391,6 +1407,7 @@ static int coli_cuda_load(void){
     RESOLVE(group_stats_device, fn_group_stats_device)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
+    RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
     RESOLVE(expert_group_take, fn_expert_group_take)
     RESOLVE(attention_absorb, fn_attention_absorb)
@@ -1530,6 +1547,19 @@ int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *
                            float *y, const float *x){
     if(!g_cuda.available) return 0;
     return g_cuda.expert_group(gates, ups, downs, rows, count, y, x);
+}
+
+int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                                  ColiCudaTensor *const *ups,
+                                  ColiCudaTensor *const *downs,
+                                  const int *rows, int count,
+                                  float *y, const float *x,
+                                  int pin_small_batch){
+    if(!g_cuda.available) return 0;
+    if(g_cuda.expert_group_pinned)
+        return g_cuda.expert_group_pinned(gates,ups,downs,rows,count,y,x,pin_small_batch);
+    if(pin_small_batch) return 0; /* old DLL: preserve SPEC_PIN via the CPU fallback */
+    return g_cuda.expert_group(gates,ups,downs,rows,count,y,x);
 }
 
 int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,

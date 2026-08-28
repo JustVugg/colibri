@@ -11,6 +11,15 @@
 #ifndef COMPAT_H
 #define COMPAT_H
 
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #ifdef __APPLE__
 #include <fcntl.h>
 #include <unistd.h>
@@ -320,6 +329,12 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
+static inline int compat_unsetenv(const char *name){
+    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+}
+#define unsetenv(name) compat_unsetenv(name)
+
 /* --- getenv_utf8: read an env var as UTF-8, not through the ANSI codepage ---
  * Plain getenv()/_environ are populated by the CRT from the ANSI-codepage view
  * of the process environment block, not UTF-8. A parent that hands the child a
@@ -379,6 +394,77 @@ static inline char *compat_mkdtemp(char *tmpl){
 #ifndef COMPAT_O_BINARY
 #define COMPAT_O_BINARY 0
 #endif
+
+/* --- read-only file mapping -------------------------------------------------
+ * A small ownership-carrying primitive for safetensors that are already in the
+ * engine's final byte representation.  The caller gets a pointer to the exact
+ * requested (possibly unaligned) range while this object retains the aligned
+ * OS view needed to release it safely.
+ *
+ * This does not prefetch or lock pages.  Mapping changes ownership/accounting,
+ * not the model's active working set: pages are faulted when the caller reads
+ * them and remain reclaimable file-backed cache pages. */
+typedef struct {
+    void *base;
+    size_t len;
+#ifdef _WIN32
+    HANDLE mapping;
+#endif
+} compat_ro_map;
+
+static inline int compat_map_readonly(int fd, int64_t off, size_t len,
+                                      compat_ro_map *map, const void **data)
+{
+    if (!map || !data || off < 0 || len == 0) { errno = EINVAL; return -1; }
+    memset(map, 0, sizeof(*map));
+#ifdef _WIN32
+    intptr_t osfh = _get_osfhandle(fd);
+    if (osfh == -1 || osfh == -2) { errno = EBADF; return -1; }
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uint64_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536u;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    HANDLE fm = CreateFileMappingA((HANDLE)osfh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!fm) { errno = EIO; return -1; }
+    void *base = MapViewOfFile(fm, FILE_MAP_READ,
+                               (DWORD)(aligned >> 32), (DWORD)(aligned & 0xffffffffu),
+                               view_len);
+    if (!base) { CloseHandle(fm); errno = EIO; return -1; }
+    map->base = base;
+    map->len = view_len;
+    map->mapping = fm;
+    *data = (const char*)base + (size_t)delta;
+#else
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    uint64_t gran = (uint64_t)pg;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    void *base = mmap(NULL, view_len, PROT_READ, MAP_SHARED, fd, (off_t)aligned);
+    if (base == MAP_FAILED) return -1;
+    map->base = base;
+    map->len = view_len;
+    *data = (const char*)base + (size_t)delta;
+#endif
+    return 0;
+}
+
+static inline void compat_unmap_readonly(compat_ro_map *map)
+{
+    if (!map || !map->base) return;
+#ifdef _WIN32
+    UnmapViewOfFile(map->base);
+    if (map->mapping) CloseHandle(map->mapping);
+#else
+    munmap(map->base, map->len);
+#endif
+    memset(map, 0, sizeof(*map));
+}
 
 /* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
  *
@@ -449,6 +535,69 @@ static inline void coli_serve_binary_mode(void)
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
+}
+
+/* A release archive ships the ENGINES next to the launcher, so on Windows the
+ * first thing a new user does is double-click `colibri.exe` from Explorer. The
+ * engine has no model to load, prints one line and exits -- the console window
+ * appears and vanishes, which reads as "the program does not start" (#1241).
+ *
+ * GetConsoleProcessList reports how many processes share this console: a run
+ * started from a shell has at least the shell too, while a double-click leaves
+ * the engine alone on a console Windows destroys the moment it exits. That is
+ * the only case where holding the window is right, and it is exactly the case
+ * where the message would otherwise be unreadable.
+ *
+ * No-op on Linux/macOS, and no-op on Windows whenever a shell, a script, the
+ * `coli` launcher or CI is on the other end.
+ *
+ * This is the belt, not the braces: an engine that re-execs itself for OpenMP
+ * tuning can still be sharing the console with the exiting parent at the moment
+ * we look, and then the message prints without the pause. `coli.cmd` -- shipped
+ * in the Windows archive and always correct -- is the supported entry point. */
+static inline int coli_console_is_own(void)
+{
+#ifdef _WIN32
+    DWORD owners[2];
+    return GetConsoleProcessList(owners, 2) == 1;
+#else
+    return 0;
+#endif
+}
+
+static inline void coli_hold_console(void)
+{
+    if (!coli_console_is_own()) return;
+    fprintf(stderr, "\nPress Enter to close this window. ");
+    fflush(stderr);
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+}
+
+/* One wording for every engine: what this binary is, and the command that does
+ * what the user was trying to do. Called on the "no model" exit path, which is
+ * where a bare launch lands. `engine` is the family name for the message. */
+static inline void coli_print_launcher_help(const char *engine)
+{
+#ifdef _WIN32
+    const char *run = "coli.cmd";
+#else
+    const char *run = "./coli";
+#endif
+    fprintf(stderr,
+        "colibri: this is the %s engine, and it was started without a model.\n"
+        "The engine is not the program you run directly -- the launcher is:\n"
+        "\n"
+        "    %s chat  --model <model directory>    interactive chat\n"
+        "    %s serve --model <model directory>    OpenAI-compatible API\n"
+        "    %s web   --model <model directory>    API plus the dashboard\n"
+        "    %s doctor --model <model directory>   check a model is usable\n"
+        "\n"
+        "The launcher needs Python 3 and picks the right engine for the model.\n"
+        "Getting a model, step by step: https://github.com/JustVugg/colibri"
+        "/blob/main/docs/quickstart.md\n",
+        engine, run, run, run, run);
+    coli_hold_console();
 }
 
 #endif /* COMPAT_H */

@@ -79,7 +79,9 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 
 **`tune`**: `--prompt <text>`, `--tokens 16`, `--repeats 2`,
 `--timeout 900`, `--min-gain 0.03`. The command uses fixed-token replay and
-only tests quality-preserving execution scheduling.
+only tests quality-preserving execution scheduling. For disk-backed MoE it also
+tests smaller, planner-bounded RAM/cache allocations; output, hit rate, TTFT,
+and tail-latency gates prevent a decode-only win from degrading real chat.
 
 **`doctor`**: `--deep` strictly checks every safetensors header and tensor
 layout, filename-declared shard completeness, required core tensors, an
@@ -108,7 +110,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | KV conversation slots. |
 
-Tool calling (`tools` in the request) is supported; the opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed int4 tool calls. Server-relevant env vars: `COLI_METAL`, `PIPE`, `DIRECT`, `COLI_NO_OMP_TUNE`, `RAM_GB`, `CTX`, `KVSAVE` (all from [ENVIRONMENT.md](ENVIRONMENT.md)) apply because the server launches the same `glm` engine.
+Tool calling is supported by GLM and DeepSeek V4; Inkling, Kimi K3, and OLMoE reject active tool declarations and choices explicitly. See the [per-engine API matrix](api.md#tool-calling-support). The opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed GLM int4 tool calls; V4 uses its native DSML parser. Engine-specific runtime variables are listed in [ENVIRONMENT.md](ENVIRONMENT.md); the server passes the environment through to the selected engine.
 
 ---
 

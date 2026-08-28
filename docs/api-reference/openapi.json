@@ -1,0 +1,415 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "colibrì HTTP API",
+    "version": "1.0.0",
+    "description": "OpenAI- and Anthropic-compatible inference endpoints plus local scheduler and dashboard telemetry."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "Default local server"
+    }
+  ],
+  "tags": [
+    { "name": "Inference", "description": "Generate text through OpenAI- or Anthropic-compatible request shapes." },
+    { "name": "Models", "description": "Inspect the model loaded by the persistent server." },
+    { "name": "Operations", "description": "Inspect liveness, queue state, hardware, routing, and per-turn telemetry." }
+  ],
+  "paths": {
+    "/v1/chat/completions": {
+      "post": {
+        "tags": ["Inference"],
+        "summary": "Create a chat completion",
+        "description": "Generate a response from a list of OpenAI-compatible messages. Set `stream` to receive server-sent events.",
+        "operationId": "createChatCompletion",
+        "security": [{ "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A JSON completion or an SSE stream when `stream` is true.",
+            "headers": {
+              "x-colibri-queue-wait-ms": {
+                "description": "Milliseconds spent waiting for the engine admission queue.",
+                "schema": { "type": "number" }
+              }
+            },
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ChatCompletion" } },
+              "text/event-stream": { "schema": { "type": "string" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/QueueFull" }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "tags": ["Inference"],
+        "summary": "Create a legacy completion",
+        "description": "Generate text from one prompt using the legacy OpenAI completions shape.",
+        "operationId": "createCompletion",
+        "security": [{ "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CompletionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A JSON completion or an SSE stream when `stream` is true.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Completion" } },
+              "text/event-stream": { "schema": { "type": "string" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/QueueFull" }
+        }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": ["Inference"],
+        "summary": "Create an Anthropic message",
+        "description": "Generate a response with the Anthropic Messages request shape. Unsupported fields are rejected explicitly.",
+        "operationId": "createMessage",
+        "security": [{ "apiKeyAuth": [] }, { "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AnthropicMessageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "An Anthropic message or named SSE event stream.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/AnthropicMessage" } },
+              "text/event-stream": { "schema": { "type": "string" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/QueueFull" }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "List loaded models",
+        "description": "Return the model exposed by this persistent server process.",
+        "operationId": "listModels",
+        "security": [{ "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Model list",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelList" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/models/{model}": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "Retrieve the loaded model",
+        "description": "Return metadata when the path matches the configured model identifier.",
+        "operationId": "retrieveModel",
+        "security": [{ "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The identifier passed with `--model-id`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Model metadata",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Model" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Check server health",
+        "description": "Always returns liveness. Authenticated requests also receive scheduler, KV-slot, tier, and hardware details when available.",
+        "operationId": "getHealth",
+        "security": [{}, { "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Server health",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+          }
+        }
+      }
+    },
+    "/experts": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read expert routing telemetry",
+        "description": "Return an empty map without valid authentication, or the current expert map and routing hits for an authenticated local dashboard.",
+        "operationId": "getExperts",
+        "security": [{}, { "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Expert map and routing state",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Experts" } } }
+          }
+        }
+      }
+    },
+    "/profile": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read generation profiles",
+        "description": "Return an empty turn list without valid authentication, or recent per-turn timing and token telemetry for an authenticated local dashboard.",
+        "operationId": "getProfile",
+        "security": [{}, { "bearerAuth": [] }, { "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Recent generation profiles",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Profile" } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The value configured with `COLI_API_KEY` or `--api-key`."
+      },
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "Anthropic-compatible API-key header."
+      }
+    },
+    "schemas": {
+      "ChatMessage": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["system", "user", "assistant", "tool"] },
+          "content": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+            ]
+          },
+          "name": { "type": "string" },
+          "tool_call_id": { "type": "string" },
+          "tool_calls": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        }
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "required": ["model", "messages"],
+        "properties": {
+          "model": { "type": "string", "example": "glm-5.2-colibri" },
+          "messages": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/ChatMessage" } },
+          "stream": { "type": "boolean", "default": false },
+          "stream_options": { "type": "object", "properties": { "include_usage": { "type": "boolean" } } },
+          "max_tokens": { "type": "integer", "minimum": 1 },
+          "max_completion_tokens": { "type": "integer", "minimum": 1 },
+          "temperature": { "type": "number", "minimum": 0 },
+          "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+          "stop": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "maxItems": 4, "items": { "type": "string" } }
+            ]
+          },
+          "tools": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "tool_choice": { "oneOf": [{ "type": "string" }, { "type": "object", "additionalProperties": true }] },
+          "reasoning_effort": { "type": "string" },
+          "enable_thinking": { "type": "boolean", "description": "colibrì extension for model reasoning output." },
+          "cache_slot": { "type": "integer", "minimum": 0, "maximum": 15, "description": "colibrì extension selecting an isolated KV context." },
+          "x_colibri_ignore_leading_stop": { "type": "boolean", "description": "Ignore leading stop markers until non-whitespace output begins." }
+        }
+      },
+      "CompletionRequest": {
+        "type": "object",
+        "required": ["model", "prompt"],
+        "properties": {
+          "model": { "type": "string" },
+          "prompt": { "type": "string" },
+          "stream": { "type": "boolean", "default": false },
+          "max_tokens": { "type": "integer", "minimum": 1 },
+          "temperature": { "type": "number", "minimum": 0 },
+          "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+          "stop": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "maxItems": 4, "items": { "type": "string" } }
+            ]
+          },
+          "cache_slot": { "type": "integer", "minimum": 0, "maximum": 15 }
+        }
+      },
+      "AnthropicMessageRequest": {
+        "type": "object",
+        "required": ["model", "max_tokens", "messages"],
+        "properties": {
+          "model": { "type": "string" },
+          "max_tokens": { "type": "integer", "minimum": 1 },
+          "messages": { "type": "array", "items": { "type": "object", "required": ["role", "content"], "additionalProperties": true } },
+          "system": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object", "additionalProperties": true } }] },
+          "stream": { "type": "boolean", "default": false },
+          "temperature": { "type": "number", "minimum": 0 },
+          "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+          "tools": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "tool_choice": { "type": "object", "additionalProperties": true },
+          "thinking": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "properties": {
+          "prompt_tokens": { "type": "integer" },
+          "completion_tokens": { "type": "integer" },
+          "total_tokens": { "type": "integer" }
+        }
+      },
+      "ChatCompletion": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "object": { "type": "string", "const": "chat.completion" },
+          "created": { "type": "integer" },
+          "model": { "type": "string" },
+          "choices": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "usage": { "$ref": "#/components/schemas/Usage" }
+        }
+      },
+      "Completion": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "object": { "type": "string", "const": "text_completion" },
+          "created": { "type": "integer" },
+          "model": { "type": "string" },
+          "choices": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "usage": { "$ref": "#/components/schemas/Usage" }
+        }
+      },
+      "AnthropicMessage": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string", "const": "message" },
+          "role": { "type": "string", "const": "assistant" },
+          "content": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "model": { "type": "string" },
+          "stop_reason": { "type": ["string", "null"] },
+          "usage": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "object": { "type": "string", "const": "model" },
+          "created": { "type": "integer" },
+          "owned_by": { "type": "string" }
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "properties": {
+          "object": { "type": "string", "const": "list" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Model" } }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "const": "ok" },
+          "scheduler": { "type": "object", "additionalProperties": true },
+          "kv_slots": { "type": "integer" },
+          "tiers": { "type": "object", "additionalProperties": true },
+          "hwinfo": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "Experts": {
+        "type": "object",
+        "required": ["rows", "cols", "map", "hits", "seq"],
+        "properties": {
+          "rows": { "type": "integer" },
+          "cols": { "type": "integer" },
+          "map": { "type": "string" },
+          "hits": { "type": "string" },
+          "seq": { "type": "integer" }
+        }
+      },
+      "Profile": {
+        "type": "object",
+        "required": ["seq", "turns"],
+        "properties": {
+          "seq": { "type": "integer" },
+          "turns": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": { "type": "string" },
+              "type": { "type": ["string", "null"] },
+              "param": { "type": ["string", "null"] },
+              "code": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request is invalid or asks for an unsupported capability.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "The configured API key is missing or invalid.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "QueueFull": {
+        "description": "The bounded generation queue is full or the request expired while waiting.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "The requested model or route does not exist.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  }
+}

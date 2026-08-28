@@ -9,7 +9,10 @@ Carica `coli` come modulo (ha la guardia __main__) e verifica il contratto:
 import importlib.machinery
 import importlib.util
 import os
+import json
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -23,9 +26,14 @@ _spec = importlib.util.spec_from_loader("coli_cli", _loader)
 coli = importlib.util.module_from_spec(_spec)
 _loader.exec_module(coli)
 
+_MODEL_DIR = tempfile.TemporaryDirectory()
+_MODEL = Path(_MODEL_DIR.name)
+(_MODEL / "config.json").write_text(
+    json.dumps({"model_type": "glm_moe_dsa"}), encoding="utf-8")
+
 
 def args(**over):
-    base = dict(model="X", policy="quality", ram=0, ngen=0, topp=0, topk=0,
+    base = dict(model=str(_MODEL), policy="quality", ram=0, ngen=0, topp=0, topk=0,
                 temp=None, repin=0, ctx=0, auto_tier=False, gpu=None, vram=0)
     base.update(over)
     return types.SimpleNamespace(**base)
@@ -41,7 +49,8 @@ class EnvDefaultsTest(unittest.TestCase):
         False keeps these tests independent of the host's GPU."""
         with mock.patch.dict(os.environ, environ, clear=True), \
              mock.patch.object(sys, "platform", platform), \
-             mock.patch.object(coli, "cuda_binary", return_value=cuda):
+             mock.patch.object(coli, "cuda_binary", return_value=cuda), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8):
             return coli.env_for(args())
 
     def test_win32_sets_measured_defaults(self):
@@ -102,6 +111,7 @@ class CudaAutoEnableTest(unittest.TestCase):
              mock.patch.object(sys, "platform", platform), \
              mock.patch.object(coli, "cuda_binary", return_value=cuda), \
              mock.patch.object(resource_plan, "discover_gpus", return_value=gpus), \
+             mock.patch.object(resource_plan, "physical_cpu_count", return_value=8), \
              mock.patch.object(resource_plan, "build_plan", return_value=plan), \
              mock.patch.object(resource_plan, "environment_for_plan",
                                side_effect=fake_environment_for_plan):
@@ -132,6 +142,20 @@ class CudaAutoEnableTest(unittest.TestCase):
         self.assertNotIn("COLI_GPUS", e)
         self.assertNotIn("CUDA_EXPERT_GB", e)
 
+    def test_win32_does_not_auto_enable_an_unqualified_gpu(self):
+        # A device whose free memory is not qualified as a placement budget
+        # (free_bytes is None -- a Windows AMD part found through hipInfo) is
+        # discovered and worth reporting, but auto-enable is an automatic
+        # placement decision and must not be made from it. Bare `coli chat`
+        # stays on the CPU path, exactly as if nothing had been found.
+        identity_only = {"index": 0, "name": "AMD Radeon(TM) 8060S Graphics",
+                         "arch": "gfx1151", "total_bytes": 78 * 1024 ** 3,
+                         "free_bytes": None, "unified_memory": True}
+        e = self._env_for("win32", cuda=True, gpus=[identity_only])
+        self.assertNotIn("COLI_CUDA", e)
+        self.assertNotIn("COLI_GPUS", e)
+        self.assertNotIn("CUDA_EXPERT_GB", e)
+
     def test_win32_cpu_build_stays_silent(self):
         # No coli_cuda.dll (cuda=False) -> CPU build, nothing GPU-related emitted.
         e = self._env_for("win32", cuda=False, gpus=[self._fake_gpu()])
@@ -144,6 +168,76 @@ class CudaAutoEnableTest(unittest.TestCase):
         e = self._env_for("linux", cuda=True, gpus=[self._fake_gpu()])
         self.assertNotIn("COLI_CUDA", e)
         self.assertNotIn("CUDA_EXPERT_GB", e)
+
+
+class Dsv4CudaDetectTest(unittest.TestCase):
+    """dsv4_cuda_available: the Windows check is a DLL next to the engine, but
+    Linux links the tier straight into the binary (nvcc, -lcudart), so the DLL
+    probe there rejected every valid `make deepseek-v4 CUDA=1` build (#1219)."""
+
+    def _detect(self, platform, ldd_stdout=None, dll=False, engine_exists=True,
+                ldd_error=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        eng = Path(tmp.name) / "deepseek"
+        if engine_exists:
+            eng.write_bytes(b"")
+        if dll:
+            (Path(tmp.name) / "coli_cuda_dsv4.dll").write_bytes(b"")
+        fake_run = mock.Mock(return_value=types.SimpleNamespace(stdout=ldd_stdout or ""),
+                             side_effect=ldd_error)
+        with mock.patch.object(sys, "platform", platform), \
+             mock.patch.object(coli, "engine_for", return_value=str(eng)), \
+             mock.patch.object(coli.subprocess, "run", fake_run):
+            return coli.dsv4_cuda_available(str(_MODEL))
+
+    def test_linux_cuda_link_detected(self):
+        out = "\tlibcudart.so.12 => /opt/cuda/lib64/libcudart.so.12 (0x00007f)\n"
+        self.assertTrue(self._detect("linux", ldd_stdout=out))
+
+    def test_linux_hip_link_is_not_dsv4_cuda(self):
+        out = "\tlibamdhip64.so.6 => /opt/rocm/lib/libamdhip64.so.6 (0x00007f)\n"
+        self.assertFalse(self._detect("linux", ldd_stdout=out))
+
+    def test_linux_cpu_build_rejected(self):
+        out = "\tlibc.so.6 => /usr/lib/libc.so.6 (0x00007f)\n"
+        self.assertFalse(self._detect("linux", ldd_stdout=out))
+
+    def test_linux_broken_link_rejected(self):
+        out = "\tlibcudart.so.12 => not found\n"
+        self.assertFalse(self._detect("linux", ldd_stdout=out))
+
+    def test_linux_missing_engine_rejected(self):
+        self.assertFalse(self._detect("linux", engine_exists=False))
+
+    def test_linux_ldd_failures_are_rejected(self):
+        for error in (FileNotFoundError("ldd"),
+                      subprocess.TimeoutExpired(["ldd", "deepseek"], 3)):
+            with self.subTest(error=type(error).__name__):
+                self.assertFalse(self._detect("linux", ldd_error=error))
+
+    def test_unexpected_ldd_errors_are_not_hidden(self):
+        with self.assertRaises(RuntimeError):
+            self._detect("linux", ldd_error=RuntimeError("test bug"))
+
+    def test_win32_dll_detected(self):
+        self.assertTrue(self._detect("win32", dll=True))
+
+    def test_win32_missing_dll_rejected(self):
+        self.assertFalse(self._detect("win32", dll=False))
+
+    def test_macos_has_no_dsv4_cuda_tier(self):
+        self.assertFalse(self._detect("darwin", ldd_stdout="libcudart.so"))
+
+    def test_build_hint_names_the_right_build(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertIn("make deepseek-v4 CUDA=1", coli.dsv4_cuda_build_hint())
+        with mock.patch.object(sys, "platform", "win32"):
+            self.assertIn("coli_cuda_dsv4.dll", coli.dsv4_cuda_build_hint())
+        with mock.patch.object(sys, "platform", "darwin"):
+            hint = coli.dsv4_cuda_build_hint()
+            self.assertIn("only on Linux and Windows", hint)
+            self.assertNotIn("CUDA=1", hint)
 
 
 if __name__ == "__main__":

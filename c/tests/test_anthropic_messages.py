@@ -14,11 +14,12 @@ import json
 import re
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError,
-                           render_chat)
+                           render_chat, render_chat_inkling, render_chat_kimi, render_chat_v4)
 
 
 class FakeEngine:
@@ -29,7 +30,8 @@ class FakeEngine:
         self.prompts = []
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None,
+                 on_tool=None):
         self.prompts.append(prompt)
         self.emitted = 0
         for chunk in self.script:
@@ -153,6 +155,55 @@ class MessagesHTTPTest(unittest.TestCase):
         self.assertEqual(payload["usage"], {"input_tokens": 11, "output_tokens": 3})
         self.assertTrue(payload["id"].startswith("msg_"))
 
+    def test_each_architecture_receives_its_native_chat_prompt(self):
+        messages = [{"role": "user", "content": "Hi"}]
+        renderers = {
+            "glm": render_chat,
+            "inkling": render_chat_inkling,
+            "kimi": render_chat_kimi,
+            "deepseek_v4": render_chat_v4,
+        }
+        for arch, renderer in renderers.items():
+            with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
+                self.post(self.base_body()).close()
+                self.assertEqual(self.engine.prompts[-1], renderer(messages))
+
+    def test_non_glm_architectures_reject_tools_before_generation(self):
+        # kimi left this list in #1143: K3 tool calling is wired up now.
+        body = self.base_body(tools=[{"name": "f", "input_schema": {"type": "object"}}])
+        for arch in ("inkling",):
+            with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
+                before = len(self.engine.prompts)
+                with self.assertRaises(HTTPError) as caught:
+                    self.post(body)
+                self.addCleanup(caught.exception.close)
+                self.assertEqual(caught.exception.code, 400)
+                self.assertIn("tool", json.load(caught.exception)["error"]["message"].lower())
+                self.assertEqual(len(self.engine.prompts), before)
+
+    def test_kimi_renders_tools_as_k3chat1_records(self):
+        body = self.base_body(tools=[{"name": "f", "input_schema": {
+            "type": "object", "properties": {"x": {"type": "string"}}}}])
+        with patch("openai_server.ARCH", "kimi"):
+            with self.post(body) as response:
+                self.assertEqual(response.status, 200)
+        prompt = self.engine.prompts[-1]
+        self.assertIn("K3CHAT1", prompt)
+        self.assertIn("tool-declare# Tools", prompt)
+        self.assertIn('"name":"f"', prompt)
+        self.assertNotIn("<|open|>", prompt)   # records, never raw XTML
+
+    def test_deepseek_v4_renders_tools_as_dsml_block(self):
+        body = self.base_body(tools=[{"name": "f", "input_schema": {
+            "type": "object", "properties": {"x": {"type": "string"}}}}])
+        with patch("openai_server.ARCH", "deepseek_v4"):
+            with self.post(body) as response:
+                self.assertEqual(response.status, 200)
+        prompt = self.engine.prompts[-1]
+        self.assertIn("## Tools", prompt)
+        self.assertIn('"name": "f"', prompt)
+        self.assertIn("｜DSML｜", prompt)
+
     def test_x_api_key_and_bearer_both_authenticate(self):
         with self.post(self.base_body(), {"x-api-key": "secret"}) as response:
             self.assertEqual(response.status, 200)
@@ -161,11 +212,13 @@ class MessagesHTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
         with self.assertRaises(HTTPError) as caught:
             self.post(self.base_body(), {"x-api-key": "wrong"})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_error_envelope_is_anthropic_shaped(self):
         with self.assertRaises(HTTPError) as caught:
             self.post({"model": "test-model", "messages": [{"role": "user", "content": "x"}]})
+        self.addCleanup(caught.exception.close)
         payload = json.load(caught.exception)
         self.assertEqual(payload["type"], "error")
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
@@ -272,6 +325,35 @@ class MessagesHTTPTest(unittest.TestCase):
             {"type": "text", "text": "answer"},
         ])
 
+    def test_inkling_thinking_uses_inkling_content_markers(self):
+        self.engine.script = ("<|content_thinking|>reason", "ing<|content_text|>answer",)
+        with patch("openai_server.ARCH", "inkling"):
+            with self.post(self.base_body(thinking={"type": "enabled"})) as response:
+                payload = json.load(response)
+        self.assertEqual(payload["content"], [
+            {"type": "thinking", "thinking": "reasoning", "signature": "colibri-local"},
+            {"type": "text", "text": "answer"},
+        ])
+
+    def test_streamed_inkling_thinking_uses_inkling_content_markers(self):
+        self.engine.script = ("<|content_think", "ing|>reasoning<|content_", "text|>answer",)
+        with patch("openai_server.ARCH", "inkling"):
+            with self.post(self.base_body(stream=True, thinking={"type": "enabled"})) as response:
+                raw = response.read().decode()
+        payloads = [json.loads(line[len("data: "):]) for line in raw.splitlines()
+                    if line.startswith("data: ")]
+        deltas = [payload["delta"] for payload in payloads
+                  if payload["type"] == "content_block_delta"]
+        self.assertEqual("".join(delta.get("thinking", "") for delta in deltas), "reasoning")
+        self.assertEqual("".join(delta.get("text", "") for delta in deltas), "answer")
+        thinking_stop = next(index for index, payload in enumerate(payloads)
+                             if payload["type"] == "content_block_stop" and payload["index"] == 0)
+        text_start = next(index for index, payload in enumerate(payloads)
+                          if payload["type"] == "content_block_start" and payload["index"] == 1)
+        self.assertLess(thinking_stop, text_start)
+        self.assertNotIn("content_thinking", raw)
+        self.assertNotIn("content_text", raw)
+
     def test_streamed_thinking_marker_can_split_at_every_boundary(self):
         marker = "</think>"
         for boundary in range(1, len(marker)):
@@ -338,6 +420,7 @@ class MessagesHTTPTest(unittest.TestCase):
         for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):
             with self.assertRaises(HTTPError) as caught:
                 self.post(self.base_body(**{field: value}))
+            self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
             self.assertIn(field, json.load(caught.exception)["error"]["message"])
 

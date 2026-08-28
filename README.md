@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
+  <img src="assets/colibri-logo.svg" width="560" alt="colibrì — tiny engine, immense model">
 </p>
 
 <p align="center">
@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -18,9 +18,10 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Five families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T), **DeepSeek V4 Flash** (284B) and **OLMoE** (7B) — one C file each, the
-same `coli chat` / `coli serve` / `coli web` front end.
+Seven families run today: **GLM-5.2** (744B), **GLM-5.3-Flash** (321B, with
+vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B),
+**Qwen3.6** (35B-A3B) and **OLMoE** (7B) —
+one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
@@ -38,7 +39,7 @@ may reduce speed; it must not quietly redefine the model.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.8.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -162,8 +163,40 @@ the right experts get. It works because routing has measurable structure (see
 the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
 structure is cacheable.
 
-The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
-at runtime, no GPU required.
+The engine is a single C file (`c/colibri.c`) plus small headers. No BLAS, no
+Python at runtime, no GPU required.
+
+### Local cluster mode
+
+The coordinator keeps token generation, routing, and KV state local while
+disk-backed expert workers execute routed FFNs on other Macs. A layer's routed
+batch-union is sent as one persistent TCP request, so a token does not incur one
+round trip per expert.
+
+Start the optional registration service:
+
+```bash
+./coli cluster coordinator --host 0.0.0.0 --port 8765
+```
+
+On each worker, with the same converted model available locally:
+
+```bash
+./coli cluster worker --model /nvme/glm52_i4 --port 9100 \
+  --coordinator http://COORDINATOR:8765 --advertise-host WORKER_IP
+```
+
+Run the coordinator with discovery, or provide `--cluster-workers
+HOST:PORT,...` for a static setup:
+
+```bash
+./coli serve --model /nvme/glm52_i4 \
+  --cluster-coordinator http://127.0.0.1:8765
+```
+
+The transport is disabled unless workers are configured, so the existing
+single-machine path remains unchanged. Dense-layer sharding and browser/WebGPU
+workers are separate follow-up seams.
 
 ## How it works
 
@@ -311,7 +344,7 @@ Take the archive for your platform from
 [Releases](https://github.com/JustVugg/colibri/releases) and unpack it:
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+mkdir colibri && tar xzf colibri-v1.8.0-linux-x86_64.tar.gz -C colibri && cd colibri
 python3 coli info                         # engine ready ✓
 ```
 
@@ -358,7 +391,7 @@ the full 756 GB on disk at once:
 
 #### Other supported models
 
-GLM-5.2 is the reference model, but the same streaming approach runs three more
+GLM-5.2 is the reference model, but the same streaming approach runs five more
 families. Each is a **sibling engine** — one C file, its own architecture, the same
 `coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
 the model's `config.json`):
@@ -370,11 +403,13 @@ the model's `config.json`):
 >
 > | Model | Disk for the weights | RAM | GPU |
 > |---|---|---|---|
-> | **OLMoE** | ~4 GB | 8 GB | not needed |
+> | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed |
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
+> | **GLM-5.3-Flash** | ~195 GB converted | 25 GB (12 GB weights at int4 + expert cache) | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
-> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 22 GB comfortable | not needed |
+> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
+> | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -384,12 +419,30 @@ the model's `config.json`):
 |---|---|---|---|---|
 | **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
+| **GLM-5.3-Flash** (Z.ai) | 321B / 40B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) — converted to **int4-gs64** routed experts, dense stays BF16 and the precision is a load-time choice; vision included | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
-| **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
+| **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
+| **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+
+Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
+cosine to the int8 anchor 0.98777 → 0.99313 and KL 0.109 → 0.080 against per-row, i.e.
+~44% less quantization error), [int4 per-row](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4)
+as the A/B baseline, and [KAT-Coder v2.5](https://huggingface.co/Kreuzzelg/kat-coder-v2.5-dev-colibri-i4-gs64),
+which the same engine runs unchanged — any architecture-identical checkpoint works
+without a code path of its own. With `CUDA=1` the VRAM expert tier measured
+**1.44 → 10.05 tok/s (7.0×) on two 8 GB cards**, output bit-identical to the CPU path.
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
+Long agent sessions can opt into recurrent-state checkpoints (`COLI_K3_CKPT=N`
+slots in RAM, or parked on disk with `COLI_K3_CKPT_DIR`): an edited or follow-up
+prompt restores the deepest surviving checkpoint and re-prefills only the tail,
+instead of replaying the whole conversation through the SSM layers. On Vulkan
+hosts `K3_VK_UP=auto` sizes the expert tier upload from measured bandwidth. The
+engine's KDA and MLA paths are validated token-exact in CI against the vendor
+implementation.
+
 Inkling ships int4 experts but **bf16 dense weights** (49.4 GB resident); on a host
 that cannot hold those, [inkling.md](docs/inkling.md) has a one-pass tool that brings
 the dense set to 15.3 GB and lets the 975B run on a 25 GB box — with the honest
@@ -407,7 +460,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
-On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
+On Windows a release archive ships `coli.cmd`: double-click it for the quick
+start, or run `coli.cmd chat --model D:\glm52_i4` from cmd or PowerShell.
+From a source checkout the same commands work with `python coli chat --model
+D:\glm52_i4`. The `.exe` files are the engines, not the launcher: started on
+their own they have no model to load and exit immediately.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
@@ -457,6 +514,8 @@ Two things that differ per model, both documented in the per-model page:
 | Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
+| Experimental layer-segment embedding ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
+| Experimental tokenizer/embedding/head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
@@ -465,16 +524,35 @@ Two things that differ per model, both documented in the per-model page:
 **DeepSeek V4 Flash** streams the official checkpoint with no conversion: routed
 experts stay **native fp4**, the dense set stays **fp8-e4m3** with UE8M0 block
 scales. MLA + DSA sparse attention, 43 layers, 256 routed experts plus one
-shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2.
+shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2 (CPU), with
+an optional CUDA tier (Windows runtime DLL; Linux `CUDA=1` direct link,
+verified under WSL2) that keeps every stage CPU-canonical and falls back per stage.
 
 ```bash
 cd c
 make deepseek-v4
-python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
+python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 32
 # also: coli run / coli serve / coli web
+# Windows CUDA tier: make cuda-dsv4-dll CUDA_ARCH=portable  (+ make cuda-dsv4-dg-dll on RTX 50)
 ```
 
-Greedy decode, one KV slot; tools and grammar are not wired up yet.
+Two opt-in GPU levers are new and looking for community numbers, both default
+off and byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses
+between the GPU fill branch and the CPU branch using bandwidths measured at
+runtime, and `COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`)
+prefetches the next layer's full expert set into a second VRAM bank while the
+current layer computes, falling back to the single bank when VRAM is short.
+The CUDA tier also runs on Pascal and Turing cards now (GTX 10 / RTX 20
+series): build with `CUDA_ARCH=portable-pre-ampere NO_TC=1`.
+
+Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
+with V4's native prompt and DSML call blocks; grammar is not supported. See the
+[per-engine API matrix](docs/api.md#tool-calling-support). Prefix checkpoints
+(in memory + on disk) make agent sessions and follow-up turns start in seconds
+after the first prefill of a system prompt. Measured on an RTX 5080 + 2 NVMe:
+3324-token prefill 90 s, 8.3k-token first turn ~4 min once, later
+sessions/turns 6-9 s, decode ~1.6 tok/s at 3k context — see
+[docs/deepseek-v4.md](docs/deepseek-v4.md).
 
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`
@@ -489,8 +567,9 @@ the drafts saved — one 14-token answer took 495 seconds. So `V4_DRAFT` and
 `V4_MTP` default to `0` and the code stays, with the numbers beside it, for
 whoever retries this on faster storage.
 
-See [docs/deepseek-v4.md](docs/deepseek-v4.md) for checkpoint validation, the
-generated tiny independent oracle, and the full knob list.
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for the CUDA tier (build, DLL
+selection, GPU coverage), the environment reference, performance numbers,
+checkpoint validation, and the generated tiny independent oracle.
 
 ## What's next
 
@@ -501,9 +580,10 @@ generated tiny independent oracle, and the full knob list.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+  routed experts can be staged the same way. Six families run today (GLM-5.2,
+  Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.6, OLMoE); further open-weight
+  families — **MiniMax** among the candidates — earn an engine the way the
+  first six did: when someone measures one end to end.
 
 ## Supporting the project
 
@@ -513,7 +593,7 @@ today its numbers come from a community of real machines. If it's useful to you:
 - ⭐ star the repo and share it;
 - 🐛 open issues with benchmark numbers from your hardware — datapoints move
   this project more than anything else;
-- 💬 join the [Discord community](https://discord.gg/fpQxKnRb) to discuss
+- 💬 join the [Discord community](https://discord.gg/MAaKtQRc) to discuss
   experiments, hardware results, and research directions;
 - 💬 reach out via GitHub issues to sponsor development or donate hardware.
 

@@ -19,17 +19,20 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import shutil
 import sys
 from pathlib import Path
 
 try:
+    import numpy  # noqa: F401  -- safetensors.torch.save_file imports it internally
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
 except ImportError as exc:
-    sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors huggingface_hub")
+    sys.exit(f"Missing dependencies: {exc}. "
+             f"Install: pip install numpy torch safetensors huggingface_hub")
 
 EXPERT_KEY_RE = re.compile(
     r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
@@ -78,7 +81,17 @@ class OutputWriter:
         self.shard_idx = len(list(out_dir.glob("model-*.safetensors")))
 
     def add(self, name: str, tensor: "torch.Tensor"):
-        self.buf[name] = tensor.contiguous()
+        self.add_many(((name, tensor),))
+
+    def add_many(self, tensors):
+        """Add a group of tensors before deciding whether to flush.
+
+        Companion tensors such as an expert's merged weights and row scales
+        must be published together so a resumed conversion never mistakes a
+        half-written expert for a completed one.
+        """
+        for name, tensor in tensors:
+            self.buf[name] = tensor.contiguous()
         if len(self.buf) >= self.flush_every:
             self.flush()
 
@@ -86,7 +99,13 @@ class OutputWriter:
         if not self.buf:
             return
         fn = self.out_dir / f"model-{self.shard_idx:05d}.safetensors"
-        save_file(self.buf, str(fn))
+        tmp = Path(str(fn) + ".tmp")
+        tmp.unlink(missing_ok=True)
+        try:
+            save_file(self.buf, str(tmp))
+            os.replace(tmp, fn)
+        finally:
+            tmp.unlink(missing_ok=True)
         print(f"  wrote {fn.name} ({len(self.buf)} tensors)", flush=True)
         self.buf = {}
         self.shard_idx += 1
@@ -164,8 +183,10 @@ def convert_local(src_dir: Path, out_dir: Path, flush_every: int):
             sys.exit(f"Missing projection for layer {layer} expert {expert}: have {list(projs)}")
         gate, up, down = get(projs["gate_proj"]), get(projs["up_proj"]), get(projs["down_proj"])
         merged_q, merged_s = convert_expert(gate, up, down)
-        writer.add(mw, merged_q)
-        writer.add(f"model.layers.{layer}.mlp.experts.{expert}.qs", merged_s)
+        writer.add_many((
+            (mw, merged_q),
+            (f"model.layers.{layer}.mlp.experts.{expert}.qs", merged_s),
+        ))
         n_done += 1
         if n_done % 100 == 0 or n_done == n_total:
             print(f"  {n_done}/{n_total} experts converted...", flush=True)
@@ -224,8 +245,10 @@ def convert_streaming(repo: str, out_dir: Path, flush_every: int, min_free_gb: f
                 slot[proj] = f.get_tensor(name)
                 if all(k in slot for k in ("gate_proj", "up_proj", "down_proj")):
                     merged_q, merged_s = convert_expert(slot["gate_proj"], slot["up_proj"], slot["down_proj"])
-                    writer.add(mw, merged_q)
-                    writer.add(f"model.layers.{layer}.mlp.experts.{expert}.qs", merged_s)
+                    writer.add_many((
+                        (mw, merged_q),
+                        (f"model.layers.{layer}.mlp.experts.{expert}.qs", merged_s),
+                    ))
                     del pending_experts[key]
 
         Path(local_path).unlink(missing_ok=True)  # delete the source shard now -- disk-safe

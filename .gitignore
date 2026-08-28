@@ -19,6 +19,17 @@ c/inkling
 c/kimi_k3
 c/kimi_k3.exe
 c/olmoe.exe
+# deepseek_v4 and the per-unit objects its amalgamated Makefile leaves behind.
+# The same omission as #858, one file over: every engine is listed here except
+# the one added last, so `make deepseek-v4` left 26 untracked .o files in
+# `git status`.
+c/deepseek_v4
+c/deepseek_v4.exe
+c/COLI_V4_UNIT_*.o
+# ...and the ownership-test objects, which the same Makefile puts in a build/
+# subdirectory (V4_OWN_DIR) rather than next to the sources. #868 caught the
+# twelve in c/, not the four in here, so `make check` still left `?? c/build/`.
+c/build/
 c/iobench
 c/iobench.exe
 c/tok_test
@@ -32,6 +43,19 @@ c/coli_hip.dll
 c/coli_hip.lib
 c/coli_hip.exp
 c/coli_hip.pdb
+# DeepSeek V4 CUDA tier build artifacts (coli_cuda_dsv4.dll is the MSVC/nvcc
+# backend loaded at runtime by the MinGW-built deepseek-v4.exe)
+c/coli_cuda_dsv4.dll
+c/coli_cuda_dsv4.lib
+c/coli_cuda_dsv4.exp
+c/backend_cuda_dsv4*.o
+c/COLI_V4_UNIT_*.o
+c/dsv4_*_test*
+c/dsv4_loader_test*
+c/dsv4_decode_loader_test*
+c/t.o
+c/t.c
+c/compile_err.txt
 c/tests/test_*
 !c/tests/test_*.c
 !c/tests/test_*.cu
@@ -58,6 +82,8 @@ c/glm_tiny/
 c/glm_tiny_i2/
 c/glm_tiny_i4/
 c/glm_tiny_mix/
+c/glm_tiny_fmt6/
+c/glm_tiny_fmt4/
 c/glm_bench_medium/
 c/bench/
 
@@ -94,3 +120,24 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# DeepGEMM sm120 checkout made by c/tools/fetch_deepgemm.sh (pinned commit,
+# not vendored): the DeepSeek V4 DeepGEMM flavour's headers.
+c/third_party/deepgemm/
+
+# DLL flavours + MSVC import/export artifacts of the V4 CUDA tier (regenerated
+# by cuda-dsv4-dll / cuda-dsv4-dg-dll); the loader picks the DLL at runtime.
+c/coli_cuda_dsv4*.dll
+c/coli_cuda_dsv4*.lib
+c/coli_cuda_dsv4*.exp
+c/*.obj
+# macOS
+.DS_Store
+**/.DS_Store
+
+# compiled objects
+*.o
+
+# vendor modeling cache for the tiny K3 oracle (maintainer tool)
+c/kimi_k3_tiny/.vendor_kimi_k3/
+c/kimi_k3_tiny/.coli_usage

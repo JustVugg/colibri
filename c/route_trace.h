@@ -60,7 +60,7 @@
 #define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
 
 /* engines that write this format; the table exists so a mismatch names both sides */
-static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", NULL };
+static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", NULL };
 
 static uint32_t rt_hash(const char *s){        /* FNV-1a 32, stable across builds */
     uint32_t h = 2166136261u;
@@ -321,6 +321,12 @@ static void rt_decay(void){
 
 static int rt_save(const char *path, int quiet){
     if(!rt_c || !path || !*path) return 0;
+    /* USAGE_SAVE=0: read-only run — the history is loaded but never written back
+     * (#1039: benchmark loops must not skew the very profile they are measuring).
+     * Checked HERE so every engine honours the same switch with the same
+     * truthiness; a requested skip is a success, not a save failure. */
+    { const char *sv = getenv("USAGE_SAVE");
+      if(sv && atoi(sv)==0) return 1; }
     rt_decay();
     int64_t tot = 0, nz = 0;
     for(int i = 0; i <= rt_nl; i++){
@@ -328,7 +334,20 @@ static int rt_save(const char *path, int quiet){
         for(int e = 0; e < rt_ne; e++) if(rt_c[i][e]){ tot += rt_c[i][e]; nz++; }
     }
     char tmp[2100];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    /* Truncation here is not cosmetic: fopen/rename below would then write and land on a
+     * DIFFERENT path than the caller asked for, silently, with no indication the intended
+     * history was never touched. Refuse instead of truncating. A NEGATIVE return
+     * (encoding error) is the same hazard in a worse coat: C leaves tmp indeterminate,
+     * so proceeding would fopen whatever bytes happen to be there. Same refusal path. */
+    int tl = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (tl < 0 || tl >= (int)sizeof(tmp)) {
+        if (!quiet) {
+            if (tl < 0) fprintf(stderr, "[STATS] snprintf error building temp path, not saved: %s\n", path);
+            else        fprintf(stderr, "[STATS] path too long (>%d bytes), not saved: %s\n",
+                                (int)sizeof(tmp) - 5, path);
+        }
+        return 0;
+    }
     FILE *f = fopen(tmp, "w");
     if(!f){ if(!quiet) perror(tmp); return 0; }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header

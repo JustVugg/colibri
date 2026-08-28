@@ -26,6 +26,27 @@ int  coli_metal_available(void);
 void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
 int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
 
+/* ---- Standalone elementwise / normalization ops ---------------------------------- */
+/*
+ * RMSNorm: out[nrows*D] = rmsnorm(x[nrows*D], w[D], eps).
+ * Each of nrows independent rows of width D. w is shared (1 copy, [D]).
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_rmsnorm(float *x, const float *w, int nrows, int D, float eps);
+
+/*
+ * Residual add: y[i] += a[i] for i in [0, n).
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_add(float *y, const float *a, size_t n);
+
+/*
+ * SiLU gate-multiply: g[i] = silu(g[i]) * u[i] for i in [0, n).
+ * Destroy-u variant: u is consumed (gate * up fusion for SwiGLU).
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_silu_mul(float *g, const float *u, size_t n);
+
 /*
  * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
  * PER-GROUP scale into the accumulation -- see the shader comment in backend_metal.mm.
@@ -80,7 +101,7 @@ int coli_metal_layer_decode(float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
     const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
     const void *o_w, const float *o_s, int o_fmt, int o_gs,
     const void *shg_w, const float *shg_s, int shg_fmt, int shg_gs,
     const void *shu_w, const float *shu_s, int shu_fmt, int shu_gs,
@@ -116,9 +137,22 @@ int coli_metal_attn_decode(const float *x,
     const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
     const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
     const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
-    const void *kvb_w, const float *kvb_s, int kvb_fmt,
+    const void *kvb_w, const float *kvb_s, int kvb_fmt, int kvb_gs,
     const void *o_w, const float *o_s, int o_fmt, int o_gs,
     float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
+
+/*
+ * Write S KV-cache rows on GPU. out = Lc + pos_base*kv_lora gets rmsnorm(raw L, kv_a_ln, eps)
+ * and Rc + pos_base*qk_rope gets rope_interleave(raw R, pos_base+s, theta). Mirrors the
+ * CPU cache write: rmsnorm(Lc[pos], Lc[pos], kv_a_ln, kv_lora, eps) + rope_interleave(Rc[pos], pos, cfg).
+ * L_raw/R_raw are [S, kv_lora] / [S, qk_rope]. Returns 1 on success, 0 if Metal unavailable. */
+int coli_metal_kv_write(float *Lc, float *Rc, const float *L_raw, const float *R_raw,
+    const float *kv_a_ln, int S, int pos_base, int kv_lora, int qk_rope, float eps, float theta);
+
+/*
+ * Zero cache rows Lc[from*kv_lora .. (to-1)*kv_lora] and Rc[from*qk_rope .. (to-1)*qk_rope]
+ * on GPU. Covered by dedicated kernel. Returns 1 on success, 0 if Metal unavailable. */
+int coli_metal_kv_clear(float *Lc, float *Rc, int from, int to, int kv_lora, int qk_rope);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
@@ -137,18 +171,16 @@ int coli_metal_resset_stats(double *flush_s);
  *
  *  D           = hidden size, Iinter = moe intermediate size
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
- *  gs/us/ds[e] = pointers to expert e's per-row scales
- *  fmt         = quant format (shared across experts). NOTE: fmt=4 (grouped int4) is
- *                NOT yet supported here -- gates to {1,2} and returns 0 (CPU fallback)
- *                for fmt=4 experts, same as before this stage. Grouped-int4 gained GPU
- *                support in mm_gemv (coli_metal_matmul/coli_metal_gemm/bind_gemv) only;
- *                extending the batched routed-expert path is future work (see PR_BODY.md).
+ *  gs/us/ds[e] = pointers to expert e's per-row (fmt=1/2) or per-group (fmt=4) scales
+ *  fmt         = quant format (shared across experts): 1=int8, 2=int4 per-row, 4=int4
+ *                grouped. qgs is the fmt=4 group size (ignored, pass 0, for fmt!=4).
+ *  qgs         = fmt=4 group size shared across experts in this block (0 for fmt!=4)
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target
  * Returns 1 on success, 0 to signal the caller to fall back to the CPU path.
  */
-int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
+int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
@@ -163,12 +195,76 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
-ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw);
 int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out);
+
+/*
+ * KDA state recurrence for one token (decode: C=1). Replaces the serial per-head
+ * sweep in kda_forward(): decay state by alpha, accumulate kS, expand by kn*vt,
+ * merge output with qn. Each thread handles one element of [H * hd] output space;
+ * alpha/kn/qn/alpha are precomputed per-head arrays.
+ *   S          — in-place state `[H * hd * hd]` (row-major: [h][kk][vv])
+ *   qn         — L2-normalized, gated Q        `[H * hd]`
+ *   kn         — L2-normalized K               `[H * hd]`
+ *   vh         — gated V                        `[H * hd]`
+ *   alpha      — decay factors                  `[H * hd]`
+ *   beta       — mixing factor                  `[H]`
+ *   oh         — output accumulator             `[H * hd]` (initialized to 0 by kernel)
+ *   H, hd     — number of heads, head dimension
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_kda_state(float *S, const float *qn, const float *kn, const float *vh,
+                           const float *alpha, const float *beta, float *oh,
+                           int H, int hd);
+
+/*
+ * KDA Conv1d + SiLU gate for one projection (q, k, or v). Replaces the OMP-parallel
+ * depthwise conv loop in kda_forward(). The conv window is stateful across tokens:
+ *   conv_win[d*K]   — [P, K] shift register, oldest first, newest at K-1
+ *   vec[d]          — [P] raw projected value (saved to window[K-1], overwritten with gated result)
+ *   taps[d*K]       — [P, K] depthwise convolution taps (constant weights)
+ * One kernel dispatch per projection. Threadgroup of 256 threads, one thread per dimension.
+ * Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_kda_conv_silu(float *conv_win, float *vec, const float *taps, int P, int K);
+
+/*
+ * KDA L2 normalization: in-place normalization of Q and K per head.
+ *   q[h*hd:(h+1)*hd] *= 1/sqrt(sum(q^2) + eps) * qscale
+ *   k[h*hd:(h+1)*hd] *= 1/sqrt(sum(k^2) + eps)
+ *   eps = 1e-6, qscale = 1/sqrt(hd).
+ * One kernel dispatch for all H heads. Returns 1 on success, 0 if Metal unavailable.
+ */
+int coli_metal_kda_l2_norm(float *q, float *k, int H, int hd, float qscale);
+
+/*
+ * Fused KDA token step: conv_silu(q,k,v) + l2_norm(q,k) + state recurrence,
+ * all encoded into a single MTLCommandBuffer. This eliminates per-kernel
+ * command-buffer creation/commit/wait overhead (~5 × 150us → one 150us).
+ *   win_q, win_k, win_v  — [P*K] conv windows (stateful across tokens)
+ *   qt, kt                — [P] = [H*hd] raw projected (become L2-normalized q/k in-place)
+ *   tv                    — [P] = [H*hd] raw projected (becomes SiLU-gated V in-place)
+ *   taps_q, taps_k, taps_v — [P*K] depthwise taps (constant)
+ *   S                     — [H*hd*hd] in-place attention state
+ *   alpha                 — [H*hd] precomputed decay factors (CPU from rgt+dt+A)
+ *   beta                  — [H] precomputed mixing factors (CPU from braw)
+ *   oh                    — [H*hd] output accumulator (written by kernel, read by CPU)
+ *   P, K, H, hd           — projection dim, kernel width, heads, head dim
+ * Returns 1 on success, 0 if Metal unavailable. Caller must zero oh[] before call.
+ */
+int coli_metal_kda_fused_token(
+    float *win_q, float *qt,
+    float *win_k, float *kt,
+    float *win_v, float *tv,
+    const float *taps_q, const float *taps_k, const float *taps_v,
+    float *S,
+    const float *alpha, const float *beta,
+    float *oh,
+    int P, int K, int H, int hd);
 
 #ifdef __cplusplus
 }

@@ -84,9 +84,9 @@ help in proportion to the RAM you can give them.
 | Invocation | What it does |
 |---|---|
 | `-p "text" [-n N]` | streaming greedy generation (stops at eos or N tokens) |
-| `--chat -p "text"` | wraps the prompt in Inkling's chat template (role tokens + `<|content_text|>`, `<|message_model|>` as the generation prompt). Instruct models fed raw text are out of distribution and answer badly. `THINK=<0..1>` raises the reasoning effort (default 0) |
+| `--chat -p "text"` | wraps the prompt in Inkling's chat template (role tokens + `<\|content_text\|>`, `<\|message_model\|>` as the generation prompt). Instruct models fed raw text are out of distribution and answer badly. `THINK=<0..1>` raises the reasoning effort (default 0) |
 | `-f prompts.txt [-n N]` | one prompt per line (`#` comments skipped), single model load, state reset between prompts — the cache-warming workflow below |
-| `--audio file.dmel [-p "text"]` | spoken input: raw u8 DMel frames `[n_frames, 80]`, one `<|audio|>` position per frame (implies `--chat`) |
+| `--audio file.dmel [-p "text"]` | spoken input: raw u8 DMel frames `[n_frames, 80]`, one `<\|audio\|>` position per frame (implies `--chat`) |
 | `[cap] [bits] [ref.json]` | token-exact oracle harness against a `tools/make_tiny_inkling.py` fixture (CI-style validation; `tools/make_tiny_inkling_audio.py` for the audio path) |
 
 `coli chat` / `coli serve` / `coli web` render the same template through the
@@ -191,6 +191,7 @@ SNAP=~/Models/inkling_i4 ./c/inkling -f warmup_prompts.txt -n 32
 | `USAGE_SAVE=0` | don't rewrite the history (benchmark runs) |
 | `NOGPU=1` / `GPU_DEV=<n>` | disable CUDA / select device |
 | `IDOT=0` | byte-exact scalar int kernels (debugging) |
+| `INK_SHARED_BATCH=0` | disable shared-expert prefill batching for a controlled A/B; positive values cap rows per chunk. The default uses up to 64 MiB of bounded scratch and never changes decode (`S=1`) |
 | `TOPP=<p>` | adaptive routing: keep routed experts up to cumulative weight `p`, drop the tail. **Trims the routing** — fewer experts read per token (the lever that matters on a disk-bound host), but a different computation from the declared top-k. Off by default; the run reports `[topp] … N/M routed used (X% trimmed)` so the trade is measurable. Same semantics as `TOPP` in `colibri.c` and `K3_TOPP` in `kimi_k3.c` |
 | First positional arg | expert-cache cap per layer (`0` = auto-size from free RAM) |
 

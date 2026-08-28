@@ -3,6 +3,12 @@ glm_tiny/
 olmoe_hf/
 olmoe_i4/
 .build-config
+# DeepSeek-V4 amalgamation build artifacts (make -f Makefile.deepseek-v4)
+build/
+COLI_V4_UNIT_*.o
+expert_store_registry.o
+deepseek_v4
+test_expert_store_registry
 tests/test_st_mirror
 tests/test_st_pread
 tools/libiq3.so
@@ -13,12 +19,17 @@ tools/librans_c.dylib
 tools/rans_c.dll
 tests/fuzz_rans
 tests/bench_omp_grain
+tests/mxfp4_ref.o
+mxfp4_cuda_test
+absorb_determinism_test
+cuda_fmt_trap_test
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped
 tests/test_kv_alloc
 tests/test_kv_disk
 tests/test_kv_fp8
+tests/test_kv_tq
 tests/test_logit_nan
 tests/test_sample_nan
 tests/test_stops
@@ -27,3 +38,16 @@ tests/test_int3
 tests/test_int3_load
 tests/test_tok_o200k
 tests/test_pipe_block
+tests/test_kimi_request_state
+tests/test_kimi_serve_framing
+tests/test_v4_serve_framing
+tests/test_inkling_serve_framing
+*.o
+*.dll
+cublasLt64*.dll
+cudart64*.dll
+glm53
+qwen36
+shaders/attention_absorb.spv
+shaders/qmatmul_gate_up.spv
+shaders/rmsnorm.spv

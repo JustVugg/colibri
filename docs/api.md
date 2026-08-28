@@ -39,14 +39,31 @@ sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
-The server is deliberately text-only and serves one generation at a time: the
-744B model stays in one persistent process, so concurrent HTTP requests queue
-instead of loading duplicate model copies. Tool-calling **is** supported on this
-path — pass OpenAI `tools` and (optionally) `tool_choice`, mirroring the
-Anthropic endpoint below. Image/audio input, log probabilities, and token
-penalties return an explicit error rather than being silently ignored. The
-default bind address is localhost; set `COLI_API_KEY` before exposing the
-server beyond the machine.
+The server serves one generation at a time: the model stays in one persistent
+process, so concurrent HTTP requests queue instead of loading duplicate model
+copies. Tool calling depends on the active engine; see the support matrix below.
+Images, log probabilities, and token penalties return an explicit error rather
+than being silently ignored. Audio is accepted only by Inkling checkpoints with
+audio support. The default bind address is localhost; set `COLI_API_KEY` before
+exposing the server beyond the machine.
+
+### Tool-calling support
+
+| Engine | OpenAI `tools` | Anthropic `tool_use` | Native format |
+|---|---|---|---|
+| GLM-5.2 (`colibri`) | yes | yes | `<tool_call>` blocks |
+| DeepSeek V4 | yes | yes | native DSML tool-call blocks |
+| Inkling | no | no | active tool declarations/choices return HTTP 400 |
+| Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
+| OLMoE | no | no | active tool declarations/choices return HTTP 400 |
+
+On supported engines, pass OpenAI `tools` and optionally `tool_choice` to
+`/v1/chat/completions`. The Anthropic endpoint translates `tools`,
+`tool_use`/`tool_result`, and the `auto`, `any`, `none`, and forced-tool choice
+modes into the active engine's native prompt and back into protocol responses.
+Protocol support does not guarantee that every quantized model emits valid
+tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
+int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
 
 When a reverse proxy or MagicDNS hostname preserves a public `Host` header,
 trust that exact hostname with repeatable `--allowed-host` options. The
@@ -98,18 +115,26 @@ export ANTHROPIC_MODEL=glm-5.2-colibri
 claude
 ```
 
-Supported: system prompts (string or text blocks), multi-turn `user`/`assistant`
-messages, `text` / `tool_use` / `tool_result` content blocks, tools with
-`input_schema`, every `tool_choice` mode, streaming with the full named-event
+Supported on every served architecture: system prompts (string or text blocks),
+multi-turn `user`/`assistant` messages, streaming with the full named-event
 sequence (`message_start` → `content_block_*` → `message_delta` → `message_stop`,
-plus protocol `ping` keepalives during long prefills), `stop_reason`
-(`end_turn` / `max_tokens` / `tool_use`), Anthropic `usage` field names, and
-`x-api-key` authentication (`Authorization: Bearer` also works). Extended
-thinking is enabled with `{"thinking": {"type": "enabled"}}`.
+plus protocol `ping` keepalives during long prefills), `stop_reason`, Anthropic
+`usage` field names, and `x-api-key` authentication (`Authorization: Bearer`
+also works). The gateway renders each request with the active engine's native
+chat template; GLM, Inkling, Kimi K3, OLMoE, and DeepSeek V4 prompts are not
+interchangeable. Where the engine exposes a reasoning mode, extended thinking
+is enabled with `{"thinking": {"type": "enabled"}}` and translated to that
+architecture's reasoning protocol; OLMoE disables it explicitly.
+
+Tool use follows the per-engine matrix above. Unsupported engines reject active
+tool declarations and choices explicitly instead of feeding another
+architecture's markers to an incompatible tokenizer.
 
 Not supported, and refused explicitly rather than ignored: `stop_sequences`,
 `top_k`, and non-text content blocks (images, documents). Errors use Anthropic's
-own `{"type":"error","error":{...}}` envelope on this path.
+own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
+features that have not been wired to this protocol are likewise rejected with
+an explicit error.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path
@@ -251,7 +276,7 @@ telemetry stack — hardware, scheduler, tier bar, per-turn time breakdown, tok/
 trend and per-GPU expert counts:
 
 <p align="center">
-  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport">
+  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
   &nbsp;&nbsp;
-  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar">
+  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar" />
 </p>

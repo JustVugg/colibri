@@ -52,13 +52,34 @@ gcc -O2 -fopenmp iobench.c -o iobench
 # 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
 COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
-# 3) record expert usage, then pin the hottest experts in your spare RAM:
+# 3) full automated datapoint — machine info + cold/warm decode + disk, one command:
+python tools/datapoint.py --snap /path/to/model --shard /path/to/container/model-00000.safetensors
+# (stdlib-only; auto-selects GLM, Inkling, Kimi K3, OLMoE, Qwen3.6, or DeepSeek V4
+#  from config.json; evicts the page cache before engine load; then keeps one
+#  SERVE=1 engine alive for cold, warm-identical, and rotating-prompt measurements)
+
+# 4) record expert usage, then pin the hottest experts in your spare RAM:
 STATS=stats.txt ./coli chat
 PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 
-# 4) quality benchmarks (MMLU/HellaSwag/ARC):
+# 5) quality benchmarks (MMLU/HellaSwag/ARC):
 ./coli bench
 ```
+
+The default datapoint measures serving behavior, not repeated startup: the same
+engine process and cache slot are used for one cold request, one repeated-prompt
+warm request, and four requests drawn in fixed order from a diverse built-in
+prompt suite. The **rotating-prompt median is the primary result** because the
+expert cache must keep adapting as requests change. Warm-identical remains in
+the report only as a useful cache/KV upper bound; it is not representative of a
+mixed chat workload. The reported completion count, decode tok/s, expert hit
+rate, and RSS come from each engine's `DONE` frame.
+
+Use repeated `--rotate-prompt '...'` arguments to replace the built-in suite
+(at least two distinct prompts), or `--rotating-runs N` to run more fixed-order
+samples. Use `--mode fresh-process` only when measuring startup or OS page-cache
+effects; that compatibility mode launches a new engine for every row and
+therefore does not retain in-process caches.
 
 ## Back-of-envelope predictions
 
@@ -87,7 +108,9 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | Apple M5 Max (18 cores) · macOS · 128 GB unified · internal SSD ([#4](https://github.com/JustVugg/colibri/issues/4), [#5](https://github.com/JustVugg/colibri/issues/5)) | ~4 GB/s cold (the 14.2 GB/s reading was cache-influenced — see note) | default, MTP off | **1.06 tok/s** · expert hit 23% · RSS 21.8 GB |
 | Apple M5 Max · macOS · 128 GB unified · 2 TB SSD · **Metal backend** ([#72](https://github.com/JustVugg/colibri/pull/72), [#87](https://github.com/JustVugg/colibri/issues/87)) | (macOS O_DIRECT figure unreliable — see note) | Metal on · `--ram 96` · 39.7 GB warm pin · MTP off | **1.83 tok/s** · expert hit 66% · warmed 1.11 → 1.83 over the run |
 | 〃 · 46.9 GB pin (2.94M-selection history) · `--ram 110`, 1024-token run ([#103](https://github.com/JustVugg/colibri/issues/103)) | 〃 | Metal on (experts + attention) · MTP off | **2.06 tok/s** · hit 72.5% · coherent output |
+| Apple M1 Ultra (20C, 48-core GPU) · Mac Studio · macOS · 128 GB unified · internal SSD · **Metal backend** · fmt=2 per-row container ([report](METAL-M1ULTRA-FMT2-REPORT.md)) | 6.89 GB/s F_NOCACHE · 8.93 GB/s buffered | Metal on (fmt=2) · `--ram 125` · `--cap 33` · 46.9 GB frozen pin · `NO_OMP`+`PIPE` · MTP off · 1024-token run | **1.50 tok/s** · hit 78.7% · RSS 104.8 GB · disk wait 57% of decode, SSD at ~93% of its iobench ceiling (1.31 at default flags, `--ram 110`) |
 | Mac Mini M4 Pro · macOS · **48 GB** unified · **Metal backend** ([#107](https://github.com/JustVugg/colibri/issues/107)) | 6.59 GB/s F_NOCACHE (fresh shard) | Metal on · `--ram 38` | **0.30 tok/s** (vs 0.18 CPU-only) |
+| Apple M3 (base, 4P+4E) · macOS · **16 GB unified** · internal Apple SSD ([#949](https://github.com/JustVugg/colibri/issues/949)) | 3.18 GB/s cold F_NOCACHE (post-eviction) · 7.27 GB/s buffered — no O_DIRECT on macOS, caveat #86 | **OLMoE int8** · cap 16 · TEMP=0 · CPU-only | **3.69 tok/s cold → 4.18 tok/s warm** · RSS 1.5–1.81 GB · load 0.7 s |
 | Epyc 9654 ES · Linux · 4x16GB DDR5-4800-rdimm · Samsung PCIe Gen3 x4 NVME SSD | — | `MTP=1 DIRECT=1` | 0.31 tok/s · expert hit 35% · RSS 21.52 GB |
 | Ryzen AI 9 HX 370 (Framework 13) · Arch Linux · 128 GB · WD SN850X, BTRFS zstd ([#12](https://github.com/JustVugg/colibri/issues/12)) | — | int8 MTP head · `--cap 32` · 46.7 GB auto-learned PIN | **0.37 tok/s** · expert hit 66% · MTP acceptance 52% (2.59 tok/fw) · RSS 105 GB |
 | Ryzen 9 9950X (32 threads) · Linux · 123 GB · Crucial P3 QLC Gen3 ([#31](https://github.com/JustVugg/colibri/issues/31)) | 1.51 GB/s buffered | default, 2 runs from cold | 0.10 tok/s · hit 53% · profile 66% disk |
@@ -114,9 +137,13 @@ machine, same history, only the disk swapped — ×5.8 disk bandwidth bought ×2
 tokens, and the profile **flipped from 66% disk to 57% matmul**. But the
 crossover depends on the CPU kernel: with OMP hot-team tuning on, an AVX-512 CPU
 can match an RTX 5090 on expert matmul ([#101](https://github.com/JustVugg/colibri/issues/101)),
-so **the GPU tier earns its VRAM only when the CPU is the weak link**. On
-multi-socket hosts, NUMA placement is a further lever: interleaving the resident
-weights across nodes measured **+13% (2-socket) and +40% (4-socket CPU-only)**
+so **the GPU tier earns its VRAM only when the CPU is the weak link**. The
+M1 Ultra ↔ M5 Max Metal pair is the same lesson on Apple Silicon: near-equal
+GPU core counts (48 vs 40) but −33% tok/s (1.50 vs 2.24), because 57% of the
+M1 Ultra decode wall is serial SSD wait at ~93% of the drive's measured
+ceiling — **when experts stream from disk, the drive, not the GPU, sets the
+rate**. On multi-socket hosts, NUMA placement is a further lever:
+interleaving the resident weights across nodes measured **+13% (2-socket) and +40% (4-socket CPU-only)**
 ([#82](https://github.com/JustVugg/colibri/issues/82)). On a 2-socket Xeon Silver
 4510 host with 6× RTX 5090, selective `COLI_NUMA=1` raised effective CPU-expert
 bandwidth from **42.42 to 58.26/65.89 GB/s** and greedy decode from **7.66 to

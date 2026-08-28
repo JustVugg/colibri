@@ -63,6 +63,8 @@ const it: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "Scrivi a colibrì…",
   "chat.inputHint": "Invio per inviare · Shift+Invio per andare a capo",
+  "chat.attachImage": "Allega un'immagine",
+  "chat.removeImage": "Togli l'immagine",
   "chat.stop": "Ferma la generazione",
   "chat.send": "Invia messaggio",
 

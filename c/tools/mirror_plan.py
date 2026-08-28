@@ -21,9 +21,13 @@ RECEIPT = ".colibri-mirror.json"
 GIB = 1024 ** 3
 MAX_HEADER = 256 * 1024 * 1024
 COPY_CHUNK = 16 * 1024 * 1024
-EXPERT_KEY = re.compile(
+GLM_EXPERT_KEY = re.compile(
     r"(?:^|\.)layers\.(\d+)\.mlp\.experts\.(\d+)\."
     r"(gate_proj|up_proj|down_proj)\.weight(?:\.qs)?$"
+)
+K3_EXPERT_KEY = re.compile(
+    r"(?:language_model\.)?model\.layers\.(\d+)\.block_sparse_moe\."
+    r"experts\.(\d+)\.(w1|w2|w3)\.weight_(packed|scale)$"
 )
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -72,6 +76,18 @@ def usage_counts(path):
     return counts
 
 
+def expert_tensor(name):
+    match = GLM_EXPERT_KEY.search(name)
+    if match is not None:
+        return ((int(match.group(1)), int(match.group(2))),
+                match.group(3) == "gate_proj" and name.endswith(".weight"))
+    match = K3_EXPERT_KEY.fullmatch(name)
+    if match is not None:
+        return ((int(match.group(1)), int(match.group(2))),
+                match.group(3) == "w1" and match.group(4) == "packed")
+    return None
+
+
 def shard_metadata(path):
     size = path.stat().st_size
     if size < 8:
@@ -89,24 +105,24 @@ def shard_metadata(path):
         raise MirrorError(f"Safetensors header is not an object: {path}")
 
     expert_bytes = {}
-    gate_experts = set()
+    anchor_experts = set()
     for name, metadata in header.items():
         if name == "__metadata__" or not isinstance(name, str) or not isinstance(metadata, dict):
             continue
-        match = EXPERT_KEY.search(name)
+        tensor = expert_tensor(name)
         offsets = metadata.get("data_offsets")
-        if match is None or not isinstance(offsets, list) or len(offsets) != 2:
+        if tensor is None or not isinstance(offsets, list) or len(offsets) != 2:
             continue
         start, end = offsets
         if (isinstance(start, bool) or isinstance(end, bool) or
                 not isinstance(start, int) or not isinstance(end, int) or
                 start < 0 or end < start or end > size - 8 - header_size):
             raise MirrorError(f"Invalid tensor offsets for {name} in {path}")
-        expert = (int(match.group(1)), int(match.group(2)))
+        expert, is_anchor = tensor
         expert_bytes[expert] = expert_bytes.get(expert, 0) + end - start
-        if match.group(3) == "gate_proj" and name.endswith(".weight"):
-            gate_experts.add(expert)
-    return size, expert_bytes, gate_experts
+        if is_anchor:
+            anchor_experts.add(expert)
+    return size, expert_bytes, anchor_experts
 
 
 def discover_shards(model, source_dirs):
@@ -124,13 +140,13 @@ def discover_shards(model, source_dirs):
             if path.name in seen or not path.is_file():
                 continue
             seen.add(path.name)
-            size, expert_bytes, gate_experts = shard_metadata(path)
+            size, expert_bytes, anchor_experts = shard_metadata(path)
             candidates.append({
                 "name": path.name,
                 "size": size,
                 "source": path,
                 "expert_bytes": expert_bytes,
-                "gate_experts": gate_experts,
+                "anchor_experts": anchor_experts,
             })
     if not candidates:
         raise MirrorError("No safetensors shards were found in the model source directories")
@@ -138,9 +154,8 @@ def discover_shards(model, source_dirs):
 
 
 def select_shards(candidates, counts, budget):
-    # The engine decides an expert's replica from its gate_proj shard. A shard
-    # containing only up/down weights cannot serve that expert from the mirror
-    # until its gate shard is present, so score companions only after activation.
+    # The engine decides an expert's replica from its first tensor (gate_proj for
+    # GLM, packed w1 for K3), so score companions only after that anchor is present.
     # The byte-weighted usage score estimates I/O moved off the primary drive.
     selected = []
     activated = set()
@@ -151,7 +166,7 @@ def select_shards(candidates, counts, budget):
         for item in remaining:
             if used + item["size"] > budget:
                 continue
-            eligible = activated | item["gate_experts"]
+            eligible = activated | item["anchor_experts"]
             benefit = sum(counts.get(expert, 0) * byte_count
                           for expert, byte_count in item["expert_bytes"].items()
                           if expert in eligible)
@@ -168,10 +183,10 @@ def select_shards(candidates, counts, budget):
                 choice[0]["name"],
             ),
         )
-        newly_activated = item["gate_experts"] - activated
+        newly_activated = item["anchor_experts"] - activated
         selected.append({**item, "weighted_expert_bytes": benefit,
                          "activated_experts": len(newly_activated)})
-        activated.update(item["gate_experts"])
+        activated.update(item["anchor_experts"])
         remaining.remove(item)
         used += item["size"]
     return selected
