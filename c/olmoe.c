@@ -2006,7 +2006,7 @@ static int olmoe_edge_engine_open(
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
                           COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id), "olmoe");
@@ -2101,11 +2101,35 @@ static int olmoe_edge_select(void *engine_impl,
     return 0;
 }
 
+static int olmoe_edge_logits(void *engine_impl,
+                             const ColiEdgeLogitsRequest *request,
+                             char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul(request->logits + (size_t)row * config->vocab,
+               normalized, engine->model.lm_head,
+               1, config->hidden, config->vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
 static const ColiEdgeAdapter olmoe_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "olmoe",
     olmoe_edge_engine_open, olmoe_edge_engine_destroy,
     olmoe_edge_tokenize, olmoe_edge_detokenize,
-    olmoe_edge_embed, olmoe_edge_select, {0}
+    olmoe_edge_embed, olmoe_edge_select, olmoe_edge_logits, {0}
 };
 
 int coli_olmoe_edge_adapter_register(void) {

@@ -348,7 +348,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     int o = 0;
     for (int i=0;i<n;i++){
         unsigned char c = s[i];
-        if (c == '"'){ if(o+2<outsz){ out[o++]='"'; out[o++]='"'; } }
+        if (c == '"'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='"'; } }
         else if (c == '\\'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='\\'; } }
         else if (c == '\n'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='n'; } }
         else if (c == '\r'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='r'; } }
@@ -3256,7 +3256,7 @@ static int qwen36_edge_engine_open(
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
                           COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id), "qwen36");
@@ -3392,11 +3392,35 @@ static int qwen36_edge_select(void *engine_impl,
     return 0;
 }
 
+static int qwen36_edge_logits(void *engine_impl,
+                              const ColiEdgeLogitsRequest *request,
+                              char *error, size_t error_size) {
+    Qwen36EdgeEngine *engine = (Qwen36EdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Qwen3.6 Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul_d(request->logits + (size_t)row * config->vocab,
+                 normalized, engine->model.lm_head,
+                 1, config->hidden, config->vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
 static const ColiEdgeAdapter qwen36_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "qwen36",
     qwen36_edge_engine_open, qwen36_edge_engine_destroy,
     qwen36_edge_tokenize, qwen36_edge_detokenize,
-    qwen36_edge_embed, qwen36_edge_select, {0}
+    qwen36_edge_embed, qwen36_edge_select, qwen36_edge_logits, {0}
 };
 
 int coli_qwen36_edge_adapter_register(void) {

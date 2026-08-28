@@ -1,0 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu; sys_platform != "darwin"
+torch==2.13.0; sys_platform == "darwin"
+transformers==5.16.1
+safetensors==0.8.0

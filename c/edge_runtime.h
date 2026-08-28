@@ -10,9 +10,10 @@
  * separate prevents a network client from reaching into an engine's private
  * Model structure or loading the complete transformer just to start a chat.
  *
- * Version 1 deliberately exposes deterministic greedy selection. Sampling
- * policies can be added without changing the embedding/activation contract.
- * Registration is explicit; ordinary Colibri executables do not use this API.
+ * Version 2 additionally exposes final-head logits. Sampling policy and RNG
+ * remain with the serving caller, while every model-specific final transform
+ * and output-head implementation stays owned by Colibri. Registration is
+ * explicit; ordinary Colibri executables do not use this API.
  */
 
 #include <stddef.h>
@@ -22,7 +23,7 @@
 extern "C" {
 #endif
 
-#define COLI_EDGE_ABI_VERSION 1u
+#define COLI_EDGE_ABI_VERSION 2u
 #define COLI_EDGE_ENGINE_ID_CAP 64u
 #define COLI_EDGE_STATE_SCHEMA_CAP 128u
 #define COLI_EDGE_NUMERIC_CLASS_CAP 96u
@@ -41,6 +42,7 @@ enum {
     COLI_EDGE_CAP_TOKENIZE = UINT64_C(1) << 0,
     COLI_EDGE_CAP_DETOKENIZE = UINT64_C(1) << 1,
     COLI_EDGE_CAP_GREEDY = UINT64_C(1) << 2,
+    COLI_EDGE_CAP_LOGITS = UINT64_C(1) << 3,
     COLI_EDGE_CAP_CPU = UINT64_C(1) << 8,
     COLI_EDGE_CAP_CUDA = UINT64_C(1) << 9,
     COLI_EDGE_CAP_HIP = UINT64_C(1) << 10,
@@ -115,6 +117,22 @@ typedef struct {
     uint64_t reserved_u64[3];
 } ColiEdgeSelectRequest;
 
+/* Applies the exact model-specific final transform and LM head, returning
+ * rows*vocab_size float logits in row-major order. This deliberately does
+ * not prescribe temperature, top-p or an RNG: those are serving policy, not
+ * model math. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t rows;
+    const void *input;
+    size_t input_bytes;
+    float *logits;
+    size_t logits_capacity;
+    ColiEdgeCancelFn should_cancel;
+    void *cancel_user_data;
+    uint64_t reserved_u64[3];
+} ColiEdgeLogitsRequest;
+
 typedef struct {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -135,8 +153,10 @@ typedef struct {
                  char *error, size_t error_size);
     int (*select)(void *engine_impl, const ColiEdgeSelectRequest *request,
                   char *error, size_t error_size);
+    int (*logits)(void *engine_impl, const ColiEdgeLogitsRequest *request,
+                  char *error, size_t error_size);
 
-    void (*reserved_fn[8])(void);
+    void (*reserved_fn[7])(void);
 } ColiEdgeAdapter;
 
 int coli_edge_adapter_register(const ColiEdgeAdapter *adapter);
@@ -168,6 +188,9 @@ int coli_edge_embed(ColiEdgeEngine *engine,
                     char *error, size_t error_size);
 int coli_edge_select(ColiEdgeEngine *engine,
                      const ColiEdgeSelectRequest *request,
+                     char *error, size_t error_size);
+int coli_edge_logits(ColiEdgeEngine *engine,
+                     const ColiEdgeLogitsRequest *request,
                      char *error, size_t error_size);
 
 #ifdef __cplusplus

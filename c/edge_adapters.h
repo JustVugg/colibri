@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 int coli_glm_edge_adapter_register(void);
+int coli_glm53_edge_adapter_register(void);
 int coli_inkling_edge_adapter_register(void);
 int coli_kimi_edge_adapter_register(void);
 int coli_olmoe_edge_adapter_register(void);

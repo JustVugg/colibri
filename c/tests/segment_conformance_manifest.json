@@ -3,45 +3,105 @@
   "release_policy": "all_registered_families",
   "families": [
     {
+      "family_id": "glm53",
+      "state_schema": "fixture/glm53-mla-latent-kda-conv-dsa-mhc-v1",
+      "state_components": [
+        "mla_latent",
+        "kda_recurrent",
+        "convolution",
+        "dsa_indexer",
+        "hyper_connections"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_glm53_multimodal_tiny.py"
+      },
+      "real_adapter_required": true
+    },
+    {
       "family_id": "glm",
       "state_schema": "fixture/glm-mla-dsa-v1",
-      "state_components": ["mla_latent", "rope", "dsa_indexer", "device_cache"],
-      "oracle": {"kind": "generated_tiny", "path": "tools/make_glm_oracle.py"},
+      "state_components": [
+        "mla_latent",
+        "rope",
+        "dsa_indexer",
+        "device_cache"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_glm_oracle.py"
+      },
       "real_adapter_required": true
     },
     {
       "family_id": "inkling",
       "state_schema": "fixture/inkling-kv-ring-conv-v1",
-      "state_components": ["global_kv", "sliding_kv_ring", "convolution"],
-      "oracle": {"kind": "generated_tiny", "path": "tools/make_tiny_inkling.py"},
+      "state_components": [
+        "global_kv",
+        "sliding_kv_ring",
+        "convolution"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_tiny_inkling.py"
+      },
       "real_adapter_required": true
     },
     {
       "family_id": "kimi",
       "state_schema": "fixture/kimi-mla-kda-conv-attnres-v1",
-      "state_components": ["mla", "kda_recurrent", "convolution", "attnres"],
-      "oracle": {"kind": "generated_tiny", "path": "tools/make_kimi_k3_tiny.py"},
+      "state_components": [
+        "mla",
+        "kda_recurrent",
+        "convolution",
+        "attnres"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_kimi_k3_tiny.py"
+      },
       "real_adapter_required": true
     },
     {
       "family_id": "olmoe",
       "state_schema": "fixture/olmoe-kv-v1",
-      "state_components": ["kv"],
-      "oracle": {"kind": "real_checkpoint", "path": "tools/make_olmoe_real_oracle.py"},
+      "state_components": [
+        "kv"
+      ],
+      "oracle": {
+        "kind": "real_checkpoint",
+        "path": "tools/make_olmoe_real_oracle.py"
+      },
       "real_adapter_required": true
     },
     {
       "family_id": "qwen36",
       "state_schema": "fixture/qwen36-kv-deltanet-conv-v1",
-      "state_components": ["attention_kv", "deltanet_recurrent", "convolution_ring"],
-      "oracle": {"kind": "generated_tiny", "path": "tools/make_qwen36_tiny.py"},
+      "state_components": [
+        "attention_kv",
+        "deltanet_recurrent",
+        "convolution_ring"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_qwen36_tiny.py"
+      },
       "real_adapter_required": true
     },
     {
       "family_id": "deepseek_v4",
       "state_schema": "fixture/dsv4-mhc-compressed-v1",
-      "state_components": ["mhc", "window_attention", "compressed_attention", "compressor", "indexer"],
-      "oracle": {"kind": "generated_tiny", "path": "tools/make_deepseek_v4_tiny.py"},
+      "state_components": [
+        "mhc",
+        "window_attention",
+        "compressed_attention",
+        "compressor",
+        "indexer"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_deepseek_v4_tiny.py"
+      },
       "real_adapter_required": true
     }
   ]

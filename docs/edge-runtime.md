@@ -73,7 +73,12 @@ Tokenize and detokenize support a sizing pass by passing a null output with
 zero capacity. `coli_edge_embed` accepts exactly one token ID per row and emits
 `rows * state_width` values in the advertised dtype. `coli_edge_select`
 applies the model's exact final transform and output head to every input row,
-returning one greedy token and an optional score per row.
+returning one greedy token and an optional score per row. Edge ABI v2 also
+exposes `coli_edge_logits`, which returns the complete row-major vocabulary
+logits after that same model-specific transform. Colibri therefore remains the
+owner of model math, while a serving caller can apply temperature, top-p and
+its own reproducible RNG policy without duplicating any of the six heads.
+`argmax(logits)` is release-gated against `coli_edge_select` for every family.
 
 The runtime validates structure sizes, activation geometry, batch limits,
 output capacities and cancellation before entering an adapter. Model adapters
@@ -89,6 +94,9 @@ the real Edge adapter and a full real Segment range, round-trips text, embeds
 an independent oracle prompt, performs prefill plus decode and compares three
 greedy tokens with that oracle. It also requires generated tokens to be
 detokenizable and requires exact Edge/Segment capability identity.
+For each family, the gate additionally computes the full logits for the first
+decode row and requires their argmax to equal the already oracle-checked
+greedy token.
 
 Generate the existing tiny checkpoints from `c/` (they are test data and are
 not committed):

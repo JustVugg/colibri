@@ -16,6 +16,7 @@ extern "C" {
 #endif
 
 int coli_glm_segment_adapter_register(void);
+int coli_glm53_segment_adapter_register(void);
 int coli_inkling_segment_adapter_register(void);
 int coli_kimi_segment_adapter_register(void);
 int coli_olmoe_segment_adapter_register(void);

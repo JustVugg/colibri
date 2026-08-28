@@ -3081,7 +3081,7 @@ static int inkling_edge_engine_open(
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
                           COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id), "inkling");
@@ -3181,11 +3181,37 @@ static int inkling_edge_select(void *engine_impl,
     return 0;
 }
 
+static int inkling_edge_logits(void *engine_impl,
+                               const ColiEdgeLogitsRequest *request,
+                               char *error, size_t error_size) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Inkling Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        for (int item = 0; item < config->hidden; item++)
+            normalized[item] /= config->mup;
+        matmul_w(request->logits + (size_t)row * config->unpad_vocab,
+                 normalized, engine->model.lm_head,
+                 1, config->hidden, config->unpad_vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
 static const ColiEdgeAdapter inkling_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "inkling",
     inkling_edge_engine_open, inkling_edge_engine_destroy,
     inkling_edge_tokenize, inkling_edge_detokenize,
-    inkling_edge_embed, inkling_edge_select, {0}
+    inkling_edge_embed, inkling_edge_select, inkling_edge_logits, {0}
 };
 
 int coli_inkling_edge_adapter_register(void) {

@@ -833,6 +833,10 @@ class FamilyRegistryTest(unittest.TestCase):
     def test_tuning_replay_prompts_are_registry_owned(self):
         prompt = "hello {world}"
         expected = {
+            # GLM-5.3 apre il ragionamento e non lo chiude: il suo
+            # chat_template.jinja mette <think> dopo <|assistant|> e basta,
+            # dove GLM-5.2 metteva <think></think>.
+            "glm53": "[gMASK]<sop><|user|>hello {world}<|assistant|><think>",
             "glm": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",

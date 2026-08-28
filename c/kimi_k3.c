@@ -1143,7 +1143,13 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
           g_k3_val_layer=-1;
         } else {
           const char *ofn=getenv("K3_VALIDATE_OUT");
-          if(!ofn) ofn="/tmp/k3_val";
+          /* CWD-relative, not a /tmp path: same rule as test_stops.c and
+             test_pipe_block.c, since the windows job builds native .exe
+             files that resolve Windows paths and /tmp is not one. The
+             chosen path is printed on both the success and the failure
+             branch below, so a caller relying on the old default is told
+             where the dump went. */
+          if(!ofn) ofn="k3_val";
           g_k3_val_fp=fopen(ofn,"w");
           if(!g_k3_val_fp){
             fprintf(stderr,"[K3-VAL] cannot open %s (%s) — disabled\n",ofn,strerror(errno));
@@ -3844,7 +3850,7 @@ static int kimi_edge_engine_open(
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
                           COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id), "kimi");
@@ -3948,11 +3954,38 @@ static int kimi_edge_select(void *engine_impl,
     return 0;
 }
 
+static int kimi_edge_logits(void *engine_impl,
+                            const ColiEdgeLogitsRequest *request,
+                            char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *mixed = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge logits cancelled");
+        }
+        const float *state = input + (size_t)row * engine->state_width;
+        res_mix(mixed, state, state + config->hidden,
+                (int)engine->nbmax, config->hidden,
+                engine->model.out_sw, config->eps);
+        rmsnorm_(mixed, mixed, engine->model.final_norm,
+                 config->hidden, config->eps);
+        w_matmul(request->logits + (size_t)row * config->vocab,
+                 mixed, &engine->model.lm_head, 1);
+    }
+    free(mixed);
+    return 0;
+}
+
 static const ColiEdgeAdapter kimi_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "kimi",
     kimi_edge_engine_open, kimi_edge_engine_destroy,
     kimi_edge_tokenize, kimi_edge_detokenize,
-    kimi_edge_embed, kimi_edge_select, {0}
+    kimi_edge_embed, kimi_edge_select, kimi_edge_logits, {0}
 };
 
 int coli_kimi_edge_adapter_register(void) {

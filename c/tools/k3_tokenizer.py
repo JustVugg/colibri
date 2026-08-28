@@ -27,6 +27,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 
 PAT = "|".join([
     r"""[\p{Han}]+""",
@@ -155,13 +156,30 @@ def main():
             return
         enc = tiktoken.Encoding(name="k3", pat_str=PAT,
                                 mergeable_ranks=ranks, special_tokens={})
-        cases = "/tmp/k3_tok_cases.bin"
-        with open(cases, "wb") as f:
-            f.write(_st.pack("<I", len(corpus)))
-            for t in corpus:
-                b = t.encode("utf-8")
-                f.write(_st.pack("<I", len(b)) + b)
-        r = subprocess.run([a.ctest, out, cases], capture_output=True, text=True)
+        # Next to the output rather than a hardcoded /tmp, and removed
+        # after. Same rule as test_stops.c and test_pipe_block.c, which say
+        # not to root a path at /tmp because the windows job builds native
+        # .exe files and that is not a Windows path, and as the setup.sh
+        # OMP probe. fopen("w") creates the file but not the directory, so
+        # this fails wherever /tmp does not already exist. A fixed FILENAME
+        # is also a collision between two concurrent runs, and nothing here
+        # ever deleted it.
+        fd, cases = tempfile.mkstemp(prefix=".colibri-k3-cases-", suffix=".bin",
+                                     dir=os.path.dirname(os.path.abspath(out)))
+        os.close(fd)
+        try:
+            with open(cases, "wb") as f:
+                f.write(_st.pack("<I", len(corpus)))
+                for t in corpus:
+                    b = t.encode("utf-8")
+                    f.write(_st.pack("<I", len(b)) + b)
+            r = subprocess.run([a.ctest, out, cases], capture_output=True, text=True)
+        finally:
+            # try/finally so a failing ctest does not leave the file behind
+            try:
+                os.unlink(cases)
+            except OSError:
+                pass
         print(r.stderr.strip(), file=sys.stderr)
         got = [([int(x) for x in ln.split()] if ln else [])
                for ln in r.stdout.splitlines()]

@@ -26,6 +26,21 @@ _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
 _ANALYSIS_CACHE_VERSION = 1
 
 
+def _dense_in_ram(descriptor, on_disk_bytes):
+    """I byte che i pesi densi occuperanno, non quelli che occupano sul disco.
+
+    Coincidono per chi li carica come stanno; una famiglia che li riquantizza
+    al caricamento lo dichiara nel registro. Un errore qui non e' cosmetico:
+    e' la differenza fra dire a qualcuno che il modello ci sta e dirgli di no."""
+    ratio = getattr(descriptor, "dense_load_ratio", None)
+    if ratio is None:
+        return on_disk_bytes
+    try:
+        return max(0, int(ratio(on_disk_bytes)))
+    except Exception:
+        return on_disk_bytes
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()
@@ -150,7 +165,11 @@ def analyze_model(model):
         "path": str(model),
         "shards": len(shards),
         "model_bytes": model_bytes,
-        "dense_bytes": dense_bytes,
+        # Come pesano DAVVERO in RAM: un motore che riquantizza al caricamento
+        # ne occupa meno di quanto ne occupino sul disco, e il pianificatore
+        # serve a rispondere "ci sta?", non "quanto pesa il file".
+        "dense_bytes": _dense_in_ram(resolved.descriptor, dense_bytes),
+        "dense_disk_bytes": dense_bytes,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),

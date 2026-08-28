@@ -48,12 +48,14 @@ static int32_t *read_ids(jval *object, const char *key, int *count) {
 
 static int register_all(void) {
     return coli_glm_segment_adapter_register() ||
+           coli_glm53_segment_adapter_register() ||
            coli_inkling_segment_adapter_register() ||
            coli_kimi_segment_adapter_register() ||
            coli_olmoe_segment_adapter_register() ||
            coli_qwen36_segment_adapter_register() ||
            coli_deepseek_v4_segment_adapter_register() ||
            coli_glm_edge_adapter_register() ||
+           coli_glm53_edge_adapter_register() ||
            coli_inkling_edge_adapter_register() ||
            coli_kimi_edge_adapter_register() ||
            coli_olmoe_edge_adapter_register() ||
@@ -77,7 +79,7 @@ int main(int argc, char **argv) {
     ColiEdgeEngine *edge = NULL;
     ColiSegmentEngine *segment = NULL;
     ColiSegmentSession *session = NULL;
-    float *input = NULL, *output = NULL;
+    float *input = NULL, *output = NULL, *logits = NULL;
     int32_t *probe_ids = NULL;
     char *probe_text = NULL;
     int status = 1;
@@ -114,6 +116,8 @@ int main(int argc, char **argv) {
             "real adapter does not expose tokenization");
     REQUIRE(edge_cap.flags & COLI_EDGE_CAP_GREEDY,
             "real adapter does not expose the model head");
+    REQUIRE(edge_cap.flags & COLI_EDGE_CAP_LOGITS,
+            "real adapter does not expose final-head logits");
 
     static const char tokenizer_probe[] = "edge";
     size_t probe_count = 0, probe_bytes = 0;
@@ -202,6 +206,22 @@ int main(int argc, char **argv) {
     REQUIRE(coli_edge_select(edge, &select, error, sizeof(error)) == 0, error);
     REQUIRE(predicted == full[prompt_count],
             "first generated token differs from the independent oracle");
+    logits = malloc((size_t)edge_cap.vocab_size * sizeof(*logits));
+    REQUIRE(logits != NULL, "out of memory for Edge logits");
+    ColiEdgeLogitsRequest logits_request = {
+        .struct_size = sizeof(logits_request), .rows = 1,
+        .input = select.input, .input_bytes = row_bytes,
+        .logits = logits, .logits_capacity = edge_cap.vocab_size,
+    };
+    REQUIRE(coli_edge_logits(edge, &logits_request,
+                             error, sizeof(error)) == 0, error);
+    int32_t logits_winner = 0;
+    for (uint32_t token = 1; token < edge_cap.vocab_size; token++)
+        if (logits[token] > logits[logits_winner])
+            logits_winner = (int32_t)token;
+    REQUIRE(logits_winner == predicted,
+            "argmax(logits) differs from deterministic Edge selection");
+    free(logits); logits = NULL;
     size_t generated_bytes = 0;
     REQUIRE(coli_edge_detokenize(edge, &predicted, 1, NULL, 0,
                                  &generated_bytes, error, sizeof(error)) == 0 &&
@@ -234,7 +254,7 @@ int main(int argc, char **argv) {
 fail:
     if (status && error[0]) fprintf(stderr, "%s: %s\n", family, error);
     free(probe_text); free(probe_ids);
-    free(output); free(input);
+    free(logits); free(output); free(input);
     coli_segment_session_destroy(session);
     if (segment) (void)coli_segment_engine_close(segment, NULL, 0);
     coli_edge_engine_close(edge);

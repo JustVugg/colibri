@@ -65,7 +65,9 @@ static int capabilities_valid(const ColiEdgeCapabilities *capabilities,
            !!(capabilities->flags & COLI_EDGE_CAP_TOKENIZE) == tokenizer &&
            !!(capabilities->flags & COLI_EDGE_CAP_DETOKENIZE) == tokenizer &&
            !!(capabilities->flags & COLI_EDGE_CAP_GREEDY) ==
-               !!adapter->select;
+               !!adapter->select &&
+           !!(capabilities->flags & COLI_EDGE_CAP_LOGITS) ==
+               !!adapter->logits;
 }
 
 int coli_edge_adapter_register(const ColiEdgeAdapter *adapter) {
@@ -229,4 +231,27 @@ int coli_edge_select(ColiEdgeEngine *engine,
         request->should_cancel(request->cancel_user_data))
         return set_error(error, error_size, "edge selection cancelled");
     return engine->adapter->select(engine->impl, request, error, error_size);
+}
+
+int coli_edge_logits(ColiEdgeEngine *engine,
+                     const ColiEdgeLogitsRequest *request,
+                     char *error, size_t error_size) {
+    size_t expected = 0;
+    if (!engine || !request || request->struct_size < sizeof(*request) ||
+        !request->rows || !request->input ||
+        activation_bytes(engine, request->rows, &expected) ||
+        request->input_bytes != expected || !request->logits ||
+        engine->capabilities.vocab_size > SIZE_MAX / request->rows ||
+        request->logits_capacity <
+            (size_t)request->rows * engine->capabilities.vocab_size)
+        return set_error(error, error_size, "invalid edge logits request");
+    if (!engine->adapter->logits)
+        return set_error(error, error_size, "edge logits are not supported");
+    if (engine->capabilities.max_batch_rows &&
+        request->rows > engine->capabilities.max_batch_rows)
+        return set_error(error, error_size, "edge batch exceeds capabilities");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return set_error(error, error_size, "edge logits cancelled");
+    return engine->adapter->logits(engine->impl, request, error, error_size);
 }

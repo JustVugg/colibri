@@ -72,6 +72,8 @@ const de: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "Nachricht an colibrì…",
   "chat.inputHint": "Eingabetaste zum Senden · Umschalt+Eingabetaste für Zeilenumbruch",
+  "chat.attachImage": "Bild anhängen",
+  "chat.removeImage": "Bild entfernen",
   "chat.stop": "Generierung stoppen",
   "chat.send": "Nachricht senden",
 

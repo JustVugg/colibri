@@ -45,6 +45,18 @@ static const ColiSegmentConformanceFixture g_fixtures[] = {
         4, 8, 5, 64, UINT32_C(0x474c4d35),
     },
     {
+        "glm53", "GLM-5.3-Flash", "fixture/glm53-mla-latent-kda-conv-dsa-mhc-v1",
+        "absorbed MLA latent + KDA recurrent state + convolution windows + "
+        "DSA indexer + hyper-connection streams",
+        "tools/make_glm53_multimodal_tiny.py",
+        COLI_SEGMENT_FIXTURE_MLA_LATENT |
+            COLI_SEGMENT_FIXTURE_RECURRENT |
+            COLI_SEGMENT_FIXTURE_CONVOLUTION |
+            COLI_SEGMENT_FIXTURE_DSA_INDEXER |
+            COLI_SEGMENT_FIXTURE_MHC,
+        4, 10, 4, 64, UINT32_C(0x474c3533),
+    },
+    {
         "inkling", "Inkling", "fixture/inkling-kv-ring-conv-v1",
         "global KV + sliding KV ring + convolutional state",
         "tools/make_tiny_inkling.py",
@@ -334,11 +346,12 @@ static int fixture_restore(void *session_impl, ColiSegmentReadFn read_fn,
     }
 
 DECLARE_OPEN_WRAPPER(glm, 0)
-DECLARE_OPEN_WRAPPER(inkling, 1)
-DECLARE_OPEN_WRAPPER(kimi, 2)
-DECLARE_OPEN_WRAPPER(olmoe, 3)
-DECLARE_OPEN_WRAPPER(qwen36, 4)
-DECLARE_OPEN_WRAPPER(deepseek_v4, 5)
+DECLARE_OPEN_WRAPPER(glm53, 1)
+DECLARE_OPEN_WRAPPER(inkling, 2)
+DECLARE_OPEN_WRAPPER(kimi, 3)
+DECLARE_OPEN_WRAPPER(olmoe, 4)
+DECLARE_OPEN_WRAPPER(qwen36, 5)
+DECLARE_OPEN_WRAPPER(deepseek_v4, 6)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
@@ -357,6 +370,7 @@ DECLARE_OPEN_WRAPPER(deepseek_v4, 5)
 
 static const ColiSegmentAdapter g_adapters[] = {
     FIXTURE_ADAPTER(glm),
+    FIXTURE_ADAPTER(glm53),
     FIXTURE_ADAPTER(inkling),
     FIXTURE_ADAPTER(kimi),
     FIXTURE_ADAPTER(olmoe),

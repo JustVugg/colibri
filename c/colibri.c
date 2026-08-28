@@ -12006,7 +12006,7 @@ static int glm_edge_engine_open(
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
                           COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id), "glm");
@@ -12098,11 +12098,34 @@ static int glm_edge_select(void *engine_impl,
     return 0;
 }
 
+static int glm_edge_logits(void *engine_impl,
+                           const ColiEdgeLogitsRequest *request,
+                           char *error, size_t error_size) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM Edge logits cancelled");
+        }
+        rmsnorm(normalized, input + (size_t)row * config->hidden,
+                engine->model.final_norm, config->hidden, config->eps);
+        matmul_qt(request->logits + (size_t)row * config->vocab,
+                  normalized, &engine->model.lm_head, 1);
+    }
+    free(normalized);
+    return 0;
+}
+
 static const ColiEdgeAdapter glm_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "glm",
     glm_edge_engine_open, glm_edge_engine_destroy,
     glm_edge_tokenize, glm_edge_detokenize,
-    glm_edge_embed, glm_edge_select, {0}
+    glm_edge_embed, glm_edge_select, glm_edge_logits, {0}
 };
 
 int coli_glm_edge_adapter_register(void) {

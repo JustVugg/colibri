@@ -17,7 +17,8 @@ static int fake_open(void **impl, ColiEdgeCapabilities *capabilities,
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_CPU;
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
     snprintf(capabilities->engine_id, sizeof(capabilities->engine_id), "fake");
     snprintf(capabilities->state_schema, sizeof(capabilities->state_schema),
              "fake/f32-v1");
@@ -96,10 +97,25 @@ static int fake_select(void *impl, const ColiEdgeSelectRequest *request,
     return 0;
 }
 
+static int fake_logits(void *impl, const ColiEdgeLogitsRequest *request,
+                       char *error, size_t error_size) {
+    (void)impl; (void)error; (void)error_size;
+    const float *input = request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        float sum = 0.0f;
+        for (uint32_t column = 0; column < 4; column++)
+            sum += input[(size_t)row * 4 + column];
+        float *logits = request->logits + (size_t)row * 256;
+        for (uint32_t token = 0; token < 256; token++) logits[token] = -1.0f;
+        logits[(uint32_t)((int32_t)sum & 255)] = sum;
+    }
+    return 0;
+}
+
 static const ColiEdgeAdapter fake_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "fake",
     fake_open, fake_destroy, fake_tokenize, fake_detokenize,
-    fake_embed, fake_select, {0}
+    fake_embed, fake_select, fake_logits, {0}
 };
 
 static const ColiEdgeAdapter incomplete_tokenizer = {
@@ -111,6 +127,7 @@ static const ColiEdgeAdapter incomplete_tokenizer = {
     .tokenize = fake_tokenize,
     .embed = fake_embed,
     .select = fake_select,
+    .logits = fake_logits,
 };
 
 static int never_cancel(void *unused) { (void)unused; return 0; }
@@ -195,6 +212,25 @@ int main(void) {
     assert(coli_edge_select(engine, &select, error, sizeof(error)) != 0);
     select.token_capacity = 2; select.should_cancel = always_cancel;
     assert(coli_edge_select(engine, &select, error, sizeof(error)) != 0);
+
+    float logits[2 * 256];
+    ColiEdgeLogitsRequest logits_request = {
+        .struct_size = sizeof(logits_request), .rows = 2,
+        .input = states, .input_bytes = sizeof(states),
+        .logits = logits, .logits_capacity = 2 * 256,
+        .should_cancel = never_cancel,
+    };
+    assert(coli_edge_logits(engine, &logits_request,
+                            error, sizeof(error)) == 0);
+    assert(logits[(97 + 98 + 99 + 100) & 255] ==
+           97.0f + 98.0f + 99.0f + 100.0f);
+    logits_request.logits_capacity--;
+    assert(coli_edge_logits(engine, &logits_request,
+                            error, sizeof(error)) != 0);
+    logits_request.logits_capacity = 2 * 256;
+    logits_request.should_cancel = always_cancel;
+    assert(coli_edge_logits(engine, &logits_request,
+                            error, sizeof(error)) != 0);
 
     coli_edge_engine_close(engine);
     puts("edge runtime tests: ok");

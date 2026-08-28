@@ -228,3 +228,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .tok-com { color: #6b7780; font-style: italic; }
 .md-caret { display: inline-block; width: 7px; height: 13px; margin-left: 1px; background: var(--primary); opacity: .75; animation: md-blink 1s steps(2) infinite; vertical-align: text-bottom; }
 @keyframes md-blink { 50% { opacity: 0; } }
+
+/* Anteprime delle immagini allegate al messaggio in scrittura. Piccole di
+   proposito: servono a ricordare cosa si sta mandando, non a guardarle. */
+.attachments { display: flex; flex-wrap: wrap; gap: .4rem; padding: .4rem .1rem 0; }
+.attachment { position: relative; display: inline-flex; }
+.attachment img {
+  width: 3rem; height: 3rem; object-fit: cover; border-radius: .375rem;
+  border: 1px solid hsl(var(--border));
+}
+.attachment button {
+  position: absolute; top: -.35rem; right: -.35rem; width: 1.15rem; height: 1.15rem;
+  line-height: 1; border-radius: 999px; border: 1px solid hsl(var(--border));
+  background: hsl(var(--background)); color: hsl(var(--muted-foreground));
+  font-size: .7rem; cursor: pointer;
+}
+.attachment button:hover { color: hsl(var(--foreground)); }
