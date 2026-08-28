@@ -43,6 +43,13 @@
       "state_components": ["mhc", "window_attention", "compressed_attention", "compressor", "indexer"],
       "oracle": {"kind": "generated_tiny", "path": "tools/make_deepseek_v4_tiny.py"},
       "real_adapter_required": true
+    },
+    {
+      "family_id": "minimax_m3",
+      "state_schema": "fixture/minimax-m3-gqa-msa-v1",
+      "state_components": ["gqa_kv", "rope", "msa_indexer", "device_cache"],
+      "oracle": {"kind": "generated_tiny", "path": "tools/make_m3tiny.py"},
+      "real_adapter_required": true
     }
   ]
 }

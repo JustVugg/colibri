@@ -602,7 +602,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/attention_gqa.spv shaders/rmsnorm.spv
 endif
 
 all: colibri$(EXE)
@@ -667,6 +667,22 @@ deepseek-v4-tiny-check:
 deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
+
+# MiniMax-M3 CI gate (#601): tiny random checkpoint -> int8 conversion -> numpy
+# oracle -> the engine's REF/TF gate, token-exact on every prefill and decode
+# position (the driver enforces the counts; the engine itself always exits 0).
+# Deps: tools/requirements-m3-tiny.txt (torch generates, numpy+safetensors
+# convert and run the oracle). M3 rides the main colibri binary, so this needs
+# no engine platform gate beyond colibri's own.
+.PHONY: m3-tiny-generate m3-tiny-check
+m3-tiny-generate:
+	rm -rf m3tiny m3tiny_i8
+	$(PYTHON) tools/make_m3tiny.py m3tiny
+	$(PYTHON) tools/convert_fp8_to_int4.py --arch m3 --indir m3tiny --outdir m3tiny_i8 --ebits 8 --io-bits 8
+	$(PYTHON) tools/oracle_m3.py m3tiny_i8
+
+m3-tiny-check: m3-tiny-generate colibri$(EXE)
+	$(PYTHON) tests/test_m3_tiny.py --binary ./colibri$(EXE) --snap m3tiny_i8 --ref ref_m3.json
 
 # Convenience aliases — 'glm' kept for backward compatibility.
 # On POSIX EXE is empty, so `colibri: colibri$(EXE)` becomes a self-dependency

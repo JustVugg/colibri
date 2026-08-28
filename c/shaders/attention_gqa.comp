@@ -1,0 +1,78 @@
+#version 450
+// GQA attention core (decode), the VK equivalent of colibri's attention_gqa CPU
+// loop (MiniMax-M3). One workgroup per (query row s = WorkGroupID.y, head
+// h = WorkGroupID.x); the whole core for one head runs in a single dispatch:
+//   g        = h / (H/NK)                                  (repeat_kv group)
+//   score_t  = (q[s,h] . K_t[g]) * scale   t in [st0, T-S+s]  (causal)
+//   p        = softmax(score)
+//   ctx[i]   = sum_t p_t * V_t[g][i]
+// K and V are the PERSISTENT device-side caches, each row KVd = NK*hd wide, rows
+// appended by the host each token (absolute position indexing, kv_start windows
+// skip rows). Queries and cache rows arrive already normed + roped (host writes
+// them that way) and are plain f32 — no dequant, no weight absorption.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QB { float q[]; };    // [S,H,hd] roped
+layout(std430, binding = 1) readonly  buffer KB { float kc[]; };   // K cache [max_t, NK*hd]
+layout(std430, binding = 2) readonly  buffer VB { float vc[]; };   // V cache [max_t, NK*hd]
+layout(std430, binding = 3) buffer          SC { float sc[]; };    // scores [S,H,cap] scratch
+layout(std430, binding = 4) writeonly buffer CB { float ctx[]; };  // [S,H,hd] out
+
+layout(push_constant) uniform P {
+    int S, H, NK, hd;   // heads, kv-heads, head_dim
+    int st0, T;         // attend rows [st0, T-S+s]; T = absolute rows incl. final query
+    int cap;            // score scratch stride per (s,h) = T-st0
+    float scale;        // 1/sqrt(head_dim)
+} p;
+
+shared float qsh[256];   // this head's query row
+shared float red[256];   // reduction scratch
+
+void main() {
+    int h   = int(gl_WorkGroupID.x);
+    int s   = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+    int lane   = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int sg     = int(gl_SubgroupID);
+    int nsg    = nth / sgsize;
+
+    int G   = p.H / p.NK;
+    int gof = (h / G) * p.hd;                  // this query head's KV group slice in a row
+    int KVd = p.NK * p.hd;
+    int nt  = (p.T - p.S + s + 1) - p.st0;      // causal window for query s
+    int qoff  = (s * p.H + h) * p.hd;
+    int scoff = (s * p.H + h) * p.cap;
+
+    for (int i = tid; i < p.hd; i += nth) qsh[i] = q[qoff + i];
+    barrier();
+
+    /* 1) scores: one subgroup per cached token, lanes split the hd dot */
+    float lmax = -3.0e38;
+    for (int j = sg; j < nt; j += nsg) {
+        int t = p.st0 + j;
+        float a = 0.0;
+        for (int i = lane; i < p.hd; i += sgsize) a += qsh[i] * kc[t * KVd + gof + i];
+        float tot = subgroupAdd(a) * p.scale;
+        if (lane == 0) { sc[scoff + j] = tot; lmax = max(lmax, tot); }
+    }
+    red[tid] = lmax; barrier();
+    for (int o = nth / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = max(red[tid], red[tid + o]); barrier(); }
+    float wmax = red[0]; barrier();
+
+    /* 2) softmax: exp in place + workgroup sum */
+    float lsum = 0.0;
+    for (int j = tid; j < nt; j += nth) { float e = exp(sc[scoff + j] - wmax); sc[scoff + j] = e; lsum += e; }
+    red[tid] = lsum; barrier();
+    for (int o = nth / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; barrier(); }
+    float inv = 1.0 / red[0]; barrier();
+
+    /* 3) weighted value: ctx[i] = sum_t p_t V_t[g][i] — thread-parallel over head dim */
+    for (int i = tid; i < p.hd; i += nth) {
+        float acc = 0.0;
+        for (int j = 0; j < nt; j++) acc += sc[scoff + j] * vc[(p.st0 + j) * KVd + gof + i];
+        ctx[(s * p.H + h) * p.hd + i] = acc * inv;
+    }
+}

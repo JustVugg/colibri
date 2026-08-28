@@ -875,5 +875,74 @@ class PhysicalCpuCountTest(unittest.TestCase):
             self.assertEqual(physical_cpu_count(), 8)
 
 
+class M3ResourcePlanTest(unittest.TestCase):
+    """#601 review B2: the planner sized KV from the MLA keys only, so a GQA
+    (MiniMax-M3) container planned with kv_bytes=0 and configured_experts=0 --
+    the RAM reservation ran ~1 GB short at 60L x 4096 ctx and the expert-cap
+    clamp never fired. The formulas now live in the registry's
+    _minimax_geometry; these run a real container end to end, so they fail if
+    build_plan stops routing M3 through it -- not only if the geometry is
+    wrong."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "minimax_m3",
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "num_local_experts": 3,
+            "moe_layer_freq": [0, 1],
+            "sparse_attention_config": {
+                "use_sparse_attention": True, "sparse_index_dim": 4,
+                "sparse_num_index_heads": 2},
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_proj.weight", 200),
+            ("model.layers.1.mlp.experts.0.gate_proj.weight", 30),
+            ("model.layers.1.mlp.experts.1.gate_proj.weight", 30),
+            ("model.layers.1.mlp.experts.2.gate_proj.weight", 30),
+        ])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_gqa_kv_is_reserved(self):
+        context = 32
+        plan = build_plan(self.model, ram_gb=16, context=context,
+                          available_memory=32 * GB, available_disk=100 * GB,
+                          gpus=[], physical_cpus=8, cpu_sockets=1)
+        # K and V rows on 2 layers + the MTP row kv_alloc also keeps, then the
+        # MSA index keys on the one sparse layer (moe_layer_freq [0, 1]), which
+        # gets no MTP row.
+        kv_bytes = (2 + 1) * context * 2 * 2 * 8 * 4 + 1 * context * 4 * 4
+        # attention_gqa scratch: q + ctx (heads-wide), k + v (kv-heads-wide),
+        # the per-row scores, and the indexer's own q/k projections.
+        kv_buffer = (context * ((2 * 4 + 2 * 2) * 8 + 4) * 4
+                     + context * (2 + 1) * 4 * 4)
+        ram = plan["tiers"]["ram"]
+        self.assertEqual(ram["sequence_state_bytes"], kv_bytes)
+        self.assertEqual(ram["workspace_bytes"], kv_buffer)
+        max_expert = plan["model"]["max_expert_bytes"]
+        self.assertEqual(ram["runtime_bytes"],
+                         int(1.2 * GB + 2.5 * GB + 64 * max_expert
+                             + kv_bytes + kv_buffer))
+
+    def test_container_resolves_to_the_minimax_family(self):
+        plan = build_plan(self.model, ram_gb=16, context=32,
+                          available_memory=32 * GB, available_disk=100 * GB,
+                          gpus=[], physical_cpus=8, cpu_sockets=1)
+        self.assertEqual(plan["model"]["family_id"], "minimax_m3")
+
+    def test_expert_cap_clamps_to_num_local_experts(self):
+        plan = build_plan(self.model, ram_gb=16, context=32,
+                          available_memory=32 * GB, available_disk=100 * GB,
+                          gpus=[], physical_cpus=8, cpu_sockets=1)
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

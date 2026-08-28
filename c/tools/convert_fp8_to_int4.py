@@ -189,7 +189,11 @@ _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
 
 # ---------- classificazione dei tensori ----------
 def layer_idx(name):
+    # ANCHORED match: "model.layers.N..." (mapped) or the raw MiniMax-M3 VL prefix
+    # "language_model.model.layers.N..." -- NOT "layers.<N>" anywhere, which would
+    # change classification for every arch on names this converter never vetted.
     p = name.split(".")
+    if len(p) > 1 and p[0] == "language_model" and p[1] == "model": p = p[1:]
     if len(p) > 2 and p[0] == "model" and p[1] == "layers":
         try: return int(p[2])
         except ValueError: return -1
@@ -202,8 +206,12 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
     li = layer_idx(name)
     if keep_idx:
-        # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
-        if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
+        # modalita' --indexer: SOLO i pesi dell'indexer di scoring dei layer principali.
+        # GLM DSA usa "indexer"; MiniMax-M3 MSA usa "self_attn.index_" (Lightning Indexer).
+        # EN: --indexer mode: ONLY the scoring-indexer weights. GLM DSA = "indexer",
+        # MiniMax-M3 MSA = "self_attn.index_".
+        is_idx = ("indexer" in name) or (".index_" in name)
+        if li < 0 or li >= n_layers or not is_idx: return "skip"
         if name.endswith("norm.weight"): return "f32"
         return "q"                                       # int8 consigliato (--ebits 8): pesi di scoring
     if keep_mtp:
@@ -225,14 +233,57 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     #   "attn" = other attention projections (q_a, q_b, kv_a)
     #   "dmlp" = dense MLP (first 3 layers)
     if "shared_experts" in name: return "sh"
+    # "idx" = MSA/DSA scoring-indexer projections (MiniMax-M3 self_attn.index_*).
+    # Selection is DISCRETE (top-k blocks): quantization noise flips choices rather
+    # than blurring them, so these tiny tensors (~215 MB) default to int8 instead
+    # of following ebits (the validated real-model MSA config used int8).
+    if ".index_" in name and name.endswith("proj.weight"): return "idx"
     if name.endswith("o_proj.weight"): return "o"
     if name.endswith("kv_b_proj.weight"): return "kvb"
     if any(name.endswith(k) for k in ("q_a_proj.weight", "q_b_proj.weight",
-                                       "kv_a_proj_with_mqa.weight")): return "attn"
+                                       "kv_a_proj_with_mqa.weight",
+                                       # GQA family (MiniMax-M3): plain q/k/v projections
+                                       "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+                                       "self_attn.v_proj.weight")): return "attn"
     if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
                                        "mlp.down_proj.weight")): return "dmlp"
     if name.endswith(".weight"): return "q"              # fallback: other resident weights
     return "f32"
+
+# ---------- MiniMax-M3 (minimax_m3_vl): name normalization to the GLM container scheme ----
+# The VL checkpoint nests the text model under `language_model.` and uses Mixtral-style
+# expert names. Normalizing here keeps the C engine's MoE loader single-naming:
+#   language_model.model.X            -> model.X        (language_model.lm_head -> lm_head)
+#   .block_sparse_moe.                -> .mlp.          (router gate.weight + bias line up)
+#   .experts.E.{w1,w3,w2}.weight      -> .experts.E.{gate_proj,up_proj,down_proj}.weight
+#   vision_tower / multi_modal_projector / patch_merge_mlp -> dropped (text-only port)
+#   .self_attn.index_{q,k}_{proj,norm}  -> KEPT (MSA Lightning Indexer: q/k_proj int8,
+#                                          q/k_norm f32; used for block-sparse selection)
+# Returns the container name, or None to skip the tensor entirely.
+def m3_name(name):
+    if name.startswith(("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")):
+        return None
+    if name.startswith("language_model."): name = name[len("language_model."):]
+    name = name.replace(".block_sparse_moe.e_score_correction_bias",
+                        ".mlp.gate.e_score_correction_bias")   # the C loader's GLM name
+    name = name.replace(".block_sparse_moe.", ".mlp.")
+    name = name.replace(".w1.weight", ".gate_proj.weight")
+    name = name.replace(".w3.weight", ".up_proj.weight")
+    name = name.replace(".w2.weight", ".down_proj.weight")
+    return name
+
+# Container config.json for M3: the engine reads a flat config, so hoist text_config
+# to the top level (keeping generation ids reachable) and drop the vision blocks.
+def write_m3_config(src_path, outdir):
+    cfg = json.loads(open(src_path).read())
+    tc = cfg.get("text_config", {})
+    flat = dict(tc)
+    flat["model_type"] = "minimax_m3"
+    flat["architectures"] = ["MiniMaxM3SparseForCausalLM"]
+    for k in ("torch_dtype", "transformers_version"):
+        if k in cfg: flat[k] = cfg[k]
+    with open(os.path.join(outdir, "config.json"), "w") as f:
+        json.dump(flat, f, indent=1)
 
 # ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
 def dequant_nvfp4(f, name):
@@ -330,15 +381,18 @@ def _e8_job(item):
     return name, q, s
 
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
-                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None, arch="glm"):
     from safetensors import safe_open
     e8_jobs = []                                # deferred: encoded in a pool after the scan
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
         for name in f.keys():
-            kind = classify(name, n_layers, keep_mtp, keep_idx)
+            cname = m3_name(name) if arch == "m3" else name
+            if cname is None: continue
+            kind = classify(cname, n_layers, keep_mtp, keep_idx)
             if kind in ("skip", "consumed"): continue
             w = dequant(f, name, keys)
+            name = cname
             if kind == "f32":
                 out_dict[name] = w.astype(np.float32)
             else:
@@ -346,10 +400,14 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                 # otherwise fall back to the classic ebits/xbits/io_bits scheme.
                 if bits_map and kind in bits_map:
                     bits = bits_map[kind]
+                elif kind == "idx":
+                    # MSA scoring indexer (M3 self_attn.index_*): block selection is
+                    # DISCRETE top-k, so noise flips choices -- int8 default, not ebits.
+                    bits = 8
                 else:
                     bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
                 # Any unknown kind that fell through classify as "q"
-                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
+                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp", "idx"):
                     bits = ebits
                 # Per-projection override for routed experts, applied on top of the type-level bits.
                 if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
@@ -401,11 +459,11 @@ def _init_worker(proj_bits):
 def _convert_one(args):
     # Convert one shard in a worker; the main process writes the result, so shard numbering
     # and the atomic manifest stay serial and identical to --workers 1.
-    i, sp, n_layers, ebits, io_bits, xbits, keep_mtp, keep_idx, group_size, bits_map = args
+    i, sp, n_layers, ebits, io_bits, xbits, keep_mtp, keep_idx, group_size, bits_map, arch = args
     out = {}
     convert_shard(sp, out, n_layers, ebits, io_bits, xbits,
                   keep_mtp=keep_mtp, keep_idx=keep_idx,
-                  group_size=group_size, bits_map=bits_map)
+                  group_size=group_size, bits_map=bits_map, arch=arch)
     return i, out
 
 def check_or_record_params(outdir, prefix, params):
@@ -464,6 +522,9 @@ def main():
         help="bits for kv_b_proj (reconstructs KV cache on every decode). Default=ebits")
     ap.add_argument("--attn-bits", type=int, default=None,
         help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
+    ap.add_argument("--idx-bits", type=int, default=8,
+        help="bits for the MSA/DSA scoring-indexer projections (block selection is "
+             "discrete — noise flips choices; tiny tensors, keep int8). Default=8")
     ap.add_argument("--dmlp-bits", type=int, default=None,
         help="bits for dense MLP (first 3 layers). Default=ebits")
     ap.add_argument("--group-size", type=int, default=64,
@@ -483,7 +544,13 @@ def main():
         help="bits for gate_proj in routed experts. Default=xbits")
     ap.add_argument("--down-bits", type=_bits, default=None,
         help="bits for down_proj in routed experts. Default=xbits")
-    ap.add_argument("--n-layers", type=int, default=78)
+    ap.add_argument("--n-layers", type=int, default=None,  # default: from --arch (glm 78, m3 60)
+                    help="main-model layer count (default: 78 for glm, 60 for m3)")
+    ap.add_argument("--arch", choices=["auto", "glm", "m3"], default="auto",
+                    help="checkpoint family: glm (GLM/DeepSeek MLA names, the default when no "
+                         "language_model. prefix is seen) or m3 (MiniMax-M3 VL: strips the "
+                         "language_model. prefix, maps block_sparse_moe/w1/w2/w3 onto the GLM "
+                         "container scheme, drops the vision tower + MSA index branch)")
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--workers", type=int, default=1,
                     help="Parallel worker processes for the local --indir conversion "
@@ -545,8 +612,41 @@ def main():
     if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
     if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
+    # "idx" is recorded only when overridden: the int8 default lives at the consumer
+    # in convert_shard, so default runs keep the params manifest byte-identical to
+    # pre-M3 converters and in-progress GLM/DeepSeek outdirs stay resumable.
+    if a.idx_bits != 8: bits_map["idx"] = a.idx_bits
     if bits_map:
         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+
+    # --arch auto: detect the checkpoint family BEFORE the plan print. config.json
+    # model_type is authoritative; a shard-key peek ("language_model." prefix) is the
+    # fallback when no config is present (e.g. a bare shard dir).
+    if a.arch == "auto":
+        mt = None
+        try:
+            if a.indir and os.path.exists(os.path.join(a.indir, "config.json")):
+                mt = json.loads(open(os.path.join(a.indir, "config.json")).read()).get("model_type")
+            elif a.repo:
+                from huggingface_hub import hf_hub_download
+                mt = json.loads(open(hf_hub_download(a.repo, "config.json")).read()).get("model_type")
+        except Exception:
+            mt = None
+        if mt is None and a.indir:
+            sh = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
+            if sh:
+                from safetensors import safe_open
+                with safe_open(sh[0], framework="pt") as f:
+                    if any(k.startswith("language_model.") for k in f.keys()): mt = "minimax_m3_vl"
+        a.arch = "m3" if (mt or "").startswith("minimax") else "glm"
+        print(f"[ARCH] auto-detected: {a.arch}" + (f" (model_type {mt})" if mt else ""))
+    if a.n_layers is None:
+        a.n_layers = 60 if a.arch == "m3" else 78
+    if a.arch == "m3" and a.mtp:
+        raise SystemExit("--arch m3: the checkpoint ships no MTP tensors")
+    # --arch m3 --indexer: supplemental pass for the MSA Lightning Indexer weights
+    # (self_attn.index_{q,k}_{proj,norm}) -> out-idx-*.safetensors, kept next to a main
+    # container that predates the indexer being kept in the main pass.
 
     # Il PIANO risolto, PRIMA di toccare qualunque cosa (#383): --mtp/--indexer cambiano il
     # default di ebits a 8 (testa int4 = acceptance ~0%, issue #8) e il ramo grouped e'
@@ -555,7 +655,7 @@ def main():
     mode = "MTP head only" if a.mtp else "DSA indexer only" if a.indexer else "main model"
     grp = f"grouped gs={a.group_size} (fmt=4)" if (a.group_size and a.ebits <= 4) else \
           (f"PER-ROW (grouped branch needs bits<=4; ebits={a.ebits} disables it)" if a.group_size else "per-row")
-    print(f"[PLAN] mode: {mode} | source: {source_label(a)} | "
+    print(f"[PLAN] mode: {mode} | arch: {a.arch} | source: {source_label(a)} | "
           f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {a.xbits}-bit | {grp}")
 
     if a.selftest_nvfp4:
@@ -652,8 +752,9 @@ def main():
                 wmap = json.load(open(idxp))["weight_map"]
                 if a.mtp:
                     want = {v for k, v in wmap.items() if k.startswith(f"model.layers.{a.n_layers}.")}
-                else:
-                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) < a.n_layers}
+                else:   # GLM DSA "indexer" or MiniMax-M3 MSA "self_attn.index_"
+                    want = {v for k, v in wmap.items()
+                            if ("indexer" in k or ".index_" in k) and 0 <= layer_idx(k) < a.n_layers}
                 keep = [sp for sp in shards if os.path.basename(sp) in want]
                 print(f"[PLAN] index: {len(keep)}/{len(shards)} local shard(s) hold the requested tensors")
                 shards = keep
@@ -680,6 +781,7 @@ def main():
         params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
                   "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
                   "proj_bits": dict(PROJ_BITS)}
+        if a.arch != "glm": params["arch"] = a.arch   # default omitted: pre-M3 manifests stay resumable
         prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
         prog = {}
         if os.path.exists(prog_path):
@@ -702,7 +804,7 @@ def main():
         if a.workers and a.workers > 1:
             from multiprocessing import Pool
             _pending = [(i, sp, a.n_layers, a.ebits, a.io_bits, a.xbits,
-                         a.mtp, a.indexer, a.group_size, bits_map)
+                         a.mtp, a.indexer, a.group_size, bits_map, a.arch)
                         for i, sp in enumerate(shards)
                         if not _shard_already_done(done, os.path.basename(sp), a.outdir)]
             _pool = Pool(a.workers, initializer=_init_worker, initargs=(dict(PROJ_BITS),))
@@ -728,7 +830,7 @@ def main():
                 out = {}
                 convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
                               keep_mtp=a.mtp, keep_idx=a.indexer,
-                              group_size=a.group_size, bits_map=bits_map)
+                              group_size=a.group_size, bits_map=bits_map, arch=a.arch)
             if not out:                                   # shard senza MTP/idx: niente file (come il download path)
                 done[key] = ""
             else:
@@ -749,10 +851,15 @@ def main():
         # EN: an outdir whose container already has its metadata.
         if not a.mtp and not a.indexer:
             copied, missing = [], []
-            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] \
+                      + (["chat_template.jinja"] if a.arch == "m3" else []):
                 src = os.path.join(a.indir, fn)
-                if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
-                else: missing.append(fn)
+                if not os.path.exists(src): missing.append(fn); continue
+                if fn == "config.json" and a.arch == "m3":
+                    write_m3_config(src, a.outdir)      # flatten text_config for the engine
+                else:
+                    shutil.copy(src, a.outdir)
+                copied.append(fn)
             print(f"[META] copied from {a.indir}: {', '.join(copied) if copied else 'nothing'}")
             if missing:
                 print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
@@ -982,8 +1089,12 @@ def main():
     if not shards:
         print("ERROR: no .safetensors shards found in this repository.", flush=True)
         return
-    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
-        try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] \
+              + (["chat_template.jinja"] if a.arch == "m3" else []):
+        try:
+            src = hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta")
+            if fn == "config.json" and a.arch == "m3": write_m3_config(src, a.outdir)
+            else: shutil.copy(src, a.outdir)
         except Exception: pass
     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
     if a.mtp:
@@ -1036,6 +1147,7 @@ def main():
     params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
               "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
               "proj_bits": dict(PROJ_BITS)}
+    if a.arch != "glm": params["arch"] = a.arch   # default omitted: pre-M3 manifests stay resumable
     if not check_or_record_params(a.outdir, "out-", params): return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
@@ -1044,7 +1156,7 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map, arch=a.arch)
         _save_file_atomic(save_file, out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):

@@ -393,6 +393,63 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _minimax_geometry(config, context, _model_dir):
+    """MiniMax-M3: plain GQA -- no latent compression, so the cache holds the
+    full K and V rows rather than a compressed pair.
+
+    Mirrors colibri.c's ARCH_M3 allocation. load_cfg aliases the MLA cache
+    fields onto the GQA widths (kv_lora = qk_rope = num_key_value_heads *
+    head_dim, colibri.c:1411-1412), so kv_alloc's per-layer Lc/Rc pair is one
+    full K row and one full V row per token. It keeps num_hidden_layers + 1
+    rows: the extra one is the MTP layer's KV.
+
+        state = (layers + 1) * context * 2 * kv_heads * head_dim * 4
+
+    The MSA Lightning Indexer adds one index-key row per token, but only on
+    the sparse layers and without the MTP row (kv_alloc allocates Ic over
+    n_layers and skips !idx_type layers). The engine derives sparsity from
+    moe_layer_freq -- M3's sparse attention layers ARE its MoE layers, so
+    idx_type[i] = (i >= first_dense) where first_dense is the index of the
+    first non-zero entry, else 0 (colibri.c load_cfg, ARCH_M3 branch):
+
+        state += (layers - first_dense) * context * sparse_index_dim * 4
+
+    Workspace mirrors attention_gqa()'s scratch set with S == context at
+    prefill: q and ctx are heads-wide, k and v are kv_heads-wide, plus the
+    per-row score buffer (heads * window, window <= context). On sparse
+    layers the indexer adds its own projections, index_heads * index_dim
+    wide for the query side and index_dim for the key side.
+
+        ws = context * ((2 * heads + 2 * kv_heads) * head_dim + heads) * 4
+             + context * (index_heads + 1) * sparse_index_dim * 4
+
+    Experts: configured_experts = num_local_experts (M3's spelling of
+    n_routed_experts).
+    """
+    layers = _required_int(config, "num_hidden_layers", "minimax_m3")
+    experts = _required_int(config, "num_local_experts", "minimax_m3")
+    heads = _required_int(config, "num_attention_heads", "minimax_m3")
+    kv_heads = _required_int(config, "num_key_value_heads", "minimax_m3")
+    head_dim = _required_int(config, "head_dim", "minimax_m3")
+
+    state = (layers + 1) * context * 2 * kv_heads * head_dim * 4
+    workspace = context * ((2 * heads + 2 * kv_heads) * head_dim + heads) * 4
+
+    sparse = config.get("sparse_attention_config")
+    if isinstance(sparse, dict) and sparse.get("use_sparse_attention"):
+        index_dim = _required_int(sparse, "sparse_index_dim", "minimax_m3")
+        index_heads = _optional_int(sparse, "sparse_num_index_heads", 1, 1)
+        freq = config.get("moe_layer_freq")
+        first_dense = 0
+        if isinstance(freq, list):
+            first_dense = next((i for i, value in enumerate(freq) if value), len(freq))
+        first_dense = min(first_dense, layers)
+        state += (layers - first_dense) * context * index_dim * 4
+        workspace += context * (index_heads + 1) * index_dim * 4
+
+    return PlannerGeometry(state, 0, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -431,6 +488,11 @@ def _inkling_expert_inventory(name, size, config):
 
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
 
+# engine_group of the families the colibri binary serves itself. Named for the
+# binary rather than for a family, so callers asking "is this my own engine?"
+# do not have to resolve some other family's id to find out.
+COLIBRI_CORE_GROUP = "colibri-core"
+
 FAMILIES = (
     FamilyDescriptor(
         id="glm",
@@ -439,7 +501,7 @@ FAMILIES = (
         display_scale="744B",
         engine_artifact="colibri",
         engine_aliases=("glm",),
-        engine_group="colibri-core",
+        engine_group=COLIBRI_CORE_GROUP,
         internal_arch="glm",
         build_target="colibri",
         process_names=("colibri", "glm"),
@@ -588,6 +650,43 @@ FAMILIES = (
         capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
+    ),
+    FamilyDescriptor(
+        id="minimax_m3",
+        # The converter flattens text_config to the root and stamps
+        # "minimax_m3"; a raw MiniMax checkpoint is the VL wrapper
+        # ("minimax_m3_vl") with the text model nested. Both resolve here, and
+        # config_section="text_config" reads either shape.
+        model_types=("minimax_m3", "minimax_m3_vl"),
+        display_name="MiniMax-M3",
+        display_scale="426B",
+        # Shares GLM's binary ON PURPOSE: colibri.c reads config.json and
+        # switches itself to ARCH_M3 (GQA + MSA). The descriptor keeps them
+        # distinct where it matters -- internal_arch, template, planner -- so
+        # this is routing, not the #879 fallthrough. engine_aliases mirrors
+        # GLM's because it is literally the same artifact on disk.
+        engine_artifact="colibri",
+        engine_aliases=("glm",),
+        engine_group=COLIBRI_CORE_GROUP,
+        internal_arch="minimax_m3",
+        build_target="colibri",
+        process_names=("colibri",),
+        default_model_id="minimax-m3-colibri",
+        cli_adapter="minimax_m3",
+        gateway_adapter="minimax_m3",
+        planner_id="minimax_m3_gqa",
+        planner_geometry=_minimax_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        config_section="text_config",
+        # implicit_cap 0 is GLM's platform-auto sentinel, which this binary
+        # resolves itself -- the legacy 8 belongs to the sister engines.
+        # One KV slot: batched serve is not validated for M3 in this PR.
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 0, "CTX"),
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        tune_prompt_template="]~!b[]~b]user\n{prompt}[e~[\n]~b]ai\n</mm:think>",
     ),
 )
 
