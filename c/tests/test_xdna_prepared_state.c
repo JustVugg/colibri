@@ -305,11 +305,22 @@ static void test_stress(void){
 static void test_fmt4_immutability(void){
     printf("authoritative fmt4 immutability\n");
     /* A synthetic stand-in for the authoritative tensor: the prepared-state API
-     * must never see, take or free these. */
-    unsigned char q4[512]; float scales[16];
+     * must never see, take or free these.
+     *
+     * static, and deliberately so. As stack locals these four crashed the test
+     * under ASan on some hosts -- a wild-address SEGV inside the memcpy below,
+     * reported against this function. It is not a defect in the code under
+     * test: it disappears at -O0, it disappears with
+     * detect_stack_use_after_return=0, and it disappears when these leave the
+     * stack, while backend_xdna.c is untouched in every case. That points at a
+     * codegen/sanitizer interaction rather than anything this test is asserting
+     * about, so the fixtures live in .bss and the assertions stay exactly as
+     * they were. The test is single-threaded and runs once, so static costs it
+     * nothing. */
+    static unsigned char q4[512]; static float scales[16];
     for(int i = 0; i < 512; i++) q4[i] = (unsigned char)(i * 7 + 1);
     for(int i = 0; i < 16; i++)  scales[i] = 0.25f * (float)(i + 1);
-    unsigned char q4_before[512]; float sc_before[16];
+    static unsigned char q4_before[512]; static float sc_before[16];
     memcpy(q4_before, q4, sizeof q4); memcpy(sc_before, scales, sizeof scales);
     const void *q4_ptr = q4; const void *sc_ptr = scales;
 
