@@ -20,67 +20,59 @@
 #endif
 #if defined(__SSE4_1__)
 #include "sse41_kernels.h"
+#endif
 
-/* Exact-activation W4A32 dot for x86 CPUs below AVX2. Packed weights use
- * offset nibbles: 0 means -8 and 15 means +7. */
-static inline float dot_i4f_sse41(const uint8_t *w,const float *x,int I){
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+/* Load one packed byte from each of four output rows, then unpack their low and
+ * high offset nibbles into four f32 lanes. Keeping independent output rows in
+ * the lanes preserves the scalar operation order within every row. */
+static inline void colibri_i4_rows4(const uint8_t *q4,int rb,int o,int byte,
+                                    __m128 *lo,__m128 *hi){
     const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8);
-    __m128 a0=_mm_setzero_ps(),a1=_mm_setzero_ps(); int i=0;
-    for(;i+16<=I;i+=16){
-        __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
-        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i q=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);
-        a0=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i),
-                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(q)),a0);
-        a1=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+4),
-                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(q,4))),a1);
-        a0=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+8),
-                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(q,8))),a0);
-        a1=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+12),
-                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(q,12))),a1);
-    }
-    float sum=colibri_sse41_hsum_ps(_mm_add_ps(a0,a1));
-    for(;i+1<I;i+=2){ uint8_t b=w[i>>1];
-        sum+=x[i]*(float)((int)(b&15)-8)+x[i+1]*(float)((int)(b>>4)-8); }
-    if(i<I) sum+=x[i]*(float)((int)(w[i>>1]&15)-8);
-    return sum;
+    uint32_t packed=(uint32_t)q4[(int64_t)(o+0)*rb+byte]
+                   |(uint32_t)q4[(int64_t)(o+1)*rb+byte]<<8
+                   |(uint32_t)q4[(int64_t)(o+2)*rb+byte]<<16
+                   |(uint32_t)q4[(int64_t)(o+3)*rb+byte]<<24;
+    __m128i by=_mm_cvtsi32_si128((int)packed);
+    __m128i qlo=_mm_sub_epi8(_mm_and_si128(by,m4),b8);
+    __m128i qhi=_mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(by,4),m4),b8);
+    *lo=_mm_cvtepi32_ps(_mm_cvtepi8_epi32(qlo));
+    *hi=_mm_cvtepi32_ps(_mm_cvtepi8_epi32(qhi));
 }
 
-/* Gate and up share the same activation row. Keep both projections in flight
- * so the SSE4.1 path loads that row once. */
-static inline void dot_i4f_sse41_pair(const uint8_t *wg,const uint8_t *wu,
-                                      const float *x,int I,float *g,float *u){
-    const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8);
-    __m128 g0=_mm_setzero_ps(),g1=_mm_setzero_ps();
-    __m128 u0=_mm_setzero_ps(),u1=_mm_setzero_ps(); int i=0;
-    for(;i+16<=I;i+=16){
-        __m128 x0=colibri_sse41_loadu_ps(x+i), x1=colibri_sse41_loadu_ps(x+i+4);
-        __m128 x2=colibri_sse41_loadu_ps(x+i+8), x3=colibri_sse41_loadu_ps(x+i+12);
-        __m128i bg=_mm_loadl_epi64((const __m128i*)(wg+(i>>1)));
-        __m128i lg=_mm_and_si128(bg,m4), hg=_mm_and_si128(_mm_srli_epi16(bg,4),m4);
-        __m128i qg=_mm_sub_epi8(_mm_unpacklo_epi8(lg,hg),b8);
-        g0=COLIBRI_FMA(x0,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(qg)),g0);
-        g1=COLIBRI_FMA(x1,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qg,4))),g1);
-        g0=COLIBRI_FMA(x2,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qg,8))),g0);
-        g1=COLIBRI_FMA(x3,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qg,12))),g1);
-        __m128i bu=_mm_loadl_epi64((const __m128i*)(wu+(i>>1)));
-        __m128i lu=_mm_and_si128(bu,m4), hu=_mm_and_si128(_mm_srli_epi16(bu,4),m4);
-        __m128i qu=_mm_sub_epi8(_mm_unpacklo_epi8(lu,hu),b8);
-        u0=COLIBRI_FMA(x0,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(qu)),u0);
-        u1=COLIBRI_FMA(x1,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qu,4))),u1);
-        u0=COLIBRI_FMA(x2,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qu,8))),u0);
-        u1=COLIBRI_FMA(x3,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qu,12))),u1);
+static inline __m128 colibri_f32_rows4(const float *p,int stride,int o,int i){
+    return _mm_set_ps(p[(int64_t)(o+3)*stride+i],p[(int64_t)(o+2)*stride+i],
+                      p[(int64_t)(o+1)*stride+i],p[(int64_t)(o+0)*stride+i]);
+}
+
+/* Process four output rows at once without a horizontal reduction. Each lane
+ * uses the scalar kernel's pair sum, scale multiply, and accumulator add in
+ * the same order, so the result can remain byte-identical on pre-FMA CPUs. */
+static void matmul_i4_grouped_sse41_rows4(float *y,const float *x,
+                                           const uint8_t *q4,const float *scale,
+                                           int S,int I,int O,int gs,int rb,int ng,
+                                           int o4){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<o4;o+=4){
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; __m128 a=_mm_setzero_ps();
+            for(int g=0;g*gs<I;g++){
+                int base=g*gs,end=base+gs; if(end>I) end=I;
+                __m128 sc=colibri_f32_rows4(scale,ng,o,g); int i=base;
+                for(;i+1<end;i+=2){
+                    __m128 lo,hi; colibri_i4_rows4(q4,rb,o,i>>1,&lo,&hi);
+                    __m128 pair=_mm_add_ps(_mm_mul_ps(_mm_set1_ps(xs[i]),lo),
+                                           _mm_mul_ps(_mm_set1_ps(xs[i+1]),hi));
+                    a=_mm_add_ps(a,_mm_mul_ps(pair,sc));
+                }
+                if(i<end){
+                    __m128 lo,hi; colibri_i4_rows4(q4,rb,o,i>>1,&lo,&hi); (void)hi;
+                    a=_mm_add_ps(a,_mm_mul_ps(_mm_mul_ps(_mm_set1_ps(xs[i]),lo),sc));
+                }
+            }
+            colibri_sse41_storeu_ps(y+(int64_t)s*O+o,a);
+        }
     }
-    float ag=colibri_sse41_hsum_ps(_mm_add_ps(g0,g1));
-    float au=colibri_sse41_hsum_ps(_mm_add_ps(u0,u1));
-    for(;i+1<I;i+=2){ uint8_t bg=wg[i>>1],bu=wu[i>>1];
-        ag+=x[i]*(float)((int)(bg&15)-8)+x[i+1]*(float)((int)(bg>>4)-8);
-        au+=x[i]*(float)((int)(bu&15)-8)+x[i+1]*(float)((int)(bu>>4)-8); }
-    if(i<I){
-        ag+=x[i]*(float)((int)(wg[i>>1]&15)-8);
-        au+=x[i]*(float)((int)(wu[i>>1]&15)-8);
-    }
-    *g=ag; *u=au;
 }
 #endif
 #ifdef __AVX2__
@@ -235,8 +227,17 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o0=0;
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+    /* Even group sizes keep every group start on a low-nibble boundary. */
+    if(!(gs&1)){
+        o0=O&~3;
+        if(o0) matmul_i4_grouped_sse41_rows4(y,x,q4,scale,S,I,O,gs,rb,ng,o0);
+        if(o0==O) return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=o0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
         const float *scl=scale+(int64_t)o*ng;
         for(int s=0;s<S;s++){
@@ -263,13 +264,6 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                  * the glm_tiny token oracle, depend on build flags rather than
                  * on the code. */
                 a=fmaf(hsum256(acc),sc,a);
-#elif defined(__SSE4_1__)
-                /* Group starts must be nibble-aligned before the packed row
-                 * can be passed as an independent SSE4.1 dot product. */
-                if(!(base&1)){
-                    a+=dot_i4f_sse41(w+(base>>1),xs+base,glen)*sc;
-                    i=base+glen;
-                }
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];

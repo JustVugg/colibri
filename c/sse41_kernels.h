@@ -47,13 +47,6 @@
 static inline __m128 colibri_sse41_loadu_ps(const float *p) { return _mm_loadu_ps(p); }
 static inline void  colibri_sse41_storeu_ps(float *p, __m128 v) { _mm_storeu_ps(p, v); }
 
-/* Fixed four-lane reduction used by the grouped-int4 GEMV kernels. */
-static inline float colibri_sse41_hsum_ps(__m128 v) {
-    v = _mm_add_ps(v, _mm_movehl_ps(v, v));
-    v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
-    return _mm_cvtss_f32(v);
-}
-
 /*
  * Min/max (SSE 4.1 native). Identical to AVX2, just narrower width.
  */
