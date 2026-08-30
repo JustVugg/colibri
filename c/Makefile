@@ -1365,6 +1365,11 @@ tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h 
 tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
 
+# Portable MLX affine Q4/Q8 format contract and CPU oracle.  This stays
+# separate from QT fmt=4, whose signed-int4 scale-only layout is incompatible.
+tests/test_affine_quant$(EXE): tests/test_affine_quant.c affine_quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
 	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
 
