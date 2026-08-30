@@ -32,7 +32,12 @@ executes an unmodified vLLM checkout (commit
 `ffd46bfab2128bb84146050e98b51a617c6575ab`) as a behavioural oracle for the
 native port; no vLLM code is vendored.
 
-## Swiftlet MLX affine Metal GEMV
+## Swiftlet qpack and MLX affine Metal GEMV
+
+`c/qpack.c` and `c/qpack.h` implement the Swiftlet qpack v1 container schema
+documented by `Sources/SwiftletCore/Qpack.swift` at the commit linked below.
+The reader is a new portable implementation for Colibri and does not copy
+Swift source code.
 
 The MLX affine Q4/Q8 kernels in `c/backend_metal.mm` are adapted from
 `gemv_affine_fast` and `gemv_affine_fast8` in Swiftlet:
