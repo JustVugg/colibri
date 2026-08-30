@@ -86,7 +86,15 @@ static void reference_gs_gemv(float *y, const float *x, const int8_t *q, const f
                 __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
                 s = _mm_add_ps(s, _mm_movehl_ps(s,s));
                 s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
-                acc += _mm_cvtss_f32(s) * sc[gi];
+                /* fmaf, not `acc += x * sc[gi]`: gsgemv.h's real AVX2 tier
+                 * (gs_group_sum + fmaf) fuses this step explicitly, so an
+                 * implicit multiply-add here only matches it when the compiler
+                 * happens to auto-contract -- true at -O2/-O3 with the default
+                 * -ffp-contract=fast, false at -O1 or with contraction off
+                 * (confirmed: -O3 -ffp-contract=off reproduces the mismatch).
+                 * Matching the explicit fmaf makes the comparison exact
+                 * regardless of optimisation flags, instead of accidentally so. */
+                acc = fmaf(_mm_cvtss_f32(s), sc[gi], acc);
             }
             y[o] = acc;
         }
