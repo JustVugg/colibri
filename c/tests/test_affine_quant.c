@@ -1,4 +1,4 @@
-#include "../affine_quant.h"
+#include "../backend_metal.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -124,6 +124,11 @@ static int run_parity(ColiAffineFormat format,
                 bits, (int)scalar_format, coli_affine_status_string(status));
         return 1;
     }
+    if (!coli_metal_affine_dispatch_supported(&view, BATCH)) {
+        fprintf(stderr, "valid Metal dispatch rejected bits=%u scalar=%d\n",
+                bits, (int)scalar_format);
+        return 1;
+    }
     status = coli_affine_matmul_ref(output, input, BATCH, &view);
     if (status != COLI_AFFINE_OK) {
         fprintf(stderr, "affine matmul failed bits=%u scalar=%d: %s\n",
@@ -195,6 +200,31 @@ static int test_validation(void) {
                   COLI_AFFINE_OVERFLOW);
 #undef EXPECT_STATUS
     if (output != 123.0f) return 1;
+
+    if (!coli_metal_affine_dispatch_supported(&view, 1) ||
+        coli_metal_affine_dispatch_supported(&view, 0) ||
+        coli_metal_affine_dispatch_supported(&view, -1))
+        return 1;
+    view.format = (ColiAffineFormat)99;
+    if (coli_metal_affine_dispatch_supported(&view, 1)) return 1;
+    view.format = COLI_AFFINE_MLX_Q4;
+#if SIZE_MAX > UINT32_MAX
+    view.output_dim = (size_t)UINT32_MAX + 1u;
+    view.weight_bytes = view.scale_bytes = view.bias_bytes = SIZE_MAX;
+    if (coli_affine_validate(&view) != COLI_AFFINE_OK ||
+        coli_metal_affine_dispatch_supported(&view, 1))
+        return 1;
+    view.output_dim = UINT32_MAX;
+    if (coli_affine_validate(&view) != COLI_AFFINE_OK ||
+        coli_metal_affine_dispatch_supported(&view, 2))
+        return 1;
+    view.output_dim = UINT32_C(65536);
+    view.input_dim = UINT32_C(1048576);
+    view.group_size = 8;
+    if (coli_affine_validate(&view) != COLI_AFFINE_OK ||
+        coli_metal_affine_dispatch_supported(&view, 1))
+        return 1;
+#endif
     return 0;
 }
 
