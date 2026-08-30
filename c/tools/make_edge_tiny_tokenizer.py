@@ -34,8 +34,8 @@ def main() -> int:
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--vocab-size", type=int, required=True)
     args = parser.parse_args()
-    if args.vocab_size < 128:
-        raise SystemExit("Edge fixture vocabulary must contain at least 128 IDs")
+    if args.vocab_size < 34:
+        raise SystemExit("Edge fixture vocabulary must contain at least 34 IDs")
     args.model_dir.mkdir(parents=True, exist_ok=True)
     symbols = byte_symbols()
     vocab = {symbols[token]: token for token in range(min(256, args.vocab_size))}

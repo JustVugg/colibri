@@ -54,6 +54,24 @@ class CliOutputLanguageTest(unittest.TestCase):
         self.assertIn("disk", result.stdout)
         self.assertIn("engine", result.stdout)
 
+    def test_info_reads_registered_nested_text_config(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "qwen4_exp",
+                "text_config": {
+                    "model_type": "qwen4_exp_text",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 48,
+                    "num_experts": 512,
+                    "num_experts_per_tok": 10,
+                },
+            }), encoding="utf-8")
+            result = self.run_cli("info", "--model", model)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hidden 2560 · 48 layer · 512 expert/layer · top-10",
+                      result.stdout)
+        self.assertNotIn("hidden None", result.stdout)
+
     def test_missing_model_error_is_english(self):
         with tempfile.TemporaryDirectory() as directory:
             missing_model = str(Path(directory) / "missing-model")
@@ -320,6 +338,14 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
+
+    def test_qwen38_rejects_gpu_and_vram_flags_before_binary_detection(self):
+        gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
+        with self.assertRaisesRegex(SystemExit, "CPU only.*--gpu"):
+            self.coli.env_for_engine(gpu_args, "qwen38")
+        vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
+        with self.assertRaisesRegex(SystemExit, "CPU only.*--vram"):
+            self.coli.env_for_engine(vram_args, "qwen38")
 
 
 if __name__ == "__main__":

@@ -97,7 +97,7 @@ static int hexnib(char c){
  * pre-tokenize + per-piece ByteLevel map + BPE merges. */
 typedef struct { char **keys; int *vals; int *used; int cap; } SMap;
 static unsigned shash(const char *s){ unsigned h=2166136261u; while(*s){ h^=(unsigned char)*s++; h*=16777619u; } return h; }
-static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc(cap,sizeof(char*)); m->vals=malloc(cap*sizeof(int)); m->used=calloc(cap,sizeof(int)); }
+static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc((size_t)cap,sizeof(char*)); m->vals=malloc((size_t)cap*sizeof(int)); m->used=calloc((size_t)cap,sizeof(int)); }
 static void smap_put(SMap *m,const char *k,int v){ if(!k)return; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0){m->vals[h]=v;return;} h=(h+1)&(m->cap-1);} m->used[h]=1; m->keys[h]=(char*)k; m->vals[h]=v; }
 static int smap_get(SMap *m,const char *k){ if(!m||!m->cap||!k)return -1; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0)return m->vals[h]; h=(h+1)&(m->cap-1);} return -1; }
 
@@ -362,7 +362,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     return o;
 }
 
-/* Append b[0..n) into buf/*bn, extract as many LEADING complete UTF-8
+/* Append b[0..n) into buf (*bn), extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
  * sequence stays in buf. Returns bytes written to out. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){
@@ -484,7 +484,7 @@ static void stream_token(int id){
     if (g_openai){
         if (g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* TTFT on first token */
         if (!g_tok){
-            char jb[160];
+            char jb[512];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%d\"},\"finish_reason\":null}]}",
@@ -497,7 +497,7 @@ static void stream_token(int id){
         utf8_drain(g_sbuf, &g_sbn, tmp, tn, chunk, &cn);
         if (cn > 0){
             char esc[1024]; json_escape(chunk, cn, esc, sizeof esc);
-            char jb[1200];
+            char jb[2048];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
@@ -531,7 +531,7 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
             for (int k=0;k<g_sbn;k++) chunk[cn++] = g_sbuf[k]; g_sbn = 0;
             if (cn > 0){
                 char esc[256]; json_escape(chunk, cn, esc, sizeof esc);
-                char jb[400];
+                char jb[768];
                 snprintf(jb, sizeof jb,
                   "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
                   "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
@@ -1072,7 +1072,8 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0;
-    c->is_attn = calloc(c->n_layers, sizeof(uint8_t));
+    if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
+    c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
 }
 
@@ -1145,6 +1146,9 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
 }
 
 static void load_meta(Cfg *c, const char *snap) {
+    /* is_attn was sized by load_cfg from config.json and is NOT resized here, so
+     * every write below is bounded by this count, not by whatever the meta says. */
+    const int is_attn_len = c->n_layers;
     char path[2048]; snprintf(path, sizeof(path), "%s/qwen36_meta.json", snap);
     FILE *f = fopen(path, "rb"); if (!f) { printf("[meta] %s not found; using i%%4==3 + defaults\n", path); return; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -1165,6 +1169,16 @@ static void load_meta(Cfg *c, const char *snap) {
         G("dn_vheads", dn_vheads); G("dn_kheads", dn_kheads); G("dn_kdim", dn_kdim);
         G("dn_vdim", dn_vdim); G("dn_convk", dn_convk); G("dn_conv_dim", dn_conv_dim);
         #undef G
+        /* validate_cfg makes exactly this check, and used to be the only one --
+         * but it runs AFTER load_meta returns, one line too late to stop the
+         * is_attn writes below. A container whose config.json said 4 layers and
+         * whose meta said 8 therefore wrote past a 4-byte allocation before
+         * anything refused it: ASan heap-buffer-overflow at the layer_types
+         * loop, reached from an ordinary model directory. Refuse here, while
+         * is_attn is still the only thing that has been sized. */
+        CFG_NEED(c->n_layers == is_attn_len,
+                 "config.json says %d layers, qwen36_meta.json says %d",
+                 is_attn_len, c->n_layers);
         if((v=json_get(r,"partial_rotary_factor"))&&v->t==J_NUM) c->partial_rotary_factor=(float)v->num;
         if((v=json_get(r,"rope_theta"))&&v->t==J_NUM) c->theta=(float)v->num;
         if((v=json_get(r,"rms_eps"))&&v->t==J_NUM) c->eps=(float)v->num;
@@ -1229,6 +1243,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int n_layers_from_config = m->c.n_layers;
     load_meta(&m->c, snap);
     validate_cfg(&m->c, n_layers_from_config);
+    /* load_cfg and validate_cfg both guard n_layers, but the compiler can't see
+     * across function boundaries, so re-assert here to silence -Walloc-size-larger-than. */
+    if (m->c.n_layers <= 0) { fprintf(stderr, "model_init: n_layers=%d invalid\n", m->c.n_layers); exit(1); }
     if (m->c.rotary_dim > m->c.head_dim || m->c.rotary_dim % 2 != 0) {
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }
@@ -1247,7 +1264,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     }
-    m->L = calloc(c->n_layers, sizeof(Layer));
+    m->L = calloc((size_t)c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
      * under its OWN original index model.layers.{i}. So active_of is the identity
      * map; experts and dense weights are read from model.layers.{i} for all i. */
@@ -1310,17 +1327,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             #undef LD4
         }
     }
-    m->cache = calloc(c->n_layers, sizeof(LCache));
+    m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
-        m->cache[i].slots = calloc(cap, sizeof(Slot));
+        m->cache[i].slots = calloc((size_t)cap, sizeof(Slot));
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
     }
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
-    m->DN_rec = calloc(c->n_layers, sizeof(float*));
-    m->DN_conv = calloc(c->n_layers, sizeof(float*));
+    m->DN_rec = calloc((size_t)c->n_layers, sizeof(float*));
+    m->DN_conv = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
@@ -1375,6 +1392,64 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->g4 = s->u4 = s->d4 = NULL;   /* packed int4 (allocated on int4 load if GPU int4 active) */
 }
 
+
+/* Unpack packed signed-int4 experts to int8. Two nibbles per byte; LOW nibble is
+ * element 2k, HIGH is 2k+1, each signed 4-bit two's complement. Must stay in step
+ * with pack_int4 in c/tools/convert_qwen36.py.
+ *
+ * This is the hottest thing on this engine's CPU decode path. Every expert cache
+ * miss unpacks a whole expert -- 3*inter*hidden = 6.29M values on
+ * Qwen3.6-35B-A3B -- and a fit of decode time against miss count put ~60% of
+ * decode inside it.
+ *
+ * The loop this replaces was indexed by ELEMENT, so it reloaded raw[i>>1], did an
+ * i&1 select and took a branch for every value. Walking BYTES and sign-extending
+ * by shifting removes the branch. Vectorising then needs an INTERLEAVING store,
+ * which is why no compiler gets there from the scalar form: the two nibble
+ * streams are consecutive in the output, so it needs vst2q on NEON or
+ * unpacklo/unpackhi on AVX2 rather than a strided store. Checking the
+ * disassembly after the branchless rewrite confirmed zero vector registers.
+ *
+ * Sign extension is branchless in both paths. In vectors the signed value of a
+ * nibble n is (n ^ 8) - 8; the scalar tail gets the same result more cheaply by
+ * casting the nibble into the top four bits and arithmetic-shifting back down.
+ *
+ * Integer throughout, so unlike a float reduction this is bit-exact by
+ * construction rather than by tolerance -- verified identical to the original
+ * branching form over all 256 byte values, at every length around a vector
+ * boundary, and on a full-size 6.29M-value random expert, on AVX2 and NEON. */
+static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
+{
+    int64_t nb = n / 2, b = 0;                  /* n is 3*inter*hidden, always even */
+#if defined(__AVX2__)
+    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi8(8);
+    for (; b + 16 <= nb; b += 16) {
+        __m128i by = _mm_loadu_si128((const __m128i *)(raw + b));
+        __m128i lo = _mm_and_si128(by, m4);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);   /* 16-bit shift: mask after */
+        lo = _mm_sub_epi8(_mm_xor_si128(lo, e8), e8);
+        hi = _mm_sub_epi8(_mm_xor_si128(hi, e8), e8);
+        _mm_storeu_si128((__m128i *)(out + 2 * b),      _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(out + 2 * b + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t e8 = vdupq_n_s8(8);
+    for (; b + 16 <= nb; b += 16) {
+        uint8x16_t by = vld1q_u8(raw + b);
+        int8x16x2_t z;
+        z.val[0] = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vandq_u8(by, m4)), e8), e8);
+        z.val[1] = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), e8), e8);
+        vst2q_s8(out + 2 * b, z);               /* the interleaved store is the trick */
+    }
+#endif
+    for (; b < nb; b++) {                       /* tail, and the whole loop if scalar */
+        uint8_t byte = raw[b];
+        out[2 * b]     = (int8_t)(byte << 4) >> 4;
+        out[2 * b + 1] = (int8_t)(byte & 0xF0) >> 4;
+    }
+}
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     int la = m->active_of[layer];   /* container stores experts under active index */
@@ -1403,12 +1478,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
-        for (int64_t i = 0; i < want_w; i++) {
-            uint8_t byte = raw[i >> 1];
-            int8_t v = (int8_t)((i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF));
-            if (v & 8) v -= 16;                 /* sign-extend signed 4-bit */
-            s->g[i] = v;
-        }
+        unpack_int4_to_int8(s->g, raw, want_w);
         s->is_int4 = 1;
         /* Free any previous occupant first (LRU slot reuse). */
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
@@ -2296,7 +2366,7 @@ static void ensure_kv(Model *m){
         for (int i = 0; i < c->n_layers; i++){ if (m->K[i]) free(m->K[i]); if (m->V[i]) free(m->V[i]); }
         free(m->K); free(m->V); m->K = NULL; m->V = NULL;
     }
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * c->k_head_dim);
@@ -2606,7 +2676,13 @@ int main(int argc, char **argv) {
         if (getenv("ENC_DEBUG") && np <= 300) { fprintf(stderr, "[enc] prompt ids: "); for (int i=0;i<np;i++) fprintf(stderr, "%d ", prompt[i]); fprintf(stderr, "\n"); }
     }
 
-    Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; model_init(&m, snap, cap, bits);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());

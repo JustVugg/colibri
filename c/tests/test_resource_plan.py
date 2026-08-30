@@ -27,8 +27,11 @@ def write_shard(path, tensors):
     offset = 0
     header = {}
     payload = b""
-    for name, size in tensors:
-        header[name] = {"dtype": "U8", "shape": [size], "data_offsets": [offset, offset + size]}
+    for tensor in tensors:
+        name, size, *metadata = tensor
+        dtype = metadata[0] if metadata else "U8"
+        header[name] = {"dtype": dtype, "shape": [size],
+                        "data_offsets": [offset, offset + size]}
         payload += b"\0" * size
         offset += size
     raw = json.dumps(header).encode()
@@ -637,6 +640,74 @@ memInfo.free:                     23.50 GB (97%)
                           gpus=gpus, gpu_indices=[1])
         self.assertEqual(plan["tiers"]["vram"]["devices"], [])
         self.assertIn("not detected", plan["warnings"][0])
+
+    def test_qwen38_cpu_only_plan_prices_heterogeneous_cache_and_exports_cap(self):
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text", "num_hidden_layers": 2,
+                "hidden_size": 8, "vocab_size": 16,
+                "max_position_embeddings": 128, "eos_token_id": 2,
+                "layer_types": ["linear_attention", "qwen_sparse_attention"],
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 4, "rope_parameters": {"partial_rotary_factor": 0.5},
+                "indexer_kv_heads": 1, "indexer_head_dim": 2,
+                "indexer_n_heads": 1, "indexer_budget": 2,
+                "indexer_compress_ratio": 1,
+                "linear_num_key_heads": 1, "linear_num_value_heads": 1,
+                "linear_key_head_dim": 2, "linear_value_head_dim": 2,
+                "linear_conv_kernel_dim": 2, "hc_count": 4, "hc_lowrank": 4,
+                "ple_layer_ids": [1], "ple_embed_dim": 8,
+                "ple_conv_kernel_size": 2, "ngram_size": 3,
+                "heads_per_ngram": 1, "split_ngram_parts": 1,
+                "num_experts": 2, "num_experts_per_tok": 1,
+                "moe_intermediate_size": 4,
+                "shared_expert_intermediate_size": 4,
+            },
+        }
+        (self.model / "config.json").write_text(json.dumps(config))
+        tensors = [("model.embed_tokens.weight", 256, "BF16")]
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"model.layers.0.mlp.experts.0.{projection}"
+            tensors.append((prefix + ".weight", 32, "F8_E4M3"))
+            tensors.append((prefix + ".weight_scale_inv", 4, "F32"))
+            tensors.append((
+                f"model.layers.0.mlp.experts.1.{projection}.weight", 128, "F32"
+            ))
+        write_shard(self.model / "model.safetensors", tensors)
+        analysis = analyze_model(self.model)
+        self.assertEqual(analysis["dense_bytes"], 256)
+        # The three native FP8 sidecars are retained once in the normalized
+        # scale bank, not once per cache slot.
+        self.assertEqual(analysis["expert_fixed_bytes"], 12)
+        self.assertEqual(analysis["expert_bytes"], 480)
+        # A slot can receive either expert. It must use the larger retained
+        # representation, not the median of unlike source dtypes.
+        self.assertEqual(analysis["expert_bytes_by_layer"], {0: 384})
+        self.assertEqual(analysis["per_cap_bytes"], 384)
+        gpu = {"index": 0, "name": "unrelated", "total_bytes": 16 * GB,
+               "free_bytes": 14 * GB, "unified_memory": True}
+        plan = build_plan(self.model, context=64, available_memory=16 * GB,
+                          available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual(plan["tiers"]["vram"]["devices"], [])
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertFalse(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        cap = plan["tiers"]["ram"]["cache_slots_per_layer"]
+        self.assertGreaterEqual(cap, 1)
+        self.assertEqual(environment_for_plan(plan)["COLI_PLAN_CAP"], str(cap))
+        for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
+            with self.subTest(variable=variable), self.assertRaisesRegex(
+                    ValueError, "requires native expert storage"):
+                environment_for_plan(plan, {variable: "0"})
+        plan["tiers"]["ram"]["cache_slots_per_layer"] = 0
+        with self.assertRaisesRegex(ValueError, "one expert slot"):
+            environment_for_plan(plan)
+        with self.assertRaisesRegex(ValueError, "CPU only"):
+            build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
+                       available_disk=16 * GB, gpus=[gpu])
+        with self.assertRaisesRegex(ValueError, "CPU only"):
+            build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
+                       available_disk=16 * GB, gpus=[gpu])
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"

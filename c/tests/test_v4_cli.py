@@ -194,6 +194,10 @@ class V4CliTest(unittest.TestCase):
         self.assertNotIn("COLI_PROFILE_CAP", explicit)
         self.assertEqual(self.cli.cap_for_launch(None, env, 8), 12)
         self.assertEqual(self.cli.cap_for_launch(7, env, 8), 7)
+        self.assertEqual(self.cli.cap_for_launch(
+            None, {"COLI_PROFILE_CAP": "12", "COLI_PLAN_CAP": "20"}, 8), 12)
+        self.assertEqual(self.cli.cap_for_launch(
+            None, {"COLI_PLAN_CAP": "20"}, 8), 20)
         with mock.patch.dict(os.environ, {"CAP": "9"}, clear=True):
             args = argparse.Namespace(cap=None)
             self.assertEqual(self.cli.operator_cap(args, "glm"), 9)

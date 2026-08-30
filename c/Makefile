@@ -1022,6 +1022,23 @@ endif
 qwen36$(EXE): qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
+# Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
+# qwen38.c owns the direct checkpoint loader and SERVE=1 protocol, with no
+# CUDA/Metal tier advertised by the control plane.
+qwen38$(EXE): qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
+
+.PHONY: qwen38-tiny-generate qwen38-tiny-check
+qwen38-tiny-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny
+
+qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
+	@for batch in 0 1; do for bf16 in 0 1; do for cap in 1 4; do \
+		Q38_PREFILL_BATCH=$$batch Q38_NATIVE_BF16=$$bf16 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json || exit $$?; \
+	done; \
+	done; \
+	done
+
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
 # Same tier sources as the engine: the test includes qwen36.c, so with CUDA=1
@@ -1111,6 +1128,46 @@ tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h t
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
+tests/test_st_slice$(EXE): tests/test_st_slice.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
+
+# Genera la fixture della torre e la confronta con l'oracolo upstream. Non serve
+# il checkpoint: 240k parametri casuali, meno di un megabyte.
+.PHONY: qwen38-vision-check
+qwen38-vision-check: tests/test_qwen38_vision$(EXE)
+	$(PYTHON) tools/make_qwen38_vision_tiny.py --out ./qwen38_vision_tiny
+	./tests/test_qwen38_vision$(EXE) ./qwen38_vision_tiny
+
+# Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
+# generazione. Prova che due immagini diverse danno risposte diverse, che e'
+# l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
+.PHONY: qwen38-vision-serve-check
+qwen38-vision-serve-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_multimodal_tiny.py --out ./qwen38_mm_tiny
+	$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_mm_tiny
+	$(PYTHON) tests/test_qwen38_vision_serve.py --binary ./qwen38$(EXE) --fixture ./qwen38_mm_tiny
+
+tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h segment_runtime.c segment_runtime.h segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_st_map$(EXE): tests/test_st_map.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1327,7 +1384,8 @@ SEGMENT_ENGINE_OBJS = \
 	$(SEGMENT_BUILD_DIR)/inkling.o \
 	$(SEGMENT_BUILD_DIR)/kimi.o \
 	$(SEGMENT_BUILD_DIR)/olmoe.o \
-	$(SEGMENT_BUILD_DIR)/qwen36.o
+	$(SEGMENT_BUILD_DIR)/qwen36.o \
+	$(SEGMENT_BUILD_DIR)/qwen38.o
 SEGMENT_V4_UNITS = $(filter-out COLI_V4_UNIT_PROMPT \
 	COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS)) $(V4_SEGMENT_UNIT)
 SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_UNITS)))
@@ -1372,6 +1430,13 @@ $(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c segment_runtime.h edge_runtime.h \
 		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
 		edge_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
+
+$(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c qwen38_core.h segment_runtime.h \
+		segment_adapters.h segment_adapter_internal.h edge_runtime.h \
+		edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h \
+		qwen38_nfc.h qwen38_nfc_tables.h route_trace.h tok_unicode.h \
+		tok_unicode_o200k.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN38_NO_MAIN -c qwen38.c -o $@
 
 $(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c deepseek_v4.h \
 		deepseek_v4_internal.h segment_runtime.h segment_adapters.h \
@@ -1441,6 +1506,7 @@ segment-adapters-real: tests/test_segment_adapters_real$(EXE)
 	@test -n "$(KIMI_SEGMENT_MODEL)" || { echo "set KIMI_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(OLMOE_SEGMENT_MODEL)" || { echo "set OLMOE_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(QWEN_SEGMENT_MODEL)" || { echo "set QWEN_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(QWEN38_SEGMENT_MODEL)" || { echo "set QWEN38_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(DEEPSEEK_SEGMENT_MODEL)" || { echo "set DEEPSEEK_SEGMENT_MODEL" >&2; exit 2; }
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm "$(GLM_SEGMENT_MODEL)" 0 3 5 8
 	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm53 "$(GLM53_SEGMENT_MODEL)" 0 2 4 16
@@ -1448,6 +1514,8 @@ segment-adapters-real: tests/test_segment_adapters_real$(EXE)
 	COLI_RAM_OVERCOMMIT=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) kimi "$(KIMI_SEGMENT_MODEL)" 0 3 6 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) olmoe "$(OLMOE_SEGMENT_MODEL)" 0 2 4 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen36 "$(QWEN_SEGMENT_MODEL)" 0 4 8 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen38 "$(QWEN38_SEGMENT_MODEL)" 0 2 4 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen38 "$(QWEN38_SEGMENT_MODEL)" 1 2 4 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_SEGMENT_MODEL)" 0 1 3 8
 
 # End-to-end model-edge gate. Every run performs tokenizer round-trip, embeds
@@ -1461,6 +1529,7 @@ edge-adapters-real: tests/test_edge_adapters_real$(EXE)
 	@test -n "$(KIMI_EDGE_MODEL)" && test -n "$(KIMI_EDGE_REF)" || { echo "set KIMI_EDGE_MODEL and KIMI_EDGE_REF" >&2; exit 2; }
 	@test -n "$(OLMOE_EDGE_MODEL)" && test -n "$(OLMOE_EDGE_REF)" || { echo "set OLMOE_EDGE_MODEL and OLMOE_EDGE_REF" >&2; exit 2; }
 	@test -n "$(QWEN_EDGE_MODEL)" && test -n "$(QWEN_EDGE_REF)" || { echo "set QWEN_EDGE_MODEL and QWEN_EDGE_REF" >&2; exit 2; }
+	@test -n "$(QWEN38_EDGE_MODEL)" && test -n "$(QWEN38_EDGE_REF)" || { echo "set QWEN38_EDGE_MODEL and QWEN38_EDGE_REF" >&2; exit 2; }
 	@test -n "$(DEEPSEEK_EDGE_MODEL)" && test -n "$(DEEPSEEK_EDGE_REF)" || { echo "set DEEPSEEK_EDGE_MODEL and DEEPSEEK_EDGE_REF" >&2; exit 2; }
 	GLM_SEGMENT_EBITS=16 GLM_SEGMENT_DBITS=16 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm "$(GLM_EDGE_MODEL)" "$(GLM_EDGE_REF)" 3
 	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm53 "$(GLM53_EDGE_MODEL)" "$(GLM53_EDGE_REF)" 3
@@ -1468,6 +1537,7 @@ edge-adapters-real: tests/test_edge_adapters_real$(EXE)
 	COLI_RAM_OVERCOMMIT=1 K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) kimi "$(KIMI_EDGE_MODEL)" "$(KIMI_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) olmoe "$(OLMOE_EDGE_MODEL)" "$(OLMOE_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen36 "$(QWEN_EDGE_MODEL)" "$(QWEN_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen38 "$(QWEN38_EDGE_MODEL)" "$(QWEN38_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_EDGE_MODEL)" "$(DEEPSEEK_EDGE_REF)" 3
 
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
@@ -1560,6 +1630,8 @@ tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h 
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_mirror_stripe_split$(EXE): tests/test_mirror_stripe_split.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c deepseek_v4_hybrid.h hybrid_split.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1715,7 +1787,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -1727,6 +1799,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
+	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
@@ -1754,6 +1827,7 @@ bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
+	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 

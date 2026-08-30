@@ -128,6 +128,8 @@ int main(void){
          * #700 completed), so its id must resolve to a name like every sibling's */
         check(strcmp(rt_engine_of(rt_hash("deepseek_v4")), "deepseek_v4") == 0,
               "the deepseek_v4 writer can be named");
+        check(strcmp(rt_engine_of(rt_hash("qwen38")), "qwen38") == 0,
+              "the qwen38 writer can be named");
     }
 
     /* 7. inkling's IKU1 layout is refused by any engine that is not inkling */

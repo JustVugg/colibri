@@ -2,11 +2,11 @@
 
 Reference for the environment variables read by the colibrì engine.
 
-**Generated from `dev @ 7fb1159`** by scanning every `getenv()` / `getenv_utf8()` site in `c/*.c`, `c/*.h`, `c/*.cu` and `c/*.mm`. Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
+**Generated from `dev @ def8419`** by scanning every `getenv()` / `getenv_utf8()` site in `c/*.c`, `c/*.h`, `c/*.cu` and `c/*.mm`. Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate this after the code changes.
 
 ## Which program reads these?
 
-**There are six engine binaries, and they do not share a knob set.** The main
+**There are seven engine binaries, and they do not share a knob set.** The main
 engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
 what follows, but the sister engines read their own:
 
@@ -16,6 +16,7 @@ what follows, but the sister engines read their own:
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, and its dense/CUDA-tier controls — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
+| `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_PREFILL_BATCH`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 
@@ -292,7 +293,7 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `REPLAY` | unset | Replay mode. |
 | `TF` | unset | Teacher-forcing mode. |
 | `CHAT_TEMPLATE` | `1` | Apply the GLM chat template (`0` = raw prompt). |
-| `PPL` | off (`olmoe.c` only) | `PPL=1` enters teacher-forced NLL/perplexity meter mode in the OLMoE sister engine. |
+| `PPL` | off (`olmoe.c` and `qwen38.c` only) | `PPL=1` enters teacher-forced NLL/perplexity meter mode in the OLMoE and Qwen3.8 sister engines. |
 | `ABLATE_SCORE` | unset | Causal-ablation sweep over `ABLATE_SCORE=<file>`, with a per-target-position final-logit read-out. Runs before `SCORE` and exits when done. |
 | `ABLATE_OUT` | unset | Where the ablation sweep writes its logit read-out. Pair with `ABLATE_SCORE`; an optional `ROUTE_TRACE` records the post-ablation router trace. |
 | `DEBUG_LOGITS` | unset | In reference-comparison mode, dump per-position logit diagnostics. |
@@ -387,6 +388,20 @@ and the CPU/GPU execution split.
 | `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
+
+## Qwen3.8 engine (`qwen38`)
+
+Read **only** by `c/qwen38.c`. See [qwen38.md](qwen38.md) for the native FP8
+checkpoint layout and the text-only capability boundary.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `Q38_MAXT` | `8192` | Served context capacity. Values above the model's native 262,144-token limit are clamped; malformed or non-positive values restore the default. |
+| `Q38_EOS` | tokenizer/config stop IDs | Override the served end-of-sequence token ID for controlled experiments. Normally the engine stops on the tokenizer's `<|im_end|>` / `<|endoftext|>` IDs, falling back to `eos_token_id`. |
+| `Q38_NATIVE_FP8` | `1` (on) | Keep routed E4M3 expert bytes and their F32 128×128 block scales native in the LRU. `=0` restores expanded-FP32 slots for A/B validation. |
+| `Q38_NATIVE_BF16` | `1` (on) | Keep resident and routed BF16 matrices in two-byte storage while retaining FP32 activations/accumulation. `=0` restores the expanded-FP32 reference. |
+| `Q38_PREFILL_BATCH` | `1` (on) | Route prompt rows in bounded expert-major chunks and batch resident shared-expert/DeltaNet projections. `=0` restores row-at-a-time prompt execution for A/B diagnosis; decode is unchanged. |
+| `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. The shared per-request `PROF` frame is emitted regardless. |
 
 ## DeepSeek V4 engine (`deepseek_v4`)
 

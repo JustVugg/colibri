@@ -3,6 +3,28 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### A seventh engine: Qwen3.8-Flash-Next
+
+- Added complete text-only inference for the official Qwen3.8-Flash-Next FP8
+  checkpoint: four-stream Gated Residual, Gated DeltaNet, Qwen Sparse Attention,
+  pageable hashed n-gram embeddings, top-10 routed MoE, and the shared expert.
+- The original 131 safetensors shards run directly. Vision and MTP are not
+  loaded or advertised; tools and non-text gateway content are refused.
+- Added family/planner/doctor/build/release integration and a pinned upstream
+  tiny oracle covering sparse selection, cached decode, LRU eviction, and
+  sanitizer runs.
+- Kept native FP8 expert payloads and normalized scale banks bounded, added
+  cache-sized parallel demand loading, and made prompt MoE execution
+  expert-major with bounded shared-expert and causal DeltaNet batching.
+- Added exact single-slot hybrid prompt-prefix reuse across QSA, DeltaNet and
+  PLE state, with persistent state and bounded workspace reflected explicitly
+  in planner RAM accounting.
+- Added the boundary-only Qwen3.8 Edge adapter and the seventh-family real
+  Edge -> Segment -> Edge oracle gate without loading transformer, vision or
+  MTP tensors into the Edge process.
+
 ## [1.7.0] — 2026-08-19
 71 pull requests since v1.6.2. A sixth model family with its GPU tier, a
 rebuilt expert-matmul path, and the CI that would have caught the class of bug

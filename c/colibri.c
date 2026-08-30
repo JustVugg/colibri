@@ -3138,6 +3138,51 @@ static void *mir_stripe_worker(void *a){
     return NULL;
 }
 /* Returns total bytes read (== len) on success, -1 to make the caller fall back. */
+/* Split `len` across `nsf` replicas PROPORTIONALLY to their measured bandwidth,
+ * rather than len/nsf. Stripe i reads sz[i] bytes at off[i] from replica
+ * srep[(rep+i)%nsf]; offsets are contiguous and the sizes sum to exactly len.
+ *
+ * mir_pread_striped joins every stripe, so an equal split makes the whole read
+ * as slow as the slowest drive - and the weights needed to avoid that are
+ * already computed and already in scope. g_mir_cut[] is the same bandwidth
+ * ranking expert_route() uses for whole-expert placement, from
+ * COLI_DISK_WEIGHTS or the startup probe. Before this it decided WHICH drive
+ * holds an expert and was ignored for how much of one each drive reads, so a
+ * correctly down-weighted slow drive still got an equal share of every stripe.
+ *
+ * Measured on 2x NVMe + 1x SATA (990 Pro 5.69, SN850P 5.03, MX500 0.44 GB/s),
+ * 19 MB expert, O_DIRECT, one thread per leg as in the caller:
+ *
+ *   2 legs, equal      9.5 / 9.5 MB          -> join waits  2.0 ms
+ *   3 legs, equal      6.33 / 6.33 / 6.33    -> join waits 12.6 ms
+ *   3 legs, weighted   9.69 / 8.56 / 0.75    -> join waits  1.9 ms
+ *
+ * So adding a drive the engine already knows is 10x slower cost 6.3x on every
+ * striped read, and the same drive weighted is a small net win.
+ *
+ * Split out of the caller so the arithmetic is testable without fds or threads
+ * (tests/test_mirror_stripe_split.c). Everything it reads is an argument except
+ * g_mir_cut, so a test can drive it by setting that alone. */
+static void mir_stripe_plan(int64_t len, int nsf, const int *srep, int rep,
+                            int64_t *off, int64_t *sz){
+    int64_t wsum=0, w[MIR_REPS];
+    for(int i=0;i<nsf;i++){
+        int r=srep[i], lo=r?g_mir_cut[r-1]:0;
+        w[i]=g_mir_cut[r]-lo;
+        if(w[i]<1) w[i]=1;                    /* a zero share would strand bytes */
+        wsum+=w[i];
+    }
+    int64_t acc=0;
+    for(int i=0;i<nsf;i++){
+        int k=(rep+i)%nsf;                    /* chunk 0 on the routed replica */
+        int64_t want = i==nsf-1 ? len-acc     /* last leg absorbs the remainder */
+                                : ((len*w[k]/wsum) + 4095) & ~4095LL;
+        if(want<0) want=0;
+        if(acc+want>len) want=len-acc;
+        off[i]=acc; sz[i]=want; acc+=want;
+    }
+}
+
 static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,int64_t base){
     if(!g_mir_stripe || g_mir_nrep<2 || len < (4<<20)) return -1;
     int sfd[MIR_REPS], srep[MIR_REPS], nsf=0;
@@ -3146,14 +3191,22 @@ static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,
         if(f>=0){ sfd[nsf]=f; srep[nsf]=r; nsf++; }
     }
     if(nsf<2) return -1;
-    int64_t chunk=((len+nsf-1)/nsf + 4095) & ~4095LL;
+    int64_t off[MIR_REPS], sz[MIR_REPS];
+    mir_stripe_plan(len, nsf, srep, rep, off, sz);
     MirStripe st[MIR_REPS]; pthread_t th[MIR_REPS]; int nth=0, ns=0;
+    /* Which replica each stripe landed on. Tracked explicitly rather than
+     * recomputed as (rep+i)%nsf below: a share that rounds away is skipped, so
+     * the stripe index is no longer the leg index and the old expression would
+     * bill the wrong drive. */
+    int sowner[MIR_REPS];
     for(int i=0;i<nsf;i++){
-        int64_t o=(int64_t)i*chunk; if(o>=len) break;
+        if(sz[i]<=0) continue;                /* a share that rounded away */
         int k=(rep+i)%nsf;                    /* chunk 0 on the routed replica */
-        st[ns]=(MirStripe){sfd[k], buf+o, len-o<chunk?len-o:chunk, base+o, -1};
+        st[ns]=(MirStripe){sfd[k], buf+off[i], sz[i], base+off[i], -1};
+        sowner[ns]=srep[k];
         ns++;
     }
+    if(ns<2) return -1;                       /* nothing left to parallelise */
     for(int i=1;i<ns;i++)
         if(pthread_create(&th[nth],NULL,mir_stripe_worker,&st[i])==0) nth++;
         else st[i].r=pread(st[i].fd,st[i].buf,(size_t)st[i].len,st[i].off);
@@ -3161,9 +3214,8 @@ static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,
     for(int i=0;i<nth;i++) pthread_join(th[i],NULL);
     for(int i=0;i<ns;i++) if(st[i].r!=st[i].len) return -1;
     for(int i=0;i<ns;i++){
-        int k=(rep+i)%nsf;
-        atomic_fetch_add_explicit(&g_mir_bytes[srep[k]],st[i].len,memory_order_relaxed);
-        atomic_fetch_add_explicit(&g_mir_nread[srep[k]],1,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mir_bytes[sowner[i]],st[i].len,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mir_nread[sowner[i]],1,memory_order_relaxed);
     }
     return len;
 }
@@ -11850,7 +11902,14 @@ int main(int argc, char **argv){
         atexit(cluster_close_all);
     }
 #endif
-    Model m; double t0=now_s(); model_init(&m,snap,weights_dir,cap,ebits,dbits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; double t0=now_s();
+    model_init(&m,snap,weights_dir,cap,ebits,dbits);
     /* KV_TQ requires power-of-two row widths: both codecs rotate through a
      * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
      * other width. On a model whose kv_lora/qk_rope are not powers of two that

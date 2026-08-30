@@ -1493,7 +1493,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
             return 1;
         }
-        Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+        static Model m; model_init(&m, snap, cap, bits);
         m.max_t = ctx_cap;
         m.K = calloc(m.c.n_layers, sizeof(float*)); m.V = calloc(m.c.n_layers, sizeof(float*));
         for (int i = 0; i < m.c.n_layers; i++) {
@@ -1525,7 +1531,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
             return 1;
         }
-        Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+        static Model m; model_init(&m, snap, cap, bits);
         printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
@@ -1551,7 +1563,13 @@ int main(int argc, char **argv) {
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
-    Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */

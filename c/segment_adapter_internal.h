@@ -156,14 +156,20 @@ static int coli_segment_spans_write(const ColiSegmentStateSpan *spans,
     return 0;
 }
 
+typedef int (*ColiSegmentPayloadValidateFn)(
+    const ColiSegmentStateSpan *spans, size_t count,
+    const unsigned char *payload, size_t payload_bytes,
+    void *user_data, char *error, size_t error_size);
+
 /* Read into a compact temporary buffer, validate the complete payload, then
  * commit to live state.  A failed or truncated restore therefore leaves the
- * conversation byte-for-byte unchanged. */
-static int coli_segment_spans_restore(const ColiSegmentStateSpan *spans,
-                                      size_t count, uint64_t expected_hash,
-                                      ColiSegmentReadFn read_fn,
-                                      void *user_data, char *error,
-                                      size_t error_size) {
+ * conversation byte-for-byte unchanged.  The optional validator lets an
+ * adapter reject semantically impossible state while it is still staged. */
+static int coli_segment_spans_restore_checked(
+    const ColiSegmentStateSpan *spans, size_t count, uint64_t expected_hash,
+    ColiSegmentReadFn read_fn, void *read_user_data,
+    ColiSegmentPayloadValidateFn validate_fn, void *validate_user_data,
+    char *error, size_t error_size) {
     size_t bytes;
     if (coli_segment_spans_size(spans, count, &bytes))
         return coli_segment_adapter_error(error, error_size,
@@ -172,7 +178,7 @@ static int coli_segment_spans_restore(const ColiSegmentStateSpan *spans,
     if (bytes && !payload)
         return coli_segment_adapter_error(error, error_size,
                                            "out of memory restoring segment state");
-    if (coli_segment_stream_read(read_fn, user_data, payload, bytes,
+    if (coli_segment_stream_read(read_fn, read_user_data, payload, bytes,
                                  error, error_size)) {
         free(payload);
         return -1;
@@ -183,6 +189,11 @@ static int coli_segment_spans_restore(const ColiSegmentStateSpan *spans,
         return coli_segment_adapter_error(error, error_size,
                                            "segment snapshot checksum mismatch");
     }
+    if (validate_fn && validate_fn(spans, count, payload, bytes,
+                                   validate_user_data, error, error_size)) {
+        free(payload);
+        return -1;
+    }
     const unsigned char *cursor = payload;
     for (size_t index = 0; index < count; index++) {
         if (spans[index].size) {
@@ -192,6 +203,16 @@ static int coli_segment_spans_restore(const ColiSegmentStateSpan *spans,
     }
     free(payload);
     return 0;
+}
+
+static int coli_segment_spans_restore(const ColiSegmentStateSpan *spans,
+                                      size_t count, uint64_t expected_hash,
+                                      ColiSegmentReadFn read_fn,
+                                      void *user_data, char *error,
+                                      size_t error_size) {
+    return coli_segment_spans_restore_checked(
+        spans, count, expected_hash, read_fn, user_data, NULL, NULL,
+        error, error_size);
 }
 
 #endif /* COLIBRI_SEGMENT_ADAPTER_INTERNAL_H */

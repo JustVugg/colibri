@@ -369,6 +369,7 @@ def ngen_for(a, interactive=False, family=None):
     return 16384 if interactive else 1024
 
 _PROFILE_CAP_ENV = "COLI_PROFILE_CAP"
+_PLAN_CAP_ENV = "COLI_PLAN_CAP"
 
 def apply_measured_profile(env, profile, explicit_env, explicit_cap):
     """Apply scheduling/resource results while preserving CLI precedence."""
@@ -391,7 +392,11 @@ def cap_for_launch(explicit_cap, env, fallback):
         measured=int(env.pop(_PROFILE_CAP_ENV,""))
     except (TypeError,ValueError):
         measured=0
-    return measured if measured>=1 else fallback
+    try:
+        planned=int(env.pop(_PLAN_CAP_ENV,""))
+    except (TypeError,ValueError):
+        planned=0
+    return measured if measured>=1 else planned if planned>=1 else fallback
 
 def operator_cap(a, arch):
     """Return a real operator cap, including GLM's documented CAP channel."""
@@ -410,6 +415,8 @@ def env_for_engine(a, arch, plan=None):
     explicit_env = set(os.environ)
     env = os.environ.copy()
     env.pop(_PROFILE_CAP_ENV,None)
+    env.pop(_PLAN_CAP_ENV,None)
+    family=family_by_id(arch)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -495,6 +502,11 @@ def env_for_engine(a, arch, plan=None):
     # getattr: tests build partial Namespaces for env_for_engine.
     gpu = getattr(a, "gpu", None)
     vram = getattr(a, "vram", None)
+    if not family.supports_accelerator:
+        if gpu not in (None,"none"):
+            sys.exit(f"{C.yel}{family.display_name} currently supports CPU only; --gpu is unavailable{C.r}")
+        if vram and gpu!="none":
+            sys.exit(f"{C.yel}{family.display_name} currently supports CPU only; --vram is unavailable{C.r}")
     if gpu is not None:
         env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
         if gpu == "none":
@@ -524,18 +536,21 @@ def env_for_engine(a, arch, plan=None):
         # code path, so #1196 could measure and save a perfectly valid Kimi,
         # Inkling, OLMoE, Qwen or V4 profile that chat/serve never loaded.
         from resource_plan import build_plan, environment_for_plan
-        if plan is None:
-            ram,ctx,devices,vram=resource_request(a,env)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                            kv_slots=requested_kv_slots(a,env))
-        # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-        # selects a capable build above. Merely asking for auto-tier must not
-        # turn a CPU-only sibling binary into an attempted CUDA launch.
-        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
-                                  and (arch == "deepseek_v4"
-                                       or env.get("COLI_NO_OMP_TUNE")))
-        env=environment_for_plan(plan,env,
-                                 cuda_enabled=env.get("COLI_CUDA") == "1")
+        try:
+            if plan is None:
+                ram,ctx,devices,vram=resource_request(a,env)
+                plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                                kv_slots=requested_kv_slots(a,env))
+            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
+            # selects a capable build above. Merely asking for auto-tier must not
+            # turn a CPU-only sibling binary into an attempted CUDA launch.
+            plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
+                                      and (arch == "deepseek_v4"
+                                           or env.get("COLI_NO_OMP_TUNE")))
+            env=environment_for_plan(plan,env,
+                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+        except (OSError,ValueError,json.JSONDecodeError) as error:
+            sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -642,6 +657,7 @@ def env_for(a):
     explicit_env = set(os.environ)
     e = dict(os.environ, SNAP=a.model)
     e.pop(_PROFILE_CAP_ENV,None)
+    e.pop(_PLAN_CAP_ENV,None)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # A GLM resource winner is a measured pair (RAM ceiling + argv cap). An
     # explicit cap asks the engine to size against the current RAM plan, not a
@@ -1006,8 +1022,10 @@ def cmd_info(a):
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     cfgp=os.path.join(a.model,"config.json")
+    resolved=None
     try:
-        family=resolve_model(a.model).descriptor
+        resolved=resolve_model(a.model)
+        family=resolved.descriptor
     except (FamilyConfigError,UnknownFamilyError) as error:
         if os.path.exists(cfgp):
             sys.exit(f"{C.yel}unsupported model:{C.r} {error}")
@@ -1015,9 +1033,15 @@ def cmd_info(a):
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
+        # Multimodal wrappers such as Qwen3.8 keep the language architecture
+        # below text_config.  The registry has already resolved that section;
+        # using the root here produced a recognized family followed by four
+        # misleading `None` dimensions in `coli info`.
+        arch_c=resolved.family_config if resolved else c
+        experts=arch_c.get("n_routed_experts",arch_c.get("num_experts"))
         row("model", a.model)
-        row("arch", f"hidden {c.get('hidden_size')} · {c.get('num_hidden_layers')} layer · "
-                    f"{c.get('n_routed_experts')} expert/layer · top-{c.get('num_experts_per_tok')}")
+        row("arch", f"hidden {arch_c.get('hidden_size')} · {arch_c.get('num_hidden_layers')} layer · "
+                    f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}")
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
