@@ -28,6 +28,16 @@ from family_registry import (
 )
 
 
+def _readmes(repo):
+    """Ogni README del repo, trovato e non elencato.
+
+    Una lista scritta a mano qui avrebbe lo stesso difetto che questi test
+    esistono per prendere: chi aggiunge README.fr.md non tocca il test, il
+    test continua a passare, e il lettore francese non trova il modello.
+    """
+    return sorted(repo.glob("README*.md"))
+
+
 def qwen_geometry(config, context, _model_dir):
     layers = config["num_hidden_layers"]
     full = sum(kind == "full_attention" for kind in config["layer_types"])
@@ -1136,11 +1146,8 @@ class FamilyRegistryTest(unittest.TestCase):
         legge la sua lingua e non trova il modello.
         """
         repo = Path(__file__).resolve().parents[2]
-        readmes = ["README.md", "README.it.md", "README.zh-CN.md", "README.zh-TW.md"]
-        for name in readmes:
-            path = repo / name
-            if not path.exists():
-                continue
+        for path in _readmes(repo):
+            name = path.name
             text = path.read_text(encoding="utf-8")
             for family in FAMILIES:
                 # Il nome senza il suffisso di taglia: i README scrivono
@@ -1161,6 +1168,41 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"{name}: does not mention {family.display_name} "
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
+
+    def test_every_readme_banner_matches_the_declared_version(self):
+        """Il banner dei README deve dire la versione che dichiara version.py.
+
+        Il numero vive in cinque posti e finora niente li legava. Il modo in
+        cui questo sbaglia non e' rumoroso: si aggiornano quattro file su
+        cinque, la release esce, e il banner del quinto annuncia la versione
+        precedente a chiunque legga quella lingua. E' la stessa forma che ha
+        fatto uscire la v1.9.0 senza archivi -- una costante, piu' consumatori,
+        nessun controllo -- solo su un file diverso.
+
+        Qui il confronto e' con version.py e non fra i README fra loro: se
+        divergessero tutti insieme dal codice, un test di sola coerenza
+        reciproca li troverebbe d'accordo e non direbbe niente.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        self.assertIsNotNone(declared, "c/version.py: __version__ non trovato")
+        version = declared.group(1)
+        seen = 0
+        for path in _readmes(repo):
+            for banner in re.findall(r"colibri v(\d+\.\d+\.\d+)",
+                                     path.read_text(encoding="utf-8")):
+                seen += 1
+                self.assertEqual(
+                    banner, version,
+                    f"{path.name}: il banner dice v{banner} ma version.py "
+                    f"dichiara {version}; la release annuncerebbe due numeri "
+                    f"diversi a seconda della lingua che il lettore apre")
+        # Se un giorno il banner cambia forma questo test smetterebbe di
+        # guardare qualcosa senza mai fallire: meglio che lo dica.
+        self.assertGreater(seen, 0,
+                           "nessun banner 'colibri vX.Y.Z' trovato in alcun "
+                           "README: il test non sta piu' controllando niente")
 
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
