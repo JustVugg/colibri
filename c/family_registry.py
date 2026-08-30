@@ -907,7 +907,7 @@ FAMILIES = (
         # implicit_cap 0, non 8: questo motore dimensiona la cache degli
         # esperti dalla RAM disponibile, quindi "nessuna scelta esplicita"
         # deve arrivargli come 0 e non come otto slot per layer.
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 0, "GLM53_MAXT"),
+        limits=FamilyLimits(8192, 1048576, 1024, 1024, 16, 0, "GLM53_MAXT"),
         # tools=True: this family DOES render and parse tool calls. It used to
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
