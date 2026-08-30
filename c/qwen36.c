@@ -1145,6 +1145,9 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
 }
 
 static void load_meta(Cfg *c, const char *snap) {
+    /* is_attn was sized by load_cfg from config.json and is NOT resized here, so
+     * every write below is bounded by this count, not by whatever the meta says. */
+    const int is_attn_len = c->n_layers;
     char path[2048]; snprintf(path, sizeof(path), "%s/qwen36_meta.json", snap);
     FILE *f = fopen(path, "rb"); if (!f) { printf("[meta] %s not found; using i%%4==3 + defaults\n", path); return; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -1165,6 +1168,16 @@ static void load_meta(Cfg *c, const char *snap) {
         G("dn_vheads", dn_vheads); G("dn_kheads", dn_kheads); G("dn_kdim", dn_kdim);
         G("dn_vdim", dn_vdim); G("dn_convk", dn_convk); G("dn_conv_dim", dn_conv_dim);
         #undef G
+        /* validate_cfg makes exactly this check, and used to be the only one --
+         * but it runs AFTER load_meta returns, one line too late to stop the
+         * is_attn writes below. A container whose config.json said 4 layers and
+         * whose meta said 8 therefore wrote past a 4-byte allocation before
+         * anything refused it: ASan heap-buffer-overflow at the layer_types
+         * loop, reached from an ordinary model directory. Refuse here, while
+         * is_attn is still the only thing that has been sized. */
+        CFG_NEED(c->n_layers == is_attn_len,
+                 "config.json says %d layers, qwen36_meta.json says %d",
+                 is_attn_len, c->n_layers);
         if((v=json_get(r,"partial_rotary_factor"))&&v->t==J_NUM) c->partial_rotary_factor=(float)v->num;
         if((v=json_get(r,"rope_theta"))&&v->t==J_NUM) c->theta=(float)v->num;
         if((v=json_get(r,"rms_eps"))&&v->t==J_NUM) c->eps=(float)v->num;
@@ -2606,7 +2619,13 @@ int main(int argc, char **argv) {
         if (getenv("ENC_DEBUG") && np <= 300) { fprintf(stderr, "[enc] prompt ids: "); for (int i=0;i<np;i++) fprintf(stderr, "%d ", prompt[i]); fprintf(stderr, "\n"); }
     }
 
-    Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; model_init(&m, snap, cap, bits);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());

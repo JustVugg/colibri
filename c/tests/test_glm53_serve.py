@@ -36,8 +36,11 @@ def reuse_reported():
 
 
 def engine(binary, fixture, extra=None):
+    # GLM53_VERBOSE: il riuso del prefisso si racconta solo su richiesta,
+    # perche' `coli chat` eredita lo stderr del server e quella riga finirebbe
+    # a schermo dopo ogni risposta.
     environment = {**os.environ, "SERVE": "1", "SERVE_BATCH": "1",
-                   "SNAP": str(fixture), "GLM53_BITS": "32"}
+                   "SNAP": str(fixture), "GLM53_BITS": "32", "GLM53_VERBOSE": "1"}
     environment.update(extra or {})
     # stderr in un file: il riuso del prefisso si racconta li', perche' nel
     # protocollo una riga in piu' farebbe cadere il gateway (di proposito).

@@ -2531,8 +2531,13 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * righe che non conosce, ma questo progetto ha scelto il contrario apposta
      * e lo mette per iscritto in un test: una riga sconosciuta uccide il
      * dispatcher, cosi' un motore non puo' parlare a un server che non lo
-     * capisce. La regola vera e' quella del test, non quella del documento. */
-    fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
+     * capisce. La regola vera e' quella del test, non quella del documento.
+     *
+     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
+     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
+     * occhi di chi voleva solo la risposta. */
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,

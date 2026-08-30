@@ -126,6 +126,32 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | Dell Pro Max GB10 (DGX Spark: Grace, **aarch64 i8mm/sve2**) · Linux · 121 GB unified LPDDR5x · GB10 sm_121 ([#136](https://github.com/JustVugg/colibri/issues/136), [#161](https://github.com/JustVugg/colibri/issues/161)) | **5.58 GB/s** O_DIRECT | int8 MTP head · warm cache | 0.50 tok/s warm · **2.4 tok/s full-k8**, **3.33 tok/s** with `CACHE_ROUTE` (#199) |
 | Intel i5-13600K (14C/20T, avx-vnni) · native Linux · 62 GB · Samsung 980 PRO PCIe 4.0 (NTFS/ntfs3) · RTX 5070 Ti ([#605](https://github.com/JustVugg/colibri/issues/605)) | **5.90 GB/s** O_DIRECT | MTP off · `PIN=auto PIN_GB=20 DIRECT=1 PIPE=1 --ram 50 --cap 32 --topp 0.7` · 750 VRAM + 307 RAM pinned (5.8 GB) | **0.98 tok/s** (peak 1.07) · hit 54.7% (pin 37.9 + lru 16.7) · 360 experts/token · RSS 42.0 GB — up from 0.56 tok/s / hit 45.4% untuned |
 | **6 × RTX 5090 · dual Xeon Silver 4510 · 251 GB** (author's rig, [experiment log](experiments/glm52-6x5090-2026-07-12.md)) | NVMe | `CUDA_EXPERT_GB=auto PIN_GB=all` full residency · `COLI_CUDA_PIPE=2 TC_W4A16` · DRAFT=0 | **5.8–6.8 tok/s** decode · TTFT ~13 s · hit 89–100% |
+| Apple M5 Max (6P+12E) · macOS 26.5 · 128 GB unified · internal SSD · **Metal** ([#387](https://github.com/JustVugg/colibri/issues/387)) | macOS figures cache-influenced (caveat #86) | `MTP=0 CAP_RAISE=0 AUTOPIN=0 --ram 90 --cap 1` | **0.4 → 2.0 tok/s at identical output** — two additive levers, no routing substitution, no expert pruning |
+| Ryzen 9 5950X (16C/32T, Zen 3, AVX2 only) · Ubuntu 26.04 · 62.7 GB · Samsung 990 PRO Gen4 · RX 7900 XTX, ROCm 7.2.4 ([#680](https://github.com/JustVugg/colibri/issues/680)) | 4.88 GB/s buffered · **5.87 GB/s** O_DIRECT | CPU-tuned | **0.77 tok/s** — the HIP expert tier underperformed the AVX2 CPU on this box |
+| Ryzen AI 365 · native Windows · 32 GB DDR5-5600 · NVMe · **Vulkan** ([#999](https://github.com/JustVugg/colibri/issues/999)) | 3.32 GB/s buffered · **1.53 GB/s** O_DIRECT | `COLI_VULKAN=1 COLI_VK_DENSE=1 COLI_VK_ATTN=1` · `PIN_GB=0` | **0.19–0.24 tok/s** |
+| Apple M1 Max (8P+2E, 32-core GPU) · macOS 26.6 · 64 GB unified · internal 2 TB SSD · **Metal** ([#1030](https://github.com/JustVugg/colibri/issues/1030)) | 4.4 GB/s (engine probe) | Metal on, settings-tuned | **0.13 → 0.61 tok/s from settings alone** · Metal 2.5× over CPU · **a larger `--ram` was consistently slower** |
+| Ryzen 7 5800X (8C/16T, Zen 3) · Ubuntu 22.04 · 32 GB DDR4-3200 · Samsung 980 PRO ([#1070](https://github.com/JustVugg/colibri/issues/1070)) | 10.02 GB/s buffered · **2.50 GB/s** O_DIRECT | **DeepSeek V4 Flash** · `--ram 22` | **0.93 tok/s** · hit 52.5% · TTFT 16.9 s |
+| Ryzen 7 9850X3D (8C/16T) · native Windows 11 · 64 GB DDR5 · WD_Black SN8100 · RTX 5090 sm_120 ([#1091](https://github.com/JustVugg/colibri/issues/1091)) | up to **10.64 GB/s** | `COLI_CUDA=1 CUDA_DENSE=1 CUDA_EXPERT_GB=auto PIN_GB=20 DIRECT=1` | **0.89 tok/s median** |
+| Ryzen 9 5950X (16C/32T, Zen 3, **AVX2 only**) · Linux · 62.7 GB ([#1119](https://github.com/JustVugg/colibri/issues/1119)) | ~2.7 GB/s O_DIRECT | **DeepSeek V4 Flash** · CPU-only | **1.24 tok/s** — no I/O flag and no +40% expert cache moved it, which points at the AVX2 kernels rather than storage |
+| EPYC 7282 (16C, Zen 2 AVX2) · Ubuntu 24.04 · **128 GB** DDR4-3200 8-channel · 2× Micron 3400 RAID 0 ([#1154](https://github.com/JustVugg/colibri/issues/1154)) | — | **DeepSeek V4 Flash** · `COLI_TEMP=0`, 128 tokens | **0.68 cold / 0.69 warm tok/s** · RSS 123.8 GB · load 30 s |
+| Ryzen 7 4800H · Linux · 64 GB · NVMe ([#1173](https://github.com/JustVugg/colibri/issues/1173)) | 1.65 GB/s buffered · **1.37 GB/s** O_DIRECT | **DeepSeek V4 Flash** · rotating prompts, n=4 | **0.47 tok/s** (ondemand, 2.9 GHz cap) → **0.60 tok/s** (performance governor) · hit 81% · CPU 56.8 → 92.4 °C |
+| i9-14900K (24C/32T) · native Windows 11 · 128 GB DDR5 · Samsung 990 Pro, SN850P partial mirror · RTX 3090 24 GB ([#1183](https://github.com/JustVugg/colibri/issues/1183)) | — | GLM-5.2 int4 · CUDA expert tier | **0.71 tok/s median** — the 24 GB VRAM point on the curve |
+| Apple M4 Max (16C, 40-core GPU) · macOS · 128 GB unified · **XPG MARS 980 Gen5 over Thunderbolt 5** ([#1210](https://github.com/JustVugg/colibri/issues/1210)) | — (TB5 enclosure) | `COLI_METAL=1 DIRECT=1 MTP=0 PIPE_WORKERS=8` · `PIN_GB=90` | 0.88 tok/s at `--ram 90` → **1.06–1.17 tok/s** pinned · hit 68–73% · RSS 96.7 GB |
+| Threadripper PRO 7965WX (24C/48T, Zen 4 avx512-vnni) · Linux · 123 GB · **two NVMe on independent controllers** (990 PRO 4 TB + 9100) ([#1249](https://github.com/JustVugg/colibri/issues/1249)) | 6.70 / 8.05 GB/s single-drive O_DIRECT | `DIRECT=1`, CPU-only (RTX 5090 present, not engaged) | one drive **0.80** → both **1.10 tok/s**, **+37.5%** · with `DIRECT=0` the same split is worth only +16% · expert wait 98.9 → 55.5 s |
+
+### Two datapoints that are not rows
+
+**16 GB is below the floor for the large models** ([#923](https://github.com/JustVugg/colibri/issues/923)):
+an i5-12450H with 16 GB DDR5 and a DRAM-less QLC drive builds and passes the
+self-test on native Windows, but there is no decode number to report, because a
+cold token needs ~11 GB of expert reads and the RAM cap leaves almost nothing
+resident. On machines this size, run OLMoE or Qwen3.6 rather than GLM-5.2: the
+M3 row above is 16 GB unified and reaches 3.69–4.18 tok/s on OLMoE.
+
+**Vulkan beat ROCm/HIP on RDNA4** ([#523](https://github.com/JustVugg/colibri/issues/523)):
+on an RX 9070 XT, Vulkan measured 19–24% faster than the HIP path. The first
+version of that comparison was confounded and the reporter corrected it
+themselves, which is why the number is worth carrying: it is the corrected one.
 
 ### Takeaways
 
@@ -150,6 +176,22 @@ bandwidth from **42.42 to 58.26/65.89 GB/s** and greedy decode from **7.66 to
 9.02/9.17 tok/s** (64 tokens, `TEMP=0 DRAFT=0`, byte-identical output). Do not
 blanket-interleave a GPU host: it also spreads DMA staging pages and has measured
 up to a 10× regression; generated plans enable only the selective slab policy.
+
+Three lessons from the 2026-08 datapoints. **A second drive on an independent
+controller is real bandwidth**: the Threadripper pair measured +37.5% from
+adding one, and the gain more than doubles under `DIRECT=1`, because buffered
+reads spend the second controller's bandwidth refilling a page cache the engine
+does not need ([#1249](https://github.com/JustVugg/colibri/issues/1249)). That is
+the README's multi-SSD hypothesis measured rather than assumed. **On AVX2-only
+CPUs the kernels bind before the disk does**: the Zen 3 DeepSeek V4 Flash run
+did not move for any I/O flag or for 40% more expert cache
+([#1119](https://github.com/JustVugg/colibri/issues/1119)), which is the
+opposite of the small-RAM machines above and says the AVX-512 kernels are where
+that box's speed is. And **settings are worth more than hardware on Apple
+Silicon**: the M5 Max went 0.4 → 2.0 and the M1 Max 0.13 → 0.61 at identical
+output, with a *larger* `--ram` measuring consistently slower on the M1
+([#387](https://github.com/JustVugg/colibri/issues/387),
+[#1030](https://github.com/JustVugg/colibri/issues/1030)).
 
 ## Quality benchmark
 

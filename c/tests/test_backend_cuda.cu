@@ -375,7 +375,7 @@ int main(int argc, char **argv) {
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */
-    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], async4[64], tensor4[64];
+    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], async4[64], tensor4[64], pinned4[64];
     for(int i=0;i<(int)sizeof(w4);i++){
         int lo=((i%15)-7)&15,hi=(((i*3)%15)-7)&15;
         w4[i]=(uint8_t)(lo|(hi<<4));
@@ -400,12 +400,26 @@ int main(int argc, char **argv) {
     setenv("COLI_CUDA_TC_MIN_ROWS","1",1);
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,tensor4,gx4)||
        !relative_rms(tensor4,scalar4,64,0.30f))return 1;
+    if(!coli_cuda_expert_group_pinned(gg4,ug4,dg4,group_rows,2,pinned4,gx4,1)||
+       std::memcmp(pinned4,scalar4,sizeof(pinned4))){
+        std::fprintf(stderr,"pinned CUDA group did not bypass W4A4 Tensor Cores\n");
+        return 1;
+    }
     unsetenv("COLI_CUDA_TC_INT4");
     unsetenv("COLI_CUDA_TC_MIN_ROWS");
+    setenv("COLI_CUDA_TC_W4A16","1",1);
+    setenv("COLI_CUDA_TC_W4A16_MIN","1",1);
+    if(!coli_cuda_expert_group_pinned(gg4,ug4,dg4,group_rows,2,pinned4,gx4,1)||
+       std::memcmp(pinned4,scalar4,sizeof(pinned4))){
+        std::fprintf(stderr,"pinned CUDA group did not bypass W4A16 Tensor Cores\n");
+        return 1;
+    }
+    unsetenv("COLI_CUDA_TC_W4A16");
+    unsetenv("COLI_CUDA_TC_W4A16_MIN");
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    if(group_calls!=4||group_experts!=8||group_total_rows!=8) return 1;
+    if(group_calls!=6||group_experts!=12||group_total_rows!=12) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {

@@ -7,27 +7,21 @@ Works from cmd.exe, PowerShell, Git Bash, or MSYS2 — no `rm` or POSIX
 import glob
 import os
 import shutil
-import sys
-
-C_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if C_DIR not in sys.path:                   # `python tools/clean.py` puts tools/ first
-    sys.path.insert(0, C_DIR)
-from family_registry import all_families
-
-# The engines are DERIVED, not listed. family_registry is what the release job
-# already trusts to decide which engines an archive must contain (release.yml,
-# "Verify the packaged archive actually runs"), so deriving from it makes one
-# fact true by construction: nothing can be published that clean does not own.
-#
-# The hand-written list had qwen36 missing. `make clean` therefore left the old
-# qwen36 binary in place, and the release Package step copies whatever sits at
-# c/qwen36 without asking where it came from -- so a locally staged release
-# could ship an engine that was never rebuilt. CI never saw it (fresh runners);
-# a maintainer packaging on their own machine would have.
-ENGINES = sorted({family.engine_artifact for family in all_families()})
 
 # Files (relative to c/) to remove if present.
-FILES = [name for engine in ENGINES for name in (engine, engine + ".exe")] + [
+FILES = [
+    "colibri", "colibri.exe",
+    "inkling", "inkling.exe",
+    "kimi_k3", "kimi_k3.exe",
+    "olmoe", "olmoe.exe",
+    # Missing here means `make clean` leaves the binary in place, and a rebuild
+    # with different EXTRA_CFLAGS then reports "up to date". That is how the
+    # `Qwen3.6 tiny oracle` job re-ran an UN-INSTRUMENTED binary from its ASan
+    # step for as long as it existed (#1262), reporting green while the
+    # sanitizer had never run. test_family_registry keeps this list and the
+    # registry in step.
+    "qwen36", "qwen36.exe",
+    "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o",
@@ -91,8 +85,8 @@ def clean():
     return removed
 
 
-# Guarded, so that reading FILES (which tests/test_clean_ownership.py does, to
-# check it against the release registry) cannot delete the build products the
+# Guarded, so that reading FILES -- which tests/test_clean_ownership.py does, to
+# check it against the release registry -- cannot delete the build products the
 # rest of the suite is running against. Importing this module must be inert.
 if __name__ == "__main__":
     print(f"clean: removed {clean()} files/dirs")

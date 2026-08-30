@@ -16061,7 +16061,8 @@ static inline __m256 v4_fp8_decode8(__m256i codes) {
         _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
         _mm256_slli_epi32(man, 20));
     __m256 nval = _mm256_castsi256_ps(nbits);
-    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(ldexpf(1.0f, -9)));
+    float man_factor = 1.0f / (float)(1 << 9);
+    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(man_factor));
     __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
     __m256i sbits = _mm256_or_si256(
         _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
