@@ -1001,6 +1001,12 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                 /* Same pinning as matmul_i4_grouped in quant.h: contraction
                  * here is the compiler's choice, so the result was too. */
                 ag=fmaf(hsum256(accg),scg,ag); au=fmaf(hsum256(accu),scu,au);
+#elif defined(__SSE4_1__)
+                if(!(base&1)){
+                    float dg,du;
+                    dot_i4f_sse41_pair(wg+(base>>1),wu2+(base>>1),xs+base,glen,&dg,&du);
+                    ag+=dg*scg; au+=du*scu; i=base+glen;
+                }
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];

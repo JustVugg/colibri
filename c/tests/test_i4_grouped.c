@@ -99,7 +99,7 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
  *  - Correctness, always: both outputs must match the double reference within
  *    the same magnitude-relative epsilon as the unfused kernel.
  *  - Bit-exactness, only when I % gs == 0: then every group is covered by the
- *    AVX2 body, whose accumulation order is identical to the unfused kernel, so
+ *    same SIMD or scalar body in both kernels, so
  *    the results agree to the last bit. This is the shape the real g64
  *    checkpoints have (I = 2048 / 6144, gs = 64), i.e. the production path.
  *
@@ -143,8 +143,8 @@ static int check_pair(const char *name, int S, int I, int O, int gs){
         }
         if(yg[i]!=rg[i]||yu[i]!=ru[i]) exact=0;
     }
-    /* Aligned shapes run entirely through the AVX2 body: same order as unfused,
-     * so bit-exactness is a real invariant there and worth asserting. */
+    /* Aligned shapes use the same accumulation order as the unfused kernel, so
+     * bit-exactness is a real invariant there and worth asserting. */
     if(I%gs==0 && !exact){
         fprintf(stderr,"%s: FAIL fused != unfused bitwise on an ALIGNED shape "
                        "(no scalar tail runs here; the orders must match)\n",name);

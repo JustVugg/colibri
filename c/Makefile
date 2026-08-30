@@ -464,7 +464,7 @@ endif
 TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
-# unconditional rules and therefore remain portable gates. The three forced
+# unconditional rules and therefore remain portable gates. The four forced
 # SSE4.1 tests use -msse4.1/-mno-avx2/-mno-fma, which only exist as gcc/clang
 # flags on x86 -- unconditionally in TEST_BINS they take down `check` on
 # arm64 (e.g. macOS): "unsupported option '-msse4.1' for target arm64-...".
@@ -473,14 +473,15 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 \
+	test_i4_grouped_sse41
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifneq (,$(X86_64))
 TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
-	tests/test_olmoe_dot_i8_16_sse41$(EXE)
+	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_i4_grouped_sse41$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
@@ -1224,8 +1225,12 @@ tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< -o $@ $(LDFLAGS)
+
+# Force the grouped-int4 oracle onto the SSE4.1 tier even on an AVX2 host.
+tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
 
 tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

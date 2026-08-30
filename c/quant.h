@@ -15,8 +15,75 @@
 #endif
 
 /* ---- SIMD includes -------------------------------------------------------- */
-#ifdef __AVX2__
+#if defined(__AVX2__) || defined(__SSE4_1__)
 #include <immintrin.h>
+#endif
+#if defined(__SSE4_1__)
+#include "sse41_kernels.h"
+
+/* Exact-activation W4A32 dot for x86 CPUs below AVX2. Packed weights use
+ * offset nibbles: 0 means -8 and 15 means +7. */
+static inline float dot_i4f_sse41(const uint8_t *w,const float *x,int I){
+    const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8);
+    __m128 a0=_mm_setzero_ps(),a1=_mm_setzero_ps(); int i=0;
+    for(;i+16<=I;i+=16){
+        __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i q=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);
+        a0=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i),
+                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(q)),a0);
+        a1=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+4),
+                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(q,4))),a1);
+        a0=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+8),
+                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(q,8))),a0);
+        a1=COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+12),
+                       _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(q,12))),a1);
+    }
+    float sum=colibri_sse41_hsum_ps(_mm_add_ps(a0,a1));
+    for(;i+1<I;i+=2){ uint8_t b=w[i>>1];
+        sum+=x[i]*(float)((int)(b&15)-8)+x[i+1]*(float)((int)(b>>4)-8); }
+    if(i<I) sum+=x[i]*(float)((int)(w[i>>1]&15)-8);
+    return sum;
+}
+
+/* Gate and up share the same activation row. Keep both projections in flight
+ * so the SSE4.1 path loads that row once. */
+static inline void dot_i4f_sse41_pair(const uint8_t *wg,const uint8_t *wu,
+                                      const float *x,int I,float *g,float *u){
+    const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8);
+    __m128 g0=_mm_setzero_ps(),g1=_mm_setzero_ps();
+    __m128 u0=_mm_setzero_ps(),u1=_mm_setzero_ps(); int i=0;
+    for(;i+16<=I;i+=16){
+        __m128 x0=colibri_sse41_loadu_ps(x+i), x1=colibri_sse41_loadu_ps(x+i+4);
+        __m128 x2=colibri_sse41_loadu_ps(x+i+8), x3=colibri_sse41_loadu_ps(x+i+12);
+        __m128i bg=_mm_loadl_epi64((const __m128i*)(wg+(i>>1)));
+        __m128i lg=_mm_and_si128(bg,m4), hg=_mm_and_si128(_mm_srli_epi16(bg,4),m4);
+        __m128i qg=_mm_sub_epi8(_mm_unpacklo_epi8(lg,hg),b8);
+        g0=COLIBRI_FMA(x0,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(qg)),g0);
+        g1=COLIBRI_FMA(x1,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qg,4))),g1);
+        g0=COLIBRI_FMA(x2,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qg,8))),g0);
+        g1=COLIBRI_FMA(x3,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qg,12))),g1);
+        __m128i bu=_mm_loadl_epi64((const __m128i*)(wu+(i>>1)));
+        __m128i lu=_mm_and_si128(bu,m4), hu=_mm_and_si128(_mm_srli_epi16(bu,4),m4);
+        __m128i qu=_mm_sub_epi8(_mm_unpacklo_epi8(lu,hu),b8);
+        u0=COLIBRI_FMA(x0,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(qu)),u0);
+        u1=COLIBRI_FMA(x1,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qu,4))),u1);
+        u0=COLIBRI_FMA(x2,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qu,8))),u0);
+        u1=COLIBRI_FMA(x3,_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(qu,12))),u1);
+    }
+    float ag=colibri_sse41_hsum_ps(_mm_add_ps(g0,g1));
+    float au=colibri_sse41_hsum_ps(_mm_add_ps(u0,u1));
+    for(;i+1<I;i+=2){ uint8_t bg=wg[i>>1],bu=wu[i>>1];
+        ag+=x[i]*(float)((int)(bg&15)-8)+x[i+1]*(float)((int)(bg>>4)-8);
+        au+=x[i]*(float)((int)(bu&15)-8)+x[i+1]*(float)((int)(bu>>4)-8); }
+    if(i<I){
+        ag+=x[i]*(float)((int)(wg[i>>1]&15)-8);
+        au+=x[i]*(float)((int)(wu[i>>1]&15)-8);
+    }
+    *g=ag; *u=au;
+}
+#endif
+#ifdef __AVX2__
 static inline float hsum256(__m256 v){
     __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
     lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
@@ -196,6 +263,13 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                  * the glm_tiny token oracle, depend on build flags rather than
                  * on the code. */
                 a=fmaf(hsum256(acc),sc,a);
+#elif defined(__SSE4_1__)
+                /* Group starts must be nibble-aligned before the packed row
+                 * can be passed as an independent SSE4.1 dot product. */
+                if(!(base&1)){
+                    a+=dot_i4f_sse41(w+(base>>1),xs+base,glen)*sc;
+                    i=base+glen;
+                }
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];
