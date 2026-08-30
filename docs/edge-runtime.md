@@ -19,7 +19,7 @@ adapters and keep their existing initialization and inference paths.
 External consumers can build the complete CPU-baseline runtime with
 `make -C c segment-edge-library`. The resulting
 `c/build/segment/libcolibri_segment_edge.a` contains both public runtimes and
-all six built-in adapters. Consumers link it after their own objects and call
+all seven built-in adapters. Consumers link it after their own objects and call
 the explicit registration functions below; ordinary Colibri executables do
 not link this archive.
 
@@ -59,6 +59,7 @@ Colibri model family:
 | Kimi K3 | hidden plus all AttnRes blocks | tokenizer, final transforms and head; embedding rows stream on demand |
 | OLMoE | hidden state | tokenizer, embedding, final norm and head |
 | Qwen3.6 | hidden state | tokenizer, embedding, final norm and head |
+| Qwen3.8-Flash-Next | four-stream hyper state | tokenizer, native BF16 embedding, final hyper mixer and native BF16 head |
 | DeepSeek V4 | expanded mHC state | tokenizer and small final mHC tensors; BF16 embedding rows and head tiles stream on demand |
 
 Every adapter currently advertises CPU only. Accelerator flags will be added
@@ -82,13 +83,16 @@ its own reproducible RNG policy without duplicating any of the six heads.
 
 The runtime validates structure sizes, activation geometry, batch limits,
 output capacities and cancellation before entering an adapter. Model adapters
-also validate token IDs and checkpoint boundary tensors. Errors are returned
-to the caller; the network layer decides whether to retry, migrate or fall back
-locally.
+also validate token IDs and checkpoint boundary tensors. Operational and
+compatibility errors are returned to the caller; the network layer decides
+whether to retry, migrate or fall back locally. Checkpoint discovery still uses
+the engines' shared fail-closed safetensors/config loaders: a malformed or
+hostile model directory is a process-fatal deployment error, as it is for the
+standalone engines, rather than a recoverable request error.
 
 ## All-family release gate
 
-`make -C c edge-adapters` verifies that all six real adapters coexist in one
+`make -C c edge-adapters` verifies that all seven real adapters coexist in one
 runtime. `edge-adapters-real` is the stronger gate: for every family it loads
 the real Edge adapter and a full real Segment range, round-trips text, embeds
 an independent oracle prompt, performs prefill plus decode and compares three
@@ -122,6 +126,9 @@ python3 tools/make_edge_tiny_tokenizer.py qwen36_edge_src --vocab-size 320
 python3 tools/convert_qwen36.py --model qwen36_edge_src \
   --out qwen36_edge_i8 --ebits 8 --no-readme
 
+python3 tools/make_qwen38_tiny.py --out qwen38_tiny
+python3 tools/make_edge_tiny_tokenizer.py qwen38_tiny --vocab-size 64
+
 python3 tools/make_deepseek_v4_tiny.py --output deepseek_v4_edge_tiny --force
 python3 tools/make_edge_tiny_tokenizer.py deepseek_v4_edge_tiny --vocab-size 128
 ```
@@ -139,6 +146,8 @@ make -C c edge-adapters-real \
   OLMOE_EDGE_REF=olmoe_tiny_src/ref_olmoe.json \
   QWEN_EDGE_MODEL=qwen36_edge_i8 \
   QWEN_EDGE_REF=qwen36_edge_src/ref_qwen36.json \
+  QWEN38_EDGE_MODEL=qwen38_tiny \
+  QWEN38_EDGE_REF=qwen38_tiny/ref.json \
   DEEPSEEK_EDGE_MODEL=deepseek_v4_edge_tiny \
   DEEPSEEK_EDGE_REF=deepseek_v4_edge_tiny/ref.json
 ```

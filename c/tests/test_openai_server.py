@@ -21,7 +21,8 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
-                           render_chat_v4, _dsv4_tool_calls, serve, split_thinking_reply,
+                           render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
+                           split_thinking_reply,
                            stop_policy, tune_child_env)
 
 
@@ -84,6 +85,45 @@ class TemplateTest(unittest.TestCase):
             render_chat([{"role": "user", "content": "Hi"}], True, "high"),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
         )
+
+    def test_qwen38_defaults_to_xhigh_instruction_and_thinking(self):
+        prompt = render_chat_qwen38([{"role": "user", "content": "Hi"}])
+        self.assertEqual(
+            prompt,
+            "<|im_start|>system\n"
+            "Reasoning effort is set to xhigh. Please think carefully through the task, "
+            "validate key assumptions, consider plausible alternatives, and prioritize "
+            "correctness, consistency, and clarity in the final answer."
+            "<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n",
+        )
+
+    def test_qwen38_reasoning_efforts_and_disabled_thinking(self):
+        medium = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                    reasoning_effort="medium")
+        self.assertEqual(medium,
+                         "<|im_start|>user\nHi<|im_end|>\n"
+                         "<|im_start|>assistant\n<think>\n")
+        low = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                  reasoning_effort="low")
+        self.assertIn("Reasoning effort is set to low.", low)
+        high = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                   reasoning_effort="high")
+        self.assertIn("Reasoning effort is set to xhigh.", high)
+        disabled = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                      enable_thinking=False)
+        self.assertEqual(disabled,
+                         "<|im_start|>user\nHi<|im_end|>\n"
+                         "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+    def test_qwen38_rejects_tools_and_non_text_content(self):
+        with self.assertRaisesRegex(APIError, "qwen38 engine"):
+            render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                               tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "text message content only"):
+            render_chat_qwen38([{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "x"}}
+            ]}])
 
     def test_kimi_payload_preserves_utf8_lengths_and_turns(self):
         prompt = render_chat_kimi([
@@ -1074,6 +1114,12 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("inkling", 7, profiled), 7)
         self.assertEqual(cap_for_arch("inkling", None,
                                       {"COLI_PROFILE_CAP": "invalid"}), 8)
+        planned = {"COLI_PLAN_CAP": "11"}
+        self.assertEqual(cap_for_arch("qwen38", None, planned), 11)
+        self.assertEqual(cap_for_arch(
+            "qwen38", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
+        self.assertEqual(cap_for_arch(
+            "qwen38", 5, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 5)
 
     def test_engine_consumes_profile_cap_without_leaking_private_env(self):
         process = FakeProcess(lambda _process, _frame: None)
@@ -1088,12 +1134,26 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertNotIn("COLI_PROFILE_CAP", child_env)
         self.assertEqual(child_env["KEEP"], "yes")
 
+    def test_engine_consumes_planned_cap_without_leaking_private_env(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        model = self._model("qwen4_exp_text")
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine("qwen38", model,
+                            env={"COLI_PLAN_CAP": "13", "KEEP": "yes"})
+            engine.close()
+        self.assertEqual(popen.call_args[0][0], ["qwen38", "13"])
+        child_env = popen.call_args[1]["env"]
+        self.assertNotIn("COLI_PLAN_CAP", child_env)
+        self.assertEqual(child_env["KEEP"], "yes")
+
     def test_model_arch_reads_model_type(self):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
+        self.assertEqual(model_arch(self._model("qwen4_exp")), "qwen38")
+        self.assertEqual(model_arch(self._model("qwen4_exp_text")), "qwen38")
         with self.assertRaisesRegex(ValueError, "cannot read config.json"):
             model_arch("/nonexistent")
 

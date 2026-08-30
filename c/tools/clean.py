@@ -21,6 +21,7 @@ FILES = [
     # sanitizer had never run. test_family_registry keeps this list and the
     # registry in step.
     "qwen36", "qwen36.exe",
+    "qwen38", "qwen38.exe",
     "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",

@@ -55,6 +55,7 @@ exposing the server beyond the machine.
 | DeepSeek V4 | yes | yes | native DSML tool-call blocks |
 | Inkling | no | no | active tool declarations/choices return HTTP 400 |
 | Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
+| Qwen3.8-Flash-Next | no | no | active tool declarations/choices return HTTP 400 |
 | OLMoE | no | no | active tool declarations/choices return HTTP 400 |
 
 On supported engines, pass OpenAI `tools` and optionally `tool_choice` to
@@ -121,7 +122,7 @@ sequence (`message_start` → `content_block_*` → `message_delta` → `message
 plus protocol `ping` keepalives during long prefills), `stop_reason`, Anthropic
 `usage` field names, and `x-api-key` authentication (`Authorization: Bearer`
 also works). The gateway renders each request with the active engine's native
-chat template; GLM, Inkling, Kimi K3, OLMoE, and DeepSeek V4 prompts are not
+chat template; GLM, Inkling, Kimi K3, Qwen3.8, OLMoE, and DeepSeek V4 prompts are not
 interchangeable. Where the engine exposes a reasoning mode, extended thinking
 is enabled with `{"thinking": {"type": "enabled"}}` and translated to that
 architecture's reasoning protocol; OLMoE disables it explicitly.

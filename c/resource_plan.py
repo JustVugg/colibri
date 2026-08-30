@@ -11,7 +11,9 @@ import sys
 import threading
 from pathlib import Path
 
-from family_registry import expert_contributions, planner_geometry, resolve_model
+from family_registry import (expert_contributions, planner_geometry,
+                             fixed_resident_contribution, resident_contribution,
+                             resolve_model)
 
 
 GB = 1_000_000_000
@@ -23,7 +25,7 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 1
+_ANALYSIS_CACHE_VERSION = 7
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -67,7 +69,10 @@ def _tensor_sizes(path):
         start, end = meta["data_offsets"]
         if not 0 <= start <= end <= file_size - 8 - length:
             raise ValueError(f"invalid tensor offsets for {name}: {path}")
-        yield name, end - start
+        dtype = meta.get("dtype")
+        if not isinstance(dtype, str):
+            raise ValueError(f"invalid tensor dtype for {name}: {path}")
+        yield name, end - start, dtype
 
 
 def analyze_model(model):
@@ -110,6 +115,10 @@ def analyze_model(model):
         pass  # missing/corrupt/unreadable cache -> recompute
 
     dense_bytes = 0
+    # Model-owned allocations that are retained once, independently of the
+    # number of per-layer cache slots. Qwen3.8's native FP8 path uses this for
+    # its normalized scale bank; fallback accounting remains conservative.
+    expert_fixed_bytes = 0
     expert_groups = {}
     tensor_names = set()
     for shard in shards:
@@ -125,20 +134,31 @@ def analyze_model(model):
             # storage, all of them is the mount.
             raise OSError(error.errno,
                           f"{error.strerror or error}: {shard}") from error
-        for name, size in sizes:
+        for name, size, dtype in sizes:
             tensor_names.add(name)
-            contributions = expert_contributions(resolved, name, size)
+            contributions = expert_contributions(resolved, name, size, dtype)
             if contributions:
                 for layer, expert, byte_count in contributions:
                     key = (layer, expert)
                     expert_groups[key] = expert_groups.get(key, 0) + byte_count
             else:
-                dense_bytes += size
+                fixed_bytes = fixed_resident_contribution(
+                    resolved, name, size, dtype)
+                if fixed_bytes:
+                    expert_fixed_bytes += fixed_bytes
+                else:
+                    dense_bytes += resident_contribution(
+                        resolved, name, size, dtype)
 
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
         layer_sizes.setdefault(layer, []).append(size)
-    per_layer = {layer: int(statistics.median(sizes)) for layer, sizes in layer_sizes.items()}
+    # Most families ship uniform experts and retain the historical median to
+    # tolerate container padding. Qwen3.8 explicitly accepts heterogeneous
+    # source dtypes; one LRU slot may hold any expert, so each layer must be
+    # priced at its largest retained representation just like the C runtime.
+    reducer = max if resolved.descriptor.id == "qwen38" else statistics.median
+    per_layer = {layer: int(reducer(sizes)) for layer, sizes in layer_sizes.items()}
     per_cap_bytes = sum(per_layer.values())
     typical_expert_bytes = int(statistics.median(per_layer.values())) if per_layer else 0
     max_expert_bytes = max(per_layer.values(), default=0)
@@ -170,6 +190,7 @@ def analyze_model(model):
         # serve a rispondere "ci sta?", non "quanto pesa il file".
         "dense_bytes": _dense_in_ram(resolved.descriptor, dense_bytes),
         "dense_disk_bytes": dense_bytes,
+        "expert_fixed_bytes": expert_fixed_bytes,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -871,6 +892,18 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
+    if not resolved.descriptor.supports_accelerator:
+        if gpu_indices:
+            raise ValueError(
+                f"{resolved.descriptor.display_name} currently supports CPU only; "
+                "GPU selection is unavailable")
+        if vram_gb > 0:
+            raise ValueError(
+                f"{resolved.descriptor.display_name} currently supports CPU only; "
+                "a VRAM budget is unavailable")
+        # Do not let unrelated GPUs distort unified-memory/RAM/cache planning
+        # for an engine that cannot execute any part of this model on them.
+        gpus = []
     geometry = planner_geometry(resolved, context)
     if (isinstance(kv_slots, bool) or not isinstance(kv_slots, int) or
             not 1 <= kv_slots <= resolved.descriptor.limits.max_kv_slots):
@@ -898,7 +931,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     max_expert = info["max_expert_bytes"] or typical
     kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
     kv_buffer = geometry.workspace_bytes
-    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert + kv_bytes + kv_buffer)
+    # expert_fixed_bytes is retained once per model (currently Qwen3.8's
+    # normalized FP8 scale bank), unlike per_cap_bytes which is paid for
+    # every cache slot. Include it in the resident runtime reservation so the
+    # selected capacity cannot overrun the model's actual allocation.
+    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert +
+                        info["expert_fixed_bytes"] + kv_bytes + kv_buffer)
     per_cap = info["per_cap_bytes"]
     configured_experts = geometry.configured_experts
 
@@ -1020,6 +1058,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
                     "runtime_bytes": runtime_bytes,
+                    "expert_fixed_bytes": info["expert_fixed_bytes"],
                     "sequence_state_bytes": geometry.context_state_bytes,
                     "fixed_state_bytes": geometry.fixed_state_bytes,
                     "workspace_bytes": geometry.workspace_bytes,
@@ -1034,8 +1073,10 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "projected_hit_rate": round(projected_hit, 4),
         "tune": tune,
         "next_actions": actions,
-        "decisions": [
-            {"target": "VRAM", "reason": "profile-ranked hot experts"},
+        # Un motore solo-CPU non ha un tier VRAM: annunciarlo comunque fa
+        # scrivere al piano una riga che nessuno puo' eseguire.
+        "decisions": ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
+                      if resolved.descriptor.supports_accelerator else []) + [
             {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
             {"target": "Disk", "reason": "immutable recovery source for cold experts"},
         ],
@@ -1075,6 +1116,25 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
+    planned_cap = ram.get("cache_slots_per_layer")
+    if (plan.get("model", {}).get("family_id") == "qwen38" and
+            (not isinstance(planned_cap, int) or
+             isinstance(planned_cap, bool) or planned_cap < 1)):
+        raise ValueError(
+            "Qwen3.8 RAM budget cannot hold one expert slot per loaded layer")
+    if plan.get("model", {}).get("family_id") == "qwen38":
+        disabled = [name for name in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16")
+                    if result.get(name) == "0"]
+        if disabled:
+            raise ValueError(
+                "Qwen3.8 auto-tier requires native expert storage; unset " +
+                ", ".join(disabled) +
+                " or disable auto-tier and choose an explicit cache cap")
+    if (isinstance(planned_cap, int) and not isinstance(planned_cap, bool) and
+            planned_cap >= 1):
+        # Private bridge for engines whose expert capacity is an argv value.
+        # The gateway consumes and removes it before starting the engine.
+        result.setdefault("COLI_PLAN_CAP", str(planned_cap))
 
     vram = plan["tiers"]["vram"]
     # Report every device, but only name the placement-qualified ones to the

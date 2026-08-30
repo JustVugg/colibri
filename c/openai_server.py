@@ -557,7 +557,7 @@ def _tool_hold():
 
 
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
-               # kimi | olmoe | qwen36 | deepseek_v4)
+               # kimi | olmoe | qwen36 | qwen38 | deepseek_v4)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -1201,6 +1201,80 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Text-only Qwen3.8 chat-template subset with native reasoning hints."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the qwen38 engine yet.",
+                       "tools", "unsupported_parameter")
+
+    instruction = ""
+    if enable_thinking:
+        effort = reasoning_effort or "xhigh"
+        if effort == "high":
+            effort = "xhigh"
+        elif effort == "minimal":
+            effort = "low"
+        if effort not in ("xhigh", "medium", "low"):
+            raise APIError(400, "Qwen3.8 reasoning_effort must be high, xhigh, medium, or low.",
+                           "reasoning_effort")
+        if effort == "xhigh":
+            instruction = ("Reasoning effort is set to xhigh. Please think carefully through "
+                           "the task, validate key assumptions, consider plausible "
+                           "alternatives, and prioritize correctness, consistency, and "
+                           "clarity in the final answer.")
+        elif effort == "low":
+            instruction = ("Reasoning effort is set to low. Keep your thinking brief and "
+                           "focused, moving directly to the conclusion without unnecessary "
+                           "elaboration.")
+
+    parts = []
+    first = messages[0]
+    first_role = first.get("role") if isinstance(first, dict) else None
+    if first_role == "developer":
+        first_role = "system"
+    if first_role == "system":
+        raw = first.get("content")
+        text = content_text(raw, "messages.0.content").strip() if raw is not None else ""
+        if instruction:
+            text = instruction + ("\n\n" + text if text else "")
+        parts.append(f"<|im_start|>system\n{text}<|im_end|>\n")
+        start = 1
+    elif instruction:
+        parts.append(f"<|im_start|>system\n{instruction}<|im_end|>\n")
+        start = 0
+    else:
+        start = 0
+
+    for index, message in enumerate(messages[start:], start=start):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if role == "system" and index != 0:
+            raise APIError(400, "System message must be at the beginning.",
+                           f"messages.{index}.role")
+        raw = message.get("content")
+        text = (content_text(raw, f"messages.{index}.content").strip()
+                if raw is not None else "")
+        if role == "assistant":
+            reasoning = message.get("reasoning_content", "")
+            if not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            text = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
+        parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+
+    parts.append("<|im_start|>assistant\n")
+    parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -1609,6 +1683,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     renderer = (render_chat_glm53 if ARCH == "glm53" else
                 render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
+                render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
@@ -2209,6 +2284,12 @@ def cap_for_arch(arch, cap, env=None):
             measured = 0
         if measured >= 1:
             return measured
+        try:
+            planned = int(env.get("COLI_PLAN_CAP", ""))
+        except (TypeError, ValueError):
+            planned = 0
+        if planned >= 1:
+            return planned
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -2344,12 +2425,14 @@ class Engine:
             family = (resolve_model(model).descriptor if config.exists()
                       else family_by_id(ARCH))
         arch = family.id
+        self.family = family
         self.model_dir = str(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
         resolved_cap = cap_for_arch(arch, cap, child_env)
         child_env.pop("COLI_PROFILE_CAP", None)
+        child_env.pop("COLI_PLAN_CAP", None)
         self.process = subprocess.Popen(
             [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
@@ -3567,9 +3650,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # COLI_THINK=1 makes thinking the default when the client sends NEITHER reasoning_effort
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
-        if (reasoning_effort is None and "enable_thinking" not in body
-                and os.environ.get("COLI_THINK", "0") == "1"):
-            reasoning_effort = "high"
+        if reasoning_effort is None and "enable_thinking" not in body:
+            # Qwen3.8's official template defaults to enabled xhigh thinking;
+            # preserve the older opt-in default for the other families.
+            if ARCH == "qwen38":
+                reasoning_effort = "xhigh"
+            elif os.environ.get("COLI_THINK", "0") == "1":
+                reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
@@ -3619,8 +3706,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if thinking is not None and not isinstance(thinking, dict):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
-        if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
-            enable_thinking = True
+        if not enable_thinking and thinking is None:
+            if ARCH == "qwen38":
+                enable_thinking = True
+            elif os.environ.get("COLI_THINK", "0") == "1":
+                enable_thinking = True
         if ARCH == "olmoe":
             enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
@@ -3635,8 +3725,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
+        default_effort = "xhigh" if ARCH == "qwen38" and thinking is None else "high"
         prompt = render_chat_for_arch(messages, enable_thinking,
-                                      "high" if enable_thinking else None,
+                                      default_effort if enable_thinking else None,
                                       tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 

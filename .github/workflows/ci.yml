@@ -181,16 +181,16 @@ jobs:
             mingw-w64-ucrt-x86_64-binutils
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
-      # "Every engine" was four of five. deepseek-v4's only CI is the Linux
-      # v4-tiny job in check.yml, so the MSYS2 build of that engine had no job
-      # anywhere -- the release tag compiled it on Windows for the first time.
+      # Keep the portable sibling list aligned with release packaging. DeepSeek
+      # V4 remains conditional because its amalgamated target is unsupported on
+      # one platform in this matrix.
       # The hyphenated target is appended rather than folded into the loop
       # because it must not run on macos.
       - name: Build every engine
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -440,6 +440,50 @@ jobs:
           grep -q "config.json says 4 layers" bad.log || {
             echo "FAIL: refused, but not for the reason under test"; cat bad.log; exit 1; }
           echo "refused as expected:"; grep '^\[cfg\]' bad.log
+
+  qwen38-tiny-check:
+    name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-qwen38-tiny.txt
+      - name: Install pinned Qwen4-Exp oracle dependencies
+        run: pip install -r c/tools/requirements-qwen38-tiny.txt
+      - name: Generate the upstream text fixture and run the token-and-logit oracle
+        run: make -C c qwen38-tiny-check
+      - name: Repeat the eviction path under ASan and UBSan
+        run: |
+          cd c
+          make -B qwen38 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            OMP_NUM_THREADS=2 SNAP=./qwen38_tiny \
+            ./qwen38 1 8 ./qwen38_tiny/ref.json > qwen38-san.log 2>&1
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log; then
+            cat qwen38-san.log
+            exit 1
+          fi
+          grep -q "Matching tokens: 8/8" qwen38-san.log
+      - name: Refuse config and tensor-shape disagreement
+        run: |
+          cd c
+          cp -r qwen38_tiny qwen38_tiny_bad
+          python3 - <<'PY'
+          import json
+          path = "qwen38_tiny_bad/config.json"
+          config = json.load(open(path, encoding="utf-8"))
+          config["hc_count"] = 5
+          json.dump(config, open(path, "w", encoding="utf-8"))
+          PY
+          if SNAP=./qwen38_tiny_bad ./qwen38 1 8 ./qwen38_tiny/ref.json > qwen38-bad.log 2>&1; then
+            echo "FAIL: malformed Qwen3.8 container was accepted"
+            cat qwen38-bad.log
+            exit 1
+          fi
+          grep -qE "elements, expected|gated residual dimensions" qwen38-bad.log
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)

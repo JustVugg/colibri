@@ -251,6 +251,21 @@ class PersistentDatapointTest(unittest.TestCase):
         self.assertEqual(engine.asserted_slot, 0)
         self.assertEqual(result["profile"]["expert_disk_s"], 1.25)
 
+    def test_qwen38_reconstructs_decode_intervals_not_token_count(self):
+        class QwenEngine:
+            family = SimpleNamespace(id="qwen38")
+            profile_seq = 0
+            profile = []
+
+            def generate(self, *_args, **_kwargs):
+                return {"completion_tokens": 3, "tokens_per_second": 4.0,
+                        "prompt_tokens": 1}
+
+        self.assertEqual(
+            datapoint._measure_persistent_request(QwenEngine(), "prompt", 3)["gen_s"],
+            0.5,
+        )
+
     def test_sister_engines_use_physical_cores_without_overriding_user_value(self):
         family = SimpleNamespace(id="qwen36")
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -311,9 +326,53 @@ class PersistentDatapointTest(unittest.TestCase):
         self.assertIn("4 built-in prompts, fixed rotation", report)
 
     def test_every_registered_family_has_the_shared_persistent_adapter(self):
-        expected = {"glm", "inkling", "kimi", "olmoe", "qwen36", "deepseek_v4"}
+        expected = {"glm", "inkling", "kimi", "olmoe", "qwen36", "qwen38",
+                    "deepseek_v4"}
         self.assertTrue(expected.issubset({family.id for family in FAMILIES}))
         self.assertTrue(all(family.has_gateway_adapter for family in FAMILIES))
+
+
+class FreshDatapointTest(unittest.TestCase):
+    def test_qwen38_receives_a_temporary_prompt_file_and_exact_generation_cap(self):
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            prompt_path = Path(command[3])
+            observed["command"] = command
+            observed["prompt"] = prompt_path.read_text(encoding="utf-8")
+            observed["path"] = prompt_path
+            observed["env"] = kwargs["env"]
+            self.assertIsNone(kwargs["input"])
+            return subprocess.CompletedProcess(
+                command, 0, stdout="",
+                stderr=("resident weights loaded in 1.5s | RSS after load: 19.0 GB\n"
+                        "Speed: 2.00 tok/s (3.5s for 7 tokens)\n"),
+            )
+
+        with mock.patch.object(datapoint.subprocess, "run", side_effect=fake_run):
+            rows = datapoint.run_fresh_engine(
+                "/tmp/qwen38", "/model", "multilingual: caffè 世界",
+                max_new=7, runs=1, cap=3, bits=8)
+
+        self.assertEqual(observed["command"][:3], ["/tmp/qwen38", "3", "8"])
+        self.assertEqual(observed["prompt"], "multilingual: caffè 世界")
+        self.assertEqual(observed["env"]["N_NEW"], "7")
+        self.assertFalse(observed["path"].exists())
+        self.assertEqual(rows[0]["tokens"], 7)
+        self.assertEqual(rows[0]["rss"], 19.0)
+        self.assertEqual(rows[0]["gen_s"], 3.5)
+
+    def test_qwen38_fresh_measurement_refuses_a_failed_engine(self):
+        failed = subprocess.CompletedProcess(
+            ["/tmp/qwen38"], 2, stdout="",
+            stderr="resident weights loaded in 1.5s | RSS after load: 19.0 GB\nboom\n",
+        )
+        with mock.patch.object(datapoint.subprocess, "run", return_value=failed), \
+             self.assertRaisesRegex(SystemExit, "status 2"):
+            datapoint.run_fresh_engine(
+                "/tmp/qwen38", "/model", "hello", max_new=7,
+                runs=1, cap=3, bits=8,
+            )
 
 
 class EvictCacheSpaceTest(unittest.TestCase):

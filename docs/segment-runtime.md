@@ -16,7 +16,7 @@ The ABI is deliberately separate from every model's internal structs:
   activations through `coli_segment_run`, and can stream snapshots for
   migration or recovery.
 
-All six model families have engine-owned CPU adapters, but no ordinary CLI or
+All seven model families have engine-owned CPU adapters, but no ordinary CLI or
 server links or registers them. A Segment host opts in by linking the dedicated
 adapter objects and calling the explicit registration functions. Existing
 standalone initialization and inference therefore remain unchanged.
@@ -55,7 +55,7 @@ residency when this bit is absent.
 ## Real adapters
 
 `c/segment_adapters.h` exposes explicit registration for GLM-5.2, Inkling,
-Kimi K3, OLMoE, Qwen3.6 and DeepSeek V4. The adapters retain model weights in
+Kimi K3, OLMoE, Qwen3.6, Qwen3.8-Flash-Next and DeepSeek V4. The adapters retain model weights in
 the engine and conversation state in isolated sessions:
 
 | Adapter | Boundary/state contract |
@@ -65,14 +65,15 @@ the engine and conversation state in isolated sessions:
 | Kimi K3 | hidden plus every AttnRes block residual; KDA, conv, MLA and DSA |
 | OLMoE | hidden activations and conventional KV |
 | Qwen3.6 | hidden activations; attention KV, DeltaNet recurrent and conv state |
+| Qwen3.8-Flash-Next | four-stream hyper-residual activations; QSA KV/indexer, GDN recurrent/conv and PLE hash history |
 | DeepSeek V4 | expanded `hc_mult * hidden` mHC state; window/compressed attention, compressor and indexer |
 
 The current adapter build advertises CPU only. This is intentional capability
 truthfulness, not a limitation of the ABI: GPU flags will be added per engine
 only when the corresponding Colibri backend is executed by the adapter.
-`make -C c segment-adapters` builds all six together and verifies that their
+`make -C c segment-adapters` builds all seven together and verifies that their
 identities register in one runtime. They are never pulled into `colibri`,
-`inkling`, `kimi_k3`, `olmoe`, `qwen36` or `deepseek_v4` by that target.
+`inkling`, `kimi_k3`, `olmoe`, `qwen36`, `qwen38` or `deepseek_v4` by that target.
 
 ## Run contract
 
@@ -84,6 +85,10 @@ sizes and context bounds before calling the adapter.
 Positions and model-specific ordering rules remain adapter-owned. A failed or
 cancelled run must not be reported as committed by the distributed caller.
 Network-level idempotency and duplicate request handling belong above this ABI.
+Cancellation is cooperative, not asynchronous: an adapter may check only at a
+model-safe boundary, and Qwen3.8 currently checks before entering a complete
+Segment run. Callers that need prompt-time interruption should terminate or
+migrate the worker and retry from the last published snapshot.
 
 ## Snapshot contract
 
@@ -96,7 +101,7 @@ restore.
 ## All-family conformance gate
 
 `tests/test_segment_conformance` keeps the ABI universal independently of
-model files. It registers six deterministic, stateful fixtures matching all
+model files. It registers seven deterministic, stateful fixtures matching all
 families in `family_registry.py`:
 
 | Family | Remote state represented by the fixture |
@@ -106,6 +111,7 @@ families in `family_registry.py`:
 | Kimi K3 | MLA, KDA recurrent state, convolution windows and AttnRes |
 | OLMoE | conventional key/value cache |
 | Qwen3.6 | attention KV, DeltaNet recurrent state and convolution ring |
+| Qwen3.8-Flash-Next | four-stream hyper-residual boundary, QSA/indexer KV, GDN recurrence and PLE history |
 | DeepSeek V4 | mHC, window/compressed attention, compressor and indexer |
 
 Every fixture must pass the same checks for half-open range identity, exact
@@ -119,7 +125,7 @@ they are not model math and are never registered by a shipping executable. A
 model is ready for distributed Segment execution only after its real adapter
 passes these lifecycle checks against the repository's generated tiny oracle
 and the existing token/numerical oracle for that engine. The public Lumabri
-release gate is all-or-nothing across all six families: a passing synthetic
+release gate is all-or-nothing across all seven families: a passing synthetic
 fixture alone must never be advertised as model support.
 
 `tests/segment_conformance_manifest.json` binds this matrix to the authoritative
@@ -133,7 +139,7 @@ transactional. Tiny checkpoints come from the existing GLM, Inkling, Kimi,
 Qwen and DeepSeek generators plus `tools/make_olmoe_tiny.py`; Qwen and OLMoE
 are passed through their production Colibri converters before the test.
 
-Run the complete gate with the six generated container paths:
+Run the complete gate with the seven generated container paths:
 
 ```sh
 make -C c segment-adapters-real \
@@ -142,5 +148,6 @@ make -C c segment-adapters-real \
   KIMI_SEGMENT_MODEL=/path/to/kimi_k3_tiny \
   OLMOE_SEGMENT_MODEL=/path/to/olmoe_merged_tiny \
   QWEN_SEGMENT_MODEL=/path/to/qwen36_converted_tiny \
+  QWEN38_SEGMENT_MODEL=/path/to/qwen38_tiny \
   DEEPSEEK_SEGMENT_MODEL=/path/to/deepseek_v4_tiny
 ```

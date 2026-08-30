@@ -60,7 +60,7 @@
 #define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
 
 /* engines that write this format; the table exists so a mismatch names both sides */
-static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", NULL };
+static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", "qwen38", NULL };
 
 static uint32_t rt_hash(const char *s){        /* FNV-1a 32, stable across builds */
     uint32_t h = 2166136261u;
@@ -115,6 +115,18 @@ static uint32_t  *rt_counts(int layer){
     return (rt_c && layer >= 0 && layer <= rt_nl) ? rt_c[layer] : NULL;
 }
 static int rt_tracing(void){ return rt_fp != NULL; }
+
+/* Long-lived Segment hosts already own model-specific teardown, while the
+ * standalone engines historically relied on process exit.  New engines can
+ * use this explicit cleanup so sanitizer runs also cover a complete lifecycle. */
+static void rt_destroy(void){
+    if(rt_fp){ fclose(rt_fp); rt_fp = NULL; }
+    if(rt_c){
+        for(int i = 0; i <= rt_nl; i++) free(rt_c[i]);
+        free(rt_c);
+    }
+    rt_c = NULL; rt_nl = -1; rt_ne = 0; rt_id = 0; rt_engine = ""; rt_call = 0;
+}
 
 /* Release a layer's counter row, so rt_counts(layer) is NULL for a layer that does not
  * route. rt_init cannot know which those are — an engine learns its own sparsity while it
@@ -392,9 +404,10 @@ static int rt_save(const char *path, int quiet){
  * colibri.c has carried this guard as a private router_best_or_fallback() since
  * that test was written. inkling.c, kimi_k3.c and olmoe.c never received it --
  * the recurring shape of defects in this tree, a fix that lands in one engine
- * and not its siblings. It lives here now because route_trace.h is the one
- * header all four engines already include, and because "which expert did we
- * pick" is exactly what this file is about.
+ * and not its siblings. It lives here now because route_trace.h was the one
+ * header all four original engines already included (newer integrated engines
+ * inherit it too), and because "which expert did we pick" is exactly what this
+ * file is about.
  *
  * Degrading deterministically (to kk, the slot's own index) keeps the selection
  * reproducible and in range; the warning fires once so a poisoned tile is

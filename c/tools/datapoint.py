@@ -47,6 +47,10 @@ LOAD_RE = re.compile(
 TUNE_RE = re.compile(r"TUNE decode:\s*(\d+)\s*tokens in\s*([\d.]+)s", re.IGNORECASE)
 FIRST_RE = re.compile(r"time_to_first_token=([\d.]+)s", re.IGNORECASE)
 V4_TOKENS_RE = re.compile(r"v4_tokens.*?generated=(\d+)", re.IGNORECASE)
+QWEN38_SPEED_RE = re.compile(
+    r"Speed:\s*[\d.]+\s*tok/s\s*\(([\d.]+)s\s+for\s+(\d+)\s+tokens\)",
+    re.IGNORECASE,
+)
 RAM_RE = re.compile(r"(?:projected=|dense=resident\(|available=)([\d.]+)G[iI]?B", re.IGNORECASE)
 IOBENCH_RE = re.compile(r"-> ([\d.]+) GB/s")
 
@@ -287,7 +291,9 @@ def _measure_persistent_request(engine, prompt, max_new):
     # The engine's own decode rate is authoritative.  This reconstructed
     # duration is useful for a compact table and avoids conflating prefill with
     # decode when the request wall includes both.
-    gen_s = tok_count / tok_s if tok_count > 0 and tok_s > 0 else 0.0
+    family_id = getattr(getattr(engine, "family", None), "id", None)
+    rate_tokens = max(tok_count - 1, 0) if family_id == "qwen38" else tok_count
+    gen_s = rate_tokens / tok_s if rate_tokens > 0 and tok_s > 0 else 0.0
     ttft_s = ((first_text_at[0] - start) if first_text_at[0] is not None else wall)
 
     # Some engines emit PROF immediately before DONE, while DeepSeek V4 emits
@@ -419,8 +425,10 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
     engine_name = os.path.basename(engine).lower()
 
     for i in range(runs):
-        env = dict(os.environ, CHAT="1", COLI_TEMP="0", MAX_NEW=str(max_new), SNAP=snap)
+        env = dict(os.environ, CHAT="1", COLI_TEMP="0", MAX_NEW=str(max_new),
+                   N_NEW=str(max_new), SNAP=snap)
         t0 = time.monotonic()
+        prompt_path = None
 
         # Support modern engines and CLI wrappers
         # Exact basename check so 'colibri' isn't misclassified as 'coli-wrapper'
@@ -431,21 +439,49 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
             mem_str = str(int(memory_gb)) if memory_gb is not None else "32"
             cmd = [engine, snap, prompt, "--max-tokens", str(max_new), "--memory-gb", mem_str]
             stdin_input = None
+        elif engine_name in ("qwen38", "qwen38.exe"):
+            # Qwen3.8's direct CLI takes a prompt filename at argv[3]; stdin is
+            # reserved for its persistent SERVE protocol.  Close the temporary
+            # file before launch so this path also works on Windows.
+            handle = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".txt", delete=False)
+            try:
+                handle.write(prompt)
+                prompt_path = handle.name
+            finally:
+                handle.close()
+            cmd = [engine, str(cap), str(bits), prompt_path]
+            stdin_input = None
         else:
             # Legacy positional engines (olmoe, inkling, colibri)
             cmd = [engine, str(cap), str(bits)]
             stdin_input = prompt + "\n"
 
-        proc = subprocess.run(cmd, input=stdin_input, capture_output=True, text=True, env=env)
+        try:
+            proc = subprocess.run(cmd, input=stdin_input, capture_output=True,
+                                  text=True, env=env)
+        finally:
+            if prompt_path:
+                try:
+                    os.unlink(prompt_path)
+                except FileNotFoundError:
+                    pass
         wall = time.monotonic() - t0
         output = proc.stdout + "\n" + proc.stderr
+        if proc.returncode:
+            sys.exit(
+                f"engine exited with status {proc.returncode}:\n{output[-400:]}"
+            )
 
         # 1. Try standard load & RSS regex
         m = LOAD_RE.search(output)
         if m:
             load_s, rss = float(m.group(1)), float(m.group(2))
-            gen_s = wall - load_s
-            tok_count = max_new
+            speed = QWEN38_SPEED_RE.search(output) if engine_name in ("qwen38", "qwen38.exe") else None
+            if engine_name in ("qwen38", "qwen38.exe") and not speed:
+                sys.exit(f"could not parse Qwen3.8 generation count/speed:\n{output[-400:]}")
+            gen_s = float(speed.group(1)) if speed else wall - load_s
+            tok_count = int(speed.group(2)) if speed else max_new
         else:
             # 2. Fallback parser for engines like deepseek_v4 that output TUNE decode / timing lines
             m_tune = TUNE_RE.search(output)

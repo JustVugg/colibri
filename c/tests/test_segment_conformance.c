@@ -5,7 +5,7 @@
 
 static int expected_family(const char *family_id) {
     static const char *const expected[] = {
-        "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "deepseek_v4",
+        "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "qwen38", "deepseek_v4",
     };
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++)
         if (strcmp(expected[i], family_id) == 0) return 1;
@@ -13,7 +13,7 @@ static int expected_family(const char *family_id) {
 }
 
 int main(void) {
-    const size_t required_families = 7;
+    const size_t required_families = 8;
     size_t count = coli_segment_conformance_fixture_count();
     if (count != required_families) {
         fprintf(stderr, "segment conformance requires %zu families, found %zu\n",
@@ -39,6 +39,17 @@ int main(void) {
             !fixture->tiny_generator || !*fixture->tiny_generator) {
             fprintf(stderr, "incomplete Segment fixture at index %zu\n", i);
             return 1;
+        }
+        if (!strcmp(fixture->family_id, "qwen38")) {
+            const uint32_t qwen38_state = COLI_SEGMENT_FIXTURE_HYPER_RESIDUAL |
+                COLI_SEGMENT_FIXTURE_SPARSE_ATTN |
+                COLI_SEGMENT_FIXTURE_RECURRENT |
+                COLI_SEGMENT_FIXTURE_CONVOLUTION |
+                COLI_SEGMENT_FIXTURE_PLE;
+            if ((fixture->state_kinds & qwen38_state) != qwen38_state) {
+                fprintf(stderr, "Qwen3.8 fixture omits required state topology\n");
+                return 1;
+            }
         }
         for (size_t j = 0; j < i; j++) {
             const ColiSegmentConformanceFixture *previous =
@@ -73,7 +84,10 @@ int main(void) {
         COLI_SEGMENT_FIXTURE_ATTN_RESIDUAL |
         COLI_SEGMENT_FIXTURE_MHC |
         COLI_SEGMENT_FIXTURE_COMPRESSOR |
-        COLI_SEGMENT_FIXTURE_DEVICE_CACHE;
+        COLI_SEGMENT_FIXTURE_DEVICE_CACHE |
+        COLI_SEGMENT_FIXTURE_HYPER_RESIDUAL |
+        COLI_SEGMENT_FIXTURE_SPARSE_ATTN |
+        COLI_SEGMENT_FIXTURE_PLE;
     if ((covered_state & required_state) != required_state) {
         fprintf(stderr, "Segment state-topology matrix is incomplete\n");
         return 1;

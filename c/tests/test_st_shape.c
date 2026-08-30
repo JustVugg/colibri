@@ -24,22 +24,29 @@
 
 typedef struct {
     const char *shape;
+    const char *offsets;
     int accept;
     int rank;
     int64_t numel;
     int data_bytes;
+    const char *error_field;
 } shape_case;
 
 static const shape_case CASES[] = {
-    {"[2,\"3\"]", 0, 0, 0, 0},
-    {"[2,3.5]", 0, 0, 0, 0},
-    {"[2,-1]", 0, 0, 0, 0},
-    {"[9223372036854775807,2]", 0, 0, 0, 0},
-    {"[4611686018427387904,3]", 0, 0, 0, 0},
-    {"[1,1,1,1,1,1,1,1]", 1, 8, 1, 1},
-    {"[1,1,1,1,1,1,1,1,1]", 0, 0, 0, 0},
-    {"[]", 1, 0, 1, 1},
-    {"[0,4096]", 1, 2, 0, 0},
+    {"[2,\"3\"]", "[0,0]", 0, 0, 0, 0, "shape"},
+    {"[2,3.5]", "[0,0]", 0, 0, 0, 0, "shape"},
+    {"[2,-1]", "[0,0]", 0, 0, 0, 0, "shape"},
+    {"[9223372036854775807,2]", "[0,0]", 0, 0, 0, 0, "shape"},
+    {"[4611686018427387904,3]", "[0,0]", 0, 0, 0, 0, "shape"},
+    {"[1,1,1,1,1,1,1,1]", "[0,1]", 1, 8, 1, 1, NULL},
+    {"[1,1,1,1,1,1,1,1,1]", "[0,0]", 0, 0, 0, 0, "shape"},
+    {"[]", "[0,1]", 1, 0, 1, 1, NULL},
+    {"[0,4096]", "[0,0]", 1, 2, 0, 0, NULL},
+    {"[1]", "[null,1]", 0, 0, 0, 0, "data_offsets"},
+    {"[1]", "[0.5,1]", 0, 0, 0, 0, "data_offsets"},
+    {"[1]", "[-1,0]", 0, 0, 0, 0, "data_offsets"},
+    {"[1]", "[0,1e999]", 0, 0, 0, 0, "data_offsets"},
+    {"[1]", "[0,9223372036854775808]", 0, 0, 0, 0, "data_offsets"},
 };
 
 static int write_case(const char *dir, const shape_case *test) {
@@ -48,8 +55,8 @@ static int write_case(const char *dir, const shape_case *test) {
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
     int header_bytes = snprintf(
         header, sizeof(header),
-        "{\"t\":{\"dtype\":\"U8\",\"shape\":%s,\"data_offsets\":[0,%d]}}",
-        test->shape, test->data_bytes);
+        "{\"t\":{\"dtype\":\"U8\",\"shape\":%s,\"data_offsets\":%s}}",
+        test->shape, test->offsets);
     if (header_bytes < 0 || (size_t)header_bytes >= sizeof(header)) return -1;
 
     FILE *file = fopen(path, "wb");
@@ -82,6 +89,7 @@ static int child_case(int index, const char *dir) {
     }
     for (int i = tensor->rank; i < ST_MAX_RANK; i++)
         if (tensor->shape[i] != 0) return 94;
+    st_destroy(&S);
     return 0;
 }
 
@@ -147,7 +155,7 @@ int main(int argc, char **argv) {
         } else {
             CHECK(code == 1);
             CHECK(strstr(error, "tensor 't'") != NULL);
-            CHECK(strstr(error, "shape") != NULL);
+            CHECK(strstr(error, CASES[i].error_field) != NULL);
         }
     }
 

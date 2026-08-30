@@ -6,11 +6,13 @@ the header both are implemented in. Background and design discussion in
 
 ## Why one header
 
-colibrì is four engines — `colibri.c` (GLM-5.2), `kimi_k3.c`, `inkling.c`, `olmoe.c` —
-and the learning cache described in [tuning.md](tuning.md) is only as good as the history
-it reads. Before `route_trace.h`, that history was per-engine: `colibri.c` wrote sparse
-text, `inkling.c` wrote a dense binary block with an `IKU1` magic, and the other two wrote
-nothing at all, so `PIN=auto` had nothing to read on them. Both writers defaulted to the
+Six of colibrì's seven engines use this header: `colibri.c` (GLM-5.2),
+`kimi_k3.c`, `inkling.c`, `olmoe.c`, `deepseek_v4.c`, and `qwen38.c`.
+Qwen3.6 is the one existing exception. The learning cache described in
+[tuning.md](tuning.md) is only as good as the history it reads. Before
+`route_trace.h`, that history was per-engine: `colibri.c` wrote sparse text,
+`inkling.c` wrote a dense binary block with an `IKU1` magic, and the other
+engines wrote nothing at all, so `PIN=auto` had nothing to read on them. Both writers defaulted to the
 same filename, so a model directory shared between two engines ended up with one history
 in a format the other refuses.
 
@@ -19,8 +21,8 @@ in a format the other refuses.
 knows its layer index, the expert ids it selected and their gates, and that is the entire
 input. `compat.h` is not optional and not incidental: on Windows the CRT `rename()` fails
 when the destination exists, so without its shim the history stops updating after the first
-write, silently. Any engine, present or future, gets the history and the trace stream from a
-handful of calls — `kimi_k3.c` needs five.
+write, silently. An engine gets the history and the trace stream from a handful
+of calls — `qwen38.c` needs the same route calls as the other integrated MoE engines.
 
 ## The history file (`.coli_usage`, `stats.txt`, `PIN=<file>`)
 

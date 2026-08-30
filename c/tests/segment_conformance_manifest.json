@@ -89,6 +89,13 @@
       "real_adapter_required": true
     },
     {
+      "family_id": "qwen38",
+      "state_schema": "fixture/qwen38-hyper-qsa-ple-v1",
+      "state_components": ["hyper_residual", "deltanet_recurrent", "convolution_ring", "attention_kv", "sparse_indexer", "ple_hash_history"],
+      "oracle": {"kind": "generated_tiny", "path": "tools/make_qwen38_tiny.py"},
+      "real_adapter_required": true
+    },
+    {
       "family_id": "deepseek_v4",
       "state_schema": "fixture/dsv4-mhc-compressed-v1",
       "state_components": [

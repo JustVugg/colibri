@@ -23,7 +23,7 @@
           },
           {
             "group": "Model engines",
-            "pages": ["deepseek-v4", "kimi_k3", "qwen36", "inkling"]
+            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling"]
           },
           {
             "group": "Configure and tune",

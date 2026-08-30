@@ -43,7 +43,7 @@ TUNABLE_KEYS = frozenset({
 })
 
 GIB = 1024 ** 3
-CAP_ARCHES = frozenset({"glm", "inkling", "olmoe", "qwen36"})
+CAP_ARCHES = frozenset({"glm", "inkling", "olmoe", "qwen36", "qwen38"})
 
 
 def _config_path(profile_dir: str | None, fingerprint: str) -> Path:

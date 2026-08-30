@@ -55,17 +55,15 @@ jobs:
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
 
-      # Every engine, not just GLM. Until now the archives shipped `colibri` alone,
-      # so a user who downloaded a release and pointed it at Kimi K3 or Inkling found
-      # no engine at all (#720) -- while the README's front page promises four model
-      # families. CI (engines-all-platforms) proves all four build on this matrix.
+      # Every portable sibling engine, not just GLM. CI's all-platform engine
+      # matrix proves the same list builds before these archives are assembled.
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38; do
             make $t ${{ matrix.make_args }}
           done
-          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
@@ -125,6 +123,7 @@ jobs:
           # a "qwen36" binary next to coli. Unconditional: the engine is portable C
           # with no platform gate, so every archive can carry it.
           cp c/qwen36${{ matrix.ext }} dist/qwen36${{ matrix.ext }}
+          cp c/qwen38${{ matrix.ext }} dist/qwen38${{ matrix.ext }}
           # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
           # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
           # the macos-arm64 archive has no such engine to ship (#858).
@@ -178,7 +177,7 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          SIBLINGS="inkling kimi_k3 olmoe qwen36"
+          SIBLINGS="inkling kimi_k3 olmoe qwen36 qwen38"
           # deepseek_v4 only where the engine builds (COLI_V4_SUPPORTED); asserting it
           # unconditionally would fail the macos-arm64 archive for shipping an engine
           # that platform cannot have.

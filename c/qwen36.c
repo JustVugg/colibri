@@ -1278,6 +1278,64 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->g4 = s->u4 = s->d4 = NULL;   /* packed int4 (allocated on int4 load if GPU int4 active) */
 }
 
+
+/* Unpack packed signed-int4 experts to int8. Two nibbles per byte; LOW nibble is
+ * element 2k, HIGH is 2k+1, each signed 4-bit two's complement. Must stay in step
+ * with pack_int4 in c/tools/convert_qwen36.py.
+ *
+ * This is the hottest thing on this engine's CPU decode path. Every expert cache
+ * miss unpacks a whole expert -- 3*inter*hidden = 6.29M values on
+ * Qwen3.6-35B-A3B -- and a fit of decode time against miss count put ~60% of
+ * decode inside it.
+ *
+ * The loop this replaces was indexed by ELEMENT, so it reloaded raw[i>>1], did an
+ * i&1 select and took a branch for every value. Walking BYTES and sign-extending
+ * by shifting removes the branch. Vectorising then needs an INTERLEAVING store,
+ * which is why no compiler gets there from the scalar form: the two nibble
+ * streams are consecutive in the output, so it needs vst2q on NEON or
+ * unpacklo/unpackhi on AVX2 rather than a strided store. Checking the
+ * disassembly after the branchless rewrite confirmed zero vector registers.
+ *
+ * Sign extension is branchless in both paths. In vectors the signed value of a
+ * nibble n is (n ^ 8) - 8; the scalar tail gets the same result more cheaply by
+ * casting the nibble into the top four bits and arithmetic-shifting back down.
+ *
+ * Integer throughout, so unlike a float reduction this is bit-exact by
+ * construction rather than by tolerance -- verified identical to the original
+ * branching form over all 256 byte values, at every length around a vector
+ * boundary, and on a full-size 6.29M-value random expert, on AVX2 and NEON. */
+static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
+{
+    int64_t nb = n / 2, b = 0;                  /* n is 3*inter*hidden, always even */
+#if defined(__AVX2__)
+    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi8(8);
+    for (; b + 16 <= nb; b += 16) {
+        __m128i by = _mm_loadu_si128((const __m128i *)(raw + b));
+        __m128i lo = _mm_and_si128(by, m4);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);   /* 16-bit shift: mask after */
+        lo = _mm_sub_epi8(_mm_xor_si128(lo, e8), e8);
+        hi = _mm_sub_epi8(_mm_xor_si128(hi, e8), e8);
+        _mm_storeu_si128((__m128i *)(out + 2 * b),      _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(out + 2 * b + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t e8 = vdupq_n_s8(8);
+    for (; b + 16 <= nb; b += 16) {
+        uint8x16_t by = vld1q_u8(raw + b);
+        int8x16x2_t z;
+        z.val[0] = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vandq_u8(by, m4)), e8), e8);
+        z.val[1] = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), e8), e8);
+        vst2q_s8(out + 2 * b, z);               /* the interleaved store is the trick */
+    }
+#endif
+    for (; b < nb; b++) {                       /* tail, and the whole loop if scalar */
+        uint8_t byte = raw[b];
+        out[2 * b]     = (int8_t)(byte << 4) >> 4;
+        out[2 * b + 1] = (int8_t)(byte & 0xF0) >> 4;
+    }
+}
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     int la = m->active_of[layer];   /* container stores experts under active index */
@@ -1306,12 +1364,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
-        for (int64_t i = 0; i < want_w; i++) {
-            uint8_t byte = raw[i >> 1];
-            int8_t v = (int8_t)((i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF));
-            if (v & 8) v -= 16;                 /* sign-extend signed 4-bit */
-            s->g[i] = v;
-        }
+        unpack_int4_to_int8(s->g, raw, want_w);
         s->is_int4 = 1;
         /* Free any previous occupant first (LRU slot reuse). */
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
