@@ -63,6 +63,8 @@ const zhCN: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "给 colibrì 发消息…",
   "chat.inputHint": "回车发送 · Shift+回车换行",
+  "chat.attachImage": "添加图片",
+  "chat.removeImage": "移除图片",
   "chat.stop": "停止生成",
   "chat.send": "发送消息",
 

@@ -26,6 +26,21 @@ _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
 _ANALYSIS_CACHE_VERSION = 1
 
 
+def _dense_in_ram(descriptor, on_disk_bytes):
+    """I byte che i pesi densi occuperanno, non quelli che occupano sul disco.
+
+    Coincidono per chi li carica come stanno; una famiglia che li riquantizza
+    al caricamento lo dichiara nel registro. Un errore qui non e' cosmetico:
+    e' la differenza fra dire a qualcuno che il modello ci sta e dirgli di no."""
+    ratio = getattr(descriptor, "dense_load_ratio", None)
+    if ratio is None:
+        return on_disk_bytes
+    try:
+        return max(0, int(ratio(on_disk_bytes)))
+    except Exception:
+        return on_disk_bytes
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()
@@ -150,7 +165,11 @@ def analyze_model(model):
         "path": str(model),
         "shards": len(shards),
         "model_bytes": model_bytes,
-        "dense_bytes": dense_bytes,
+        # Come pesano DAVVERO in RAM: un motore che riquantizza al caricamento
+        # ne occupa meno di quanto ne occupino sul disco, e il pianificatore
+        # serve a rispondere "ci sta?", non "quanto pesa il file".
+        "dense_bytes": _dense_in_ram(resolved.descriptor, dense_bytes),
+        "dense_disk_bytes": dense_bytes,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -788,6 +807,53 @@ def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_meta
     return tune
 
 
+def _next_actions(bottleneck_class, projected_hit, probe_state, probe_gbs,
+                  planning_gpus):
+    """Turn the capacity diagnosis into bounded, evidence-producing work.
+
+    These are deliberately not more automatic knobs.  The planner may spend
+    measured capacity, but it must not invent bandwidth or claim that a larger
+    tier will improve end-to-end decode without a run on this machine.
+    """
+    actions = []
+    if bottleneck_class == "disk":
+        if probe_gbs is None:
+            actions.append({
+                "id": "measure-storage",
+                "priority": "required",
+                "reason": "cold experts remain on disk and no trusted storage probe is available",
+                "command": "make -C c iobench && ./c/iobench",
+            })
+        actions.append({
+            "id": "measure-residency",
+            "priority": "recommended",
+            "reason": f"projected expert residency is {projected_hit:.0%}",
+            "command": "coli tune --model <model>",
+        })
+        if len(planning_gpus) > 1:
+            actions.append({
+                "id": "profile-interconnect",
+                "priority": "recommended",
+                "reason": "multiple GPU tiers can move the bottleneck from storage to interconnect",
+                "command": "PROF=1 coli run --auto-tier --model <model> <prompt>",
+            })
+    elif bottleneck_class == "mixed":
+        actions.append({
+            "id": "profile-overlap",
+            "priority": "recommended",
+            "reason": "CPU expert tail and GPU work must be timed separately before retuning placement",
+            "command": "PROF=1 coli run --auto-tier --model <model> <prompt>",
+        })
+    elif bottleneck_class in ("compute", "memory"):
+        actions.append({
+            "id": "measure-kernels",
+            "priority": "recommended",
+            "reason": "weights are resident; kernel and memory-bandwidth timings decide the next optimization",
+            "command": "PROF=1 coli run --auto-tier --model <model> <prompt>",
+        })
+    return actions
+
+
 POLICIES = {
     "quality": {"preserve_quantization": True, "preserve_router": True},
     "balanced": {"preserve_quantization": True, "preserve_router": True},
@@ -932,6 +998,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
                       plan_has_metal=False)
     probe_state, probe_gbs = ssd_probe_state(info["path"])
+    actions = _next_actions(bottleneck_class, projected_hit, probe_state,
+                            probe_gbs, planning_gpus)
 
     return {
         "version": 2,
@@ -965,6 +1033,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "bottleneck_class": bottleneck_class,
         "projected_hit_rate": round(projected_hit, 4),
         "tune": tune,
+        "next_actions": actions,
         "decisions": [
             {"target": "VRAM", "reason": "profile-ranked hot experts"},
             {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
@@ -1072,5 +1141,12 @@ def format_plan(plan):
         hint = tune.get("_numa_hint")
         if hint:
             lines.append(f"  hint: {hint}")
+    actions = plan.get("next_actions", [])
+    if actions:
+        lines.append("")
+        lines.append("next actions:")
+        for action in actions:
+            lines.append(f"  [{action['priority']}] {action['id']}: {action['reason']}")
+            lines.append(f"    {action['command']}")
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

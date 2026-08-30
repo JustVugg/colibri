@@ -87,6 +87,7 @@ class K3ToolCallingE2E(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             cls.port = probe.getsockname()[1]
         env = dict(os.environ, MOCK_LOG=str(cls.mock_log))
+        env.pop("COLI_API_KEY", None)
         cls.server = subprocess.Popen(
             [sys.executable, str(SERVER), "--model", cls.tmp.name,
              "--engine", str(mock), "--port", str(cls.port)],
@@ -114,10 +115,10 @@ class K3ToolCallingE2E(unittest.TestCase):
         req = urllib.request.Request(
             self.base + "/chat/completions", json.dumps(body).encode(),
             {"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        if stream:
-            return resp.read().decode()
-        return json.loads(resp.read().decode())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if stream:
+                return resp.read().decode()
+            return json.loads(resp.read().decode())
 
     def prompts(self):
         return [p for p in self.mock_log.read_text().split("\n\x00\n") if p]

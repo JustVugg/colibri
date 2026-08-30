@@ -1477,6 +1477,7 @@ int coli_v4_expert_store_open_planned(
 #ifdef COLI_V4_UNIT_MATH
 /* ######## deepseek_v4_math.c ######## */
 #include "deepseek_v4_internal.h"
+#include "hyper_connections.h"
 
 #include <limits.h>
 #include <math.h>
@@ -1491,71 +1492,17 @@ static float sigmoidf_stable(float value) {
     return growth / (1.0f + growth);
 }
 
+/* mHC: la matematica vive in hyper_connections.h, condivisa con gli altri
+ * motori il cui checkpoint porta le stesse hyper-connections (GLM-5.3-Flash usa
+ * le identiche chiavi hc_mult / hc_eps / hc_sinkhorn_iters). Qui restano solo
+ * gli inoltri, cosi' i punti di chiamata dell'amalgama e le dichiarazioni in
+ * deepseek_v4_internal.h non cambiano. */
 int coli_v4_hc_split_sinkhorn(float *pre, float *post, float *comb,
                               const float *mixes, const float scale[3],
                               const float *base, int hc, int iterations,
                               float eps) {
-    if (!pre || !post || !comb || !mixes || !scale || !base ||
-        hc < 1 || iterations < 1 || eps < 0.0f)
-        return -1;
-    for (int index = 0; index < hc; index++) {
-        pre[index] = sigmoidf_stable(
-            mixes[index] * scale[0] + base[index]) + eps;
-        post[index] = 2.0f * sigmoidf_stable(
-            mixes[hc + index] * scale[1] + base[hc + index]);
-    }
-    int matrix_offset = 2 * hc;
-    for (int row = 0; row < hc; row++) {
-        float maximum = -INFINITY;
-        for (int column = 0; column < hc; column++) {
-            int index = matrix_offset + row * hc + column;
-            float value = mixes[index] * scale[2] + base[index];
-            comb[row * hc + column] = value;
-            if (value > maximum) maximum = value;
-        }
-        float sum = 0.0f;
-        for (int column = 0; column < hc; column++) {
-            float value = expf(comb[row * hc + column] - maximum);
-            comb[row * hc + column] = value;
-            sum += value;
-        }
-        for (int column = 0; column < hc; column++)
-            comb[row * hc + column] = comb[row * hc + column] / sum + eps;
-    }
-    float *sums = malloc((size_t)hc * sizeof(*sums));
-    if (!sums) return -1;
-    for (int column = 0; column < hc; column++) {
-        float sum = 0.0f;
-        for (int row = 0; row < hc; row++)
-            sum += comb[row * hc + column];
-        sums[column] = sum;
-    }
-    for (int row = 0; row < hc; row++)
-        for (int column = 0; column < hc; column++)
-            comb[row * hc + column] /= sums[column] + eps;
-
-    for (int iteration = 1; iteration < iterations; iteration++) {
-        for (int row = 0; row < hc; row++) {
-            float sum = 0.0f;
-            for (int column = 0; column < hc; column++)
-                sum += comb[row * hc + column];
-            sums[row] = sum;
-        }
-        for (int row = 0; row < hc; row++)
-            for (int column = 0; column < hc; column++)
-                comb[row * hc + column] /= sums[row] + eps;
-        for (int column = 0; column < hc; column++) {
-            float sum = 0.0f;
-            for (int row = 0; row < hc; row++)
-                sum += comb[row * hc + column];
-            sums[column] = sum;
-        }
-        for (int row = 0; row < hc; row++)
-            for (int column = 0; column < hc; column++)
-                comb[row * hc + column] /= sums[column] + eps;
-    }
-    free(sums);
-    return 0;
+    return coli_hc_split_sinkhorn(pre, post, comb, mixes, scale, base,
+                                  hc, iterations, eps);
 }
 
 int coli_v4_hc_pre(float *output, float *post, float *comb,
@@ -1563,62 +1510,14 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
                    const float scale[3], const float *base,
                    int hc, int dimension, int iterations,
                    float norm_eps, float hc_eps) {
-    if (!output || !post || !comb || !input || !hc_fn || !scale || !base ||
-        hc < 1 || dimension < 1 || norm_eps < 0.0f)
-        return -1;
-    int flattened = hc * dimension;
-    int mix_count = (2 + hc) * hc;
-    float mean_square = 0.0f;
-    for (int index = 0; index < flattened; index++)
-        mean_square += input[index] * input[index];
-    float inverse_rms = 1.0f / sqrtf(mean_square / flattened + norm_eps);
-    float *mixes = malloc((size_t)mix_count * sizeof(*mixes));
-    float *pre = malloc((size_t)hc * sizeof(*pre));
-    if (!mixes || !pre) {
-        free(mixes);
-        free(pre);
-        return -1;
-    }
-    for (int row = 0; row < mix_count; row++) {
-        float sum = 0.0f;
-        for (int column = 0; column < flattened; column++)
-            sum += hc_fn[(size_t)row * flattened + column] * input[column];
-        mixes[row] = sum * inverse_rms;
-    }
-    if (coli_v4_hc_split_sinkhorn(pre, post, comb, mixes, scale, base,
-                                  hc, iterations, hc_eps) != 0) {
-        free(pre);
-        free(mixes);
-        return -1;
-    }
-    for (int column = 0; column < dimension; column++) {
-        float sum = 0.0f;
-        for (int copy = 0; copy < hc; copy++)
-            sum += pre[copy] * input[copy * dimension + column];
-        output[column] = sum;
-    }
-    free(pre);
-    free(mixes);
-    return 0;
+    return coli_hc_pre(output, post, comb, input, hc_fn, scale, base,
+                       hc, dimension, iterations, norm_eps, hc_eps);
 }
 
 int coli_v4_hc_post(float *output, const float *branch,
                     const float *residual, const float *post,
                     const float *comb, int hc, int dimension) {
-    if (!output || !branch || !residual || !post || !comb ||
-        hc < 1 || dimension < 1)
-        return -1;
-    for (int destination = 0; destination < hc; destination++) {
-        for (int column = 0; column < dimension; column++) {
-            float value = 0.0f;
-            for (int source = 0; source < hc; source++)
-                value += comb[source * hc + destination] *
-                         residual[source * dimension + column];
-            value += post[destination] * branch[column];
-            output[destination * dimension + column] = value;
-        }
-    }
-    return 0;
+    return coli_hc_post(output, branch, residual, post, comb, hc, dimension);
 }
 
 int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
@@ -14028,6 +13927,7 @@ int main(int argc, char **argv) {
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
+    if (argc < 2) { coli_print_launcher_help("DeepSeek V4"); return 1; }
     if (v4_cli_parse(argc, argv, &cli)) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;
@@ -16161,7 +16061,8 @@ static inline __m256 v4_fp8_decode8(__m256i codes) {
         _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
         _mm256_slli_epi32(man, 20));
     __m256 nval = _mm256_castsi256_ps(nbits);
-    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(ldexpf(1.0f, -9)));
+    float man_factor = 1.0f / (float)(1 << 9);
+    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(man_factor));
     __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
     __m256i sbits = _mm256_or_si256(
         _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
@@ -17077,12 +16978,21 @@ int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
 #include "deepseek_v4_internal.h"
 #include "segment_adapter_internal.h"
 #include "segment_adapters.h"
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "tok.h"
+#include "edge_tok_internal.h"
 
+#include <float.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 typedef struct {
     ColiV4Engine *model;
@@ -17650,4 +17560,392 @@ static const ColiSegmentAdapter deepseek_v4_segment_adapter = {
 int coli_deepseek_v4_segment_adapter_register(void) {
     return coli_segment_adapter_register(&deepseek_v4_segment_adapter);
 }
+
+#ifdef COLI_EDGE_ADAPTER
+/* ######## DeepSeek V4 engine-owned model Edge adapter ################# */
+
+typedef struct {
+    ColiDeepSeekV4Config config;
+    ColiSafetensorsIndex *index;
+    ColiFloatTensor head_function, head_base, head_scale, final_norm;
+    Tok tokenizer;
+    uint32_t state_width;
+} DeepSeekV4EdgeEngine;
+
+static void deepseek_v4_edge_engine_destroy(void *engine_impl) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    if (!engine) return;
+    tok_free(&engine->tokenizer);
+    coli_float_tensor_free(&engine->final_norm);
+    coli_float_tensor_free(&engine->head_scale);
+    coli_float_tensor_free(&engine->head_base);
+    coli_float_tensor_free(&engine->head_function);
+    coli_st_index_close(engine->index);
+    free(engine);
+}
+
+static int deepseek_v4_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid DeepSeek V4 Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 Edge supports CPU only");
+    DeepSeekV4EdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening DeepSeek V4 Edge");
+    if (coli_v4_config_load(&engine->config, options->model_dir,
+                            error, error_size) ||
+        coli_st_index_open(&engine->index, options->model_dir,
+                           error, error_size)) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return -1;
+    }
+    uint64_t width = (uint64_t)engine->config.hc_mult *
+                     (uint64_t)engine->config.hidden_size;
+    if (!width || width > UINT32_MAX) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 boundary state is too wide");
+    }
+    engine->state_width = (uint32_t)width;
+    if (coli_tensor_load_f32(&engine->head_function, engine->index,
+                             "hc_head_fn", error, error_size) ||
+        coli_tensor_load_f32(&engine->head_base, engine->index,
+                             "hc_head_base", error, error_size) ||
+        coli_tensor_load_f32(&engine->head_scale, engine->index,
+                             "hc_head_scale", error, error_size) ||
+        coli_tensor_load_f32(&engine->final_norm, engine->index,
+                             "norm.weight", error, error_size)) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return -1;
+    }
+    int hidden = engine->config.hidden_size, hc = engine->config.hc_mult;
+    if (hc < 1 || hc > 16 ||
+        engine->head_function.count < (uint64_t)hc * hc * hidden ||
+        engine->head_base.count < (uint64_t)hc ||
+        engine->head_scale.count < 1 ||
+        engine->final_norm.count < (uint64_t)hidden) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 global tensor shape mismatch");
+    }
+    const ColiSafetensorsTensor *embedding =
+        coli_st_find(engine->index, "embed.weight");
+    const ColiSafetensorsTensor *head =
+        coli_st_find(engine->index, "head.weight");
+    uint64_t boundary_cells = (uint64_t)engine->config.vocab_size *
+                              (uint64_t)engine->config.hidden_size;
+    if (!embedding || embedding->dtype != COLI_ST_BF16 ||
+        embedding->numel != (int64_t)boundary_cells ||
+        !head || head->dtype != COLI_ST_BF16 ||
+        head->numel != (int64_t)boundary_cells) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 embedding/head shape or dtype mismatch");
+    }
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+    uint64_t resident = (engine->head_function.count +
+                         engine->head_base.count +
+                         engine->head_scale.count +
+                         engine->final_norm.count) * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 Edge exceeds memory limit");
+    }
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id),
+                                "deepseek_v4");
+    coli_edge_capability_string(
+        capabilities->state_schema, sizeof(capabilities->state_schema),
+        "deepseek-v4/mhc-window-compressor-indexer-f32-v1");
+    coli_edge_capability_string(
+        capabilities->numeric_class, sizeof(capabilities->numeric_class),
+        "deepseek-v4/fp8-mxfp4-bf16/f32/cpu-v1");
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "deepseek-v4/byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->vocab_size = (uint32_t)engine->config.vocab_size;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens =
+        (uint32_t)engine->config.max_position_embeddings;
+    capabilities->num_layers =
+        (uint32_t)engine->config.num_hidden_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = 1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int deepseek_v4_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int deepseek_v4_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int deepseek_v4_edge_embed(void *engine_impl,
+                                  const ColiEdgeEmbedRequest *request,
+                                  char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    const ColiSafetensorsTensor *embedding =
+        coli_st_find(engine->index, "embed.weight");
+    if (!embedding || embedding->dtype != COLI_ST_BF16)
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 embedding is unavailable");
+    int hidden = engine->config.hidden_size;
+    int copies = engine->config.hc_mult;
+    int shard = coli_st_tensor_shard(engine->index, embedding);
+    uint16_t *packed = malloc((size_t)hidden * sizeof(*packed));
+    if (!packed)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory reading DeepSeek V4 embedding");
+    float *output = request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= engine->config.vocab_size ||
+            coli_st_read_at(
+                engine->index, shard,
+                (uint64_t)embedding->off +
+                    (uint64_t)token * hidden * sizeof(*packed),
+                (size_t)hidden * sizeof(*packed), packed)) {
+            free(packed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "cannot read DeepSeek V4 embedding");
+        }
+        float *state = output + (size_t)row * engine->state_width;
+        for (int copy = 0; copy < copies; copy++)
+            for (int item = 0; item < hidden; item++)
+                state[(size_t)copy * hidden + item] =
+                    coli_bf16_decode(packed[item]);
+    }
+    free(packed);
+    return 0;
+}
+
+static void deepseek_v4_edge_final_hidden(
+    DeepSeekV4EdgeEngine *engine, float *output, const float *state) {
+    int hidden = engine->config.hidden_size;
+    int copies = engine->config.hc_mult;
+    int flattened = copies * hidden;
+    float square = 0.0f;
+    for (int item = 0; item < flattened; item++)
+        square += state[item] * state[item];
+    float inverse_rms = 1.0f / sqrtf(
+        square / flattened + engine->config.rms_norm_eps);
+    float pre[16];
+    for (int copy = 0; copy < copies; copy++) {
+        float mix = 0.0f;
+        for (int item = 0; item < flattened; item++)
+            mix += engine->head_function.data[
+                (size_t)copy * flattened + item] * state[item];
+        float z = mix * inverse_rms * engine->head_scale.data[0] +
+                  engine->head_base.data[copy];
+        float sigmoid = z >= 0.0f
+            ? 1.0f / (1.0f + expf(-z))
+            : expf(z) / (1.0f + expf(z));
+        pre[copy] = sigmoid + engine->config.hc_eps;
+    }
+    for (int item = 0; item < hidden; item++) {
+        float value = 0.0f;
+        for (int copy = 0; copy < copies; copy++)
+            value += pre[copy] * state[(size_t)copy * hidden + item];
+        output[item] = coli_bf16_round(value);
+    }
+    coli_v4_rmsnorm(output, output, engine->final_norm.data,
+                    hidden, engine->config.rms_norm_eps);
+    coli_bf16_round_array(output, (size_t)hidden);
+}
+
+static float deepseek_v4_edge_head_dot(
+    const uint16_t *weight, const float *hidden, int dimension) {
+    float sum = 0.0f;
+    int column = 0;
+#ifdef __AVX2__
+    for (; column + 8 <= dimension; column += 8) {
+        float products[8];
+        __m128i packed = _mm_loadu_si128((const __m128i *)(weight + column));
+        __m256i bits = _mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(packed), 16);
+        _mm256_storeu_ps(products, _mm256_mul_ps(
+            _mm256_castsi256_ps(bits), _mm256_loadu_ps(hidden + column)));
+        for (int lane = 0; lane < 8; lane++) sum += products[lane];
+    }
+#endif
+    for (; column < dimension; column++)
+        sum += coli_bf16_decode(weight[column]) * hidden[column];
+    return sum;
+}
+
+static int deepseek_v4_edge_argmax(
+    DeepSeekV4EdgeEngine *engine, const float *hidden,
+    int32_t *best_token, float *best_logit,
+    ColiEdgeCancelFn should_cancel, void *cancel_user_data) {
+    const ColiSafetensorsTensor *head =
+        coli_st_find(engine->index, "head.weight");
+    if (!head || head->dtype != COLI_ST_BF16) return -1;
+    int dimension = engine->config.hidden_size;
+    int vocab = engine->config.vocab_size;
+    int shard = coli_st_tensor_shard(engine->index, head);
+    enum { TILE_ROWS = 64 };
+    uint16_t *raw = malloc((size_t)TILE_ROWS * dimension * sizeof(*raw));
+    float *scores = malloc((size_t)TILE_ROWS * sizeof(*scores));
+    if (!raw || !scores) { free(scores); free(raw); return -1; }
+    int winner = -1;
+    float maximum = -FLT_MAX;
+    for (int start = 0; start < vocab; start += TILE_ROWS) {
+        if (should_cancel && should_cancel(cancel_user_data)) {
+            free(scores); free(raw); return -2;
+        }
+        int rows = vocab - start < TILE_ROWS ? vocab - start : TILE_ROWS;
+        size_t bytes = (size_t)rows * dimension * sizeof(*raw);
+        if (coli_st_read_at(
+                engine->index, shard,
+                (uint64_t)head->off +
+                    (uint64_t)start * dimension * sizeof(*raw),
+                bytes, raw)) {
+            free(scores); free(raw); return -1;
+        }
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < rows; row++)
+            scores[row] = deepseek_v4_edge_head_dot(
+                raw + (size_t)row * dimension, hidden, dimension);
+        for (int row = 0; row < rows; row++)
+            if (scores[row] > maximum) {
+                maximum = scores[row]; winner = start + row;
+            }
+    }
+    free(scores); free(raw);
+    *best_token = winner;
+    if (best_logit) *best_logit = maximum;
+    return winner < 0 ? -1 : 0;
+}
+
+static int deepseek_v4_edge_select(void *engine_impl,
+                                   const ColiEdgeSelectRequest *request,
+                                   char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    int hidden = engine->config.hidden_size;
+    float *final = malloc((size_t)hidden * sizeof(*final));
+    if (!final)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory running DeepSeek V4 head");
+    const float *input = request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        deepseek_v4_edge_final_hidden(
+            engine, final, input + (size_t)row * engine->state_width);
+        int result = deepseek_v4_edge_argmax(
+            engine, final, &request->token_ids[row],
+            request->scores ? &request->scores[row] : NULL,
+            request->should_cancel, request->cancel_user_data);
+        if (result) {
+            free(final);
+            return coli_edge_adapter_error(
+                error, error_size, result == -2
+                    ? "DeepSeek V4 Edge selection cancelled"
+                    : "DeepSeek V4 Edge head failed");
+        }
+    }
+    free(final);
+    return 0;
+}
+
+static int deepseek_v4_edge_logits(void *engine_impl,
+                                   const ColiEdgeLogitsRequest *request,
+                                   char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    const ColiSafetensorsTensor *head =
+        coli_st_find(engine->index, "head.weight");
+    if (!head || head->dtype != COLI_ST_BF16)
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 Edge head is unavailable");
+    int hidden = engine->config.hidden_size;
+    int vocab = engine->config.vocab_size;
+    int shard = coli_st_tensor_shard(engine->index, head);
+    enum { TILE_ROWS = 64 };
+    uint16_t *raw = malloc((size_t)TILE_ROWS * hidden * sizeof(*raw));
+    float *final = malloc((size_t)hidden * sizeof(*final));
+    if (!raw || !final) {
+        free(final); free(raw);
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory running DeepSeek V4 logits");
+    }
+    const float *input = request->input;
+    for (uint32_t batch_row = 0; batch_row < request->rows; batch_row++) {
+        deepseek_v4_edge_final_hidden(
+            engine, final, input + (size_t)batch_row * engine->state_width);
+        float *logits = request->logits + (size_t)batch_row * vocab;
+        for (int start = 0; start < vocab; start += TILE_ROWS) {
+            if (request->should_cancel &&
+                request->should_cancel(request->cancel_user_data)) {
+                free(final); free(raw);
+                return coli_edge_adapter_error(
+                    error, error_size, "DeepSeek V4 Edge logits cancelled");
+            }
+            int rows = vocab - start < TILE_ROWS ? vocab - start : TILE_ROWS;
+            size_t bytes = (size_t)rows * hidden * sizeof(*raw);
+            if (coli_st_read_at(
+                    engine->index, shard,
+                    (uint64_t)head->off +
+                        (uint64_t)start * hidden * sizeof(*raw),
+                    bytes, raw)) {
+                free(final); free(raw);
+                return coli_edge_adapter_error(
+                    error, error_size, "DeepSeek V4 Edge head read failed");
+            }
+            #pragma omp parallel for schedule(static)
+            for (int row = 0; row < rows; row++)
+                logits[start + row] = deepseek_v4_edge_head_dot(
+                    raw + (size_t)row * hidden, final, hidden);
+        }
+    }
+    free(final); free(raw);
+    return 0;
+}
+
+static const ColiEdgeAdapter deepseek_v4_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "deepseek_v4",
+    deepseek_v4_edge_engine_open, deepseek_v4_edge_engine_destroy,
+    deepseek_v4_edge_tokenize, deepseek_v4_edge_detokenize,
+    deepseek_v4_edge_embed, deepseek_v4_edge_select,
+    deepseek_v4_edge_logits, {0}
+};
+
+int coli_deepseek_v4_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&deepseek_v4_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */
 #endif /* COLI_V4_UNIT_SEGMENT_ADAPTER && COLI_SEGMENT_ADAPTER */

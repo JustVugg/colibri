@@ -72,6 +72,11 @@ class FamilyDescriptor:
     config_section: str
     limits: FamilyLimits
     capabilities: FamilyCapabilities
+    # Quanto pesano in RAM i pesi densi rispetto a come stanno su disco.
+    # Vale 1.0 per chi li carica cosi' come sono; un motore che li riquantizza
+    # a load time pesa meno, e senza questo il pianificatore direbbe che il
+    # modello non ci sta quando invece ci sta.
+    dense_load_ratio: object = None      # callable(bytes_su_disco) -> bytes in RAM
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
@@ -225,6 +230,92 @@ def _kimi_geometry(config, context, _model_dir):
     workspace = max(ws_kda, ws_mla)
     return PlannerGeometry(state, fixed, workspace, experts)
 
+
+
+# Il default di GLM53_PREFILL_CHUNK in glm53.c. Se cambia li', cambia qui:
+# e' una costante con due consumatori.
+_GLM53_PREFILL_CHUNK = 128
+
+
+def _glm53_dense_in_ram(on_disk_bytes):
+    """I densi di GLM-5.3 non restano come sul disco.
+
+    Il checkpoint li porta in BF16 e il motore li quantizza al caricamento
+    secondo GLM53_BITS (default 4), che e' int4 con una scala ogni 64 colonne:
+    0,5625 byte per parametro contro i 2 del file. Contarli come stanno su
+    disco fa dire al pianificatore che manca RAM per un solo esperto per layer,
+    quando ce ne stanno diciassette."""
+    import os
+    try:
+        bits = int(os.environ.get("GLM53_BITS", "4"))
+    except ValueError:
+        bits = 4
+    per_parameter = {4: 0.5625, 8: 1.0, 32: 4.0}.get(bits, 0.5625)
+    return int(on_disk_bytes * per_parameter / 2.0)      # il file e' BF16
+
+
+def _glm53_geometry(config, context, _model_dir):
+    """GLM-5.3-Flash: 34 layer KDA ricorrenti piu' 11 layer MLA con DSA.
+
+    Solo i layer DSA crescono col contesto, e crescono meno di quanto sembri:
+    il motore assorbe kv_b_proj (glm53.c, absorb_kvb), quindi in cache finisce
+    il latente da kv_lora e non chiavi e valori espansi. Con 64 teste a 256 la
+    differenza e' fra 33 KB e 1,39 MB per token. Ai latenti si aggiungono le
+    chiavi e i gate dell'indexer, due vettori da index_head_dim per posizione.
+
+    I layer KDA portano uno stato ricorrente che NON dipende dal contesto, piu'
+    la finestra della convoluzione corta: entrambi vanno nel fisso.
+
+    Lo spazio di lavoro NON scala col contesto: il prefill va a pezzi da
+    GLM53_PREFILL_CHUNK (glm53.c, forward_prefill), quindi i temporanei costano
+    quanto un pezzo. Il costo che domina dentro al pezzo non e' l'attenzione ma
+    i flussi delle hyper-connections, hc_mult copie del residuo per posizione,
+    tenute due volte perche' il passaggio le scambia.
+    """
+    layers = _required_int(config, "num_hidden_layers", "glm5_next")
+    experts = _required_int(config, "n_routed_experts", "glm5_next")
+    hidden = _required_int(config, "hidden_size", "glm5_next")
+    heads = _required_int(config, "num_attention_heads", "glm5_next")
+    q_lora = _required_int(config, "q_lora_rank", "glm5_next")
+    kv_lora = _required_int(config, "kv_lora_rank", "glm5_next")
+    qk_nope = _required_int(config, "qk_nope_head_dim", "glm5_next")
+    v_head = _required_int(config, "v_head_dim", "glm5_next")
+    index_hd = _required_int(config, "index_head_dim", "glm5_next")
+    hc_mult = _required_int(config, "hc_mult", "glm5_next")
+
+    la = config.get("linear_attn_config")
+    if not isinstance(la, dict):
+        raise ValueError("glm5_next: missing or invalid planning key 'linear_attn_config'")
+    kda_heads = _required_int(la, "num_heads", "glm5_next")
+    kda_hd = _required_int(la, "head_dim", "glm5_next")
+    kernel = _required_int(la, "short_conv_kernel_size", "glm5_next")
+
+    # Quali layer sono ad attenzione piena: il checkpoint lo dice in due modi e
+    # devono concordare, altrimenti non si sa quale credere.
+    types = config.get("layer_types")
+    full_list = la.get("full_attn_layers")
+    if isinstance(types, list) and types:
+        n_full = sum(1 for t in types if isinstance(t, str) and "linear" not in t)
+    elif isinstance(full_list, list):
+        n_full = len(full_list)
+    else:
+        raise ValueError("glm5_next: missing 'layer_types' and 'linear_attn_config.full_attn_layers'")
+    n_kda = layers - n_full
+    if n_kda < 0:
+        n_kda = 0
+
+    state = n_full * context * (kv_lora + 2 * index_hd) * 4
+    kda_proj = kda_heads * kda_hd
+    fixed = n_kda * (kda_heads * kda_hd * kda_hd + 3 * kda_proj * kernel) * 4
+
+    # prefill: due banchi di flussi residui, piu' i temporanei del layer piu'
+    # caro fra KDA e MLA (un passaggio ne tocca uno solo per volta)
+    chunk = _GLM53_PREFILL_CHUNK
+    ws_streams = 2 * chunk * hc_mult * hidden * 4
+    ws_kda = chunk * (6 * kda_proj + kda_hd + hidden) * 4
+    ws_mla = chunk * (q_lora + heads * (qk_nope + kv_lora) + 2 * heads * v_head) * 4
+    workspace = ws_streams + max(ws_kda, ws_mla)
+    return PlannerGeometry(state, fixed, workspace, experts)
 
 
 def _inkling_local_layers(config, layers):
@@ -401,6 +492,9 @@ _KIMI_EXPERT = re.compile(
     r"experts\.(\d+)\."
 )
 _V4_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
+_GLM53_EXPERT = re.compile(
+    r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
+)
 _INKLING_EXPERT = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\."
     r"(?:gate_up_proj|down_proj)(?:\.|$)"
@@ -432,6 +526,39 @@ def _inkling_expert_inventory(name, size, config):
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
 
 FAMILIES = (
+    FamilyDescriptor(
+        id="glm53",
+        # "glm5_next" e' il tipo della radice, che e' il wrapper vision; un
+        # export di solo testo dichiara "glm5_next_text" al primo livello.
+        model_types=("glm5_next", "glm5_next_text"),
+        display_name="GLM-5.3-Flash",
+        display_scale="321B",
+        engine_artifact="glm53",
+        engine_aliases=(),
+        engine_group="glm53",
+        internal_arch="glm53",
+        build_target="glm53",
+        process_names=("glm53",),
+        default_model_id="glm-5.3-flash-colibri",
+        cli_adapter="glm53",
+        gateway_adapter="glm53",
+        planner_id="glm53_hybrid",
+        dense_load_ratio=_glm53_dense_in_ram,
+        planner_geometry=_glm53_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM53_EXPERT),
+        config_section="text_config",
+        # implicit_cap 0, non 8: questo motore dimensiona la cache degli
+        # esperti dalla RAM disponibile, quindi "nessuna scelta esplicita"
+        # deve arrivargli come 0 e non come otto slot per layer.
+        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 0, "GLM53_MAXT"),
+        capabilities=COMMON_CAP,
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        # Dal chat_template.jinja del checkpoint: nessun a capo, e <think>
+        # subito dopo <|assistant|>, che e' quello che apre il ragionamento.
+        tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think>",
+    ),
     FamilyDescriptor(
         id="glm",
         model_types=("glm_moe_dsa", "glm5_moe", "glm"),

@@ -833,6 +833,10 @@ class FamilyRegistryTest(unittest.TestCase):
     def test_tuning_replay_prompts_are_registry_owned(self):
         prompt = "hello {world}"
         expected = {
+            # GLM-5.3 apre il ragionamento e non lo chiude: il suo
+            # chat_template.jinja mette <think> dopo <|assistant|> e basta,
+            # dove GLM-5.2 metteva <think></think>.
+            "glm53": "[gMASK]<sop><|user|>hello {world}<|assistant|><think>",
             "glm": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
@@ -900,6 +904,7 @@ class FamilyRegistryTest(unittest.TestCase):
         release = (repo / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         docker = (repo / "docker" / "Dockerfile.slim").read_text(encoding="utf-8")
+        clean = (repo / "c" / "tools" / "clean.py").read_text(encoding="utf-8")
         make_rules = re.sub(r"\\\n[ \t]*", " ", makefile)
         install_rule = re.search(r"(?m)^install:\s*(.*)$", make_rules)
         self.assertIsNotNone(install_rule)
@@ -919,7 +924,30 @@ class FamilyRegistryTest(unittest.TestCase):
                     self.assertIn(family.build_target,
                                   re.search(r'ENGINES="([^"]+)"', ci).group(1).split())
                     self.assertIn(f"cp c/{family.engine_artifact}", release)
+                    # Copiarlo non basta: va anche COSTRUITO. Il contratto
+                    # verificava solo meta', e con quella meta' la v1.9.0 e'
+                    # uscita col nome di GLM-5.3-Flash e senza il suo binario,
+                    # esattamente come la v1.5.0 con DeepSeek V4 (#858). Un
+                    # `cp` di un file che nessuno ha compilato fallisce a
+                    # release gia' pubblicata, cioe' nel momento peggiore.
+                    build_step = re.search(r"for t in ([a-z0-9_ ]+); do",
+                                           release)
+                    self.assertIsNotNone(build_step,
+                                         "release.yml: build loop not found")
+                    self.assertIn(family.build_target, build_step.group(1).split(),
+                                  f"{family.id}: release.yml copies "
+                                  f"c/{family.engine_artifact} but never builds it")
                     self.assertIn(f"$(LIBEXECDIR)/{family.engine_artifact}", makefile)
+                    # `make clean` must actually remove the engine. When it does
+                    # not, a rebuild with different EXTRA_CFLAGS reports "up to
+                    # date" and the caller silently keeps the OLD binary. The
+                    # ASan step of the Qwen3.6 oracle job re-ran an
+                    # un-instrumented qwen36 that way for as long as it existed
+                    # (#1262): green, with the sanitizer never having run.
+                    self.assertIn(f'"{family.engine_artifact}"', clean,
+                                  f"{family.id}: tools/clean.py does not remove "
+                                  f"c/{family.engine_artifact}, so a rebuild with "
+                                  f"different flags is a silent no-op")
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)

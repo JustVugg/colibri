@@ -164,6 +164,19 @@ static void hwinfo_emit(Model *m){
     }
     if(g_cuda_ndev>0)
         snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
+#elif defined(COLI_VULKAN)
+    double used=0, budget=0;
+    ngpu=coli_vk_available()?1:0;
+    if(ngpu){
+        if(coli_vk_mem_budget(&used,&budget)) vram_total=budget;
+        snprintf(gpu_name,sizeof(gpu_name),"Vulkan device%s",
+                 coli_vk_dev2_available()?" x2":"");
+        if(coli_vk_dev2_available()){
+            double used2=0, budget2=0;
+            if(coli_vk_mem_budget2(&used2,&budget2)) vram_total+=budget2;
+            ngpu=2;
+        }
+    }
 #endif
     printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
         cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
@@ -179,6 +192,14 @@ static void tiers_emit(Model *m){
     int vram=0; double vram_gb=0;
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
+#elif defined(COLI_VULKAN)
+    vram=g_vk_reg_n+g_vk_reg_n2;
+    int64_t bytes=0;
+    if(g_vk_reg) for(int i=0;i<g_vk_reg_NL;i++) for(int e=0;e<g_vk_reg_E;e++){
+        ColiVkTensor **slot=vk_reg_at(i,e);
+        for(int j=0;j<3;j++) if(slot[j]) bytes+=(int64_t)coli_vk_tensor_bytes(slot[j]);
+    }
+    vram_gb=(double)bytes/1e9;
 #endif
     int ram=pinned-vram+lru; if(ram<0) ram=0;
     int disk=total-vram-ram; if(disk<0) disk=0;
@@ -212,8 +233,11 @@ static void emap_emit(Model *m){
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
             int tier=0;
+#ifdef COLI_VULKAN
+            if(vk_reg_served(i,e)) tier=2;
+#endif
             ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+            for(int z=0;!tier&&z<m->npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
 #else

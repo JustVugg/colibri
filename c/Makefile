@@ -296,6 +296,23 @@ ifneq ($(LINUX),)
 NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
 endif
 endif
+# CUDA 13.1 host_config.h accepts only Visual Studio 2019-2022 and refuses
+# anything newer outright, so on a box with VS Build Tools 18 (MSVC 19.50)
+# EVERY nvcc target fails at the first #include with C1189 -- cuda-test,
+# cuda-dll, all of it. nvcc offers -allow-unsupported-compiler to override the
+# check, but there was no way to get one flag in: NVCCFLAGS is the only handle
+# and replacing it wholesale discards $(CUDA_GENCODE), the -ccbin set above and
+# the -Xcompiler warning form that Windows specifically needs -- the same
+# argument that made NVCC_STD a variable rather than a rewrite.
+#
+# Defaults to 0: nvcc's own wording is "may cause compilation failure or
+# incorrect run time execution", so an unsupported host compiler is the
+# builder's decision to make explicitly, not a default this Makefile makes for
+# them. Any result produced with it set should say so.
+NVCC_ALLOW_UNSUPPORTED ?= 0
+ifeq ($(NVCC_ALLOW_UNSUPPORTED),1)
+NVCCFLAGS += -allow-unsupported-compiler
+endif
 # HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
@@ -449,7 +466,8 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
-	test_segment_adapters_registration test_segment_adapters_real
+	test_segment_adapters_registration test_segment_adapters_real \
+	test_edge_adapters_registration test_edge_adapters_real
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -458,7 +476,8 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
-	tests/test_segment_adapters_registration$(EXE)
+	tests/test_segment_adapters_registration$(EXE) \
+	tests/test_edge_adapters_registration$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -1014,6 +1033,9 @@ tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
@@ -1032,6 +1054,12 @@ comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
+
+# GLM-5.3-Flash: CPU puro, esperti in streaming dal contenitore int4 gs64.
+# Nessun oggetto CUDA/Vulkan/Metal fra le dipendenze perche' il motore non ne
+# ha ancora: quando li avra', questa riga somigliera' a quella di kimi_k3.
+glm53$(EXE): glm53.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) glm53.c $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
@@ -1280,6 +1308,9 @@ tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h 
 tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
 
+tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
+	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
+
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
 
@@ -1288,10 +1319,11 @@ include Makefile.deepseek-v4.units
 # is advertised only after an adapter has a real backend implementation.
 SEGMENT_BUILD_DIR = build/segment
 SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
-	-DCOLI_VULKAN,$(CFLAGS)) -D_GNU_SOURCE -include pthread.h \
-	-DCOLI_SEGMENT_ADAPTER
+	-DCOLI_VULKAN,$(CFLAGS)) -include pthread.h \
+	-DCOLI_SEGMENT_ADAPTER -DCOLI_EDGE_ADAPTER
 SEGMENT_ENGINE_OBJS = \
 	$(SEGMENT_BUILD_DIR)/glm.o \
+	$(SEGMENT_BUILD_DIR)/glm53.o \
 	$(SEGMENT_BUILD_DIR)/inkling.o \
 	$(SEGMENT_BUILD_DIR)/kimi.o \
 	$(SEGMENT_BUILD_DIR)/olmoe.o \
@@ -1302,71 +1334,141 @@ SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_
 SEGMENT_V4_REGISTRY_OBJ = $(SEGMENT_BUILD_DIR)/expert_store_registry.o
 SEGMENT_ALL_OBJS = $(SEGMENT_ENGINE_OBJS) $(SEGMENT_V4_OBJS) \
 	$(SEGMENT_V4_REGISTRY_OBJ)
+SEGMENT_RUNTIME_OBJS = \
+	$(SEGMENT_BUILD_DIR)/segment_runtime.o \
+	$(SEGMENT_BUILD_DIR)/edge_runtime.o
+SEGMENT_RUNTIME_LIB = $(SEGMENT_BUILD_DIR)/libcolibri_segment_edge.a
 
 $(SEGMENT_BUILD_DIR):
 	mkdir -p $@
 
-$(SEGMENT_BUILD_DIR)/glm.o: colibri.c segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/glm.o: colibri.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLIBRI_NO_MAIN -c colibri.c -o $@
 
-$(SEGMENT_BUILD_DIR)/inkling.o: inkling.c segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/glm53.o: glm53.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h st.h quant.h tok.h hyper_connections.h \
+		delta_attention.h sparse_index.h vision_tower.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DGLM53_NO_MAIN -c glm53.c -o $@
+
+$(SEGMENT_BUILD_DIR)/inkling.o: inkling.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DINKLING_NO_MAIN -c inkling.c -o $@
 
-$(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DKIMI_K3_NO_MAIN -c kimi_k3.c -o $@
 
-$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DOLMOE_NO_MAIN -c olmoe.c -o $@
 
-$(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
 
 $(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c deepseek_v4.h \
 		deepseek_v4_internal.h segment_runtime.h segment_adapters.h \
-		segment_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+		edge_runtime.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h \
 		expert_store.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
 
+$(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c segment_runtime.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c segment_runtime.c -o $@
+
+$(SEGMENT_BUILD_DIR)/edge_runtime.o: edge_runtime.c edge_runtime.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c edge_runtime.c -o $@
+
+$(SEGMENT_RUNTIME_LIB): $(SEGMENT_RUNTIME_OBJS) $(SEGMENT_ALL_OBJS)
+	$(AR) rcs $@ $^
+
+.PHONY: segment-edge-library
+segment-edge-library: $(SEGMENT_RUNTIME_LIB)
+
 tests/test_segment_adapters_registration$(EXE): \
 		tests/test_segment_adapters_registration.c segment_runtime.c \
-		segment_runtime.h segment_adapters.h $(SEGMENT_ALL_OBJS)
+		edge_runtime.c segment_runtime.h edge_runtime.h segment_adapters.h \
+		edge_adapters.h $(SEGMENT_ALL_OBJS)
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_registration.c \
-		segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_segment_adapters_real$(EXE): tests/test_segment_adapters_real.c \
-		segment_runtime.c segment_runtime.h segment_adapters.h $(SEGMENT_ALL_OBJS)
+		segment_runtime.c edge_runtime.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h $(SEGMENT_ALL_OBJS)
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_real.c \
-		segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_edge_adapters_registration$(EXE): \
+		tests/test_edge_adapters_registration.c edge_runtime.c segment_runtime.c \
+		edge_runtime.h segment_runtime.h edge_adapters.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_edge_adapters_registration.c \
+		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_edge_adapters_real$(EXE): tests/test_edge_adapters_real.c \
+		edge_runtime.c segment_runtime.c edge_runtime.h segment_runtime.h \
+		edge_adapters.h segment_adapters.h json.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_edge_adapters_real.c \
+		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
 .PHONY: segment-adapters segment-adapters-real
 segment-adapters: tests/test_segment_adapters_registration$(EXE)
 	./tests/test_segment_adapters_registration$(EXE)
 
+.PHONY: edge-adapters edge-adapters-real
+edge-adapters: tests/test_edge_adapters_registration$(EXE)
+	./tests/test_edge_adapters_registration$(EXE)
+
 # Maintainer/release gate. Paths point at generated/converted tiny Colibri
 # containers; see docs/segment-runtime.md for the exact generators.
 # OMP_NUM_THREADS defaults to a stable, non-single-threaded 2 for reproducible
 # reductions, but callers can override it to exercise a different schedule.
+# Kimi's generated fixture is safe at a few MB; overcommit there only prevents
+# its production-size reserve heuristic from making the test host-dependent.
 segment-adapters-real: tests/test_segment_adapters_real$(EXE)
 	@test -n "$(GLM_SEGMENT_MODEL)" || { echo "set GLM_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(GLM53_SEGMENT_MODEL)" || { echo "set GLM53_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(INKLING_SEGMENT_MODEL)" || { echo "set INKLING_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(KIMI_SEGMENT_MODEL)" || { echo "set KIMI_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(OLMOE_SEGMENT_MODEL)" || { echo "set OLMOE_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(QWEN_SEGMENT_MODEL)" || { echo "set QWEN_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(DEEPSEEK_SEGMENT_MODEL)" || { echo "set DEEPSEEK_SEGMENT_MODEL" >&2; exit 2; }
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm "$(GLM_SEGMENT_MODEL)" 0 3 5 8
+	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm53 "$(GLM53_SEGMENT_MODEL)" 0 2 4 16
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) inkling "$(INKLING_SEGMENT_MODEL)" 0 4 8 8
-	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) kimi "$(KIMI_SEGMENT_MODEL)" 0 3 6 8
+	COLI_RAM_OVERCOMMIT=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) kimi "$(KIMI_SEGMENT_MODEL)" 0 3 6 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) olmoe "$(OLMOE_SEGMENT_MODEL)" 0 2 4 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen36 "$(QWEN_SEGMENT_MODEL)" 0 4 8 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_SEGMENT_MODEL)" 0 1 3 8
+
+# End-to-end model-edge gate. Every run performs tokenizer round-trip, embeds
+# the independent oracle's prompt, executes the complete real Segment stack
+# and compares greedy decode tokens with that oracle. The fixture tokenizer
+# helper is only for existing math-only tiny checkpoints that omit one.
+edge-adapters-real: tests/test_edge_adapters_real$(EXE)
+	@test -n "$(GLM_EDGE_MODEL)" && test -n "$(GLM_EDGE_REF)" || { echo "set GLM_EDGE_MODEL and GLM_EDGE_REF" >&2; exit 2; }
+	@test -n "$(GLM53_EDGE_MODEL)" && test -n "$(GLM53_EDGE_REF)" || { echo "set GLM53_EDGE_MODEL and GLM53_EDGE_REF" >&2; exit 2; }
+	@test -n "$(INKLING_EDGE_MODEL)" && test -n "$(INKLING_EDGE_REF)" || { echo "set INKLING_EDGE_MODEL and INKLING_EDGE_REF" >&2; exit 2; }
+	@test -n "$(KIMI_EDGE_MODEL)" && test -n "$(KIMI_EDGE_REF)" || { echo "set KIMI_EDGE_MODEL and KIMI_EDGE_REF" >&2; exit 2; }
+	@test -n "$(OLMOE_EDGE_MODEL)" && test -n "$(OLMOE_EDGE_REF)" || { echo "set OLMOE_EDGE_MODEL and OLMOE_EDGE_REF" >&2; exit 2; }
+	@test -n "$(QWEN_EDGE_MODEL)" && test -n "$(QWEN_EDGE_REF)" || { echo "set QWEN_EDGE_MODEL and QWEN_EDGE_REF" >&2; exit 2; }
+	@test -n "$(DEEPSEEK_EDGE_MODEL)" && test -n "$(DEEPSEEK_EDGE_REF)" || { echo "set DEEPSEEK_EDGE_MODEL and DEEPSEEK_EDGE_REF" >&2; exit 2; }
+	GLM_SEGMENT_EBITS=16 GLM_SEGMENT_DBITS=16 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm "$(GLM_EDGE_MODEL)" "$(GLM_EDGE_REF)" 3
+	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm53 "$(GLM53_EDGE_MODEL)" "$(GLM53_EDGE_REF)" 3
+	INK_SEGMENT_BITS=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) inkling "$(INKLING_EDGE_MODEL)" "$(INKLING_EDGE_REF)" 3
+	COLI_RAM_OVERCOMMIT=1 K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) kimi "$(KIMI_EDGE_MODEL)" "$(KIMI_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) olmoe "$(OLMOE_EDGE_MODEL)" "$(OLMOE_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen36 "$(QWEN_EDGE_MODEL)" "$(QWEN_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_EDGE_MODEL)" "$(DEEPSEEK_EDGE_REF)" 3
 
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
@@ -1458,6 +1560,8 @@ tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h 
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_mirror_stripe_split$(EXE): tests/test_mirror_stripe_split.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c deepseek_v4_hybrid.h hybrid_split.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1643,13 +1747,14 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
+	$(INSTALL) -m 755 glm53$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm53$(EXE)
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)

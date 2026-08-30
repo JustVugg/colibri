@@ -1369,13 +1369,245 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- immagini per GLM-5.3 ------------------------------------------------------------
+# Il modello vede l'immagine come una sequenza di segnaposto <|image|>, uno per
+# token che la torre produrra': (griglia_h/2) x (griglia_w/2). Il numero non e'
+# negoziabile -- il motore rifiuta se non combacia con gli embedding che riceve --
+# quindi si preprocessa PRIMA di rendere il prompt e si espande il segnaposto al
+# numero giusto. Cosi' il renderer non deve sapere niente di immagini.
+GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
+    "<|begin_of_image|>", "<|image|>", "<|end_of_image|>")
+
+
+def _image_bytes_from_url(url):
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine."""
+    if not isinstance(url, str) or not url:
+        raise APIError(400, "image_url.url must be a non-empty string.", "messages")
+    if url.startswith("data:"):
+        head, _, payload = url.partition(",")
+        if "base64" not in head:
+            raise APIError(400, "only base64 data: URIs are supported.", "messages")
+        import base64
+        try:
+            return base64.b64decode(payload, validate=True)
+        except Exception:
+            raise APIError(400, "image_url.url is not valid base64.", "messages")
+    if url.startswith("http://") or url.startswith("https://"):
+        # Scaricare da un URL che arriva in una richiesta vorrebbe dire far fare
+        # al server una chiamata di rete decisa da chi la manda. Non si fa.
+        raise APIError(400, "remote image URLs are not fetched; send the image "
+                            "as a base64 data: URI or a path on this machine.",
+                       "messages")
+    path = url[7:] if url.startswith("file://") else url
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError as problem:
+        raise APIError(400, f"cannot read image {path}: {problem}", "messages")
+
+
+def expand_glm53_images(messages, model_dir):
+    """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
+
+    Restituisce (messaggi riscritti, patch). I messaggi tornano con contenuto
+    testuale puro, quindi il renderer li tratta come qualunque altro turno."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_image(data, model_dir)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(GLM53_IMAGE_OPEN + GLM53_IMAGE * tokens + GLM53_IMAGE_CLOSE)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_image(data, model_dir):
+    """L'immagine nelle patch che la torre vuole. Il lavoro sta in
+    tools/glm53_image.py, verificato contro il processore ufficiale."""
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from glm53_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir)
+
+
+GLM53_TOOL_PREAMBLE = (
+    "<|system|>\n# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>\n")
+GLM53_TOOL_EPILOGUE = (
+    "\n</tools>\n\n"
+    "For each function call, output the function name and arguments within the "
+    "following XML format:\n"
+    "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+    "<arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>"
+    "<arg_value>{arg-value-2}</arg_value>...</tool_call>")
+
+
+def _glm53_tool_json(tool):
+    """Una firma di strumento come la serializza il template di GLM-5.3.
+
+    Le chiavi restano nell'ordine in cui il client le ha mandate, perche' il
+    template itera `tool.items()` e non le riordina; `defer_loading` e `strict`
+    non entrano nel prompt."""
+    if isinstance(tool, dict) and "function" in tool:
+        tool = tool["function"]
+    if not isinstance(tool, dict):
+        raise APIError(400, "each tool must be an object.", "tools")
+    parts = [f'"{key}": {json.dumps(value, ensure_ascii=False)}'
+             for key, value in tool.items()
+             if key not in ("defer_loading", "strict")]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _glm53_tool_block(tools):
+    """Il blocco di dichiarazione, spaziatura compresa.
+
+    Gli a capo non sono decorativi: sono quelli che escono da chat_template.jinja
+    e il test li confronta byte a byte contro jinja2, perche' un prompt che
+    somiglia a quello dell'addestramento non e' quello dell'addestramento."""
+    body = "".join(f"\n{_glm53_tool_json(tool)}\n\n"
+                   for tool in tools
+                   if not (isinstance(tool, dict)
+                           and (tool.get("function", tool) or {}).get("defer_loading")))
+    return GLM53_TOOL_PREAMBLE + body + GLM53_TOOL_EPILOGUE
+
+
+def _glm53_tool_calls(calls):
+    """Le chiamate di un turno assistente passato, nel formato che il modello
+    stesso produce: <tool_call>nome<arg_key>k</arg_key><arg_value>v</arg_value>.
+    Le stringhe passano cosi' come sono, il resto come JSON."""
+    out = []
+    for call in calls or []:
+        if isinstance(call, dict) and "function" in call:
+            call = call["function"]
+        name = (call or {}).get("name", "")
+        arguments = (call or {}).get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = {}
+        pieces = [f"<tool_call>{name}"]
+        for key, value in (arguments or {}).items():
+            rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            pieces.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
+        pieces.append("</tool_call>")
+        out.append("".join(pieces))
+    return "\n" + "".join(out) + "\n" if out else ""
+
+
+def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    Not a variant of the GLM-5.2 renderer above, and the differences are not
+    cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
+    template defaults the effort to Max rather than leaving it unset; it accepts
+    only low, high and max, not the six-level ladder; its generation prompt
+    OPENS the reasoning block with a bare `<think>` where 5.2 closed it
+    immediately; and it declares tools with its own preamble and spacing.
+
+    What the two share is how a call comes BACK: both models emit
+    `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
+    so the existing parser needs nothing added for this family.
+
+    The whole thing is pinned byte for byte against chat_template.jinja rendered
+    with jinja2 (tests/test_glm53_chat_template.py). Getting the prompt nearly
+    right is the failure mode worth guarding: the model answers either way.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # il client li ha vietati: non si offrono
+
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non
+    # la nostra. `none` non arriva qui, spegne il ragionamento a monte.
+    effort = {"minimal": "Low", "low": "Low", "medium": "High",
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
+    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+    if tools:
+        prompt.append(_glm53_tool_block(tools))
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise APIError(400, "each message must be an object.", "messages")
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, list):                 # parti multimodali: solo il testo
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict) and part.get("type") == "text")
+        content = content or ""
+        if role == "user":
+            prompt.append(f"<|user|>{content}")
+        elif role == "system":
+            prompt.append(f"<|system|>{content}")
+        elif role == "tool":
+            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str) and "</think>" in content:
+                reasoning = content.split("</think>")[0].split("<think>")[-1]
+                content = content.split("</think>")[-1]
+            opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
+            prompt.append(f"<|assistant|>{opened}{content.strip()}"
+                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
+        else:
+            raise APIError(400, f"unsupported message role {role!r}.", "messages")
+
+    # Il prompt di generazione apre il blocco di ragionamento; con il
+    # ragionamento spento lo chiude subito.
+    #
+    # Il template ufficiale conosce solo la prima forma, perche' per lui il
+    # modello ragiona sempre. La seconda pero' non e' inventata: e' esattamente
+    # quello che il template scrive davanti a un turno passato che ragionamento
+    # non ne aveva (<think></think> seguito dal contenuto), quindi e' uno stato
+    # su cui il modello e' stato addestrato e non una posizione mai vista.
+    # Chi vuole il comportamento ufficiale non tocca niente: acceso e' il caso
+    # che combacia col template, ed e' quello che il test confronta.
+    prompt.append("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
+    return "".join(prompt)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None):
     """Render a chat request with the active engine's native prompt contract."""
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
-    renderer = (render_chat_kimi if ARCH == "kimi" else
+    renderer = (render_chat_glm53 if ARCH == "glm53" else
+                render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
@@ -1389,6 +1621,17 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
 # translation and the response/SSE shapes are new. Claude Code is the reference client.
 
 ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, not a crypto proof
+
+
+def starts_in_reasoning(enable_thinking):
+    """Se l'uscita del modello comincia DENTRO al blocco di ragionamento.
+
+    Dipende da come il prompt lo ha lasciato, e ogni famiglia lo lascia come
+    dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
+    solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
+    Se le due cose non concordano il ragionamento finisce incollato davanti
+    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
+    return enable_thinking
 
 
 class ThinkingStreamSplit:
@@ -1444,7 +1687,7 @@ class ThinkingStreamSplit:
 def split_thinking_reply(text, enable_thinking=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
     thinking, answer = [], []
-    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=enable_thinking)
+    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=starts_in_reasoning(enable_thinking))
     split.feed(text)
     split.finish()
     return "".join(thinking), "".join(answer)
@@ -2101,6 +2344,7 @@ class Engine:
             family = (resolve_model(model).descriptor if config.exists()
                       else family_by_id(ARCH))
         arch = family.id
+        self.model_dir = str(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
@@ -2287,7 +2531,7 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None):
+                 on_tool=None, image=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2352,6 +2596,16 @@ class Engine:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
+                # Le patch sono binarie e grosse: viaggiano in un frame loro,
+                # annunciato subito prima del SUBMIT a cui appartengono. Deve
+                # partire dentro lo stesso lock, o un'altra richiesta potrebbe
+                # infilarsi in mezzo e prendersi l'immagine di questa.
+                if image is not None:
+                    patches, grid_h, grid_w = image
+                    blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
+                    self.process.stdin.write(
+                        f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
+                        + blob + b"\n")
                 self.process.stdin.write(header + payload + xpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
@@ -2983,7 +3237,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None):
+                   enable_thinking=False, audio=None, image=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -3047,7 +3301,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    **({"audio": audio} if audio else {}))
+                    **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
@@ -3213,7 +3468,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
-                                             initial_thinking=enable_thinking)
+                                             initial_thinking=starts_in_reasoning(enable_thinking))
                          if glm_think else None)
                 def emit_tools(chunk):
                     if dbg_echo:
@@ -3228,7 +3483,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -3248,7 +3504,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     content_split = splitter
                 elif glm_think:                            # GLM <think> reasoning → reasoning_content
                     content_split = ThinkingStreamSplit(emit_reasoning, emit,
-                                                        initial_thinking=enable_thinking)
+                                                        initial_thinking=starts_in_reasoning(enable_thinking))
                 else:
                     content_split = None
                 def emit_plain(chunk):
@@ -3259,7 +3515,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -3328,11 +3585,24 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+        messages = body.get("messages")
+        # Le immagini diventano segnaposto PRIMA del rendering: il renderer
+        # tratta poi turni di solo testo, e il conto dei segnaposto e quello
+        # degli embedding non possono divergere.
+        image = None
+        if ARCH == "glm53":
+            messages, images = expand_glm53_images(
+                messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
-                        audio=b"".join(audio_clips) if audio_clips else None)
+                        audio=b"".join(audio_clips) if audio_clips else None,
+                        image=image)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
@@ -3560,8 +3830,11 @@ class APIHandler(BaseHTTPRequestHandler):
                                            emit_thinking if enable_thinking else None,
                                            close_thinking if enable_thinking else None)
             else:
+                # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
+                # lo splitter serve pure col ragionamento "spento", o il
+                # pensiero finisce incollato davanti alla risposta.
                 split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if enable_thinking else None)
+                         if starts_in_reasoning(enable_thinking) else None)
 
             def on_text(chunk):
                 raw.append(chunk)

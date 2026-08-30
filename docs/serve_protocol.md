@@ -33,6 +33,7 @@ recognize**; that is the protocol's forward-compatibility rule.
 
 ```
 SUBMIT <id> <slot> <bytes> <max_tokens> <temperature> <top_p>\n<payload>\n
+IMAGE <id> <bytes> <grid_h> <grid_w>\n<payload>\n
 STOP <id>\n
 CANCEL <id>\n
 ```
@@ -45,6 +46,14 @@ CANCEL <id>\n
 - `bytes` — exact byte length of `payload` (UTF-8, may contain newlines). The engine
   reads exactly that many bytes after the header line, then one trailing `\n`.
 - `payload` — the fully rendered prompt (the server owns the chat template).
+- `IMAGE` (GLM-5.3-Flash) announces the pre-extracted patches of one image for
+  the request with the same `id`, and must arrive immediately before its
+  `SUBMIT`. `payload` is `bytes` of little-endian f32 in the tower's patch
+  order; the server owns the preprocessing (`c/tools/glm53_image.py`). The
+  prompt must already contain one `<|image|>` placeholder per output token,
+  i.e. `(grid_h/merge) x (grid_w/merge)` of them: the engine refuses a mismatch
+  rather than answering about a different picture. An engine holds one pending
+  image and discards an earlier one.
 - `STOP` ends generation through the normal successful `DONE` path. Statistics,
   usage history, and KV state are persisted; the HTTP gateway uses it after a
   client-provided stop sequence matches.

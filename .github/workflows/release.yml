@@ -62,10 +62,10 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri inkling kimi_k3 olmoe qwen36; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36; do
             make $t ${{ matrix.make_args }}
           done
-          ls -lh colibri${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
@@ -114,6 +114,7 @@ jobs:
           # "engine is not built. Run: coli build" -- with the engine sitting right there.
           # The version lives in the ARCHIVE name, which is where a downloader looks for it.
           cp c/colibri${{ matrix.ext }} dist/colibri${{ matrix.ext }}
+          cp c/glm53${{ matrix.ext }} dist/glm53${{ matrix.ext }}
           # The sibling engines go in under their plain names too: `coli` resolves the
           # engine from the model's config.json and looks for kimi_k3/inkling next to
           # itself (c/coli, engine_for()). ~830 KB for all four.
@@ -136,6 +137,11 @@ jobs:
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
           cp c/coli dist/
+          # Windows has nothing to click otherwise: `coli` is an extensionless
+          # Python script, and the .exe files are engines that exit at once
+          # without a model (#1241). coli.cmd is both the double-click entry
+          # point and what `coli chat ...` resolves to in cmd/PowerShell.
+          if [ "${{ matrix.ext }}" = ".exe" ]; then cp c/coli.cmd dist/; fi
           cp c/version.py dist/
           cp c/openai_server.py dist/
           cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import

@@ -84,6 +84,7 @@ class ToolCallingV4E2E(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             cls.port = probe.getsockname()[1]
         env = dict(os.environ, MOCK_LOG=str(cls.mock_log))
+        env.pop("COLI_API_KEY", None)
         cls.server = subprocess.Popen(
             [sys.executable, str(SERVER), "--model", cls.tmp.name,
              "--engine", str(mock), "--arch", "deepseek_v4", "--port", str(cls.port)],
@@ -91,7 +92,8 @@ class ToolCallingV4E2E(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{cls.port}/v1"
         for _ in range(100):
             try:
-                urllib.request.urlopen(cls.base + "/models", timeout=2)
+                with urllib.request.urlopen(cls.base + "/models", timeout=2):
+                    pass
                 return
             except OSError:
                 if cls.server.poll() is not None:
@@ -110,11 +112,12 @@ class ToolCallingV4E2E(unittest.TestCase):
         req = urllib.request.Request(
             self.base + path, json.dumps(body).encode(),
             {"Content-Type": "application/json"})
-        return json.loads(urllib.request.urlopen(req, timeout=30).read())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
 
     def model_id(self):
-        return json.loads(urllib.request.urlopen(self.base + "/models", timeout=5)
-                          .read())["data"][0]["id"]
+        with urllib.request.urlopen(self.base + "/models", timeout=5) as resp:
+            return json.loads(resp.read())["data"][0]["id"]
 
     def test_tool_call_non_stream(self):
         out = self.post({"model": self.model_id(),
@@ -154,16 +157,17 @@ class ToolCallingV4E2E(unittest.TestCase):
                         "stream": True}).encode(),
             {"Content-Type": "application/json"})
         got_calls, leak = False, False
-        for raw in urllib.request.urlopen(req, timeout=30):
-            line = raw.decode().strip()
-            if not line.startswith("data: ") or line == "data: [DONE]":
-                continue
-            for choice in json.loads(line[6:])["choices"]:
-                delta = choice.get("delta", {})
-                if delta.get("tool_calls"):
-                    got_calls = True
-                elif "DSML" in (delta.get("content") or ""):
-                    leak = True
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for raw in resp:
+                line = raw.decode().strip()
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                for choice in json.loads(line[6:])["choices"]:
+                    delta = choice.get("delta", {})
+                    if delta.get("tool_calls"):
+                        got_calls = True
+                    elif "DSML" in (delta.get("content") or ""):
+                        leak = True
         self.assertTrue(got_calls, "no tool_calls deltas streamed")
         self.assertFalse(leak, "DSML markers leaked into streamed content")
 

@@ -40,6 +40,12 @@ tiers, the reason for each placement, and the expected bottleneck. The default
 and router decisions unless `--topk` or `--topp` is passed; those explicit lossy
 overrides print a warning and proceed.
 
+The plan also emits a machine-readable `next_actions` list and renders it in
+the terminal. A missing storage measurement is marked `required`; subsequent
+profiling and tuning work is `recommended`. These actions produce the evidence
+needed to improve a plan on this machine—they do not silently enable an
+unmeasured optimization.
+
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
 limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that

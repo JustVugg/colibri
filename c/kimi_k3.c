@@ -120,6 +120,11 @@
 #include "segment_adapters.h"
 #include "segment_adapter_internal.h"
 #endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "edge_tok_internal.h"
+#endif
 
 /* ---------- config ---------- */
 typedef struct {
@@ -1138,7 +1143,13 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
           g_k3_val_layer=-1;
         } else {
           const char *ofn=getenv("K3_VALIDATE_OUT");
-          if(!ofn) ofn="/tmp/k3_val";
+          /* CWD-relative, not a /tmp path: same rule as test_stops.c and
+             test_pipe_block.c, since the windows job builds native .exe
+             files that resolve Windows paths and /tmp is not one. The
+             chosen path is printed on both the success and the failure
+             branch below, so a caller relying on the old default is told
+             where the dump went. */
+          if(!ofn) ofn="k3_val";
           g_k3_val_fp=fopen(ofn,"w");
           if(!g_k3_val_fp){
             fprintf(stderr,"[K3-VAL] cannot open %s (%s) — disabled\n",ofn,strerror(errno));
@@ -3028,6 +3039,7 @@ int main(int argc, char **argv){
      * below, so an error says what to do instead of only what went wrong. */
     if(!serving && (argc<2 || !strcmp(argv[1],"--help") || !strcmp(argv[1],"-h")
                           || !strcmp(argv[1],"help"))){
+        if(argc<2){ coli_print_launcher_help("Kimi K3"); return 1; }
         k3_usage(argv[0]);
         return argc<2 ? 1 : 0;          /* asking for help is not a failure */
     }
@@ -3726,3 +3738,257 @@ int coli_kimi_segment_adapter_register(void) {
     return coli_segment_adapter_register(&kimi_segment_adapter);
 }
 #endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+    uint32_t state_width, nbmax;
+} KimiEdgeEngine;
+
+static uint64_t kimi_edge_w_bytes(const W *weight) {
+    uint64_t cells = (uint64_t)weight->O * weight->I;
+    if (weight->fmt == 0) return cells * sizeof(float);
+    if (weight->fmt == 1) return cells + (uint64_t)weight->O * sizeof(float);
+    if (weight->fmt == 2)
+        return (cells + 1u) / 2u + (uint64_t)weight->O * sizeof(float);
+    if (weight->fmt == 4) {
+        uint64_t groups = ((uint64_t)weight->I + weight->gs - 1u) /
+                          (uint64_t)weight->gs;
+        return (cells + 1u) / 2u +
+               (uint64_t)weight->O * groups * sizeof(float);
+    }
+    return 0;
+}
+
+static void kimi_edge_engine_destroy(void *engine_impl) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    if (!engine) return;
+    free(engine->model.final_norm); free(engine->model.out_sw);
+    w_release_host(&engine->model.lm_head);
+    st_destroy(&engine->model.S);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int kimi_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid Kimi K3 Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 Edge supports CPU only");
+    KimiEdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening Kimi K3 Edge");
+    Model *model = &engine->model;
+    load_cfg(&model->c, options->model_dir);
+    st_init_multi(&model->S, options->model_dir, getenv("K3_DIRS"));
+    model->pfx[0] = '\0';
+    if (!st_has(&model->S, "model.layers.0.input_layernorm.weight") &&
+        st_has(&model->S,
+               "language_model.model.layers.0.input_layernorm.weight"))
+        snprintf(model->pfx, sizeof(model->pfx), "language_model.");
+    Cfg *config = &model->c;
+    uint64_t nbmax = ((uint64_t)config->n_layers + config->res_bs - 1u) /
+                     (uint64_t)config->res_bs;
+    uint64_t state_width = (1u + nbmax) * (uint64_t)config->hidden;
+    if (!nbmax || state_width > UINT32_MAX) {
+        kimi_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 boundary state is too wide");
+    }
+    engine->nbmax = (uint32_t)nbmax;
+    engine->state_width = (uint32_t)state_width;
+    g_bits_env = getenv("K3_BITS") != NULL;
+    g_k3_mmap = getenv("K3_MMAP") ? atoi(getenv("K3_MMAP")) : 0;
+    g_k3_idot = getenv("K3_IDOT") ? atoi(getenv("K3_IDOT")) : 1;
+    int head_bits = getenv("K3_HEAD_BITS")
+        ? atoi(getenv("K3_HEAD_BITS")) : 8;
+    char name[512];
+    snprintf(name, sizeof(name), "%smodel.norm.weight", model->pfx);
+    if (!st_has(&model->S, name)) {
+        kimi_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 final head is not present");
+    }
+    model->has_head = 1;
+    model->final_norm = f32_load(model, "model.norm.weight", config->hidden);
+    float *residual_norm = f32_load(
+        model, "model.output_attn_res_norm.weight", config->hidden);
+    float *residual_projection = f32_load(
+        model, "model.output_attn_res_proj.weight", config->hidden);
+    model->out_sw = falloc(config->hidden);
+    for (int item = 0; item < config->hidden; item++)
+        model->out_sw[item] = residual_norm[item] * residual_projection[item];
+    free(residual_norm); free(residual_projection);
+    w_load(model, &model->lm_head, "lm_head.weight",
+           config->vocab, config->hidden, head_bits);
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    uint64_t resident = kimi_edge_w_bytes(&model->lm_head) +
+                        2u * (uint64_t)config->hidden * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        kimi_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 Edge exceeds memory limit");
+    }
+    int bits = getenv("K3_BITS") ? atoi(getenv("K3_BITS")) : 4;
+    int mla_bits = getenv("K3_MLA_BITS") ? atoi(getenv("K3_MLA_BITS")) : 8;
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "kimi");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "kimi-k3/attnres-kda-mla-dsa-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "kimi-k3/q%d-mla%d-mxfp4-idot%d/f32/cpu-v1",
+             bits, mla_bits, g_k3_idot != 0);
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "kimi-k3/rank-byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->vocab_size = (uint32_t)config->vocab;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = UINT32_MAX;
+    capabilities->num_layers = (uint32_t)config->n_layers;
+    capabilities->bos_token_id = config->bos;
+    capabilities->eos_token_id = config->n_eos ? config->eos[0] : -1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int kimi_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int kimi_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int kimi_edge_embed(void *engine_impl,
+                           const ColiEdgeEmbedRequest *request,
+                           char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *output = (float *)request->output;
+    char name[512];
+    snprintf(name, sizeof(name), "%smodel.embed_tokens.weight",
+             engine->model.pfx);
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= config->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 token ID is out of range");
+        float *state = output + (size_t)row * engine->state_width;
+        memset(state, 0, (size_t)engine->state_width * sizeof(float));
+        st_read_slice_f32(&engine->model.S, name,
+                          (int64_t)token * config->hidden,
+                          config->hidden, state, 0);
+    }
+    return 0;
+}
+
+static int kimi_edge_select(void *engine_impl,
+                            const ColiEdgeSelectRequest *request,
+                            char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *mixed = falloc(config->hidden);
+    float *logits = falloc(config->vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge selection cancelled");
+        }
+        const float *state = input + (size_t)row * engine->state_width;
+        res_mix(mixed, state, state + config->hidden,
+                (int)engine->nbmax, config->hidden,
+                engine->model.out_sw, config->eps);
+        rmsnorm_(mixed, mixed, engine->model.final_norm,
+                 config->hidden, config->eps);
+        w_matmul(logits, mixed, &engine->model.lm_head, 1);
+        if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge head failed");
+        }
+    }
+    free(logits); free(mixed);
+    return 0;
+}
+
+static int kimi_edge_logits(void *engine_impl,
+                            const ColiEdgeLogitsRequest *request,
+                            char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *mixed = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge logits cancelled");
+        }
+        const float *state = input + (size_t)row * engine->state_width;
+        res_mix(mixed, state, state + config->hidden,
+                (int)engine->nbmax, config->hidden,
+                engine->model.out_sw, config->eps);
+        rmsnorm_(mixed, mixed, engine->model.final_norm,
+                 config->hidden, config->eps);
+        w_matmul(request->logits + (size_t)row * config->vocab,
+                 mixed, &engine->model.lm_head, 1);
+    }
+    free(mixed);
+    return 0;
+}
+
+static const ColiEdgeAdapter kimi_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "kimi",
+    kimi_edge_engine_open, kimi_edge_engine_destroy,
+    kimi_edge_tokenize, kimi_edge_detokenize,
+    kimi_edge_embed, kimi_edge_select, kimi_edge_logits, {0}
+};
+
+int coli_kimi_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&kimi_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

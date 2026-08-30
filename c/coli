@@ -24,7 +24,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
+import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
 
 # input() only gets line editing and UP/DOWN history once the readline module
 # has been LOADED — without it the terminal's arrow-key escape sequences are
@@ -455,8 +455,21 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi"):
+    if arch in ("deepseek_v4", "kimi", "glm53"):
         if a.ram: env["RAM_GB"] = str(a.ram)
+    if arch == "glm53":
+        # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
+        # BF16 sono 19 GB che nessuno recupera. Chi vuole la precisione piena
+        # mette GLM53_BITS=32, e questo setdefault gli lascia la scelta.
+        env.setdefault("GLM53_BITS", "4")
+        # Budget della cache degli esperti. Se l'utente ha dato --ram, si lascia
+        # spazio a densi, stato e sistema invece di prendersi tutto.
+        if a.ram:
+            try:
+                spare = max(2.0, float(a.ram) - 8.0)
+                env.setdefault("GLM53_EXPERT_GB", f"{spare:.1f}")
+            except (TypeError, ValueError):
+                pass
     if a.ctx:
         env[family_by_id(arch).limits.context_env] = str(a.ctx)
     if arch == "deepseek_v4":
@@ -1208,6 +1221,11 @@ def cmd_run(a):
                 try: os.unlink(prompt_path)
                 except OSError: pass
         sys.exit(result)
+    if arch=="glm53":
+        e=env_for_engine(a,arch)
+        cmd=[engine,"--model",os.path.abspath(a.model),"--prompt",prompt,
+             "--greedy",str(ngen_for(a,interactive=True,family=family))]
+        sys.exit(subprocess.call(cmd,env=e))
     if arch=="olmoe":
         # olmoe.c now speaks the gateway's SERVE protocol too (`coli chat`/
         # `coli web`/`coli serve` use it), but `coli run` predates that and
@@ -1272,9 +1290,17 @@ def chat_attached(a, base, model_id):
         if msg in (":q",":quit","exit"): break
         if not msg.strip(): continue
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
-        msgs.append({"role":"user","content":msg})
-        body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
-                         "max_tokens":ngen_for(a,interactive=True)}).encode()
+        payload = message_with_images(msg)
+        if payload is None: continue          # percorso sbagliato: gia' detto
+        msgs.append({"role":"user","content":payload})
+        # Il livello di ragionamento e' una leva di tempo, non di gusto: su un
+        # motore che streamma gli esperti da disco, "max" vuol dire centinaia
+        # di token di riflessione prima della prima parola di risposta.
+        request = {"model":model_id,"messages":msgs,"stream":True,
+                   "max_tokens":ngen_for(a,interactive=True)}
+        if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
+        if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        body=json.dumps(request).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
@@ -1377,6 +1403,73 @@ def kv_resume_notice(model_dir):
         print(f"  {C.dgray}  it steers tone, language and topic. :reset clears it · "
               f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
     except (OSError, struct.error): pass
+
+IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
+# Un percorso che finisce in un'estensione di immagine, nelle due forme che
+# capita di incollare: Windows (C:\Users\...) e POSIX (/home/...  ~/foto.png).
+#
+# Il confine e' l'ESTENSIONE, non lo spazio: le cartelle di Windows si chiamano
+# "Nuova cartella" e spezzare sugli spazi le taglierebbe a meta'. E non si passa
+# da shlex, che in modalita' POSIX mangia le barre rovesciate e va in errore su
+# un apostrofo -- cioe' su una frase italiana su due.
+_ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
+IMAGE_PATH = re.compile(
+    r"(?:[A-Za-z]:\\|~?/|\./)[^\"'<>|?*\n]*?\.(?:" + _ESTENSIONI + r")\b",
+    re.IGNORECASE)
+
+
+def to_local_path(token):
+    """Il percorso come lo vede questa macchina.
+
+    Un percorso Windows incollato da Esplora risorse dentro WSL indica un file
+    che da qui si chiama /mnt/<lettera>/...: senza tradurlo non esiste."""
+    token = token.strip().strip('"').strip("'")
+    if re.fullmatch(r"[A-Za-z]:\\.*", token, re.S):
+        if sys.platform == "win32":
+            return token
+        return f"/mnt/{token[0].lower()}/" + token[2:].replace("\\", "/").lstrip("/")
+    return os.path.expanduser(token)
+
+
+def message_with_images(text):
+    """Un percorso incollato diventa un'immagine, il resto resta testo.
+
+    Chi scrive in chat non ha voglia di comporre JSON: incolla il percorso, o
+    ce lo trascina sopra e il terminale glielo mette fra virgolette.
+
+    Restituisce None quando qualcosa SEMBRA un'immagine e il file non c'e',
+    dopo averlo detto. Il silenzio qui costa caro: si aspetta la risposta per
+    minuti e solo alla fine si scopre che il modello non ha ricevuto nulla."""
+    if not text.strip():
+        return text
+
+    found, rest = [], text
+    for match in IMAGE_PATH.finditer(text):
+        raw = match.group(0)
+        candidate = to_local_path(raw)
+        if not os.path.isfile(candidate):
+            print(f"  {C.yel}✗ non trovo{C.r} {raw}"
+                  + (f"\n    da qui si chiamerebbe {candidate}" if candidate != raw else ""))
+            return None
+        found.append(candidate)
+        rest = rest.replace(raw, " ", 1)
+
+    if not found:
+        return text
+    if len(found) > 1:
+        # Il motore ne tiene una in sospeso per volta. Dirlo adesso costa un
+        # secondo; scoprirlo dal server dopo il prefill ne costa centinaia.
+        print(f"  {C.yel}✗ una immagine per messaggio{C.r}: ne hai indicate "
+              f"{len(found)}")
+        return None
+    content = []
+    rest = " ".join(rest.split()).strip()
+    if rest:
+        content.append({"type":"text","text":rest})
+    for path in found:
+        content.append({"type":"image_url","image_url":{"url":path}})
+    return content
+
 
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
@@ -1901,6 +1994,12 @@ def main():
     # clamps to it and the control silently does nothing above 1024 (#889).
     common.add_argument("--ngen", type=int, default=None)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
+    common.add_argument("--effort", choices=("minimal","low","medium","high","xhigh"),
+                        default=None)   # quanto il modello riflette prima di rispondere
+    # --think / --no-think: se riflettere del tutto. Spento, il prompt chiude
+    # subito il blocco e la risposta arriva alla prima parola.
+    common.add_argument("--think", action="store_true", default=None)
+    common.add_argument("--no-think", dest="think", action="store_false")
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     common.add_argument("--cluster-workers", default=os.environ.get("CLUSTER_WORKERS"),
                         help="comma-separated expert workers, host:port,...")

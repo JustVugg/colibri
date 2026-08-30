@@ -190,7 +190,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri inkling kimi_k3 olmoe qwen36"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"

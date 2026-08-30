@@ -89,6 +89,11 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #include "segment_adapters.h"
 #include "segment_adapter_internal.h"
 #endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "edge_tok_internal.h"
+#endif
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -2583,6 +2588,51 @@ static void *mir_stripe_worker(void *a){
     return NULL;
 }
 /* Returns total bytes read (== len) on success, -1 to make the caller fall back. */
+/* Split `len` across `nsf` replicas PROPORTIONALLY to their measured bandwidth,
+ * rather than len/nsf. Stripe i reads sz[i] bytes at off[i] from replica
+ * srep[(rep+i)%nsf]; offsets are contiguous and the sizes sum to exactly len.
+ *
+ * mir_pread_striped joins every stripe, so an equal split makes the whole read
+ * as slow as the slowest drive - and the weights needed to avoid that are
+ * already computed and already in scope. g_mir_cut[] is the same bandwidth
+ * ranking expert_route() uses for whole-expert placement, from
+ * COLI_DISK_WEIGHTS or the startup probe. Before this it decided WHICH drive
+ * holds an expert and was ignored for how much of one each drive reads, so a
+ * correctly down-weighted slow drive still got an equal share of every stripe.
+ *
+ * Measured on 2x NVMe + 1x SATA (990 Pro 5.69, SN850P 5.03, MX500 0.44 GB/s),
+ * 19 MB expert, O_DIRECT, one thread per leg as in the caller:
+ *
+ *   2 legs, equal      9.5 / 9.5 MB          -> join waits  2.0 ms
+ *   3 legs, equal      6.33 / 6.33 / 6.33    -> join waits 12.6 ms
+ *   3 legs, weighted   9.69 / 8.56 / 0.75    -> join waits  1.9 ms
+ *
+ * So adding a drive the engine already knows is 10x slower cost 6.3x on every
+ * striped read, and the same drive weighted is a small net win.
+ *
+ * Split out of the caller so the arithmetic is testable without fds or threads
+ * (tests/test_mirror_stripe_split.c). Everything it reads is an argument except
+ * g_mir_cut, so a test can drive it by setting that alone. */
+static void mir_stripe_plan(int64_t len, int nsf, const int *srep, int rep,
+                            int64_t *off, int64_t *sz){
+    int64_t wsum=0, w[MIR_REPS];
+    for(int i=0;i<nsf;i++){
+        int r=srep[i], lo=r?g_mir_cut[r-1]:0;
+        w[i]=g_mir_cut[r]-lo;
+        if(w[i]<1) w[i]=1;                    /* a zero share would strand bytes */
+        wsum+=w[i];
+    }
+    int64_t acc=0;
+    for(int i=0;i<nsf;i++){
+        int k=(rep+i)%nsf;                    /* chunk 0 on the routed replica */
+        int64_t want = i==nsf-1 ? len-acc     /* last leg absorbs the remainder */
+                                : ((len*w[k]/wsum) + 4095) & ~4095LL;
+        if(want<0) want=0;
+        if(acc+want>len) want=len-acc;
+        off[i]=acc; sz[i]=want; acc+=want;
+    }
+}
+
 static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,int64_t base){
     if(!g_mir_stripe || g_mir_nrep<2 || len < (4<<20)) return -1;
     int sfd[MIR_REPS], srep[MIR_REPS], nsf=0;
@@ -2591,14 +2641,22 @@ static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,
         if(f>=0){ sfd[nsf]=f; srep[nsf]=r; nsf++; }
     }
     if(nsf<2) return -1;
-    int64_t chunk=((len+nsf-1)/nsf + 4095) & ~4095LL;
+    int64_t off[MIR_REPS], sz[MIR_REPS];
+    mir_stripe_plan(len, nsf, srep, rep, off, sz);
     MirStripe st[MIR_REPS]; pthread_t th[MIR_REPS]; int nth=0, ns=0;
+    /* Which replica each stripe landed on. Tracked explicitly rather than
+     * recomputed as (rep+i)%nsf below: a share that rounds away is skipped, so
+     * the stripe index is no longer the leg index and the old expression would
+     * bill the wrong drive. */
+    int sowner[MIR_REPS];
     for(int i=0;i<nsf;i++){
-        int64_t o=(int64_t)i*chunk; if(o>=len) break;
+        if(sz[i]<=0) continue;                /* a share that rounded away */
         int k=(rep+i)%nsf;                    /* chunk 0 on the routed replica */
-        st[ns]=(MirStripe){sfd[k], buf+o, len-o<chunk?len-o:chunk, base+o, -1};
+        st[ns]=(MirStripe){sfd[k], buf+off[i], sz[i], base+off[i], -1};
+        sowner[ns]=srep[k];
         ns++;
     }
+    if(ns<2) return -1;                       /* nothing left to parallelise */
     for(int i=1;i<ns;i++)
         if(pthread_create(&th[nth],NULL,mir_stripe_worker,&st[i])==0) nth++;
         else st[i].r=pread(st[i].fd,st[i].buf,(size_t)st[i].len,st[i].off);
@@ -2606,9 +2664,8 @@ static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,
     for(int i=0;i<nth;i++) pthread_join(th[i],NULL);
     for(int i=0;i<ns;i++) if(st[i].r!=st[i].len) return -1;
     for(int i=0;i<ns;i++){
-        int k=(rep+i)%nsf;
-        atomic_fetch_add_explicit(&g_mir_bytes[srep[k]],st[i].len,memory_order_relaxed);
-        atomic_fetch_add_explicit(&g_mir_nread[srep[k]],1,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mir_bytes[sowner[i]],st[i].len,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mir_nread[sowner[i]],1,memory_order_relaxed);
     }
     return len;
 }
@@ -6110,8 +6167,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
         for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]&&dev_ok[di]==0){
             double td=g_prof?now_s():0;
-            dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
-                group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
+            dev_ok[di]=coli_cuda_expert_group_pinned(dev_g[di],dev_u[di],dev_d[di],
+                dev_rows[di],dev_nc[di],group_y+(int64_t)dev_off[di]*D,
+                group_x+(int64_t)dev_off[di]*D,spec_pinned());
             if(g_prof)dev_time[di]=now_s()-td;
         }
         for(int di=0;di<g_cuda_ndev;di++){
@@ -6171,7 +6229,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
         atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
     if(shared_min<16)shared_min=16;
-    if(shared_cuda==0&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
+    if(shared_cuda==0&&!spec_pinned()&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
        l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
        getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
        qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
@@ -10652,7 +10710,8 @@ int main(int argc, char **argv){
         puts("AVX512 i3 selftest: ok"); return 0;
     }
 #endif
-    const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    const char *snap=getenv("SNAP");
+    if(!snap){ coli_print_launcher_help("GLM-5.2"); return 1; }
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
@@ -11020,7 +11079,13 @@ int main(int argc, char **argv){
         atexit(cluster_close_all);
     }
 #endif
-    Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     /* KV_TQ requires power-of-two row widths: both codecs rotate through a
      * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
      * other width. On a model whose kv_lora/qk_rope are not powers of two that
@@ -11767,3 +11832,223 @@ int coli_glm_segment_adapter_register(void) {
     return coli_segment_adapter_register(&glm_segment_adapter);
 }
 #endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+} GlmEdgeEngine;
+
+static void glm_edge_qt_destroy(QT *tensor) {
+    if (!tensor) return;
+    free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
+    memset(tensor, 0, sizeof(*tensor));
+}
+
+static void glm_edge_engine_destroy(void *engine_impl) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    if (!engine) return;
+    glm_edge_qt_destroy(&engine->model.embed);
+    glm_edge_qt_destroy(&engine->model.lm_head);
+    free(engine->model.final_norm);
+    st_destroy(&engine->model.S);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int glm_edge_has_dsa(Model *model) {
+    Cfg *config = &model->c;
+    int enabled = config->index_topk > 0 && config->index_nh > 0 &&
+                  config->index_hd > 0 && config->index_hd <= 256;
+    char name[320];
+    for (int layer = 0; enabled && layer < config->n_layers; layer++) {
+        if (!config->idx_type[layer]) continue;
+        snprintf(name, sizeof(name),
+                 "model.layers.%d.self_attn.indexer.wq_b.weight", layer);
+        if (!st_has(&model->S, name)) enabled = 0;
+    }
+    if (getenv("DSA") && atoi(getenv("DSA")) == 0) enabled = 0;
+    return enabled;
+}
+
+static int glm_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid GLM Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM Edge supports CPU only");
+    int ebits = getenv("GLM_SEGMENT_EBITS")
+        ? atoi(getenv("GLM_SEGMENT_EBITS")) : 8;
+    int dbits = getenv("GLM_SEGMENT_DBITS")
+        ? atoi(getenv("GLM_SEGMENT_DBITS")) : ebits;
+    if (ebits < 2 || ebits > 16 || dbits < 2 || dbits > 16)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM Edge bit widths must be 2..16");
+    GlmEdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening GLM Edge");
+    Model *model = &engine->model;
+    model->ebits = ebits; model->dbits = dbits;
+    load_cfg(&model->c, options->model_dir);
+    const char *model_dirs = getenv("COLI_MODEL_DIRS");
+    st_init_multi(&model->S, options->model_dir,
+                  model_dirs && *model_dirs ? model_dirs : NULL);
+    int io_bits = dbits >= 8 ? 16 : dbits;
+    model->embed = qt_load(model, "model.embed_tokens.weight",
+                           model->c.vocab, model->c.hidden, io_bits);
+    model->lm_head = qt_load(model, "lm_head.weight",
+                             model->c.vocab, model->c.hidden, io_bits);
+    model->final_norm = ld(model, "model.norm.weight");
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    int has_dsa = glm_edge_has_dsa(model);
+    uint64_t resident = (uint64_t)qt_bytes(&model->embed) +
+                        (uint64_t)qt_bytes(&model->lm_head) +
+                        (uint64_t)model->c.hidden * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        glm_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM Edge exceeds memory limit");
+    }
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "glm");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "glm/mla-rope-dsa-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "glm/e%d-d%d-dsa%d-kvf32/cpu-v1", ebits, dbits, has_dsa);
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "glm/cl100k-byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = (uint32_t)model->c.hidden;
+    capabilities->vocab_size = (uint32_t)model->c.vocab;
+    capabilities->max_batch_rows = 512;
+    capabilities->max_context_tokens = UINT32_MAX;
+    capabilities->num_layers = (uint32_t)model->c.n_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int glm_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int glm_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int glm_edge_embed(void *engine_impl,
+                          const ColiEdgeEmbedRequest *request,
+                          char *error, size_t error_size) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    int hidden = engine->model.c.hidden;
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= engine->model.c.vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM token ID is out of range");
+        embed_row(&engine->model, token, output + (size_t)row * hidden);
+    }
+    return 0;
+}
+
+static int glm_edge_select(void *engine_impl,
+                           const ColiEdgeSelectRequest *request,
+                           char *error, size_t error_size) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    float *logits = falloc(config->vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM Edge selection cancelled");
+        }
+        rmsnorm(normalized, input + (size_t)row * config->hidden,
+                engine->model.final_norm, config->hidden, config->eps);
+        matmul_qt(logits, normalized, &engine->model.lm_head, 1);
+        if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM Edge head failed");
+        }
+    }
+    free(logits); free(normalized);
+    return 0;
+}
+
+static int glm_edge_logits(void *engine_impl,
+                           const ColiEdgeLogitsRequest *request,
+                           char *error, size_t error_size) {
+    GlmEdgeEngine *engine = (GlmEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM Edge logits cancelled");
+        }
+        rmsnorm(normalized, input + (size_t)row * config->hidden,
+                engine->model.final_norm, config->hidden, config->eps);
+        matmul_qt(request->logits + (size_t)row * config->vocab,
+                  normalized, &engine->model.lm_head, 1);
+    }
+    free(normalized);
+    return 0;
+}
+
+static const ColiEdgeAdapter glm_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "glm",
+    glm_edge_engine_open, glm_edge_engine_destroy,
+    glm_edge_tokenize, glm_edge_detokenize,
+    glm_edge_embed, glm_edge_select, glm_edge_logits, {0}
+};
+
+int coli_glm_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&glm_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

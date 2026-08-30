@@ -4,6 +4,11 @@ export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
+  /* Immagini allegate al turno, come data: URI. Restano sul messaggio e non
+     dentro `content` perche' la cronologia le deve poter rimandare al server
+     insieme al testo: un secondo turno che parla della foto senza la foto
+     riceverebbe una risposta su niente. */
+  images?: string[]
   /* Reasoning models stream their thinking on a separate delta field before
      the answer. Kept apart from `content` so it can be rendered as its own
      block and excluded from what is sent back as conversation history. */
@@ -160,7 +165,19 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     signal: options.signal,
     body: JSON.stringify({
       model: options.model,
-      messages: options.messages.map(({ role, content }) => ({ role, content })),
+      /* Un turno con immagini viaggia nella forma a parti dell'API OpenAI;
+         senza, resta la stringa di sempre e nessun server vede una differenza. */
+      messages: options.messages.map(({ role, content, images }) =>
+        images && images.length
+          ? {
+              role,
+              content: [
+                ...(content ? [{ type: "text", text: content }] : []),
+                ...images.map((url) => ({ type: "image_url", image_url: { url } })),
+              ],
+            }
+          : { role, content },
+      ),
       temperature: options.temperature,
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.enableThinking,
