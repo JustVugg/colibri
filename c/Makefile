@@ -1117,6 +1117,9 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
+qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
