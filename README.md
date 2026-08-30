@@ -583,10 +583,11 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. Seven families run today (GLM-5.2,
-  Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.8-Flash-Next, Qwen3.6, OLMoE); further open-weight
-  families — **MiniMax** among the candidates — earn an engine the way the
-  first seven did: when someone measures one end to end.
+  routed experts can be staged the same way. Eight families run today (GLM-5.2,
+  GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.8-Flash-Next,
+  Qwen3.6, OLMoE); further open-weight families — **MiniMax** among the
+  candidates — earn an engine the way the first eight did: when someone
+  measures one end to end.
 
 ## Supporting the project
 

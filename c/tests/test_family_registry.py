@@ -1120,6 +1120,48 @@ class FamilyRegistryTest(unittest.TestCase):
                 f"non-interactive default ({family.limits.default_max_output}) -- "
                 f"reasoning can consume it before the answer starts")
 
+    def test_every_readme_names_every_family(self):
+        """Ogni README, tradotto compreso, deve nominare ogni famiglia.
+
+        E' la terza volta oggi che un conteggio ripetuto in due posti diverge:
+        release.yml costruiva sei motori e ne copiava sette, i contatori degli
+        adapter dicevano 7 con 8 famiglie registrate, e i README dichiaravano
+        sei, sette e otto famiglie contemporaneamente -- l'inglese si
+        contraddiceva da solo fra riga 21 e riga 586.
+
+        Il nome della famiglia e' il controllo giusto, non il numerale: sono
+        quattro lingue e il numerale si scrive in quattro modi, mentre
+        `Qwen3.8-Flash-Next` si scrive uguale ovunque. Chi aggiunge una famiglia
+        e dimentica le traduzioni lo scopre qui invece che da un utente che
+        legge la sua lingua e non trova il modello.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        readmes = ["README.md", "README.it.md", "README.zh-CN.md", "README.zh-TW.md"]
+        for name in readmes:
+            path = repo / name
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            for family in FAMILIES:
+                # Il nome senza il suffisso di taglia: i README scrivono
+                # "**Qwen3.6** (35B-A3B)", non "Qwen3.6-35B-A3B", perche' la
+                # dimensione sta fra parentesi. Cercare il display_name intero
+                # fallirebbe su una differenza di formattazione invece che su
+                # una famiglia mancante, che e' quello che qui interessa.
+                parts = []
+                for piece in family.display_name.split("-"):
+                    if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                        break
+                    parts.append(piece)
+                token = "-".join(parts) or family.display_name
+                # assertTrue e non assertIn: assertIn stampa il README intero
+                # nel messaggio di errore, e mille righe di markdown nascondono
+                # la riga che dice cosa manca.
+                self.assertTrue(token in text,
+                                f"{name}: does not mention {family.display_name} "
+                                f"({family.id}); a reader in that language cannot "
+                                f"tell the family is supported")
+
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")
