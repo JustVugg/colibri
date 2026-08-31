@@ -59,6 +59,7 @@ static int qwen36_max_ctx(void) {
 #endif
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
+#include "coli_env.h"
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -2607,6 +2608,8 @@ static void serve_loop(Model *m){
 }
 
 int main(int argc, char **argv) {
+    coli_env_check(CE_QWEN, "qwen36");
+    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_QWEN, "qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

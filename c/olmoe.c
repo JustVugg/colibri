@@ -36,6 +36,7 @@
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
 #include "omp_tune.h"
+#include "coli_env.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "serve_codec.h"
 #ifdef COLI_SEGMENT_ADAPTER
@@ -1466,6 +1467,11 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 #ifndef OLMOE_NO_MAIN
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_OLMOE, "olmoe");
+    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_OLMOE, "olmoe");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

@@ -7,6 +7,18 @@ on:
     branches: [dev, main]
 
 jobs:
+  # The environment-variable registry (c/coli_env.h) against the sources. No
+  # build, no model, no GPU -- seconds, so it reports before anything else.
+  env-registry:
+    name: Env registry in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: make -C c check-env
+
   engine:
     name: Engine (Linux, CPU)
     runs-on: ubuntu-latest

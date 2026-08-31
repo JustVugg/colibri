@@ -51,6 +51,7 @@
 #include "edge_adapters.h"
 #include "edge_tok_internal.h"
 #endif
+#include "coli_env.h"
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -2394,6 +2395,11 @@ int main(int argc, char **argv) {
     }
 #endif  /* !COLI_CUDA && !__APPLE__ */
     coli_omp_tune_threads("inkling");
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_INKLING, "inkling");
+    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_INKLING, "inkling");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Inkling"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
