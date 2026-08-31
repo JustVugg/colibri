@@ -154,6 +154,115 @@ static int run_affine(ColiAffineFormat format, ColiAffineScalarFormat scalar_for
   return ok?0:1;
 }
 
+// ---- Slot buffers: registered once, offset-addressed, refilled in place ----
+// Three claims: (1) offset addressing inside one whole-slot buffer matches the
+// CPU reference; (2) refilling the SAME registered memory is seen by the next
+// dispatch (write-through -- the property the resident-handle cache cannot give
+// reused memory); (3) the refusal arms hold: misaligned registration, sections
+// outside the registered range, and a view that does not describe the slot's
+// current fill are refused, never dispatched.
+static int run_affine_slot(ColiAffineFormat format, ColiAffineScalarFormat scalar_format,
+                           int S, const char *name) {
+  enum { O=48, I=2048, GROUP=32, HEADER=256 };  // HEADER: prove nonzero offsets
+  const size_t pg=16384;
+  unsigned bits=coli_affine_bits(format), per_word=32u/bits;
+  size_t packed_words=(size_t)O*(I/per_word);
+  size_t wbytes=packed_words*sizeof(uint32_t);
+  size_t scalar_count=(size_t)O*(I/GROUP);
+  size_t sbytes=scalar_count*coli_affine_scalar_size(scalar_format);
+  size_t woff=HEADER, soff=woff+wbytes, boff=soff+sbytes;
+  size_t len=((boff+sbytes)+pg-1)&~(pg-1);
+  uint8_t *slab=nullptr;
+  if (posix_memalign((void**)&slab,pg,len)) {
+    printf("  %-38s FAIL (posix_memalign)\n",name); return 1; }
+  memset(slab,0,len);
+
+  auto fill=[&](uint32_t seed){
+    uint32_t state=seed;
+    uint32_t *w=(uint32_t*)(void*)(slab+woff);
+    for(size_t i=0;i<packed_words;i++){ state=state*1664525u+1013904223u; w[i]=state; }
+    std::vector<uint8_t> sc(sbytes), bi(sbytes);
+    for(size_t i=0;i<scalar_count;i++){
+      state=state*1664525u+1013904223u;
+      float scale=(float)((int)(state%7u)-3)*0.03125f;
+      float bias=(float)((int)((state>>8)%5u)-2)*0.015625f;
+      if(scale==0.0f) scale=0.046875f;
+      affine_store_scalar(sc,i,scalar_format,scale);
+      affine_store_scalar(bi,i,scalar_format,bias);
+    }
+    memcpy(slab+soff,sc.data(),sbytes); memcpy(slab+boff,bi.data(),sbytes);
+  };
+
+  ColiAffineQuantizedView view = {
+    slab+woff, slab+soff, slab+boff, wbytes, sbytes, sbytes,
+    (size_t)O, (size_t)I, (size_t)GROUP, format, scalar_format
+  };
+  std::vector<float> x((size_t)S*I), expected((size_t)S*O), actual((size_t)S*O);
+  for(size_t i=0;i<x.size();i++) x[i]=(float)((int)((i*13+5)%29)-14)*0.0625f;
+  auto relative_error=[&](){
+    double maxabs=0.0, ymax=0.0;
+    for(size_t i=0;i<actual.size();i++){
+      if(!std::isfinite(actual[i]) || !std::isfinite(expected[i]))
+        return (double)INFINITY;
+      maxabs=fmax(maxabs,fabs((double)actual[i]-expected[i]));
+      ymax=fmax(ymax,fabs((double)expected[i]));
+    }
+    return maxabs/(ymax+1e-9);
+  };
+
+  size_t count_before=0, bytes_before=0;
+  coli_metal_stats(&count_before,&bytes_before);
+  // A misaligned base or a non-page-multiple length must not register at all:
+  // those layouts would take wrap()'s copying fallback and go stale on refill.
+  int misaligned_refused = coli_metal_slot_register(slab+4,len)==NULL &&
+                           coli_metal_slot_register(slab,len-4)==NULL;
+  ColiMetalSlotBuffer *slot=coli_metal_slot_register(slab,len);
+  size_t count_reg=0, bytes_reg=0;
+  coli_metal_stats(&count_reg,&bytes_reg);
+  int registered = slot!=NULL && count_reg==count_before+1 &&
+                   bytes_reg==bytes_before+len;
+
+  fill(0xC4C40001u ^ (uint32_t)format ^ ((uint32_t)scalar_format<<4));
+  int ref_ok=coli_affine_matmul_ref(expected.data(),x.data(),(size_t)S,&view)==COLI_AFFINE_OK;
+  std::fill(actual.begin(),actual.end(),NAN);
+  int first = registered && ref_ok &&
+      coli_metal_matmul_affine_slot(slot,woff,soff,boff,actual.data(),x.data(),S,&view);
+  double first_nerr = first ? relative_error() : INFINITY;
+
+  // Refill the same registered memory with a different expert; the next
+  // dispatch must read the NEW bytes through the same registration.
+  fill(0x5EED0002u ^ (uint32_t)format ^ ((uint32_t)scalar_format<<4));
+  int ref2_ok=coli_affine_matmul_ref(expected.data(),x.data(),(size_t)S,&view)==COLI_AFFINE_OK;
+  std::fill(actual.begin(),actual.end(),NAN);
+  int refilled = first && ref2_ok &&
+      coli_metal_matmul_affine_slot(slot,woff,soff,boff,actual.data(),x.data(),S,&view);
+  double refill_nerr = refilled ? relative_error() : INFINITY;
+
+  // Sections outside the registered range are refused.
+  int oob_refused = refilled &&
+      !coli_metal_matmul_affine_slot(slot,len-4,soff,boff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(slot,woff,len,boff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(slot,woff,soff,len,actual.data(),x.data(),S,&view);
+  // A view that does not describe the claimed offsets (a stale or misdirected
+  // descriptor) is refused, not dispatched.
+  int mismatch_refused = refilled &&
+      !coli_metal_matmul_affine_slot(slot,woff+4,soff,boff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(slot,woff,boff,soff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(NULL,woff,soff,boff,actual.data(),x.data(),S,&view);
+
+  coli_metal_slot_unregister(slot);
+  size_t count_after=0, bytes_after=0;
+  coli_metal_stats(&count_after,&bytes_after);
+  int restored = count_after==count_before && bytes_after==bytes_before;
+  free(slab);
+  int ok = misaligned_refused && registered && first && first_nerr<1e-4 &&
+           refilled && refill_nerr<1e-4 && oob_refused && mismatch_refused &&
+           restored;
+  printf("  %-38s nerr=%.2e/%.2e (fill/refill) S=%d  %s\n",
+         name,first_nerr,refill_nerr,S,ok?"ok":"*** MISMATCH");
+  return ok?0:1;
+}
+
 // ---- fmt=4 (grouped int4): own CPU reference + harness -----------------------------
 // cpu_ref's [O] per-row scale layout can't express fmt=4's [O,ceil(I/gs)] per-group
 // scale, so this is a separate reference rather than a branch of cpu_ref. Mirrors
@@ -934,6 +1043,10 @@ int main(void) {
                                (int)coli_affine_bits((ColiAffineFormat)format),scalar_name[scalar]);
         fail |= run_affine((ColiAffineFormat)format,(ColiAffineScalarFormat)scalar,3,name);
       }
+    printf("Metal MLX affine slot-buffer tests (register once, offset-address, refill):\n");
+    fail |= run_affine_slot(COLI_AFFINE_MLX_Q4, COLI_AFFINE_SCALAR_F32,  3, "affine slot Q4/f32 offset+refill");
+    fail |= run_affine_slot(COLI_AFFINE_MLX_Q4, COLI_AFFINE_SCALAR_F16,  2, "affine slot Q4/f16 offset+refill");
+    fail |= run_affine_slot(COLI_AFFINE_MLX_Q8, COLI_AFFINE_SCALAR_BF16, 3, "affine slot Q8/bf16 offset+refill");
   } else if (affine_capability==COLI_METAL_AFFINE_CAP_SIMD_WIDTH_UNSUPPORTED) {
     printf("Metal MLX affine packed GEMV tests: SKIPPED (requires 32-lane simdgroups)\n");
   } else {

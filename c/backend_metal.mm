@@ -1137,6 +1137,48 @@ struct AffineGemvParamsHost {
 static_assert(sizeof(AffineGemvParamsHost) == 5*sizeof(uint32_t),
               "Metal affine parameter layout drift");
 
+/* Shared encode/run body for the two affine entry points: the buffers are
+ * either a resident handle's per-section wraps (offsets 0) or one whole-slot
+ * buffer addressed by section byte offsets.  Synchronous; returns 0 on
+ * any allocation, encoder, or command-buffer failure. */
+static int affine_dispatch_run(id<MTLBuffer> wbuf, size_t woff,
+                               id<MTLBuffer> sbuf, size_t soff,
+                               id<MTLBuffer> bbuf, size_t boff,
+                               float *y, const float *x, int batch,
+                               const ColiAffineQuantizedView *view) {
+  const size_t input_bytes=(size_t)batch*view->input_dim*sizeof(float);
+  const size_t output_bytes=(size_t)batch*view->output_dim*sizeof(float);
+  id<MTLBuffer> bx=[g_dev newBufferWithBytes:x length:input_bytes
+                                      options:MTLResourceStorageModeShared];
+  id<MTLBuffer> by=[g_dev newBufferWithLength:output_bytes
+                                     options:MTLResourceStorageModeShared];
+  if (!bx || !by) return 0;
+  AffineGemvParamsHost p = {
+    (uint32_t)view->output_dim, (uint32_t)view->input_dim,
+    (uint32_t)view->group_size, (uint32_t)view->scalar_format,
+    (uint32_t)batch
+  };
+  id<MTLCommandBuffer> cb=[g_queue commandBuffer];
+  id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+  if (!cb || !e) return 0;
+  [e setComputePipelineState:(view->format == COLI_AFFINE_MLX_Q4 ?
+                              g_affine_q4 : g_affine_q8)];
+  [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:wbuf offset:woff atIndex:1];
+  [e setBuffer:sbuf offset:soff atIndex:2]; [e setBuffer:bbuf offset:boff atIndex:3];
+  [e setBuffer:by offset:0 atIndex:4]; [e setBytes:&p length:sizeof(p) atIndex:5];
+  [e dispatchThreads:MTLSizeMake(32,(NSUInteger)batch*view->output_dim,1)
+      threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+  [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  if (cb.status != MTLCommandBufferStatusCompleted) {
+    fprintf(stderr,"[metal] affine GEMV command buffer failed (status=%ld): %s\n",
+            (long)cb.status,
+            cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
+    return 0;
+  }
+  memcpy(y,[by contents],output_bytes);
+  return 1;
+}
+
 extern "C" int coli_metal_matmul_affine(ColiMetalTensor **tp,
                                          float *y, const float *x, int batch,
                                          const ColiAffineQuantizedView *view) {
@@ -1175,43 +1217,10 @@ extern "C" int coli_metal_matmul_affine(ColiMetalTensor **tp,
       t->host_w=view->weights; t->host_s=view->scales; t->host_b=view->biases;
     }
 
-    const size_t input_bytes=(size_t)batch*view->input_dim*sizeof(float);
-    const size_t output_bytes=(size_t)batch*view->output_dim*sizeof(float);
-    id<MTLBuffer> bx=[g_dev newBufferWithBytes:x length:input_bytes
-                                        options:MTLResourceStorageModeShared];
-    id<MTLBuffer> by=[g_dev newBufferWithLength:output_bytes
-                                       options:MTLResourceStorageModeShared];
-    if (!bx || !by) {
+    if (!affine_dispatch_run(t->w, 0, t->s, 0, t->b, 0, y, x, batch, view)) {
       if (fresh) tensor_destroy(t);
       return 0;
     }
-    AffineGemvParamsHost p = {
-      (uint32_t)view->output_dim, (uint32_t)view->input_dim,
-      (uint32_t)view->group_size, (uint32_t)view->scalar_format,
-      (uint32_t)batch
-    };
-    id<MTLCommandBuffer> cb=[g_queue commandBuffer];
-    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-    if (!cb || !e) {
-      if (fresh) tensor_destroy(t);
-      return 0;
-    }
-    [e setComputePipelineState:(view->format == COLI_AFFINE_MLX_Q4 ?
-                                g_affine_q4 : g_affine_q8)];
-    [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:t->w offset:0 atIndex:1];
-    [e setBuffer:t->s offset:0 atIndex:2]; [e setBuffer:t->b offset:0 atIndex:3];
-    [e setBuffer:by offset:0 atIndex:4]; [e setBytes:&p length:sizeof(p) atIndex:5];
-    [e dispatchThreads:MTLSizeMake(32,(NSUInteger)batch*view->output_dim,1)
-        threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted) {
-      fprintf(stderr,"[metal] affine GEMV command buffer failed (status=%ld): %s\n",
-              (long)cb.status,
-              cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
-      if (fresh) tensor_destroy(t);
-      return 0;
-    }
-    memcpy(y,[by contents],output_bytes);
     if (fresh) {
       *tp=t;
       g_tensor_count++;
@@ -1219,6 +1228,80 @@ extern "C" int coli_metal_matmul_affine(ColiMetalTensor **tp,
     }
   }
   return 1;
+}
+
+// ---- Whole-slot buffers for bounded, refillable qpack expert slots ----
+// One MTLBuffer per slot, wrapped zero-copy EXACTLY once; the pool refills the
+// same host memory with different experts, and dispatches address the weight,
+// scale, and bias sections by byte offset inside the registered buffer.  The
+// zero-copy wrap is mandatory, not best-effort: the copying fallback in wrap()
+// would snapshot the first fill and silently detach the GPU from every later
+// refill, which is exactly the stale-projection hazard the whole-slot
+// buffers exist to remove.
+struct ColiMetalSlotBuffer {
+  id<MTLBuffer> buf;
+  void *base;
+  size_t len;
+};
+
+extern "C" ColiMetalSlotBuffer *coli_metal_slot_register(void *base, size_t len) {
+  const size_t pg = 16384;   // Apple page: newBufferWithBytesNoCopy contract
+  if (!g_dev || !base || !len) return NULL;
+  if (((uintptr_t)base % pg) != 0 || (len % pg) != 0) return NULL;
+  id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
+                                            options:MTLResourceStorageModeShared
+                                        deallocator:nil];
+  if (!b) return NULL;
+  ColiMetalSlotBuffer *s = new ColiMetalSlotBuffer();
+  s->buf = b; s->base = base; s->len = len;
+  g_tensor_count++; g_tensor_bytes += len;
+  return s;
+}
+
+extern "C" void coli_metal_slot_unregister(ColiMetalSlotBuffer *slot) {
+  if (!slot) return;
+  g_tensor_count--; g_tensor_bytes -= slot->len;
+  slot->buf = nil;
+  delete slot;
+}
+
+extern "C" int coli_metal_matmul_affine_slot(ColiMetalSlotBuffer *slot,
+                                             size_t weights_offset,
+                                             size_t scales_offset,
+                                             size_t biases_offset,
+                                             float *y, const float *x, int batch,
+                                             const ColiAffineQuantizedView *view) {
+  if (!slot || !slot->buf || !y || !x || !coli_metal_affine_available() ||
+      !coli_metal_affine_dispatch_supported(view,batch))
+    return 0;
+  @autoreleasepool {
+    const unsigned bits=coli_affine_bits(view->format), per_word=32u/bits;
+    const size_t groups=view->input_dim/view->group_size;
+    const size_t wbytes=view->output_dim*(view->input_dim/per_word)*sizeof(uint32_t);
+    const size_t scalar_bytes=view->output_dim*groups*
+                              coli_affine_scalar_size(view->scalar_format);
+    /* Every section must lie inside the registered slot, and the weight words
+     * must land 4-byte aligned (base is page-aligned; the kernel casts each
+     * row to device const uint*). */
+    if (weights_offset % 4 != 0) return 0;
+    if (weights_offset > slot->len || wbytes > slot->len - weights_offset)
+      return 0;
+    if (scales_offset > slot->len || scalar_bytes > slot->len - scales_offset)
+      return 0;
+    if (biases_offset > slot->len || scalar_bytes > slot->len - biases_offset)
+      return 0;
+    /* Tripwire: the descriptor must describe THIS slot's current fill.  A
+     * view carried across a refill (or aimed at another slot) disagrees with
+     * base+offset and is refused instead of dispatched. */
+    const unsigned char *base=(const unsigned char *)slot->base;
+    if (view->weights != base + weights_offset ||
+        view->scales != base + scales_offset ||
+        view->biases != base + biases_offset)
+      return 0;
+    return affine_dispatch_run(slot->buf, weights_offset,
+                               slot->buf, scales_offset,
+                               slot->buf, biases_offset, y, x, batch, view);
+  }
 }
 
 // ---- fused decode attention scratch (GLM-5.2 dims) ----

@@ -121,6 +121,42 @@ int coli_metal_matmul_affine(ColiMetalTensor **tensor,
                              float *y, const float *x, int batch,
                              const ColiAffineQuantizedView *view);
 
+/* Whole-slot buffers for bounded, refillable qpack expert slots.  A slot
+ * buffer wraps one page-aligned host slot in an MTLBuffer exactly ONCE
+ * (zero-copy); the pool refills the same memory with different experts, and
+ * every dispatch addresses the projection weight, scale, and bias sections
+ * by BYTE OFFSET inside that one registered buffer.  Nothing is keyed on the
+ * refillable host pointers and no bytes are copied at registration, so a
+ * refill cannot leave a stale GPU-side snapshot behind -- the exact hazard
+ * that makes the resident-handle path above (which caches by stable host
+ * pointer) unusable for reused memory.
+ *
+ * Registration requires base aligned to 16384 (the Apple page) and len a
+ * multiple of it and REFUSES anything else (returns NULL): the copying wrap
+ * fallback used elsewhere would silently detach the GPU from later refills.
+ * qpack expert strides already satisfy this (COLI_QPACK_PAGE_ALIGNMENT).
+ * Slot buffers count in coli_metal_stats() like resident tensor handles.
+ *
+ * coli_metal_matmul_affine_slot runs the same Q4/Q8 affine kernels as
+ * coli_metal_matmul_affine but takes the registered slot plus section byte
+ * offsets instead of a cached per-projection handle.  The checked view must
+ * describe the slot's CURRENT fill: every section must lie inside the
+ * registered range, the weights offset must be 4-byte aligned (the kernel
+ * reads uint32 words), and the view's host pointers must equal base+offset.
+ * A descriptor from a previous fill or the wrong slot is refused (returns 0,
+ * CPU fallback), never dispatched.  Synchronous like the rest of this API:
+ * when it returns, the GPU is done reading the slot and the caller may
+ * refill it. */
+typedef struct ColiMetalSlotBuffer ColiMetalSlotBuffer;
+ColiMetalSlotBuffer *coli_metal_slot_register(void *base, size_t len);
+void coli_metal_slot_unregister(ColiMetalSlotBuffer *slot);
+int coli_metal_matmul_affine_slot(ColiMetalSlotBuffer *slot,
+                                  size_t weights_offset,
+                                  size_t scales_offset,
+                                  size_t biases_offset,
+                                  float *y, const float *x, int batch,
+                                  const ColiAffineQuantizedView *view);
+
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
 /* Weight payload bytes only, preserving the established QT API contract. */
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
