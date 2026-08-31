@@ -57,6 +57,7 @@
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
+#include "cli_args.h"
 #include "st.h"
 #ifdef __linux__
 #include "uring.h"
@@ -10861,10 +10862,10 @@ int main(int argc, char **argv){
     /* cap itself is resolved below, once g_metal_enabled and the SSD probe (both
      * needed for the platform default) are known -- see coli_resolve_cap(). */
     int cap_given = argc>1;
-    int cap_arg = cap_given?atoi(argv[1]):0;
+    int cap_arg = cap_given?coli_arg_int(argv[1],"cache/layer"):0;
     int cap_env = getenv("CAP")?atoi(getenv("CAP")):0;
-    int ebits= argc>2?atoi(argv[2]):8;
-    int dbits= argc>3?atoi(argv[3]):ebits;
+    int ebits= argc>2?coli_arg_int(argv[2],"expert bits"):8;
+    int dbits= argc>3?coli_arg_int(argv[3],"dense bits"):ebits;
 #if !defined(_WIN32)
     if(getenv("EXPERT_WORKER")){
         int port=getenv("CLUSTER_WORKER_PORT")?atoi(getenv("CLUSTER_WORKER_PORT")):9100;

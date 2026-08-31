@@ -31,6 +31,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
 #ifdef _OPENMP
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
@@ -1476,8 +1477,8 @@ int main(int argc, char **argv) {
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
-    int cap    = argc > 1 ? atoi(argv[1]) : 16;
-    int bits   = argc > 2 ? atoi(argv[2]) : 8;
+    int cap    = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 16;
+    int bits   = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 8;
     if (bits < 2 || bits > 8) {
         fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits);
         return 1;

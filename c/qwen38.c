@@ -59,6 +59,7 @@ static int qwen38_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
 #include "qwen38_vision.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
@@ -1629,8 +1630,8 @@ int main(int argc, char **argv) {
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL");
     if (mv && *mv) snprintf(g_model, sizeof g_model, "%s", mv);
-    int cap   = argc > 1 ? atoi(argv[1]) : 1;
-    int bits  = argc > 2 ? atoi(argv[2]) : 8;
+    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 1;
+    int bits  = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 8;
     /* cap < 1 leaves every layer cache empty, so expert_get finds no slot to
      * evict and waits for a publish that can never come. The old lru=0 fallback
      * turned that into a heap OOB instead; neither is a failure mode to ship. */

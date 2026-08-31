@@ -65,6 +65,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+#include "cli_args.h"
 #include "json.h"
 #include "st.h"
 #include "quant.h"
@@ -2578,7 +2579,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids = argv[++i];
-        else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = coli_arg_int(argv[++i], "--greedy");
         else if (!strcmp(argv[i], "--logits")) show_logits = 1;
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--patches") && i + 1 < argc) patch_file = argv[++i];
@@ -2588,10 +2589,10 @@ int main(int argc, char **argv) {
             /* Capienza posizionale: e' cosi' che il gateway lancia ogni motore
              * (openai_server.py, Engine.__init__). Zero vuol dire "decidila
              * tu", che qui e' il budget misurato dalla RAM disponibile. */
-            const int cap = atoi(argv[i]);
+            const int cap = coli_arg_int(argv[i], "cache/layer");
             if (cap > 0) g_cap_override = cap;
         }
-        else { fprintf(stderr, "argomento sconosciuto: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
     }
     /* SERVE=1 e SNAP=<dir>: il motore non e' piu' una CLI ma il capo di una
      * pipa, e il modello arriva dall'ambiente perche' e' cosi' che lo lancia
