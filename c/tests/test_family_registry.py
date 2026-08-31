@@ -1169,6 +1169,62 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
 
+    def test_the_python_job_builds_every_engine_a_test_skips_without(self):
+        """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
+        non compila quel motore, e sparisce in silenzio: la classe si salta,
+        il job resta verde, e nessuno distingue "passato" da "mai eseguito".
+
+        E' successo davvero. Il job Python non compilava nessun motore, quindi
+        sette test fra test_kimi_usage_cli e test_inkling_prefix_serve non
+        giravano da sempre, e uno era rosso da quando il messaggio di kimi_k3
+        e' stato riscritto. E' la stessa forma del job dei sanitizer che
+        rieseguiva un binario senza strumentazione: verde perche' vuoto.
+
+        Il controllo va nella direzione che serve. Non chiede che il job
+        compili una certa lista, che sarebbe un'altra costante da tenere
+        allineata a mano: parte dai test, guarda su quale binario si saltano,
+        e pretende che il job lo costruisca.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        tests_dir = repo / "c" / "tests"
+        guard = re.compile(r'ENGINE\s*=\s*HERE\s*/\s*\(?\s*"([a-z0-9_]+)\.exe"'
+                           r'.*?else\s*"([a-z0-9_]+)"', re.S)
+        needed = {}
+        for path in sorted(tests_dir.glob("test_*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "skipUnless" not in text or "ENGINE.exists()" not in text:
+                continue
+            m = guard.search(text)
+            if m:
+                needed[m.group(2)] = path.name
+        self.assertTrue(needed,
+                        "nessun test guardato da ENGINE.exists() trovato: il "
+                        "controllo non sta piu' guardando niente")
+        ci = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        # Il corpo del job va da "  python:" fino al job successivo, cioe' la
+        # prossima riga indentata di due spazi esatti. Tagliare al primo "\n  "
+        # non funziona: le righe interne sono indentate di quattro e cominciano
+        # anch'esse per due spazi, quindi il corpo verrebbe vuoto e il test
+        # fallirebbe sempre, per la ragione sbagliata.
+        job = re.search(r"(?m)^  python:\n(.*?)(?=^  \S|\Z)", ci, re.S)
+        self.assertIsNotNone(job, "il job 'python:' non esiste piu' in ci.yml")
+        body = job.group(1)
+        # I bersagli veri di make, non il corpo del job: un commento che nomina
+        # "test_inkling_prefix_serve.py" contiene la parola "inkling" e farebbe
+        # passare il controllo senza che nulla venga compilato. Il controllo
+        # negativo di questo test lo ha dimostrato togliendo inkling dalla
+        # riga di build: passava lo stesso.
+        built = set()
+        for run_line in re.findall(r"(?m)^\s*run:\s*(.+)$", body):
+            m = re.search(r"\bmake\b(?:\s+-C\s+\S+)?\s+(.*)", run_line)
+            if m:
+                built.update(tok for tok in m.group(1).split() if not tok.startswith("-"))
+        for engine, where in sorted(needed.items()):
+            self.assertIn(engine, built,
+                          f"{where} si salta se '{engine}' non e' compilato, e il "
+                          f"job Python della CI non lo compila: quei test non "
+                          f"girano mai e il job resta verde perche' e' vuoto")
+
     def test_every_readme_banner_matches_the_declared_version(self):
         """Il banner dei README deve dire la versione che dichiara version.py.
 

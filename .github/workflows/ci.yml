@@ -773,6 +773,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Sette test in tests/test_kimi_usage_cli.py e tests/test_inkling_prefix_serve.py
+      # sono protetti da skipUnless(ENGINE.exists()). Questo job non compilava
+      # nessun motore, quindi si saltavano tutti e sette e il job restava verde
+      # perche' era vuoto -- la stessa forma del job dei sanitizer che
+      # rieseguiva un binario non strumentato. Uno di quei test era rosso da
+      # settimane senza che nessuno potesse vederlo.
+      - name: Build the engines those tests exercise
+        run: make -C c kimi_k3 inkling
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
