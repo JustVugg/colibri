@@ -111,6 +111,8 @@ section{padding:clamp(4.5rem,9vh,7rem) 0}
 .meta .k{font-weight:600;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;color:var(--gray)}
 .meta .v{font-family:var(--mono);font-size:.88rem;color:var(--ink)}
 .card .btn{margin-top:1.3rem;align-self:flex-start}
+.tags{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.9rem}
+.tag{font-family:var(--mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--teal);border:1px solid var(--line);border-radius:999px;padding:.18rem .6rem}
 
 /* data list (hardware) */
 .dlist{margin-top:2.4rem;border-top:1px solid var(--hair)}
@@ -227,7 +229,7 @@ footer li a:hover{color:var(--on-dark)}
     <div><div class="n">510</div><div class="l">pull requests merged</div></div>
     <div><div class="n">6</div><div class="l">families · 4 backends · 3 platforms</div></div>
     <div class="since">All of it in <b data-gh-age>six weeks</b>, in the open: issues filed from strangers' machines,
-      reproduced and fixed the same day. Currently shipping <b>v1.7.0</b>.</div>
+      reproduced and fixed the same day. Currently shipping <b>v1.10.1</b>.</div>
   </div>
 </section>
 
@@ -259,26 +261,39 @@ footer li a:hover{color:var(--on-dark)}
 <section id="models">
   <div class="wrap reveal">
     <div class="overline">The models</div>
-    <h2 class="sec-h">Six families run today, one engine each.</h2>
+    <h2 class="sec-h">Eight families run today, one engine each.</h2>
     <div class="cards">
       <div class="card"><h3>GLM-5.2</h3><p class="desc">The flagship target: an int4 container, token-exact versus reference, with the full expert atlas published.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size · Status</span><span class="v">744B MoE · Live</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Run it →</a></div>
+        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">744B MoE &middot; from 16 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Run it &rarr;</a></div>
+      <div class="card"><h3>GLM-5.3-Flash</h3><p class="desc">The flagship&rsquo;s fast sibling: the same 40B active at less than half the total size, and it takes images through the same server.</p>
+        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span><span class="tag">vision</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">321B MoE &middot; 25 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Run it &rarr;</a></div>
+      <div class="card"><h3>Qwen3.8-Flash-Next</h3><p class="desc">The first family to arrive complete: tool calling and a vision tower verified against the upstream reference, on day one.</p>
+        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span><span class="tag">vision</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">125B+51B MoE &middot; from 16 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/qwen38.md">Run it &rarr;</a></div>
       <div class="card"><h3>Kimi K3</h3><p class="desc">The largest family we run: gated recurrence plus MLA attention, 2.8T parameters, now with a Metal backend on Apple Silicon.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">2.8T MoE · Live</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it →</a></div>
+        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">2.8T MoE &middot; from 32 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it &rarr;</a></div>
       <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE with an audio tower. Mixed-precision staging fits it on a consumer box.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Live</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it →</a></div>
-      <div class="card"><h3>DeepSeek V4</h3><p class="desc">Sparse attention, multi-token prediction and a trained drafter: the most instrumented engine here.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">284B MoE · Live</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">Run it →</a></div>
+        <div class="tags"><span class="tag">reasoning</span><span class="tag">audio</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">975B MoE &middot; 25 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it &rarr;</a></div>
+      <div class="card"><h3>DeepSeek V4 Flash</h3><p class="desc">Sparse attention, multi-token prediction and a trained drafter: the most instrumented engine here.</p>
+        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">284B MoE &middot; from 16 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">Run it &rarr;</a></div>
       <div class="card"><h3>Qwen3.6</h3><p class="desc">Gated attention plus Gated DeltaNet. Its CUDA tier keeps hot experts in VRAM: 7x faster than CPU on two 8&nbsp;GB cards, output bit-identical.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">35B MoE · Live</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md">Run it →</a></div>
+        <div class="tags"><span class="tag">reasoning</span></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">35B MoE &middot; 24 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md">Run it &rarr;</a></div>
       <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse. Quantization A/Bs and quality ablations run here first.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">7B MoE · Live</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri">Run it →</a></div>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">7B MoE &middot; 8 GB</span></div></div>
+        <a class="btn ghost" href="https://github.com/JustVugg/colibri">Run it &rarr;</a></div>
     </div>
   </div>
 </section>
@@ -349,8 +364,9 @@ footer li a:hover{color:var(--on-dark)}
         <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a></li>
       </ul></div>
       <div><h4>Models</h4><ul>
-        <li><a href="#models">GLM-5.2</a></li><li><a href="#models">Kimi K3</a></li>
-        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek V4</a></li>
+        <li><a href="#models">GLM-5.2</a></li><li><a href="#models">GLM-5.3-Flash</a></li>
+        <li><a href="#models">Qwen3.8-Flash-Next</a></li><li><a href="#models">Kimi K3</a></li>
+        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek V4 Flash</a></li>
         <li><a href="#models">Qwen3.6</a></li><li><a href="#models">OLMoE</a></li>
       </ul></div>
       <div><h4>Project</h4><ul>

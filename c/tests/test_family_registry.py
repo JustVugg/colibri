@@ -1307,6 +1307,40 @@ class FamilyRegistryTest(unittest.TestCase):
                            "nessun banner 'colibri vX.Y.Z' trovato in alcun "
                            "README: il test non sta piu' controllando niente")
 
+    def test_the_site_shows_the_version_and_every_family(self):
+        """site/index.html deve dire la versione vera e nominare ogni famiglia.
+
+        Trovato fermo a "Currently shipping v1.7.0" con sei famiglie su otto:
+        quattro release e due modelli indietro. E' la sesta copia del numero di
+        versione e la quinta lista di famiglie, e ne' il contratto dei banner
+        (#1288) ne' quello dei README (#1287) la guardavano. Il sito e' la
+        prima cosa che un visitatore vede e l'ultima che ci si ricorda di
+        aggiornare: esattamente il posto per un contratto.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        site = (repo / "site" / "index.html").read_text(encoding="utf-8")
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        shown = re.search(r"Currently shipping <b>v([\d.]+)</b>", site)
+        self.assertIsNotNone(shown,
+                             "site/index.html: la riga 'Currently shipping' non "
+                             "c'e' piu'; il contratto non sta controllando niente")
+        self.assertEqual(shown.group(1), declared.group(1),
+                         f"il sito dice v{shown.group(1)} ma version.py dichiara "
+                         f"{declared.group(1)}: il visitatore legge una versione "
+                         f"vecchia")
+        for family in FAMILIES:
+            parts = []
+            for piece in family.display_name.split("-"):
+                if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                    break
+                parts.append(piece)
+            token = "-".join(parts) or family.display_name
+            self.assertTrue(token in site,
+                            f"site/index.html non nomina {family.display_name} "
+                            f"({family.id}): il sito mostra meno famiglie di "
+                            f"quante ne girano")
+
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")
