@@ -1169,6 +1169,51 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
 
+    def test_release_ships_every_tool_coli_invokes(self):
+        """Ogni script che `coli` lancia deve finire nell'archivio.
+
+        #1296: il pacchetto v1.10.0 conteneva un solo file in tools/,
+        k3_tokenizer.py, scelto a mano nel workflow. coli ne invoca altri tre,
+        fra cui convert_fp8_to_int4.py, e `coli convert` nel pacchetto
+        pubblicato moriva con "No such file or directory". C'era anche un passo
+        di verifica: controllava la presenza dell'unico file copiato, cioe'
+        confermava se stesso.
+
+        Il workflow ora ricava la lista da coli con una grep. Questo test
+        protegge l'assunzione di quella grep: se domani coli costruisse il
+        percorso di uno script in un altro modo -- una variabile, un f-string,
+        os.path.join a pezzi -- la grep non lo vedrebbe, il file non verrebbe
+        copiato, e saremmo di nuovo a #1296 con la release verde.
+
+        Percio' qui si contano le invocazioni in due modi diversi e si pretende
+        che diano lo stesso numero.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        coli = (repo / "c" / "coli").read_text(encoding="utf-8")
+
+        # 1. Come li vede la grep del workflow.
+        seen = set(re.findall(r'TOOLS,\s*"([a-z0-9_]+\.py)"', coli))
+        self.assertTrue(seen, "nessuno script trovato in coli: la grep del "
+                              "workflow non copierebbe piu' niente")
+
+        # 2. Ogni .py nominato accanto a TOOLS, comunque sia scritto.
+        every = set(re.findall(r'TOOLS[^\n]*?([a-z0-9_]+\.py)', coli))
+        self.assertEqual(every, seen,
+                         "coli nomina uno script in una forma che la grep di "
+                         "release.yml non riconosce: finirebbe fuori "
+                         "dall'archivio come in #1296")
+
+        # 3. Esistono, e il workflow li copia e li verifica.
+        release = (repo / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        for script in sorted(seen):
+            self.assertTrue((repo / "c" / "tools" / script).exists(),
+                            f"coli invoca tools/{script}, che non esiste")
+        self.assertIn("dist/tools/$s", release,
+                      "release.yml non copia piu' gli script ricavati da coli")
+        self.assertIn('test -f "tools/$s"', release,
+                      "release.yml non verifica piu' che siano nell'archivio")
+
     def test_the_python_job_builds_every_engine_a_test_skips_without(self):
         """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
         non compila quel motore, e sparisce in silenzio: la classe si salta,
