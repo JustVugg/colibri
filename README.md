@@ -131,7 +131,7 @@ hardware, commit, model/container, exact command, prompt, cache state, throughpu
 TTFT, expert hit rate, bytes read, and quality check; change one variable, repeat
 the run, and attach raw logs. Start with
 [CONTRIBUTING.md](CONTRIBUTING.md), compare against
-[the benchmark protocol](docs/benchmarks.md), then
+[the benchmark protocol](docs/benchmarking.md), then
 [open an experiment issue](https://github.com/JustVugg/colibri/issues/new).
 A well-controlled failure is more valuable here than an unexplained fast number.
 
@@ -511,6 +511,7 @@ Two things that differ per model, both documented in the per-model page:
 | topic | doc |
 |---|---|
 | Benchmarks, community datapoints, quality measurements | [docs/benchmarks.md](docs/benchmarks.md) |
+| Reproducible benchmark protocol and minimum report | [docs/benchmarking.md](docs/benchmarking.md) |
 | Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
 | Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
 | CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
