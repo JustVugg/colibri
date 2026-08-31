@@ -68,6 +68,8 @@ typedef enum { CE_BOOL, CE_INT, CE_FLOAT, CE_STR, CE_PATH } ColiEnvType;
 #define CE_OLMOE    0x8
 #define CE_DSV4     0x10
 #define CE_QWEN     0x20
+#define CE_GLM53    0x40
+#define CE_QWEN38   0x80
 /* CE_ALL is retained for declarations shared by the original four engines.
  * New rows use explicit engine masks derived from their actual call sites. */
 #define CE_ALL      (CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE)
@@ -134,8 +136,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_DRAFT_CORPUS",                CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DSA_GATHER",                  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DSV4_DLL",                    CE_STR   , CE_DSV4                                         , 0             , NULL},
-    {"COLI_ENV_DUMP",                    CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN, 0             , NULL},
-    {"COLI_ENV_STRICT",                  CE_BOOL  , CE_ALL                                          , 0             , NULL},
+    {"COLI_ENV_DUMP",                    CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38, 0             , NULL},
+    {"COLI_ENV_STRICT",                  CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38, 0             , NULL},
     {"COLI_EXPERT_STORE",                CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_GEMM_CHUNK",                  CE_STR   , CE_ALL                                          , 0             , NULL},
     {"COLI_GPU",                         CE_STR   , CE_COLIBRI                                      , 0             , NULL},
@@ -177,9 +179,9 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_SLAB_SHRINK",                 CE_BOOL  , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_SSD_FAST_GBS",                CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_TEMP",                        CE_FLOAT , CE_COLIBRI | CE_KIMI | CE_OLMOE                 , 0             , NULL},
-    {"COLI_TIMERS",                      CE_STR   , CE_QWEN                                         , 0             , NULL},
-    {"COLI_USAGE",                       CE_STR   , CE_KIMI | CE_OLMOE                              , 0             , NULL},
-    {"COLI_USAGE_DECAY",                 CE_FLOAT , CE_KIMI                                         , 0             , NULL},
+    {"COLI_TIMERS",                      CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
+    {"COLI_USAGE",                       CE_STR   , CE_KIMI | CE_OLMOE | CE_QWEN38                 , 0             , NULL},
+    {"COLI_USAGE_DECAY",                 CE_FLOAT , CE_KIMI | CE_QWEN38                            , 0             , NULL},
     {"COLI_V4_AUTOPIN",                  CE_BOOL  , CE_DSV4                                         , 0             , NULL},
     {"COLI_V4_DIRECT",                   CE_BOOL  , CE_DSV4                                         , 0             , NULL},
     {"COLI_V4_EXPERT_PREFETCH",          CE_BOOL  , CE_DSV4                                         , 0             , NULL},
@@ -199,10 +201,10 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_VK_QPREP",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_VK_RESERVE2_GB",              CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_VK_RESERVE_GB",               CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
-    {"COLI_VK_SHADERS",                  CE_STR   , CE_COLIBRI | CE_KIMI                            , 0             , NULL},
+    {"COLI_VK_SHADERS",                  CE_STR   , CE_COLIBRI | CE_KIMI | CE_GLM53                 , 0             , NULL},
     {"COLI_VK_SPIN_US",                  CE_STR   , CE_ALL                                          , 0             , NULL},
     {"COLI_VK_TEST_BALLAST",             CE_INT   , CE_ALL                                          , 0             , NULL},
-    {"COLI_VULKAN",                      CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_VULKAN",                      CE_INT   , CE_COLIBRI | CE_GLM53                           , 0             , NULL},
     {"CONF_LIMIT",                       CE_FLOAT , CE_OLMOE | CE_QWEN                              , 0             , NULL},
     {"COUPLE",                           CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COUPLE_D",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -252,14 +254,20 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSV4_DECODE_PROF",                 CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_HYBRID",                      CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_IDX_VERIFY",                  CE_STR   , CE_DSV4                                         , 0             , NULL},
-    {"DUMP",                             CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"DUMP",                             CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"DUMP_LAYERS",                      CE_STR   , CE_QWEN                                         , 0             , NULL},
-    {"ENC_DEBUG",                        CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"ENC_DEBUG",                        CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"EXPERT_BUDGET",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"EXPERT_BUDGET_EXPERIMENTAL",       CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"EXPERT_DROP",                      CE_INT   , CE_OLMOE                                        , 0             , NULL},
     {"EXPERT_WORKER",                    CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"FUSED3",                           CE_STR   , CE_OLMOE                                        , 0             , NULL},
+    {"GLM53_BITS",                       CE_INT   , CE_GLM53                                        , 0             , NULL},
+    {"GLM53_DUMP_INDEX",                 CE_BOOL  , CE_GLM53                                        , 0             , NULL},
+    {"GLM53_EXPERT_GB",                  CE_FLOAT , CE_GLM53                                        , 0             , NULL},
+    {"GLM53_MAXT",                       CE_INT   , CE_GLM53                                        , 0             , NULL},
+    {"GLM53_PREFILL_CHUNK",              CE_INT   , CE_GLM53                                        , 0             , NULL},
+    {"GLM53_VERBOSE",                    CE_BOOL  , CE_GLM53                                        , 0             , NULL},
     {"GLM_SEGMENT_DBITS",                CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"GLM_SEGMENT_EBITS",                CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"GPU_DEV",                          CE_INT   , CE_INKLING                                      , 0             , NULL},
@@ -318,13 +326,13 @@ static const ColiEnvVar coli_env_table[] = {
     {"KVB_FLASH_MB",                     CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"KVB_TILE_MB",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"KVSAVE",                           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"KV_SLOTS",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"KV_SLOTS",                         CE_INT   , CE_COLIBRI | CE_GLM53                           , 0             , NULL},
     {"KV_TQ",                            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"KV_TQ_POLAR",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"LOOKA",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"MAX_NEW",                          CE_INT   , CE_OLMOE                                        , 0             , NULL},
     {"MLOCK",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"MODEL",                            CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"MODEL",                            CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"MTP",                              CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"MTP_DEBUG",                        CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"MTP_PRENORM",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
@@ -332,11 +340,11 @@ static const ColiEnvVar coli_env_table[] = {
     {"NGEN",                             CE_INT   , CE_COLIBRI | CE_DSV4                            , 0             , NULL},
     {"NOGPU",                            CE_STR   , CE_INKLING                                      , 0             , NULL},
     {"NOPACK",                           CE_STR   , CE_COLIBRI                                      , 0             , NULL},
-    {"NOSTREAM",                         CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"NOSTREAM",                         CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"NUCLEUS",                          CE_FLOAT , CE_COLIBRI | CE_OLMOE                           , 0             , NULL},
-    {"N_NEW",                            CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"N_NEW",                            CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"OMP_NUM_THREADS",                  CE_STR   , CE_DSV4                                         , 0             , NULL},
-    {"OPENAI",                           CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"OPENAI",                           CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"PILOT",                            CE_INT   , CE_COLIBRI | CE_OLMOE | CE_QWEN                 , 0             , NULL},
     {"PILOT_EVICT_GUARD",                CE_INT   , CE_COLIBRI | CE_OLMOE                           , 0             , NULL},
     {"PILOT_K",                          CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -350,12 +358,22 @@ static const ColiEnvVar coli_env_table[] = {
     {"PIPE",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PIPE_WORKERS",                     CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PLANAR",                           CE_STR   , CE_COLIBRI                                      , 0             , NULL},
-    {"PPL",                              CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
+    {"PPL",                              CE_INT   , CE_OLMOE | CE_QWEN | CE_QWEN38                 , 0             , NULL},
     {"PREFETCH",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PROF",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PROMPT",                           CE_STR   , CE_ALL                                          , 0             , NULL},
     {"Q36_EOS",                          CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"Q36_MAXT",                         CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"Q38_EOS",                          CE_INT   , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_EXPERT_PARALLEL_READS",        CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_EXPERT_PREFETCH",              CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_MAXT",                         CE_INT   , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_NATIVE_BF16",                  CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_NATIVE_FP8",                   CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_PLE_PREFETCH",                 CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_PREFILL_BATCH",                CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_PREFIX_LOG",                   CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_VISION",                       CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
     {"QT_NO_WARMSTART",                  CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"QWEN_DENSE_BATCH",                 CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"QWEN_SHARED_BATCH",                CE_STR   , CE_QWEN                                         , 0             , NULL},
@@ -374,16 +392,16 @@ static const ColiEnvVar coli_env_table[] = {
     {"ROUTE_J",                          CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"ROUTE_M",                          CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"ROUTE_P",                          CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
-    {"ROUTE_TRACE",                      CE_STR   , CE_ALL                                          , 0             , NULL},
+    {"ROUTE_TRACE",                      CE_STR   , CE_ALL | CE_QWEN38                              , 0             , NULL},
     {"RSS_GUARD_GB",                     CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
     {"SCHEMA",                           CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"SCORE",                            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"SCORE_PREFIX",                     CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"SEED",                             CE_INT   , CE_COLIBRI | CE_INKLING                         , 0             , NULL},
-    {"SERVE",                            CE_INT   , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN, 0             , NULL},
-    {"SERVE_BATCH",                      CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"SERVE",                            CE_INT   , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38, 0             , NULL},
+    {"SERVE_BATCH",                      CE_INT   , CE_COLIBRI | CE_GLM53                           , 0             , NULL},
     {"SMOOTH",                           CE_FLOAT , CE_OLMOE | CE_QWEN                              , 0             , NULL},
-    {"SNAP",                             CE_STR   , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN, 0             , NULL},
+    {"SNAP",                             CE_STR   , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38, 0             , NULL},
     {"SNAP_MIRROR",                      CE_STR   , CE_COLIBRI | CE_DSV4                            , 0             , NULL},
     {"SPEC",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"SPEC_PIN",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -391,12 +409,12 @@ static const ColiEnvVar coli_env_table[] = {
     {"TEMP",                             CE_FLOAT , CE_COLIBRI | CE_OLMOE                           , CE_DEPRECATED , "COLI_TEMP"},
     {"TF",                               CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"THINK",                            CE_INT   , CE_COLIBRI | CE_INKLING                         , 0             , NULL},
-    {"TOK",                              CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"TOK",                              CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"TOKENS",                           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"TOPK",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"TOPP",                             CE_FLOAT , CE_COLIBRI | CE_INKLING                         , 0             , NULL},
     {"URING",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"USAGE_SAVE",                       CE_STR   , CE_ALL                                          , 0             , NULL},
+    {"USAGE_SAVE",                       CE_STR   , CE_ALL | CE_QWEN38                              , 0             , NULL},
     {"V4_DRAFT",                         CE_INT   , CE_DSV4                                         , 0             , NULL},
     {"V4_EXPERT_UNION",                  CE_BOOL  , CE_DSV4                                         , 0             , NULL},
     {"V4_IDX_BATCH",                     CE_STR   , CE_DSV4                                         , 0             , NULL},
@@ -480,7 +498,8 @@ static const char *coli_env_suggest(const char *name) {
 /* Names we own. An unknown FOO=1 in the environment is not our business, but an
  * unknown COLI_FOO=1 almost certainly is. */
 static int coli_env_is_ours(const char *n) {
-    return !strncmp(n, "COLI_", 5) || !strncmp(n, "K3_", 3) || !strncmp(n, "INK_", 4);
+    return !strncmp(n, "COLI_", 5) || !strncmp(n, "K3_", 3) || !strncmp(n, "INK_", 4) ||
+           !strncmp(n, "GLM53_", 6) || !strncmp(n, "Q38_", 4);
 }
 
 /* Compare the process environment against the table. `self` is the calling
@@ -514,11 +533,12 @@ static int coli_env_check(unsigned char self, const char *name) {
             continue;
         }
         if (!(v->engines & self)) {
-            fprintf(stderr, "[env] %s is not read by %s (it belongs to %s%s%s%s%s%s) -- it will have no effect\n",
+            fprintf(stderr, "[env] %s is not read by %s (it belongs to %s%s%s%s%s%s%s%s) -- it will have no effect\n",
                     key, name,
                     (v->engines & CE_COLIBRI) ? "colibri " : "", (v->engines & CE_KIMI) ? "kimi_k3 " : "",
                     (v->engines & CE_INKLING) ? "inkling " : "", (v->engines & CE_OLMOE) ? "olmoe " : "",
-                    (v->engines & CE_DSV4) ? "deepseek-v4 " : "", (v->engines & CE_QWEN) ? "qwen36" : "");
+                    (v->engines & CE_DSV4) ? "deepseek-v4 " : "", (v->engines & CE_QWEN) ? "qwen36 " : "",
+                    (v->engines & CE_GLM53) ? "glm53 " : "", (v->engines & CE_QWEN38) ? "qwen38" : "");
             bad++;
             continue;
         }

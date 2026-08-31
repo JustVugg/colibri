@@ -74,6 +74,7 @@
 static int g_vk_ready = 0;
 #endif
 #include "compat.h"
+#include "coli_env.h"
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -2573,6 +2574,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+    coli_env_check(CE_GLM53, "glm53");
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {

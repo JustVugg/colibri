@@ -6,7 +6,7 @@ Reference for the environment variables read by the colibrì engine.
 
 ## Which program reads these?
 
-**There are seven engine binaries, and they do not share a knob set.** The main
+**There are eight engine binaries, and they do not share a knob set.** The main
 engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
 what follows, but the sister engines read their own:
 
@@ -16,12 +16,13 @@ what follows, but the sister engines read their own:
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, and its dense/CUDA-tier controls — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
-| `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_PREFILL_BATCH`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
+| `qwen38` | `c/qwen38.c` | the `Q38_*` family and its shared serving, tracing, and tokenizer controls — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
+| `glm53` | `c/glm53.c` | the `GLM53_*` family plus its Vulkan, serving, and KV-slot controls — see [GLM-5.3 engine](#glm-53-flash-engine-glm53) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
-versa; nothing warns you about it. A few variables are genuinely shared because
+versa; the startup registry warns about that mismatch. A few variables are genuinely shared because
 they live in headers every engine includes (`COLI_USAGE`, `USAGE_SAVE`,
 `COLI_USAGE_DECAY` in `route_trace.h`; `RANS_*` in `rans.h`;
 `COLI_NO_OMP_TUNE` / `OMP_NUM_THREADS` in `omp_tune.h`).
@@ -61,9 +62,9 @@ knobs:
 | `COLI_ENV_DUMP` | `0` | `=1` prints every variable this engine reads, its type, and whether it is currently set — the fastest answer to "is my export reaching the engine?" |
 
 Variables the engine does not own are left alone: an unrelated `EDITOR` or
-`MY_VAR` in the environment is never reported. Only `COLI_*`, `K3_*` and
-`INK_*` names are checked, since an unrecognised one of those is almost
-certainly meant for us.
+`MY_VAR` in the environment is never reported. Only `COLI_*`, `K3_*`, `INK_*`,
+`GLM53_*`, and `Q38_*` names are checked, since an unrecognised one of those is
+almost certainly meant for us.
 
 
 ---

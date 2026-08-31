@@ -22,7 +22,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_DIR = os.path.dirname(HERE)
 
-GETENV = re.compile(r'(?:compat_)?getenv(?:_utf8)?\(\s*"([A-Z0-9_]+)"')
+GETENV = re.compile(r'(?:q38_env_bool|(?:compat_)?getenv(?:_utf8)?)\(\s*"([A-Z0-9_]+)"')
 ROW = re.compile(r'^\s*\{"([A-Z0-9_]+)"\s*,')
 
 
