@@ -224,6 +224,60 @@ coli_affine_matmul_ref(float *output, const float *input, size_t batch,
     return COLI_AFFINE_OK;
 }
 
+/* Row-major logical expansion out[output_dim, input_dim] = dequant(view):
+ * out[row*I + col] = scale[row, col/gs] * q[row, col] + bias[row, col/gs],
+ * with the SAME bit conventions as coli_affine_matmul_ref above (little-endian
+ * uint32 words, lowest bits = lowest logical column).  This is the loader-side
+ * oracle: matmul_ref folds the dequant into its accumulation and never
+ * materialises the weights, but a dense tensor the ENGINE keeps resident
+ * (qwen36's attention/DeltaNet/shared-expert set from a Swiftlet container's
+ * model.safetensors) needs the expanded f32 rows exactly once, at load time.
+ * Kept next to matmul_ref so the two bit-level readings of the packed words
+ * cannot drift apart without this file changing. */
+static inline ColiAffineStatus
+coli_affine_dequant_ref(const ColiAffineQuantizedView *view, float *output) {
+    ColiAffineStatus status = coli_affine_validate(view);
+    unsigned bits, per_word;
+    uint32_t mask;
+    size_t groups, unused;
+    const uint8_t *weights;
+
+    if (status != COLI_AFFINE_OK) return status;
+    if (!output) return COLI_AFFINE_NULL;
+    if (!coli_affine_size_mul(view->output_dim, view->input_dim, &unused))
+        return COLI_AFFINE_OVERFLOW;
+
+    bits = coli_affine_bits(view->format);
+    per_word = 32u / bits;
+    mask = (UINT32_C(1) << bits) - 1u;
+    groups = view->input_dim / view->group_size;
+    weights = (const uint8_t *)view->weights;
+
+    for (size_t row = 0; row < view->output_dim; row++) {
+        const uint8_t *weight_row =
+            weights + row * (view->input_dim / per_word) * 4;
+        float *out_row = output + row * view->input_dim;
+        for (size_t group = 0; group < groups; group++) {
+            const size_t word_base = group * (view->group_size / per_word);
+            const size_t input_base = group * view->group_size;
+            const size_t scalar_index = row * groups + group;
+            const float scale = coli_affine_load_scalar(
+                view->scales, scalar_index, view->scalar_format);
+            const float bias = coli_affine_load_scalar(
+                view->biases, scalar_index, view->scalar_format);
+            for (size_t local = 0; local < view->group_size; local++) {
+                const size_t word_index = word_base + local / per_word;
+                const uint32_t word =
+                    coli_affine_load_le32(weight_row + word_index * 4);
+                const unsigned shift = bits * (unsigned)(local % per_word);
+                out_row[input_base + local] =
+                    scale * (float)((word >> shift) & mask) + bias;
+            }
+        }
+    }
+    return COLI_AFFINE_OK;
+}
+
 #ifdef __cplusplus
 }
 #endif

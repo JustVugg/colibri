@@ -1402,6 +1402,11 @@ tests/test_affine_quant$(EXE): tests/test_affine_quant.c affine_quant.h backend_
 tests/test_qpack$(EXE): tests/test_qpack.c qpack.c qpack.h affine_quant.h json.h compat.h
 	$(CC) $(CFLAGS) tests/test_qpack.c qpack.c -o $@ $(LDFLAGS)
 
+# Loader-side expansion oracle for the same MLX affine contract: nibble/byte
+# order, scalar decodings, parity against coli_affine_matmul_ref, refusals.
+tests/test_affine_dequant$(EXE): tests/test_affine_dequant.c affine_quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
 	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
 
