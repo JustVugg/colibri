@@ -80,6 +80,78 @@ class EnvDefaultsTest(unittest.TestCase):
             self.assertNotIn(k, e)
 
 
+class SiblingPlanRefusalTest(unittest.TestCase):
+    """A sibling auto-tier refusal is a launcher diagnostic, never a traceback
+    or a child started with an implicit over-budget cache."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+        (self.model / "config.json").write_text(
+            json.dumps({"model_type": "qwen4_exp_text"}), encoding="utf-8")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def refusal_args(self, **overrides):
+        values = dict(
+            model=str(self.model), policy="quality", ram=0, ngen=8, topp=0,
+            topk=0, temp=None, repin=0, ctx=0, auto_tier=True, gpu=None,
+            vram=0, kv_slots=1, no_tune_profile=True, cap=None,
+            no_attach=True, attach=None, api_key=None,
+        )
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def plan_refusal(self):
+        return mock.patch(
+            "resource_plan.build_plan",
+            return_value={"model": {"family_id": "qwen38"}},
+        ), mock.patch(
+            "resource_plan.environment_for_plan",
+            side_effect=ValueError(
+                "Qwen3.8 RAM budget cannot hold one expert slot per loaded layer"
+            ),
+        )
+
+    def test_chat_refuses_before_popen_without_traceback(self):
+        build_plan, environment = self.plan_refusal()
+        with mock.patch.object(coli, "need_model"), \
+             mock.patch.object(coli, "engine_for", return_value="/engines/qwen38"), \
+             mock.patch.object(coli, "resource_request", return_value=(0, 0, [], 0)), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch.object(coli, "banner"), build_plan, environment, \
+             mock.patch.object(coli.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit) as stopped:
+                coli.cmd_chat(self.refusal_args())
+        message = str(stopped.exception)
+        self.assertIn("invalid resource plan", message)
+        self.assertIn("one expert slot", message)
+        self.assertNotIn("Traceback", message)
+        popen.assert_not_called()
+
+    def test_serve_refuses_without_starting_or_leaving_pidfile(self):
+        build_plan, environment = self.plan_refusal()
+        pidfile = self.model / "serve.pid"
+        arguments = self.refusal_args(
+            port=9123, host="127.0.0.1", model_id=None,
+            cluster_coordinator=None, cluster_workers=None,
+        )
+        with mock.patch.object(coli, "need_model"), \
+             mock.patch.object(coli, "engine_for", return_value="/engines/qwen38"), \
+             mock.patch.object(coli, "resource_request", return_value=(0, 0, [], 0)), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch.object(coli, "serve_pidfile", return_value=str(pidfile)), \
+             mock.patch.object(coli, "banner"), build_plan, environment, \
+             mock.patch("openai_server.ARCH", "glm"), \
+             mock.patch("openai_server.serve") as serve:
+            with self.assertRaises(SystemExit) as stopped:
+                coli.cmd_serve(arguments)
+        self.assertIn("invalid resource plan", str(stopped.exception))
+        serve.assert_not_called()
+        self.assertFalse(pidfile.exists())
+
+
 class CudaAutoEnableTest(unittest.TestCase):
     """Windows bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS run
     CPU-only even on a CUDA build with a GPU present. env_for now auto-enables

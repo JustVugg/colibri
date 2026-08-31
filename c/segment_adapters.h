@@ -21,6 +21,7 @@ int coli_inkling_segment_adapter_register(void);
 int coli_kimi_segment_adapter_register(void);
 int coli_olmoe_segment_adapter_register(void);
 int coli_qwen36_segment_adapter_register(void);
+int coli_qwen38_segment_adapter_register(void);
 int coli_deepseek_v4_segment_adapter_register(void);
 
 #ifdef __cplusplus

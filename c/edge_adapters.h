@@ -14,6 +14,7 @@ int coli_inkling_edge_adapter_register(void);
 int coli_kimi_edge_adapter_register(void);
 int coli_olmoe_edge_adapter_register(void);
 int coli_qwen36_edge_adapter_register(void);
+int coli_qwen38_edge_adapter_register(void);
 int coli_deepseek_v4_edge_adapter_register(void);
 
 #ifdef __cplusplus

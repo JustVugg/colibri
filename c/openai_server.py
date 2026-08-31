@@ -529,6 +529,8 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
+    if ARCH == "qwen38":
+        return parse_qwen38_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -557,7 +559,7 @@ def _tool_hold():
 
 
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
-               # kimi | olmoe | qwen36 | deepseek_v4)
+               # kimi | olmoe | qwen36 | qwen38 | deepseek_v4)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -1201,6 +1203,221 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+# Qwen3.8 declares and emits tool calls in an XML-ish form of its own, not the
+# JSON block GLM uses and not DeepSeek's DSML -- so it needs its own renderer and
+# its own parser. Both sides are transcribed from chat_template.jinja rather than
+# paraphrased, because a tool preamble the model has not seen verbatim is a
+# different prompt: the declaration is what teaches it the syntax it must emit.
+#
+#   <tool_call>
+#   <function=NAME>
+#   <parameter=KEY>
+#   VALUE
+#   </parameter>
+#   </function>
+#   </tool_call>
+QWEN38_TOOL_PREAMBLE = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
+
+
+def _qwen38_tool_block(tools):
+    """The `# Tools` system section, byte-identical to the template's."""
+    lines = ["# Tools\n\nYou have access to the following functions:\n\n<tools>"]
+    for tool in tools:
+        lines.append("\n" + json.dumps(tool, ensure_ascii=False, separators=(", ", ": ")))
+    lines.append("\n</tools>")
+    lines.append(QWEN38_TOOL_PREAMBLE)
+    return "".join(lines)
+
+
+def _qwen38_tool_calls(tool_calls, has_content, index):
+    """Render assistant tool_calls. The template separates the FIRST call from
+    preceding content with a blank line only when that content is non-empty, and
+    every later call with a single newline; getting that wrong changes the prompt
+    the model is conditioned on."""
+    out = []
+    for position, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.",
+                           f"messages.{index}.tool_calls.{position}")
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.",
+                           f"messages.{index}.tool_calls.{position}.function")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            raise APIError(400, "`function.name` must be a non-empty string.",
+                           f"messages.{index}.tool_calls.{position}.function.name")
+        lead = ("\n\n" if has_content else "") if position == 0 else "\n"
+        out.append(f"{lead}<tool_call>\n<function={name}>\n")
+        args = fn.get("arguments", "")
+        if isinstance(args, str) and args:
+            try:
+                args = json.loads(args)
+            except (TypeError, ValueError):
+                raise APIError(400, "`function.arguments` must be a JSON object.",
+                               f"messages.{index}.tool_calls.{position}.function.arguments")
+        if isinstance(args, dict):
+            for key, value in args.items():
+                # The template stringifies a str as-is and tojson's everything
+                # else, so a string argument must NOT gain quotes here.
+                rendered = value if isinstance(value, str) else json.dumps(
+                    value, ensure_ascii=False, separators=(", ", ": "))
+                out.append(f"<parameter={key}>\n{rendered}\n</parameter>\n")
+        out.append("</function>\n</tool_call>")
+    return "".join(out)
+
+
+QWEN38_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
+QWEN38_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
+
+
+def parse_qwen38_tool_calls(reply, tools=None):
+    """Parse Qwen3.8's XML-ish calls back into OpenAI `tool_calls`.
+
+    Values are returned as strings, which is what the template feeds in: it
+    writes a str argument unquoted, so the original type is not recoverable from
+    the text alone. Where the declared schema says a parameter is not a string we
+    re-read it as JSON, which restores numbers and booleans without guessing at
+    anything the schema did not promise."""
+    schema = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        params = (fn.get("parameters") or {}).get("properties") or {}
+        if isinstance(params, dict):
+            schema[fn.get("name")] = params
+    calls = []
+    for match in QWEN38_CALL_RE.finditer(reply or ""):
+        name = match.group(1).strip()
+        args = {}
+        for key, raw in QWEN38_PARAM_RE.findall(match.group(2)):
+            key = key.strip()
+            declared = (schema.get(name) or {}).get(key) or {}
+            kind = declared.get("type") if isinstance(declared, dict) else None
+            if kind in (None, "string"):
+                args[key] = raw
+            else:
+                try:
+                    args[key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    args[key] = raw
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    text = QWEN38_CALL_RE.sub("", reply or "")
+    if not calls and tools and "<tool_call>" in (reply or ""):
+        sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
+                         "possibly truncated or mangled output\n")
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Text-only Qwen3.8 chat-template subset with native reasoning hints."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice in ("none",):
+        tools = None                              # the client forbade them: do not offer any
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+
+    instruction = ""
+    if enable_thinking:
+        effort = reasoning_effort or "xhigh"
+        if effort == "high":
+            effort = "xhigh"
+        elif effort == "minimal":
+            effort = "low"
+        if effort not in ("xhigh", "medium", "low"):
+            raise APIError(400, "Qwen3.8 reasoning_effort must be high, xhigh, medium, or low.",
+                           "reasoning_effort")
+        if effort == "xhigh":
+            instruction = ("Reasoning effort is set to xhigh. Please think carefully through "
+                           "the task, validate key assumptions, consider plausible "
+                           "alternatives, and prioritize correctness, consistency, and "
+                           "clarity in the final answer.")
+        elif effort == "low":
+            instruction = ("Reasoning effort is set to low. Keep your thinking brief and "
+                           "focused, moving directly to the conclusion without unnecessary "
+                           "elaboration.")
+
+    parts = []
+    first = messages[0]
+    first_role = first.get("role") if isinstance(first, dict) else None
+    if first_role == "developer":
+        first_role = "system"
+    system_text = ""
+    start = 0
+    if first_role == "system":
+        raw = first.get("content")
+        system_text = content_text(raw, "messages.0.content").strip() if raw is not None else ""
+        start = 1
+    if tools:
+        # With tools the template builds ONE system turn in a fixed order:
+        # reasoning instruction, then the tool block, then the user's own system
+        # text last -- not the other way round.
+        head = (instruction + "\n\n") if instruction else ""
+        block = head + _qwen38_tool_block(tools)
+        if system_text:
+            block += "\n\n" + system_text
+        parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
+    elif system_text or instruction:
+        text = system_text
+        if instruction:
+            text = instruction + ("\n\n" + text if text else "")
+        parts.append(f"<|im_start|>system\n{text}<|im_end|>\n")
+
+    for index, message in enumerate(messages[start:], start=start):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if role == "system" and index != 0:
+            raise APIError(400, "System message must be at the beginning.",
+                           f"messages.{index}.role")
+        raw = message.get("content")
+        text = (content_text(raw, f"messages.{index}.content").strip()
+                if raw is not None else "")
+        if role == "tool":
+            # Consecutive tool results share ONE user turn: the opening tag is
+            # written only when the previous message was not a tool, and the
+            # closing one only when the next is not. Emitting a turn per result
+            # would be a different conversation shape.
+            prev = messages[index - 1].get("role") if index > 0 and isinstance(
+                messages[index - 1], dict) else None
+            nxt = messages[index + 1].get("role") if index + 1 < len(messages) and isinstance(
+                messages[index + 1], dict) else None
+            if prev != "tool":
+                parts.append("<|im_start|>user")
+            parts.append(f"\n<tool_response>\n{text}\n</tool_response>")
+            if nxt != "tool":
+                parts.append("<|im_end|>\n")
+            continue
+        if role == "assistant":
+            reasoning = message.get("reasoning_content", "")
+            if not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            calls = message.get("tool_calls")
+            rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
+            if calls:
+                rendered += _qwen38_tool_calls(calls, bool(text.strip()), index)
+            parts.append(f"<|im_start|>assistant\n{rendered}<|im_end|>\n")
+            continue
+        parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+
+    parts.append("<|im_start|>assistant\n")
+    parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -1406,6 +1623,62 @@ def _image_bytes_from_url(url):
         raise APIError(400, f"cannot read image {path}: {problem}", "messages")
 
 
+# Qwen3.8 splices images as <|vision_start|> + N x <|image_pad|> + <|vision_end|>,
+# and N is not a constant: the resolution is dynamic, so it comes from the grid
+# the preprocessor chose. Hardcoding it would put the right vectors in the wrong
+# number of slots, which the engine refuses rather than guesses about.
+QWEN38_VISION_START = "<|vision_start|>"
+QWEN38_IMAGE_PAD = "<|image_pad|>"
+QWEN38_VISION_END = "<|vision_end|>"
+
+
+def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from qwen38_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
+
+
+def expand_qwen38_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholders and pull out the patches.
+
+    Returns (rewritten messages, images). The messages come back as plain text,
+    so the renderer treats them like any other turn."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_qwen38_image(
+                    data, model_dir, max_tokens)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(QWEN38_VISION_START + QWEN38_IMAGE_PAD * tokens
+                              + QWEN38_VISION_END)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
 def expand_glm53_images(messages, model_dir):
     """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
 
@@ -1552,11 +1825,23 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     elif tool_choice == "none":
         tools = None                              # il client li ha vietati: non si offrono
 
-    # low e high passano, tutto il resto e' Max: e' la scala del template, non
-    # la nostra. `none` non arriva qui, spegne il ragionamento a monte.
-    effort = {"minimal": "Low", "low": "Low", "medium": "High",
-              "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
-    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+    prompt = ["[gMASK]<sop>"]
+    if enable_thinking:
+        # SOLO col ragionamento acceso. Con --no-think il prompt chiude gia' il
+        # blocco, e lasciare "Reasoning Effort: Max" davanti a un <think></think>
+        # chiuso dice al modello due cose opposte: rifletti al massimo, e hai
+        # finito di riflettere. Il modello risponde riaprendo un <think>, lo
+        # splitter -- che era partito correttamente in modalita' testo -- lo vede
+        # e ci rientra, e da li' in poi tutta la risposta viene archiviata come
+        # pensiero: l'utente vede riflettere e poi nessuna risposta (#1278).
+        # render_chat (GLM-5.2) mette questa riga sotto la stessa condizione da
+        # sempre, ed e' l'unico dei due che non ha mai avuto questa segnalazione.
+        #
+        # low e high passano, tutto il resto e' Max: e' la scala del template,
+        # non la nostra. `none` non arriva qui, spegne il ragionamento a monte.
+        effort = {"minimal": "Low", "low": "Low", "medium": "High",
+                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
+        prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
@@ -1609,6 +1894,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     renderer = (render_chat_glm53 if ARCH == "glm53" else
                 render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
+                render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
@@ -2209,6 +2495,12 @@ def cap_for_arch(arch, cap, env=None):
             measured = 0
         if measured >= 1:
             return measured
+        try:
+            planned = int(env.get("COLI_PLAN_CAP", ""))
+        except (TypeError, ValueError):
+            planned = 0
+        if planned >= 1:
+            return planned
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -2344,12 +2636,14 @@ class Engine:
             family = (resolve_model(model).descriptor if config.exists()
                       else family_by_id(ARCH))
         arch = family.id
+        self.family = family
         self.model_dir = str(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
         resolved_cap = cap_for_arch(arch, cap, child_env)
         child_env.pop("COLI_PROFILE_CAP", None)
+        child_env.pop("COLI_PLAN_CAP", None)
         self.process = subprocess.Popen(
             [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
@@ -3567,9 +3861,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # COLI_THINK=1 makes thinking the default when the client sends NEITHER reasoning_effort
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
-        if (reasoning_effort is None and "enable_thinking" not in body
-                and os.environ.get("COLI_THINK", "0") == "1"):
-            reasoning_effort = "high"
+        if reasoning_effort is None and "enable_thinking" not in body:
+            # Qwen3.8's official template defaults to enabled xhigh thinking;
+            # preserve the older opt-in default for the other families.
+            if ARCH == "qwen38":
+                reasoning_effort = "xhigh"
+            elif os.environ.get("COLI_THINK", "0") == "1":
+                reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
@@ -3597,6 +3895,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
+        elif ARCH == "qwen38":
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
@@ -3619,8 +3926,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if thinking is not None and not isinstance(thinking, dict):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
-        if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
-            enable_thinking = True
+        if not enable_thinking and thinking is None:
+            if ARCH == "qwen38":
+                enable_thinking = True
+            elif os.environ.get("COLI_THINK", "0") == "1":
+                enable_thinking = True
         if ARCH == "olmoe":
             enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
@@ -3635,8 +3945,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
+        default_effort = "xhigh" if ARCH == "qwen38" and thinking is None else "high"
         prompt = render_chat_for_arch(messages, enable_thinking,
-                                      "high" if enable_thinking else None,
+                                      default_effort if enable_thinking else None,
                                       tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 

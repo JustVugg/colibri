@@ -19,6 +19,8 @@ c/inkling
 c/kimi_k3
 c/kimi_k3.exe
 c/olmoe.exe
+c/qwen38
+c/qwen38.exe
 # deepseek_v4 and the per-unit objects its amalgamated Makefile leaves behind.
 # The same omission as #858, one file over: every engine is listed here except
 # the one added last, so `make deepseek-v4` left 26 untracked .o files in
@@ -117,6 +119,7 @@ c/olmoe_merged/
 c/olmoe_i4/
 .idea
 c/tiny_inkling/
+c/qwen38_tiny/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
@@ -141,3 +144,5 @@ c/*.obj
 # vendor modeling cache for the tiny K3 oracle (maintainer tool)
 c/kimi_k3_tiny/.vendor_kimi_k3/
 c/kimi_k3_tiny/.coli_usage
+c/qwen38_vision_tiny/
+c/qwen38_mm_tiny/

@@ -1,0 +1,7 @@
+# Pinned dependencies for the Qwen3.8-Flash-Next text oracle. Transformers
+# 5.16.1 is the first release that includes the upstream Qwen4-Exp text class.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu; sys_platform != "darwin"
+torch==2.13.0; sys_platform == "darwin"
+safetensors==0.8.0
+transformers==5.16.1

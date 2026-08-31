@@ -146,8 +146,24 @@ def main() -> int:
     if not off.endswith("<|assistant|><think></think>"):
         print(f"FAIL: col ragionamento spento il prompt finisce con {off[-40:]!r}")
         return 1
-    if off[:-len("</think>")] != on:
-        print("FAIL: acceso e spento differiscono per piu' della chiusura del blocco")
+    # Questa asserzione prima pretendeva che acceso e spento differissero SOLO
+    # per </think>. Era sbagliata, ed e' costata #1278: lasciava "Reasoning
+    # Effort: Max" davanti a un blocco gia' chiuso, cioe' diceva al modello di
+    # riflettere al massimo e insieme che aveva finito. Il modello riapre un
+    # <think>, lo splitter ci rientra e archivia la risposta come pensiero:
+    # l'utente vede riflettere e poi niente.
+    #
+    # Adesso pretende le DUE differenze che devono esserci e nessun'altra: il
+    # blocco chiuso, e nessuna riga di effort. E' la stessa forma che
+    # render_chat (GLM-5.2) produce da sempre.
+    if "Reasoning Effort" in off:
+        print("FAIL: col ragionamento spento il prompt chiede ancora di riflettere")
+        return 1
+    stripped = on.replace("[gMASK]<sop>", "", 1)
+    stripped = stripped[stripped.index("<|user|>"):] if "<|user|>" in stripped else stripped
+    if off[:-len("</think>")] != "[gMASK]<sop>" + stripped:
+        print("FAIL: acceso e spento differiscono per piu' della chiusura del blocco "
+              "e della riga di effort")
         return 1
 
     print(f"PASS GLM-5.3 chat template: {checked} rese identiche a "

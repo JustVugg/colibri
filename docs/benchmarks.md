@@ -54,7 +54,7 @@ COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
 # 3) full automated datapoint — machine info + cold/warm decode + disk, one command:
 python tools/datapoint.py --snap /path/to/model --shard /path/to/container/model-00000.safetensors
-# (stdlib-only; auto-selects GLM, Inkling, Kimi K3, OLMoE, Qwen3.6, or DeepSeek V4
+# (stdlib-only; auto-selects GLM, Inkling, Kimi K3, OLMoE, Qwen3.8, Qwen3.6, or DeepSeek V4
 #  from config.json; evicts the page cache before engine load; then keeps one
 #  SERVE=1 engine alive for cold, warm-identical, and rotating-prompt measurements)
 

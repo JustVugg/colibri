@@ -22,6 +22,7 @@ ARCHES = [
     ("inkling", "inkling"),
     ("kimi_k3", "kimi_k3"),
     ("olmoe", "olmoe"),
+    ("qwen4_exp", "qwen38"),
     ("deepseek_v4", "deepseek_v4"),
 ]
 

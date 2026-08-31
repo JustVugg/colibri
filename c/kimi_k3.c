@@ -104,6 +104,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
@@ -3047,7 +3048,7 @@ int main(int argc, char **argv){
     if(!snap||!*snap){ fprintf(stderr,"set SNAP=<Kimi K3 snapshot directory>\n"); return 1; }
     int ngen=32, chat=0;
     for(int i=serving?1:2;i<argc;i++){
-        if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=atoi(argv[++i]);
+        if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=coli_arg_int(argv[++i], "--ngen");
         else if(!strcmp(argv[i],"--ids")&&i+1<argc) idstr=argv[++i];
         else if(!strcmp(argv[i],"--chat")) chat=1;
         else if(!strcmp(argv[i],"--system")&&i+1<argc) sysmsg=argv[++i];
