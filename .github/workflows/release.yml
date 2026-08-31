@@ -135,29 +135,20 @@ jobs:
           # run it -- the second half of #720.
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
-          # Gli script che `coli` lancia, letti da coli invece che elencati qui.
-          # Una lista scritta a mano in questo punto e' gia' costata #1296: si
-          # copiava k3_tokenizer.py e basta, mentre coli ne invoca tre altri, e
-          # `coli convert` nel pacchetto pubblicato moriva con "No such file or
-          # directory". Il passo di verifica piu' sotto controllava l'unico file
-          # presente, quindi la release passava.
-          for s in $(grep -oE 'TOOLS,"[a-z0-9_]+\.py"' c/coli | sed 's/.*"\(.*\)"/\1/' | sort -u); do
-            test -f "c/tools/$s" || { echo "FAIL: coli invokes tools/$s, which does not exist"; exit 1; }
-            cp "c/tools/$s" "dist/tools/$s"
-          done
           cp c/coli dist/
           # Windows has nothing to click otherwise: `coli` is an extensionless
           # Python script, and the .exe files are engines that exit at once
           # without a model (#1241). coli.cmd is both the double-click entry
           # point and what `coli chat ...` resolves to in cmd/PowerShell.
           if [ "${{ matrix.ext }}" = ".exe" ]; then cp c/coli.cmd dist/; fi
-          cp c/version.py dist/
-          cp c/openai_server.py dist/
-          cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import
-          cp c/family_registry.py dist/ # authoritative model-family dispatch/capability registry
-          cp c/resource_plan.py dist/
-          cp c/doctor.py dist/
-          cp c/autotune.py dist/
+          # I file Python non sono piu' elencati qui. Erano sette, scelti a mano,
+          # con i commenti che spiegavano quale importava quale: un inseguimento
+          # del codice fatto a occhio, e il codice era avanti. #1296: mancavano
+          # quattro script invocati da coli e tre moduli importati, fra cui
+          # qwen38_image, per cui mandare un'immagine al pacchetto pubblicato
+          # rispondeva "image support needs Pillow and numpy" mentre il file
+          # semplicemente non era stato spedito.
+          python3 c/tools/pack_python.py c dist
           cp LICENSE dist/
           # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
           # probe that layout as well as the source checkout's one-level-up form.
@@ -198,10 +189,12 @@ jobs:
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
           # script in the archive the engine ships but cannot be driven by coli chat.
           test -f tools/k3_tokenizer.py || { echo "FAIL: k3_tokenizer.py missing from archive"; exit 1; }
-          # E ogni script che coli lancia: e' il controllo che mancava a #1296.
-          for s in $(grep -oE 'TOOLS,"[a-z0-9_]+\.py"' coli | sed 's/.*"\(.*\)"/\1/' | sort -u); do
-            test -f "tools/$s" || { echo "FAIL: coli invokes tools/$s, missing from archive"; exit 1; }
-          done
+          # E tutto cio' che coli raggiunge, import e sottoprocessi. Il controllo
+          # qui sopra guarda l'unico file che il passo di copia aveva appena
+          # scritto: conferma se stesso, ed e' il motivo per cui la v1.10.0 e'
+          # uscita verde con quattro comandi rotti dentro.
+          python3 ../c/tools/pack_python.py ../c . --check \
+            || { echo "FAIL: the archive is missing Python that coli needs"; exit 1; }
           # encoding='utf-8' explicitly: on Windows open() defaults to the ANSI code
           # page (cp1252), which cannot decode this UTF-8 file, so the v1.4.0 tag build
           # failed here with a UnicodeDecodeError while the file itself was perfectly

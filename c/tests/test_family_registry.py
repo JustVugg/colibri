@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1169,50 +1170,51 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
 
-    def test_release_ships_every_tool_coli_invokes(self):
-        """Ogni script che `coli` lancia deve finire nell'archivio.
+    def test_release_ships_everything_coli_reaches(self):
+        """L'archivio deve contenere ogni file Python che coli raggiunge.
 
-        #1296: il pacchetto v1.10.0 conteneva un solo file in tools/,
-        k3_tokenizer.py, scelto a mano nel workflow. coli ne invoca altri tre,
-        fra cui convert_fp8_to_int4.py, e `coli convert` nel pacchetto
-        pubblicato moriva con "No such file or directory". C'era anche un passo
-        di verifica: controllava la presenza dell'unico file copiato, cioe'
-        confermava se stesso.
+        #1296: il pacchetto v1.10.0 aveva quattro comandi rotti. release.yml
+        copiava sette .py scelti a mano piu' un solo file in tools/, e il
+        codice era andato avanti. Mancavano convert_fp8_to_int4.py,
+        eval_glm.py, fetch_benchmarks.py, mirror_plan.py, e i moduli cluster,
+        glm53_image, qwen38_image.
 
-        Il workflow ora ricava la lista da coli con una grep. Questo test
-        protegge l'assunzione di quella grep: se domani coli costruisse il
-        percorso di uno script in un altro modo -- una variabile, un f-string,
-        os.path.join a pezzi -- la grep non lo vedrebbe, il file non verrebbe
-        copiato, e saremmo di nuovo a #1296 con la release verde.
+        Ora la lista la calcola c/tools/pack_python.py. Questo test fissa i
+        due punti ciechi che avevano fatto passare il difetto, perche' sono i
+        due modi in cui un file sfugge a chi guarda a occhio:
 
-        Percio' qui si contano le invocazioni in due modi diversi e si pretende
-        che diano lo stesso numero.
+        - un import dentro una funzione, dopo un sys.path.insert. E' il caso
+          di qwen38_image in openai_server.py, e l'ImportError li' e'
+          catturato e riscritto come "image support needs Pillow and numpy":
+          nel pacchetto pubblicato mandare un'immagine dava la colpa
+          all'ambiente dell'utente per un file che non avevamo spedito.
+        - un sottoprocesso scritto con lo spazio dopo la virgola,
+          os.path.join(TOOLS, "mirror_plan.py"). La mia prima grep cercava
+          TOOLS," senza spazio e non lo vedeva: quattro invocazioni, non tre.
         """
         repo = Path(__file__).resolve().parents[2]
-        coli = (repo / "c" / "coli").read_text(encoding="utf-8")
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
 
-        # 1. Come li vede la grep del workflow.
-        seen = set(re.findall(r'TOOLS,\s*"([a-z0-9_]+\.py)"', coli))
-        self.assertTrue(seen, "nessuno script trovato in coli: la grep del "
-                              "workflow non copierebbe piu' niente")
+        reached = {path.name for path in pack_python.needed(repo / "c")}
 
-        # 2. Ogni .py nominato accanto a TOOLS, comunque sia scritto.
-        every = set(re.findall(r'TOOLS[^\n]*?([a-z0-9_]+\.py)', coli))
-        self.assertEqual(every, seen,
-                         "coli nomina uno script in una forma che la grep di "
-                         "release.yml non riconosce: finirebbe fuori "
-                         "dall'archivio come in #1296")
+        # I sette file che mancavano davvero dall'archivio v1.10.0.
+        for name in ("convert_fp8_to_int4.py", "eval_glm.py",
+                     "fetch_benchmarks.py", "mirror_plan.py",
+                     "cluster.py", "glm53_image.py", "qwen38_image.py"):
+            self.assertIn(name, reached,
+                          f"{name} mancava dall'archivio v1.10.0 e il calcolo "
+                          f"non lo ritrova: #1296 si ripeterebbe")
 
-        # 3. Esistono, e il workflow li copia e li verifica.
         release = (repo / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
-        for script in sorted(seen):
-            self.assertTrue((repo / "c" / "tools" / script).exists(),
-                            f"coli invoca tools/{script}, che non esiste")
-        self.assertIn("dist/tools/$s", release,
-                      "release.yml non copia piu' gli script ricavati da coli")
-        self.assertIn('test -f "tools/$s"', release,
-                      "release.yml non verifica piu' che siano nell'archivio")
+        self.assertIn("pack_python.py c dist", release,
+                      "release.yml non calcola piu' i file da copiare")
+        self.assertIn("--check", release,
+                      "release.yml non verifica piu' l'archivio estratto")
 
     def test_the_python_job_builds_every_engine_a_test_skips_without(self):
         """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
@@ -1359,8 +1361,21 @@ class FamilyRegistryTest(unittest.TestCase):
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
-        for text in (makefile, release, docker):
+        for text in (makefile, docker):
             self.assertIn("family_registry.py", text)
+        # release.yml non nomina piu' i singoli .py: da #1296 la lista la
+        # calcola pack_python.py seguendo gli import a partire da coli. Il
+        # contratto qui e' sempre lo stesso -- family_registry.py deve finire
+        # nell'archivio -- ma va verificato alla fonte nuova, se no si
+        # controlla che esista una riga invece che il file venga spedito.
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+        shipped = {path.name for path in pack_python.needed(repo / "c")}
+        self.assertIn("family_registry.py", shipped,
+                      "l'archivio non spedirebbe family_registry.py")
 
 
 if __name__ == "__main__":
