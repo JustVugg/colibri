@@ -9,6 +9,10 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 
+/* Optional CUDA VRAM expert tier. Without -DCOLI_CUDA this header supplies
+ * inline no-op stubs, so the engine below is unchanged and costs nothing. */
+#include "qwen38_tier.h"
+
 #define Q38_MAX_LAYERS 512
 #define Q38_MAX_EXPERTS 1024
 #define Q38_MAX_TOPK 256
@@ -1657,13 +1661,30 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
         Slot *selected[Q38_MAX_TOPK];
         int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
+        /* Optional CUDA VRAM expert tier. Offer every routed expert so the tier
+         * can place it, then issue whichever it already holds. `gpu` is a
+         * bitmask of the z it took; those are skipped below and folded in by
+         * q38t_take. Without -DCOLI_CUDA every call here is an inline no-op
+         * returning 0, so the loop is exactly what it was. */
         for(int z=0;z<K;z++){
+            Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);
+            q38t_note(layer,idx[z],ex->gate.data,ex->gate.scales,
+                                   ex->up.data,  ex->up.scales,
+                                   ex->down.data,ex->down.scales);
+        }
+        uint32_t gpu=q38t_issue(layer,idx,K,xs);
+        for(int z=0;z<K;z++){
+            if(gpu&(1u<<z)) continue;          /* this expert is on the GPU */
             Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
         }
+        /* Fold the GPU half in AFTER the CPU misses, so the device work
+         * overlapped with them instead of blocking on the first take. */
+        if(gpu){phase_started=now_s();q38t_take(gpu,route_gates,K,ys);
+                q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);}
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();

@@ -1737,6 +1737,12 @@ int main(int argc, char **argv) {
     q38_telemetry_init(snap, &m);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
+    /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot routed experts live in
+     * VRAM and their gate/up/down run there. Off unless asked for, and a no-op
+     * entirely without -DCOLI_CUDA. Placed here because it needs the geometry
+     * from the loaded config and must precede the first token. */
+    q38t_init(m.c.layers, m.c.experts, m.c.hidden, m.c.inter, m.c.topk);
+
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts
      * exactly like argv runs, and serve_loop never returns. */
