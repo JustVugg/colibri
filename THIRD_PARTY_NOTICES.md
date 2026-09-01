@@ -59,3 +59,13 @@ text.
 manifest-last completion policy from Swiftlet's `StreamingInstaller.swift` at
 commit `86246618ba2af30334227e09ff84a6a7182c2a40`. It is a new
 transport-neutral Python implementation and does not copy Swift source code.
+
+`c/tools/qpack_http_install.py` is a new Python HTTP frontend over that policy.
+It interoperates with Hugging Face-hosted Swiftlet qpack repositories but does
+not copy Swiftlet or huggingface_hub source code.
+
+`c/tools/qpack_mirror_install.py` and the static-mirror support in
+`c/tools/qpack_http_install.py` interoperate with the `hashes.json` schema
+emitted by Swiftlet's `scripts/verify_container.py`. They are new Python
+implementations with stricter path, transport, credential, resume, and digest
+validation; no Swiftlet source code is copied.
