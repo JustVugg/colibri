@@ -48,3 +48,14 @@ What that checkout contains, and the licences that apply when you build with it:
 - NVIDIA CUTLASS / CuTe (BSD-3-Clause), the `third-party/cutlass` submodule of
   that commit @ f3fde58372d33e9a5650ba7b80fc48b3b49d40c8. License text:
   `c/third_party/deepgemm/third-party/cutlass/LICENSE.txt` after the fetch.
+
+## Swiftlet qpack installers (`c/tools/qpack_*install*.py`)
+
+Swiftlet (https://github.com/leonickson1/Swiftlet) is licensed under Apache
+License 2.0. This repository's `LICENSE` contains the applicable Apache 2.0
+text.
+
+`c/tools/qpack_install_policy.py` adapts the source-bound resume and
+manifest-last completion policy from Swiftlet's `StreamingInstaller.swift` at
+commit `86246618ba2af30334227e09ff84a6a7182c2a40`. It is a new
+transport-neutral Python implementation and does not copy Swift source code.

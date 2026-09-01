@@ -4,6 +4,13 @@ These scripts support model preparation and offline engineering work. They are
 not runtime dependencies of the C engine.
 
 - `convert_fp8_to_int4.py`, `download_glm52.py`: model preparation
+- `qpack_install_policy.py`: source-bound resume decisions and manifest-last
+  publication primitives for future qpack download/repack frontends. Hold its
+  install session for the full transfer. Qpack v1 has sizes but no content
+  hashes, so frontends must also enforce immutable revisions and any available
+  transport checksum or ETag. It covers manifest-declared container artifacts,
+  not required runtime auxiliaries such as `config.json`. Directory-fsync crash
+  durability is POSIX-only.
 - `convert_fmt4_to_fmt2.py`: fmt=4 (grouped int4) -> fmt=2 (per-row int4)
   re-quant of a GLM-5.2 container, for Metal-backend compatibility
   (see `docs/METAL-M1ULTRA-FMT2-REPORT.md`)
