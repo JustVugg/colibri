@@ -85,6 +85,13 @@ static uint16_t bf16_bits(float value) {   /* fixture values are bf16-exact */
     return (uint16_t)(bits >> 16);
 }
 
+static void write_file(const char *path, const char *text) {
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    CHECK(fwrite(text, 1, strlen(text), f) == strlen(text));
+    CHECK(fclose(f) == 0);
+}
+
 /* Q4 [2,32] logical, gs=16: per (row,group) scale 0.5*(1+idx), bias
  * 0.25*idx - 1.0 (all bf16-exact). */
 static const uint32_t q4_words[2][4] = {
@@ -180,6 +187,36 @@ static void test_q8_expansion(void) {
     free(w);
 }
 
+/* MLX norm-weight dialect: with zero_centered_norms=0 (what the snap-view
+ * tool emits for MLX-derived containers) load_norm_n must undo the
+ * materialised +1 so rmsnorm_row's (1 + w) sees zero-centered weights again;
+ * with the default HF dialect it must not touch a value. */
+static void test_norm_unshift(void) {
+    g_dm.c.zero_centered_norms = 1;
+    float *w = load_norm_n(&g_dm, "model.plain.weight", 4);
+    for (int i = 0; i < 4; i++) CHECK(w[i] == plain_bf16_vals[i]);
+    free(w);
+    g_dm.c.zero_centered_norms = 0;
+    w = load_norm_n(&g_dm, "model.plain.weight", 4);
+    for (int i = 0; i < 4; i++) CHECK(w[i] == plain_bf16_vals[i] - 1.0f);
+    free(w);
+    g_dm.c.zero_centered_norms = 1;
+}
+
+/* qwen36_meta.json carries the dialect flag; load_meta must parse it. */
+static void test_meta_flag(void) {
+    write_file("tests/tmp_dense_affine/qwen36_meta.json",
+               "{\"zero_centered_norms\": false}");
+    Cfg c;
+    memset(&c, 0, sizeof(c));
+    c.n_layers = 1;
+    c.is_attn = calloc(1, 1);
+    c.zero_centered_norms = 1;
+    load_meta(&c, "tests/tmp_dense_affine");
+    CHECK(c.zero_centered_norms == 0);
+    free(c.is_attn);
+}
+
 static void test_prefix_resolution(void) {
     CHECK(dense_has(&g_dm, "model.plain.weight"));
     CHECK(dense_has(&g_dm, "model.unprefixed.weight"));
@@ -262,6 +299,8 @@ int main(int argc, char **argv) {
     test_q4_expansion();
     test_q8_expansion();
     test_prefix_resolution();
+    test_norm_unshift();
+    test_meta_flag();
 #ifndef _WIN32
     test_refusals();
 #endif
