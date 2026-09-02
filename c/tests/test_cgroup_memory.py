@@ -2,12 +2,16 @@
 
 Pure fixtures: every kernel input (``/proc/self/cgroup``, ``/proc/self/mountinfo``,
 ``/proc/meminfo`` and the cgroup control files) is a file under a temporary
-directory, so the tests run identically on any platform, and every expectation
-is derived from the fixture numbers rather than from the implementation.
+directory, and every expectation is derived from the fixture numbers rather
+than from the implementation. The fixtures model Linux procfs/cgroupfs, whose
+mount points are POSIX-absolute paths; the production probe is gated to Linux
+for the same reason, so these tests are skipped elsewhere (a Windows temporary
+directory such as ``D:/...`` is correctly refused by the parser under test).
 """
 
 import json
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,7 +32,13 @@ from resource_plan import (
 
 HOST_AVAILABLE = 16_384 * 1024
 
+_LINUX_ONLY = unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "cgroup fixtures model Linux procfs/cgroupfs paths; the probe is Linux-only",
+)
 
+
+@_LINUX_ONLY
 class CgroupMemoryAdmissionTest(unittest.TestCase):
     """Fixture-driven checks of the cgroup half of the admission minimum."""
 
@@ -787,6 +797,7 @@ def _write_shard(path, tensors):
     path.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
 
 
+@_LINUX_ONLY
 class DoctorMemoryAdmissionTest(unittest.TestCase):
     """The tri-state reaches doctor unchanged (A1).
 
