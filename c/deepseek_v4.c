@@ -7255,12 +7255,23 @@ enum { V4_W1 = 0, V4_W2 = 1, V4_W3 = 2, V4_MATRIX_COUNT = 3 };
 typedef struct {
     const ColiSafetensorsTensor *weight[V4_MATRIX_COUNT];
     const ColiSafetensorsTensor *scale[V4_MATRIX_COUNT];
-    int shard;
+    int scale_shard;
+    int weight_shard;
     uint64_t scale_offset;
     uint64_t scale_bytes;
     uint64_t weight_offset;
     uint64_t weight_bytes;
     uint64_t record_bytes;
+    /* Per-matrix fallback when scale (or weight) tensors are split across
+     * shards (REAP-style packed checkpoints). per_matrix=1 selects m_off/
+     * m_len/m_shard directly; the group fields above are ignored then. */
+    int per_matrix;
+    int m_scale_shard[V4_MATRIX_COUNT];
+    int m_weight_shard[V4_MATRIX_COUNT];
+    uint64_t m_scale_offset[V4_MATRIX_COUNT];
+    uint64_t m_scale_bytes[V4_MATRIX_COUNT];
+    uint64_t m_weight_offset[V4_MATRIX_COUNT];
+    uint64_t m_weight_bytes[V4_MATRIX_COUNT];
 } V4ExpertRecord;
 
 typedef struct {
@@ -7370,16 +7381,39 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
                              layer, expert, matrix_names[matrix]);
     }
     int scale_shard = -1, weight_shard = -1;
-    if (contiguous_group(record->scale, state->index,
-                         &scale_shard, &record->scale_offset,
-                         &record->scale_bytes) != 0 ||
-        contiguous_group(record->weight, state->index,
-                         &weight_shard, &record->weight_offset,
-                         &record->weight_bytes) != 0 || scale_shard != weight_shard)
-        return set_error(error, error_size,
-                         "expert is not two contiguous ranges: layer=%d expert=%d",
-                         layer, expert);
-    record->shard = scale_shard;
+    int scale_range_contiguous = contiguous_group(record->scale, state->index,
+                                     &scale_shard, &record->scale_offset,
+                                     &record->scale_bytes) == 0;
+    int weight_range_contiguous = contiguous_group(record->weight, state->index,
+                                      &weight_shard, &record->weight_offset,
+                                      &record->weight_bytes) == 0;
+    if (!scale_range_contiguous || !weight_range_contiguous) {
+        /* REAP-style packed checkpoint: fall back to per-matrix reads. */
+        record->per_matrix = 1;
+        uint64_t per_matrix_bytes = 0;
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            int matrix_scale_shard = coli_st_tensor_shard(state->index, record->scale[matrix]);
+            int matrix_weight_shard = coli_st_tensor_shard(state->index, record->weight[matrix]);
+            if (matrix_scale_shard < 0 || matrix_weight_shard < 0)
+                return set_error(error, error_size,
+                                 "expert shard lookup failed: layer=%d expert=%d",
+                                 layer, expert);
+            record->m_scale_shard[matrix] = matrix_scale_shard;
+            record->m_weight_shard[matrix] = matrix_weight_shard;
+            record->m_scale_offset[matrix] = (uint64_t)record->scale[matrix]->off;
+            record->m_scale_bytes[matrix] = (uint64_t)record->scale[matrix]->nbytes;
+            record->m_weight_offset[matrix] = (uint64_t)record->weight[matrix]->off;
+            record->m_weight_bytes[matrix] = (uint64_t)record->weight[matrix]->nbytes;
+            per_matrix_bytes += record->m_scale_bytes[matrix] + record->m_weight_bytes[matrix];
+        }
+        record->scale_shard = record->m_scale_shard[0];
+        record->weight_shard = record->m_weight_shard[0];
+        record->record_bytes = per_matrix_bytes;
+        return 0;
+    }
+    record->per_matrix = 0;
+    record->scale_shard = scale_shard;
+    record->weight_shard = weight_shard;
     record->record_bytes = record->scale_bytes + record->weight_bytes;
     return 0;
 }
@@ -7539,12 +7573,25 @@ static void fill_tensor_view(ColiTensorView *view,
                              const V4ExpertSlot *slot, int matrix) {
     const ColiSafetensorsTensor *weight = record->weight[matrix];
     const ColiSafetensorsTensor *scale = record->scale[matrix];
+    uint64_t scale_base = 0, weight_base = 0;
+    if (record->per_matrix) {
+        /* REAP fallback: slab packs per-matrix scales first, then weights. */
+        for (int prior = 0; prior < matrix; prior++)
+            scale_base += record->m_scale_bytes[prior];
+        for (int all = 0; all < V4_MATRIX_COUNT; all++)
+            weight_base += record->m_scale_bytes[all];
+        for (int prior = 0; prior < matrix; prior++)
+            weight_base += record->m_weight_bytes[prior];
+    } else {
+        scale_base = (uint64_t)scale->off - record->scale_offset;
+        weight_base = record->scale_bytes +
+                      ((uint64_t)weight->off - record->weight_offset);
+    }
     memset(view, 0, sizeof(*view));
     view->format = COLI_TENSOR_FP4_NATIVE_BLOCK;
     view->scale_format = COLI_SCALE_UE8M0;
-    view->data = slot->slab + record->scale_bytes +
-                 ((uint64_t)weight->off - record->weight_offset);
-    view->scales = slot->slab + ((uint64_t)scale->off - record->scale_offset);
+    view->data = slot->slab + weight_base;
+    view->scales = slot->slab + scale_base;
     view->data_bytes = (size_t)weight->nbytes;
     view->scale_bytes = (size_t)scale->nbytes;
     view->rows = weight->shape[0];
@@ -7597,13 +7644,44 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         int rep = coli_st_expert_route(key.layer, key.expert);
         struct timespec disk_t0;
         clock_gettime(CLOCK_MONOTONIC, &disk_t0);
-        if (coli_st_read_at_streaming_rep(
-                state->index, record->shard, rep, record->scale_offset,
-                (size_t)record->scale_bytes, slot->slab) != 0 ||
-            coli_st_read_at_streaming_rep(
-                state->index, record->shard, rep, record->weight_offset,
-                (size_t)record->weight_bytes,
-                slot->slab + record->scale_bytes) != 0) {
+        int read_failed = 0;
+        if (record->per_matrix) {
+            uint64_t scale_cursor = 0;
+            for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+                if (coli_st_read_at_streaming_rep(
+                        state->index, record->m_scale_shard[matrix], rep,
+                        record->m_scale_offset[matrix],
+                        (size_t)record->m_scale_bytes[matrix],
+                        slot->slab + scale_cursor) != 0) {
+                    read_failed = 1; break;
+                }
+                scale_cursor += record->m_scale_bytes[matrix];
+            }
+            if (!read_failed) {
+                uint64_t weight_cursor = 0;
+                for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++)
+                    weight_cursor += record->m_scale_bytes[matrix];
+                for (int matrix = 0; matrix < V4_MATRIX_COUNT && !read_failed; matrix++) {
+                    if (coli_st_read_at_streaming_rep(
+                            state->index, record->m_weight_shard[matrix], rep,
+                            record->m_weight_offset[matrix],
+                            (size_t)record->m_weight_bytes[matrix],
+                            slot->slab + weight_cursor) != 0)
+                        read_failed = 1;
+                    weight_cursor += record->m_weight_bytes[matrix];
+                }
+            }
+        } else {
+            if (coli_st_read_at_streaming_rep(
+                    state->index, record->scale_shard, rep, record->scale_offset,
+                    (size_t)record->scale_bytes, slot->slab) != 0 ||
+                coli_st_read_at_streaming_rep(
+                    state->index, record->weight_shard, rep, record->weight_offset,
+                    (size_t)record->weight_bytes,
+                    slot->slab + record->scale_bytes) != 0)
+                read_failed = 1;
+        }
+        if (read_failed) {
             struct timespec disk_t1;
             clock_gettime(CLOCK_MONOTONIC, &disk_t1);
             state->disk_sec +=
@@ -7666,7 +7744,7 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
     V4ExpertStoreState *state = store->state;
     int accepted = 0;
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
-    size_t capacity = count * 2, ranges = 0;
+    size_t capacity = count * 6, ranges = 0;
     int *shards = malloc(capacity * sizeof(*shards));
     uint64_t *offsets = malloc(capacity * sizeof(*offsets));
     size_t *lengths = malloc(capacity * sizeof(*lengths));
@@ -7681,12 +7759,25 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         V4ExpertSlot *slot = indexed_expert_slot(state, keys[i]);
         int resident = slot && slot->slab && slot->expert == keys[i].expert;
         if (resident) continue;
-        shards[ranges] = record->shard;
-        offsets[ranges] = record->scale_offset;
-        lengths[ranges++] = (size_t)record->scale_bytes;
-        shards[ranges] = record->shard;
-        offsets[ranges] = record->weight_offset;
-        lengths[ranges++] = (size_t)record->weight_bytes;
+        if (record->per_matrix) {
+            for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+                shards[ranges] = record->m_scale_shard[matrix];
+                offsets[ranges] = record->m_scale_offset[matrix];
+                lengths[ranges++] = (size_t)record->m_scale_bytes[matrix];
+            }
+            for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+                shards[ranges] = record->m_weight_shard[matrix];
+                offsets[ranges] = record->m_weight_offset[matrix];
+                lengths[ranges++] = (size_t)record->m_weight_bytes[matrix];
+            }
+        } else {
+            shards[ranges] = record->scale_shard;
+            offsets[ranges] = record->scale_offset;
+            lengths[ranges++] = (size_t)record->scale_bytes;
+            shards[ranges] = record->weight_shard;
+            offsets[ranges] = record->weight_offset;
+            lengths[ranges++] = (size_t)record->weight_bytes;
+        }
         candidates++;
     }
     pthread_mutex_unlock(&state->mutex);
@@ -7699,13 +7790,44 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         V4ExpertRecord *record = get_record(state, keys[i]);
         if (!record) continue;
         int rep = coli_st_expert_route(keys[i].layer, keys[i].expert);
-        if (coli_st_prefetch_at_rep(state->index, record->shard, rep,
-                                    record->scale_offset,
-                                    (size_t)record->scale_bytes) == 0 &&
-            coli_st_prefetch_at_rep(state->index, record->shard, rep,
-                                    record->weight_offset,
-                                    (size_t)record->weight_bytes) == 0)
-            accepted++;
+        int all_weights_prefetched = 1;
+        int matrix_count = record->per_matrix ? V4_MATRIX_COUNT : 1;
+        for (int segment = 0; segment < matrix_count && all_weights_prefetched; segment++) {
+            int shard;
+            uint64_t offset;
+            size_t length;
+            if (record->per_matrix) {
+                shard = record->m_weight_shard[segment];
+                offset = record->m_weight_offset[segment];
+                length = (size_t)record->m_weight_bytes[segment];
+            } else {
+                shard = record->weight_shard;
+                offset = record->weight_offset;
+                length = (size_t)record->weight_bytes;
+            }
+            if (coli_st_prefetch_at_rep(state->index, shard, rep,
+                                        offset, length) != 0)
+                all_weights_prefetched = 0;
+        }
+        if (!all_weights_prefetched) continue;
+        int all_scales_prefetched = 1;
+        for (int segment = 0; segment < matrix_count; segment++) {
+            int shard;
+            uint64_t offset;
+            size_t length;
+            if (record->per_matrix) {
+                shard = record->m_scale_shard[segment];
+                offset = record->m_scale_offset[segment];
+                length = (size_t)record->m_scale_bytes[segment];
+            } else {
+                shard = record->scale_shard;
+                offset = record->scale_offset;
+                length = (size_t)record->scale_bytes;
+            }
+            all_scales_prefetched &= coli_st_prefetch_at_rep(state->index, shard, rep,
+                                                              offset, length) == 0;
+        }
+        if (all_weights_prefetched && all_scales_prefetched) accepted++;
     }
 #endif
     pthread_mutex_lock(&state->mutex);
@@ -8083,11 +8205,38 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
+    if (record->per_matrix) {
+        int direct_available = slot->aligned_slab &&
+            coli_st_streaming_direct_available_rep(state->index, record->m_scale_shard[0], rep);
+        if (direct_available)
+            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
+                               __ATOMIC_RELAXED);
+        uint64_t scale_cursor = 0;
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            if (coli_st_read_at_rep(state->index, record->m_scale_shard[matrix], rep,
+                                    record->m_scale_offset[matrix],
+                                    (size_t)record->m_scale_bytes[matrix],
+                                    slot->slab + scale_cursor) != 0)
+                return -1;
+            scale_cursor += record->m_scale_bytes[matrix];
+        }
+        uint64_t weight_cursor = scale_cursor;
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            if (coli_st_read_at_rep(state->index, record->m_weight_shard[matrix], rep,
+                                    record->m_weight_offset[matrix],
+                                    (size_t)record->m_weight_bytes[matrix],
+                                    slot->slab + weight_cursor) != 0)
+                return -1;
+            weight_cursor += record->m_weight_bytes[matrix];
+        }
+        return 0;
+    }
     int direct_available = slot->aligned_slab &&
-        coli_st_streaming_direct_available_rep(state->index, record->shard, rep);
-    if (direct_available &&
+        coli_st_streaming_direct_available_rep(state->index, record->scale_shard, rep);
+    int same_shard = record->scale_shard == record->weight_shard;
+    if (direct_available && same_shard &&
         record->scale_offset + record->scale_bytes == record->weight_offset &&
-        !v4_read_direct_window(state, record->shard, rep, slot->slab,
+        !v4_read_direct_window(state, record->scale_shard, rep, slot->slab,
                                record->scale_offset,
                                (size_t)record->record_bytes, 0)) {
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
@@ -8099,24 +8248,24 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
     }
 
     int weight_direct = direct_available && !v4_read_direct_window(
-        state, record->shard, rep, slot->slab, record->weight_offset,
+        state, record->weight_shard, rep, slot->slab, record->weight_offset,
         (size_t)record->weight_bytes, (size_t)record->scale_bytes);
     if (weight_direct) {
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_payload_bytes, record->weight_bytes,
                            __ATOMIC_RELAXED);
-        return coli_st_read_at_rep(state->index, record->shard, rep,
+        return coli_st_read_at_rep(state->index, record->scale_shard, rep,
                                    record->scale_offset,
                                    (size_t)record->scale_bytes, slot->slab);
     }
     if (direct_available)
         __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
                            __ATOMIC_RELAXED);
-    if (coli_st_read_at_rep(state->index, record->shard, rep,
+    if (coli_st_read_at_rep(state->index, record->weight_shard, rep,
                             record->weight_offset,
                             (size_t)record->weight_bytes,
                             slot->slab + record->scale_bytes)) return -1;
-    return coli_st_read_at_rep(state->index, record->shard, rep,
+    return coli_st_read_at_rep(state->index, record->scale_shard, rep,
                                record->scale_offset,
                                (size_t)record->scale_bytes, slot->slab);
 }
@@ -8649,7 +8798,7 @@ int COLI_V4_ROWS16_STORE_OPEN(
     V4ExpertStoreState *state = (*output)->state;
     int direct_io = state->layers > 0 && state->experts_per_layer > 0 &&
         coli_st_streaming_direct_available(
-            state->index, state->records[0].shard);
+            state->index, state->records[0].weight_shard);
     fprintf(stderr, "v4_ssd_io mode=%s fallback=buffered-pread\n",
             direct_io ? "direct-aligned" : "buffered-pread");
     int minimum_slots = state->experts_per_layer < 6
@@ -14641,12 +14790,23 @@ enum { V4_W1 = 0, V4_W2 = 1, V4_W3 = 2, V4_MATRIX_COUNT = 3 };
 typedef struct {
     const ColiSafetensorsTensor *weight[V4_MATRIX_COUNT];
     const ColiSafetensorsTensor *scale[V4_MATRIX_COUNT];
-    int shard;
+    int scale_shard;
+    int weight_shard;
     uint64_t scale_offset;
     uint64_t scale_bytes;
     uint64_t weight_offset;
     uint64_t weight_bytes;
     uint64_t record_bytes;
+    /* Per-matrix fallback when scale (or weight) tensors are split across
+     * shards (REAP-style packed checkpoints). per_matrix=1 selects m_off/
+     * m_len/m_shard directly; the group fields above are ignored then. */
+    int per_matrix;
+    int m_scale_shard[V4_MATRIX_COUNT];
+    int m_weight_shard[V4_MATRIX_COUNT];
+    uint64_t m_scale_offset[V4_MATRIX_COUNT];
+    uint64_t m_scale_bytes[V4_MATRIX_COUNT];
+    uint64_t m_weight_offset[V4_MATRIX_COUNT];
+    uint64_t m_weight_bytes[V4_MATRIX_COUNT];
 } V4ExpertRecord;
 
 typedef struct {
@@ -14736,16 +14896,39 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
                              layer, expert, matrix_names[matrix]);
     }
     int scale_shard = -1, weight_shard = -1;
-    if (contiguous_group(record->scale, state->index,
-                         &scale_shard, &record->scale_offset,
-                         &record->scale_bytes) != 0 ||
-        contiguous_group(record->weight, state->index,
-                         &weight_shard, &record->weight_offset,
-                         &record->weight_bytes) != 0 || scale_shard != weight_shard)
-        return set_error(error, error_size,
-                         "expert is not two contiguous ranges: layer=%d expert=%d",
-                         layer, expert);
-    record->shard = scale_shard;
+    int scale_range_contiguous = contiguous_group(record->scale, state->index,
+                                     &scale_shard, &record->scale_offset,
+                                     &record->scale_bytes) == 0;
+    int weight_range_contiguous = contiguous_group(record->weight, state->index,
+                                      &weight_shard, &record->weight_offset,
+                                      &record->weight_bytes) == 0;
+    if (!scale_range_contiguous || !weight_range_contiguous) {
+        /* REAP-style packed checkpoint: fall back to per-matrix reads. */
+        record->per_matrix = 1;
+        uint64_t per_matrix_bytes = 0;
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            int matrix_scale_shard = coli_st_tensor_shard(state->index, record->scale[matrix]);
+            int matrix_weight_shard = coli_st_tensor_shard(state->index, record->weight[matrix]);
+            if (matrix_scale_shard < 0 || matrix_weight_shard < 0)
+                return set_error(error, error_size,
+                                 "expert shard lookup failed: layer=%d expert=%d",
+                                 layer, expert);
+            record->m_scale_shard[matrix] = matrix_scale_shard;
+            record->m_weight_shard[matrix] = matrix_weight_shard;
+            record->m_scale_offset[matrix] = (uint64_t)record->scale[matrix]->off;
+            record->m_scale_bytes[matrix] = (uint64_t)record->scale[matrix]->nbytes;
+            record->m_weight_offset[matrix] = (uint64_t)record->weight[matrix]->off;
+            record->m_weight_bytes[matrix] = (uint64_t)record->weight[matrix]->nbytes;
+            per_matrix_bytes += record->m_scale_bytes[matrix] + record->m_weight_bytes[matrix];
+        }
+        record->scale_shard = record->m_scale_shard[0];
+        record->weight_shard = record->m_weight_shard[0];
+        record->record_bytes = per_matrix_bytes;
+        return 0;
+    }
+    record->per_matrix = 0;
+    record->scale_shard = scale_shard;
+    record->weight_shard = weight_shard;
     record->record_bytes = record->scale_bytes + record->weight_bytes;
     return 0;
 }
@@ -14766,12 +14949,25 @@ static void fill_tensor_view(ColiTensorView *view,
                              const V4ExpertSlot *slot, int matrix) {
     const ColiSafetensorsTensor *weight = record->weight[matrix];
     const ColiSafetensorsTensor *scale = record->scale[matrix];
+    uint64_t scale_base = 0, weight_base = 0;
+    if (record->per_matrix) {
+        /* REAP fallback: slab packs per-matrix scales first, then weights. */
+        for (int prior = 0; prior < matrix; prior++)
+            scale_base += record->m_scale_bytes[prior];
+        for (int all = 0; all < V4_MATRIX_COUNT; all++)
+            weight_base += record->m_scale_bytes[all];
+        for (int prior = 0; prior < matrix; prior++)
+            weight_base += record->m_weight_bytes[prior];
+    } else {
+        scale_base = (uint64_t)scale->off - record->scale_offset;
+        weight_base = record->scale_bytes +
+                      ((uint64_t)weight->off - record->weight_offset);
+    }
     memset(view, 0, sizeof(*view));
     view->format = COLI_TENSOR_FP4_NATIVE_BLOCK;
     view->scale_format = COLI_SCALE_UE8M0;
-    view->data = slot->slab + record->scale_bytes +
-                 ((uint64_t)weight->off - record->weight_offset);
-    view->scales = slot->slab + ((uint64_t)scale->off - record->scale_offset);
+    view->data = slot->slab + weight_base;
+    view->scales = slot->slab + scale_base;
     view->data_bytes = (size_t)weight->nbytes;
     view->scale_bytes = (size_t)scale->nbytes;
     view->rows = weight->shape[0];
@@ -14829,13 +15025,44 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         int rep = coli_st_expert_route(key.layer, key.expert);
         struct timespec disk_t0;
         clock_gettime(CLOCK_MONOTONIC, &disk_t0);
-        if (coli_st_read_at_streaming_rep(
-                state->index, record->shard, rep, record->scale_offset,
-                (size_t)record->scale_bytes, slot->slab) != 0 ||
-            coli_st_read_at_streaming_rep(
-                state->index, record->shard, rep, record->weight_offset,
-                (size_t)record->weight_bytes,
-                slot->slab + record->scale_bytes) != 0) {
+        int read_failed = 0;
+        if (record->per_matrix) {
+            uint64_t scale_cursor = 0;
+            for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+                if (coli_st_read_at_streaming_rep(
+                        state->index, record->m_scale_shard[matrix], rep,
+                        record->m_scale_offset[matrix],
+                        (size_t)record->m_scale_bytes[matrix],
+                        slot->slab + scale_cursor) != 0) {
+                    read_failed = 1; break;
+                }
+                scale_cursor += record->m_scale_bytes[matrix];
+            }
+            if (!read_failed) {
+                uint64_t weight_cursor = 0;
+                for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++)
+                    weight_cursor += record->m_scale_bytes[matrix];
+                for (int matrix = 0; matrix < V4_MATRIX_COUNT && !read_failed; matrix++) {
+                    if (coli_st_read_at_streaming_rep(
+                            state->index, record->m_weight_shard[matrix], rep,
+                            record->m_weight_offset[matrix],
+                            (size_t)record->m_weight_bytes[matrix],
+                            slot->slab + weight_cursor) != 0)
+                        read_failed = 1;
+                    weight_cursor += record->m_weight_bytes[matrix];
+                }
+            }
+        } else {
+            if (coli_st_read_at_streaming_rep(
+                    state->index, record->scale_shard, rep, record->scale_offset,
+                    (size_t)record->scale_bytes, slot->slab) != 0 ||
+                coli_st_read_at_streaming_rep(
+                    state->index, record->weight_shard, rep, record->weight_offset,
+                    (size_t)record->weight_bytes,
+                    slot->slab + record->scale_bytes) != 0)
+                read_failed = 1;
+        }
+        if (read_failed) {
             struct timespec disk_t1;
             clock_gettime(CLOCK_MONOTONIC, &disk_t1);
             state->disk_sec +=
@@ -14896,7 +15123,7 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
     V4ExpertStoreState *state = store->state;
     int accepted = 0;
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
-    size_t capacity = count * 2, ranges = 0;
+    size_t capacity = count * 6, ranges = 0;
     int *shards = malloc(capacity * sizeof(*shards));
     uint64_t *offsets = malloc(capacity * sizeof(*offsets));
     size_t *lengths = malloc(capacity * sizeof(*lengths));
@@ -14915,12 +15142,25 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
                 resident = 1; break;
             }
         if (resident) continue;
-        shards[ranges] = record->shard;
-        offsets[ranges] = record->scale_offset;
-        lengths[ranges++] = (size_t)record->scale_bytes;
-        shards[ranges] = record->shard;
-        offsets[ranges] = record->weight_offset;
-        lengths[ranges++] = (size_t)record->weight_bytes;
+        if (record->per_matrix) {
+            for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+                shards[ranges] = record->m_scale_shard[matrix];
+                offsets[ranges] = record->m_scale_offset[matrix];
+                lengths[ranges++] = (size_t)record->m_scale_bytes[matrix];
+            }
+            for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+                shards[ranges] = record->m_weight_shard[matrix];
+                offsets[ranges] = record->m_weight_offset[matrix];
+                lengths[ranges++] = (size_t)record->m_weight_bytes[matrix];
+            }
+        } else {
+            shards[ranges] = record->scale_shard;
+            offsets[ranges] = record->scale_offset;
+            lengths[ranges++] = (size_t)record->scale_bytes;
+            shards[ranges] = record->weight_shard;
+            offsets[ranges] = record->weight_offset;
+            lengths[ranges++] = (size_t)record->weight_bytes;
+        }
         candidates++;
     }
     pthread_mutex_unlock(&state->mutex);
@@ -14933,13 +15173,44 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
         V4ExpertRecord *record = get_record(state, keys[i]);
         if (!record) continue;
         int rep = coli_st_expert_route(keys[i].layer, keys[i].expert);
-        if (coli_st_prefetch_at_rep(state->index, record->shard, rep,
-                                    record->scale_offset,
-                                    (size_t)record->scale_bytes) == 0 &&
-            coli_st_prefetch_at_rep(state->index, record->shard, rep,
-                                    record->weight_offset,
-                                    (size_t)record->weight_bytes) == 0)
-            accepted++;
+        int all_weights_prefetched = 1;
+        int matrix_count = record->per_matrix ? V4_MATRIX_COUNT : 1;
+        for (int segment = 0; segment < matrix_count && all_weights_prefetched; segment++) {
+            int shard;
+            uint64_t offset;
+            size_t length;
+            if (record->per_matrix) {
+                shard = record->m_weight_shard[segment];
+                offset = record->m_weight_offset[segment];
+                length = (size_t)record->m_weight_bytes[segment];
+            } else {
+                shard = record->weight_shard;
+                offset = record->weight_offset;
+                length = (size_t)record->weight_bytes;
+            }
+            if (coli_st_prefetch_at_rep(state->index, shard, rep,
+                                        offset, length) != 0)
+                all_weights_prefetched = 0;
+        }
+        if (!all_weights_prefetched) continue;
+        int all_scales_prefetched = 1;
+        for (int segment = 0; segment < matrix_count; segment++) {
+            int shard;
+            uint64_t offset;
+            size_t length;
+            if (record->per_matrix) {
+                shard = record->m_scale_shard[segment];
+                offset = record->m_scale_offset[segment];
+                length = (size_t)record->m_scale_bytes[segment];
+            } else {
+                shard = record->scale_shard;
+                offset = record->scale_offset;
+                length = (size_t)record->scale_bytes;
+            }
+            all_scales_prefetched &= coli_st_prefetch_at_rep(state->index, shard, rep,
+                                                              offset, length) == 0;
+        }
+        if (all_weights_prefetched && all_scales_prefetched) accepted++;
     }
 #endif
     pthread_mutex_lock(&state->mutex);
