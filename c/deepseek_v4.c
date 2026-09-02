@@ -8397,6 +8397,15 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             state->eheat[expert_index]++;
     }
     rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
+    /* ESPERIMENTO LOCALE (replay policy cache): sequenza ordinata delle
+     * richieste come le vede la cache, hit e miss. V4_REPLAY_TRACE=<path>. */
+    {
+        static FILE *replay_fp; static int replay_init;
+        if (!replay_init) { replay_init = 1;
+            const char *rp = getenv("V4_REPLAY_TRACE");
+            if (rp) replay_fp = fopen(rp, "w"); }
+        if (replay_fp) fprintf(replay_fp, "%d %d\n", key.layer, key.expert);
+    }
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
         layer_requests % policy->repin_interval == 0)
