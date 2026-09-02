@@ -9,21 +9,27 @@ not runtime dependencies of the C engine.
   install session for the full transfer. Qpack v1 has sizes but no content
   hashes, so frontends must also enforce immutable revisions and any available
   transport checksum or ETag. It covers manifest-declared container artifacts,
-  not required runtime auxiliaries such as `config.json`. Directory-fsync crash
-  durability is POSIX-only.
+  not required runtime auxiliaries such as `config.json`. Swiftlet manifests
+  vary: the 35B container declares `packed_experts/layout.json` and its
+  tokenizer files, the production Qwen3-Next-80B container declares only the
+  weights, so `layout.json` is verified when declared and never required
+  here. Directory-fsync crash durability is POSIX-only.
 - `qpack_http_install.py`: dependency-free Hugging Face frontend for that
   policy. It resolves a branch or tag to an immutable commit before opening the
   install session, streams manifest-declared files directly into `.part`
   files, resumes only exact HTTP ranges, and publishes `manifest.json` last.
-  `config.json` is required; manifest-declared tokenizer/configuration files
-  use the same resumable artifact path, while undeclared optional files are
-  copied as verified sidecars when present. Strong ETags, documented server
+  `config.json` is required, and so is `packed_experts/layout.json`, which
+  the reader opens directly: when the manifest does not declare it, it is
+  fetched as a required sidecar. Manifest-declared tokenizer/configuration
+  files use the same resumable artifact path, while undeclared optional files
+  are copied as verified sidecars when present. Strong ETags, documented server
   SHA-256 values, and a locally computed full-file SHA-256 are persisted in
   `.qpack-http.json` and checked on resume. `HF_TOKEN` is sent only to the Hub
   origin and is stripped on cross-origin HTTPS redirects.
 - `qpack_mirror_install.py`: static HTTPS/R2 frontend over the same transfer
   engine. A strict `hashes.json` is required and fetched before the manifest;
-  it must cover `manifest.json`, `config.json`, and every manifest artifact.
+  it must cover `manifest.json`, `config.json`, `packed_experts/layout.json`,
+  and every manifest artifact.
   The legacy Swiftlet `{"files":{"path":"sha256"}}` schema and the sized
   `qpack.hashes.v1` schema are accepted. The normalized mirror URL plus the
   digest of the exact raw index bytes bind resume state; indexed runtime files receive

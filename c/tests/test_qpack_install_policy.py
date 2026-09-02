@@ -108,16 +108,56 @@ class QpackInstallPolicyTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(QpackInstallError):
                 parse_manifest(self.manifest(files), "local:fixture")
 
-    def test_manifest_rejects_invalid_sizes_and_missing_layout(self):
+    def test_manifest_rejects_invalid_sizes_and_layout_is_not_required(self):
         for size in (True, False, 0, -1, 1.5, MAX_FILE_SIZE + 1):
             with self.subTest(size=size), self.assertRaises(QpackInstallError):
                 parse_manifest(self.manifest({
                     "packed_experts/layout.json": size,
                 }), "local:fixture")
-        with self.assertRaisesRegex(QpackInstallError, "layout.json"):
-            parse_manifest(self.manifest({"model.safetensors": 7}), "local:fixture")
+        # The production Qwen3-Next-80B manifest declares no layout.json;
+        # Swiftlet's reader never consults the files table for it.
+        plan = parse_manifest(
+            self.manifest({"model.safetensors": 7}), "local:fixture")
+        self.assertEqual(plan.files, (QpackFile("model.safetensors", 7),))
         with self.assertRaisesRegex(QpackInstallError, "source_id"):
             parse_manifest(self.raw, "")
+
+    def test_real_swiftlet_manifests_are_accepted_with_or_without_layout(self):
+        fixtures = Path(__file__).parent / "fixtures"
+        # Qwen3-Next-80B, as published on Swiftlet's mirror: 49 entries,
+        # model.safetensors plus 48 layer blobs, no layout.json, no aux files.
+        plan = parse_manifest(
+            (fixtures / "swiftlet_qwen3_next_80b_manifest.json").read_bytes(),
+            "mirror:fixture")
+        names = [file.name for file in plan.files]
+        self.assertEqual(len(names), 49)
+        self.assertNotIn("packed_experts/layout.json", names)
+        self.assertEqual(
+            names,
+            ["model.safetensors"]
+            + [f"packed_experts/layer_{index:02d}.bin" for index in range(48)])
+        self.assertTrue(all(file.size > 0 for file in plan.files))
+        # Qwen3.6-35B, same writer, declares layout.json and the tokenizer.
+        plan = parse_manifest(
+            (fixtures / "swiftlet_qwen36_35b_manifest.json").read_bytes(),
+            "mirror:fixture")
+        self.assertEqual(len(plan.files), 47)
+        self.assertIn(QpackFile("packed_experts/layout.json", 2048), plan.files)
+
+    def test_declared_layout_with_wrong_size_cannot_commit_or_publish(self):
+        session = self.begin()
+        layout = self.file("packed_experts/layout.json")
+        self.write_partial(session, layout, b"x" * (layout.size + 1))
+        with self.assertRaisesRegex(QpackInstallError, "not complete"):
+            commit_file(session, layout)
+        self.write_partial(session, layout, b"x" * (layout.size - 1))
+        with self.assertRaisesRegex(QpackInstallError, "not complete"):
+            commit_file(session, layout)
+        self.write_partial(session, self.file("model.safetensors"), b"w" * 7)
+        commit_file(session, self.file("model.safetensors"))
+        with self.assertRaisesRegex(QpackInstallError, "before all files"):
+            publish_manifest(session, self.raw)
+        self.assertFalse((self.root / MANIFEST).exists())
 
     def test_manifest_matches_swiftlet_required_fields_and_file_limit(self):
         for field in ("modelName", "sourceCheckpoint"):

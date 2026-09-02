@@ -4,6 +4,15 @@
 Qpack v1 records file sizes but no content digests. Callers must use an
 immutable ``source_id`` and validate any ETag or checksum supplied by the
 transport; this module prevents cross-revision resume, not silent media damage.
+
+The manifest files table is the authority for every artifact it declares, and
+nothing else. Swiftlet's own manifests vary in what they declare: the
+Qwen3.6-35B container sizes ``packed_experts/layout.json`` and its tokenizer
+files, while the production Qwen3-Next-80B container sizes only
+``model.safetensors`` and the 48 layer blobs. Swiftlet's reader never consults
+the files table for ``layout.json``, so a declared entry is verified and an
+undeclared one is not required here; frontends that need the file fetch it as
+a required auxiliary, the way they already fetch ``config.json``.
 """
 
 from __future__ import annotations
@@ -149,7 +158,13 @@ def _validate_file(file: QpackFile) -> None:
 
 
 def parse_manifest(raw: bytes, source_id: str) -> QpackInstallPlan:
-    """Parse a qpack v1 manifest and bind it to an immutable source identity."""
+    """Parse a qpack v1 manifest and bind it to an immutable source identity.
+
+    Every declared file must carry a positive size, which the install session
+    then enforces on commit and before publication. ``packed_experts/layout.json``
+    is verified when declared and not required: the production Qwen3-Next-80B
+    manifest omits it (see the module docstring).
+    """
     if (not isinstance(source_id, str) or not source_id.strip()
             or "\x00" in source_id or len(source_id.encode("utf-8")) > 4096):
         raise QpackInstallError("source_id must identify an immutable source revision")
@@ -180,8 +195,6 @@ def parse_manifest(raw: bytes, source_id: str) -> QpackInstallPlan:
         file = QpackFile(name, size)
         _validate_file(file)
         planned.append(file)
-    if not any(file.name == "packed_experts/layout.json" for file in planned):
-        raise QpackInstallError("qpack manifest does not declare packed_experts/layout.json")
     _validate_namespace(planned)
     return QpackInstallPlan(
         source_id=source_id,

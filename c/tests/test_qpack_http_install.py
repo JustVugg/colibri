@@ -382,7 +382,8 @@ class QpackHTTPInstallTest(unittest.TestCase):
         transport.assert_empty()
 
     def test_real_swiftlet_manifest_declared_auxiliaries_are_accepted(self):
-        fixture = Path(__file__).parent / "fixtures" / "swiftlet_qpack_manifest.json"
+        fixture = (Path(__file__).parent / "fixtures"
+                   / "swiftlet_qwen36_35b_manifest.json")
         plan = parse_manifest(fixture.read_bytes(), f"hf:owner/model@{COMMIT}")
         _check_adapter_namespace(plan)
         self.assertEqual(
@@ -390,6 +391,71 @@ class QpackHTTPInstallTest(unittest.TestCase):
             {"chat_template.jinja", "config.json", "tokenizer.json",
              "tokenizer_config.json", "vocab.json"})
         self.assertEqual(len(plan.files), 47)
+
+    def test_undeclared_layout_is_fetched_from_the_hub_and_required(self):
+        # The production Qwen3-Next-80B manifest declares only the weights;
+        # the reader still opens packed_experts/layout.json from disk.
+        self.files = {"model.safetensors": b"weights"}
+        self.manifest = self.make_manifest({"model.safetensors": 7})
+        layout = b'{"layer_count":1}'
+        transport = ScriptedTransport(
+            self.manifest_response(), self.config_response(),
+            self.response(layout, etag='"layout"', checksum=True),
+            self.artifact_response("model.safetensors"))
+
+        result = self.install(transport)
+
+        self.assertEqual(
+            [call["url"].rsplit("/", 1)[-1] for call in transport.calls],
+            ["manifest.json", "config.json", "layout.json", "model.safetensors"])
+        self.assertTrue(transport.calls[2]["url"].endswith(
+            "/packed_experts/layout.json"))
+        self.assertEqual(result.downloaded_files, 3)
+        self.assertEqual(
+            (self.root / "packed_experts" / "layout.json").read_bytes(), layout)
+        self.assertEqual((self.root / "manifest.json").read_bytes(), self.manifest)
+        transport.assert_empty()
+
+        root = Path(self.temporary.name) / "no-layout.qpack"
+        transport = ScriptedTransport(
+            self.manifest_response(), self.config_response(),
+            self.response(b"", status=404))
+        with self.assertRaisesRegex(QpackHTTPError, "HTTP 404"):
+            self.install(transport, root=root)
+        self.assertFalse((root / "model.safetensors.part").exists())
+        self.assertFalse((root / "manifest.json").exists())
+
+    def test_every_request_carries_the_installer_user_agent(self):
+        # Revision resolution, manifest, config, and every ranged weight
+        # request (including a retried resume) identify the installer.
+        api = Response(200, json.dumps({"sha": COMMIT}).encode(),
+                       [("Content-Length", str(len(json.dumps({"sha": COMMIT}))))])
+        first = self.artifact_response(
+            "model.safetensors", body=self.files["model.safetensors"][:3])
+        first.headers = Headers([
+            ("Content-Length", str(len(self.files["model.safetensors"]))),
+            ("X-Repo-Commit", COMMIT),
+            ("ETag", '"model.safetensors"'),
+            ("X-Checksum-Sha256",
+             hashlib.sha256(self.files["model.safetensors"]).hexdigest()),
+        ])
+        transport = ScriptedTransport(
+            api, self.manifest_response(), self.config_response(), first,
+            self.artifact_response("model.safetensors", offset=3),
+            self.artifact_response("packed_experts/layout.json"))
+
+        self.install(transport, revision="main", retries=1, token="secret-token")
+
+        self.assertEqual(len(transport.calls), 6)
+        self.assertTrue(any(call["headers"].get("Range") == "bytes=3-6"
+                            for call in transport.calls))
+        for call in transport.calls:
+            with self.subTest(url=call["url"]):
+                self.assertEqual(call["method"], "GET")
+                self.assertEqual(call["headers"]["User-Agent"],
+                                 "colibri-qpack-install/1.0")
+                self.assertEqual(call["headers"]["Accept-Encoding"], "identity")
+        transport.assert_empty()
 
     def test_hugging_face_manifest_may_declare_hashes_json_as_an_artifact(self):
         files = dict(self.files)

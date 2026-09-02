@@ -9,6 +9,7 @@ from urllib.request import Request
 
 from tools.qpack_http_install import (
     HASHES_NAME,
+    LAYOUT_NAME,
     QpackHTTPError,
     SafeRedirectHandler,
     install_mirror_qpack,
@@ -69,6 +70,15 @@ class ScriptedTransport:
     def assert_empty(self):
         if self.responses:
             raise AssertionError(f"{len(self.responses)} scripted responses unused")
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+# Swiftlet's public mirror, 2026-09-02. hashes.json pins manifest.json, so the
+# fixtures are the exact published bytes (see fixtures/.gitattributes).
+QWEN3_NEXT_80B_HASHES_SHA256 = (
+    "2133857f76c818ef2c3a72c79be1f1c5de188602af723eb996f23501913c21c6")
+QWEN36_35B_HASHES_SHA256 = (
+    "1605766290c951ce2e9f54ed4fb7d4b48b41db72a90f359b411ca80f7dd45b75")
 
 
 class QpackMirrorInstallTest(unittest.TestCase):
@@ -404,6 +414,231 @@ class QpackMirrorInstallTest(unittest.TestCase):
             with self.subTest(base_url=base_url), self.assertRaises(QpackHTTPError):
                 install_mirror_qpack(
                     base_url, self.root, transport=ScriptedTransport())
+
+    def use_undeclared_layout_shape(self):
+        """The production Qwen3-Next-80B shape: weights only in the manifest,
+        layout.json (and the aux files) indexed by hashes.json alone."""
+        self.files = {
+            "model.safetensors": b"weights",
+            "packed_experts/layer_00.bin": b"layer00",
+        }
+        self.layout = b'{"layer_count":1}'
+        self.manifest = json.dumps({
+            "magic": "QPACK",
+            "version": 1,
+            "modelName": "qwen3_next",
+            "sourceCheckpoint": "owner/model@static",
+            "quantBits": 4,
+            "quantGroupSize": 32,
+            "files": {name: len(value) for name, value in self.files.items()},
+        }, sort_keys=True, separators=(",", ":")).encode()
+
+    def real_index_probe(self, name, pin):
+        """Serve a real mirror index and manifest, then refuse config.json."""
+        hashes_raw = (FIXTURES / f"{name}_hashes.json").read_bytes()
+        manifest_raw = (FIXTURES / f"{name}_manifest.json").read_bytes()
+        self.assertEqual(hashlib.sha256(hashes_raw).hexdigest(), pin,
+                         "fixture bytes differ from the mirror pin; check "
+                         "fixtures/.gitattributes on a CRLF checkout")
+        self.assertEqual(
+            hashlib.sha256(manifest_raw).hexdigest(),
+            json.loads(hashes_raw)["files"]["manifest.json"])
+        transport = ScriptedTransport(
+            self.response(hashes_raw), self.response(manifest_raw),
+            self.response(b"", status=404))
+        with self.assertRaisesRegex(QpackHTTPError, "HTTP 404"):
+            self.install(transport, hashes_sha256=pin)
+        self.assertEqual(
+            [call["url"].removeprefix(self.base_url + "/")
+             for call in transport.calls],
+            ["hashes.json", "manifest.json", "config.json"])
+        # The install session opened: manifest validation is behind us and
+        # the journal binds the destination to this index.
+        self.assertTrue((self.root / ".qpack-install.json").is_file())
+        self.assertEqual((self.root / HASHES_NAME).read_bytes(), hashes_raw)
+        self.assertFalse((self.root / "manifest.json").exists())
+        return json.loads(manifest_raw)["files"], json.loads(hashes_raw)["files"]
+
+    def test_real_qwen3_next_80b_index_is_accepted_and_transfers_begin(self):
+        # Before this shape was accepted the installer refused with "qpack
+        # manifest does not declare packed_experts/layout.json" after two
+        # requests and never opened the destination.
+        manifest_files, indexed = self.real_index_probe(
+            "swiftlet_qwen3_next_80b", QWEN3_NEXT_80B_HASHES_SHA256)
+        self.assertEqual(len(manifest_files), 49)
+        self.assertEqual(len(indexed), 61)
+        self.assertNotIn(LAYOUT_NAME, manifest_files)
+        self.assertIn(LAYOUT_NAME, indexed)
+
+    def test_real_qwen36_35b_index_is_still_accepted(self):
+        manifest_files, indexed = self.real_index_probe(
+            "swiftlet_qwen36_35b", QWEN36_35B_HASHES_SHA256)
+        self.assertEqual(len(manifest_files), 47)
+        self.assertEqual(len(indexed), 48)
+        self.assertEqual(manifest_files[LAYOUT_NAME], 2048)
+
+    def test_undeclared_layout_is_fetched_as_a_required_indexed_sidecar(self):
+        self.use_undeclared_layout_shape()
+        hashes_raw = self.hashes_raw(extra={LAYOUT_NAME: self.layout})
+        transport = ScriptedTransport(
+            self.response(hashes_raw), self.response(self.manifest),
+            self.response(self.config), self.response(self.layout),
+            self.artifact_response("model.safetensors"),
+            self.artifact_response("packed_experts/layer_00.bin"))
+
+        result = self.install(transport)
+
+        self.assertEqual(
+            [call["url"].removeprefix(self.base_url + "/")
+             for call in transport.calls],
+            ["hashes.json", "manifest.json", "config.json", LAYOUT_NAME,
+             "model.safetensors", "packed_experts/layer_00.bin"])
+        self.assertEqual(result.downloaded_files, 4)
+        self.assertEqual((self.root / LAYOUT_NAME).read_bytes(), self.layout)
+        self.assertFalse((self.root / "packed_experts" / ".layout.json.part").exists())
+        self.assertEqual((self.root / "manifest.json").read_bytes(), self.manifest)
+        state = json.loads((self.root / ".qpack-http.json").read_text())
+        self.assertEqual(state["aux"][LAYOUT_NAME]["sha256"],
+                         hashlib.sha256(self.layout).hexdigest())
+        transport.assert_empty()
+
+        # A completed install re-verifies the sidecar offline, and notices
+        # when it changes.
+        transport = ScriptedTransport(
+            self.response(hashes_raw), self.response(self.manifest))
+        result = self.install(transport)
+        self.assertTrue(result.already_complete)
+        self.assertEqual(len(transport.calls), 2)
+        (self.root / LAYOUT_NAME).write_bytes(b'{"layer_count":2}')
+        with self.assertRaisesRegex(QpackHTTPError, "auxiliary file changed"):
+            self.install(ScriptedTransport(
+                self.response(hashes_raw), self.response(self.manifest)))
+
+    def test_undeclared_layout_absent_from_index_or_mirror_is_refused(self):
+        self.use_undeclared_layout_shape()
+        transport = ScriptedTransport(
+            self.response(self.hashes_raw()), self.response(self.manifest))
+        with self.assertRaisesRegex(
+                QpackHTTPError, f"does not cover required file: {LAYOUT_NAME}"):
+            self.install(transport)
+        self.assertEqual(len(transport.calls), 2)
+        self.assertFalse(self.root.exists())
+
+        hashes_raw = self.hashes_raw(extra={LAYOUT_NAME: self.layout})
+        transport = ScriptedTransport(
+            self.response(hashes_raw), self.response(self.manifest),
+            self.response(self.config), self.response(b"", status=404))
+        with self.assertRaisesRegex(QpackHTTPError, "HTTP 404"):
+            self.install(transport)
+        self.assertTrue(transport.calls[-1]["url"].endswith("/" + LAYOUT_NAME))
+        self.assertFalse((self.root / "model.safetensors.part").exists())
+        self.assertFalse((self.root / "manifest.json").exists())
+
+        # An indexed sidecar that is not a JSON object is refused even
+        # when its hash matches: the reader parses layout.json as an object.
+        root = Path(self.temporary.name) / "not-an-object.qpack"
+        transport = ScriptedTransport(
+            self.response(self.hashes_raw(extra={LAYOUT_NAME: b"[]"})),
+            self.response(self.manifest), self.response(self.config),
+            self.response(b"[]"))
+        with self.assertRaisesRegex(
+                QpackHTTPError, f"{LAYOUT_NAME} must be a non-empty object"):
+            self.install(transport, root=root)
+        self.assertFalse((root / LAYOUT_NAME).exists())
+
+    def test_declared_layout_with_wrong_size_is_refused_before_publication(self):
+        declared = json.loads(self.manifest)
+        declared["files"][LAYOUT_NAME] = len(self.files[LAYOUT_NAME]) + 1
+        self.manifest = json.dumps(
+            declared, sort_keys=True, separators=(",", ":")).encode()
+        transport = ScriptedTransport(
+            self.response(self.hashes_raw()), self.response(self.manifest),
+            self.response(self.config),
+            self.artifact_response("model.safetensors"),
+            self.artifact_response(LAYOUT_NAME))
+        with self.assertRaisesRegex(
+                QpackHTTPError, f"Content-Length mismatch for {LAYOUT_NAME}"):
+            self.install(transport)
+        self.assertFalse((self.root / "manifest.json").exists())
+        self.assertFalse((self.root / LAYOUT_NAME).exists())
+
+        # A sized index disagreeing with the manifest stops before any
+        # transfer at all.
+        sized = json.dumps({
+            "schema": "qpack.hashes.v1",
+            "files": {
+                name: {"sha256": digest, "size": len({
+                    "manifest.json": self.manifest,
+                    "config.json": self.config,
+                    **self.files,
+                }[name])}
+                for name, digest in self.hash_map().items()
+            },
+        }).encode()
+        root = Path(self.temporary.name) / "sized.qpack"
+        transport = ScriptedTransport(
+            self.response(sized), self.response(self.manifest))
+        with self.assertRaisesRegex(
+                QpackHTTPError, f"size mismatch for {LAYOUT_NAME}"):
+            self.install(transport, root=root)
+        self.assertEqual(len(transport.calls), 2)
+        self.assertFalse(root.exists())
+
+    def test_missing_layer_blob_is_still_refused(self):
+        self.use_undeclared_layout_shape()
+        hashes_raw = self.hashes_raw(
+            extra={LAYOUT_NAME: self.layout},
+            omit=("packed_experts/layer_00.bin",))
+        transport = ScriptedTransport(
+            self.response(hashes_raw), self.response(self.manifest))
+        with self.assertRaisesRegex(
+                QpackHTTPError,
+                "does not cover required file: packed_experts/layer_00.bin"):
+            self.install(transport)
+        self.assertEqual(len(transport.calls), 2)
+        self.assertFalse(self.root.exists())
+
+        hashes_raw = self.hashes_raw(extra={LAYOUT_NAME: self.layout})
+        transport = ScriptedTransport(
+            self.response(hashes_raw), self.response(self.manifest),
+            self.response(self.config), self.response(self.layout),
+            self.artifact_response("model.safetensors"),
+            self.response(b"", status=404))
+        with self.assertRaisesRegex(QpackHTTPError, "HTTP 404"):
+            self.install(transport)
+        self.assertTrue(
+            transport.calls[-1]["url"].endswith("/packed_experts/layer_00.bin"))
+        self.assertTrue((self.root / "model.safetensors").is_file())
+        self.assertFalse((self.root / "manifest.json").exists())
+
+    def test_every_request_carries_the_installer_user_agent(self):
+        # Swiftlet's R2 mirror answers 403 to Python-urllib/*; the installer
+        # identifies itself on the index, manifest, sidecar and every ranged
+        # weight request, including a resume.
+        value = self.files["model.safetensors"]
+        first = self.artifact_response("model.safetensors", body=value[:3])
+        first.headers = Headers([("Content-Length", str(len(value)))])
+        interrupted = ScriptedTransport(
+            self.response(self.hashes_raw()), self.response(self.manifest),
+            self.response(self.config), first)
+        with self.assertRaisesRegex(QpackHTTPError, "short HTTP body"):
+            self.install(interrupted)
+        resumed = ScriptedTransport(
+            self.response(self.hashes_raw()), self.response(self.manifest),
+            self.artifact_response("model.safetensors", offset=3),
+            self.artifact_response(LAYOUT_NAME))
+        self.install(resumed, authorization="Bearer mirror-token")
+
+        calls = interrupted.calls + resumed.calls
+        self.assertEqual(len(calls), 8)
+        self.assertTrue(any(call["headers"].get("Range") == "bytes=3-6"
+                            for call in calls))
+        for call in calls:
+            with self.subTest(url=call["url"]):
+                self.assertEqual(call["method"], "GET")
+                self.assertEqual(call["headers"]["User-Agent"],
+                                 "colibri-qpack-install/1.0")
+                self.assertEqual(call["headers"]["Accept-Encoding"], "identity")
 
     def test_cross_origin_redirect_strips_all_explicit_secrets(self):
         handler = SafeRedirectHandler()

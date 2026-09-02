@@ -70,6 +70,12 @@ SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 REQUIRED_AUX = ("config.json",)
+# Swiftlet's reader opens packed_experts/layout.json directly and never
+# consults the manifest files table for it. The production Qwen3-Next-80B
+# manifest sizes only model.safetensors and the layer blobs, so when the
+# manifest does not declare layout.json it is fetched as a required sidecar
+# (hash-indexed on a mirror) rather than refused.
+LAYOUT_NAME = "packed_experts/layout.json"
 OPTIONAL_AUX = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -431,6 +437,31 @@ def _declared_auxiliary_names(plan):
     return {name for name in (*REQUIRED_AUX, *OPTIONAL_AUX) if name in declared}
 
 
+def _aux_temporary_name(name: str) -> str:
+    """The .part path _atomic_bytes uses for an auxiliary, in manifest form."""
+    parent, _separator, leaf = name.rpartition("/")
+    return f"{parent}/.{leaf}.part" if parent else f".{leaf}.part"
+
+
+def _aux_target(root: Path, name: str, create_parent: bool = False) -> Path:
+    """Resolve an auxiliary path under root without crossing a symlink."""
+    parent = root
+    components = name.split("/")
+    for component in components[:-1]:
+        parent = parent / component
+        if parent.is_symlink():
+            raise QpackHTTPError(f"auxiliary path crosses a symlink: {parent}")
+        if parent.exists() and not parent.is_dir():
+            raise QpackHTTPError(f"auxiliary parent is not a directory: {parent}")
+        if create_parent and not parent.exists():
+            parent.mkdir()
+            _fsync_directory(parent.parent)
+    target = parent / components[-1]
+    if target.is_symlink():
+        raise QpackHTTPError(f"refusing symlink auxiliary path: {target}")
+    return target
+
+
 def _check_adapter_namespace(plan, reserve_hashes=False) -> None:
     reserved = {
         STATE_NAME.casefold(),
@@ -441,12 +472,13 @@ def _check_adapter_namespace(plan, reserve_hashes=False) -> None:
             HASHES_NAME.casefold(),
             f".{HASHES_NAME}.part".casefold(),
         ))
+    declared = {file.name for file in plan.files}
     declared_aux = _declared_auxiliary_names(plan)
-    for name in (*REQUIRED_AUX, *OPTIONAL_AUX):
-        if name in declared_aux:
+    for name in (*REQUIRED_AUX, *OPTIONAL_AUX, LAYOUT_NAME):
+        if name in declared:
             continue
         reserved.add(name.casefold())
-        reserved.add((f".{name}.part").casefold())
+        reserved.add(_aux_temporary_name(name).casefold())
     for file in plan.files:
         if file.name in declared_aux and file.size > MAX_AUX_SIZE:
             raise QpackHTTPError(
@@ -618,7 +650,7 @@ def _fetch_small(source, name, transport, timeout, maximum, required,
 def _verify_or_fetch_aux(session, state, source, name, required, transport,
                          timeout, retries, sleep, completed,
                          expected_checksum=None, expected_size=None):
-    target = session.root / name
+    target = _aux_target(session.root, name)
     recorded = state["aux"].get(name)
     if recorded is not None:
         if (not isinstance(recorded, dict)
@@ -645,13 +677,14 @@ def _verify_or_fetch_aux(session, state, source, name, required, transport,
                              expected_size)
     if raw is None:
         return False, 0
-    if name == "config.json":
+    if name in ("config.json", LAYOUT_NAME):
         try:
-            config = json.loads(raw)
+            document = json.loads(raw)
         except (UnicodeError, json.JSONDecodeError) as error:
-            raise QpackHTTPError("config.json is not valid JSON") from error
-        if not isinstance(config, dict) or not config:
-            raise QpackHTTPError("config.json must be a non-empty object")
+            raise QpackHTTPError(f"{name} is not valid JSON") from error
+        if not isinstance(document, dict) or not document:
+            raise QpackHTTPError(f"{name} must be a non-empty object")
+    target = _aux_target(session.root, name, create_parent=True)
     _atomic_bytes(target, raw)
     state["aux"][name] = {
         "sha256": expected_checksum or hashlib.sha256(raw).hexdigest(),
@@ -967,7 +1000,8 @@ def _download_file(session, state, source, file, transport, timeout,
 
 
 def _validate_hash_coverage(plan, manifest_raw, entries) -> None:
-    required = {"manifest.json", "config.json", *(file.name for file in plan.files)}
+    required = {"manifest.json", "config.json", LAYOUT_NAME,
+                *(file.name for file in plan.files)}
     missing = sorted(required - entries.keys())
     if missing:
         raise QpackHTTPError(
@@ -1029,6 +1063,16 @@ def _install_resolved_qpack(source, output_dir, manifest_raw, manifest_etag,
             downloaded_files += int(changed)
             downloaded_bytes += count
         _validate_config(session.root / "config.json")
+        if LAYOUT_NAME not in files_by_name:
+            changed, count = _verify_or_fetch_aux(
+                session, state, source, LAYOUT_NAME, True, transport, timeout,
+                retries, sleep, session.complete,
+                expected_hashes[LAYOUT_NAME].sha256
+                if expected_hashes is not None else None,
+                expected_hashes[LAYOUT_NAME].size
+                if expected_hashes is not None else None)
+            downloaded_files += int(changed)
+            downloaded_bytes += count
         if not session.complete:
             for name in sorted(declared_aux - {"config.json"}):
                 changed, count, resumed = _download_file(
