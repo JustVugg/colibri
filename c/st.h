@@ -792,7 +792,7 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     /* SEC: numel viene dallo shape, nbytes dagli offset — due campi indipendenti
      * del file. Se non concordano, la memcpy F32 (nbytes) o i loop BF16/F16
      * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
@@ -832,7 +832,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
  * self-consistent and may keep using st_read_f32. */
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
@@ -883,7 +883,7 @@ static inline float ue8m0_to_f32(uint8_t v) {
  * che il chiamante ha allocato, come in st_read_f32_cap. */
 static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "scale %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
@@ -920,7 +920,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
  * A new caller with none of those wants st_read_raw_cap below. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
@@ -931,7 +931,7 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
  * check -- and one that has none cannot silently do the wrong thing. */
 static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->nbytes < 0 || t->nbytes > cap) {
         fprintf(stderr, "%s: tensor declares %lld bytes, destination holds %lld — refusing "
                 "(untrusted container)\n", name, (long long)t->nbytes, (long long)cap); exit(1); }
@@ -1000,7 +1000,7 @@ static void st_unmap_raw(st_mapped_raw *mapped) {
 static void st_read_slice_raw_cap(shards *S, const char *name, int64_t byte_off,
                                   int64_t nbytes, void *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (byte_off < 0 || nbytes < 0) {
         fprintf(stderr, "slice %s [%lld,+%lld) has negative offset/length\n",
                 name, (long long)byte_off, (long long)nbytes); exit(1);
@@ -1036,7 +1036,7 @@ static void st_read_slice_raw_cap(shards *S, const char *name, int64_t byte_off,
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->dtype >= 3) {   /* stesso motivo di st_read_f32 sopra */
         fprintf(stderr, "slice %s: tensor is %s — not a float tensor\n",
                 name, st_dtype_name(t->dtype)); exit(1); }
