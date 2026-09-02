@@ -858,6 +858,15 @@ gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine
 	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
 	./gemm_largebatch_test
 
+# Apple gate: qwen36 routed experts through the MLX affine path, Metal vs
+# the CPU reference -- one-layer MoE parity plus end-to-end logit parity on
+# the tiny hybrid stack. Needs QWEN36_QPACK_FIXTURE=<dir> pointing at a real
+# swiftlet-repack output of tiny-model-q4; without it the binary skips with a
+# distinct marker instead of pretending to pass.
+qwen36-metal-test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o
+	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
+	./qwen36_qpack_metal_test
+
 # fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
 # falls back to its numpy path when the library is absent, producing the same
 # bytes ~13x slower. Uses the same ARCH as the engine, so an AVX2 host gets the
