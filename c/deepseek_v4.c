@@ -16056,19 +16056,52 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
     }
 #else
     #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint8_t *w = q4 + (int64_t)o * rb;
-        const uint8_t *scl = e8s + (int64_t)o * ng;
-        float sum = 0.0f;
+    for (int o = 0; o < O; o += 4) {
+        int o1 = o + 1 < O ? o + 1 : o;
+        int o2 = o + 2 < O ? o + 2 : o;
+        int o3 = o + 3 < O ? o + 3 : o;
+        const uint8_t *w0 = q4 + (int64_t)o * rb;
+        const uint8_t *w1 = q4 + (int64_t)o1 * rb;
+        const uint8_t *w2 = q4 + (int64_t)o2 * rb;
+        const uint8_t *w3 = q4 + (int64_t)o3 * rb;
+        const uint8_t *scl0 = e8s + (int64_t)o * ng;
+        const uint8_t *scl1 = e8s + (int64_t)o1 * ng;
+        const uint8_t *scl2 = e8s + (int64_t)o2 * ng;
+        const uint8_t *scl3 = e8s + (int64_t)o3 * ng;
+        float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+        /* Interleaving independent rows changes no row's c=0..I-1 direct
+         * fold: each accumulator receives the same rounded term sequence. */
         for (int c = 0; c < I; c++) {
-            uint8_t byte = w[c >> 1];
-            float wv = coli_e2m1_decode((c & 1)
-                ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF));
-            float t = x[c] * wv;
-            t = t * e8lut[scl[c / 32]];
-            sum = sum + t;
+            float xc = x[c];
+            uint8_t byte0 = w0[c >> 1];
+            uint8_t byte1 = w1[c >> 1];
+            uint8_t byte2 = w2[c >> 1];
+            uint8_t byte3 = w3[c >> 1];
+            float wv0 = coli_e2m1_decode((c & 1)
+                ? (uint8_t)(byte0 >> 4) : (uint8_t)(byte0 & 0xF));
+            float wv1 = coli_e2m1_decode((c & 1)
+                ? (uint8_t)(byte1 >> 4) : (uint8_t)(byte1 & 0xF));
+            float wv2 = coli_e2m1_decode((c & 1)
+                ? (uint8_t)(byte2 >> 4) : (uint8_t)(byte2 & 0xF));
+            float wv3 = coli_e2m1_decode((c & 1)
+                ? (uint8_t)(byte3 >> 4) : (uint8_t)(byte3 & 0xF));
+            float t0 = xc * wv0;
+            float t1 = xc * wv1;
+            float t2 = xc * wv2;
+            float t3 = xc * wv3;
+            t0 = t0 * e8lut[scl0[c / 32]];
+            t1 = t1 * e8lut[scl1[c / 32]];
+            t2 = t2 * e8lut[scl2[c / 32]];
+            t3 = t3 * e8lut[scl3[c / 32]];
+            sum0 = sum0 + t0;
+            sum1 = sum1 + t1;
+            sum2 = sum2 + t2;
+            sum3 = sum3 + t3;
         }
-        y[o] = sum;
+        y[o] = sum0;
+        if (o1 != o) y[o1] = sum1;
+        if (o2 != o) y[o2] = sum2;
+        if (o3 != o) y[o3] = sum3;
     }
 #endif
 }
