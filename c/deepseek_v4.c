@@ -13509,6 +13509,24 @@ extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
 extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
 extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);   /* #890 */
 
+#ifdef __APPLE__
+/* #macos-port: needed by the Darwin branch inside v4_hwinfo_emit below. It sits HERE, next to
+ * its only caller, rather than with the platform includes near the top: this file is an
+ * amalgamation compiled once per -DCOLI_V4_UNIT_*, and that upper include region is not part
+ * of the unit that compiles this function, so an include placed there yields
+ * "call to undeclared function 'sysctlbyname'". */
+#include <sys/sysctl.h>
+#endif
+
+#ifdef __APPLE__
+/* #macos-port: needed by the Darwin branch inside v4_hwinfo_emit below. It sits HERE, next to
+ * its only caller, rather than with the platform includes near the top: this file is an
+ * amalgamation compiled once per -DCOLI_V4_UNIT_*, and that upper include region is not part
+ * of the unit that compiles this function, so an include placed there yields
+ * "call to undeclared function 'sysctlbyname'". */
+#include <sys/sysctl.h>
+#endif
+
 static void v4_hwinfo_emit(void) {
     char cpu[256] = "";
     int cores = 0;
@@ -13543,6 +13561,70 @@ static void v4_hwinfo_emit(void) {
         }
         fclose(mi);
     }
+#ifdef __APPLE__
+    /* #macos-port: neither /proc/cpuinfo nor /proc/meminfo exists on macOS, so both reads above
+     * fail silently and this line goes out as "0.0 0.0 ... unknown". The dashboard renders that
+     * as "unknown" with "0 GB RAM / 0 GB free" -- the gateway is faithfully forwarding zeroes.
+     * Fill only what /proc could not supply, so the Linux path stays byte-identical.
+     *
+     * Units follow the Linux branch exactly: it reports kB/1e6, i.e. DECIMAL GB, which is the
+     * contract the web UI was built against. Hence bytes/1e9, not bytes/2^30.
+     *
+     * Availability reuses coli_v4_os_available_memory() rather than repeating the detection:
+     * it already carries a Darwin branch (free + inactive + purgeable pages, the MemAvailable
+     * equivalent). Declared extern because the amalgamation compiles this file once per
+     * -DCOLI_V4_UNIT_*, so the definition need not be in this unit. */
+    {
+        extern uint64_t coli_v4_os_available_memory(void);
+        if (!cpu[0]) {
+            size_t len = sizeof(cpu);
+            if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, NULL, 0) != 0)
+                cpu[0] = 0;
+        }
+        if (ram_total <= 0.0) {
+            uint64_t memsize = 0;
+            size_t len = sizeof(memsize);
+            if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0 && memsize)
+                ram_total = (double)memsize / 1e9;
+        }
+        if (ram_avail <= 0.0) {
+            uint64_t avail = coli_v4_os_available_memory();
+            if (avail) ram_avail = (double)avail / 1e9;
+        }
+    }
+#endif
+#ifdef __APPLE__
+    /* #macos-port: neither /proc/cpuinfo nor /proc/meminfo exists on macOS, so both reads above
+     * fail silently and this line goes out as "0.0 0.0 ... unknown". The dashboard renders that
+     * as "unknown" with "0 GB RAM / 0 GB free" -- the gateway faithfully forwards the zeroes.
+     * Fill only what /proc could not supply, so the Linux path stays byte-identical.
+     *
+     * Units follow the Linux branch exactly: it reports kB/1e6, i.e. DECIMAL GB, which is the
+     * contract the web UI was built against. Hence bytes/1e9, not bytes/2^30.
+     *
+     * Availability reuses coli_v4_os_available_memory() rather than repeating the detection:
+     * it already carries a Darwin branch (free + inactive + purgeable pages, the MemAvailable
+     * equivalent). Declared extern because the amalgamation compiles this file once per
+     * -DCOLI_V4_UNIT_*, so the definition need not be in this unit. */
+    {
+        extern uint64_t coli_v4_os_available_memory(void);
+        if (!cpu[0]) {
+            size_t len = sizeof(cpu);
+            if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, NULL, 0) != 0)
+                cpu[0] = 0;
+        }
+        if (ram_total <= 0.0) {
+            uint64_t memsize = 0;
+            size_t len = sizeof(memsize);
+            if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0 && memsize)
+                ram_total = (double)memsize / 1e9;
+        }
+        if (ram_avail <= 0.0) {
+            uint64_t avail = coli_v4_os_available_memory();
+            if (avail) ram_avail = (double)avail / 1e9;
+        }
+    }
+#endif
     printf("HWINFO %d %.1f %.1f 0 0.0 %s|v4-cpu\n", cores, ram_total,
            ram_avail, cpu[0] ? cpu : "unknown");
     fflush(stdout);
