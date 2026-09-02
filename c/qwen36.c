@@ -3129,6 +3129,22 @@ int main(int argc, char **argv) {
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     tm_report();
     qt_stats();
+    /* qpack dispatch evidence, mirroring what the parity gates assert: which
+     * path computed the routed projections (coli_metal_matmul_affine_slot
+     * returns 0 for CPU fallback by contract, and qq_counts is where that
+     * becomes visible) and how hard the bounded slot pool worked.  A run
+     * whose experts silently fell back to the CPU reference shows cpu != 0
+     * here instead of hiding it. */
+    if (qq_active()) {
+        uint64_t qmp = 0, qcp = 0, qev = 0, qfl = 0;
+        int qsl = 0;
+        qq_counts(&qmp, &qcp);
+        qq_slot_stats(&qsl, &qev, &qfl);
+        fprintf(stderr, "[qpack] projections: metal=%llu cpu=%llu"
+                " | slots=%d fills=%llu evictions=%llu\n",
+                (unsigned long long)qmp, (unsigned long long)qcp,
+                qsl, (unsigned long long)qfl, (unsigned long long)qev);
+    }
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
