@@ -492,7 +492,10 @@ def commit_file(session: QpackInstallSession, file: QpackFile) -> None:
         raise QpackInstallError(f"cannot commit over existing qpack artifact: {file.name}")
     if not partial.is_file() or partial.stat().st_size != file.size:
         raise QpackInstallError(f"qpack partial is not complete: {file.name}")
-    descriptor = os.open(partial, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    # Windows implements fsync as _commit, which needs a writable handle; a
+    # read-only descriptor fails with EBADF there. POSIX flushes either way.
+    flags = (os.O_RDWR if os.name == "nt" else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(partial, flags)
     try:
         os.fsync(descriptor)
     finally:
