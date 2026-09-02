@@ -62,6 +62,7 @@ static int qwen36_max_ctx(void) {
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
+#include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -1237,20 +1238,128 @@ static void load_meta(Cfg *c, const char *snap) {
                c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim);
 }
 
+/* Multimodal Qwen3.5/3.6 checkpoints (a Swiftlet qpack container's
+ * model.safetensors included) store the text stack under a `language_model.`
+ * prefix; the engine and the converter both speak unprefixed names.  Resolve
+ * the plain name first so converted snapshots are untouched, then the
+ * prefixed one; when neither exists return the CANONICAL name so the caller's
+ * refusal names the tensor the engine actually wanted. */
+#define QW_DENSE_NAME_MAX 288   /* 256-byte call-site buffers + the prefix */
+static const char *dense_resolve(Model *m, const char *name,
+                                 char *buf, size_t cap) {
+    if (st_has(&m->S, name)) return name;
+    snprintf(buf, cap, "language_model.%s", name);
+    if (st_has(&m->S, buf)) return buf;
+    return name;
+}
+static int dense_has(Model *m, const char *name) {
+    char rn[QW_DENSE_NAME_MAX];
+    return st_has(&m->S, dense_resolve(m, name, rn, sizeof rn));
+}
+
+/* Dense tensor stored as an MLX affine triple (packed U32 `.weight` + sibling
+ * `.scales`/`.biases`, the layout Swiftlet writes into a qpack container's
+ * model.safetensors): expand to f32 rows through the checked affine contract.
+ * Every dimension is anchored to `want`, the CONFIG-implied element count the
+ * forward pass will index with -- the same discipline as load_t_n below, so a
+ * container whose packed geometry disagrees with config.json is a refusal,
+ * never a plausible heap OOB.  bits (Q4/Q8) and the group size are DERIVED
+ * from the shapes (logical input over packed words, logical input over scale
+ * groups) rather than parsed from config quantization overrides: the file's
+ * own byte layout is what the expansion must agree with, and the affine
+ * validator re-checks the derived geometry against every buffer length. */
+static float *load_t_affine(Model *m, const char *wname, int64_t want) {
+    st_tensor *w = st_find(&m->S, wname);
+    if (!w) { fprintf(stderr, "missing %s\n", wname); exit(1); }
+    size_t wlen = strlen(wname);
+    char sname[QW_DENSE_NAME_MAX], bname[QW_DENSE_NAME_MAX];
+    if (wlen < 7 || strcmp(wname + wlen - 7, ".weight") != 0 ||
+        wlen - 7 + sizeof(".scales") > sizeof(sname)) {
+        fprintf(stderr, "%s: U32 tensor is not a `.weight` with room for "
+                "`.scales`/`.biases` siblings -- refusing\n", wname); exit(1);
+    }
+    snprintf(sname, sizeof(sname), "%.*s.scales", (int)(wlen - 7), wname);
+    snprintf(bname, sizeof(bname), "%.*s.biases", (int)(wlen - 7), wname);
+    st_tensor *s = st_find(&m->S, sname), *b = st_find(&m->S, bname);
+    if (!s || !b) {
+        fprintf(stderr, "%s: affine `.scales`/`.biases` siblings are missing "
+                "-- refusing\n", wname); exit(1);
+    }
+    ColiAffineScalarFormat sf;
+    switch (s->dtype) {
+        case 0: sf = COLI_AFFINE_SCALAR_BF16; break;
+        case 1: sf = COLI_AFFINE_SCALAR_F16; break;
+        case 2: sf = COLI_AFFINE_SCALAR_F32; break;
+        default:
+            fprintf(stderr, "%s: scales dtype %s is not BF16/F16/F32 -- "
+                    "refusing\n", sname, st_dtype_name(s->dtype)); exit(1);
+    }
+    if (b->dtype != s->dtype || b->numel != s->numel) {
+        fprintf(stderr, "%s: biases dtype/numel disagree with scales -- "
+                "refusing\n", bname); exit(1);
+    }
+    int64_t packed = w->rank >= 2 ? w->shape[w->rank - 1] : 0;
+    int64_t rows = packed > 0 ? w->numel / packed : 0;
+    if (want <= 0 || rows <= 0 || w->numel != rows * packed ||
+        want % rows != 0) {
+        fprintf(stderr, "%s: packed shape does not divide the config-implied "
+                "%lld elements -- refusing\n", wname, (long long)want); exit(1);
+    }
+    int64_t in = want / rows;
+    int64_t per_word = packed > 0 && in % packed == 0 ? in / packed : 0;
+    if (per_word != 8 && per_word != 4) {
+        fprintf(stderr, "%s: %lld packed words for %lld logical columns is "
+                "neither Q4 nor Q8 -- refusing\n",
+                wname, (long long)packed, (long long)in); exit(1);
+    }
+    int64_t groups = s->numel % rows == 0 ? s->numel / rows : 0;
+    int64_t gs = groups > 0 && in % groups == 0 ? in / groups : 0;
+    if (gs <= 0) {
+        fprintf(stderr, "%s: %lld scale groups do not tile %lld logical "
+                "columns -- refusing\n",
+                sname, (long long)groups, (long long)in); exit(1);
+    }
+    void *wraw = malloc((size_t)w->nbytes);
+    void *sraw = malloc((size_t)s->nbytes);
+    void *braw = malloc((size_t)b->nbytes);
+    if (!wraw || !sraw || !braw) { fprintf(stderr, "OOM reading %s\n", wname); exit(1); }
+    st_read_raw(&m->S, wname, wraw, 1);
+    st_read_raw(&m->S, sname, sraw, 1);
+    st_read_raw(&m->S, bname, braw, 1);
+    ColiAffineQuantizedView view = {
+        wraw, sraw, braw,
+        (size_t)w->nbytes, (size_t)s->nbytes, (size_t)b->nbytes,
+        (size_t)rows, (size_t)in, (size_t)gs,
+        per_word == 8 ? COLI_AFFINE_MLX_Q4 : COLI_AFFINE_MLX_Q8, sf
+    };
+    float *p = falloc(want);
+    ColiAffineStatus status = coli_affine_dequant_ref(&view, p);
+    if (status != COLI_AFFINE_OK) {
+        fprintf(stderr, "%s: affine expansion refused (%s)\n",
+                wname, coli_affine_status_string(status)); exit(1);
+    }
+    free(wraw); free(sraw); free(braw);
+    return p;
+}
+
 /* `want` is the element count the forward pass will index with. The container
  * is a file, not an invariant: this used to allocate whatever st_numel reported
  * while every read afterwards used CONFIG dims, so a short tensor was a plain
  * heap OOB read (embed is indexed as m->embed + ids[s]*D). The expert path
  * already refuses a wrong size; this is the same discipline for the dense set. */
 static float *load_t_n(Model *m, const char *name, int64_t want) {
-    int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    char rn[QW_DENSE_NAME_MAX];
+    const char *nm = dense_resolve(m, name, rn, sizeof rn);
+    st_tensor *t = st_find(&m->S, nm);
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (t->dtype == 7) return load_t_affine(m, nm, want);
+    int64_t n = t->numel;
     if (want > 0 && n != want) {
         fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
-                name, (long long)n, (long long)want); exit(1);
+                nm, (long long)n, (long long)want); exit(1);
     }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);
+    st_read_f32(&m->S, nm, p, 0);
     return p;
 }
 
@@ -1303,13 +1412,13 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight", ai);
-            l->qn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->qn = dense_has(m, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_norm.weight", ai);
-            l->kn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->kn = dense_has(m, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+        if (dense_has(m, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
         else l->gate_bias = NULL;
         /* shared expert (dense f32) */
         #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert." suffix,ai); l->field = load_t_n(m,nm,(want))
@@ -1319,7 +1428,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         #undef LD2
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer */
             #define LD3(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.self_attn." suffix,ai); l->field = load_t_n(m,nm,(want))
