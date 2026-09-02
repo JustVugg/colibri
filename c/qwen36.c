@@ -293,11 +293,29 @@ static void load_tokenizer(const char *path){
     jval *merges = json_get(model, "merges");
     if (merges && merges->t==J_ARR){
         for (int r=0;r<merges->len;r++){
-            const char *e = merges->kids[r]->str; if(!e) continue;
-            const char *sp = strchr(e, ' '); if(!sp) continue;
-            int la=(int)(sp-e), lb=(int)strlen(sp+1);
+            /* Two on-disk spellings for one merge table: legacy tokenizer.json
+             * writes "a b" strings, tokenizers >= 0.20 (transformers 4.45+,
+             * the Qwen3.6 checkpoints included) writes ["a","b"] pairs.  The
+             * string-only reader SILENTLY indexed zero merges from the pair
+             * form, and encode_text degraded to one token per byte-symbol --
+             * 24 tokens for a 24-char prompt, real-model run -- because
+             * bpe_piece treats an empty merge table as "nothing to merge",
+             * not as an error. */
+            jval *mk = merges->kids[r];
+            const char *a, *b;
+            int la, lb;
+            if (mk && mk->t==J_STR && mk->str){
+                const char *sp = strchr(mk->str, ' '); if(!sp) continue;
+                a = mk->str; la = (int)(sp - mk->str);
+                b = sp + 1;  lb = (int)strlen(b);
+            } else if (mk && mk->t==J_ARR && mk->len==2 &&
+                       mk->kids[0] && mk->kids[0]->t==J_STR && mk->kids[0]->str &&
+                       mk->kids[1] && mk->kids[1]->t==J_STR && mk->kids[1]->str){
+                a = mk->kids[0]->str; la = (int)strlen(a);
+                b = mk->kids[1]->str; lb = (int)strlen(b);
+            } else continue;
             char *key=malloc(la+1+lb+1);
-            memcpy(key,e,la); key[la]=0x1F; memcpy(key+la+1,sp+1,lb); key[la+1+lb]=0;
+            memcpy(key,a,la); key[la]=0x1F; memcpy(key+la+1,b,lb); key[la+1+lb]=0;
             smap_put(&g_merge, key, r);
         }
     }
