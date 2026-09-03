@@ -927,16 +927,16 @@ def _print_inventory_summary(all_inv, dry_run):
 #
 # The EXTERNAL (non-tensor) files the loader/server actually open from a
 # model dir at runtime, verified against this worktree's HEAD:
-#   - config.json          cfg_root, colibri.c:1361 -- fopen(...); if(!f){
+#   - config.json          cfg_root, colibri.c:1616 -- fopen(...); if(!f){
 #     perror(p); exit(1); } -- MANDATORY, the run aborts without it. Also
-#     read by openai_server.py's Engine.__init__ (:1773) for arch detection.
-#   - generation_config.json  colibri.c:1404-1405 -- fopen, comment "assente
+#     read by openai_server.py's Engine.__init__ (:2635) for arch detection.
+#   - generation_config.json  colibri.c:1659 -- fopen, comment "assente
 #     = nessun problema: e' opzionale" -- best-effort; HF's authority for
 #     generation defaults (extra EOS stop ids) when present.
 #   - tokenizer.json        c/tok.h:101 (tk_read_file, called from tok_load)
 #     -- fopen(...); if(!f){ perror(path); exit(1); } -- MANDATORY. Called
 #     from every serve/generate entry point that needs a tokenizer
-#     (colibri.c:7294 run_text, :7952 run_serve_mux, :8134 main serve loop).
+#     (colibri.c:8171 run_text, :8952 run_serve_mux, :9135 main serve loop).
 #     Before this fix main() never copied it into --outdir, so a minted
 #     directory was not standalone-loadable for THIS reason alone (confirmed
 #     by V2's end-to-end smoke test, 2026-08-18: load only succeeded via a
@@ -947,8 +947,8 @@ def _print_inventory_summary(all_inv, dry_run):
 # fopen/Path().open against a model dir) and therefore excluded:
 #   - tokenizer_config.json, chat_template.jinja -- the GLM-5.2 chat template
 #     is reimplemented natively in code, not read from the .jinja file
-#     (colibri.c:8211 comment: "template UFFICIALE GLM-5.2 (chat_template
-#     .jinja): niente \n dopo i ruoli..."; openai_server.py:1016: "AUTHORITATIVE
+#     (colibri.c:9211 comment: "template UFFICIALE GLM-5.2 (chat_template
+#     .jinja): niente \n dopo i ruoli..."; openai_server.py:1524: "AUTHORITATIVE
 #     GLM-5.2 tool-declaration block (byte-matches chat_template.jinja)" --
 #     both hardcoded to match the file's behavior, not sourced from it).
 #   - README.md, LICENSE, .gitattributes -- pure repo/documentation metadata,
