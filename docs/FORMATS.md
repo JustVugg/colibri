@@ -139,8 +139,8 @@ pair's current restack, base dev `292ed4c`):
   CPU (`quant.h`) or Metal kernel exists for it, and `qt_resolve_fmt` has
   no byte-arithmetic branch that returns 7.
 - **fmt=8** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
-  (`quant.h:446`) / `e4m3_decode` (`quant.h:480`), block size
-  `FP8_BLOCK=128` (`quant.h:482`), kernel `matmul_fp8` (`quant.h:491`).
+  (`quant.h:478`) / `e4m3_decode` (`quant.h:512`), block size
+  `FP8_BLOCK=128` (`fp8_format.h:23`), kernel `matmul_fp8` (`quant.h:525`).
   Disambiguation from fmt=1 ("THE DESIGN LANDMINE" — the two formats'
   weight bytes are byte-identical and can only be told apart by
   scale-array geometry, which is ambiguous for some small shapes) and the

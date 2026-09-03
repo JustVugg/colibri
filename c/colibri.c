@@ -278,9 +278,10 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
     if(t->fmt==8){ /* fp8-e4m3 passthrough: O*I raw e4m3 bytes (n, byte-identical layout
                     * to fmt=1's weight bytes) + one f32 scale per 128x128 block
-                    * (FP8_BLOCK in quant.h, included below qt_bytes -- keep the
-                    * arithmetic literal here, same discipline as fmt=5's comment
-                    * above). Missing this branch would fall through to the fmt=2
+                    * (FP8_BLOCK in fp8_format.h via quant.h, included below
+                    * qt_bytes -- keep the arithmetic literal here, same
+                    * discipline as fmt=5's comment above). Missing this branch would
+                    * fall through to the fmt=2
                     * default below (packed-nibble formula, ~half the real weight
                     * bytes) and undercount a resident fp8 tensor's byte footprint --
                     * feeds AUTOPIN/RAM-budget math, so this branch is load-bearing
