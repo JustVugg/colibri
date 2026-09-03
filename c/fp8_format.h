@@ -9,10 +9,10 @@
  * restating 128 / >>7 as literals.
  *
  * The in-repo FP8 tests are NOT independent of this constant: the reference
- * decoders in test_fp8_passthrough.c, test_fp8_load.c, test_fp8_e2e_loader.c
- * and test_qwen38_native_weights.c all index with FP8_BLOCK/fp8_nblk via
- * quant.h, so they move in lockstep with an edit here (only
- * test_backend_metal.mm's ref_fp8_nblk keeps its own literal, on purpose).
+ * decoders in test_fp8_passthrough.c, test_fp8_load.c, test_fp8_e2e_loader.c,
+ * test_qwen38_native_weights.c and test_qt_addrow.c all index with
+ * FP8_BLOCK/fp8_nblk via quant.h, so they move in lockstep with an edit here
+ * (only test_backend_metal.mm's ref_fp8_nblk keeps its own literal, on purpose).
  * An edit to FP8_BLOCK is a format change, not a tunable -- those tests
  * cannot catch a wrong edit on their own. */
 #ifndef COLI_FP8_FORMAT_H
