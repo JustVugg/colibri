@@ -1591,6 +1591,12 @@ static int serve_one(Model *m, ServeReq *q){
     else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
     q38_tm_report_bank(&timers,"request");
+    /* Tier residency alongside the phase timers, under the same COLI_TIMERS
+     * gate. Without this the tier's hit rate is printed only by
+     * q38t_shutdown(), which serve mode never reaches - the engine is killed,
+     * not closed - so the one number that says whether the tier is earning its
+     * VRAM was unobtainable on the only path that matters. */
+    if(getenv("COLI_TIMERS")&&getenv("COLI_TIMERS")[0]=='1') q38t_stats();
     return input_eof?-1:0;
 }
 

@@ -60,6 +60,18 @@ static struct {
     /* per-device issue bookkeeping, valid between issue() and take() */
     int is_cnt[Q38T_MAX_DEV];
     int is_k[Q38T_MAX_DEV][Q38T_MAX_ISSUE];
+    /* EXPERIMENT, Q38T_TWO_ROUND=1: experts past the 8-row cap held for a
+     * SECOND issue/take round inside q38t_take, instead of falling to the CPU.
+     * Telemetry says misses are zero - the declined experts are already
+     * resident in VRAM and sit on the CPU only because of the API's batching
+     * limit - so a second round is at least worth measuring. Default off. */
+    int two_round;
+    int pd_cnt[Q38T_MAX_DEV];
+    int pd_k[Q38T_MAX_DEV][Q38T_MAX_ISSUE];
+    ColiCudaTensor *pd_g[Q38T_MAX_DEV][Q38T_MAX_ISSUE];
+    ColiCudaTensor *pd_u[Q38T_MAX_DEV][Q38T_MAX_ISSUE];
+    ColiCudaTensor *pd_d[Q38T_MAX_DEV][Q38T_MAX_ISSUE];
+    unsigned long long round2;
     /* counters, reported by q38t_stats */
     unsigned long long hits, miss, over_cap, uploads, upload_fail;
     size_t vram_used;      /* RAW weight bytes uploaded, for reporting only */
@@ -169,6 +181,23 @@ int q38t_init(int n_layers, int n_experts, int hidden, int inter, int topk) {
         if (!G.xrep[i]) return 0;
     }
     G.byte_ceiling = byte_ceiling();
+    /* Two rounds by DEFAULT, measured. Q38T_TWO_ROUND=0 opts out.
+     *
+     * It was written as an opt-in experiment expecting to lose: the one-round
+     * design lets the CPU compute the 2 experts past the row cap while the 8
+     * on the GPU are in flight, and a second device round serialises what was
+     * concurrent. Measured on an RTX 3090, 18-token prompt, warm, three
+     * interleaved rounds with the cold run discarded per visit:
+     *
+     *     one round   3.123 tok/s  sd 0.015  n=9
+     *     two rounds  3.315 tok/s  sd 0.029  n=9      +6.1%
+     *
+     * Two rounds won every round. The CPU experts do not hide behind the GPU
+     * ones - they cost more than an entire second issue/take including its
+     * launch and sync. On this hardware, moving expert work to the device is
+     * worth more than the overlap it destroys. */
+    { const char *tr = getenv("Q38T_TWO_ROUND");
+      G.two_round = !(tr && tr[0] == '0' && tr[1] == 0); }
     G.on = 1;
 
     fprintf(stderr,
@@ -236,7 +265,7 @@ uint32_t q38t_issue(int layer, const int *eids, int K, const float *x) {
     static int rows[Q38T_MAX_ISSUE];
     for (int i = 0; i < Q38T_MAX_ISSUE; i++) rows[i] = 1;   /* S=1 per expert at decode */
 
-    for (int i = 0; i < G.ndev; i++) G.is_cnt[i] = 0;
+    for (int i = 0; i < G.ndev; i++) { G.is_cnt[i] = 0; G.pd_cnt[i] = 0; }
 
     uint32_t mask = 0;
     for (int k = 0; k < K; k++) {
@@ -247,7 +276,22 @@ uint32_t q38t_issue(int layer, const int *eids, int K, const float *x) {
         /* The 8-row ceiling is per device per issue. Anything past it is a
          * CPU expert this token; it is counted so the split is visible in
          * q38t_stats rather than being an invisible truncation. */
-        if (c >= Q38T_MAX_ISSUE) { G.over_cap++; continue; }
+        if (c >= Q38T_MAX_ISSUE) {
+            /* Past the row cap. Default: back to the CPU. Under Q38T_TWO_ROUND
+             * it is queued for a second GPU round in q38t_take instead. */
+            if (G.two_round) {
+                int p = G.pd_cnt[di];
+                if (p < Q38T_MAX_ISSUE) {
+                    G.pd_g[di][p] = s->tg; G.pd_u[di][p] = s->tu; G.pd_d[di][p] = s->td;
+                    G.pd_k[di][p] = k;
+                    G.pd_cnt[di] = p + 1;
+                    mask |= 1u << k;
+                    G.hits++;
+                    continue;
+                }
+            }
+            G.over_cap++; continue;
+        }
         tg[di][c] = s->tg; tu[di][c] = s->tu; td[di][c] = s->td;
         G.is_k[di][c] = k;
         G.is_cnt[di] = c + 1;
@@ -271,20 +315,51 @@ uint32_t q38t_issue(int layer, const int *eids, int K, const float *x) {
     return mask;
 }
 
+/* Collect one device's in-flight group into out[], weighted. */
+static void take_one(int di, int c, const int *ks, const float *route_gates, float *out) {
+    const float *y = coli_cuda_expert_group_take(G.dev[di]);
+    if (!y) return;
+    for (int j = 0; j < c; j++) {
+        float w = route_gates[ks[j]];
+        const float *row = y + (size_t)j * G.D;
+        for (int d = 0; d < G.D; d++) out[d] += w * row[d];
+    }
+}
+
 void q38t_take(uint32_t mask, const float *route_gates, int K, float *out) {
     (void)K;
     if (!G.on || !mask || !route_gates || !out) return;
     for (int di = 0; di < G.ndev; di++) {
         int c = G.is_cnt[di];
-        if (!c) continue;
-        const float *y = coli_cuda_expert_group_take(G.dev[di]);
-        if (!y) { G.is_cnt[di] = 0; continue; }
-        for (int j = 0; j < c; j++) {
-            float w = route_gates[G.is_k[di][j]];
-            const float *row = y + (size_t)j * G.D;
-            for (int d = 0; d < G.D; d++) out[d] += w * row[d];
-        }
+        if (c) take_one(di, c, G.is_k[di], route_gates, out);
         G.is_cnt[di] = 0;
+
+        /* Second round, only under Q38T_TWO_ROUND. The API allows one
+         * outstanding issue per device, so this cannot overlap with the first
+         * round - it is deliberately serial, which is exactly what the
+         * experiment is measuring. */
+        int p = G.pd_cnt[di];
+        G.pd_cnt[di] = 0;
+        if (!p) continue;
+        static int rows2[Q38T_MAX_ISSUE];
+        for (int i = 0; i < Q38T_MAX_ISSUE; i++) rows2[i] = 1;
+        float *xr = G.xrep[di];
+        /* NO REFILL. xrep already holds x replicated across all 8 rows from the
+         * first round, and the second round needs the same activation. An
+         * earlier version re-copied here and its j=0 case was memcpy(xr, xr, D)
+         * - self-overlapping, and undefined behaviour rather than a no-op.
+         * A second round can only exist once the first filled the cap, so p>0
+         * implies the first round placed 8 and xr is fully populated. */
+        if (coli_cuda_expert_group_issue(G.pd_g[di], G.pd_u[di], G.pd_d[di], rows2, p, xr)) {
+            take_one(di, p, G.pd_k[di], route_gates, out);
+            G.round2++;
+        } else {
+            /* The second issue failed. Those experts contributed nothing and
+             * the caller already skipped them on the CPU, so their weight is
+             * missing from out[]. That is a wrong answer, not a slow one -
+             * count it loudly rather than let it pass. */
+            G.upload_fail++;
+        }
     }
 }
 
