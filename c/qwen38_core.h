@@ -1094,6 +1094,21 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
     Cfg *c=&m->c;
     Q38ExpertScaleCache *cache=&m->expert_scales[layer];
     float *scales=cache->values+(int64_t)expert*3*cache->scale_count;
+    /* Se i tre intervalli sono mappati (COLI_MAP_EXPERTS=1), lo slot li PUNTA
+     * invece di copiarli: niente slab, niente 14 MB per miss. */
+    {
+        const uint8_t *pg=(const uint8_t*)st_map_shard_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
+        const uint8_t *pu=(const uint8_t*)st_map_shard_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
+        const uint8_t *pd=(const uint8_t*)st_map_shard_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
+        if(pg&&pu&&pd){
+            int sc=(int)cache->scale_count;
+            q38_bind_borrowed_fp8(&slot->gate,(void*)pg,scales,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->up,(void*)pu,scales+sc,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->down,(void*)pd,scales+2*sc,c->hidden,c->inter);
+            if(slot->fp8_slab){free(slot->fp8_slab);slot->fp8_slab=NULL;slot->fp8_slab_bytes=0;}
+            return;
+        }
+    }
     q38_bind_fp8_slot(slot,scales,(int)cache->scale_count,c->hidden,c->inter);
     int64_t pair_bytes=weight[0]->nbytes+weight[1]->nbytes;
     unsigned char *raw=(unsigned char*)slot->fp8_slab;
