@@ -113,27 +113,22 @@ read side. `main()` also copies `config.json` (mandatory, colibri.c's
 load_cfg) and `generation_config.json` (best-effort) from --indir into
 --outdir. Together with kv_b_proj emission below, this makes the tool's
 output a standalone-loadable model directory on its own, with one caveat: the
-engine's fmt=8 absorb support (branch `f8/absorb-fmt8`) must land before a
-kv_b_proj-carrying container is safe to decode through the batched serving
-path -- see below.
+CUDA absorb kernels do not yet decode fmt=8, so a kv_b_proj-carrying
+container decodes through the CPU absorb path only -- see below.
 
 kv_b_proj (kind "kvb") is now emitted the same way as o_proj/attn: byte-
 preserved fp8 weight + renamed `.qs` scale sidecar, stamped (it clears the
 collision shape the same way o_proj does -- M1 audit, GLM-5.2's kv_b_proj is
-never at the ambiguous [O,I] this tool's `_check_geometry` guards). THIS TOOL
-CHANGE IS INDEPENDENT of, and does not wait on, the engine-side absorb work:
-colibri.c's MLA-absorption CPU path (qt_addrow/qt_matvec_rows, called only on
-l->kv_b) and the CUDA absorb kernels have no fmt==8 case as of this tool's own
-HEAD -- that support is being built in parallel on `f8/absorb-fmt8` and is
-NOT part of this diff. A container minted with this tool BEFORE that engine
-branch lands will load clean (qt_from_disk resolves the stamp exactly like
-o_proj's) but crash -- loudly, not silently -- on any decode that reaches the
-batched (`kvs`-nonNULL) serving path, because `ABSORB=0` cannot bypass absorb
-there. Sequencing that correctly (engine work before this container is used
-for decode) is the gate's job, not this tool's: repacking kv_b_proj here is
-the tool-side half of a two-sided integration, done now because engine and
-tool work can (and per the gate's assembly manifest, should) proceed in
-parallel.
+never at the ambiguous [O,I] this tool's `_check_geometry` guards). The
+engine-side half of this two-sided integration now exists on the CPU:
+colibri.c's MLA-absorption path (qt_addrow/qt_matvec_rows, called only on
+l->kv_b) carries explicit fmt==8 decode arms, so a container minted here
+loads clean (qt_from_disk resolves the stamp exactly like o_proj's) and
+decodes correctly through the batched (`kvs`-nonNULL) serving path, where
+absorb cannot be bypassed. The CUDA absorb kernels still have no fmt==8
+case (absorb_fmt_ok delegates to coli_cuda_weight_at_supported's fmt 0..4
+allowlist), so fmt=8 kv_b decode stays on the CPU absorb path until that
+lands.
 
 METADATA STAMP (reference implementation of the FORMATS-registry FR -- see
 docs/FORMATS.md): every output shard's safetensors `__metadata__` carries a
