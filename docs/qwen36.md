@@ -78,6 +78,66 @@ per-row quantization error concentrates the same way. The gs64 container costs
 ~1.7 GB more on disk and a few percent on cold-start; warm decode speed is the
 same or slightly better.
 
+## Which checkpoints, and what the banner calls them
+
+Two Qwen checkpoints declare `model_type: qwen3_5_moe_text` and resolve to
+this engine:
+
+| checkpoint | layers | experts | hidden | banner |
+|---|---|---|---|---|
+| Qwen/Qwen3.6-35B-A3B | 40 (10 attention) | 256, top-8 | 2048 | `Qwen3.6-35B-A3B · 35B MoE` |
+| Qwen/Qwen3.8-2.4T-A95B | 92 (23 attention) | 512, top-10 | 8192 | `Qwen3.8-2.4T-A95B · 2.4T MoE` |
+
+The registry names a checkpoint by its geometry (`display_variants` on the
+`qwen36` descriptor), so the banner says what is on disk. A config that
+matches neither, a tiny fixture for instance, is named by its own
+`model_type` and measured geometry rather than by a sibling's parameter
+count (#1045).
+
+The 2.4T checkpoint is **architecture-identical** to the 35B: same layer
+pattern, every engine guard holds, and the registry's planner puts its KV
+cache at 1.44 GiB for 8k context and 46 GiB at the 256k maximum, with a
+context-free DeltaNet state of 0.55 GiB. What this engine cannot do for it
+is hold the experts: the warmstart keeps every expert in RAM by design (see
+`--ram` below), which is ~1.4 TB of int4 for 2.4T. Serving it needs the
+disk-streaming design, not this one. The conversion and the geometry checks
+are in place so that work starts from a verified shape, not from a guess.
+
+### The converter's tensor contract
+
+Both checkpoints ship experts **fused** per layer (`mlp.experts.gate_up_proj`,
+`mlp.experts.down_proj`), a one-layer multi-token-prediction head (`mtp.*`,
+`mtp_num_hidden_layers: 1`), and the 35B additionally a vision tower
+(`visual.*`). `tools/qwen36_tensor_kinds.py` classifies every tensor name
+before the first shard is read: layer tensors are converted, `mtp.*` and
+`visual.*` are skipped **on purpose** and reported with a count, and a name
+the contract does not know stops the conversion. A converter that silently
+drops what it does not recognise produces a container that loads and is
+quietly missing a tensor; this one refuses instead (the GLM-5.3 precedent).
+`tests/test_qwen36_tensor_kinds.py` pins the contract to both real indexes.
+
+### Validating the 2.4T shape without a single weight
+
+`tools/make_qwen36_tiny.py --geometry qwen38-2p4t` builds a fixture with the
+2.4T's structural numbers at toy widths -- 92 layers, interval 4, 512 experts
+top-10, 16:1 attention heads, 8:1 DeltaNet heads -- and rewrites the shard
+into the real layout: fused experts plus an `mtp.*` head. The converter must
+split the one and skip the other, and the engine must match the transformers
+reference token for token. CI runs it at cache capacities 1, 2 and 512, and
+under ASan/UBSan. Locally:
+
+```sh
+cd c && make qwen36
+python3 tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 \
+        --out q24 --ref-mode full --emit-ref q24/ref_full.json
+python3 tools/convert_qwen36.py --model q24 --out q24_c --ebits 8
+COLI_DENSE_I8=0 SNAP=q24_c ./qwen36 512 8 q24/ref_full.json
+```
+
+(`--seed 3`: the default seed collapses this geometry's reference to one
+repeated token, which a shape error could still reproduce; seed 3 yields
+twelve distinct tokens over sixteen.)
+
 ## `--ram` is not honoured by this engine
 
 `coli --ram` sizes the RAM budget for engines that stream experts from disk on

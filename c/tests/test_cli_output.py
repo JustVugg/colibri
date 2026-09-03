@@ -242,6 +242,29 @@ class BannerModelLineTest(unittest.TestCase):
                 line = self.line({"model_type": model_type, "n_routed_experts": 8})
                 self.assertTrue(line.startswith(expected), line)
 
+    def test_qwen_checkpoints_are_named_by_geometry(self):
+        """One model_type, two sizes: the banner must not call a 2.4T a 35B (#1045)."""
+        thirty_five = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 40,
+                       "num_experts": 256, "hidden_size": 2048}
+        two_point_four = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 92,
+                          "num_experts": 512, "hidden_size": 8192}
+        self.assertTrue(self.line(thirty_five).startswith("Qwen3.6-35B-A3B · 35B MoE"),
+                        self.line(thirty_five))
+        line = self.line(two_point_four)
+        self.assertTrue(line.startswith("Qwen3.8-2.4T-A95B · 2.4T MoE"), line)
+        self.assertNotIn("35B", line)
+        # the HF repo nests the text config under text_config; the family
+        # config, not the root, is what carries the geometry
+        wrapped = {"model_type": "qwen3_5_moe", "text_config": two_point_four}
+        self.assertTrue(self.line(wrapped).startswith("Qwen3.8-2.4T-A95B"), self.line(wrapped))
+        # a geometry the registry does not recognise names itself, with its
+        # own numbers -- a tiny fixture is not "Qwen3.6-35B-A3B"
+        tiny = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 8,
+                "num_experts": 8, "hidden_size": 64}
+        line = self.line(tiny)
+        self.assertTrue(line.startswith("qwen3_5_moe_text · 8L x 8E MoE"), line)
+        self.assertNotIn("35B", line)
+
     def test_deepseek_v4_is_not_read_as_glm(self):
         """The regression this exists for: a non-GLM checkpoint said GLM-5.2."""
         line = self.line({"model_type": "deepseek_v4", "n_routed_experts": 256})
