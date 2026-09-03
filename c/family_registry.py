@@ -44,6 +44,23 @@ class FamilyLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class DisplayVariant:
+    """One checkpoint geometry a family serves, and what to call it.
+
+    A family is keyed by model_type, and one model_type can cover checkpoints
+    of very different size: Qwen3.6-35B-A3B and Qwen3.8-2.4T-A95B both say
+    ``qwen3_5_moe_text``. A single display_name would announce the 2.4T as a
+    35B, which is the kind of banner that costs someone a day (#1045). The
+    ``geometry`` pairs are config keys the family config must match exactly;
+    the first matching variant names the model. No match: the model keeps its
+    own model_type as its name rather than borrowing a sibling's.
+    """
+    geometry: tuple
+    display_name: str
+    display_scale: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerGeometry:
     context_state_bytes: int
     fixed_state_bytes: int
@@ -83,6 +100,9 @@ class FamilyDescriptor:
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
     supports_accelerator: bool = True
+    # Size-keyed names for families whose model_type spans several checkpoint
+    # sizes. Empty: display_name/display_scale name every checkpoint.
+    display_variants: tuple = ()
     # Optional model-owned allocations that are neither dense resident
     # tensors nor per-expert cache entries. Qwen3.8 uses this for the
     # normalized FP8 scale bank shared by every cache slot. Keeping this
@@ -1048,6 +1068,17 @@ FAMILIES = (
         model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
+        # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
+        # numbers that differ by an order of magnitude, so a config with
+        # any of them off names itself rather than one of these.
+        display_variants=(
+            DisplayVariant((("num_hidden_layers", 40), ("num_experts", 256),
+                            ("hidden_size", 2048)),
+                           "Qwen3.6-35B-A3B", "35B"),
+            DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
+                            ("hidden_size", 8192)),
+                           "Qwen3.8-2.4T-A95B", "2.4T"),
+        ),
         engine_artifact="qwen36",
         engine_aliases=(),
         engine_group="qwen36",
@@ -1161,6 +1192,21 @@ def _build_registry(families):
             family.tune_prompt_template.format(prompt="test", prompt_len=4)
         except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
             raise RegistryError(f"invalid tune prompt template: {family.id}") from error
+        for variant in family.display_variants:
+            if (not isinstance(variant, DisplayVariant) or not variant.geometry or
+                    not isinstance(variant.display_name, str) or not variant.display_name or
+                    not isinstance(variant.display_scale, str) or
+                    any(not isinstance(key, str) or not key or isinstance(value, bool) or
+                        not isinstance(value, int) or value < 1
+                        for key, value in variant.geometry)):
+                raise RegistryError(f"invalid display variant: {family.id}")
+        # The static display_name is what the READMEs are held to mention, so
+        # it must be a name some checkpoint actually shows -- a family whose
+        # variants all say something else would document a name no banner
+        # prints.
+        if family.display_variants and family.display_name not in {
+                variant.display_name for variant in family.display_variants}:
+            raise RegistryError(f"display_name is not one of its variants: {family.id}")
         identity = (family.engine_artifact, family.internal_arch)
         if identity in identities:
             raise RegistryError(f"duplicate engine identity: {identity}")
@@ -1237,6 +1283,25 @@ def resolve_model(model_dir):
                           config, family_config, str(model))
 
 
+def display_for(resolved):
+    """(display_name, display_scale) for what was actually loaded.
+
+    Families without variants keep their static name. With variants, the
+    first whose geometry keys all match the family config wins; a config that
+    matches none is named by its own model_type with an empty scale, so the
+    banner prints the measured geometry instead of a sibling's parameter
+    count.
+    """
+    family = resolved.descriptor
+    if not family.display_variants:
+        return family.display_name, family.display_scale
+    config = resolved.family_config
+    for variant in family.display_variants:
+        if all(config.get(key) == value for key, value in variant.geometry):
+            return variant.display_name, variant.display_scale
+    return resolved.model_type, ""
+
+
 def planner_geometry(resolved, context):
     if isinstance(context, bool) or not isinstance(context, int) or context < 1:
         raise ValueError("context must be a positive integer")
@@ -1310,6 +1375,11 @@ def public_metadata(family):
         "model_types": list(family.model_types),
         "display_name": family.display_name,
         "display_scale": family.display_scale,
+        "display_variants": [
+            {"geometry": dict(variant.geometry),
+             "display_name": variant.display_name,
+             "display_scale": variant.display_scale}
+            for variant in family.display_variants],
         "engine_artifact": family.engine_artifact,
         "engine_aliases": list(family.engine_aliases),
         "engine_group": family.engine_group,
