@@ -333,5 +333,28 @@ int main(void){
         }
         coli_cuda_shutdown();
     }
+
+    /* ---- Phase 3: LUT-gate lifecycle across shutdown/re-init --------------- */
+    {   /* g_fp8_lut_ready is process-wide while the e4m3 table is per-device,
+         * so BOTH coli_cuda_shutdown AND coli_cuda_init clear it: every context
+         * rebuild must republish before a fmt=8 tensor exists (a re-init may
+         * widen the device set past what the previous publish covered). Pins
+         * the reset on both paths -- including init WITHOUT a shutdown between,
+         * the sequence that would otherwise inherit a stale ready flag. */
+        int devs[1]={0};
+        enum { LO=4, LI=128 };
+        uint8_t lw[LO*LI]; float ls[1]={1.f};
+        for(size_t i=0;i<sizeof lw;i++) lw[i]=rnd_e4m3();
+        ColiCudaTensor *lt=nullptr;
+        if(!coli_cuda_init(devs,1)){ printf("FAIL lifecycle re-init\n"); return 1; }
+        if(coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL gate open after re-init (stale ready flag)\n"); return 1; }
+        if(!coli_cuda_fp8_set_lut(lut)){ printf("FAIL lifecycle set_lut\n"); return 1; }
+        if(!coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL upload after republish\n"); return 1; }
+        coli_cuda_tensor_free(lt); lt=nullptr;
+        if(!coli_cuda_init(devs,1)){ printf("FAIL init-without-shutdown\n"); return 1; }
+        if(coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL gate open after init-without-shutdown\n"); return 1; }
+        coli_cuda_shutdown();
+        printf("lut-gate lifecycle: shutdown AND init both force a republish\n");
+    }
     printf("OK\n"); return 0;
 }

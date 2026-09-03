@@ -112,23 +112,21 @@ when no `.qs` sidecar exists, colibri.c) -- nothing new is exercised on the
 read side. `main()` also copies `config.json` (mandatory, colibri.c's
 load_cfg) and `generation_config.json` (best-effort) from --indir into
 --outdir. Together with kv_b_proj emission below, this makes the tool's
-output a standalone-loadable model directory on its own, with one caveat: the
-CUDA absorb kernels do not yet decode fmt=8, so a kv_b_proj-carrying
-container decodes through the CPU absorb path only -- see below.
+output a standalone-loadable model directory on its own: both halves of the
+engine-side absorb support (CPU and CUDA) exist -- see below.
 
 kv_b_proj (kind "kvb") is now emitted the same way as o_proj/attn: byte-
 preserved fp8 weight + renamed `.qs` scale sidecar, stamped (it clears the
 collision shape the same way o_proj does -- M1 audit, GLM-5.2's kv_b_proj is
 never at the ambiguous [O,I] this tool's `_check_geometry` guards). The
-engine-side half of this two-sided integration now exists on the CPU:
+engine side of this two-sided integration now exists on both backends:
 colibri.c's MLA-absorption path (qt_addrow/qt_matvec_rows, called only on
-l->kv_b) carries explicit fmt==8 decode arms, so a container minted here
-loads clean (qt_from_disk resolves the stamp exactly like o_proj's) and
-decodes correctly through the batched (`kvs`-nonNULL) serving path, where
-absorb cannot be bypassed. The CUDA absorb kernels still have no fmt==8
-case (absorb_fmt_ok delegates to coli_cuda_weight_at_supported's fmt 0..4
-allowlist), so fmt=8 kv_b decode stays on the CPU absorb path until that
-lands.
+l->kv_b) carries explicit fmt==8 decode arms, and the CUDA absorb kernels
+decode fmt=8 through weight_at/absorb_scale (admitted by
+coli_cuda_weight_at_supported, uploads gated on the published e4m3 LUT).
+A container minted here loads clean (qt_from_disk resolves the stamp
+exactly like o_proj's) and decodes correctly through the batched
+(`kvs`-nonNULL) serving path, where absorb cannot be bypassed.
 
 METADATA STAMP (reference implementation of the FORMATS-registry FR -- see
 docs/FORMATS.md): every output shard's safetensors `__metadata__` carries a

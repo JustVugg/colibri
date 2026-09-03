@@ -2185,10 +2185,9 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
      * dereferenced it -- silent, unnamed, and one refactor away from a misread.
      * Refuse BY NAME instead, BEFORE any pointer/stride use, and say what happens
      * instead: the un-sharded kv_b stays whole on its layer home device, where fmt=8
-     * kv_b decode runs the CPU absorb path (qt_addrow/qt_matvec_rows' fmt=8
-     * branches below; the CUDA absorb kernels refuse fmt=8 via absorb_fmt_ok's
-     * fmt 0..4 allowlist) -- COLI_CUDA_ATTN_SHARD is a no-op for it. Same
-     * "refuse rather than misread" discipline as qt_addrow/
+     * kv_b decode runs the absorb path (qt_addrow/qt_matvec_rows' fmt=8 branches, or
+     * the CUDA absorb kernels via absorb_fmt_ok) -- COLI_CUDA_ATTN_SHARD is a no-op
+     * for it. Same "refuse rather than misread" discipline as qt_addrow/
      * qt_matvec_rows' guards; notice only (no exit): sharding is an opt-in
      * optimization and skipping it is the correct, working behavior. Bounded once
      * per process per fmt, never per layer (metal_fmt_gate_notice, the precedent

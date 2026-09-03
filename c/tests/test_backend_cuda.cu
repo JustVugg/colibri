@@ -223,6 +223,106 @@ static int test_fmt6(int dev) {
     return 1;
 }
 
+/* ---- fmt=8 (fp8-e4m3) absorb decode -----------------------------------
+ * Exercises weight_at's new fmt=8 branch and absorb_scale's new per-128x128-
+ * block branch (this PR pair) through the REAL attention_absorb kernel and
+ * absorb_fmt_ok gate, against a CPU reference built the same way the fmt=0
+ * absorb block in main() (below) is: independent score/softmax/context
+ * accumulation, only the weight lookup itself changes to an e4m3 block-scale
+ * dequant. Dims are chosen so BOTH the row-block and column-block axes carry
+ * a partial tail block (O=H*(Q+V)=160 -> nblkO=2, rows 128..159 partial;
+ * K=140 -> nblkI=2, cols 128..139 partial) -- the exact geometry the new
+ * branches must index correctly (blkO=row>>7, blkI=k>>7, scale index
+ * blkO*nblkI+blkI). The e4m3 reference decoder is arithmetic (sign/exp/mant,
+ * OCP E4M3-FN policy), not the engine's c_e4m3 LUT, so it cross-checks
+ * coli_cuda_fp8_set_lut's uploaded table rather than assuming it -- same
+ * independence discipline as t8_e4m3_ref's sibling in tests/test_fp8_cuda.cu. */
+static float t8_e4m3_ref(uint8_t b) {
+    int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    if (e == 15 && m == 7) return NAN;              /* E4M3-FN: only NaN, no inf */
+    float v = e ? ldexpf(1.f + m/8.f, e-7) : ldexpf(m/8.f, -6);
+    return s ? -v : v;
+}
+static uint32_t t8_rng_state = 0xC001D00Du;
+static uint8_t t8_rnd_byte(void) {
+    t8_rng_state ^= t8_rng_state<<13; t8_rng_state ^= t8_rng_state>>17; t8_rng_state ^= t8_rng_state<<5;
+    uint8_t b = (uint8_t)(t8_rng_state & 0xFF);
+    if ((b & 0x7F) == 0x7F) b &= (uint8_t)~1;        /* avoid the two NaN byte patterns */
+    return b;
+}
+static float t8_dequant(const uint8_t *q, const float *scale, int I, int row, int col, int nblkI) {
+    int blkO = row >> 7, blkI = col >> 7;
+    return t8_e4m3_ref(q[(size_t)row*I + col]) * scale[(size_t)blkO*nblkI + blkI];
+}
+
+static int test_fmt8_absorb(int dev) {
+    float lut[256]; for (int i = 0; i < 256; i++) lut[i] = t8_e4m3_ref((uint8_t)i);
+    if (!coli_cuda_fp8_set_lut(lut)) { std::fprintf(stderr,"fmt=8 absorb: set_lut failed\n"); return 0; }
+
+    const int H = 2, Q = 40, V = 40, R = 2, K = 140, T = 3, O = H*(Q+V);
+    const int nblkO = (O+127)/128, nblkI = (K+127)/128, nblk = nblkO*nblkI;
+    uint8_t *w = (uint8_t*)std::malloc((size_t)O*K);
+    for (size_t i = 0; i < (size_t)O*K; i++) w[i] = t8_rnd_byte();
+    float *wscale = (float*)std::malloc((size_t)nblk*sizeof(float));
+    for (int i = 0; i < nblk; i++) wscale[i] = 0.01f + 0.002f*(float)i;
+
+    /* Refusal must have held BEFORE this test ever ran (fmt=8 was invisible to
+     * absorb_fmt_ok on unpatched main) -- upload + launch below is the positive
+     * side of the same predicate this PR widened. */
+    ColiCudaTensor *wt = nullptr;
+    if (!coli_cuda_tensor_upload(&wt, w, wscale, 8, K, O, dev)) {
+        std::fprintf(stderr,"fmt=8 absorb: weight upload rejected\n"); return 0;
+    }
+
+    float *q = (float*)std::malloc((size_t)H*(Q+R)*sizeof(float));
+    float *latent = (float*)std::malloc((size_t)T*K*sizeof(float));
+    float *rope = (float*)std::malloc((size_t)T*R*sizeof(float));
+    for (int i = 0; i < H*(Q+R); i++) q[i] = std::sin((float)(i+1)*0.037f);
+    for (int i = 0; i < T*K; i++) latent[i] = std::sin((float)(i+1)*0.019f)*0.5f;
+    for (int i = 0; i < T*R; i++) rope[i] = std::cos((float)(i+1)*0.041f)*0.3f;
+    float *ctx = (float*)std::malloc((size_t)H*V*sizeof(float));
+    float scale = 1.f/std::sqrt((float)K);
+
+    if (!coli_cuda_attention_absorb(wt, ctx, q, latent, rope, H, Q, R, V, K, T, scale)) {
+        std::fprintf(stderr,"fmt=8 absorb: kernel launch rejected (absorb_fmt_ok gate?)\n"); return 0;
+    }
+
+    int bad = 0;
+    for (int h = 0; h < H; h++) {
+        int rbase = h*(Q+V);
+        float qa[512];   /* K<=512, this attention_absorb's own documented bound */
+        for (int k = 0; k < K; k++) {
+            double a = 0;
+            for (int d = 0; d < Q; d++) a += (double)q[h*(Q+R)+d]*t8_dequant(w,wscale,K,rbase+d,k,nblkI);
+            qa[k] = (float)a;
+        }
+        float scores[T];
+        for (int t = 0; t < T; t++) {
+            double a = 0; for (int k = 0; k < K; k++) a += (double)qa[k]*latent[t*K+k];
+            for (int d = 0; d < R; d++) a += (double)q[h*(Q+R)+Q+d]*rope[t*R+d];
+            scores[t] = (float)a*scale;
+        }
+        float mx = scores[0]; for (int t = 1; t < T; t++) mx = scores[t]>mx?scores[t]:mx;
+        float z = 0; for (int t = 0; t < T; t++) { scores[t] = std::exp(scores[t]-mx); z += scores[t]; }
+        for (int t = 0; t < T; t++) scores[t] /= z;
+        float cl[512];
+        for (int k = 0; k < K; k++) { double a=0; for (int t=0;t<T;t++) a += (double)scores[t]*latent[t*K+k]; cl[k]=(float)a; }
+        for (int v = 0; v < V; v++) {
+            int row = rbase+Q+v;
+            double a = 0; for (int k = 0; k < K; k++) a += (double)cl[k]*t8_dequant(w,wscale,K,row,k,nblkI);
+            float want = (float)a, got = ctx[h*V+v];
+            float rel = std::fabs(want)>1e-4f ? std::fabs(got-want)/std::fabs(want) : std::fabs(got-want);
+            if (rel > 1e-3f) {
+                std::fprintf(stderr,"fmt=8 absorb mismatch h=%d v=%d got=%.6f want=%.6f rel=%.4g\n",h,v,got,want,rel);
+                bad++;
+            }
+        }
+    }
+    coli_cuda_tensor_free(wt);
+    std::free(w); std::free(wscale); std::free(q); std::free(latent); std::free(rope); std::free(ctx);
+    return bad == 0;
+}
+
 int main(int argc, char **argv) {
     int devices[COLI_CUDA_MAX_DEVICES], ndev = argc > 1 ? argc - 1 : 1;
     if (ndev > COLI_CUDA_MAX_DEVICES) return 2;
@@ -449,6 +549,20 @@ int main(int argc, char **argv) {
     if (!test_fmt6(d0)) return 1;
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) { std::fprintf(stderr,"fmt=6 leaked tensors\n"); return 1; }
+
+    /* fmt=8 absorb: same self-contained lifecycle discipline as fmt=6 above,
+     * BOTH halves. The byte half is load-bearing history: an earlier vintage of
+     * this feature found coli_cuda_tensor_free subtracting per-row scale bytes
+     * for a per-block-scaled fmt=8 tensor (upload charged scale_count =
+     * ceil(O/128)*ng, free subtracted O*ng), so the `tensor_bytes >= bytes`
+     * guard silently declined the subtraction and the diagnostic VRAM counter
+     * stuck non-zero forever after freeing ANY fmt=8 tensor. free's accounting
+     * now mirrors upload's charge expression exactly (see the comment in
+     * coli_cuda_tensor_free), and this is the assertion that keeps the two
+     * from drifting apart again for a tracked fmt=8 tensor. */
+    if (!test_fmt8_absorb(d0)) return 1;
+    coli_cuda_stats(-1, &count, &bytes);
+    if (count || bytes) { std::fprintf(stderr,"fmt=8 absorb leaked tensors\n"); return 1; }
 
     coli_cuda_shutdown();
     std::printf("cuda backend: q8/q4/q2/f32/e8 correctness ok on %d device(s)\n", ndev);

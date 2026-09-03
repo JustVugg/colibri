@@ -1,6 +1,11 @@
 #include "backend_cuda.h"
+#include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
+
+static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-edged scale "
+              "grids (mint tool, docs/FORMATS.md); FP8_BLOCK is container format, not a "
+              "tunable -- an edit here is a format change");
 
 /* Optional fmt=8 decode candidate (COLI_CUDA_F8_WARP=2): cuda_fp8.h maps
  * __nv_cvt_fp8_to_halfraw to an sm_89+ cvt instruction, with a bit-manip
@@ -270,13 +275,14 @@ __device__ static inline float mx4_weight_at(const uint8_t *q, int i) {
  * branch and the fall-through is a refusal.
  *
  * It used to be the other way round: int2 was the fall-through, so every format
- * this function does not decode -- fmt=5 (int3-g64), fmt=6 (E8/IQ3), fmt=8
- * (fp8-e4m3), and anything added later -- was read as 2-bit values and returned
- * numbers. Meanwhile the CPU functions doing the same job on the same tensor,
- * qt_addrow and qt_matvec_rows (colibri.c), both exit(1) naming the function and
- * the fmt. Two backends, identical unsupported input, one refusing and one
- * fabricating: that asymmetry is the defect, independent of any particular
- * format's arrival.
+ * this function does not decode -- fmt=5 (int3-g64), fmt=6 (E8/IQ3), and
+ * anything added later -- was read as 2-bit values and returned numbers.
+ * (fmt=8 was in that misread set too, then refused, until it gained its own
+ * explicit branch below for the absorb path.) Meanwhile the CPU functions
+ * doing the same job on the same tensor, qt_addrow and qt_matvec_rows
+ * (colibri.c), both exit(1) naming the function and the fmt. Two backends,
+ * identical unsupported input, one refusing and one fabricating: that
+ * asymmetry is the defect, independent of any particular format's arrival.
  *
  * WHY __trap() AND NOT A DIAGNOSTIC. This is device code inside a running
  * kernel; there is no stderr to name the tensor on and no way to unwind. __trap
@@ -305,6 +311,15 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
+    /* fmt=8 (fp8-e4m3): raw byte, same layout as fmt=1 (row_bytes(8,I)==I), decoded
+     * through the shared c_e4m3 LUT (same table quant_matmul's fmt==8 branch reads,
+     * uploaded once by coli_cuda_fp8_set_lut). Callers gate on the LUT being live
+     * before a fmt=8 tensor ever reaches this function (coli_cuda_tensor_upload
+     * refuses the upload otherwise), so the table is always populated here. Returns
+     * the decoded WEIGHT only, unscaled -- absorb_scale below applies the
+     * per-128x128-block scale, exactly like every other quantized fmt returns
+     * unscaled through this function. */
+    if (fmt == 8) return c_e4m3[base[i]];
     const uint8_t *q = base;
     if (fmt == 2 || fmt == 4) {                               /* fmt=4: same nibble layout */
         uint8_t v = q[i >> 1];
@@ -325,6 +340,25 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
  * (fmt=2) semantic that crashed #298's g64 kv_b. */
 __device__ static float absorb_scale(const float *wscale, int fmt, int gs, int ng, int row, int k) {
     if (!fmt) return 1.f;
+    if (fmt == 8) {
+        /* fp8-e4m3: one f32 scale per 128x128 BLOCK, block-row-major
+         * ([ceil(O/128), ceil(I/128)]), exactly quant_matmul's fmt==8 indexing
+         * (scl[i >> 7] on a scale row selected by o >> 7) and matmul_fp8's CPU
+         * reference (quant.h). `ng` here is coli_cuda_tensor_upload's t->ng,
+         * which for fmt=8 is set to ceil(I/128) specifically (not the fmt=4
+         * group count) -- see the upload-time assignment there. `gs` is unused
+         * for fmt=8 (always 0, only fmt=4 sets it), so the block edge is the
+         * fixed FP8_BLOCK constant (fp8_format.h, shared with the CPU side),
+         * not a caller-supplied group size. Rounding note: the GEOMETRY here
+         * matches quant_matmul_f8w/matmul_fp8, but their fp8 accumulation
+         * convention (f32 partial per block, scale once per partial, double
+         * across blocks) is NOT carried into the absorb kernels -- they apply
+         * the scale per element into a float accumulator, matching their own
+         * fmt=4 arm's long-standing behavior; CPU-vs-CUDA absorb divergence
+         * is an accepted, documented class (#510). */
+        int rowBlk = row / FP8_BLOCK, colBlk = k / FP8_BLOCK;
+        return wscale[(size_t)rowBlk * ng + colBlk];
+    }
     if (fmt != 4) return wscale[row];
     int g = k / gs; if (g >= ng) g = ng - 1;   /* tail of the last (partial) group */
     return wscale[(size_t)row * ng + g];
@@ -541,9 +575,9 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * the ORIGINAL dense path, kept for COLI_CUDA_F8_WARP=0; the default
          * routes fmt=8 to quant_matmul_f8w instead (quant_matmul_launch). */
         const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
-        const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
+        const float *scl = scales + (size_t)(o / FP8_BLOCK) * (size_t)((I + FP8_BLOCK - 1) / FP8_BLOCK);
         for (int i = threadIdx.x; i < I; i += blockDim.x)
-            sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
+            sum += xs[i] * c_e4m3[wrow[i]] * scl[i / FP8_BLOCK];
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -1236,6 +1270,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
     if (!cuda_ok(cudaGetDeviceCount(&available), "device discovery")) return 0;
     g_nctx = 0;
+    g_fp8_lut_ready = 0;   /* the flag is process-wide but the e4m3 table is per-device:
+                            * a re-init may WIDEN the device set past what the previous
+                            * publish covered (init({0}) -> set_lut -> init({0,1}) would
+                            * otherwise admit fmt=8 uploads whose kernels read device 1's
+                            * unwritten table). Any context rebuild must republish via
+                            * coli_cuda_fp8_set_lut before fmt=8 tensors exist. */
     for (int i = 0; i < count; i++) {
         int device = devices[i];
         if (device < 0 || device >= available) {
@@ -1314,6 +1354,19 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
+    /* g_fp8_lut_ready is PROCESS-WIDE while the e4m3 table (c_e4m3, a
+     * __constant__ device symbol whose lifetime is the CUDA primary context,
+     * not this file's host-side DeviceContext structs) is PER-DEVICE. A later
+     * coli_cuda_init may select a device the previous span never published to;
+     * without this reset the upload gate (g_fp8_lut_ready, checked in
+     * coli_cuda_tensor_upload) would still be satisfied from the PREVIOUS
+     * boot and admit fmt=8 tensors whose kernels there decode against an
+     * unwritten (zero) table: silent all-zero weights, the exact
+     * fabricated-numbers failure mode the format gates exist to refuse.
+     * Reset so every boot must publish its own LUT (coli_cuda_fp8_set_lut)
+     * before any fmt=8 upload; coli_cuda_init clears the flag for the same
+     * reason, so a re-init that WIDENS the device set is covered too. */
+    g_fp8_lut_ready = 0;
 #ifdef COLI_ANS
     if(g_ans_sidecar){std::fclose(g_ans_sidecar);g_ans_sidecar=nullptr;}
 #if defined(__linux__)
@@ -1409,9 +1462,9 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
     t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
     t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
-    if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
-        t->ng = (I + 127) / 128;
-        t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
+    if (fmt == 8) {   /* per-block scales: [ceil(O/FP8_BLOCK), ceil(I/FP8_BLOCK)] (fp8_format.h) */
+        t->ng = (int)fp8_nblk(I);
+        t->scale_count = (size_t)fp8_nblk(O) * (size_t)t->ng;
     }
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
@@ -2183,18 +2236,20 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
 
 
 /* The absorb kernels decode `w` through weight_at + absorb_scale, which know
- * per-row and fmt=4 group scales only. Refuse anything else (fmt=5/6/8) rather
- * than mis-decode it — the caller keeps its CPU attention path. (`proj`
- * tensors are exempt: they run through quant_matmul, which dispatches every
- * format it uploads.) A dedicated block-scale absorb for fmt=8 is follow-up
- * work, same shape as routing fmt=4 through the grouped kernels was.
+ * per-row scales, fmt=4 group scales, and fmt=8 per-128x128-block scales.
+ * Refuse anything else (fmt=5/6/7) rather than mis-decode it — the caller
+ * keeps its CPU attention path. (`proj` tensors are exempt: they run through
+ * quant_matmul, which dispatches every format it uploads.) fmt=8 support
+ * funnels through this one predicate for all the absorb host wrappers below,
+ * so none of them needed a separate change.
  *
  * The admissible set is weight_at's own, taken from the shared predicate rather
- * than restated as `fmt <= 4`: this gate and weight_at's device-side backstop
- * must not be able to drift apart, and the old inequality also admitted
- * NEGATIVE fmt values, which weight_at would then have fallen through on. Same
- * truth table for every fmt a container can actually carry (0..8), so no
- * existing container changes behaviour here. */
+ * than restated as an inequality: this gate and weight_at's device-side
+ * backstop must not be able to drift apart, and the old `fmt <= 4` also
+ * admitted NEGATIVE fmt values, which weight_at would then have fallen through
+ * on. A fmt=8 tensor implies a live e4m3 LUT (upload refuses it otherwise --
+ * see the predicate's caveat note in backend_cuda.h), so no extra gate is
+ * needed here. */
 static int absorb_fmt_ok(const ColiCudaTensor *w){
     return w && coli_cuda_weight_at_supported(w->fmt);
 }
