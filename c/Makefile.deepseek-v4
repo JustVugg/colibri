@@ -228,20 +228,20 @@ $(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h \
 	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
-		st.h json.h compat.h tensor.h quant.h route_trace.h \
+		st.h json.h compat.h tensor.h quant.h fp8_format.h route_trace.h \
 		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
 
 $(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
-		tensor.h quant.h native_quant.h native_quant_batch.h
+		tensor.h quant.h fp8_format.h native_quant.h native_quant_batch.h
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
 
