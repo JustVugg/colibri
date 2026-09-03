@@ -3,8 +3,8 @@
   "generator_version": "2",
   "seed": 1234,
   "source": "transformers",
-  "transformers_version": "5.14.1",
-  "torch_version": "2.13.0+cpu",
+  "transformers_version": "5.12.1",
+  "torch_version": "2.12.1+cu130",
   "quantization_format": {
     "dense": "E4M3 weight + UE8M0 128x128 scale, dequantized in reference",
     "routed_experts": "packed E2M1 + UE8M0 per-row/per-32 scale, dequantized in reference",
