@@ -20,6 +20,16 @@
    include per conto suo; qui si definisce solo il corpo. ---- */
 #include <stdint.h>
 #include <time.h>
+
+/* MinGW non ha setenv: il tier legge la sua configurazione dall'ambiente, e il
+ * test deve poterla impostare anche su Windows. */
+#if defined(_WIN32)
+#include <stdlib.h>
+static int test_setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite; return _putenv_s(name, value);
+}
+#define setenv test_setenv
+#endif
 #include "../backend_cuda.h"
 
 struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; };
