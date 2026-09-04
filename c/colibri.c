@@ -394,7 +394,12 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                   * slices of a per-layer arena and must never be free()d —
                   * expert_host_release detaches them, expert_host_ensure
                   * re-attaches. NULL for every individually-allocated slot. */
-                 uint8_t *aslab; float *afslab; } ESlot;
+                 uint8_t *aslab; float *afslab;
+                 /* #1050: recency-list links (slot indices, -1 = none).
+                  * rlist: 0 = unlinked (calloc-zero safe), 1 = ev-list
+                  * (resident with slab, publishable), 2 = pin-list (kept warm;
+                  * currently unused by the GLM engine, no HOT-STORE slots). */
+                 int rprev, rnext; int8_t rlist; } ESlot;
 
 static void eslot_acquire(ESlot *s){ __atomic_add_fetch(&s->in_flight,1,__ATOMIC_ACQ_REL); }
 static void eslot_release(ESlot *s){
@@ -424,6 +429,8 @@ static int eslot_lru_victim(ESlot *slots,int n,int ecap){
     return lru;
 }
 
+/* ---------- #1050: recency list for the evictable set (eslot_lru_victim sans scan) ----------
+ * Functions defined AFTER struct Model; forward declared there. */
 typedef struct {
     float **Lc, **Rc, **Ic;
     uint8_t **Lc8, **Rc8;                        /* KV8: righe latenti fp8 e4m3 (Lc/Rc restano NULL) */
@@ -455,6 +462,12 @@ typedef struct {
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     int **ecache_slot_by_expert;                 /* eid -> LRU slot (resident or PILOT reservation) */
+    /* #1050: per-layer recency list heads/tails ([NR] rows).  ev-list holds
+     * resident slots that own a slab (the scan's evictable set); least-recent
+     * first, head = victim.  In-flight / reserved / slab-less slots are
+     * off-list, mirroring exactly what eslot_lru_victim's scan skipped. */
+    int *ev_head, *ev_tail;
+    int *ecn_freeslab;                           /* #1050: per-layer #1034 free-with-slab reuse candidates */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
 #ifdef COLI_VULKAN
@@ -560,6 +573,56 @@ static int g_no_fused_pair=0;
 static int g_spec_pin=1;
 static int g_spec_live=0;
 static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
+
+/* ---------- #1050: recency list for the evictable set (eslot_lru_victim sans scan) ----------
+ * Model is complete here.  Semantics match the linear scan being replaced:
+ *  - only resident slots with a slab and eid>=0 are list members ("live & publishable")
+ *  - order is `used` order (least recent at head); used=(uint64_t)-1 reservations and
+ *    used=0 freed slots are never pushed, so a fresh publish (fresh used stamp) lands
+ *    naturally at the tail.
+ * Priority order preserved from the scan: free-with-slab first, then LRU.  The
+ * empty-slab-less branch (reuse under ecap) is only reachable when the list is
+ * empty — the scan's `live<ecap` condition; handled by the caller fallback. */
+static void eslot_list_unlink(Model *m,int layer,ESlot *s){
+    if(s->rlist==0) return;
+    if(s->rprev>=0) m->ecache[layer][s->rprev].rnext=s->rnext; else m->ev_head[layer]=s->rnext;
+    if(s->rnext>=0) m->ecache[layer][s->rnext].rprev=s->rprev; else m->ev_tail[layer]=s->rprev;
+    s->rlist=0; s->rprev=s->rnext=-1;
+}
+static void eslot_list_push_back(Model *m,int layer,ESlot *s){
+    if(!m->ev_head) return;
+    /* #1050 (Grok-r1 M3): pushing an already-linked slot would duplicate the node. */
+    if(s->rlist==1) eslot_list_unlink(m,layer,s);
+    int idx=(int)(s-m->ecache[layer]);
+    s->rlist=1; s->rnext=-1; s->rprev=m->ev_tail[layer];
+    if(m->ev_tail[layer]>=0) m->ecache[layer][m->ev_tail[layer]].rnext=idx;
+    else m->ev_head[layer]=idx;
+    m->ev_tail[layer]=idx;
+}
+static void eslot_list_touch(Model *m,int layer,ESlot *s){
+    if(s->rlist!=1) return;
+    if(m->ev_tail[layer]==(int)(s-m->ecache[layer])) return;   /* already MRU */
+    eslot_list_unlink(m,layer,s);
+    eslot_list_push_back(m,layer,s);
+}
+static int eslot_victim_pick(Model *m,int layer,int ecap){
+    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+    /* #1050 (Sol-r1 M2): free-with-slab reuse comes FIRST, exactly like the
+     * legacy scan (eslot_lru_victim returns any {eid==-1, slab} before LRU
+     * residents).  The counter makes this O(free) instead of O(n) and only
+     * pays the scan when a #1034 reuse candidate actually exists. */
+    if(m->ecn_freeslab && m->ecn_freeslab[layer]>0){
+        for(int z=0;z<nn;z++){
+            ESlot *s=&Sl[z];
+            if(s->eid==-1 && s->slab && !eslot_busy(s)) return z;
+        }
+    }
+    if(m->ev_head && m->ev_head[layer]>=0){
+        ESlot *s=&Sl[m->ev_head[layer]];
+        if(!eslot_busy(s)) return m->ev_head[layer];   /* list members are never busy */
+    }
+    return eslot_lru_victim(Sl,nn,ecap);   /* fallback: LRU residents / empty-under-cap */
+}
 
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
 static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
@@ -2276,6 +2339,10 @@ static void model_init_range(Model *m, const char *snap, int cap,
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->ecache_slot_by_expert=calloc(NR,sizeof(int*));
+    m->ev_head=calloc(NR,sizeof(int)); m->ev_tail=calloc(NR,sizeof(int));   /* #1050 recency lists */
+    m->ecn_freeslab=calloc(NR,sizeof(int));      /* #1050 free-with-slab counters */
+    for(int i=0;i<NR;i++){ m->ev_head[i]=-1; m->ev_tail[i]=-1; }   /* #1050 (Grok-r1 B1): calloc-zero reads as head=0 */
+    if(!m->ev_head||!m->ev_tail||!m->ecn_freeslab){ fprintf(stderr,"OOM expert cache recency list\n"); exit(1); }
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
 #ifdef COLI_VULKAN
@@ -5057,6 +5124,10 @@ static int ecache_key(const ESlot *s){
 
 static void ecache_unindex(Model *m,int layer,ESlot *s){
     int eid=ecache_key(s), i=(int)(s-m->ecache[layer]);
+    eslot_list_unlink(m,layer,s);                 /* #1050: leaving evictable set drops list link */
+    /* #1050: free-with-slab bookkeeping — a slot that WAS {eid==-1, slab} was a
+     * #1034 reuse candidate; whichever state it is entering, it is leaving that. */
+    if(s->slab && eid==-1 && m->ev_head && m->ecn_freeslab) m->ecn_freeslab[layer]--;
     if(eid>=0&&eid<m->c.n_experts&&m->ecache_slot_by_expert&&
        m->ecache_slot_by_expert[layer]&&m->ecache_slot_by_expert[layer][eid]==i)
         m->ecache_slot_by_expert[layer][eid]=-1;
@@ -5068,6 +5139,10 @@ static void ecache_publish(Model *m,int layer,ESlot *s,int eid){
     if(eid>=0&&eid<m->c.n_experts&&m->ecache_slot_by_expert&&
        m->ecache_slot_by_expert[layer])
         m->ecache_slot_by_expert[layer][eid]=(int)(s-m->ecache[layer]);
+    /* #1050: list membership is established by eslot_list_refile AFTER the caller
+     * stamps a fresh `used` — publish runs before the stamp in every pilot path,
+     * and pushing here would either drop the slot (used==-1) or file it with a
+     * stale stamp. */
 }
 
 static void ecache_reserve(Model *m,int layer,ESlot *s,int eid){
@@ -5081,6 +5156,16 @@ static void ecache_reserve(Model *m,int layer,ESlot *s,int eid){
 static void ecache_hide(Model *m,int layer,ESlot *s){
     ecache_unindex(m,layer,s);
     s->eid=-1;
+    if(s->slab && m->ev_head && m->ecn_freeslab) m->ecn_freeslab[layer]++;   /* #1050: #1034 reuse candidate */
+}
+
+/* #1050: file/unfile a slot exactly when its fresh `used` stamp exists.
+ * Members: resident (eid>=0) with slab, not a reservation (used!=-1). */
+static void eslot_list_refile(Model *m,int layer,ESlot *s){
+    if(!m->ev_head) return;
+    if(!(s->eid>=0 && s->slab && s->used!=(uint64_t)-1)) return;
+    eslot_list_unlink(m,layer,s);
+    eslot_list_push_back(m,layer,s);
 }
 
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
@@ -5553,7 +5638,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(use[j]){ m->hits++; m->hit_pin++; }
             if(!use[j]){
                 use[j]=ecache_indexed(m,layer,eid,0);
-                if(use[j]){ m->hits++; m->hit_ecache++; use[j]->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+                if(use[j]){ m->hits++; m->hit_ecache++; use[j]->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+                            eslot_list_touch(m,layer,use[j]); }   /* #1050: O(1) MRU re-link on hit */
             }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
@@ -6207,15 +6293,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
-                     if(lru<0){ static int warned;
-                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
-                         continue; }
-                     dst=&Sl[lru]; }
+        else { int lru=eslot_victim_pick(m,layer,m->ecap);   /* #1050: list pick w/ scan fallback */
+               if(lru<0){ static int warned;
+                   if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
+                   continue; }
+               dst=&Sl[lru]; }
               ecache_unindex(m,layer,dst);
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
               ecache_publish(m,layer,dst,dst->eid);
-              dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+              dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+              eslot_list_refile(m,layer,dst); }          /* #1050: fresh stamp -> ev-list tail */
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
@@ -6404,7 +6491,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew=0;
     if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=eslot_lru_victim(Sl,nn,m->ecap);           /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        slot=eslot_victim_pick(m,layer,m->ecap);        /* #1050: list pick w/ scan fallback (#1034 free-with-slab + LRU order) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                     pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o cap raggiunto */
         /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
@@ -6426,6 +6513,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     dst->used=(uint64_t)-1;                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
                                                          * (chiude la finestra eid-reale/used-vecchio: uno snapshot di eclock si sarebbe potuto
                                                          * far superare da altri load durante il pread). used fresco ristampato al successo. */
+    eslot_list_unlink(m,layer,dst);                     /* #1050: reserved slot leaves the evictable list */
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
@@ -6435,6 +6523,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     if(rc==0){
         ecache_publish(m,layer,dst,eid);
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
+        eslot_list_refile(m,layer,dst);                 /* #1050: fresh stamp -> ev-list tail */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
         /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
@@ -6478,7 +6567,7 @@ static void pilot_uring_batch(Model *m){
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else slot=eslot_lru_victim(Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        else slot=eslot_victim_pick(m,layer,m->ecap);   /* #1050: list pick w/ scan fallback (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
@@ -6517,8 +6606,9 @@ static void pilot_uring_batch(Model *m){
         if(rc==0){
             ecache_publish(m,d->layer,d->dst,d->eid);
             d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+            eslot_list_refile(m,d->layer,d->dst);       /* #1050: fresh stamp -> ev-list tail */
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
-        }else{
+        } else {
             ecache_hide(m,d->layer,d->dst);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
         }
@@ -11500,6 +11590,8 @@ static void glm_segment_model_destroy(GlmSegmentEngine *engine) {
     }
     for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
          slot++) glm_segment_eslot_destroy(&model->ws[slot]);
+    free(model->ev_head); free(model->ev_tail);   /* #1050 recency lists */
+    free(model->ecn_freeslab);
     for (int layer = 0; layer < rows; layer++) {
         free(model->ecache_slot_by_expert
                  ? model->ecache_slot_by_expert[layer] : NULL);
