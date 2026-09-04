@@ -2645,6 +2645,59 @@ static void serve_loop(Model *m){
     }
 }
 
+/* Warmstart body, lifted out of main so a test can drive it against an
+ * in-memory model without a container (the QT_NO_WARMSTART check stays at the
+ * call site). expert_is_int4 is what main probed from the on-disk expert size.
+ */
+static void tier_warmstart(Model *m, int expert_is_int4) {
+    /* Plan the set (heat order), then load+stage IN PARALLEL. The
+     * load path is thread-safe: expert_get locks the layer cache
+     * (g_pilot_mx), st_read_raw uses pread; entries are unique. */
+    double t0 = now_s();
+    int cap_total = m->c.n_layers * m->c.n_experts;
+    int *wpl = malloc((size_t)cap_total*sizeof(int));
+    int *wpe = malloc((size_t)cap_total*sizeof(int));
+    int wn = qt_plan_fill(wpl, wpe, cap_total);
+    /* Load ALL experts into RAM, not just the planned (VRAM) set:
+     * otherwise the first touch of a CPU-fallback expert triggers a
+     * ~12 ms container read in the middle of decode (measured: 139
+     * ms/token on a single-GPU run). Planned ones also go to VRAM. */
+    uint8_t *planned = calloc((size_t)cap_total, 1);
+    for (int i = 0; i < wn; i++) planned[wpl[i]*m->c.n_experts + wpe[i]] = 1;
+    int keep8 = getenv("COLI_KEEP_INT8") != NULL;
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (int gi = 0; gi < cap_total; gi++) {
+        int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
+        Slot *e; expert_get(m, l, eidw, &e);
+        /* int4: i puntatori impacchettati; int8: i pesi stessi. Prima
+         * qui si esigeva e->g4, che su un container int8 e' NULL: la
+         * promozione non partiva mai e il budget restava riservato a
+         * vuoto (#1331). */
+        const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
+        const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
+        const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
+        if (planned[gi] && wg) {
+            qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
+            /* The staging copy is done. On an int4 container the int8 copy
+             * can go RIGHT AWAY so it never shows up in peak RSS: g4/u4/d4
+             * stay as the source of truth, and slot_ensure_int8() rebuilds
+             * the int8 block on an LFRU eviction with no container access.
+             * An int8 container has no second copy -- e->g4 is NULL -- so
+             * freeing e->g there both dangles the pointer qt_note_planned
+             * just stored (any later stage() reads freed memory) and leaves
+             * slot_ensure_int8() unable to bring the expert back: it returns
+             * early without g4, and the CPU fallback in the decode loop then
+             * dereferences NULL. Keep it (#1341). COLI_KEEP_INT8 keeps its
+             * meaning for int4. */
+            if (!keep8 && expert_is_int4 && e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+        }
+    }
+    qt_fill_wait();
+    free(wpl); free(wpe); free(planned);
+    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (int8 only for non-residents), %d in VRAM -- %.1f s\n",
+            cap_total, wn, now_s()-t0);
+}
+
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
@@ -2782,47 +2835,7 @@ int main(int argc, char **argv) {
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
-        if (!(nws && *nws=='1')) {
-            /* Plan the set (heat order), then load+stage IN PARALLEL. The
-             * load path is thread-safe: expert_get locks the layer cache
-             * (g_pilot_mx), st_read_raw uses pread; entries are unique. */
-            double t0 = now_s();
-            int cap_total = m.c.n_layers * m.c.n_experts;
-            int *wpl = malloc((size_t)cap_total*sizeof(int));
-            int *wpe = malloc((size_t)cap_total*sizeof(int));
-            int wn = qt_plan_fill(wpl, wpe, cap_total);
-            /* Load ALL experts into RAM, not just the planned (VRAM) set:
-             * otherwise the first touch of a CPU-fallback expert triggers a
-             * ~12 ms container read in the middle of decode (measured: 139
-             * ms/token on a single-GPU run). Planned ones also go to VRAM. */
-            uint8_t *planned = calloc((size_t)cap_total, 1);
-            for (int i = 0; i < wn; i++) planned[wpl[i]*m.c.n_experts + wpe[i]] = 1;
-            int keep8 = getenv("COLI_KEEP_INT8") != NULL;
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int gi = 0; gi < cap_total; gi++) {
-                int l = gi / m.c.n_experts, eidw = gi % m.c.n_experts;
-                Slot *e; expert_get(&m, l, eidw, &e);
-                /* int4: i puntatori impacchettati; int8: i pesi stessi. Prima
-                 * qui si esigeva e->g4, che su un container int8 e' NULL: la
-                 * promozione non partiva mai e il budget restava riservato a
-                 * vuoto (#1331). */
-                const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
-                const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
-                const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
-                if (planned[gi] && wg) {
-                    qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
-                    /* The staging copy is done; free the int8 copy RIGHT AWAY
-                     * so it never shows up in peak RSS. On LFRU eviction
-                     * slot_ensure_int8() rematerializes from g4 (no container
-                     * access). */
-                    if (!keep8 && e->g) { free(e->g); e->g = e->u = e->d = NULL; }
-                }
-            }
-            qt_fill_wait();
-            free(wpl); free(wpe); free(planned);
-            fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (int8 only for non-residents), %d in VRAM -- %.1f s\n",
-                    cap_total, wn, now_s()-t0);
-        }
+        if (!(nws && *nws=='1')) tier_warmstart(&m, expert_is_int4);
     }
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

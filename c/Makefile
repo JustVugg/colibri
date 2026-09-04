@@ -1656,6 +1656,15 @@ tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/q
 tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
+# tier raw pointers into the RAM expert slots, so only a test that includes
+# qwen36.c can prove the weights behind them are still there afterwards -- on an
+# int8 container there is no packed copy to rebuild them from (#1341). Includes
+# qwen36_tier.c in its own TU like the other tier tests, so nothing else is
+# compiled in and no model file is needed.
+tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
