@@ -31,6 +31,11 @@ void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
 void coli_vk_alloc_priority(float p);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
+/* 1 when resident weights go to plain DEVICE_LOCAL memory through a host staging buffer
+ * (discrete card without Resizable BAR, or COLI_VK_STAGED=1); 0 = mapped host-visible
+ * uploads as before. Decided once in coli_vk_init. */
+int  coli_vk_staged(void);
+
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.

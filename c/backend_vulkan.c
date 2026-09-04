@@ -64,6 +64,14 @@ static struct {
     uint32_t qfam;
     uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL) — for inputs/weights
     uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
+    /* Staged weight path: on a discrete card without Resizable BAR the HOST_VISIBLE|
+     * DEVICE_LOCAL type is a ~256 MB window and everything past it silently lands in
+     * system RAM. When staged==1, weight arenas use memtype_dl (DEVICE_LOCAL, not
+     * host-visible) and are filled by vkCmdCopyBuffer from `stage` (memtype_stage,
+     * host-visible, preferably NOT device-local so it never eats the BAR) on the
+     * dedicated up_cmd/up_fence. Scratches, KV mirror and readbacks are unchanged. */
+    int staged; uint32_t memtype_dl, memtype_stage;
+    VkCommandPool up_cpool; VkCommandBuffer up_cmd; VkFence up_fence;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
     VkPipeline pipe;
@@ -80,6 +88,7 @@ static struct {
     VkCommandBuffer cmd;
     VkFence fence;
     Scratch x, y, h;   /* h = fused gate+up hidden output */
+    Scratch stage;     /* host staging buffer for the staged weight path (TRANSFER_SRC) */
     /* full expert-group scratch: activations/hidden/output for K experts + per-expert
      * descriptor sets (gate_up: dsl_gu, down: dsl), so gate_up->down runs on-device in
      * one submit with hidden never leaving the GPU. */
@@ -151,6 +160,33 @@ static int pick_memtype_cached(VkPhysicalDevice phys) {
             (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
     }
     return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
+}
+
+/* DEVICE_LOCAL and NOT host-visible, on the largest device-local heap: the target of the
+ * staged weight path. -1 when no such type exists (unified-memory APUs, Lavapipe). */
+static int pick_memtype_dl(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    int best = -1; VkDeviceSize bestheap = 0;
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        VkDeviceSize hs = m.memoryHeaps[m.memoryTypes[i].heapIndex].size;
+        if (hs > bestheap) { bestheap = hs; best = (int)i; }
+    }
+    return best;
+}
+/* Host-visible+coherent type for the staging buffer, preferring one that is NOT
+ * device-local so staging never consumes the BAR window; falls back to G.memtype. */
+static int pick_memtype_stage(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return (int)i;
+    }
+    return (int)G.memtype;
 }
 
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
@@ -395,14 +431,32 @@ int coli_vk_init(const char *spv_path) {
                 mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
         VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
-        if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        int small_bar = dl_max && (!(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || hv_dl * 4 < dl_max);
+        /* Staged device-local weights: auto when the host-visible slice is small,
+         * COLI_VK_STAGED=1/0 forces either way (1 lets ReBAR owners validate the path). */
+        int dl = pick_memtype_dl(G.phys);
+        const char *st = getenv("COLI_VK_STAGED");
+        int want = st && *st ? (*st == '1') : small_bar;
+        if (want && dl < 0) {
+            fprintf(stderr, "[VK] COLI_VK_STAGED requested but no device-local-only memory type "
+                    "(unified memory?) — mapped uploads\n");
+            want = 0;
+        }
+        if (want) {
+            G.staged = 1; G.memtype_dl = (uint32_t)dl; G.memtype_stage = (uint32_t)pick_memtype_stage(G.phys);
+            fprintf(stderr, "[VK] weights: staged device-local uploads (host-visible VRAM %llu of %llu MB; "
+                    "memtype %u via staging memtype %u)\n", (unsigned long long)(hv_dl >> 20),
+                    (unsigned long long)(dl_max >> 20), G.memtype_dl, G.memtype_stage);
+        } else if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
             fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
                     "will live in system RAM and every access crosses PCIe (expect slower than "
-                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS.\n");
-        else if (dl_max && hv_dl * 4 < dl_max)
+                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or set "
+                    "COLI_VK_STAGED=1.\n");
+        else if (small_bar)
             fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
                     "appears disabled) — allocations beyond the %llu MB window fall back to system "
-                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS.\n",
+                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS, "
+                    "or unset COLI_VK_STAGED=0.\n",
                     (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20),
                     (unsigned long long)(hv_dl >> 20));
     }
@@ -453,6 +507,16 @@ int coli_vk_init(const char *spv_path) {
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.fence), "fence");
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
+    if (G.staged) {   /* own pool: command buffers from one pool need external sync too */
+        VkCommandPoolCreateInfo upci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
+        VKCHECK(vkCreateCommandPool(G.dev, &upci, NULL, &G.up_cpool), "up cmdPool");
+        VkCommandBufferAllocateInfo ubi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = G.up_cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VKCHECK(vkAllocateCommandBuffers(G.dev, &ubi, &G.up_cmd), "up cmdBuf");
+        VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.up_fence), "up fence");
+    }
+
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
@@ -461,6 +525,7 @@ int coli_vk_init(const char *spv_path) {
 }
 
 int coli_vk_available(void) { return G.ready; }
+int coli_vk_staged(void) { return G.ready && G.staged; }
 
 void coli_vk_mem_info(size_t *used, size_t *count) {
     if (used) *used = G.used_bytes;
@@ -1566,6 +1631,9 @@ void coli_vk_shutdown(void) {
     if (G.att_sc.buf) { vkDestroyBuffer(G.dev, G.att_sc.buf, NULL); vkFreeMemory(G.dev, G.att_sc.mem, NULL); }
     if (G.att_ctx.buf) { vkDestroyBuffer(G.dev, G.att_ctx.buf, NULL); vkFreeMemory(G.dev, G.att_ctx.mem, NULL); }
     if (G.y2.buf) { vkDestroyBuffer(G.dev, G.y2.buf, NULL); vkFreeMemory(G.dev, G.y2.mem, NULL); }
+    if (G.stage.buf) { vkDestroyBuffer(G.dev, G.stage.buf, NULL); vkFreeMemory(G.dev, G.stage.mem, NULL); }
+    if (G.up_fence) vkDestroyFence(G.dev, G.up_fence, NULL);
+    if (G.up_cpool) vkDestroyCommandPool(G.dev, G.up_cpool, NULL);
     if (G.pair_pool) vkDestroyDescriptorPool(G.dev, G.pair_pool, NULL);
     coli_vk_kv_reset();
     if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
@@ -2042,6 +2110,7 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
+    printf("weights: %s\n", coli_vk_staged() ? "staged device-local" : "mapped host-visible");
     srand(1234);
     int bad = 0;
     /* COLI_VK_TEST_BALLAST=N: allocate N idle 4 MB device buffers before benching.
