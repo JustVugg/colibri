@@ -97,6 +97,17 @@ static void *uploader(void *arg){
             /* LFRU swap: free the victim only when no group is in flight */
             while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
             QSlot *v=qs(vl,ve);
+            if(G.th_stop && G.issue_open){
+                /* Shutting down with a group still open: qt_take() -- the only
+                 * thing that clears issue_open -- will never come. Abandon
+                 * this swap instead of freeing a victim tensor the in-flight
+                 * group may still reference; qt_lfru_tick_locked already
+                 * cleared the victim's resident flag before enqueueing, so
+                 * restore it to keep the flag consistent with the tensor it
+                 * still holds. */
+                v->resident=1; qs(layer,eid)->queued=0;
+                pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
+            }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
             pthread_mutex_unlock(&G.mx);
@@ -497,7 +508,10 @@ void qt_shutdown(void){
             fprintf(stderr,"[qtier] HEAT_FILE saved: %s\n",hf);
         }
     }
-    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_mutex_unlock(&G.mx);
+    /* Wake cv_take too: the uploader's LFRU victim wait (and qt_note_block /
+     * qt_note_planned / qt_fill_wait, all waiting on the same condvar) would
+     * otherwise never notice th_stop and pthread_join below would hang (#1340). */
+    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     G.on=0;
     coli_cuda_shutdown();

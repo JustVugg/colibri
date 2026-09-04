@@ -1650,6 +1650,12 @@ tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c tests/qwen36_fa
 tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, single device: proves qt_shutdown returns (under an
+# alarm(10) watchdog) instead of hanging forever when a group is still open
+# and an LFRU swap is parked waiting for cv_take (#1340).
+tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
