@@ -1637,6 +1637,9 @@ tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
