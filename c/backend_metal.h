@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "affine_quant.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,7 +24,9 @@ typedef struct ColiMetalTensor ColiMetalTensor;
 int  coli_metal_init(void);
 void coli_metal_shutdown(void);
 int  coli_metal_available(void);
-/* Bytes of unified memory in use by wrapped tensors, and their count. */
+/* Resident handle count and bytes. Existing QT handles retain weight-only byte
+ * accounting; affine handles include their weight, scale, and bias buffers.
+ */
 void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
 int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
 
@@ -68,7 +72,57 @@ int coli_metal_matmul(ColiMetalTensor **tensor,
                       const void *weights, const float *scales,
                       int fmt, int S, int I, int O, int gs);
 
+/* Returns whether a validated MLX affine descriptor and batch fit the Metal
+ * shader's uint32 indexing ABI.  This predicate is portable and does not query
+ * hardware; coli_metal_affine_available() additionally requires initialized
+ * Q4/Q8 pipelines on a device with 32-lane simdgroups.
+ */
+static inline int
+coli_metal_affine_dispatch_supported(const ColiAffineQuantizedView *view,
+                                     int batch) {
+    size_t elements, groups;
+    if (batch <= 0 || coli_affine_validate(view) != COLI_AFFINE_OK)
+        return 0;
+    if (view->output_dim > UINT32_MAX || view->input_dim > UINT32_MAX ||
+        view->group_size > UINT32_MAX)
+        return 0;
+    groups = view->input_dim / view->group_size;
+    if (!coli_affine_size_mul(view->output_dim, groups, &elements) ||
+        elements > UINT32_MAX)
+        return 0;
+    if (!coli_affine_size_mul((size_t)batch, view->input_dim, &elements) ||
+        elements > UINT32_MAX)
+        return 0;
+    if (!coli_affine_size_mul((size_t)batch, view->output_dim, &elements) ||
+        elements > UINT32_MAX)
+        return 0;
+    return 1;
+}
+
+/* Dedicated MLX affine path.  This does not use or extend Colibri's QT fmt
+ * namespace: `view` names unsigned uint32-packed Q4/Q8 plus scale and bias.
+ * The first successful call wraps the three stable buffers in `tensor`, as
+ * coli_metal_matmul does for its existing weight formats.  Returns 0 for CPU
+ * fallback when validation, capability, allocation, or execution fails.
+ */
+typedef enum {
+    COLI_METAL_AFFINE_CAP_NOT_INITIALIZED = 0,
+    COLI_METAL_AFFINE_CAP_PIPELINE_UNAVAILABLE = 1,
+    COLI_METAL_AFFINE_CAP_SIMD_WIDTH_UNSUPPORTED = 2,
+    COLI_METAL_AFFINE_CAP_READY = 3
+} ColiMetalAffineCapability;
+
+/* Reports why the runtime affine path is unavailable so tests and callers can
+ * distinguish an optional hardware-width fallback from a pipeline failure.
+ */
+ColiMetalAffineCapability coli_metal_affine_capability(void);
+int coli_metal_affine_available(void);
+int coli_metal_matmul_affine(ColiMetalTensor **tensor,
+                             float *y, const float *x, int batch,
+                             const ColiAffineQuantizedView *view);
+
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
+/* Weight payload bytes only, preserving the established QT API contract. */
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 
 /*

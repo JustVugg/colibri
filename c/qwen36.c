@@ -62,6 +62,7 @@ static int qwen36_max_ctx(void) {
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
+#include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -294,11 +295,29 @@ static void load_tokenizer(const char *path){
     jval *merges = json_get(model, "merges");
     if (merges && merges->t==J_ARR){
         for (int r=0;r<merges->len;r++){
-            const char *e = merges->kids[r]->str; if(!e) continue;
-            const char *sp = strchr(e, ' '); if(!sp) continue;
-            int la=(int)(sp-e), lb=(int)strlen(sp+1);
+            /* Two on-disk spellings for one merge table: legacy tokenizer.json
+             * writes "a b" strings, tokenizers >= 0.20 (transformers 4.45+,
+             * the Qwen3.6 checkpoints included) writes ["a","b"] pairs.  The
+             * string-only reader SILENTLY indexed zero merges from the pair
+             * form, and encode_text degraded to one token per byte-symbol --
+             * 24 tokens for a 24-char prompt, real-model run -- because
+             * bpe_piece treats an empty merge table as "nothing to merge",
+             * not as an error. */
+            jval *mk = merges->kids[r];
+            const char *a, *b;
+            int la, lb;
+            if (mk && mk->t==J_STR && mk->str){
+                const char *sp = strchr(mk->str, ' '); if(!sp) continue;
+                a = mk->str; la = (int)(sp - mk->str);
+                b = sp + 1;  lb = (int)strlen(b);
+            } else if (mk && mk->t==J_ARR && mk->len==2 &&
+                       mk->kids[0] && mk->kids[0]->t==J_STR && mk->kids[0]->str &&
+                       mk->kids[1] && mk->kids[1]->t==J_STR && mk->kids[1]->str){
+                a = mk->kids[0]->str; la = (int)strlen(a);
+                b = mk->kids[1]->str; lb = (int)strlen(b);
+            } else continue;
             char *key=malloc(la+1+lb+1);
-            memcpy(key,e,la); key[la]=0x1F; memcpy(key+la+1,sp+1,lb); key[la+1+lb]=0;
+            memcpy(key,a,la); key[la]=0x1F; memcpy(key+la+1,b,lb); key[la+1+lb]=0;
             smap_put(&g_merge, key, r);
         }
     }
@@ -578,6 +597,15 @@ typedef struct {
     int n_group, topk_group;
     float theta, eps, partial_rotary_factor;
     int norm_topk, has_qk_norm, has_bias, attn_output_gate;
+    /* RMSNorm weight dialect for the tensors rmsnorm_row touches (input/post
+     * layernorms, q/k norms, final norm).  1 = HF Qwen3.6 zero-centered
+     * storage, apply (1 + w) -- the convention every converted snapshot uses
+     * and the engine has always assumed.  0 = full-gamma storage (MLX-derived
+     * containers: mlx-lm materialises the +1 into the weights at conversion),
+     * unshifted back to zero-centered at LOAD so the forward pass stays one
+     * convention.  The DeltaNet gated norm is full-gamma in BOTH dialects and
+     * is untouched by this flag. */
+    int zero_centered_norms;
     uint8_t *is_attn;   /* [n_layers] 1 if Gated Attention layer, 0 if DeltaNet */
     /* Gated DeltaNet (linear_attention) dims, read from qwen36_meta.json. */
     int dn_vheads, dn_kheads, dn_kdim, dn_vdim, dn_convk, dn_conv_dim;
@@ -1073,7 +1101,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->partial_rotary_factor = 0.25f;
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
-    c->attn_output_gate = 1; c->n_active = 0;
+    c->attn_output_gate = 1; c->n_active = 0; c->zero_centered_norms = 1;
     if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
     c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
@@ -1186,6 +1214,7 @@ static void load_meta(Cfg *c, const char *snap) {
         if((v=json_get(r,"rms_eps"))&&v->t==J_NUM) c->eps=(float)v->num;
         if((v=json_get(r,"attn_output_gate"))&&v->t==J_BOOL) c->attn_output_gate=v->boolean;
         if((v=json_get(r,"norm_topk_prob"))&&v->t==J_BOOL) c->norm_topk=v->boolean;
+        if((v=json_get(r,"zero_centered_norms"))&&v->t==J_BOOL) c->zero_centered_norms=v->boolean;
         if((v=json_get(r,"has_bias"))&&v->t==J_BOOL) c->has_bias=v->boolean;
         if((v=json_get(r,"has_qk_norm"))&&v->t==J_BOOL) c->has_qk_norm=v->boolean;
         /* derive rotary_dim from head_dim * partial_rotary_factor (HF formula) */
@@ -1219,21 +1248,146 @@ static void load_meta(Cfg *c, const char *snap) {
                c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim);
 }
 
+/* Multimodal Qwen3.5/3.6 checkpoints (a Swiftlet qpack container's
+ * model.safetensors included) store the text stack under a `language_model.`
+ * prefix; the engine and the converter both speak unprefixed names.  Resolve
+ * the plain name first so converted snapshots are untouched, then the
+ * prefixed one; when neither exists return the CANONICAL name so the caller's
+ * refusal names the tensor the engine actually wanted. */
+#define QW_DENSE_NAME_MAX 288   /* 256-byte call-site buffers + the prefix */
+static const char *dense_resolve(Model *m, const char *name,
+                                 char *buf, size_t cap) {
+    if (st_has(&m->S, name)) return name;
+    snprintf(buf, cap, "language_model.%s", name);
+    if (st_has(&m->S, buf)) return buf;
+    return name;
+}
+static int dense_has(Model *m, const char *name) {
+    char rn[QW_DENSE_NAME_MAX];
+    return st_has(&m->S, dense_resolve(m, name, rn, sizeof rn));
+}
+
+/* Dense tensor stored as an MLX affine triple (packed U32 `.weight` + sibling
+ * `.scales`/`.biases`, the layout Swiftlet writes into a qpack container's
+ * model.safetensors): expand to f32 rows through the checked affine contract.
+ * Every dimension is anchored to `want`, the CONFIG-implied element count the
+ * forward pass will index with -- the same discipline as load_t_n below, so a
+ * container whose packed geometry disagrees with config.json is a refusal,
+ * never a plausible heap OOB.  bits (Q4/Q8) and the group size are DERIVED
+ * from the shapes (logical input over packed words, logical input over scale
+ * groups) rather than parsed from config quantization overrides: the file's
+ * own byte layout is what the expansion must agree with, and the affine
+ * validator re-checks the derived geometry against every buffer length. */
+static float *load_t_affine(Model *m, const char *wname, int64_t want) {
+    st_tensor *w = st_find(&m->S, wname);
+    if (!w) { fprintf(stderr, "missing %s\n", wname); exit(1); }
+    size_t wlen = strlen(wname);
+    char sname[QW_DENSE_NAME_MAX], bname[QW_DENSE_NAME_MAX];
+    if (wlen < 7 || strcmp(wname + wlen - 7, ".weight") != 0 ||
+        wlen - 7 + sizeof(".scales") > sizeof(sname)) {
+        fprintf(stderr, "%s: U32 tensor is not a `.weight` with room for "
+                "`.scales`/`.biases` siblings -- refusing\n", wname); exit(1);
+    }
+    snprintf(sname, sizeof(sname), "%.*s.scales", (int)(wlen - 7), wname);
+    snprintf(bname, sizeof(bname), "%.*s.biases", (int)(wlen - 7), wname);
+    st_tensor *s = st_find(&m->S, sname), *b = st_find(&m->S, bname);
+    if (!s || !b) {
+        fprintf(stderr, "%s: affine `.scales`/`.biases` siblings are missing "
+                "-- refusing\n", wname); exit(1);
+    }
+    ColiAffineScalarFormat sf;
+    switch (s->dtype) {
+        case 0: sf = COLI_AFFINE_SCALAR_BF16; break;
+        case 1: sf = COLI_AFFINE_SCALAR_F16; break;
+        case 2: sf = COLI_AFFINE_SCALAR_F32; break;
+        default:
+            fprintf(stderr, "%s: scales dtype %s is not BF16/F16/F32 -- "
+                    "refusing\n", sname, st_dtype_name(s->dtype)); exit(1);
+    }
+    if (b->dtype != s->dtype || b->numel != s->numel) {
+        fprintf(stderr, "%s: biases dtype/numel disagree with scales -- "
+                "refusing\n", bname); exit(1);
+    }
+    int64_t packed = w->rank >= 2 ? w->shape[w->rank - 1] : 0;
+    int64_t rows = packed > 0 ? w->numel / packed : 0;
+    if (want <= 0 || rows <= 0 || w->numel != rows * packed ||
+        want % rows != 0) {
+        fprintf(stderr, "%s: packed shape does not divide the config-implied "
+                "%lld elements -- refusing\n", wname, (long long)want); exit(1);
+    }
+    int64_t in = want / rows;
+    int64_t per_word = packed > 0 && in % packed == 0 ? in / packed : 0;
+    if (per_word != 8 && per_word != 4) {
+        fprintf(stderr, "%s: %lld packed words for %lld logical columns is "
+                "neither Q4 nor Q8 -- refusing\n",
+                wname, (long long)packed, (long long)in); exit(1);
+    }
+    int64_t groups = s->numel % rows == 0 ? s->numel / rows : 0;
+    int64_t gs = groups > 0 && in % groups == 0 ? in / groups : 0;
+    if (gs <= 0) {
+        fprintf(stderr, "%s: %lld scale groups do not tile %lld logical "
+                "columns -- refusing\n",
+                sname, (long long)groups, (long long)in); exit(1);
+    }
+    void *wraw = malloc((size_t)w->nbytes);
+    void *sraw = malloc((size_t)s->nbytes);
+    void *braw = malloc((size_t)b->nbytes);
+    if (!wraw || !sraw || !braw) { fprintf(stderr, "OOM reading %s\n", wname); exit(1); }
+    st_read_raw(&m->S, wname, wraw, 1);
+    st_read_raw(&m->S, sname, sraw, 1);
+    st_read_raw(&m->S, bname, braw, 1);
+    ColiAffineQuantizedView view = {
+        wraw, sraw, braw,
+        (size_t)w->nbytes, (size_t)s->nbytes, (size_t)b->nbytes,
+        (size_t)rows, (size_t)in, (size_t)gs,
+        per_word == 8 ? COLI_AFFINE_MLX_Q4 : COLI_AFFINE_MLX_Q8, sf
+    };
+    float *p = falloc(want);
+    ColiAffineStatus status = coli_affine_dequant_ref(&view, p);
+    if (status != COLI_AFFINE_OK) {
+        fprintf(stderr, "%s: affine expansion refused (%s)\n",
+                wname, coli_affine_status_string(status)); exit(1);
+    }
+    free(wraw); free(sraw); free(braw);
+    return p;
+}
+
 /* `want` is the element count the forward pass will index with. The container
  * is a file, not an invariant: this used to allocate whatever st_numel reported
  * while every read afterwards used CONFIG dims, so a short tensor was a plain
  * heap OOB read (embed is indexed as m->embed + ids[s]*D). The expert path
  * already refuses a wrong size; this is the same discipline for the dense set. */
 static float *load_t_n(Model *m, const char *name, int64_t want) {
-    int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    char rn[QW_DENSE_NAME_MAX];
+    const char *nm = dense_resolve(m, name, rn, sizeof rn);
+    st_tensor *t = st_find(&m->S, nm);
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (t->dtype == 7) return load_t_affine(m, nm, want);
+    int64_t n = t->numel;
     if (want > 0 && n != want) {
         fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
-                name, (long long)n, (long long)want); exit(1);
+                nm, (long long)n, (long long)want); exit(1);
     }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);
+    st_read_f32(&m->S, nm, p, 0);
     return p;
+}
+
+/* Loader for the RMSNorm weights rmsnorm_row applies as (1 + w).  HF Qwen3.6
+ * stores them zero-centered and the forward pass is written for that; an
+ * MLX-derived container stores FULL gamma (mlx-lm materialises the +1 at
+ * conversion -- measured on the production qpack container: input_layernorm
+ * mean 1.03, q_norm mean 1.33, where the zero-centered forms centre on 0).
+ * Feeding full gamma through (1 + w) doubles every normalised activation and
+ * the model degenerates to noise, so the shift is undone HERE, at load, and
+ * the forward pass keeps exactly one convention.  The DeltaNet gated norm is
+ * full gamma in both dialects (its forward multiplies plain w) and must NOT
+ * come through this loader. */
+static float *load_norm_n(Model *m, const char *name, int64_t want) {
+    float *w = load_t_n(m, name, want);
+    if (!m->c.zero_centered_norms)
+        for (int64_t i = 0; i < want; i++) w[i] -= 1.0f;
+    return w;
 }
 
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
@@ -1264,7 +1418,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     if (load_boundaries) {
         m->embed      = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
         m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
-        m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
+        m->final_norm = load_norm_n(m, "model.norm.weight", c->hidden);
     }
     m->L = calloc((size_t)c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
@@ -1276,22 +1430,24 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
-        /* input/post layernorms + MoE exist for every layer */
-        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t_n(m,nm,(want))
+        /* input/post layernorms + MoE exist for every layer; the layernorms go
+         * through load_norm_n (rmsnorm_row weights), the router does not. */
+        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_norm_n(m,nm,(want))
         LD(in_ln,  "input_layernorm.weight", c->hidden);
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
-        LD(gate, "mlp.gate.weight", (int64_t)c->n_experts * c->hidden);
         #undef LD
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",ai);
+        l->gate = load_t_n(m, nm, (int64_t)c->n_experts * c->hidden);
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight", ai);
-            l->qn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->qn = dense_has(m, nm) ? load_norm_n(m, nm, c->head_dim) : NULL;
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_norm.weight", ai);
-            l->kn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->kn = dense_has(m, nm) ? load_norm_n(m, nm, c->head_dim) : NULL;
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+        if (dense_has(m, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
         else l->gate_bias = NULL;
         /* shared expert (dense f32) */
         #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert." suffix,ai); l->field = load_t_n(m,nm,(want))
@@ -1301,7 +1457,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         #undef LD2
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer */
             #define LD3(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.self_attn." suffix,ai); l->field = load_t_n(m,nm,(want))
@@ -3369,7 +3525,7 @@ static int qwen36_edge_engine_open(
     engine->model.lm_head = load_t_n(
         &engine->model, "lm_head.weight",
         (int64_t)config->vocab * config->hidden);
-    engine->model.final_norm = load_t_n(
+    engine->model.final_norm = load_norm_n(
         &engine->model, "model.norm.weight", config->hidden);
     engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;
     char tokenizer_path[4096];
