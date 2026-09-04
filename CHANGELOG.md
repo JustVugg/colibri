@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Qwen3.6 Vulkan expert tier, and Vulkan on cards without Resizable BAR
+
+- `make qwen36 VK=1` builds the qwen36 VRAM expert tier against the shared
+  Vulkan backend (AMD via RADV including Polaris, Intel, NVIDIA): single
+  device, fill-once at warmstart, `VK_EXPERT_GB` budget. The engine now says
+  so when `COLI_VULKAN` is set on a build without the tier (refs #894).
+- The Vulkan backend uploads resident weights through a host staging buffer
+  into plain device-local memory when the host-visible slice is small, so
+  discrete cards without Resizable BAR keep real VRAM residency instead of
+  silently spilling to system RAM (`COLI_VK_STAGED` forces either mode).
+  Queue submits and arena allocation are now mutex-protected.
+- First validation of the Vulkan backend on Polaris/gfx803 (RX 580).
+
 ### A seventh engine: Qwen3.8-Flash-Next
 
 - Added complete text-only inference for the official Qwen3.8-Flash-Next FP8

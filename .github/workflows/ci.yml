@@ -118,6 +118,8 @@ jobs:
           ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
                 shaders/attention_absorb.spv shaders/rmsnorm.spv
           ldd colibri | grep -q libvulkan || { echo "FAIL: built without linking libvulkan"; exit 1; }
+          make qwen36 VK=1
+          ldd qwen36 | grep -q libvulkan || { echo "FAIL: qwen36 built without linking libvulkan"; exit 1; }
       - name: Initialise the backend against Lavapipe
         run: |
           cd c
@@ -138,6 +140,27 @@ jobs:
           grep -q "expert tier active" vk.log || {
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
+      - name: Qwen3.6 Vulkan tier gate on Lavapipe
+        # set -o pipefail: without it, the exit code of the `tee` at the end of the
+        # pipe below masks a crash or a failing check in test_qwen36_tier_vk. A
+        # runtime "skip: no usable Vulkan device" from the test is treated as a
+        # failure here (not a legitimate skip) because this job installs Lavapipe
+        # unconditionally, so a device is always expected to be usable.
+        run: |
+          set -o pipefail
+          cd c
+          make tests/test_qwen36_tier_vk VK=1
+          # Lavapipe is all host-visible memory, so the mapped path runs here; the staged
+          # path needs a discrete card and is covered by the hardware validation in the PR.
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json COLI_NO_OMP_TUNE=1 \
+            ./tests/test_qwen36_tier_vk 2>&1 | tee tier.log
+          grep -q "residency_frozen_after_warmstart: ok" tier.log || {
+            echo "FAIL: the Vulkan tier gate did not run to completion"; exit 1; }
+          make tests/test_qwen36_tier_vk_int8 VK=1
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json COLI_NO_OMP_TUNE=1 \
+            ./tests/test_qwen36_tier_vk_int8 2>&1 | tee tier_int8.log
+          grep -q "residency_frozen_after_warmstart: ok" tier_int8.log || {
+            echo "FAIL: the Vulkan tier gate (int8) did not run to completion"; exit 1; }
 
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
