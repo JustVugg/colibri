@@ -57,6 +57,7 @@ static int qwen36_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
@@ -2545,6 +2546,33 @@ static int serve_eos_ids(int *ids, int cap){
     return n;
 }
 
+/* Un CANCEL per la richiesta in corso, visto SENZA bloccare (#1332).
+ *
+ * Prima serve_read_req era l'unico posto che leggeva un CANCEL, e viene
+ * chiamata solo fra una richiesta e l'altra: quando il comando arrivava, il
+ * turno che doveva fermare era gia' finito. Il gateway intanto manda CANCEL e
+ * aspetta l'ack tenendo l'ammissione dello scheduler, quindi un client che si
+ * disconnette non liberava niente.
+ *
+ * Ritorna 1 se e' arrivato un CANCEL/STOP per `id`. Le righe che non
+ * riconosciamo si scartano, com'e' sempre stato: la regola di compatibilita'
+ * del protocollo vale in tutte e due le direzioni. Un SUBMIT non puo'
+ * legalmente arrivare mentre l'unico slot e' occupato; se arriva viene
+ * ignorato qui e sara' la lettura normale a rifiutarlo.
+ *
+ * Non legge MAI se stdin non e' pronto: una getline bloccante qui fermerebbe la
+ * generazione in attesa di un comando che potrebbe non arrivare mai. */
+static int serve_cancel_pending(const char *id){
+    int cancelled = 0;
+    while(coli_serve_stdin_ready()){
+        char line[512], cmd[16], who[64];
+        if(!fgets(line,sizeof(line),stdin)) break;
+        if(sscanf(line,"%15s %63s",cmd,who)<2) continue;
+        if((!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) && !strcmp(who,id)) cancelled = 1;
+    }
+    return cancelled;
+}
+
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
@@ -2579,6 +2607,16 @@ static void serve_one(Model *m, ServeReq *q){
         unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
         if(cn>0) serve_data(q->id,(char*)chunk,cn);
         gen++;
+        /* #1332: una guardata a stdin per token. Il costo e' una select con
+         * timeout zero; il guadagno e' che il gateway smette di aspettare un
+         * turno che nessuno vuole piu'. */
+        if(serve_cancel_pending(q->id)){
+            free(lo); lo=NULL;
+            if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);
+            printf("ERROR %s CANCELLED\n",q->id); fflush(stdout);
+            free(ids);
+            return;
+        }
         /* The next logits are not needed after the final requested token.
          * serve_one() resets the recurrent/KV state for every request, so
          * stepping here would only run a full discarded decode pass. */

@@ -1644,6 +1644,9 @@ tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
 tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c qwen36_tier.h backend_cuda.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
