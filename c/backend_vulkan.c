@@ -14,6 +14,10 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 /* Thread safety (qwen36 tier): an upload thread may call coli_vk_tensor_ensure while the
  * decode thread submits expert groups. vkQueueSubmit on one VkQueue from two threads is a
@@ -530,6 +534,27 @@ int coli_vk_init(const char *spv_path) {
 
 int coli_vk_available(void) { return G.ready; }
 int coli_vk_staged(void) { return G.ready && G.staged; }
+
+const char *coli_vk_default_spv(char *buf, size_t n) {
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if (env && *env) {
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) { snprintf(buf, n, "%s/qmatmul.spv", env); return buf; }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    if (k > 0) {
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
+            strcpy(sl + 1, "shaders/qmatmul.spv");
+            if (!stat(buf, &st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
 
 void coli_vk_mem_info(size_t *used, size_t *count) {
     if (used) *used = G.used_bytes;
@@ -2237,7 +2262,9 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
 }
 
 int main(int argc, char **argv) {
-    const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
+    char spvbuf[1024];
+    const char *spv = argc > 1 ? argv[1] : coli_vk_default_spv(spvbuf, sizeof spvbuf);
+    printf("shader: %s\n", spv);
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
     printf("weights: %s\n", coli_vk_staged() ? "staged device-local" : "mapped host-visible");
     srand(1234);
