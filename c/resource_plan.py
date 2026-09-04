@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from family_registry import (expert_contributions, planner_geometry,
@@ -18,6 +19,53 @@ from family_registry import (expert_contributions, planner_geometry,
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\.")
+
+# Cgroup and procfs inputs are tiny kernel-maintained text files. Bound every
+# read anyway: the planner may run in a container with a synthetic or partially
+# mounted cgroup tree, and admission must never turn an unexpected file into an
+# unbounded read or an unbounded hierarchy walk.
+_CGROUP_VALUE_MAX_BYTES = 128
+_CGROUP_STAT_MAX_BYTES = 64 * 1024
+_CGROUP_MEMBERSHIP_MAX_BYTES = 64 * 1024
+_CGROUP_MOUNTINFO_MAX_BYTES = 4 * 1024 * 1024
+_CGROUP_MAX_ANCESTORS = 64
+_MEMINFO_MAX_BYTES = 256 * 1024
+_CGROUP_UINT64_MAX = (1 << 64) - 1
+_CGROUP_UINT64_DIGITS = len(str(_CGROUP_UINT64_MAX))
+# cgroup v1 represents "unlimited" with a page-aligned value just below the
+# signed 64-bit maximum (commonly 9223372036854771712). No consumer host can
+# provide an exbibyte of usable RAM, so this conservative threshold also covers
+# the other kernel sentinel variants without confusing a real finite limit.
+_CGROUP_V1_UNLIMITED_MIN = 1 << 60
+
+
+class CgroupError(ValueError):
+    """A present cgroup or procfs input cannot be trusted for memory admission."""
+
+
+class CgroupFormatError(CgroupError):
+    """A present procfs or cgroup file does not have the kernel's grammar."""
+
+
+class CgroupAccessError(CgroupError):
+    """A present cgroup input cannot be read completely or mapped soundly."""
+
+
+@dataclass(frozen=True)
+class _CgroupMemberships:
+    v2: tuple | None
+    v1_memory: tuple | None
+
+
+@dataclass(frozen=True)
+class _CgroupMount:
+    mount_id: int
+    parent_id: int
+    root: tuple
+    mount_point: Path
+    fs_type: str
+    options: frozenset
+
 
 # analyze_model() scans every shard header + regex-matches ~116k tensor names on the
 # 372 GB model; it reruns on every `coli plan/doctor/tune/run --auto-tier`. Its output
@@ -239,13 +287,465 @@ def analyze_model(model):
     return result
 
 
-def memory_available():
-    # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
+def _read_bounded_bytes(path, max_bytes, description):
+    """Return ``(present, raw)`` for one small kernel pseudo-file.
+
+    ``present`` keeps an absent file (that controller or proc path is simply
+    not mounted here) distinct from one that exists but cannot be trusted. Any
+    other read failure, and any file larger than the kernel would ever write,
+    is a typed refusal: it is never evidence that the process is unconstrained.
+    """
+    path = Path(path)
     try:
-        text = Path("/proc/meminfo").read_text()
-        return int(re.search(r"MemAvailable:\s+(\d+)", text).group(1)) * 1024
-    except (OSError, AttributeError):
-        pass
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+    except (FileNotFoundError, NotADirectoryError):
+        return (False, None)
+    except OSError as error:
+        raise CgroupAccessError(f"cannot read {description} {path}: {error}") from error
+    if len(raw) > max_bytes:
+        raise CgroupFormatError(f"oversized {description}: {path}")
+    return (True, raw)
+
+
+def _read_bounded_ascii(path, max_bytes, description):
+    present, raw = _read_bounded_bytes(path, max_bytes, description)
+    if not present:
+        return (False, None)
+    try:
+        return (True, raw.decode("ascii"))
+    except UnicodeDecodeError as error:
+        raise CgroupFormatError(f"non-ASCII {description}: {path}") from error
+
+
+def _proc_lines(text, description):
+    """Split one procfs record file; an empty file or a blank record is malformed."""
+    if not text:
+        raise CgroupFormatError(f"empty {description}")
+    newline = b"\n" if isinstance(text, bytes) else "\n"
+    lines = (text[:-1] if text.endswith(newline) else text).split(newline)
+    if any(not line for line in lines):
+        raise CgroupFormatError(f"blank record in {description}")
+    return lines
+
+
+def _parse_bounded_id(field, description, *, allow_zero=True):
+    """Parse one canonical decimal u64 procfs field after a lexical length bound."""
+    if (not field or len(field) > _CGROUP_UINT64_DIGITS or not field.isdigit()
+            or (len(field) > 1 and field.startswith(b"0"))):
+        raise CgroupFormatError(f"malformed {description}: {field!r}")
+    value = int(field)
+    if value > _CGROUP_UINT64_MAX or (value == 0 and not allow_zero):
+        raise CgroupFormatError(f"out-of-range {description}: {field!r}")
+    return value
+
+
+def _path_components(raw, description):
+    """Split one absolute kernel path into components; "", "." and ".." are malformed."""
+    if raw == b"/":
+        return ()
+    if not raw.startswith(b"/"):
+        raise CgroupFormatError(f"{description} is not absolute: {raw!r}")
+    components = raw[1:].split(b"/")
+    if any(component in (b"", b".", b"..") for component in components):
+        raise CgroupFormatError(f"unnormalized {description}: {raw!r}")
+    if len(components) >= _CGROUP_MAX_ANCESTORS:
+        raise CgroupFormatError(
+            f"{description} nesting exceeds {_CGROUP_MAX_ANCESTORS - 1} levels")
+    return tuple(os.fsdecode(component) for component in components)
+
+
+# mountinfo(5) escapes exactly these four bytes as three-digit octal.
+_PROC_PATH_ESCAPES = {b"011": b"\t", b"012": b"\n", b"040": b" ", b"134": b"\\"}
+
+
+def _decode_proc_path(field, description):
+    """Decode one escaped mountinfo path field into normalized components."""
+    decoded = bytearray()
+    index = 0
+    while index < len(field):
+        byte = field[index]
+        if byte == ord("\\"):
+            escape = field[index + 1:index + 4]
+            if escape not in _PROC_PATH_ESCAPES:
+                raise CgroupFormatError(f"malformed escape in {description}: {field!r}")
+            decoded += _PROC_PATH_ESCAPES[escape]
+            index += 4
+            continue
+        if byte in (0, ord(" "), ord("\t"), ord("\n")):
+            raise CgroupFormatError(f"unescaped byte in {description}: {field!r}")
+        decoded.append(byte)
+        index += 1
+    return _path_components(bytes(decoded), description)
+
+
+def _decode_cgroup_membership_path(field, description):
+    """Decode a raw /proc/self/cgroup path (the kernel does not escape it)."""
+    if b"\0" in field:
+        raise CgroupFormatError(f"NUL byte in {description}: {field!r}")
+    return _path_components(field, description)
+
+
+def _parse_cgroup_counter(text):
+    """Parse one non-negative cgroup byte counter under an explicit u64 cap."""
+    match = re.fullmatch(r"(\d+)\n?", text or "")
+    if match is None or len(match.group(1)) > _CGROUP_UINT64_DIGITS:
+        return None
+    value = int(match.group(1))
+    return value if value <= _CGROUP_UINT64_MAX else None
+
+
+def _cgroup_inactive_file(directory, v1=False):
+    """Return the inactive file cache charged to one cgroup, in bytes.
+
+    ``memory.current`` (v1: ``usage_in_bytes``) charges clean page cache -- for
+    this engine, the mmap'd shards a previous run left behind -- while the host
+    half of the minimum, MemAvailable, counts such cache as available. Subtract
+    ``inactive_file`` (v1: ``total_inactive_file``, the hierarchical figure that
+    pairs with the hierarchical usage counter) the way Docker and cAdvisor
+    derive a working set. Absent statistics, or a kernel without the key,
+    subtract nothing; a present but malformed file is a refusal.
+    """
+    stat_path = Path(directory) / "memory.stat"
+    present, text = _read_bounded_ascii(stat_path, _CGROUP_STAT_MAX_BYTES,
+                                        "cgroup memory statistics")
+    if not present:
+        return 0
+    key = "total_inactive_file" if v1 else "inactive_file"
+    values = []
+    for line in _proc_lines(text, "cgroup memory statistics"):
+        match = re.fullmatch(r"([A-Za-z0-9_]+) (\d+)", line)
+        if match is None:
+            raise CgroupFormatError(f"malformed cgroup memory statistics: {stat_path}")
+        if match.group(1) == key:
+            values.append(match.group(2))
+    if len(values) > 1:
+        raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
+    value = _parse_cgroup_counter(values[0]) if values else 0
+    if value is None:
+        raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
+    return value
+
+
+def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
+    """Return ``(controls_present, finite_remaining_or_none)`` for one cgroup.
+
+    Present controls with ``None`` remaining are the kernel's unlimited value
+    (v2 ``max``; v1's sentinel just below 2**63). Both files must be present
+    and well-formed together: an incomplete pair or a malformed counter is a
+    refusal, never something a looser ancestor may mask. Headroom is measured
+    against the working set, charged usage less reclaimable inactive file
+    cache, so a previous run's cached model pages do not read as spent budget.
+    """
+    directory = Path(directory)
+    limit_path = directory / limit_name
+    current_path = directory / current_name
+    limit_present, limit_text = _read_bounded_ascii(
+        limit_path, _CGROUP_VALUE_MAX_BYTES, "cgroup memory limit")
+    current_present, current_text = _read_bounded_ascii(
+        current_path, _CGROUP_VALUE_MAX_BYTES, "cgroup memory usage")
+    if not limit_present and not current_present:
+        return (False, None)
+    if not limit_present or not current_present:
+        missing = current_path if limit_present else limit_path
+        raise CgroupAccessError(f"incomplete cgroup memory control pair: {missing}")
+    current = _parse_cgroup_counter(current_text)
+    if current is None:
+        raise CgroupFormatError(f"malformed cgroup memory usage: {current_path}")
+    if not v1 and limit_text in ("max", "max\n"):
+        return (True, None)
+    limit = _parse_cgroup_counter(limit_text)
+    if limit is None:
+        raise CgroupFormatError(f"malformed cgroup memory limit: {limit_path}")
+    if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
+        return (True, None)
+    working_set = max(0, current - _cgroup_inactive_file(directory, v1=v1))
+    return (True, max(0, limit - working_set))
+
+
+def _read_cgroup_memberships(proc_cgroup_path):
+    """Strictly parse v2 and v1-memory membership from ``/proc/self/cgroup``.
+
+    ``None`` means the file is absent. Hybrid layouts are ordinary -- a
+    ``0::/...`` v2 record beside v1 records for controllers this planner never
+    consumes, such as ``1:net_cls:/`` from a VPN client -- and must not fail.
+    """
+    present, raw = _read_bounded_bytes(
+        proc_cgroup_path, _CGROUP_MEMBERSHIP_MAX_BYTES, "cgroup membership file")
+    if not present:
+        return None
+    v2_path = None
+    v1_path = None
+    hierarchy_ids = set()
+    for line in _proc_lines(raw, "cgroup membership file"):
+        fields = line.split(b":", 2)
+        if len(fields) != 3:
+            raise CgroupFormatError(f"malformed cgroup membership record: {line!r}")
+        hierarchy, controllers, member_path = fields
+        hierarchy_id = _parse_bounded_id(hierarchy, "cgroup hierarchy id")
+        if hierarchy_id in hierarchy_ids:
+            raise CgroupFormatError(f"duplicate cgroup hierarchy id: {hierarchy!r}")
+        hierarchy_ids.add(hierarchy_id)
+        controller_list = controllers.split(b",") if controllers else []
+        if (any(re.fullmatch(rb"[A-Za-z0-9_.=-]+", item) is None for item in controller_list)
+                or len(set(controller_list)) != len(controller_list)):
+            raise CgroupFormatError(f"malformed cgroup controller list: {controllers!r}")
+        member = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+        if hierarchy_id == 0:
+            if controller_list or v2_path is not None:
+                raise CgroupFormatError("ambiguous cgroup v2 membership")
+            v2_path = member
+        elif not controller_list:
+            raise CgroupFormatError(f"v1 cgroup membership lacks controllers: {line!r}")
+        elif b"memory" in controller_list:
+            if v1_path is not None:
+                raise CgroupFormatError("ambiguous cgroup v1 memory membership")
+            v1_path = member
+    return _CgroupMemberships(v2=v2_path, v1_memory=v1_path)
+
+
+def _parse_mount_options(field, description):
+    try:
+        options = field.decode("ascii").split(",")
+    except UnicodeDecodeError as error:
+        raise CgroupFormatError(f"non-ASCII {description}: {field!r}") from error
+    if any(not option for option in options):
+        raise CgroupFormatError(f"malformed {description}: {field!r}")
+    return frozenset(options)
+
+
+def _read_cgroup_mounts(proc_mountinfo_path):
+    """Return every cgroup/cgroup2 mount from a strict, bounded mountinfo read.
+
+    ``None`` means the file is absent. Every record is held to mountinfo(5)'s
+    grammar so a truncated or synthetic file is a refusal rather than a quiet
+    "no cgroup mounts here"; paths are decoded only for cgroup records, so an
+    unrelated mount with an unusual name cannot block discovery.
+    """
+    present, raw = _read_bounded_bytes(
+        proc_mountinfo_path, _CGROUP_MOUNTINFO_MAX_BYTES, "cgroup mountinfo file")
+    if not present:
+        return None
+    mounts = []
+    mount_ids = set()
+    for line in _proc_lines(raw, "cgroup mountinfo file"):
+        fields = line.split(b" ")
+        if any(not field for field in fields):
+            raise CgroupFormatError(f"malformed mountinfo spacing: {line!r}")
+        try:
+            separator = fields.index(b"-", 6)
+        except ValueError as error:
+            raise CgroupFormatError(f"mountinfo record lacks separator: {line!r}") from error
+        if len(fields) != separator + 4:
+            raise CgroupFormatError(f"malformed mountinfo record: {line!r}")
+        mount_id = _parse_bounded_id(fields[0], "mountinfo mount id", allow_zero=False)
+        parent_id = _parse_bounded_id(fields[1], "mountinfo parent id")
+        device = fields[2].split(b":")
+        if len(device) != 2:
+            raise CgroupFormatError(f"malformed mountinfo device: {line!r}")
+        for number in device:
+            _parse_bounded_id(number, "mountinfo device number")
+        if mount_id in mount_ids:
+            raise CgroupFormatError(f"duplicate mountinfo id: {fields[0]!r}")
+        mount_ids.add(mount_id)
+        fs_type = fields[separator + 1]
+        if fs_type not in (b"cgroup", b"cgroup2"):
+            continue
+        if fields[3].split(b"/")[1:2] == [b".."]:
+            # cgroup_namespaces(7): a cgroupfs mount inherited from outside the
+            # process's cgroup namespace reports its root relative to that
+            # namespace as leading ".." components. Membership is reported
+            # relative to the namespace root, so no sound mapping exists.
+            raise CgroupAccessError(
+                f"unsupported cgroup mount root {fields[3]!r}: remount cgroupfs "
+                "inside the cgroup namespace")
+        root = _decode_proc_path(fields[3], "cgroup mount root")
+        mount_point = Path("/").joinpath(
+            *_decode_proc_path(fields[4], "cgroup mount point"))
+        options = (_parse_mount_options(fields[5], "cgroup mount options")
+                   | _parse_mount_options(fields[separator + 3], "cgroup super options"))
+        mounts.append(_CgroupMount(mount_id=mount_id, parent_id=parent_id, root=root,
+                                   mount_point=mount_point,
+                                   fs_type=fs_type.decode("ascii"), options=options))
+    return mounts
+
+
+def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
+    """Return the mounts exposing ``member``, shallowest root first.
+
+    A mount's root is the cgroup its mount point shows; ``member`` maps into
+    it by stripping that root and appending the rest to the mount point. Of
+    several applicable mounts, the one with the shallowest root shows the
+    most ancestors: a deeper bind mount can hide an ancestor's limit, so it
+    must never be preferred. Every view is returned and the caller takes the
+    minimum, which also makes two mounts of one root harmless.
+    """
+    if v1:
+        applicable = [mount for mount in mounts
+                      if mount.fs_type == "cgroup" and "memory" in mount.options]
+    else:
+        applicable = [mount for mount in mounts if mount.fs_type == "cgroup2"]
+    views = [mount for mount in applicable if member[:len(mount.root)] == mount.root]
+    return sorted(views, key=lambda mount: len(mount.root))
+
+
+def _cgroup_hierarchy_remaining(views, member, limit_name, current_name, v1=False):
+    """Return ``(controls_seen, tightest finite headroom)`` across every view.
+
+    Each view is walked from the membership leaf up to and including its mount
+    point, so an ancestor's finite limit bounds the result whenever any view
+    exposes it. Missing directories simply contribute nothing.
+    """
+    seen = False
+    remaining = None
+    for mount in views:
+        suffix = member[len(mount.root):]
+        for depth in range(len(suffix), -1, -1):
+            directory = mount.mount_point.joinpath(*suffix[:depth])
+            present, candidate = _cgroup_pair_remaining(
+                directory, limit_name, current_name, v1=v1)
+            seen = seen or present
+            if candidate is not None:
+                remaining = candidate if remaining is None else min(remaining, candidate)
+    return (seen, remaining)
+
+
+_CGROUP_V2_CONTROLS = ("memory.max", "memory.current")
+_CGROUP_V1_CONTROLS = ("memory.limit_in_bytes", "memory.usage_in_bytes")
+
+
+def _fixed_root_view(root, v1=False):
+    """A synthetic whole-hierarchy mount at ``root`` for kernels without mountinfo."""
+    return _CgroupMount(mount_id=0, parent_id=0, root=(), mount_point=Path(root),
+                        fs_type="cgroup" if v1 else "cgroup2",
+                        options=frozenset({"memory"}) if v1 else frozenset())
+
+
+def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
+                             proc_cgroup_path=Path("/proc/self/cgroup"),
+                             proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """Return this process's tightest finite cgroup memory headroom, or ``None``.
+
+    Cgroup v2 is authoritative when its memory controls are visible; v1 is
+    consulted through mounts whose options include the memory controller.
+    ``None`` means no finite limit applies (or no cgroupfs is mounted here at
+    all). Present but malformed, incomplete or unreadable inputs raise
+    ``CgroupError`` instead of reading as unconstrained. ``cgroup_root`` is
+    consulted only by the fixed-layout probe used when mountinfo is absent.
+    """
+    memberships = _read_cgroup_memberships(proc_cgroup_path)
+    mounts = _read_cgroup_mounts(proc_mountinfo_path)
+    v2_member = memberships.v2 if memberships else None
+    v1_member = memberships.v1_memory if memberships else None
+    if mounts is None:
+        # No mountinfo: probe the conventional roots. The leaf-to-mount-point
+        # walk also covers runtimes that mount the process's own subgroup at
+        # the root while procfs still reports its host-side path.
+        probes = ((cgroup_root, v2_member, _CGROUP_V2_CONTROLS, False),
+                  (Path(cgroup_root) / "memory", v1_member, _CGROUP_V1_CONTROLS, True),
+                  (cgroup_root, v1_member, _CGROUP_V1_CONTROLS, True))
+        for root, member, controls, v1 in probes:
+            seen, remaining = _cgroup_hierarchy_remaining(
+                [_fixed_root_view(root, v1=v1)], member or (), *controls, v1=v1)
+            if seen:
+                return remaining
+        return None
+
+    has_v2_mount = any(mount.fs_type == "cgroup2" for mount in mounts)
+    has_v1_memory_mount = any(mount.fs_type == "cgroup" and "memory" in mount.options
+                              for mount in mounts)
+    if memberships is None:
+        if has_v2_mount or has_v1_memory_mount:
+            raise CgroupAccessError(
+                "cgroup membership is unavailable for a mounted memory hierarchy")
+        return None
+    if has_v2_mount and v2_member is None:
+        raise CgroupAccessError("cgroup v2 mount has no corresponding membership record")
+    if has_v1_memory_mount and v1_member is None:
+        raise CgroupAccessError(
+            "cgroup v1 memory mount has no corresponding membership record")
+
+    if has_v2_mount:
+        views = _resolve_cgroup_hierarchy(mounts, v2_member)
+        if not views:
+            raise CgroupAccessError(
+                f"no visible cgroup2 mount exposes cgroup /{'/'.join(v2_member)}")
+        seen, remaining = _cgroup_hierarchy_remaining(views, v2_member, *_CGROUP_V2_CONTROLS)
+        if seen:
+            return remaining
+    if has_v1_memory_mount:
+        views = _resolve_cgroup_hierarchy(mounts, v1_member, v1=True)
+        if not views:
+            raise CgroupAccessError(
+                f"no visible cgroup v1 memory mount exposes cgroup /{'/'.join(v1_member)}")
+        seen, remaining = _cgroup_hierarchy_remaining(
+            views, v1_member, *_CGROUP_V1_CONTROLS, v1=True)
+        if not seen:
+            raise CgroupAccessError("cgroup v1 memory mount exposes no memory control files")
+        return remaining
+    return None
+
+
+def _host_memory_available(meminfo_path):
+    """Return strict host MemAvailable bytes, or ``None`` when it is unknown.
+
+    Unknown covers an absent ``/proc/meminfo`` and a kernel that predates
+    MemAvailable (3.14), exactly the cases the planner always fell back on. A
+    present line that is duplicated, not ``<digits> kB``, or beyond a u64 byte
+    counter is a refusal.
+    """
+    meminfo_path = Path(meminfo_path)
+    present, text = _read_bounded_ascii(meminfo_path, _MEMINFO_MAX_BYTES,
+                                        "memory information file")
+    if not present:
+        return None
+    lines = [line for line in text.split("\n") if line.startswith("MemAvailable")]
+    if not lines:
+        return None
+    match = (re.fullmatch(r"MemAvailable:[ \t]+(\d+)[ \t]+kB[ \t]*", lines[0])
+             if len(lines) == 1 else None)
+    if match is None:
+        raise CgroupFormatError(f"MemAvailable is malformed: {meminfo_path}")
+    kib = _parse_cgroup_counter(match.group(1))
+    if kib is None or kib > _CGROUP_UINT64_MAX // 1024:
+        raise CgroupFormatError(f"MemAvailable overflows a byte counter: {meminfo_path}")
+    return kib * 1024
+
+
+def memory_available(*, meminfo_path=Path("/proc/meminfo"),
+                     cgroup_root=Path("/sys/fs/cgroup"),
+                     proc_cgroup_path=Path("/proc/self/cgroup"),
+                     proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """Bytes this process may plan to allocate; ``None`` when nothing could measure it.
+
+    On Linux this is ``min(host MemAvailable, remaining finite cgroup budget)``:
+    a container started with a memory limit is killed at that limit however
+    much the host has free, and the cgroup half is what lets the planner refuse
+    an over-budget model before it allocates anything substantial. The result
+    is a tri-state -- an int (including an authoritative 0 when the budget is
+    already exhausted), ``None`` when no probe could measure anything so the
+    planner keeps its historical fallback, or ``CgroupError`` when a present
+    cgroup or procfs input is malformed, incomplete or unreadable. That last
+    case is a refusal with a reason, never permission to assume the process is
+    unconstrained, so it deliberately propagates.
+    """
+    # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
+    host_available = _host_memory_available(meminfo_path)
+    cgroup_remaining = None
+    if sys.platform.startswith("linux"):
+        # Cgroups are a Linux kernel facility; nothing else has a hierarchy to
+        # read. Probed even when the host figure is unknown, because a finite
+        # limit is still a valid conservative bound when a restricted container
+        # hides /proc/meminfo.
+        cgroup_remaining = _cgroup_memory_remaining(
+            cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path,
+            proc_mountinfo_path=proc_mountinfo_path)
+    if host_available is not None and cgroup_remaining is not None:
+        return min(host_available, cgroup_remaining)
+    if host_available is not None:
+        return host_available
+    if cgroup_remaining is not None:
+        return cgroup_remaining
     # Windows native CPython: GlobalMemoryStatusEx -> ullAvailPhys.
     # Same definition the C engine uses (compat_meminfo in compat.h):
     # standby/free/zero pages, i.e. reclaimable without swapping.
@@ -303,7 +803,7 @@ def memory_available():
                 return int(total)
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
-    return 0
+    return None
 
 
 # Strict .coli_ssd grammar -- the byte-for-byte mirror of colibri.c's
@@ -426,8 +926,8 @@ def _discover_nvidia_gpus():
             try:
                 meminfo = Path("/proc/meminfo").read_text()
                 total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
-                free = memory_available() // (1024 * 1024)
-            except (OSError, AttributeError):
+                free = (memory_available() or 0) // (1024 * 1024)
+            except (OSError, AttributeError, CgroupError):
                 total = free = 0
         name = fields[1]
         unified = any(token in name.lower() for token in ("gb10", "jetson", "grace blackwell"))
@@ -908,7 +1408,19 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if (isinstance(kv_slots, bool) or not isinstance(kv_slots, int) or
             not 1 <= kv_slots <= resolved.descriptor.limits.max_kv_slots):
         raise ValueError(f"{resolved.descriptor.id}: invalid KV slot count {kv_slots}")
-    available_memory = memory_available() if available_memory is None else available_memory
+    automatic_ram = ram_gb <= 0
+    if available_memory is None:
+        available_memory = memory_available()
+    available_memory_known = available_memory is not None
+    if not available_memory_known:
+        # Nothing could measure host memory (no /proc, vm_stat failed). Report
+        # the historical 0 and let the 8 GB compatibility fallback below size
+        # the budget; doctor's "could not be measured" warning keys on it.
+        available_memory = 0
+    elif automatic_ram and available_memory <= 0:
+        raise ValueError(
+            "no available RAM remains for automatic placement "
+            "(host/cgroup memory budget is exhausted)")
     if available_disk is None:
         try:
             usage = shutil.disk_usage(info["path"])
@@ -965,15 +1477,26 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)
         ram_expert_bytes = min(requested_ram_experts,
                                max(0, unified_pool - vram_budget))
-        ram_budget = info["dense_bytes"] + runtime_bytes + ram_expert_bytes
+        # The fixed resident footprint can itself exceed a small requested or
+        # cgroup-derived budget. Keep reporting the actual admission ceiling in
+        # that case; inflating the tier to the fixed footprint would make an
+        # exhausted shared-memory plan look admissible. The zero-cache warning
+        # below still explains that the model cannot retain even one expert.
+        ram_budget = min(requested_ram,
+                         info["dense_bytes"] + runtime_bytes + ram_expert_bytes)
         if requested_ram_experts > ram_expert_bytes:
             warnings.append(
                 f"RAM budget clamped from {format_bytes(requested_ram)} to "
                 f"{format_bytes(ram_budget)} because the GPU shares physical memory")
     else:
         ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
-    if ram_budget < 4 * GB:
-        ram_budget = 8 * GB if not unified else max(0, ram_budget)
+    # Keep the legacy 8 GB fallback only when every host-memory probe failed.
+    # A known small value -- especially finite cgroup headroom -- must retain
+    # the 12% safety reserve and can never be inflated above what is available.
+    # An explicit --ram is an intentional override, but its smaller value must
+    # likewise not be silently raised behind the user's back.
+    if automatic_ram and not available_memory_known and not unified:
+        ram_budget = 8 * GB
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:

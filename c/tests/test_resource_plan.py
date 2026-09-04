@@ -10,6 +10,7 @@ from unittest import mock
 
 from resource_plan import (
     GB,
+    CgroupFormatError,
     analyze_model,
     build_plan,
     cpu_socket_count,
@@ -76,6 +77,61 @@ class ResourcePlanTest(unittest.TestCase):
         # so the Linux-only path returned 0 and the expert cache was sized to
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
+
+    def test_auto_ram_keeps_reserve_below_small_finite_headroom(self):
+        # T15: detecting a 2 GB cgroup budget and later inflating it to the
+        # planner's historical 8 GB floor is still over-admission. Preserve the
+        # ordinary 12% reserve and never export more RAM than the finite value.
+        with mock.patch("resource_plan.memory_available", return_value=2 * GB):
+            plan = build_plan(self.model, available_disk=1, gpus=[])
+        ram = plan["tiers"]["ram"]
+        self.assertEqual(plan["memory"]["available_bytes"], 2 * GB)
+        self.assertEqual(ram["budget_bytes"], int(2 * GB * 0.88))
+        self.assertLessEqual(ram["budget_bytes"], ram["available_bytes"])
+        self.assertEqual(environment_for_plan(plan)["RAM_GB"], "1.760")
+
+    def test_auto_ram_never_exceeds_finite_headroom_on_unified_memory(self):
+        gpu = {"index": 0, "name": "NVIDIA GB10", "total_bytes": 130 * GB,
+               "free_bytes": 128 * GB, "unified_memory": True}
+        with mock.patch("resource_plan.memory_available", return_value=2 * GB):
+            plan = build_plan(self.model, available_disk=1, gpus=[gpu])
+        ram = plan["tiers"]["ram"]
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertEqual(ram["budget_bytes"], int(2 * GB * 0.88))
+        self.assertLessEqual(ram["budget_bytes"], ram["available_bytes"])
+
+    def test_auto_ram_rejects_known_zero_headroom(self):
+        # current >= limit is authoritative exhaustion, not the old
+        # unavailable-probe sentinel. Never turn it into an 8 GB launch --
+        # whether the zero was probed or handed in explicitly.
+        with mock.patch("resource_plan.memory_available", return_value=0), \
+             self.assertRaisesRegex(ValueError, "memory budget is exhausted"):
+            build_plan(self.model, available_disk=1, gpus=[])
+        with self.assertRaisesRegex(ValueError, "memory budget is exhausted"):
+            build_plan(self.model, available_memory=0, available_disk=1, gpus=[])
+
+    def test_auto_ram_retains_legacy_fallback_only_when_probe_is_unknown(self):
+        # None is the tri-state's "nothing could measure it": the historical
+        # 8 GB fallback and the historical 0 in the report, never a refusal.
+        with mock.patch("resource_plan.memory_available", return_value=None):
+            plan = build_plan(self.model, available_disk=1, gpus=[])
+        self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 8 * GB)
+        self.assertEqual(plan["memory"]["available_bytes"], 0)
+
+    def test_malformed_cgroup_input_is_a_typed_refusal_not_a_fallback(self):
+        # A present but malformed controller reaches the caller with its
+        # reason; it is a ValueError, so existing handlers still catch it.
+        error = CgroupFormatError("malformed cgroup memory limit: /sys/fs/cgroup/memory.max")
+        with mock.patch("resource_plan.memory_available", side_effect=error), \
+             self.assertRaises(CgroupFormatError) as context:
+            build_plan(self.model, available_disk=1, gpus=[])
+        self.assertIsInstance(context.exception, ValueError)
+        self.assertIn("memory.max", str(context.exception))
+
+    def test_explicit_small_ram_budget_is_not_silently_inflated(self):
+        plan = build_plan(self.model, ram_gb=2, available_memory=16 * GB,
+                          available_disk=1, gpus=[])
+        self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 2 * GB)
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)

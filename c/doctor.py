@@ -10,8 +10,8 @@ from pathlib import Path
 
 from family_registry import (FamilyConfigError, PlannerUnsupportedError, UnknownFamilyError,
                              public_metadata, resolve_model)
-from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
-                           memory_available)
+from resource_plan import (GB, SSD_PROBE_PENDING, CgroupError, build_plan, discover_gpus,
+                           format_plan)
 
 SAFETENSORS_MAX_HEADER = 512 << 20
 MODEL_INDEX_MAX_BYTES = SAFETENSORS_MAX_HEADER
@@ -511,7 +511,6 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     else:
         checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
 
-    available_memory = memory_available() if available_memory is None else available_memory
     detected_gpus = discover_gpus() if gpus is None else list(gpus)
     linkage = cuda_linkage(engine) if linkage is None else linkage
     selected_gpus = detected_gpus
@@ -543,6 +542,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
                           gpus=detected_gpus, kv_slots=kv_slots)
+        # build_plan() owns the single memory probe -- min(host MemAvailable,
+        # finite cgroup headroom); 0 means nothing could measure it (T15).
+        available_memory = plan["memory"]["available_bytes"]
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
@@ -593,6 +595,15 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("placement.plan", "skip", str(error)))
         checks.append(_check("storage.ssd_probe", "skip",
                              "probe surfacing requires a family planner"))
+    except CgroupError as error:
+        # A present but malformed, incomplete or unreadable cgroup/procfs input
+        # is a refusal with a reason, not "could not be measured" (T15 A1).
+        checks.append(_check("model.shards", "skip", "shard summary requires an admissible memory budget"))
+        checks.append(_check("storage.disk", "skip", "storage check requires an admissible memory budget"))
+        checks.append(_check("memory.ram", "fail", str(error)))
+        checks.append(_check("placement.plan", "skip", "placement requires an admissible memory budget"))
+        checks.append(_check("storage.ssd_probe", "skip",
+                             "probe surfacing requires an admissible memory budget"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))
