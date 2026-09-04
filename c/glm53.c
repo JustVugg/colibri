@@ -78,6 +78,10 @@ static int g_vk_ready = 0;
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define GLM53_HAVE_MMAP 1
 #endif
 #include "hyper_connections.h"   /* mHC, condiviso con deepseek_v4.c */
 
@@ -1145,7 +1149,17 @@ typedef struct ERef {
     int contig;                           /* i sei pezzi sono consecutivi in un file */
 } ERef;
 
-typedef struct { int eid; uint8_t *base; uint64_t used; } Slot;
+/* I sei pezzi non sono adiacenti nel file, ma non devono esserlo nemmeno in
+ * memoria: expert_mats ci costruisce sopra solo tre viste in sola lettura. */
+typedef struct { int eid; uint8_t *piece[GLM53_EXPERT_PIECES]; uint8_t *own; uint64_t used; } Slot;
+
+/* Una mappatura per file, non per esperto: gli offset dei pezzi non sono
+ * allineati alla pagina, ma mappando il file intero ci pensa il kernel. */
+#define GLM53_MAXFD 4096
+static uint8_t *g_fmap[GLM53_MAXFD];
+static size_t   g_fmaplen[GLM53_MAXFD];
+static long     g_map_serve, g_map_copy;
+static int      g_map_active, g_map_all;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
@@ -1225,8 +1239,64 @@ static double memory_available_gb(void) {
     return gb;
 }
 
+/* Un pezzo e' mappabile se il suo file e' mappato, ci sta dentro, ed e'
+ * allineato a 4 byte (le scale si leggono come float *). */
+static int piece_mappable(const GModel *m, const ERef *ref, int q) {
+    const int fd = ref->fd[q];
+    if (fd <= 0 || fd >= GLM53_MAXFD || !g_fmap[fd]) return 0;
+    if ((size_t)ref->off[q] + (size_t)m->e_len[q] > g_fmaplen[fd]) return 0;
+    return (ref->off[q] & 3) == 0;
+}
+
+/* Gli esperti si leggevano copiando 14 MB per slot da byte che il kernel teneva
+ * gia' in page cache. I sei pezzi si possono puntare direttamente nella
+ * mappatura del file: nessuna copia, e la residenza la gestisce il kernel.
+ * Su Windows non si mappa e resta il percorso originale. */
+static void expert_map_init(GModel *m) {
+#ifdef GLM53_HAVE_MMAP
+    if (getenv("GLM53_NO_MMAP") || !m->eref) return;
+    const Cfg *c = &m->c;
+    int files = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        for (int e = 0; e < c->n_experts; e++) {
+            const ERef *ref = &m->eref[(size_t)i * c->n_experts + e];
+            if (ref->fd[0] <= 0) continue;
+            for (int q = 0; q < GLM53_EXPERT_PIECES; q++) {
+                const int fd = ref->fd[q];
+                if (fd <= 0 || fd >= GLM53_MAXFD || g_fmap[fd]) continue;
+                struct stat stt;
+                if (fstat(fd, &stt) != 0 || stt.st_size <= 0) continue;
+                void *pm = mmap(NULL, (size_t)stt.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (pm == MAP_FAILED) continue;
+                g_fmap[fd] = (uint8_t *)pm;
+                g_fmaplen[fd] = (size_t)stt.st_size;
+                files++;
+            }
+        }
+    if (!files) return;
+    g_map_active = 1;
+    long full = 0, partial = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        for (int e = 0; e < c->n_experts; e++) {
+            const ERef *ref = &m->eref[(size_t)i * c->n_experts + e];
+            if (ref->fd[0] <= 0) continue;
+            int ok = 1;
+            for (int q = 0; q < GLM53_EXPERT_PIECES; q++)
+                if (!piece_mappable(m, ref, q)) { ok = 0; break; }
+            if (ok) full++; else partial++;
+        }
+    g_map_all = (partial == 0 && full > 0);
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "[MAP] %d file mappati, esperti mappabili %ld/%ld%s\n",
+                files, full, full + partial, g_map_all ? " (tutti: nessuna copia)" : "");
+#else
+    (void)m;
+#endif
+}
+
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
+    expert_map_init(m);
     const char *setting = getenv("GLM53_EXPERT_GB");
     /* Il default si misura: quello che resta libero dopo i pesi residenti,
      * meno un margine per lo stato della conversazione, i temporanei del
@@ -1248,6 +1318,9 @@ static void expert_cache_init(GModel *m) {
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
+    /* Se ogni esperto arriva dalla mappatura, uno slot non costa memoria
+     * nostra: tenerne uno per esperto toglie di mezzo lo sfratto. */
+    if (g_map_all) cap = c->n_experts;
     if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
     if (cap > c->n_experts) cap = c->n_experts;
@@ -1280,15 +1353,37 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
 
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
-    if (!slot->base) {
-        slot->base = malloc((size_t)m->e_slot);
-        if (!slot->base) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+    if (g_map_active) {
+        int ok = 1;
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+            if (!piece_mappable(m, ref, p)) { ok = 0; break; }
+        if (ok) {
+            for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+                slot->piece[p] = g_fmap[ref->fd[p]] + ref->off[p];
+            slot->eid = eid;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            g_map_serve++;
+            return;
+        }
     }
+    /* Fallback: si torna a scrivere in memoria NOSTRA, non nella mappatura di
+     * sola lettura che questo slot poteva star usando prima. */
+    if (!slot->own) {
+        slot->own = malloc((size_t)m->e_slot);
+        if (!slot->own) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+    }
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    g_map_copy++;
     if (ref->contig) {
-        st_pread_full(ref->fd[0], slot->base, m->e_slot, ref->off[0], "expert");
+        st_pread_full(ref->fd[0], slot->own, m->e_slot, ref->off[0], "expert");
     } else {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-            st_pread_full(ref->fd[p], slot->base + m->e_at[p], m->e_len[p],
+            st_pread_full(ref->fd[p], slot->own + m->e_at[p], m->e_len[p],
                           ref->off[p], "expert piece");
     }
     slot->eid = eid;
@@ -1327,11 +1422,11 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
 static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
-        { 4, NULL, NULL, slot->base + m->e_at[0], (const float *)(slot->base + m->e_at[1]),
+        { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
           inter, hidden, 64 },
-        { 4, NULL, NULL, slot->base + m->e_at[2], (const float *)(slot->base + m->e_at[3]),
+        { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
           inter, hidden, 64 },
-        { 4, NULL, NULL, slot->base + m->e_at[4], (const float *)(slot->base + m->e_at[5]),
+        { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
           hidden, inter, 64 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
@@ -1925,7 +2020,7 @@ static void model_release(GModel *m) {
     if (m->ecache) {
         for (int i = 0; i < m->c.n_layers; i++) {
             LCache *cache = &m->ecache[i];
-            for (int j = 0; j < cache->cap; j++) free(cache->s[j].base);
+            for (int j = 0; j < cache->cap; j++) free(cache->s[j].own);
             free(cache->s);
         }
         free(m->ecache);
