@@ -2756,9 +2756,13 @@ int main(int argc, char **argv) {
                 g_qdw_n, now_s()-tq, freed/1073741824.0);
     }
 
-    /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
-     * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
-     * CPU int8 path. See qwen36_tier.h. */
+    /* Optional VRAM expert tier (COLI_CUDA=1 or COLI_VULKAN=1): hot experts live in
+     * DEVICE_LOCAL memory, misses fall back to the CPU int8 path. See qwen36_tier.h. */
+#ifndef COLI_VULKAN
+    if (getenv("COLI_VULKAN"))
+        fprintf(stderr, "[qwen36] COLI_VULKAN is set but this binary was built without VK=1 "
+                        "(no Vulkan tier); running on CPU\n");
+#endif
     /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
      * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
      * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
@@ -2776,7 +2780,7 @@ int main(int argc, char **argv) {
     }
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
-        fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
+        fprintf(stderr, "[gpu] MoE experts -> %s VRAM tier\n", qt_backend_name());
         atexit(qt_shutdown);
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
