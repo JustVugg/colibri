@@ -46,7 +46,7 @@ static struct {
     /* issue state of the (single) decode thread */
     int is_cnt[QT_MAX_DEV];
     int is_k[QT_MAX_DEV][32];
-    float *is_x;                          /* count*D input replicas per device */
+    float *is_x; size_t is_x_floats;      /* 32*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
@@ -198,7 +198,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
     }
     G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
-    G.is_x=malloc((size_t)32*D*sizeof(float));
+    /* qt_issue strides each device's block by 32*D floats (its max row
+     * count), not 8*D: a device other than 0 with a full 32-row issue used
+     * to run past its own slice and off the end of this allocation (#1339). */
+    G.is_x_floats=(size_t)G.ndev*32*D;
+    G.is_x=malloc(G.is_x_floats*sizeof(float));
     if(!G.slot||!G.is_x) return 0;
     /* load learned heat (HEAT_FILE): warmstart order + initial values */
     const char *hf=getenv("HEAT_FILE");
@@ -426,7 +430,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*8*G.D;               /* per-device input block */
+        float *xr=G.is_x + (size_t)di*32*G.D;              /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
         if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */
