@@ -1637,6 +1637,13 @@ tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Il tier CUDA con un backend finto: gira SENZA GPU perche' il test definisce i
+# coli_cuda_* e registra cosa riceve. E' il solo modo di provare in CI che un
+# esperto arriva davvero in VRAM e nel formato giusto (#1331) -- un test che si
+# fermasse a "qt_init ritorna 1" sarebbe passato anche col difetto.
+tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
