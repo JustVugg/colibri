@@ -13,6 +13,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+
+/* Thread safety (qwen36 tier): an upload thread may call coli_vk_tensor_ensure while the
+ * decode thread submits expert groups. vkQueueSubmit on one VkQueue from two threads is a
+ * spec violation, and the weight arena is a linked list. Every production submit on
+ * G.queue goes through vk_submit; arena_suballoc takes g_arena_mx. Fence waits are never
+ * taken under either lock. The VK_TEST harness is single-threaded and submits directly. */
+static pthread_mutex_t g_submit_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_arena_mx  = PTHREAD_MUTEX_INITIALIZER;
+static VkResult vk_submit(VkQueue q, const VkSubmitInfo *si, VkFence f) {
+    pthread_mutex_lock(&g_submit_mx);
+    VkResult r = vkQueueSubmit(q, 1, si, f);
+    pthread_mutex_unlock(&g_submit_mx);
+    return r;
+}
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -465,7 +480,7 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
 typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
 static VkWArena *g_warena;
 #define VK_WARENA_BLOCK ((size_t)256 << 20)
-static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -502,6 +517,12 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
     if (ptr) *ptr = a->base + off;
     a->off = off + req.size;
     return 1;
+}
+static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+    pthread_mutex_lock(&g_arena_mx);
+    int r = arena_suballoc_locked(bytes, buf, ptr);
+    pthread_mutex_unlock(&g_arena_mx);
+    return r;
 }
 
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
@@ -633,7 +654,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { tA = vk_now(); p_sub += tA - t0; g_vsub_ms += tA - t0; t0 = tA; }
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
@@ -692,7 +713,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -796,7 +817,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
     { double vp0 = G.eg_prof ? vk_now() : 0;
-      VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.eg_fence), "eg queueSubmit");
+      VKCHECK(vk_submit(G.queue, &si, G.eg_fence), "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
     G.eg_pending_yb = yb; G.eg_inflight = 1;
     return 1;
@@ -1261,7 +1282,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1320,7 +1341,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1421,7 +1442,7 @@ int coli_vk_attn_qprep(int layer,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1494,7 +1515,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
