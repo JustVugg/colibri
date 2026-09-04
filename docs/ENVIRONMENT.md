@@ -194,6 +194,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_QPREP` | `1` (on) | Fuse the Q-prep step (RMSNorm + rope + compress) into one GPU dispatch instead of splitting it, which cost three fences where one suffices. `0` restores the split path; `2` additionally keeps CPU reference copies of Q and comp for A/B comparison. |
 | `COLI_VK_RESERVE_GB` | `3.0` | VRAM (GB) held back from the expert tier for the lazily-allocated dense weights, KV mirror and staging buffers (measured ~1.7 GB at 4k ctx, growing with `max_t`). Only meaningful when the driver reports `VK_EXT_memory_budget`; without it the `COLI_VK_EXPERTS` count cap applies alone. |
 | `COLI_VK_SPIN_US` | `300` | Microseconds to spin-poll a fence before blocking. `0` always blocks — lower latency at idle, at the cost of a core spinning. |
+| `COLI_VK_STAGED` | auto | `1` forces staged device-local weight uploads (host staging buffer + copy), `0` forces mapped host-visible uploads. Auto: staged when the host-visible slice is under a quarter of VRAM (Resizable BAR off). The `[VK] weights:` banner reports the mode. |
 
 ### Second Vulkan device (opt-in)
 
@@ -379,8 +380,8 @@ Read **only** by `c/inkling.c`.
 
 ## Qwen3.6 engine (`qwen36`)
 
-Read **only** by `c/qwen36.c`. See [qwen36.md](qwen36.md) for the model layout
-and the CPU/GPU execution split.
+Read **only** by `c/qwen36.c` and its expert tier `c/qwen36_tier.c`. See
+[qwen36.md](qwen36.md) for the model layout and the CPU/GPU execution split.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -388,6 +389,8 @@ and the CPU/GPU execution split.
 | `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
+| `COLI_VULKAN` | off | With a `make qwen36 VK=1` build, `=1` enables the Vulkan VRAM expert tier (single device, fill-once). See [qwen36-tier.md](qwen36-tier.md). |
+| `VK_EXPERT_GB` | `auto` | Vulkan tier VRAM budget in GB; `auto` = device-local budget minus 1 GB (falls back to 4 GB with a warning when `VK_EXT_memory_budget` is absent). Mirrors `CUDA_EXPERT_GB`. |
 
 ## Qwen3.8 engine (`qwen38`)
 

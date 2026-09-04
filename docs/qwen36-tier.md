@@ -1,10 +1,11 @@
-# qwen36: CUDA VRAM expert tier
+# qwen36: VRAM expert tier (CUDA or Vulkan)
 
 Applies colibri's placement concept ("route -> place -> overlap -> learn") to
 Qwen3.6-35B-A3B one level up from the GLM disk tier: all 10,240 experts live
 in RAM, the **hot** ones are promoted into DEVICE_LOCAL VRAM across one or
-more GPUs and computed there through the existing shared CUDA backend
-(`backend_cuda.cu` expert-group API — no new backend).
+more GPUs and computed there through the existing shared CUDA or Vulkan
+backend (`backend_cuda.cu` / `backend_vulkan.c` expert-group API — no new
+backend).
 
 ## How it works
 
@@ -36,6 +37,38 @@ SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
 `cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 containers
 only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
 per-phase timings and tier telemetry.
+
+## Vulkan tier (`make -C c qwen36 VK=1`)
+
+Any Vulkan 1.2 device — AMD via Mesa/RADV (including Polaris cards ROCm
+dropped), Intel ANV, NVIDIA. Needs `libvulkan` and `glslc` at build time, like
+the GLM Vulkan backend (see [vulkan.md](vulkan.md)).
+
+```bash
+make -C c qwen36 VK=1
+COLI_VULKAN=1 HEAT_FILE=heat.bin VK_EXPERT_GB=auto \
+OMP_NUM_THREADS=<physical cores> COLI_NO_OMP_TUNE=1 \
+SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
+```
+
+Differences from the CUDA tier:
+
+- **Single device.** `COLI_GPUS` is not read; the backend picks the most
+  capable Vulkan device (discrete > integrated).
+- **Fill once.** Residency is decided at warmstart — `HEAT_FILE` order when the
+  file exists, natural order otherwise — up to `VK_EXPERT_GB` (`auto` = the
+  driver's device-local budget minus 1 GB). There are no runtime LFRU swaps:
+  the Vulkan weight arena never reclaims a freed slice, so each swap would leak
+  one expert of VRAM. Heat still accumulates and saves at exit, so the second
+  run starts hot. `QT_NO_WARMSTART=1` switches to filling on first use, which
+  is still fill-once.
+- **No Resizable BAR needed.** Discrete cards without ReBAR get real VRAM
+  residency through the backend's staged uploads (`COLI_VK_STAGED`, see
+  [vulkan.md](vulkan.md)).
+- **CUDA wins** when a binary is built with both `CUDA=1` and `VK=1`.
+- Numerics: the same offset-binary int4 layout as the CUDA upload, so
+  `test_qwen36_tier_vk` (built into `make check`) holds the GPU output to
+  within 2e-3 relative of the CPU int4 path.
 
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 

@@ -64,9 +64,9 @@ Both optimizations are bit-exact and on by default.  For controlled A/Bs,
 `QWEN_SHARED_BATCH=N` limits each shared chunk to `N` rows.
 
 Requirements: ~30 GB RAM for comfortable expert caching and NVMe storage for
-the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` adds
-the optional CUDA VRAM expert tier documented in
-[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md).
+the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` or
+`make -C c qwen36 VK=1` adds the optional VRAM expert tier documented in
+[`qwen36-tier.md`](qwen36-tier.md).
 
 ## Which container?
 

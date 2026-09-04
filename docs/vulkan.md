@@ -26,15 +26,25 @@ Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
 Vulkan, and spinning worker threads starve the async I/O pool (measured
 CPU expert bandwidth 28 → 5 GB/s without it).
 
-**Discrete cards need Resizable BAR.** The weight tiers allocate
-HOST_VISIBLE|DEVICE_LOCAL memory; with ReBAR disabled that combination only
-exists in a ~256 MB BAR window, and the driver silently places everything
+**Resizable BAR is faster; staged uploads make it optional.** The weight tiers
+prefer HOST_VISIBLE|DEVICE_LOCAL memory. With ReBAR disabled that combination
+only exists in a ~256 MB BAR window, and the driver silently places everything
 beyond it in system RAM — the tier then *reports* resident experts while every
 access crosses PCIe, slower than the CPU path (measured 0.11 vs 0.24 tok/s
-either side of the BIOS toggle on an RX 9070 XT). The engine now warns at init
-when the host-visible slice of VRAM is small; if you see that warning, enable
-Resizable BAR / Smart Access Memory in the BIOS. Unified-memory APUs are
-unaffected.
+either side of the BIOS toggle on an RX 9070 XT). When the backend sees a small
+host-visible slice it now switches to **staged uploads**: resident weights go
+to plain DEVICE_LOCAL memory through a host staging buffer and
+`vkCmdCopyBuffer` (`[VK] weights: staged device-local uploads` in the banner).
+`COLI_VK_STAGED=1` forces the staged path on any card, `=0` forces the mapped
+path. Each new device-local block is filled once on creation: without that
+first GPU-side write, results computed from a fresh block differ slightly and
+non-deterministically (measured on an RX 580; the cause is not yet
+identified). In the correctness harness's batched int4 matmuls, the staged
+path ran roughly 4× faster than the mapped path on the RX 580 (0.17 vs 0.66
+ms/matmul) — a harness-only number for the kernel itself, not end-to-end
+throughput. Enable Resizable BAR / Smart Access Memory in the BIOS when you
+can; it removes the copy at warmstart. Unified-memory APUs have no
+device-local-only memory and are unaffected either way.
 
 The compiled shaders are found via `COLI_VK_SHADERS` (either the
 `qmatmul.spv` file or the directory holding the `.spv` set); unset, the
