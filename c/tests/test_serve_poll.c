@@ -15,7 +15,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+/* MinGW espone le stesse primitive con l'underscore. La pipe anonima di _pipe
+ * e' proprio cio' che PeekNamedPipe sa interrogare, quindi su Windows il test
+ * esercita il ramo Windows di serve_poll.h invece di saltarlo. */
+#include <io.h>
+#include <fcntl.h>
+#define pipe(fds) _pipe((fds), 4096, _O_BINARY)
+#define dup2 _dup2
+#define write _write
+#define close _close
+#else
 #include <unistd.h>
+#endif
 
 #include "../serve_poll.h"
 
