@@ -264,8 +264,12 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
     G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
     G.is_x=malloc((size_t)32*D*sizeof(float));
+#if QT_SINGLE_DEV
     G.ybuf=malloc((size_t)32*D*sizeof(float));
     if(!G.slot||!G.is_x||!G.ybuf) return 0;
+#else
+    if(!G.slot||!G.is_x) return 0;
+#endif
     /* load learned heat (HEAT_FILE): warmstart order + initial values */
     const char *hf=getenv("HEAT_FILE");
     if(hf){
@@ -433,7 +437,9 @@ void qt_note_planned(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
-/* waits until the upload queue is drained (end of warmstart). */
+/* Blocks until every enqueued upload has COMPLETED (not merely dequeued): the
+ * engine frees RAM int8 copies right after. Must not be called with an
+ * expert group open -- the CUDA swap path parks the uploader on issue_open. */
 void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
@@ -513,7 +519,15 @@ void qt_take(uint32_t mask,const float *val,int K,float *out){
         int c=G.is_cnt[di];
         if(!c) continue;
         const float *y=be_take(G.dev[di],G.ybuf);
-        if(!y) continue;
+        if(!y){
+            static int warned=0;
+            if(!warned){
+                warned=1;
+                fprintf(stderr,"[qtier] %s take failed: those experts were skipped; backend may have disabled itself\n",QT_BACKEND);
+            }
+            G.is_cnt[di]=0;
+            continue;
+        }
         for(int j=0;j<c;j++){
             float w=val[G.is_k[di][j]];
             const float *row=y+(size_t)j*G.D;

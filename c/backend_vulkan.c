@@ -34,6 +34,10 @@ static VkResult vk_submit(VkQueue q, const VkSubmitInfo *si, VkFence f) {
 }
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
 
+/* vk_fence_wait's spin budget (microseconds), set once by coli_vk_init from
+ * COLI_VK_SPIN_US (default 300) so concurrent callers never race a lazy init. */
+static long g_vk_spin_us = 300;
+
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
 
@@ -342,6 +346,11 @@ static void derive_dir_file(const char *spv, const char *fname, char *out, size_
 
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    {
+        const char *e = getenv("COLI_VK_SPIN_US");
+        g_vk_spin_us = e ? atol(e) : 300;
+        if (g_vk_spin_us < 0) g_vk_spin_us = 0;
+    }
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -440,10 +449,13 @@ int coli_vk_init(const char *spv_path) {
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
         int small_bar = dl_max && (!(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || hv_dl * 4 < dl_max);
         /* Staged device-local weights: auto when the host-visible slice is small,
-         * COLI_VK_STAGED=1/0 forces either way (1 lets ReBAR owners validate the path). */
+         * COLI_VK_STAGED=1/0 forces either way (1 lets ReBAR owners validate the path).
+         * Exactly "1" forces on, exactly "0" forces off; anything else (unset, empty,
+         * other text) is auto. */
         int dl = pick_memtype_dl(G.phys);
         const char *st = getenv("COLI_VK_STAGED");
-        int want = st && *st ? (*st == '1') : small_bar;
+        int staged_off_forced = st && !strcmp(st, "0");
+        int want = st && !strcmp(st, "1") ? 1 : (staged_off_forced ? 0 : small_bar);
         if (want && dl < 0) {
             fprintf(stderr, "[VK] COLI_VK_STAGED requested but no device-local-only memory type "
                     "(unified memory?) — mapped uploads\n");
@@ -462,10 +474,10 @@ int coli_vk_init(const char *spv_path) {
         else if (small_bar)
             fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
                     "appears disabled) — allocations beyond the %llu MB window fall back to system "
-                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS, "
-                    "or unset COLI_VK_STAGED=0.\n",
+                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS.%s\n",
                     (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20),
-                    (unsigned long long)(hv_dl >> 20));
+                    (unsigned long long)(hv_dl >> 20),
+                    staged_off_forced ? " (COLI_VK_STAGED=0 is set; unset it to use staged uploads)" : "");
     }
 
     G.shader = load_spv(G.dev, spv_path);
@@ -687,10 +699,13 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr, int dl) {
 static int stage_reserve(size_t bytes) {
     if (G.stage.cap >= bytes) return 1;
     if (G.stage.buf) { vkDestroyBuffer(G.dev, G.stage.buf, NULL); vkFreeMemory(G.dev, G.stage.mem, NULL); }
-    G.stage.buf = VK_NULL_HANDLE; G.stage.cap = 0; G.stage.ptr = NULL;
+    G.stage.buf = VK_NULL_HANDLE; G.stage.mem = VK_NULL_HANDLE; G.stage.cap = 0; G.stage.ptr = NULL;
     size_t cap = (bytes + ((size_t)4 << 20) - 1) & ~(((size_t)4 << 20) - 1);
     if (!alloc_buf_mt(cap, &G.stage.buf, &G.stage.mem, &G.stage.ptr, G.memtype_stage,
-                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+        G.stage.buf = VK_NULL_HANDLE; G.stage.mem = VK_NULL_HANDLE;
+        return 0;
+    }
     G.stage.cap = cap;
     return 1;
 }
@@ -789,13 +804,7 @@ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const floa
  * a short budget first (the common decode dispatch completes in 0.5-2 ms),
  * then fall back to the blocking wait. The spinning thread is stalled on the
  * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
-static long g_vk_spin_us = -1;
 static VkResult vk_fence_wait(VkDevice dev, VkFence f) {
-    if (g_vk_spin_us < 0) {
-        const char *e = getenv("COLI_VK_SPIN_US");
-        g_vk_spin_us = e ? atol(e) : 300;
-        if (g_vk_spin_us < 0) g_vk_spin_us = 0;
-    }
     if (g_vk_spin_us > 0) {
         double t0 = vk_now();
         do {

@@ -21,6 +21,14 @@ backend picks the most capable physical device (discrete > integrated) and
 degrades to the CPU path on any failure — a wedged GPU can slow a run, never
 corrupt it.
 
+Polaris/gfx803 validated on real hardware (RX 580 8 GB, Mesa 25.2.8 RADV, no
+Resizable BAR, GPU clocks not pinned — no root to set
+`power_dpm_force_performance_level`; commit 56f019b): the shaders' dynamic
+subgroup sizes ran unmodified, wave64-safe by construction. Qwen3.6-35B-A3B
+int4-gs64, 64-token decode: staged uploads 7.4 tok/s vs the mapped path
+(`COLI_VK_STAGED=0`) 4.16 tok/s; frozen-heat runs were token-identical to
+each other and to the CPU-only baseline.
+
 Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
 (active spin-wait) is skipped under `COLI_CUDA`/`COLI_METAL` but not under
 Vulkan, and spinning worker threads starve the async I/O pool (measured
@@ -118,10 +126,3 @@ hit-rate line is the tier-effectiveness number.
   fall back to the CPU attention path.
 - Not yet done: cooperative-matrix (coopmat) prefill kernels, a fully
   resident-layer pipeline.
-- Polaris/gfx803 validated on real hardware (RX 580 8 GB, Mesa 25.2.8 RADV,
-  no Resizable BAR, GPU clocks not pinned — no root to set
-  `power_dpm_force_performance_level`): the shaders' dynamic subgroup sizes
-  ran unmodified, wave64-safe by construction. Qwen3.6-35B-A3B int4-gs64,
-  64-token decode: staged uploads 7.4 tok/s vs the mapped path
-  (`COLI_VK_STAGED=0`) 4.16 tok/s; frozen-heat runs were token-identical to
-  each other and to the CPU-only baseline.

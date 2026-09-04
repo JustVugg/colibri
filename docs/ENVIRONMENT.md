@@ -194,7 +194,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_QPREP` | `1` (on) | Fuse the Q-prep step (RMSNorm + rope + compress) into one GPU dispatch instead of splitting it, which cost three fences where one suffices. `0` restores the split path; `2` additionally keeps CPU reference copies of Q and comp for A/B comparison. |
 | `COLI_VK_RESERVE_GB` | `3.0` | VRAM (GB) held back from the expert tier for the lazily-allocated dense weights, KV mirror and staging buffers (measured ~1.7 GB at 4k ctx, growing with `max_t`). Only meaningful when the driver reports `VK_EXT_memory_budget`; without it the `COLI_VK_EXPERTS` count cap applies alone. |
 | `COLI_VK_SPIN_US` | `300` | Microseconds to spin-poll a fence before blocking. `0` always blocks — lower latency at idle, at the cost of a core spinning. |
-| `COLI_VK_STAGED` | auto | `1` forces staged device-local weight uploads (host staging buffer + copy), `0` forces mapped host-visible uploads. Auto: staged when the host-visible slice is under a quarter of VRAM (Resizable BAR off). The `[VK] weights:` banner reports the mode. |
+| `COLI_VK_STAGED` | auto | `1` forces staged, `0` forces mapped, any other value (including empty) means auto. Auto: staged when the host-visible slice is under a quarter of VRAM (Resizable BAR off). The `[VK] weights:` banner reports the mode. |
 
 ### Second Vulkan device (opt-in)
 

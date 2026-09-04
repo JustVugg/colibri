@@ -10,17 +10,18 @@ backend).
 ## How it works
 
 - **Home device:** expert `eid` lives on GPU `eid % n_gpus`; no duplicates.
-- **Placement:** routing heat decides who earns VRAM (LFRU semantics from
+- **CUDA: Placement:** routing heat decides who earns VRAM (LFRU semantics from
   `tier.h`, 25%+4 hysteresis). Runtime heat is halved every 1024 decode ticks,
   so a long-lived process can replace experts from an old workload instead of
   permanently freezing its initial hot set. A parallel **warmstart** fills the per-device
   budget before the first token — ordered by a persisted heat table
   (`HEAT_FILE`) when present, so a second run starts fully placed.
-- **Decode:** per (token, layer) the resident experts are issued as async
-  groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
+- **CUDA: Decode:** per (token, layer) the resident experts are issued as async
+  groups on all devices (`coli_cuda_expert_group_issue/take`; Vulkan:
+  `coli_vk_expert_group_issue/take`, single device); VRAM misses
   fall back to the CPU int8 path and overlap with the in-flight groups, as
   does the shared expert. Placement never changes routing or precision.
-- **Memory:** the warmstart frees the RAM int8 copies of VRAM-resident
+- **CUDA: Memory:** the warmstart frees the RAM int8 copies of VRAM-resident
   experts (rematerialized from the packed int4 copy on LFRU eviction; no
   container access). Peak RSS for the 35B int4 container: ~29 GB with two
   8 GB GPUs.
@@ -54,7 +55,9 @@ SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
 Differences from the CUDA tier:
 
 - **Single device.** `COLI_GPUS` is not read; the backend picks the most
-  capable Vulkan device (discrete > integrated).
+  capable Vulkan device (discrete > integrated). `COLI_VK_DEV=<index>` selects
+  the Vulkan device — the backend's existing selector, documented in
+  [ENVIRONMENT.md](ENVIRONMENT.md).
 - **Fill once.** Residency is decided at warmstart — `HEAT_FILE` order when the
   file exists, natural order otherwise — up to `VK_EXPERT_GB` (`auto` = the
   driver's device-local budget minus 1 GB). There are no runtime LFRU swaps:

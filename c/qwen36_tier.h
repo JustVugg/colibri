@@ -1,4 +1,4 @@
-/* qwen36_tier.h -- optional CUDA VRAM expert tier for the qwen36 engine.
+/* qwen36_tier.h -- optional VRAM expert tier (CUDA or Vulkan) for the qwen36 engine.
  *
  * Applies colibri's placement concept ("route -> place -> overlap -> learn")
  * one level up from the GLM disk tier: experts live in RAM, the *hot* ones
@@ -65,7 +65,10 @@ int  qt_fill_next(int *layer, int *eid);
 void qt_note_block(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
-void qt_fill_wait(void);   /* blocks until the upload queue is drained */
+/* Blocks until every enqueued upload has COMPLETED (not merely dequeued): the
+ * engine frees RAM int8 copies right after. Must not be called with an
+ * expert group open -- the CUDA swap path parks the uploader on issue_open. */
+void qt_fill_wait(void);
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
