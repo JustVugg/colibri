@@ -13,15 +13,19 @@
  *    blocks on placement. A VRAM miss falls back to the CPU int8 path and
  *    overlaps with the in-flight GPU groups.
  *
- * Enable with COLI_CUDA=1 [COLI_GPUS=0,1] [CUDA_EXPERT_GB=<G>|auto]
- * [HEAT_FILE=<path>] [QT_NO_WARMSTART=1]. Compiled only when the build sets
- * -DCOLI_CUDA (CUDA=1); otherwise the inline stubs below keep the engine
- * CPU-only with zero overhead. */
+ * Backends: CUDA (`make qwen36 CUDA=1`, COLI_CUDA=1 [COLI_GPUS=0,1]
+ * [CUDA_EXPERT_GB=<G>|auto]) or Vulkan (`make qwen36 VK=1`, COLI_VULKAN=1
+ * [VK_EXPERT_GB=<G>|auto]); both take [HEAT_FILE=<path>] [QT_NO_WARMSTART=1].
+ * CUDA wins when both are compiled in. The Vulkan tier is single-device and
+ * fills ONCE at warmstart (no runtime LFRU swaps: the Vulkan weight arena
+ * never reclaims a freed slice, so a swap would leak one expert of VRAM).
+ * Without either define the inline stubs below keep the engine CPU-only
+ * with zero overhead. */
 #ifndef QWEN36_TIER_H
 #define QWEN36_TIER_H
 #include <stdint.h>
 
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA) || defined(COLI_VULKAN)
 
 /* Init after model load. Returns 1 when the tier is active.
  * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
@@ -33,6 +37,7 @@ int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
 int  qt_ready(void);
+const char *qt_backend_name(void);   /* "CUDA" | "Vulkan" (valid after qt_init) */
 int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
 
@@ -65,10 +70,11 @@ void qt_fill_wait(void);   /* blocks until the upload queue is drained */
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
-#else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
+#else /* no GPU backend: inline stubs, engine stays CPU-only */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_ready(void){return 0;}
+static inline const char *qt_backend_name(void){return "none";}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
@@ -81,5 +87,5 @@ static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,con
 static inline void qt_fill_wait(void){}
 static inline void qt_stats(void){}
 
-#endif /* COLI_CUDA */
+#endif /* COLI_CUDA || COLI_VULKAN */
 #endif /* QWEN36_TIER_H */
