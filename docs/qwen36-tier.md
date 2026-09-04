@@ -35,9 +35,11 @@ OMP_NUM_THREADS=<physical cores> OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close \
 SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
 ```
 
-`cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 containers
-only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
-per-phase timings and tier telemetry.
+`cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 and int8
+containers are promoted (a grouped-scale int8 container is refused with
+`[qtier] int8 experts with grouped scales (gs=%d) cannot be expressed on the
+GPU (fmt=1 is per-row only) -> CPU path` and stays on the CPU path).
+`COLI_TIMERS=1` prints per-phase timings and tier telemetry.
 
 ## Vulkan tier (`make -C c qwen36 VK=1`)
 
@@ -92,20 +94,23 @@ bit-identical GPU-vs-CPU on the same container (cosine 1.0000001).
 Hardware: AMD Radeon RX 580 8 GB (Polaris10, gfx803), Intel Core i7-7700K
 (8 threads), Mesa 25.2.8 RADV, no Resizable BAR. GPU clocks were not pinned
 (no root on this box to set `power_dpm_force_performance_level`). Commit
-56f019b. Prompt: 15 tokens, `N_NEW=64`, greedy decode, container
+bb16ab3. Prompt: 15 tokens, `N_NEW=64`, greedy decode, container
 `qwen36_i4_gs64` (grouped-scale int4, gs=64) — this is the tier's first run
 against a gs64 container.
 
 | | CPU-only | Vulkan cold heat | Vulkan warm heat (staged, frozen) | Vulkan mapped path (`COLI_VK_STAGED=0`, frozen) |
 |---|---|---|---|---|
-| decode tok/s | 0.63 | 6.46 | 7.4 (7.52 / 7.35 across 2 runs) | 4.16 |
-| TTFT | 44.65 s | 1.48 s | 1.14 s / 1.31 s | 2.36 s |
-| VRAM-resident experts | — | 3,644/10,240 (35.6 %) | 3,644/10,240 (35.6 %) | 3,661/10,240 (35.8 %) |
-| VRAM hit rate | — | 35.8 % | 96.7 % | 96.8 % |
-| peak RSS | 17.75 GB | 40.78 GB | 40.72 GB | 40.67 GB |
+| decode tok/s | 0.63 | 6.40 | 5.99 (6.38 / 5.60 across 2 runs) | 2.44 |
+| TTFT | 44.65 s | 1.50 s | 1.48 s / 1.50 s | 2.48 s |
+| VRAM-resident experts | — | 3,663/10,240 (35.8 %) | 3,663 and 3,655/10,240 (35.8 / 35.7 %) | 3,655/10,240 (35.7 %) |
+| VRAM hit rate | — | 36.1 % | 96.8 % | 96.8 % |
+| peak RSS | 17.75 GB | 40.73 GB | 40.67 / 40.69 GB | 40.69 GB |
 
 The two frozen-heat staged runs were token-identical to each other and to the
-CPU-only baseline (`diff` clean both ways): the gs64 grouped-scale int4
-upload path holds bit-for-bit on this card. Staged uploads ran ~1.8x the
-mapped-path throughput warm (7.4 vs 4.16 tok/s) — the expected cost of every
-non-resident-window access crossing PCIe without ReBAR.
+CPU-only baseline (`diff` clean both ways), and so was the mapped-path run:
+the gs64 grouped-scale int4 upload path holds bit-for-bit on this card.
+Staged uploads ran ~2.5x the mapped-path throughput warm (5.99 vs 2.44
+tok/s) — the expected cost of every non-resident-window access crossing PCIe
+without ReBAR. With the clocks unpinned the two warm runs spread 12 %
+(6.38 / 5.60), and the resident count moves a few experts run to run because
+the budget follows the live `VK_EXT_memory_budget` free figure.

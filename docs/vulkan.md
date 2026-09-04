@@ -23,10 +23,10 @@ corrupt it.
 
 Polaris/gfx803 validated on real hardware (RX 580 8 GB, Mesa 25.2.8 RADV, no
 Resizable BAR, GPU clocks not pinned — no root to set
-`power_dpm_force_performance_level`; commit 56f019b): the shaders' dynamic
+`power_dpm_force_performance_level`; commit bb16ab3): the shaders' dynamic
 subgroup sizes ran unmodified, wave64-safe by construction. Qwen3.6-35B-A3B
-int4-gs64, 64-token decode: staged uploads 7.4 tok/s vs the mapped path
-(`COLI_VK_STAGED=0`) 4.16 tok/s; frozen-heat runs were token-identical to
+int4-gs64, 64-token decode: staged uploads 5.99 tok/s vs the mapped path
+(`COLI_VK_STAGED=0`) 2.44 tok/s; frozen-heat runs were token-identical to
 each other and to the CPU-only baseline.
 
 Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
