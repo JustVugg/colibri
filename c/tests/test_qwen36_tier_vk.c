@@ -1,13 +1,20 @@
 /* Qwen3.6 Vulkan expert tier gate: drives qwen36_tier.c through the shared Vulkan
- * backend with synthetic int4 experts (no model file) and checks the accumulated
- * routed-expert output against a CPU reference. Built into every `make check`;
- * without VK=1 it compiles to a skip, and with VK=1 but no usable device it skips
- * at runtime (exit 0) so CPU hosts and CI stay green. */
+ * backend with synthetic experts (no model file) and checks the accumulated
+ * routed-expert output against a CPU reference. Compiled twice: this file for
+ * packed int4 experts, and test_qwen36_tier_vk_int8.c (which #defines
+ * TIER_VK_INT8 1 before including this one) for raw int8 experts -- the Vulkan
+ * backend cannot be re-initialised in-process, so the int8 scenario runs as a
+ * separate executable rather than a second qt_init() here. Built into every
+ * `make check`; without VK=1 both compile to a skip, and with VK=1 but no
+ * usable device they skip at runtime (exit 0) so CPU hosts and CI stay green. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#ifndef TIER_VK_INT8
+#define TIER_VK_INT8 0
+#endif
 #ifndef COLI_VULKAN
 int main(void){ puts("skip: built without VK=1"); return 0; }
 #else
@@ -24,22 +31,36 @@ enum { NL=2, NE=8, D=64, IH=32, TOPK=2 };
 typedef struct { uint8_t *g4,*u4,*d4; float *gs,*us,*ds; } Exp;
 static Exp E[NL][NE];
 
-/* packed two's-complement int4 (LOW nibble = even column), per-row f32 scales:
- * the container layout qwen36.c hands the tier; the tier XORs to offset-binary. */
+/* int4: packed two's-complement (LOW nibble = even column), per-row f32 scales,
+ * the container layout qwen36.c hands the tier; the tier XORs to offset-binary.
+ * int8 (TIER_VK_INT8): raw signed bytes, one per element, same per-row scales. */
 static void make_expert(Exp *e){
+#if TIER_VK_INT8
+    size_t mb=(size_t)D*IH;
+#else
     size_t mb=(size_t)D*IH/2;
+#endif
     e->g4=malloc(mb); e->u4=malloc(mb); e->d4=malloc(mb);
     e->gs=malloc(IH*sizeof(float)); e->us=malloc(IH*sizeof(float)); e->ds=malloc(D*sizeof(float));
     for(size_t i=0;i<mb;i++){ e->g4[i]=(uint8_t)rnd(); e->u4[i]=(uint8_t)rnd(); e->d4[i]=(uint8_t)rnd(); }
     for(int o=0;o<IH;o++){ e->gs[o]=0.01f+0.02f*(float)(rnd()%100)/100.f; e->us[o]=0.01f+0.02f*(float)(rnd()%100)/100.f; }
     for(int o=0;o<D;o++) e->ds[o]=0.01f+0.02f*(float)(rnd()%100)/100.f;
 }
+#if TIER_VK_INT8
+static float deq(const uint8_t *row,int i){ return (float)((const int8_t*)row)[i]; }
+/* y[O] = (x[I] . W[O,I]) * s[O]; int8 row stride is I bytes (no packing) */
+static void gemv(float *y,const float *x,const uint8_t *w,const float *s,int I,int O){
+    for(int o=0;o<O;o++){ const uint8_t *row=w+(size_t)o*I; double a=0;
+        for(int i=0;i<I;i++) a+=x[i]*deq(row,i); y[o]=(float)a*s[o]; }
+}
+#else
 static float deq(const uint8_t *row,int i){ int nib=(i&1)?(row[i>>1]>>4):(row[i>>1]&15); return (float)((nib&8)?nib-16:nib); }
 /* y[O] = (x[I] . W[O,I]) * s[O] */
 static void gemv(float *y,const float *x,const uint8_t *w,const float *s,int I,int O){
     for(int o=0;o<O;o++){ const uint8_t *row=w+(size_t)o*((I+1)/2); double a=0;
         for(int i=0;i<I;i++) a+=x[i]*deq(row,i); y[o]=(float)a*s[o]; }
 }
+#endif
 static void expert_ref(float *y,const float *x,const Exp *e){
     float g[IH],u[IH];
     gemv(g,x,e->g4,e->gs,D,IH); gemv(u,x,e->u4,e->us,D,IH);
@@ -55,11 +76,15 @@ static int count_resident(int layer){ int n=0; for(int e=0;e<NE;e++) n+=qt_is_re
 
 /* One tier init for the whole run: the backend is not designed to be torn down and
  * brought up again inside one process (arenas outlive coli_vk_shutdown). The budget
- * admits exactly two experts (per-expert bytes = 3*D*IH/2 + (2*IH+D)*4 + 4096 = 7680;
- * 0.00002 GB = 21474 bytes), and the natural warmstart order fills layer 0, eids 0 and 1,
- * so those two are the resident pair and eid 2 is a guaranteed miss. */
+ * admits exactly two experts:
+ *   int4: per-expert bytes = 3*D*IH/2 + (2*IH+D)*4 + 4096 = 7680; VK_EXPERT_GB=0.00002
+ *         (21474 bytes) admits two, not three.
+ *   int8: per-expert bytes = 3*D*IH   + (2*IH+D)*4 + 4096 = 10752; VK_EXPERT_GB=0.000025
+ *         (26843 bytes) admits two, not three.
+ * The natural warmstart order fills layer 0, eids 0 and 1, so those two are the
+ * resident pair and eid 2 is a guaranteed miss in both modes. */
 
-/* resident experts, served from VRAM, reproduce the CPU int4 path */
+/* resident experts, served from VRAM, reproduce the CPU reference path */
 static int resident_experts_match_cpu_path(void){
     if(!qt_is_resident(0,0)||!qt_is_resident(0,1)) return fail("warmstart should have placed layer 0 eids 0 and 1");
     float x[D]; for(int i=0;i<D;i++) x[i]=frand();
@@ -112,12 +137,21 @@ static int residency_frozen_after_warmstart(void){
 }
 
 int main(void){
+    fprintf(stderr,"qwen36 tier vk test: %s experts\n", TIER_VK_INT8 ? "int8" : "int4");
     for(int l=0;l<NL;l++) for(int e=0;e<NE;e++) make_expert(&E[l][e]);
     setenv("COLI_VULKAN","1",1);
+#if TIER_VK_INT8
+    setenv("VK_EXPERT_GB","0.000025",1);
+#else
     setenv("VK_EXPERT_GB","0.00002",1);
+#endif
     unsetenv("HEAT_FILE"); unsetenv("QT_NO_WARMSTART");
-    /* per-row scales (expert_gs=0), packed int4 weights (expert_is_int4=1) */
+    /* per-row scales (expert_gs=0); expert_is_int4 picks packed int4 vs raw int8 */
+#if TIER_VK_INT8
+    if(!qt_init(NL,NE,D,IH,NE,TOPK,0,0)){ puts("skip: no usable Vulkan device"); return 0; }
+#else
     if(!qt_init(NL,NE,D,IH,NE,TOPK,0,1)){ puts("skip: no usable Vulkan device"); return 0; }
+#endif
     note_all();
     int res=count_resident(0)+count_resident(1);
     if(res!=2) { fprintf(stderr,"resident=%d\n",res); return fail("budget should admit exactly two experts"); }

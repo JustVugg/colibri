@@ -1294,6 +1294,13 @@ tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st
 tests/test_qwen36_tier_vk$(EXE): tests/test_qwen36_tier_vk.c qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h $(VK_OBJ) $(VK_SPV)
 	$(CC) $(NOCUDA_CFLAGS) $< qwen36_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# Same gate, int8-promoted experts (fmt=1, no packing): #1334 taught the tier to
+# promote int8 containers, and the Vulkan backend cannot be re-initialised
+# in-process, so this is a thin file that #includes test_qwen36_tier_vk.c with
+# TIER_VK_INT8 set rather than a second qt_init() in the same test binary.
+tests/test_qwen36_tier_vk_int8$(EXE): tests/test_qwen36_tier_vk_int8.c tests/test_qwen36_tier_vk.c qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) $< qwen36_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

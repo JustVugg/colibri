@@ -156,6 +156,11 @@ jobs:
             ./tests/test_qwen36_tier_vk 2>&1 | tee tier.log
           grep -q "residency_frozen_after_warmstart: ok" tier.log || {
             echo "FAIL: the Vulkan tier gate did not run to completion"; exit 1; }
+          make tests/test_qwen36_tier_vk_int8 VK=1
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json COLI_NO_OMP_TUNE=1 \
+            ./tests/test_qwen36_tier_vk_int8 2>&1 | tee tier_int8.log
+          grep -q "residency_frozen_after_warmstart: ok" tier_int8.log || {
+            echo "FAIL: the Vulkan tier gate (int8) did not run to completion"; exit 1; }
 
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
