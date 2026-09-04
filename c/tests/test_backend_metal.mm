@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 
 enum { F32=0, I8=1, I4=2, I2=3, I4G=4, FP8=8 };
@@ -53,6 +54,212 @@ static int run(int fmt, int O, int I, int S, const char *name) {
   int ok = nerr < 1e-4;
   printf("  %-22s nerr=%.2e  %s\n", name, nerr, ok?"ok":"*** MISMATCH");
   coli_metal_tensor_free(t);
+  return ok?0:1;
+}
+
+static uint16_t affine_f16(float value) {
+  uint32_t bits; memcpy(&bits,&value,sizeof(bits));
+  uint32_t sign=(bits>>16)&0x8000u, mantissa=bits&0x7fffffu;
+  int exponent=(int)((bits>>23)&0xffu)-127+15;
+  if(exponent<=0) return (uint16_t)sign;
+  if(exponent>=31) return (uint16_t)(sign|0x7c00u);
+  return (uint16_t)(sign|((uint32_t)exponent<<10)|(mantissa>>13));
+}
+
+static void affine_store_scalar(std::vector<uint8_t>& bytes, size_t index,
+                                ColiAffineScalarFormat format, float value) {
+  uint32_t bits; memcpy(&bits,&value,sizeof(bits));
+  if(format==COLI_AFFINE_SCALAR_F32){
+    bytes[index*4]=(uint8_t)bits; bytes[index*4+1]=(uint8_t)(bits>>8);
+    bytes[index*4+2]=(uint8_t)(bits>>16); bytes[index*4+3]=(uint8_t)(bits>>24);
+  } else {
+    uint16_t encoded=format==COLI_AFFINE_SCALAR_F16 ? affine_f16(value)
+                                                    : (uint16_t)(bits>>16);
+    bytes[index*2]=(uint8_t)encoded; bytes[index*2+1]=(uint8_t)(encoded>>8);
+  }
+}
+
+static int run_affine(ColiAffineFormat format, ColiAffineScalarFormat scalar_format,
+                      int S, const char *name) {
+  enum { O=48, I=2048, GROUP=32 }; // 64 groups exercises lane's group+32 stride.
+  unsigned bits=coli_affine_bits(format), per_word=32u/bits;
+  size_t packed_words=I/per_word, scalar_count=(size_t)O*(I/GROUP);
+  size_t scalar_size=coli_affine_scalar_size(scalar_format);
+  std::vector<uint32_t> weights((size_t)O*packed_words);
+  std::vector<uint8_t> scales(scalar_count*scalar_size), biases(scalar_count*scalar_size);
+  std::vector<float> x((size_t)S*I), expected((size_t)S*O), actual((size_t)S*O);
+  uint32_t state=0x12345678u+(uint32_t)bits*17u+(uint32_t)scalar_format;
+  for(auto &word:weights){ state=state*1664525u+1013904223u; word=state; }
+  for(size_t i=0;i<scalar_count;i++){
+    float scale=(float)((int)(i%7)-3)*0.03125f;
+    float bias=(float)((int)(i%5)-2)*0.015625f;
+    affine_store_scalar(scales,i,scalar_format,scale);
+    affine_store_scalar(biases,i,scalar_format,bias);
+  }
+  for(size_t i=0;i<x.size();i++) x[i]=(float)((int)((i*11+3)%31)-15)*0.0625f;
+  ColiAffineQuantizedView view = {
+    weights.data(), scales.data(), biases.data(), weights.size()*sizeof(uint32_t),
+    scales.size(), biases.size(), O, I, GROUP, format, scalar_format
+  };
+  if(coli_affine_matmul_ref(expected.data(),x.data(),(size_t)S,&view)!=COLI_AFFINE_OK){
+    printf("  %-38s FAIL (CPU reference refused descriptor)\n",name); return 1;
+  }
+  auto relative_error=[&](){
+    double maxabs=0.0, ymax=0.0;
+    for(size_t i=0;i<actual.size();i++){
+      if(!std::isfinite(actual[i]) || !std::isfinite(expected[i]))
+        return (double)INFINITY;
+      maxabs=fmax(maxabs,fabs((double)actual[i]-expected[i]));
+      ymax=fmax(ymax,fabs((double)expected[i]));
+    }
+    return maxabs/(ymax+1e-9);
+  };
+  size_t count_before=0, bytes_before=0;
+  coli_metal_stats(&count_before,&bytes_before);
+  ColiMetalTensor *tensor=nullptr;
+  int submitted=coli_metal_matmul_affine(&tensor,actual.data(),x.data(),S,&view);
+  double first_nerr=submitted?relative_error():INFINITY;
+  size_t count_published=0, bytes_published=0;
+  coli_metal_stats(&count_published,&bytes_published);
+  const size_t weight_bytes=weights.size()*sizeof(uint32_t);
+  const size_t resident_bytes=weight_bytes+scales.size()+biases.size();
+  int published=submitted && tensor && count_published==count_before+1 &&
+                bytes_published==bytes_before+resident_bytes &&
+                coli_metal_tensor_bytes(tensor)==weight_bytes;
+
+  for(size_t i=0;i<x.size();i++) x[i]=-x[i]+(float)((int)(i%3)-1)*0.015625f;
+  int ref_reuse=coli_affine_matmul_ref(expected.data(),x.data(),(size_t)S,&view)==COLI_AFFINE_OK;
+  std::fill(actual.begin(),actual.end(),NAN);
+  int reused=published && ref_reuse &&
+             coli_metal_matmul_affine(&tensor,actual.data(),x.data(),S,&view);
+  double reuse_nerr=reused?relative_error():INFINITY;
+
+  ColiAffineQuantizedView mismatch=view;
+  mismatch.group_size=64;
+  int mismatch_valid=coli_affine_validate(&mismatch)==COLI_AFFINE_OK;
+  int mismatch_rejected=reused && mismatch_valid &&
+                        !coli_metal_matmul_affine(&tensor,actual.data(),x.data(),S,&mismatch);
+  size_t count_reused=0, bytes_reused=0;
+  coli_metal_stats(&count_reused,&bytes_reused);
+  int stats_stable=count_reused==count_published && bytes_reused==bytes_published;
+
+  coli_metal_tensor_free(tensor);
+  size_t count_after=0, bytes_after=0;
+  coli_metal_stats(&count_after,&bytes_after);
+  int restored=count_after==count_before && bytes_after==bytes_before;
+  int ok=submitted && first_nerr<1e-4 && reused && reuse_nerr<1e-4 &&
+         mismatch_rejected && stats_stable && restored;
+  printf("  %-38s nerr=%.2e/%.2e S=%d groups=%d  %s\n",
+         name,first_nerr,reuse_nerr,S,I/GROUP,ok?"ok":"*** MISMATCH");
+  return ok?0:1;
+}
+
+// ---- Slot buffers: registered once, offset-addressed, refilled in place ----
+// Three claims: (1) offset addressing inside one whole-slot buffer matches the
+// CPU reference; (2) refilling the SAME registered memory is seen by the next
+// dispatch (write-through -- the property the resident-handle cache cannot give
+// reused memory); (3) the refusal arms hold: misaligned registration, sections
+// outside the registered range, and a view that does not describe the slot's
+// current fill are refused, never dispatched.
+static int run_affine_slot(ColiAffineFormat format, ColiAffineScalarFormat scalar_format,
+                           int S, const char *name) {
+  enum { O=48, I=2048, GROUP=32, HEADER=256 };  // HEADER: prove nonzero offsets
+  const size_t pg=16384;
+  unsigned bits=coli_affine_bits(format), per_word=32u/bits;
+  size_t packed_words=(size_t)O*(I/per_word);
+  size_t wbytes=packed_words*sizeof(uint32_t);
+  size_t scalar_count=(size_t)O*(I/GROUP);
+  size_t sbytes=scalar_count*coli_affine_scalar_size(scalar_format);
+  size_t woff=HEADER, soff=woff+wbytes, boff=soff+sbytes;
+  size_t len=((boff+sbytes)+pg-1)&~(pg-1);
+  uint8_t *slab=nullptr;
+  if (posix_memalign((void**)&slab,pg,len)) {
+    printf("  %-38s FAIL (posix_memalign)\n",name); return 1; }
+  memset(slab,0,len);
+
+  auto fill=[&](uint32_t seed){
+    uint32_t state=seed;
+    uint32_t *w=(uint32_t*)(void*)(slab+woff);
+    for(size_t i=0;i<packed_words;i++){ state=state*1664525u+1013904223u; w[i]=state; }
+    std::vector<uint8_t> sc(sbytes), bi(sbytes);
+    for(size_t i=0;i<scalar_count;i++){
+      state=state*1664525u+1013904223u;
+      float scale=(float)((int)(state%7u)-3)*0.03125f;
+      float bias=(float)((int)((state>>8)%5u)-2)*0.015625f;
+      if(scale==0.0f) scale=0.046875f;
+      affine_store_scalar(sc,i,scalar_format,scale);
+      affine_store_scalar(bi,i,scalar_format,bias);
+    }
+    memcpy(slab+soff,sc.data(),sbytes); memcpy(slab+boff,bi.data(),sbytes);
+  };
+
+  ColiAffineQuantizedView view = {
+    slab+woff, slab+soff, slab+boff, wbytes, sbytes, sbytes,
+    (size_t)O, (size_t)I, (size_t)GROUP, format, scalar_format
+  };
+  std::vector<float> x((size_t)S*I), expected((size_t)S*O), actual((size_t)S*O);
+  for(size_t i=0;i<x.size();i++) x[i]=(float)((int)((i*13+5)%29)-14)*0.0625f;
+  auto relative_error=[&](){
+    double maxabs=0.0, ymax=0.0;
+    for(size_t i=0;i<actual.size();i++){
+      if(!std::isfinite(actual[i]) || !std::isfinite(expected[i]))
+        return (double)INFINITY;
+      maxabs=fmax(maxabs,fabs((double)actual[i]-expected[i]));
+      ymax=fmax(ymax,fabs((double)expected[i]));
+    }
+    return maxabs/(ymax+1e-9);
+  };
+
+  size_t count_before=0, bytes_before=0;
+  coli_metal_stats(&count_before,&bytes_before);
+  // A misaligned base or a non-page-multiple length must not register at all:
+  // those layouts would take wrap()'s copying fallback and go stale on refill.
+  int misaligned_refused = coli_metal_slot_register(slab+4,len)==NULL &&
+                           coli_metal_slot_register(slab,len-4)==NULL;
+  ColiMetalSlotBuffer *slot=coli_metal_slot_register(slab,len);
+  size_t count_reg=0, bytes_reg=0;
+  coli_metal_stats(&count_reg,&bytes_reg);
+  int registered = slot!=NULL && count_reg==count_before+1 &&
+                   bytes_reg==bytes_before+len;
+
+  fill(0xC4C40001u ^ (uint32_t)format ^ ((uint32_t)scalar_format<<4));
+  int ref_ok=coli_affine_matmul_ref(expected.data(),x.data(),(size_t)S,&view)==COLI_AFFINE_OK;
+  std::fill(actual.begin(),actual.end(),NAN);
+  int first = registered && ref_ok &&
+      coli_metal_matmul_affine_slot(slot,woff,soff,boff,actual.data(),x.data(),S,&view);
+  double first_nerr = first ? relative_error() : INFINITY;
+
+  // Refill the same registered memory with a different expert; the next
+  // dispatch must read the NEW bytes through the same registration.
+  fill(0x5EED0002u ^ (uint32_t)format ^ ((uint32_t)scalar_format<<4));
+  int ref2_ok=coli_affine_matmul_ref(expected.data(),x.data(),(size_t)S,&view)==COLI_AFFINE_OK;
+  std::fill(actual.begin(),actual.end(),NAN);
+  int refilled = first && ref2_ok &&
+      coli_metal_matmul_affine_slot(slot,woff,soff,boff,actual.data(),x.data(),S,&view);
+  double refill_nerr = refilled ? relative_error() : INFINITY;
+
+  // Sections outside the registered range are refused.
+  int oob_refused = refilled &&
+      !coli_metal_matmul_affine_slot(slot,len-4,soff,boff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(slot,woff,len,boff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(slot,woff,soff,len,actual.data(),x.data(),S,&view);
+  // A view that does not describe the claimed offsets (a stale or misdirected
+  // descriptor) is refused, not dispatched.
+  int mismatch_refused = refilled &&
+      !coli_metal_matmul_affine_slot(slot,woff+4,soff,boff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(slot,woff,boff,soff,actual.data(),x.data(),S,&view) &&
+      !coli_metal_matmul_affine_slot(NULL,woff,soff,boff,actual.data(),x.data(),S,&view);
+
+  coli_metal_slot_unregister(slot);
+  size_t count_after=0, bytes_after=0;
+  coli_metal_stats(&count_after,&bytes_after);
+  int restored = count_after==count_before && bytes_after==bytes_before;
+  free(slab);
+  int ok = misaligned_refused && registered && first && first_nerr<1e-4 &&
+           refilled && refill_nerr<1e-4 && oob_refused && mismatch_refused &&
+           restored;
+  printf("  %-38s nerr=%.2e/%.2e (fill/refill) S=%d  %s\n",
+         name,first_nerr,refill_nerr,S,ok?"ok":"*** MISMATCH");
   return ok?0:1;
 }
 
@@ -732,16 +939,30 @@ static int run_silu_mul(size_t n, const char *name) {
 }
 
 int main(void) {
-  if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
+  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+  if (!dev) { printf("Metal device unavailable (skipping)\n"); return 0; }
+  if (!coli_metal_init()) {
+    printf("Metal backend initialization failed on device %s\n",
+           [[dev name] UTF8String]);
+    return 1;
+  }
+  ColiMetalAffineCapability affine_capability=coli_metal_affine_capability();
+  if (affine_capability!=COLI_METAL_AFFINE_CAP_READY &&
+      affine_capability!=COLI_METAL_AFFINE_CAP_SIMD_WIDTH_UNSUPPORTED) {
+    printf("Metal MLX affine packed GEMV setup: FAIL (capability=%d)\n",
+           (int)affine_capability);
+    coli_metal_shutdown();
+    return 1;
+  }
   /* GitHub Actions Apple Silicon runners expose Metal through the Apple
    * Paravirtual device, where Metal submissions never complete (hangs -- the
    * #947 CI observation). The shader compile above (coli_metal_init) still
    * runs, keeping this suite's compile coverage -- the class of bug #940
    * shipped -- while GPU execution is honestly skipped here. (#947 review) */
-  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-  if (dev && [[dev name] containsString:@"Apple Paravirtual device"]) {
+  if ([[dev name] containsString:@"Apple Paravirtual device"]) {
     printf("SKIPPED: paravirtual device (%s) -- compile-only\n",
            [[dev name] UTF8String]);
+    coli_metal_shutdown();
     return 0;
   }
   printf("Metal standalone op tests (MAE / maxAbs error vs CPU reference):\n");
@@ -813,6 +1034,26 @@ int main(void) {
   fail |= run(I8, 2048,6144,4, "int8 gate/up S=4");
   fail |= run(I4, 2048,6144,7, "int4 gate/up S=7 (odd)");
   fail |= run(I4, 2050,6146,3, "int4 non-mult-4 dims");
+  if (affine_capability==COLI_METAL_AFFINE_CAP_READY) {
+    printf("Metal MLX affine packed GEMV tests:\n");
+    const char *scalar_name[] = {"f32","f16","bf16"};
+    for(int format=COLI_AFFINE_MLX_Q4;format<=COLI_AFFINE_MLX_Q8;format++)
+      for(int scalar=COLI_AFFINE_SCALAR_F32;scalar<=COLI_AFFINE_SCALAR_BF16;scalar++){
+        char name[64]; snprintf(name,sizeof(name),"affine Q%d/%s batched",
+                               (int)coli_affine_bits((ColiAffineFormat)format),scalar_name[scalar]);
+        fail |= run_affine((ColiAffineFormat)format,(ColiAffineScalarFormat)scalar,3,name);
+      }
+    printf("Metal MLX affine slot-buffer tests (register once, offset-address, refill):\n");
+    fail |= run_affine_slot(COLI_AFFINE_MLX_Q4, COLI_AFFINE_SCALAR_F32,  3, "affine slot Q4/f32 offset+refill");
+    fail |= run_affine_slot(COLI_AFFINE_MLX_Q4, COLI_AFFINE_SCALAR_F16,  2, "affine slot Q4/f16 offset+refill");
+    fail |= run_affine_slot(COLI_AFFINE_MLX_Q8, COLI_AFFINE_SCALAR_BF16, 3, "affine slot Q8/bf16 offset+refill");
+  } else if (affine_capability==COLI_METAL_AFFINE_CAP_SIMD_WIDTH_UNSUPPORTED) {
+    printf("Metal MLX affine packed GEMV tests: SKIPPED (requires 32-lane simdgroups)\n");
+  } else {
+    printf("Metal MLX affine packed GEMV tests: FAIL (affine pipelines unavailable, capability=%d)\n",
+           (int)affine_capability);
+    fail=1;
+  }
   printf("Metal fmt=4 grouped-int4 tests (coli_metal_matmul vs matmul_i4_grouped semantics):\n");
   // I multiple of gs=64, S=1 and S>1 (real g64-checkpoint shapes: gate/up I=6144, down I=2048)
   fail |= run_grouped(2048,6144,64,1,0, "grouped gate/up I=6144(mult64) S=1");
