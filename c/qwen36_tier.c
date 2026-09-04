@@ -33,7 +33,37 @@ static const float *be_take(int dev,float *ybuf){ (void)ybuf; return coli_cuda_e
 static void be_stats(int dev,size_t *tc,size_t *tb){ coli_cuda_stats(dev,tc,tb); }
 static void be_shutdown(void){ coli_cuda_shutdown(); }
 #elif defined(COLI_VULKAN)
-#error "Vulkan shim arrives in the next commit"
+#include "backend_vulkan.h"
+#define QT_BACKEND    "Vulkan"
+#define QT_SWAPS      0            /* fill once: the VK arena never reclaims freed slices */
+#define QT_SINGLE_DEV 1
+#define QT_BUDGET_ENV "VK_EXPERT_GB"
+typedef ColiVkTensor QtTensor;
+static int  be_enabled(void){ const char *e=getenv("COLI_VULKAN"); return e && *e=='1'; }
+static int  be_init(const int *dev,int n){ (void)dev; (void)n;
+    char buf[1024]; return coli_vk_init(coli_vk_default_spv(buf,sizeof buf)); }
+static int  be_available_device_count(void){ return 1; }   /* enumeration happens in coli_vk_init */
+static int  be_device_count(void){ return coli_vk_available() ? 1 : 0; }
+static void be_mem_info(int dev,size_t *freeb,size_t *totb){ (void)dev;
+    double used=0,budget=0;
+    if(coli_vk_mem_budget(&used,&budget)){
+        *totb=(size_t)(budget*1e9); *freeb=budget>used?(size_t)((budget-used)*1e9):0;
+    } else {
+        *totb=*freeb=(size_t)4<<30;
+        fprintf(stderr,"[qtier] VK_EXT_memory_budget absent: assuming 4 GB free (set VK_EXPERT_GB to override)\n");
+    }
+}
+/* fmt: 1 = per-row int8, 2 = per-row int4, 4 = grouped int4 ([O,ceil(I/gs)] scales).
+ * The VK i4() decoder is nibble-8, the same offset-binary layout stage() produces;
+ * i8() reads signed bytes, the layout CUDA fmt 1 takes, so int8 needs no repacking. */
+static int  be_upload(QtTensor **t,const uint8_t *w,const float *sc,int fmt,int I,int O,int dev,int gs){
+    (void)dev; return coli_vk_tensor_ensure(t,w,sc,fmt,I,O,gs); }
+static void be_free(QtTensor *t){ coli_vk_tensor_free(t); }
+static int  be_issue(QtTensor *const *g,QtTensor *const *u,QtTensor *const *d,const int *rows,int c,const float *x){
+    return coli_vk_expert_group_issue(g,u,d,rows,c,x); }
+static const float *be_take(int dev,float *ybuf){ (void)dev; return coli_vk_expert_group_take(ybuf) ? ybuf : NULL; }
+static void be_stats(int dev,size_t *tc,size_t *tb){ (void)dev; coli_vk_mem_info(tb,tc); }
+static void be_shutdown(void){ coli_vk_shutdown(); }
 #endif
 #include "tier.h"
 
@@ -69,6 +99,8 @@ static struct {
     /* upload ring with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[QT_QCAP];
     int qh, qt_, qn;
+    int inflight;   /* enqueued but not yet fully uploaded -- qn frees the ring slot at dequeue,
+                     * before be_upload() runs, so qt_fill_wait needs a separate completion count */
     pthread_cond_t cv;
     /* statistics */
     uint64_t hits[QT_MAX_DEV], miss, uploads, q_full_skips;
@@ -159,6 +191,8 @@ static void *uploader(void *arg){
         else  { int hd=home(eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
+        G.inflight--;
+        pthread_cond_broadcast(&G.cv_take);          /* upload actually complete */
         pthread_mutex_unlock(&G.mx);
     }
 }
@@ -194,9 +228,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     if(!be_init(G.dev,G.ndev)){ fprintf(stderr,"[qtier] %s backend init failed -> CPU path\n",QT_BACKEND); return 0; }
     int have=be_device_count();
     if(have<G.ndev){ G.ndev=have; }
-    if(G.ndev<1){ fprintf(stderr,"[qtier] no CUDA devices -> CPU path\n"); return 0; }
+    if(G.ndev<1){ fprintf(stderr,"[qtier] no %s devices -> CPU path\n", QT_BACKEND); return 0; }
 
-    /* per-device budget: CUDA_EXPERT_GB, or auto = free minus 1 GB headroom.
+    /* per-device budget: QT_BUDGET_ENV (CUDA_EXPERT_GB / VK_EXPERT_GB), or auto = free minus 1 GB headroom.
      * Scale counts follow the container: per-row (expert_gs=0) or grouped
      * (gs64: [O, ceil(I/gs)] per projection). */
     G.wfmt = expert_is_int4 ? 4 : 1;
@@ -284,7 +318,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     stage(w,sc,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
     G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
-    G.qt_=(G.qt_+1)%QT_QCAP; G.qn++;
+    G.qt_=(G.qt_+1)%QT_QCAP; G.qn++; G.inflight++;
     pthread_cond_signal(&G.cv);
     return 1;
 }
@@ -403,7 +437,7 @@ void qt_note_planned(int layer,int eid,
 void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
-    while(G.qn>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     pthread_mutex_unlock(&G.mx);
 }
 

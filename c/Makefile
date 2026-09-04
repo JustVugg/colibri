@@ -1282,6 +1282,12 @@ tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h 
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Qwen3.6 Vulkan expert-tier gate: synthetic experts through qwen36_tier.c and the
+# shared Vulkan backend, no model. Compiles to a skip without VK=1 (so it is a
+# portable gate like the rest of TEST_BINS) and skips at runtime without a device.
+tests/test_qwen36_tier_vk$(EXE): tests/test_qwen36_tier_vk.c qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) $< qwen36_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

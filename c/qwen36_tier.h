@@ -3,7 +3,7 @@
  * Applies colibri's placement concept ("route -> place -> overlap -> learn")
  * one level up from the GLM disk tier: experts live in RAM, the *hot* ones
  * are promoted into DEVICE_LOCAL VRAM across one or more GPUs and computed
- * there via the existing CUDA backend (backend_cuda.cu, expert-group API).
+ * there via the existing CUDA or Vulkan backend (backend_cuda.cu / backend_vulkan.c expert-group API).
  *
  *  - Every expert has one home device (eid % n_gpus), no duplicates.
  *  - Routing heat decides who earns VRAM (LFRU semantics from tier.h, with
