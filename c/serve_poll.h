@@ -47,9 +47,16 @@ static inline int coli_serve_stdin_ready(void)
     /* PeekNamedPipe funziona sulle pipe, che e' come il gateway parla ai
      * motori. Su una console o un file ritorna falso e si resta al
      * comportamento di prima: nessun falso "pronto". */
-    if (PeekNamedPipe(handle, NULL, 0, NULL, &available, NULL) && available > 0)
-        return 1;
-    return 0;
+    if (PeekNamedPipe(handle, NULL, 0, NULL, &available, NULL))
+        return available > 0;
+    /* PeekNamedPipe FALLISCE su una pipe rotta, dove select() POSIX direbbe
+     * invece "leggibile" -- e ha ragione select: una lettura non bloccherebbe,
+     * ritornerebbe EOF. Se il gateway muore o chiude, il motore deve poterlo
+     * vedere, non restare cieco fino a fine turno. Quindi qui "pronto" vale
+     * anche per la fine del flusso, e il chiamante distingue leggendo.
+     * Trovato dal test su CI Windows: su Linux i due casi coincidono e questa
+     * differenza sarebbe partita per la produzione senza che me ne accorgessi. */
+    return GetLastError() == ERROR_BROKEN_PIPE ? 1 : 0;
 #elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     fd_set readable;
     struct timeval immediately = {0, 0};
