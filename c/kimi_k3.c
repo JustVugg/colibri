@@ -310,6 +310,28 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
 }
 
 /* ---------- DSA (Dictionary Sparse Attention) CPU helpers ---------- */
+/* L'indexer DSA e' COSTRUITO ma non COLLEGATO (#1333): l'unica funzione che
+ * leggerebbe la cache Ic per scegliere le posizioni top-K, dsa_score_single qui
+ * sotto, non ha nessun chiamante -- una grep su tutto il repo trova solo la sua
+ * definizione.
+ *
+ * Finche' resta cosi' l'attenzione e' densa e il sottosistema e' lavoro pagato e
+ * mai letto: CINQUE tensori dal disco per ogni layer DSA (w_k, w_q, w_p, kn_w,
+ * kn_b -- e w_q, w_p, kn_b non sono toccati nemmeno dal codice morto), la cache
+ * Ic da [max_t * index_hd] float per layer, e per ogni token un matmul piu'
+ * rmsnorm piu' rope.
+ *
+ * Spento di default, non cancellato: quel che manca e' collegare
+ * dsa_score_single, e chi lo fara' ha bisogno di questi pesi. KIMI_DSA_INDEXER=1
+ * li ricarica. Avvertenza per chi ci mettera' mano: collegarlo CAMBIA le uscite
+ * -- l'attenzione diventa sparsa dove oggi e' densa -- quindi va fatto contro
+ * l'oracolo token-exact, non a occhio. */
+static int k3_dsa_indexer_on(void){
+    static int cached = -1;
+    if(cached < 0){ const char *e = getenv("KIMI_DSA_INDEXER"); cached = e && *e=='1'; }
+    return cached;
+}
+
 static void dsa_rope(float *v, int pos, int qk_rope, float base_theta){
     int half = qk_rope/2;
     if(qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope buffer (256)\n",qk_rope); exit(1); }
@@ -920,7 +942,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             a->qa_ln =f32_load(m,NM("model.layers.%d.self_attn.q_a_layernorm.weight",i),c->q_lora);
             a->kva_ln=f32_load(m,NM("model.layers.%d.self_attn.kv_a_layernorm.weight",i),c->kv_lora);
             /* DSA indexer weights – only for "full" layers (idx_type=1) */
-            if(c->index_hd > 0 && c->idx_type[i]){
+            if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
                 w_load(m,&a->wk,NM("model.layers.%d.self_attn.w_k.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
                 w_load(m,&a->wq,NM("model.layers.%d.self_attn.w_q.weight",i),(int64_t)c->index_hd,c->q_lora,mbits);
                 w_load(m,&a->wp,NM("model.layers.%d.self_attn.w_p.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
@@ -1427,7 +1449,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         memcpy(Rrow, cv + kvl, qr * sizeof(float));
     }
     /* DSA indexer: prefill — write K portion for full layers */
-    if(c->index_hd > 0 && c->idx_type[li]){
+    if(c->index_hd > 0 && c->idx_type[li] && k3_dsa_indexer_on()){
         for(int t=0;t<C;t++){
             float *ikd = a->Ic + (int64_t)(pos0+t) * c->index_hd;
             const float *xt = x + (int64_t)t * c->hidden;
@@ -2240,7 +2262,7 @@ static void kv_alloc(Model *m, int max_t){
     /* DSA indexer cache — only for full layers (idx_type=1) */
     for(int i=0;i<c->n_layers;i++){
         Mla *a=&m->L[i].m;
-        if(c->index_hd > 0 && c->idx_type[i]){
+        if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
             a->Ic = falloc((int64_t)max_t * c->index_hd);
         }
     }
