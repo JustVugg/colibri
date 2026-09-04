@@ -189,9 +189,9 @@ static int pick_memtype_stage(VkPhysicalDevice phys) {
     return (int)G.memtype;
 }
 
-static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype, VkBufferUsageFlags usage) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -207,6 +207,9 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+    return alloc_buf_mt(bytes, buf, mem, ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 }
 /* Priority class of subsequent allocations (VK_EXT_memory_priority; no-op without it).
  * Scratches/KV force 1.0 internally; weight uploads take whatever is current — the
@@ -519,8 +522,9 @@ int coli_vk_init(const char *spv_path) {
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
-            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "");
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s, weights %s\n", p.deviceName, G.qfam, G.memtype,
+            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
+            G.staged ? "staged" : "mapped");
     return 1;
 }
 
@@ -541,20 +545,26 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
  * in the dozens. Arena slices are never reclaimed per-tensor (registry/dense uploads
  * live for the process; the rare fill-failure free leaks its slice, bounded) — a
  * tensor's mem handle stays VK_NULL_HANDLE, which coli_vk_tensor_free's vkFreeMemory
- * treats as the documented no-op. */
-typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
-static VkWArena *g_warena;
+ * treats as the documented no-op. The staged path keeps a second chain in
+ * DEVICE_LOCAL-only memory (never mapped); slices there are filled by stage_copy. */
+typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; int filled; struct VkWArena *next; } VkWArena;
+static VkWArena *g_warena;      /* mapped host-visible chain (G.memtype) */
+static VkWArena *g_warena_dl;   /* staged device-local chain (G.memtype_dl); base == NULL */
 #define VK_WARENA_BLOCK ((size_t)256 << 20)
-static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr) {
+static VkResult vk_fence_wait(VkDevice dev, VkFence f);
+static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr, int dl, VkWArena **ablk) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes,
+        .usage = dl ? (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+                    : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
-    if (!(req.memoryTypeBits & (1u << G.memtype))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    uint32_t mt = dl ? G.memtype_dl : G.memtype; VkWArena **head = dl ? &g_warena_dl : &g_warena;
+    if (!(req.memoryTypeBits & (1u << mt))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
     size_t align = req.alignment ? req.alignment : 256, off = 0;
-    VkWArena *a = g_warena;
+    VkWArena *a = *head;
     for (; a; a = a->next) {
         off = (a->off + align - 1) & ~(align - 1);
         if (off + req.size <= a->cap) break;
@@ -564,30 +574,135 @@ static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr) {
         a = calloc(1, sizeof(*a));
         if (!a) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
         VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = cap, .memoryTypeIndex = G.memtype};
+            .allocationSize = cap, .memoryTypeIndex = mt};
 #ifdef VK_EXT_memory_priority
         VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
             .priority = G.prio};
         if (G.has_prio) ai.pNext = &pri;
 #endif
         if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
-            vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+            (!dl && vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS)) {
             if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
             free(a); vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
         }
-        a->cap = cap; a->next = g_warena; g_warena = a;
+        /* New dl blocks are filled once by the arena_suballoc wrapper, outside
+         * g_arena_mx (fence waits are never taken under a lock — see the file-top
+         * invariant); mapped blocks never need it. */
+        a->filled = dl ? 0 : 1;
+        a->cap = cap; a->next = *head; *head = a;
         off = 0;
     }
     VKCHECK(vkBindBufferMemory(G.dev, *buf, a->mem, off), "vkBindBufferMemory");
-    if (ptr) *ptr = a->base + off;
+    if (ptr) *ptr = dl ? NULL : a->base + off;
     a->off = off + req.size;
+    *ablk = a;
     return 1;
 }
-static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr, int dl) {
+    VkWArena *a = NULL;
     pthread_mutex_lock(&g_arena_mx);
-    int r = arena_suballoc_locked(bytes, buf, ptr);
+    int r = arena_suballoc_locked(bytes, buf, ptr, dl, &a);
     pthread_mutex_unlock(&g_arena_mx);
+    if (r && dl && !a->filled) {
+        /* First slice out of a fresh dl block: fill the whole block once, outside
+         * g_arena_mx. Without this fill, expert/matmul results computed from a
+         * freshly created device-local block differ slightly (within the 1e-3
+         * harness gate) and are non-deterministic run to run; filling the block
+         * once here — with ANY value, 0x00 and 0xFF measured identical — makes the
+         * staged path byte-identical to the mapped path across all 50 harness
+         * cases on RX 580 (RADV Polaris). The fill value is irrelevant, so the
+         * mechanism is the first GPU-side write/placement of the allocation, not a
+         * read of filler bytes; the underlying cause is unresolved (no GPU
+         * validation layers on the test host) and is reported upstream as a
+         * finding. Borrowing up_cmd/up_fence here is safe because dl allocations
+         * only happen under g_upload_mx, so no other suballoc can race this block's
+         * `filled` flag. On failure the slice just bound above is destroyed and 0
+         * returned; the block stays linked with filled==0 so the next dl
+         * allocation retries the fill — the lost slice is a bounded leak, like the
+         * existing fill-failure remark above the arena. */
+        VkBuffer zb = VK_NULL_HANDLE;
+        VkBufferCreateInfo zbi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = a->cap, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkCommandBufferBeginInfo zbegin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VkSubmitInfo zsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &G.up_cmd};
+        int zok = vkCreateBuffer(G.dev, &zbi, NULL, &zb) == VK_SUCCESS;
+        if (zok) {
+            VkMemoryRequirements zreq;
+            vkGetBufferMemoryRequirements(G.dev, zb, &zreq);
+            zok = zreq.size <= a->cap && (zreq.memoryTypeBits & (1u << G.memtype_dl));
+        }
+        zok = zok &&
+              vkBindBufferMemory(G.dev, zb, a->mem, 0) == VK_SUCCESS &&
+              vkResetCommandBuffer(G.up_cmd, 0) == VK_SUCCESS &&
+              vkBeginCommandBuffer(G.up_cmd, &zbegin) == VK_SUCCESS;
+        if (zok) {
+            vkCmdFillBuffer(G.up_cmd, zb, 0, VK_WHOLE_SIZE, 0);
+            VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(G.up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &mb, 0, NULL, 0, NULL);
+            zok = vkEndCommandBuffer(G.up_cmd) == VK_SUCCESS &&
+                  vkResetFences(G.dev, 1, &G.up_fence) == VK_SUCCESS &&
+                  vk_submit(G.queue, &zsi, G.up_fence) == VK_SUCCESS &&
+                  vk_fence_wait(G.dev, G.up_fence) == VK_SUCCESS;
+        }
+        if (zb) vkDestroyBuffer(G.dev, zb, NULL);
+        if (!zok) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+        a->filled = 1;
+    }
     return r;
+}
+
+/* Grow-on-demand host staging buffer for the staged weight path (4 MB granularity so
+ * the per-expert tier uploads never reallocate). Callers hold g_upload_mx. */
+static int stage_reserve(size_t bytes) {
+    if (G.stage.cap >= bytes) return 1;
+    if (G.stage.buf) { vkDestroyBuffer(G.dev, G.stage.buf, NULL); vkFreeMemory(G.dev, G.stage.mem, NULL); }
+    G.stage.buf = VK_NULL_HANDLE; G.stage.cap = 0; G.stage.ptr = NULL;
+    size_t cap = (bytes + ((size_t)4 << 20) - 1) & ~(((size_t)4 << 20) - 1);
+    if (!alloc_buf_mt(cap, &G.stage.buf, &G.stage.mem, &G.stage.ptr, G.memtype_stage,
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
+    G.stage.cap = cap;
+    return 1;
+}
+
+/* Staged upload: pack the padded rows and the scale block into the staging buffer, copy
+ * both into the tensor's device-local slices on the upload command buffer, wait. One
+ * upload at a time (g_upload_mx); the submit is serialised with decode by vk_submit. */
+static pthread_mutex_t g_upload_mx = PTHREAD_MUTEX_INITIALIZER;
+static int stage_copy(ColiVkTensor *t, const void *weights, const float *scales,
+                      size_t cpu_rb, size_t stride, size_t sb) {
+    if (!stage_reserve(t->wbytes + sb)) return 0;
+    uint8_t *p = G.stage.ptr;
+    memset(p, 0, t->wbytes);
+    for (int o = 0; o < t->O; o++)
+        memcpy(p + (size_t)o * stride, (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+    memcpy(p + t->wbytes, scales, sb);
+    VKCHECK(vkResetCommandBuffer(G.up_cmd, 0), "up resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VKCHECK(vkBeginCommandBuffer(G.up_cmd, &begin), "up beginCmd");
+    VkBufferCopy cw = {.srcOffset = 0, .dstOffset = 0, .size = t->wbytes};
+    VkBufferCopy cs = {.srcOffset = t->wbytes, .dstOffset = 0, .size = sb};
+    vkCmdCopyBuffer(G.up_cmd, G.stage.buf, t->wbuf, 1, &cw);
+    vkCmdCopyBuffer(G.up_cmd, G.stage.buf, t->sbuf, 1, &cs);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    VKCHECK(vkEndCommandBuffer(G.up_cmd), "up endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.up_cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.up_fence), "up resetFence");
+    VKCHECK(vk_submit(G.queue, &si, G.up_fence), "up queueSubmit");
+    if (vk_fence_wait(G.dev, G.up_fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] staged upload fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    return 1;
 }
 
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
@@ -603,17 +718,31 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;
-    void *wptr;
-    if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
-    memset(wptr, 0, t->wbytes);
-    for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
-        memcpy((uint8_t *)wptr + (size_t)o * stride,
-               (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
-    void *sptr;
-    if (!arena_suballoc(sfl * sizeof(float), &t->sbuf, &sptr)) {
-        vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
+    size_t sb = sfl * sizeof(float);
+    if (G.staged) {
+        pthread_mutex_lock(&g_upload_mx);
+        int ok = arena_suballoc(t->wbytes, &t->wbuf, NULL, 1) &&
+                 arena_suballoc(sb, &t->sbuf, NULL, 1) &&
+                 stage_copy(t, weights, scales, cpu_rb, stride, sb);
+        pthread_mutex_unlock(&g_upload_mx);
+        if (!ok) {
+            if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
+            if (t->sbuf) vkDestroyBuffer(G.dev, t->sbuf, NULL);
+            free(t); return 0;
+        }
+    } else {
+        void *wptr;
+        if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr, 0)) { free(t); return 0; }
+        memset(wptr, 0, t->wbytes);
+        for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
+            memcpy((uint8_t *)wptr + (size_t)o * stride,
+                   (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+        void *sptr;
+        if (!arena_suballoc(sb, &t->sbuf, &sptr, 0)) {
+            vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
+        }
+        memcpy(sptr, scales, sb);
     }
-    memcpy(sptr, scales, sfl * sizeof(float));
     // Counters are touched concurrently: frees run from expert_load under
     // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
     __atomic_add_fetch(&G.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
