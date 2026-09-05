@@ -82,6 +82,7 @@ decode, same prompt, output bit-identical in all four runs:
 | same card, budget capped at 5 GB (a 6 GB card's share), warm | 88.9 % / 9.50 | 81.2 % / **13.15** |
 | Quadro RTX 4000 (8 GB) alone, warm | 93.6 % / 11.09 | 88.4 % / **16.55** |
 | both cards, experts on both, warm | 100 % / 10.79 | 100 % / **14.80** |
+| reference: Ollama 0.32.5, same model Q4_K_M, same prompt, both cards (57 % CPU / 43 % GPU, 11.8 GB VRAM) | 20.3 warm (21.3 cold) | |
 
 The warm row is the one that matters: at a 95 % hit rate the marginal expert
 is as valuable as it gets on this card, and the trunk still wins by a third.
@@ -89,7 +90,11 @@ The hit rate drops only 4.4 points for 796 fewer residents because the
 displaced experts are the coldest of the heat order -- exactly the ones the
 placer priced as cheap. The smaller or slower the card, the larger the
 relative win: +34 % on the 3070, +38 % at a 5 GB budget, +49 % on the Quadro.
-All sixteen runs of this calibration produced bit-identical text.
+All sixteen runs of this calibration produced bit-identical text. Against
+Ollama on the same box the gap closes from 1.5× (14.97 vs 22.4 in August, two
+cards, hand-placed) to **1.23× on a single 8 GB card** (16.55 vs 20.3) --
+with Ollama holding its dense weights at ~0.56 bytes per weight (Q4_K_M)
+against this engine's 1.0 (int8), and using both cards.
 
 **Two cards are the open case.** With experts on both cards the second card
 paces every layer (the slower `take()` gates the chain), so `off` on two cards
