@@ -457,6 +457,11 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         self.assertEqual(process.terminate_calls, 1)
         self.assertGreaterEqual(process.wait_calls, 1)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "os.kill(pid, SIGTERM) on Windows is TerminateProcess with exit code 15: "
+        "no handler runs, so the POSIX mechanism under test does not exist there "
+        "(the SIGINT/exception half above covers child cleanup on Windows)")
     def test_sigterm_mid_run_terminates_the_child_and_propagates(self):
         # The SIGTERM half: a real SIGTERM (not just an ordinary
         # Python exception) delivered while the child is running must
