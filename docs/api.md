@@ -43,9 +43,24 @@ The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.
 Images, log probabilities, and token penalties return an explicit error rather
-than being silently ignored. Audio is accepted only by Inkling checkpoints with
-audio support. The default bind address is localhost; set `COLI_API_KEY` before
-exposing the server beyond the machine.
+than being silently ignored, with one documented exception: `seed` is accepted
+and ignored rather than rejected (see below). Audio is accepted only by Inkling
+checkpoints with audio support. The default bind address is localhost; set
+`COLI_API_KEY` before exposing the server beyond the machine.
+
+### `seed`
+
+`seed` is accepted (not rejected) for OpenAI-API request-shape compatibility.
+It currently has **no effect on any code path, at any temperature**: no
+engine, and no field on the wire protocol, reads a per-request seed. The
+`glm` and `inkling` engines seed their process-global RNG once from the
+`SEED` environment variable at launch, never per request; no other engine
+reads `SEED` or any per-request seed at all. Either way the request's
+`seed` value goes nowhere. At `temperature: 0` this is moot anyway (greedy
+decoding has no distribution to seed), but the same "no effect" is equally
+true at `temperature > 0`, where a client might otherwise expect the value
+to matter. A true per-request seed is out of scope for this build
+regardless.
 
 ### Tool-calling support
 
