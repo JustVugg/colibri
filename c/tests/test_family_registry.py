@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1169,6 +1170,108 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
 
+    def test_release_ships_everything_coli_reaches(self):
+        """L'archivio deve contenere ogni file Python che coli raggiunge.
+
+        #1296: il pacchetto v1.10.0 aveva quattro comandi rotti. release.yml
+        copiava sette .py scelti a mano piu' un solo file in tools/, e il
+        codice era andato avanti. Mancavano convert_fp8_to_int4.py,
+        eval_glm.py, fetch_benchmarks.py, mirror_plan.py, e i moduli cluster,
+        glm53_image, qwen38_image.
+
+        Ora la lista la calcola c/tools/pack_python.py. Questo test fissa i
+        due punti ciechi che avevano fatto passare il difetto, perche' sono i
+        due modi in cui un file sfugge a chi guarda a occhio:
+
+        - un import dentro una funzione, dopo un sys.path.insert. E' il caso
+          di qwen38_image in openai_server.py, e l'ImportError li' e'
+          catturato e riscritto come "image support needs Pillow and numpy":
+          nel pacchetto pubblicato mandare un'immagine dava la colpa
+          all'ambiente dell'utente per un file che non avevamo spedito.
+        - un sottoprocesso scritto con lo spazio dopo la virgola,
+          os.path.join(TOOLS, "mirror_plan.py"). La mia prima grep cercava
+          TOOLS," senza spazio e non lo vedeva: quattro invocazioni, non tre.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+
+        reached = {path.name for path in pack_python.needed(repo / "c")}
+
+        # I sette file che mancavano davvero dall'archivio v1.10.0.
+        for name in ("convert_fp8_to_int4.py", "eval_glm.py",
+                     "fetch_benchmarks.py", "mirror_plan.py",
+                     "cluster.py", "glm53_image.py", "qwen38_image.py"):
+            self.assertIn(name, reached,
+                          f"{name} mancava dall'archivio v1.10.0 e il calcolo "
+                          f"non lo ritrova: #1296 si ripeterebbe")
+
+        release = (repo / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("pack_python.py c dist", release,
+                      "release.yml non calcola piu' i file da copiare")
+        self.assertIn("--check", release,
+                      "release.yml non verifica piu' l'archivio estratto")
+
+    def test_the_python_job_builds_every_engine_a_test_skips_without(self):
+        """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
+        non compila quel motore, e sparisce in silenzio: la classe si salta,
+        il job resta verde, e nessuno distingue "passato" da "mai eseguito".
+
+        E' successo davvero. Il job Python non compilava nessun motore, quindi
+        sette test fra test_kimi_usage_cli e test_inkling_prefix_serve non
+        giravano da sempre, e uno era rosso da quando il messaggio di kimi_k3
+        e' stato riscritto. E' la stessa forma del job dei sanitizer che
+        rieseguiva un binario senza strumentazione: verde perche' vuoto.
+
+        Il controllo va nella direzione che serve. Non chiede che il job
+        compili una certa lista, che sarebbe un'altra costante da tenere
+        allineata a mano: parte dai test, guarda su quale binario si saltano,
+        e pretende che il job lo costruisca.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        tests_dir = repo / "c" / "tests"
+        guard = re.compile(r'ENGINE\s*=\s*HERE\s*/\s*\(?\s*"([a-z0-9_]+)\.exe"'
+                           r'.*?else\s*"([a-z0-9_]+)"', re.S)
+        needed = {}
+        for path in sorted(tests_dir.glob("test_*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "skipUnless" not in text or "ENGINE.exists()" not in text:
+                continue
+            m = guard.search(text)
+            if m:
+                needed[m.group(2)] = path.name
+        self.assertTrue(needed,
+                        "nessun test guardato da ENGINE.exists() trovato: il "
+                        "controllo non sta piu' guardando niente")
+        ci = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        # Il corpo del job va da "  python:" fino al job successivo, cioe' la
+        # prossima riga indentata di due spazi esatti. Tagliare al primo "\n  "
+        # non funziona: le righe interne sono indentate di quattro e cominciano
+        # anch'esse per due spazi, quindi il corpo verrebbe vuoto e il test
+        # fallirebbe sempre, per la ragione sbagliata.
+        job = re.search(r"(?m)^  python:\n(.*?)(?=^  \S|\Z)", ci, re.S)
+        self.assertIsNotNone(job, "il job 'python:' non esiste piu' in ci.yml")
+        body = job.group(1)
+        # I bersagli veri di make, non il corpo del job: un commento che nomina
+        # "test_inkling_prefix_serve.py" contiene la parola "inkling" e farebbe
+        # passare il controllo senza che nulla venga compilato. Il controllo
+        # negativo di questo test lo ha dimostrato togliendo inkling dalla
+        # riga di build: passava lo stesso.
+        built = set()
+        for run_line in re.findall(r"(?m)^\s*run:\s*(.+)$", body):
+            m = re.search(r"\bmake\b(?:\s+-C\s+\S+)?\s+(.*)", run_line)
+            if m:
+                built.update(tok for tok in m.group(1).split() if not tok.startswith("-"))
+        for engine, where in sorted(needed.items()):
+            self.assertIn(engine, built,
+                          f"{where} si salta se '{engine}' non e' compilato, e il "
+                          f"job Python della CI non lo compila: quei test non "
+                          f"girano mai e il job resta verde perche' e' vuoto")
+
     def test_every_readme_banner_matches_the_declared_version(self):
         """Il banner dei README deve dire la versione che dichiara version.py.
 
@@ -1203,6 +1306,40 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertGreater(seen, 0,
                            "nessun banner 'colibri vX.Y.Z' trovato in alcun "
                            "README: il test non sta piu' controllando niente")
+
+    def test_the_site_shows_the_version_and_every_family(self):
+        """site/index.html deve dire la versione vera e nominare ogni famiglia.
+
+        Trovato fermo a "Currently shipping v1.7.0" con sei famiglie su otto:
+        quattro release e due modelli indietro. E' la sesta copia del numero di
+        versione e la quinta lista di famiglie, e ne' il contratto dei banner
+        (#1288) ne' quello dei README (#1287) la guardavano. Il sito e' la
+        prima cosa che un visitatore vede e l'ultima che ci si ricorda di
+        aggiornare: esattamente il posto per un contratto.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        site = (repo / "site" / "index.html").read_text(encoding="utf-8")
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        shown = re.search(r"Currently shipping <b>v([\d.]+)</b>", site)
+        self.assertIsNotNone(shown,
+                             "site/index.html: la riga 'Currently shipping' non "
+                             "c'e' piu'; il contratto non sta controllando niente")
+        self.assertEqual(shown.group(1), declared.group(1),
+                         f"il sito dice v{shown.group(1)} ma version.py dichiara "
+                         f"{declared.group(1)}: il visitatore legge una versione "
+                         f"vecchia")
+        for family in FAMILIES:
+            parts = []
+            for piece in family.display_name.split("-"):
+                if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                    break
+                parts.append(piece)
+            token = "-".join(parts) or family.display_name
+            self.assertTrue(token in site,
+                            f"site/index.html non nomina {family.display_name} "
+                            f"({family.id}): il sito mostra meno famiglie di "
+                            f"quante ne girano")
 
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
@@ -1258,8 +1395,21 @@ class FamilyRegistryTest(unittest.TestCase):
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
-        for text in (makefile, release, docker):
+        for text in (makefile, docker):
             self.assertIn("family_registry.py", text)
+        # release.yml non nomina piu' i singoli .py: da #1296 la lista la
+        # calcola pack_python.py seguendo gli import a partire da coli. Il
+        # contratto qui e' sempre lo stesso -- family_registry.py deve finire
+        # nell'archivio -- ma va verificato alla fonte nuova, se no si
+        # controlla che esista una riga invece che il file venga spedito.
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+        shipped = {path.name for path in pack_python.needed(repo / "c")}
+        self.assertIn("family_registry.py", shipped,
+                      "l'archivio non spedirebbe family_registry.py")
 
 
 if __name__ == "__main__":

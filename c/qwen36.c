@@ -57,6 +57,7 @@ static int qwen36_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
@@ -2545,6 +2546,33 @@ static int serve_eos_ids(int *ids, int cap){
     return n;
 }
 
+/* Un CANCEL per la richiesta in corso, visto SENZA bloccare (#1332).
+ *
+ * Prima serve_read_req era l'unico posto che leggeva un CANCEL, e viene
+ * chiamata solo fra una richiesta e l'altra: quando il comando arrivava, il
+ * turno che doveva fermare era gia' finito. Il gateway intanto manda CANCEL e
+ * aspetta l'ack tenendo l'ammissione dello scheduler, quindi un client che si
+ * disconnette non liberava niente.
+ *
+ * Ritorna 1 se e' arrivato un CANCEL/STOP per `id`. Le righe che non
+ * riconosciamo si scartano, com'e' sempre stato: la regola di compatibilita'
+ * del protocollo vale in tutte e due le direzioni. Un SUBMIT non puo'
+ * legalmente arrivare mentre l'unico slot e' occupato; se arriva viene
+ * ignorato qui e sara' la lettura normale a rifiutarlo.
+ *
+ * Non legge MAI se stdin non e' pronto: una getline bloccante qui fermerebbe la
+ * generazione in attesa di un comando che potrebbe non arrivare mai. */
+static int serve_cancel_pending(const char *id){
+    int cancelled = 0;
+    while(coli_serve_stdin_ready()){
+        char line[512], cmd[16], who[64];
+        if(!fgets(line,sizeof(line),stdin)) break;
+        if(sscanf(line,"%15s %63s",cmd,who)<2) continue;
+        if((!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) && !strcmp(who,id)) cancelled = 1;
+    }
+    return cancelled;
+}
+
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
@@ -2579,6 +2607,16 @@ static void serve_one(Model *m, ServeReq *q){
         unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
         if(cn>0) serve_data(q->id,(char*)chunk,cn);
         gen++;
+        /* #1332: una guardata a stdin per token. Il costo e' una select con
+         * timeout zero; il guadagno e' che il gateway smette di aspettare un
+         * turno che nessuno vuole piu'. */
+        if(serve_cancel_pending(q->id)){
+            free(lo); lo=NULL;
+            if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);
+            printf("ERROR %s CANCELLED\n",q->id); fflush(stdout);
+            free(ids);
+            return;
+        }
         /* The next logits are not needed after the final requested token.
          * serve_one() resets the recurrent/KV state for every request, so
          * stepping here would only run a full discarded decode pass. */
@@ -2721,7 +2759,23 @@ int main(int argc, char **argv) {
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
      * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
      * CPU int8 path. See qwen36_tier.h. */
-    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk, m.c.expert_gs)) {
+    /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
+     * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
+     * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
+     * riservare qualunque budget: e' int4 impacchettato che va in VRAM come
+     * fmt=4, int8 come fmt=1. Sbagliare qui era #1331 -- budget riservato,
+     * planned=1, e zero promozioni per tutta la vita del processo. */
+    int expert_is_int4 = 1;
+    {
+        char probe[256];
+        snprintf(probe, sizeof(probe),
+                 "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
+        st_tensor *pt = st_find(&m.S, probe);
+        int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
+        if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
+    }
+    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+                m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
@@ -2748,8 +2802,15 @@ int main(int argc, char **argv) {
             for (int gi = 0; gi < cap_total; gi++) {
                 int l = gi / m.c.n_experts, eidw = gi % m.c.n_experts;
                 Slot *e; expert_get(&m, l, eidw, &e);
-                if (planned[gi] && e->g4) {
-                    qt_note_planned(l, eidw, e->g4, e->u4, e->d4, e->gs, e->us, e->ds);
+                /* int4: i puntatori impacchettati; int8: i pesi stessi. Prima
+                 * qui si esigeva e->g4, che su un container int8 e' NULL: la
+                 * promozione non partiva mai e il budget restava riservato a
+                 * vuoto (#1331). */
+                const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
+                const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
+                const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
+                if (planned[gi] && wg) {
+                    qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
                     /* The staging copy is done; free the int8 copy RIGHT AWAY
                      * so it never shows up in peak RSS. On LFRU eviction
                      * slot_ensure_int8() rematerializes from g4 (no container
