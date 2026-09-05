@@ -373,6 +373,11 @@ class TemplateTest(unittest.TestCase):
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
 
+    def test_seed_no_longer_rejected_by_generation_options(self):
+        # generation_options() used to 400 on any `seed`; it is now a silent
+        # accept-and-discard (documented no-op).
+        generation_options({"seed": 1234, "prompt": "hi"}, 16)   # must not raise
+
     def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
         with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
             self.assertEqual(generation_options({}, 8)[1], 0.25)
@@ -1115,6 +1120,59 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
+
+
+class SeedWireFrameTest(unittest.TestCase):
+    """C1: `seed` is accepted and ignored. A stub-response equality check alone
+    is vacuous here (FakeEngine always returns the same canned text regardless
+    of any request field) -- the real proof is that the byte-exact SUBMIT frame
+    the dispatcher writes to the engine process (see DispatcherTest above) never
+    carries the seed value at all, seeded or not.
+    """
+
+    def _completion(self, body):
+        frames = []
+
+        def respond(process, frame):
+            frames.append(frame)
+            rid = frame.split()[1]
+            process.stdout.feed(b"DATA " + rid + b" 5\nHello\n")
+            process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = json.dumps(body).encode()
+            headers = {"Authorization": "Bearer secret", "Content-Type": "application/json"}
+            request = Request(f"http://127.0.0.1:{server.server_port}/v1/completions",
+                              data=data, headers=headers)
+            with urlopen(request, timeout=2) as response:
+                status = response.status
+                parsed = json.load(response)
+        finally:
+            server.scheduler.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            engine.close()
+        return status, parsed, frames[0]
+
+    def test_seed_accepted_and_absent_from_submit_frame(self):
+        base = {"model": "test-model", "prompt": "Complete me", "temperature": 0, "max_tokens": 4}
+        status_plain, body_plain, frame_plain = self._completion(base)
+        status_seeded, body_seeded, frame_seeded = self._completion({**base, "seed": 1234})
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_seeded, 200)
+        self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
+        # Each call uses a freshly-constructed Engine, so both first requests are
+        # assigned request id "1" -- the wire frames are directly byte-comparable,
+        # no field needs normalizing. If `seed` ever leaked onto the SUBMIT
+        # header or into an extension field, this equality would break.
+        self.assertEqual(frame_seeded, frame_plain)
 
 
 class CapSentinelShimTest(unittest.TestCase):

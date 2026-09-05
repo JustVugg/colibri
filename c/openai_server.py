@@ -2360,8 +2360,15 @@ def generation_options(body, limit):
         raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
-    if body.get("seed") is not None:
-        raise APIError(400, "Per-request seeds are not supported yet.", "seed", "unsupported_parameter")
+    # `seed`: accepted for OpenAI-API request-shape compatibility, then
+    # silently discarded -- it has NO effect on any code path today, at any
+    # temperature: no engine and no wire field reads a per-request seed.
+    # glm and inkling each seed a process-global RNG from SEED once, at
+    # launch, never per request; no other engine reads SEED or a
+    # per-request seed at all. (At temperature 0 the question is moot
+    # anyway -- greedy decoding has no distribution to seed.)
+    # Accept-and-discard stays the whole of the seed behavior for this
+    # build; docs/api.md documents the no-op honestly.
     # response_format -> optional per-request grammar for the engine's grammar-forced
     # draft source (#70/#148). NEVER a sampling constraint: drafts are verified, so a
     # schema the engine cannot compile degrades to "no speedup", not to an error and
