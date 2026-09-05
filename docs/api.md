@@ -152,6 +152,16 @@ own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
 
+Streaming commits its HTTP 200 only once the engine has accepted the prompt,
+the same rule the OpenAI-protocol endpoints follow: a refusal discovered
+before acceptance (an oversized prompt over the context limit, say, which
+is reported as HTTP 400) surfaces with its own mapped HTTP status in the
+Anthropic error envelope, not a committed 200 whose event stream then ends
+abruptly. On a healthy engine nothing observable changes — the SSE framing
+and event order are exactly as documented above. Until the engine accepts,
+no bytes are sent at all — a request queued behind another generation
+waits silently, exactly as the OpenAI-style streaming path already does.
+
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path
 > that is a long silent wait before the first token. Read it before you connect.
