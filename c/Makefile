@@ -1240,6 +1240,12 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c st.h uring.
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# The ablation mode's manifest loader, evidence writer and dispatch contract.
+# The adapter build bypasses only the model computation, so the parser/writer
+# path is exercised for real with no model and no weights.
+tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
 # the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
 tests/test_ablate$(EXE): tests/test_ablate.c abl.h

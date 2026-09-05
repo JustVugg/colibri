@@ -24,6 +24,8 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <stdarg.h>                               /* the ablation writer forwards a format list */
+#include <inttypes.h>                             /* fixed-width parsing and printing in the ablation manifest */
 #include <pthread.h>                              /* thread I/O del PILOTA */
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
@@ -66,6 +68,7 @@
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
+#include "evidence_digest.h"                     /* SHA-256 over the bytes an evidence mode consumed */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
@@ -169,6 +172,7 @@ typedef struct {
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
+    char config_sha256[65];                      /* digest of the loaded config.json bytes */
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -1637,7 +1641,7 @@ static char* cfg_slurp(const char *path){
     if((long)got!=n){ free(b); return NULL; }
     b[got]=0; return b;
 }
-static jval* cfg_root(const char *snap, char **arena){
+static jval *cfg_root(const char *snap, char **arena, char config_sha256[65]){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
     FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -1648,11 +1652,17 @@ static jval* cfg_root(const char *snap, char **arena){
     char *b=malloc((size_t)n+1); if(!b){ fprintf(stderr,"OOM reading %s (%ld bytes)\n",p,n); exit(1); }
     size_t got=fread(b,1,(size_t)n,f); b[got]=0; fclose(f);
     if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",p,(long)got,n);
+    /* Bind the exact bytes that were loaded, for callers that record them. */
+    if(config_sha256) evidence_sha256_hex(b,got,config_sha256);
     return json_parse(b,arena);
 }
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
 static void load_cfg(Cfg *c, const char *snap){
-    char *ar=NULL; jval *r=cfg_root(snap,&ar);
+    /* The digest costs a hash pass over config.json on every load; only the
+     * ABLATE_SCORE evidence path needs to name its config input, so it is the
+     * only caller that pays for it. c->config_sha256 stays unset otherwise. */
+    char *sha_out = getenv("ABLATE_SCORE") ? c->config_sha256 : NULL;
+    char *ar=NULL; jval *r=cfg_root(snap,&ar,sha_out);
     c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
     c->n_heads=gi(r,"num_attention_heads"); c->n_experts=gi(r,"n_routed_experts");
     c->topk=gi(r,"num_experts_per_tok"); c->moe_inter=gi(r,"moe_intermediate_size");
@@ -7773,7 +7783,7 @@ static void run_score(Model *m, const char *snap, const char *path){
      * prefissato (eval_glm.py post-#194) passa INTATTO. SCORE_PREFIX=0 -> comportamento nudo. */
     int pfx[2]={-1,-1}, pfx_on=0;
     if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
-        char *ar=NULL; jval *r=cfg_root(snap,&ar);
+        char *ar=NULL; jval *r=cfg_root(snap,&ar,NULL);   /* the prefix probe needs no digest */
         jval *mt=json_get(r,"model_type");
         if(mt_is_glm(mt?mt->str:NULL)){
             char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
@@ -7835,88 +7845,785 @@ static void run_score(Model *m, const char *snap, const char *path){
  *   ncells  = # ablated cells (0 for baseline)
  *   L E A   = layer, expert, swap-target (A=-1 unless mode 3), one triple per cell
  *   t_*     = token ids (host pre-tokenised, prefix included if the model needs it)
- * abl_reset() before each item makes the ablation PER-ITEM (an item's spec can
+ * The whole manifest is strictly validated and SHA-256 bound before output;
+ * empty/malformed/duplicate-ID or zero-target inputs fail closed. abl_reset()
+ * before each item makes the ablation PER-ITEM (an item's spec can
  * never leak into the next). NLL/margin/correctness are exact; top-K is for a
  * paired approximate next-token KL on the host. */
 #define ABL_LOGIT_TOPK 32
-static void run_ablate_score(Model *m, const char *path){
-    Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
-    FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
-    const char *outp=getenv("ABLATE_OUT");
-    FILE *of = outp ? fopen(outp,"wb") : NULL;
-    if(outp && !of){ fprintf(stderr,"[ablate] cannot open ABLATE_OUT=%s\n",outp); }
-    if(of) fprintf(of,"{\"t\":\"hdr\",\"schema\":\"coli-ablate/1\",\"vocab\":%d,\"topk\":%d}\n",V,ABL_LOGIT_TOPK);
-    int maxT=1; { char *ln=NULL; size_t cp=0;
-        while(getline(&ln,&cp,f)>0){ long id,T; char *e;
-            id=strtol(ln,&e,10); if(e==ln) continue; T=strtol(e,&e,10);
-            if(T>maxT) maxT=(int)T; (void)id; }
-        free(ln); }
-    kv_alloc(m,maxT);
-    float *x=falloc((int64_t)maxT*D), *lo=falloc(V), *row=falloc(D);
-    int *ids=malloc((size_t)maxT*sizeof(int));
-    int tk_id[ABL_LOGIT_TOPK]; float tk_val[ABL_LOGIT_TOPK];
-    rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
-    while(getline(&ln,&cp,f)>0){
-        char *p=ln, *e;
-        long item=strtol(p,&e,10); if(e==p) continue; p=e;                 /* blank line */
-        long T=strtol(p,&e,10);  if(e==p){ fprintf(stderr,"[ablate] bad T\n"); continue; } p=e;
-        long np=strtol(p,&e,10); if(e==p){ fprintf(stderr,"[ablate] bad n_prompt\n"); continue; } p=e;
-        long mode=strtol(p,&e,10); if(e==p){ fprintf(stderr,"[ablate] bad mode\n"); continue; } p=e;
-        long nc=strtol(p,&e,10);  if(e==p){ fprintf(stderr,"[ablate] bad ncells\n"); continue; } p=e;
-        int Ls[ABL_MAX_CELLS], Es[ABL_MAX_CELLS], As[ABL_MAX_CELLS];
-        int bad=0; long ncc = nc<0?0:(nc>ABL_MAX_CELLS?ABL_MAX_CELLS:nc);
-        for(long i=0;i<nc;i++){                                            /* read every triple; keep first ABL_MAX_CELLS */
-            long L=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
-            long E=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
-            long A=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
-            if(i<ncc){ Ls[i]=(int)L; Es[i]=(int)E; As[i]=(int)A; }
+/* Upper bound on one manifest item's declared token count.  A teacher-forced
+ * ablation item is a prompt plus a short continuation; a million tokens is
+ * orders of magnitude above anything a study uses, and it keeps a hostile or
+ * corrupt manifest from asking the loader for an arbitrary allocation. */
+#define ABLATE_MAX_ITEM_TOKENS (1<<20)
+
+static int logit_topk_count(int V, int requested){
+    if(V<=0 || requested<=0) return 0;
+    int k=requested;
+    if(k>ABL_LOGIT_TOPK) k=ABL_LOGIT_TOPK;
+    if(k>V) k=V;
+    return k;
+}
+
+static void logprob_refusal(const char *surface, unsigned long long owner,
+                            int64_t position, const char *field,
+                            LogprobStatus status){
+    fprintf(stderr,
+        "[numeric] INCOMPLETE: surface=%s owner=%llu position=%" PRId64
+        " field=%s class=%s\n",
+        surface,owner,position,field,logprob_status_name(status));
+}
+
+/* For finite rows, select real vocabulary entries without a numeric sentinel.
+ * Filling empty slots in encounter order and replacing only on strict greater-
+ * than preserves the historical first-minimum-SLOT behavior and unsorted slot
+ * order.  This is deliberately not a lowest-token-id tie rule: [0,0,1] at
+ * k=2 emits token ids [2,1].
+ *
+ * Exceptional rows are rejected by the classified numeric-status layer before
+ * this finite-only selector is reached. */
+static int logit_topk_select(const float *lo, int V, int requested,
+                             int *tk_id, float *tk_val,
+                             int *status_out){
+    if(status_out) *status_out=0;
+    if(!lo || !tk_id || !tk_val || V<=0) return 0;
+    int k=logit_topk_count(V,requested);
+    if(k==0) return 0;
+    int finite=1;
+    for(int i=0;i<V;i++) if(!isfinite(lo[i])){ finite=0; break; }
+    if(!finite){
+        LogprobRow row;
+        LogprobStatus status=logprob_row_checked(lo,V,&row);
+        if(status_out) *status_out=(int)status;
+        return 0;
+    }
+
+    for(int j=0;j<k;j++) tk_id[j]=-1;
+    for(int i=0;i<V;i++){
+        int slot=-1;
+        for(int j=0;j<k;j++) if(tk_id[j]<0){ slot=j; break; }
+        if(slot<0){
+            int mn=0;
+            for(int j=1;j<k;j++) if(tk_val[j]<tk_val[mn]) mn=j;
+            if(!(lo[i]>tk_val[mn])) continue;
+            slot=mn;
         }
-        bad = bad || (T<1 || T>maxT || np<0 || np>T || mode<0 || mode>3);
-        for(long i=0;i<T && !bad;i++){ long v=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
-            if(v<0 || v>=V) bad=1; else ids[i]=(int)v; }
-        if(bad){ fprintf(stderr,"[ablate] ERR item %ld (bad field/token)\n",item); continue; }
+        tk_id[slot]=i;
+        tk_val[slot]=lo[i];
+    }
+    return k;
+}
+
+typedef struct {
+    char digest[65];
+    char config_sha256[65];
+    int64_t items;
+    int64_t targets;
+    int maxT;
+    int n_layers;
+    int first_dense;
+    int n_experts;
+} AblateManifestInfo;
+
+/* Parse one canonical signed-64 decimal, independent of host ``long`` width.
+ * The ABLATE manifest is intentionally narrower than generic strtoimax input:
+ * no plus, leading zero, -0, tabs, CR, or trailing whitespace.  A canonical
+ * byte stream then has one stable digest. */
+static int ablate_manifest_i64(const char **cursor, const char *end,
+                               int64_t *out){
+    const char *p=*cursor;
+    if(p>=end) return -1;
+    int negative=(*p=='-');
+    if(negative && ++p>=end) return -1;
+    if(*p<'0' || *p>'9') return -1;
+    if(*p=='0' && p+1<end && p[1]>='0' && p[1]<='9') return -1;
+    if(negative && *p=='0') return -1;
+    errno=0; char *after=NULL;
+    intmax_t value=strtoimax(*cursor,&after,10);
+    if(errno==ERANGE || after==*cursor || after>end ||
+            value<INT64_MIN || value>INT64_MAX) return -1;
+    *cursor=after; *out=(int64_t)value;
+    return 0;
+}
+
+static int ablate_manifest_space(const char **cursor, const char *end){
+    if(*cursor>=end || **cursor!=' ') return -1;
+    (*cursor)++;
+    return 0;
+}
+
+/* One manifest item id together with the line it was read from.  The duplicate
+ * check sorts these, so the line has to travel with the id: reporting the last
+ * line of the file instead would point a reader at the wrong record. */
+typedef struct {
+    int64_t item;
+    int64_t line;
+} AblateItemRef;
+
+static int ablate_item_ref_compare(const void *av, const void *bv){
+    const AblateItemRef *a=(const AblateItemRef *)av, *b=(const AblateItemRef *)bv;
+    if(a->item!=b->item) return (a->item>b->item)-(a->item<b->item);
+    return (a->line>b->line)-(a->line<b->line);
+}
+
+static int ablate_count_add(int64_t *total, int64_t increment){
+    if(!total || *total<0 || increment<0 || *total>INT64_MAX-increment)
+        return -1;
+    *total+=increment;
+    return 0;
+}
+
+typedef struct {
+    int64_t item;
+    int T;
+    int n_prompt;
+    int mode;
+    int ncells;
+    int layers[ABL_MAX_CELLS];
+    int experts[ABL_MAX_CELLS];
+    int applied[ABL_MAX_CELLS];
+    int *tokens;
+} AblateManifestItem;
+
+typedef struct {
+    AblateManifestInfo info;
+    AblateManifestItem *items;
+    size_t count;
+} AblateManifest;
+
+static int evidence_sha256_text_valid(const char *text){
+    if(!text) return 0;
+    for(int i=0;i<64;i++)
+        if(!((text[i]>='0' && text[i]<='9') ||
+             (text[i]>='a' && text[i]<='f'))) return 0;
+    return text[64]==0;
+}
+
+static void ablate_manifest_free(AblateManifest *manifest){
+    if(!manifest) return;
+    for(size_t i=0;i<manifest->count;i++) free(manifest->items[i].tokens);
+    free(manifest->items);
+    memset(manifest,0,sizeof(*manifest));
+}
+
+/* Parse and freeze the complete positive denominator before any output or
+ * model work.  The digest and the owned parsed rows come from these same bytes;
+ * execution never rereads the caller-owned FILE. */
+/* Name the precondition that failed, or NULL when they all hold.  A refusal
+ * with no reason on stderr is indistinguishable from a crash to whoever runs
+ * the mode, so every caller of this prints what it returns. */
+static const char *ablate_precondition_reason(FILE *f, const Cfg *c){
+    if(!f) return "no manifest stream";
+    if(!c) return "no loaded model configuration";
+    if(c->vocab<=0 || c->vocab>(1<<24)) return "vocabulary size out of range (1..16777216)";
+    if(c->n_layers<=0 || c->n_layers>128) return "layer count out of range (1..128)";
+    if(c->first_dense<0 || c->first_dense>c->n_layers)
+        return "first routed layer out of range (0..layer count)";
+    if(c->n_experts<=0 || c->n_experts>4096) return "expert count out of range (1..4096)";
+    if(!evidence_sha256_text_valid(c->config_sha256))
+        return "the loaded config.json was not digested, so evidence could not name it";
+    return NULL;
+}
+
+static int ablate_manifest_load(FILE *f, const Cfg *c,
+                                AblateManifest *manifest){
+    if(!manifest){
+        fprintf(stderr,"[ablate] INCOMPLETE: no manifest destination\n");
+        return 1;
+    }
+    memset(manifest,0,sizeof(*manifest));
+    const char *reason=ablate_precondition_reason(f,c);
+    if(reason){
+        fprintf(stderr,"[ablate] INCOMPLETE: %s\n",reason);
+        return 1;
+    }
+    int V=c->vocab;
+    clearerr(f); rewind(f);
+    EvidenceSha256 hash;
+    evidence_sha256_init(&hash);
+    static const char domain[]="coli-ablate-manifest/2\n";
+    evidence_sha256_update(&hash,domain,sizeof(domain)-1);
+    AblateItemRef *item_ids=NULL;
+    size_t item_cap=0, item_count=0, row_cap=0;
+    int64_t target_count=0;
+    int maxT=1, rc=0;
+    char *line=NULL; size_t cap=0; ssize_t length; int64_t line_no=0, bad_line=0;
+    int named=0;                      /* a specific reason was already printed */
+    while((length=getline(&line,&cap,f))>0){
+        line_no++;
+        /* Accept the two framings a host editor produces without meaning to:
+         * a CRLF line ending, and a last line with no terminator at all.  The
+         * record is normalised to its bare text here and the digest below is
+         * taken over the normalised bytes, so the same manifest content always
+         * produces the same digest however it was saved.  Anything else -- a
+         * stray carriage return inside a record, an embedded NUL, an empty
+         * line -- is still refused. */
+        size_t len=(size_t)length;
+        if(line[len-1]=='\n') len--;
+        if(len && line[len-1]=='\r') len--;
+        if(len==0 || memchr(line,'\r',len) || memchr(line,'\0',len)){
+            rc=1; break;
+        }
+        const char *record_end=line+len, *p=line;
+        int64_t item,T,np,mode,nc;
+        if(ablate_manifest_i64(&p,record_end,&item)<0 ||
+           ablate_manifest_space(&p,record_end)<0 ||
+           ablate_manifest_i64(&p,record_end,&T)<0 ||
+           ablate_manifest_space(&p,record_end)<0 ||
+           ablate_manifest_i64(&p,record_end,&np)<0 ||
+           ablate_manifest_space(&p,record_end)<0 ||
+           ablate_manifest_i64(&p,record_end,&mode)<0 ||
+           ablate_manifest_space(&p,record_end)<0 ||
+           ablate_manifest_i64(&p,record_end,&nc)<0){
+            rc=1; break;
+        }
+        /* A manifest is host input: an item may not ask for an unbounded
+         * allocation by declaring an enormous length.  The cap is far above any
+         * teacher-forced item a study runs -- the engine also allocates
+         * maxT * hidden floats for the prefill -- and it bounds the token array
+         * this loop is about to allocate to a few megabytes. */
+        if(T>ABLATE_MAX_ITEM_TOKENS){
+            fprintf(stderr,"[ablate] INCOMPLETE: line %" PRId64 " declares %" PRId64
+                    " tokens, above the %d-token limit for one item\n",
+                    line_no,T,ABLATE_MAX_ITEM_TOKENS);
+            named=1; rc=1; bad_line=line_no; break;
+        }
+        if(item<0 || T<2 || T>INT_MAX || np<1 || np>=T ||
+                mode<0 || mode>3 || nc<0 || nc>ABL_MAX_CELLS ||
+                (mode==0 ? nc!=0 : nc==0)){
+            rc=1; break;
+        }
+        AblateManifestItem row={0};
+        row.item=item; row.T=(int)T; row.n_prompt=(int)np;
+        row.mode=(int)mode; row.ncells=(int)nc;
+        for(int64_t i=0;i<nc;i++){
+            int64_t L,E,A;
+            if(ablate_manifest_space(&p,record_end)<0 ||
+               ablate_manifest_i64(&p,record_end,&L)<0 ||
+               ablate_manifest_space(&p,record_end)<0 ||
+               ablate_manifest_i64(&p,record_end,&E)<0 ||
+               ablate_manifest_space(&p,record_end)<0 ||
+               ablate_manifest_i64(&p,record_end,&A)<0 ||
+               L<c->first_dense || L>=c->n_layers ||
+               E<0 || E>=c->n_experts ||
+               A<INT_MIN || A>INT_MAX ||
+               (mode==3 ? (A<0 || A>=c->n_experts || A==E) : A!=-1)){
+                rc=1; break;
+            }
+            for(int64_t j=0;j<i;j++)
+                if(row.layers[j]==(int)L && row.experts[j]==(int)E){
+                    rc=1; break;
+                }
+            if(rc) break;
+            row.layers[i]=(int)L; row.experts[i]=(int)E;
+            row.applied[i]=(int)A;
+        }
+        if(!rc && (uintmax_t)T>(uintmax_t)(SIZE_MAX/sizeof(*row.tokens))) rc=1;
+        if(!rc){ row.tokens=malloc((size_t)T*sizeof(*row.tokens)); if(!row.tokens) rc=1; }
+        for(int64_t i=0;i<T && !rc;i++){
+            int64_t token;
+            if(ablate_manifest_space(&p,record_end)<0 ||
+               ablate_manifest_i64(&p,record_end,&token)<0 ||
+               token<0 || token>=V) rc=1;
+            else row.tokens[i]=(int)token;
+        }
+        if(rc || p!=record_end) { free(row.tokens); rc=1; break; }
+        if(item_count==item_cap){
+            size_t next=item_cap ? item_cap*2 : 32;
+            if(next<item_cap || next>SIZE_MAX/sizeof(*item_ids)){
+                free(row.tokens); rc=1; break;
+            }
+            AblateItemRef *grown=realloc(item_ids,next*sizeof(*item_ids));
+            if(!grown){ free(row.tokens); rc=1; break; }
+            item_ids=grown; item_cap=next;
+        }
+        if(item_count==row_cap){
+            size_t next=row_cap ? row_cap*2 : 32;
+            if(next<row_cap || next>SIZE_MAX/sizeof(*manifest->items)){
+                free(row.tokens); rc=1; break;
+            }
+            AblateManifestItem *grown=realloc(
+                manifest->items,next*sizeof(*manifest->items));
+            if(!grown){ free(row.tokens); rc=1; break; }
+            manifest->items=grown; row_cap=next;
+        }
+        item_ids[item_count]=(AblateItemRef){item,line_no};
+        item_count++;
+        manifest->items[manifest->count++]=row;
+        int64_t row_targets=T-np;
+        if(ablate_count_add(&target_count,row_targets)<0){ rc=1; break; }
+        if(T>maxT) maxT=(int)T;
+        evidence_sha256_update(&hash,line,len);
+        evidence_sha256_update(&hash,"\n",1);
+    }
+    if(ferror(f) || item_count==0 || target_count<=0 ||
+            (uintmax_t)item_count>(uintmax_t)INT64_MAX) rc=1;
+    if(!rc){
+        qsort(item_ids,item_count,sizeof(*item_ids),ablate_item_ref_compare);
+        for(size_t i=1;i<item_count;i++)
+            if(item_ids[i].item==item_ids[i-1].item){
+                /* Sorted by id then line, so this entry is the later of the
+                 * two: the record that repeats an id already used. */
+                bad_line=item_ids[i].line;
+                rc=1; break;
+            }
+    }
+    if(rc && !named){
+        int64_t at=bad_line ? bad_line : (line_no ? line_no : 1);
+        fprintf(stderr,"[ablate] invalid canonical manifest at line %" PRId64 "\n",at);
+    }
+    if(!rc){
+        unsigned char raw[32]; static const char hex[]="0123456789abcdef";
+        evidence_sha256_final(&hash,raw);
+        for(int i=0;i<32;i++){
+            manifest->info.digest[2*i]=hex[raw[i]>>4];
+            manifest->info.digest[2*i+1]=hex[raw[i]&15];
+        }
+        manifest->info.digest[64]=0;
+        memcpy(manifest->info.config_sha256,c->config_sha256,65);
+        manifest->info.items=(int64_t)item_count;
+        manifest->info.targets=target_count;
+        manifest->info.maxT=maxT;
+        manifest->info.n_layers=c->n_layers;
+        manifest->info.first_dense=c->first_dense;
+        manifest->info.n_experts=c->n_experts;
+    }
+    free(line); free(item_ids); clearerr(f); rewind(f);
+    if(rc) ablate_manifest_free(manifest);
+    return rc;
+}
+
+typedef struct AblateWriter AblateWriter;
+struct AblateWriter {
+    void *ctx;
+    int (*vprintf_fn)(void *ctx, const char *fmt, va_list ap);
+    int (*puts_fn)(void *ctx, const char *text);
+    int (*flush_fn)(void *ctx);
+    int (*close_fn)(void *ctx);
+};
+
+static int ablate_writer_printf(AblateWriter *w, const char *fmt, ...){
+    if(!w || !w->ctx || !w->vprintf_fn) return -1;
+    va_list ap; va_start(ap,fmt);
+    int n=w->vprintf_fn(w->ctx,fmt,ap);
+    va_end(ap);
+    return n;
+}
+
+static int ablate_writer_puts(AblateWriter *w, const char *text){
+    return (!w || !w->ctx || !w->puts_fn) ? -1 : w->puts_fn(w->ctx,text);
+}
+
+static int ablate_writer_flush(AblateWriter *w){
+    return (!w || !w->ctx || !w->flush_fn) ? -1 : w->flush_fn(w->ctx);
+}
+
+static int ablate_file_vprintf(void *ctx, const char *fmt, va_list ap){
+    return vfprintf((FILE *)ctx,fmt,ap);
+}
+static int ablate_file_puts(void *ctx, const char *text){
+    return fputs(text,(FILE *)ctx)==EOF ? -1 : 0;
+}
+static int ablate_file_flush(void *ctx){ return fflush((FILE *)ctx)==0 ? 0 : -1; }
+static int ablate_file_close(void *ctx){ return fclose((FILE *)ctx)==0 ? 0 : -1; }
+
+static int ablate_writer_open(AblateWriter *w, const char *path){
+    /* Evidence output is new-file-only.  O_EXCL makes the path-name decision
+     * atomic: an exact/normalised source path, hard link, symbolic link, or any
+     * other existing destination is refused before a byte can be truncated.
+     * The caller keeps the already-open manifest descriptor live through this
+     * operation, so a newly created inode cannot identify that source. */
+    int fd=open(path,O_WRONLY|O_CREAT|O_EXCL|COMPAT_O_BINARY,0666);
+    if(fd<0){ memset(w,0,sizeof(*w)); return -1; }
+    FILE *f=fdopen(fd,"wb");
+    if(!f){
+        int saved=errno;
+        close(fd);
+        errno=saved;
+        memset(w,0,sizeof(*w));
+        return -1;
+    }
+    *w=(AblateWriter){f,ablate_file_vprintf,ablate_file_puts,
+                      ablate_file_flush,ablate_file_close};
+    return 0;
+}
+
+/* Always attempt close even if flush failed, and preserve either failure. */
+static int ablate_writer_finish(AblateWriter *w){
+    if(!w || !w->ctx) return -1;
+    void *ctx=w->ctx;
+    int bad=(!w->flush_fn || w->flush_fn(ctx)<0);
+    if(!w->close_fn || w->close_fn(ctx)<0) bad=1;
+    memset(w,0,sizeof(*w));
+    return bad ? -1 : 0;
+}
+
+typedef int (*AblateOutputOpenFn)(void *ctx, AblateWriter *w,
+                                  const char *path);
+typedef int (*AblateOutputBodyFn)(void *ctx, AblateWriter *of);
+typedef struct {
+    void *ctx;
+    AblateOutputOpenFn open_fn;
+    AblateOutputBodyFn body_fn;
+    const AblateManifestInfo *manifest;
+    int64_t *completed_items;
+    int64_t *completed_targets;
+} AblateOutputRun;
+
+static int ablate_file_open_run(void *ctx, AblateWriter *w,
+                                const char *path){
+    (void)ctx;
+    return ablate_writer_open(w,path);
+}
+
+static int ablate_header_line(AblateWriter *of, int V,
+                              const AblateManifestInfo *manifest){
+    if(!manifest) return -1;
+    int topk=logit_topk_count(V,ABL_LOGIT_TOPK);
+    return ablate_writer_printf(of,
+        "{\"t\":\"hdr\",\"schema\":\"coli-ablate/2\",\"vocab\":%d,\"topk\":%d,"
+        "\"n_layers\":%d,\"first_dense\":%d,\"n_experts\":%d,"
+        "\"config_sha256\":\"%s\","
+        "\"manifest_sha256\":\"%s\",\"expected_items\":%" PRId64
+        ",\"expected_targets\":%" PRId64 "}\n",
+        V,topk,manifest->n_layers,manifest->first_dense,
+        manifest->n_experts,manifest->config_sha256,manifest->digest,
+        manifest->items,manifest->targets)<0 ? -1 : 0;
+}
+
+static int ablate_done_line(AblateWriter *of,
+                            const AblateManifestInfo *manifest,
+                            int64_t completed_items,
+                            int64_t completed_targets){
+    if(!manifest) return -1;
+    return ablate_writer_printf(of,
+        "{\"t\":\"done\",\"manifest_sha256\":\"%s\","
+        "\"completed_items\":%" PRId64
+        ",\"completed_targets\":%" PRId64 "}\n",
+        manifest->digest,completed_items,completed_targets)<0 ? -1 : 0;
+}
+
+/* Requested-output orchestration shared by the real ABLATE driver and its
+ * model-free caller-chain gate.  A missing ABLATE_OUT remains optional; once
+ * a path is requested, every open/header/body/finalize failure is a failed
+ * mode result.  Finalize always attempts close after flush. */
+static int ablate_output_run(AblateOutputRun *run, const char *outp, int V){
+    if(!run || !run->body_fn || !run->manifest ||
+            !run->completed_items || !run->completed_targets ||
+            run->manifest->items<=0 || run->manifest->targets<=0){
+        fprintf(stderr,"[ablate] INCOMPLETE: nothing to run "
+                "(the manifest produced no items or targets)\n");
+        return 1;
+    }
+    *run->completed_items=0; *run->completed_targets=0;
+    AblateWriter writer={0}, *of=NULL;
+    int rc=0;
+    if(outp){
+        if(!run->open_fn || run->open_fn(run->ctx,&writer,outp)<0){
+            fprintf(stderr,
+                "[ablate] INCOMPLETE: ABLATE_OUT must be a new file: %s\n",
+                outp);
+            return 1;
+        }
+        of=&writer;
+        if(ablate_header_line(of,V,run->manifest)<0){
+            fprintf(stderr,"[ablate] cannot write requested ABLATE_OUT=%s\n",outp);
+            rc=1;
+        }
+    }
+    if(!rc && run->body_fn(run->ctx,of)!=0) rc=1;
+    if(!rc && (*run->completed_items!=run->manifest->items ||
+               *run->completed_targets!=run->manifest->targets)){
+        fprintf(stderr,"[ablate] completion denominator mismatch: "
+                "%" PRId64 "/%" PRId64 " items, "
+                "%" PRId64 "/%" PRId64 " targets\n",
+                *run->completed_items,run->manifest->items,
+                *run->completed_targets,run->manifest->targets);
+        rc=1;
+    }
+    if(!rc && of && ablate_done_line(of,run->manifest,
+            *run->completed_items,*run->completed_targets)<0) rc=1;
+    if(of && ablate_writer_finish(of)<0) rc=1;
+    if(rc && outp)
+        fprintf(stderr,"[ablate] requested ABLATE_OUT=%s is incomplete\n",outp);
+    return rc;
+}
+
+static int ablate_item_line(AblateWriter *of, int64_t item, int64_t mode,
+                            int64_t nc, int64_t T, int64_t np,
+                            const int *Ls, const int *Es,
+                            const int *As){
+    if(ablate_writer_printf(of,
+        "{\"t\":\"ah\",\"item\":%" PRId64
+        ",\"mode\":%" PRId64 ",\"ncells\":%" PRId64
+        ",\"T\":%" PRId64 ",\"n_prompt\":%" PRId64
+        ",\"cells\":[",
+        item,mode,nc,T,np)<0) return -1;
+    for(int i=0;i<(int)nc;i++)
+        if(ablate_writer_printf(of,"%s[%d,%d,%d]",i?",":"",Ls[i],Es[i],As[i])<0)
+            return -1;
+    return ablate_writer_puts(of,"]}\n");
+}
+
+/* Keep the ABLATE numeric schema in one callable formatter so the exact
+ * production emission can be round-trip tested without loading a model.
+ * Raw diagnostic logits retain their existing compact precision; nll, logZ,
+ * and the requested top-k numeric fields are the precision-corrected sites. */
+static int ablate_logit_line(AblateWriter *of, int64_t item, int64_t pos,
+                             int gold,
+                             double nll, float glogit, float molo, float mgn,
+                             int am, float amlogit, double logZ, int corr,
+                             int topk, const int *tk_id, const float *tk_val){
+    int n=ablate_writer_printf(of,"{\"t\":\"lg\",\"item\":%" PRId64
+                     ",\"pos\":%" PRId64 ",\"gold\":%d,\"nll\":%.17g,"
+                     "\"glogit\":%.6g,\"molo\":%.6g,\"mgn\":%.6g,\"am\":%d,\"amlogit\":%.6g,"
+                     "\"logZ\":%.17g,\"corr\":%d,\"tk\":[",
+                  item,pos,gold,nll,(double)glogit,(double)molo,(double)mgn,
+                  am,(double)amlogit,logZ,corr);
+    if(n<0) return -1;
+    for(int k=0;k<topk;k++)
+        if(ablate_writer_printf(of,"%s[%d,%.17g]",k?",":"",tk_id[k],(double)tk_val[k])<0) return -1;
+    return ablate_writer_puts(of,"]}\n");
+}
+
+/* This is the actual production row-calculation/selection/format seam used by
+ * run_ablate_score and by the model-free formula gate. */
+static int ablate_logit_record(AblateWriter *of, int64_t item, int64_t pos,
+                                int gold,
+                                const float *lo, int V){
+    if(!of) return 0;                 /* ABLATE_OUT was not requested: no work */
+    if(!lo || V<=0 || gold<0 || gold>=V){
+        fprintf(stderr,"[ablate] INCOMPLETE: item %" PRId64 " position %" PRId64
+                " has no readable logit row\n",item,pos);
+        return -1;
+    }
+    LogprobRow lpr;
+    LogprobStatus status=logprob_row_checked(lo,V,&lpr);
+    if(status!=LOGPROB_FINITE){
+        logprob_refusal("ABLATE",(unsigned long long)item,pos,"row",status);
+        return -1;
+    }
+    float mx=lpr.max;
+    double target_lp=0;
+    status=logprob_from_row_checked(lo,gold,&lpr,&target_lp);
+    if(status!=LOGPROB_FINITE){
+        logprob_refusal("ABLATE",(unsigned long long)item,pos,"target",status);
+        return -1;
+    }
+    /* The classified read above decides whether this position is reportable at
+     * all.  The reported value itself is the subtraction done wholly in double,
+     * which is what this mode has always written: taking the difference in
+     * float first would round away up to an ulp of the largest logit, and on a
+     * widely spread row that is a visible amount. */
+    double gnll=lpr.logZ-(double)lo[gold];
+    if(!isfinite(gnll)){
+        logprob_refusal("ABLATE",(unsigned long long)item,pos,"nll",
+                        LOGPROB_FINITE_OVERFLOW);
+        return -1;
+    }
+    /* V==1 has no competitor and retains the historical finite sentinel.
+     * For every real competitor set, seed from an actual non-gold logit so a
+     * finite value below -1e30 cannot be hidden and margin overflow is refused. */
+    float molo=-1e30f;
+    if(V>=2){
+        int competitor=gold==0?1:0;
+        molo=lo[competitor];
+        for(int i=0;i<V;i++) if(i!=gold && lo[i]>molo) molo=lo[i];
+    }
+    float mgn=lo[gold]-molo;
+    if(!isfinite(mgn)){
+        logprob_refusal("ABLATE",(unsigned long long)item,pos,"margin",
+                        LOGPROB_FINITE_OVERFLOW);
+        return -1;
+    }
+    int tk_id[ABL_LOGIT_TOPK]; float tk_val[ABL_LOGIT_TOPK];
+    int topk_status=0;
+    int topk=logit_topk_select(lo,V,ABL_LOGIT_TOPK,tk_id,tk_val,&topk_status);
+    if(topk!=logit_topk_count(V,ABL_LOGIT_TOPK)){
+        logprob_refusal("ABLATE",(unsigned long long)item,pos,"topk",
+                        topk_status ? (LogprobStatus)topk_status : LOGPROB_INVALID);
+        return -1;
+    }
+    return ablate_logit_line(of,item,pos,gold,gnll,lo[gold],molo,mgn,
+                             lpr.argmax,mx,lpr.logZ,lpr.argmax==gold,
+                             topk,tk_id,tk_val);
+}
+
+typedef int (*AblateRowOutputFn)(void *ctx, AblateWriter *of, int64_t pos);
+
+/* One item's actual row-caller and per-item flush chain.  With no requested
+ * output it performs no logprob work, matching the historical optional path. */
+static int ablate_item_output(AblateWriter *of, int64_t first, int64_t end,
+                              AblateRowOutputFn row_fn, void *ctx){
+    if(!of) return 0;
+    if(!row_fn){
+        fprintf(stderr,"[ablate] INCOMPLETE: no row reader for the requested output\n");
+        return 1;
+    }
+    for(int64_t pos=first;pos<end;pos++)
+        if(row_fn(ctx,of,pos)<0) return 1;
+    return ablate_writer_flush(of)<0 ? 1 : 0;
+}
+
+typedef struct {
+    Model *m;
+    float *x;
+    float *row;
+    float *lo;
+    const int *ids;
+    int64_t item;
+    int D;
+    int V;
+} AblateModelRows;
+
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+/* Compile-only state for the model-free adapter gate.  The product build has
+ * no runtime test mode: the gate borrows a manifest, bypasses only model math,
+ * and enters the same production parser/writer/status adapters. */
+typedef struct {
+    FILE *borrowed_manifest;
+    void (*after_manifest_load)(FILE *manifest);
+    int bypass_model_compute;
+    int force_body_rc;
+    int override_outp;
+    const char *outp;
+    Model *main_model;
+    const char *main_path;
+    int observed_first_token;
+    const float *forced_row;          /* NULL: use the default -i row */
+} AblateAdapterTestState;
+static AblateAdapterTestState g_ablate_adapter_test;
+#define ABLATE_MODEL_COMPUTE_ENABLED (!g_ablate_adapter_test.bypass_model_compute)
+#else
+#define ABLATE_MODEL_COMPUTE_ENABLED 1
+#endif
+
+static int ablate_model_row_output(void *ctx, AblateWriter *of, int64_t pos){
+    AblateModelRows *rows=(AblateModelRows *)ctx;
+    Model *m=rows->m; Cfg *c=&m->c;
+    if(ABLATE_MODEL_COMPUTE_ENABLED){
+        rmsnorm(rows->row, rows->x+(int64_t)pos*rows->D,
+                m->final_norm, rows->D, c->eps);
+        matmul_qt(rows->lo, rows->row, &m->lm_head, 1);
+    }
+    return ablate_logit_record(of,rows->item,pos,rows->ids[pos+1],
+                               rows->lo,rows->V);
+}
+
+typedef struct {
+    Model *m;
+    const AblateManifest *manifest;
+    int64_t completed_items;
+    int64_t completed_targets;
+} AblateModelRun;
+
+static int ablate_model_output_body(void *ctx, AblateWriter *of){
+    AblateModelRun *run=(AblateModelRun *)ctx;
+    Model *m=run->m;
+    if(!run->manifest || run->manifest->count==0){
+        fprintf(stderr,"[ablate] INCOMPLETE: the manifest holds no items\n");
+        return 1;
+    }
+    Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
+    int maxT=run->manifest->info.maxT;
+    run->completed_items=0; run->completed_targets=0;
+    if(ABLATE_MODEL_COMPUTE_ENABLED) kv_alloc(m,maxT);
+    float *x=falloc((int64_t)maxT*D), *lo=falloc(V), *row=falloc(D);
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+    if(g_ablate_adapter_test.bypass_model_compute){
+        if(g_ablate_adapter_test.forced_row)
+            for(int i=0;i<V;i++) lo[i]=g_ablate_adapter_test.forced_row[i];
+        else
+            for(int i=0;i<V;i++) lo[i]=(float)-i;
+    }
+#endif
+    size_t nreq=0; int rc=0; double t0=now_s();
+    for(size_t index=0;index<run->manifest->count;index++){
+        const AblateManifestItem *item=&run->manifest->items[index];
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+        g_ablate_adapter_test.observed_first_token=item->tokens[0];
+#endif
         /* PER-ITEM RESET then configure this item's ablation (no cross-item leak). */
         abl_reset(&g_abl);
-        abl_set_item(&g_abl, (int)mode, Ls, Es, (mode==3?As:NULL), (int)ncc);
-        if(of){
-            fprintf(of,"{\"t\":\"ah\",\"item\":%ld,\"mode\":%ld,\"ncells\":%ld,\"T\":%ld,\"n_prompt\":%ld,\"cells\":[",
-                    item, mode, ncc, T, np);
-            for(int i=0;i<(int)ncc;i++) fprintf(of,"%s[%d,%d,%d]", i?",":"", Ls[i],Es[i],As[i]);
-            fprintf(of,"]}\n");
+        abl_set_item(&g_abl,item->mode,item->layers,item->experts,
+                     item->mode==3?item->applied:NULL,item->ncells);
+        if(of && ablate_item_line(of,item->item,item->mode,item->ncells,
+                item->T,item->n_prompt,item->layers,item->experts,
+                item->applied)<0){ rc=1; break; }
+        if(ABLATE_MODEL_COMPUTE_ENABLED){
+            for(int s=0;s<item->T;s++)
+                embed_row(m,item->tokens[s],x+(int64_t)s*D);
+            layers_forward(m,x,item->T,0);                                 /* ONE prefill; moe() applies g_abl */
         }
-        for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-        layers_forward(m,x,(int)T,0);                                      /* ONE prefill; moe() applies g_abl */
         /* FINAL-logit read-out at every target position pos in [np-1, T-1). */
-        if(of) for(long pos=(np>0?np-1:0); pos<T-1; pos++){
-            rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
-            matmul_qt(lo, row, &m->lm_head, 1);
-            int gold=ids[pos+1];
-            float mx=lo[0]; int am=0;
-            for(int i=1;i<V;i++){ if(lo[i]>mx){mx=lo[i];am=i;} }
-            double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
-            double logZ=(double)mx+log(se);
-            double gnll=logZ-(double)lo[gold];                             /* -log p(gold) */
-            float molo=-1e30f; for(int i=0;i<V;i++){ if(i!=gold && lo[i]>molo) molo=lo[i]; }
-            float mgn=lo[gold]-molo;                                       /* gold-vs-best-competitor logit margin */
-            for(int k=0;k<ABL_LOGIT_TOPK;k++){ tk_id[k]=-1; tk_val[k]=-1e30f; }
-            for(int i=0;i<V;i++){ float v=lo[i];
-                int mn=0; for(int k=1;k<ABL_LOGIT_TOPK;k++) if(tk_val[k]<tk_val[mn]) mn=k;
-                if(v>tk_val[mn]){ tk_val[mn]=v; tk_id[mn]=i; } }
-            fprintf(of,"{\"t\":\"lg\",\"item\":%ld,\"pos\":%ld,\"gold\":%d,\"nll\":%.6f,"
-                       "\"glogit\":%.6g,\"molo\":%.6g,\"mgn\":%.6g,\"am\":%d,\"amlogit\":%.6g,"
-                       "\"logZ\":%.6f,\"corr\":%d,\"tk\":[",
-                    item, pos, gold, gnll, (double)lo[gold], (double)molo, (double)mgn,
-                    am, (double)mx, logZ, (am==gold)?1:0);
-            for(int k=0;k<ABL_LOGIT_TOPK;k++) fprintf(of,"%s[%d,%.5g]", k?",":"", tk_id[k], (double)tk_val[k]);
-            fprintf(of,"]}\n");
-        }
-        if(of) fflush(of);
-        if(++nreq%8==0) fprintf(stderr,"[ablate %d item | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
+        AblateModelRows rows={m,x,row,lo,item->tokens,item->item,D,V};
+        if(ablate_item_output(of,item->n_prompt-1,item->T-1,
+                              ablate_model_row_output,&rows)!=0){ rc=1; break; }
+        run->completed_items++;
+        run->completed_targets+=item->T-item->n_prompt;
+        if(++nreq%8==0) fprintf(stderr,"[ablate %zu item | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
             nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
     }
     abl_reset(&g_abl);                                                     /* leave the engine in the OFF state */
-    if(of){ fflush(of); fclose(of); }
-    free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
+    free(x); free(lo); free(row);
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+    if(g_ablate_adapter_test.force_body_rc) rc=1;
+#endif
+    return rc;
+}
+
+static int run_ablate_score(Model *m, const char *path){
+    FILE *f=NULL; int own_manifest=1;
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+    if(g_ablate_adapter_test.borrowed_manifest){
+        f=g_ablate_adapter_test.borrowed_manifest; own_manifest=0;
+        clearerr(f); rewind(f);
+    }else
+#endif
+    { f=fopen(path,"rb"); if(!f){perror(path);exit(1);} }
+    AblateManifest manifest;
+    if(ablate_manifest_load(f,&m->c,&manifest)!=0){
+        if(own_manifest) fclose(f);
+        return 1;
+    }
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+    if(!own_manifest && g_ablate_adapter_test.after_manifest_load)
+        g_ablate_adapter_test.after_manifest_load(f);
+#endif
+    AblateModelRun model_run={m,&manifest,0,0};
+    AblateOutputRun output_run={
+        &model_run,ablate_file_open_run,ablate_model_output_body,
+        &manifest.info,&model_run.completed_items,&model_run.completed_targets,
+    };
+    const char *outp=getenv("ABLATE_OUT");
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+    if(g_ablate_adapter_test.override_outp) outp=g_ablate_adapter_test.outp;
+#endif
+    int rc=ablate_output_run(&output_run,outp,m->c.vocab);
+    /* Keep the manifest identity open until the atomic new-output decision and
+     * all evidence writes finish.  Borrowed test streams remain caller-owned. */
+    if(own_manifest && fclose(f)!=0){
+        fprintf(stderr,"[ablate] INCOMPLETE: the manifest could not be closed cleanly\n");
+        rc=1;
+    }
+    ablate_manifest_free(&manifest);
+    return rc;
+}
+
+typedef int (*AblateModeRunFn)(void *ctx, const char *path);
+
+static int ablate_mode_dispatch(void *ctx, const char *path,
+                                AblateModeRunFn run_fn){
+    if(!path || !run_fn){
+        fprintf(stderr,"[ablate] INCOMPLETE: the ablation mode was entered "
+                "without a manifest to run\n");
+        return 1;
+    }
+    return run_fn(ctx,path)==0 ? 0 : 1;
+}
+
+static int ablate_model_mode_run(void *ctx, const char *path){
+    return run_ablate_score((Model *)ctx,path);
 }
 
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
@@ -10624,8 +11331,26 @@ static int coli_env_on(const char *name)
              strcmp(v,"off")==0 || strcmp(v,"no")==0);
 }
 
+/* One process-status mapping for the ablation branch, shared with the
+ * model-free entry the adapter build uses, so both report the mode's result
+ * the same way. */
+#define ABLATE_MAIN_RETURN(model_,path_,stats_) do { \
+    Model *const ablate_main_model=(model_); \
+    const char *const ablate_main_path=(path_); \
+    const char *const ablate_main_stats=(stats_); \
+    int ablate_main_rc=ablate_mode_dispatch(ablate_main_model,ablate_main_path, \
+                                            ablate_model_mode_run); \
+    if(ablate_main_stats) stats_dump(ablate_main_model,ablate_main_stats); \
+    return ablate_main_rc; \
+} while(0)
+
 #ifndef COLIBRI_NO_MAIN
 int main(int argc, char **argv){
+#ifdef COLI_TEST_ABLATE_ADAPTERS
+    if(g_ablate_adapter_test.main_model)
+        ABLATE_MAIN_RETURN(g_ablate_adapter_test.main_model,
+                           g_ablate_adapter_test.main_path,NULL);
+#endif
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
      * the worker team between regions and the re-wake latency dominates. Keeping
@@ -11313,7 +12038,9 @@ int main(int argc, char **argv){
      * ablation sweep with per-target-position final-logit read-out (ABLATE_OUT=
      * <file>). Precedes SCORE. Optional ROUTE_TRACE=<file> records the
      * post-ablation router trace. */
-    if(getenv("ABLATE_SCORE")){ run_ablate_score(&m, getenv("ABLATE_SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("ABLATE_SCORE")){
+        ABLATE_MAIN_RETURN(&m,getenv("ABLATE_SCORE"),stats);
+    }
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
     if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
