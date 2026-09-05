@@ -169,15 +169,18 @@ def _build_synthetic_authorities(directory):
         "historical_delta_boundary": adapter.BOUNDARY,
     }
 
+    # The adapter treats these authorities as byte-exact JSONL and rejects a
+    # CRLF record as noncanonical, so write LF regardless of platform
+    # (newline="" stops text mode from translating "\n" on Windows).
     corpus_path = directory / "synthetic_corpus.jsonl"
     comparisons_path = directory / "synthetic_comparisons.jsonl"
     policy_path = directory / "synthetic_policy.json"
     corpus_path.write_text(
         "\n".join(json.dumps(row, sort_keys=True) for row in corpus_rows) + "\n",
-        encoding="utf-8")
+        encoding="utf-8", newline="")
     comparisons_path.write_text(
         "\n".join(json.dumps(row, sort_keys=True) for row in comparison_rows) + "\n",
-        encoding="utf-8")
+        encoding="utf-8", newline="")
     policy_path.write_text(json.dumps(policy, sort_keys=True), encoding="utf-8")
     return corpus_path, comparisons_path, policy_path
 
