@@ -3055,13 +3055,13 @@ class Engine:
         for events in requests:
             events.put(("error", error))
 
-    def _read_exact(self, size):
+    def _read_exact(self, size, kind="DATA"):
         chunks = []
         remaining = size
         while remaining:
             chunk = self.process.stdout.read(remaining)
             if chunk == b"":
-                raise RuntimeError("truncated engine DATA payload")
+                raise RuntimeError(f"truncated engine {kind} payload")
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
@@ -3170,8 +3170,8 @@ class Engine:
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
                         raise RuntimeError("invalid engine ECHO size")
-                    data = self._read_exact(size)
-                    if self._read_exact(1) != b"\n":
+                    data = self._read_exact(size, "ECHO")
+                    if self._read_exact(1, "ECHO") != b"\n":
                         raise RuntimeError("invalid engine ECHO terminator")
                     pos = int(fields[3])
                     record = self._parse_logprob_tail(fields, 4)
@@ -3179,6 +3179,25 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("echo", (pos, data, record)))
+                elif ((kind == "GRPP" and len(fields) >= 6) or
+                      (kind == "GRPG" and len(fields) >= 7)):
+                    # Group-scoring read-outs a future engine may emit
+                    # alongside a batch of ordinary requests. This server has
+                    # no group-response contract yet, so both are drained
+                    # like any other payload-framed kind (byte count in
+                    # field 2, same bound and terminator as DATA) and never
+                    # reach a request's event queue.
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError(f"invalid engine {kind} size")
+                    self._read_exact(size, kind)
+                    if self._read_exact(1, kind) != b"\n":
+                        raise RuntimeError(f"invalid engine {kind} terminator")
+                elif ((kind == "GRPS" and len(fields) == 5) or
+                      (kind == "GRPE" and len(fields) == 6)):
+                    # Header-only group-member boundaries: no payload to
+                    # read and nothing for this server to act on.
+                    pass
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the

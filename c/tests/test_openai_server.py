@@ -1736,6 +1736,26 @@ class DispatcherTest(unittest.TestCase):
             engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
         engine.close()
 
+    def test_data_frame_truncated_payload_is_a_named_data_error(self):
+        # _read_exact's kind defaults to "DATA" for the legacy DATA/TOOL
+        # call sites -- that default is the only thing keeping this message
+        # byte-identical to what it said before GRPP/GRPG (and now ECHO)
+        # learned to name their own kind. A declared size larger than what
+        # the stream ever offers, followed by close(), drives _read_exact's
+        # chunk == b"" branch instead of the separate size-bound or
+        # terminator checks.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 10\nZZ")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "^truncated engine DATA payload$"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
     def test_echo_frame_errors_are_named_echo_not_data(self):
         # A malformed ECHO frame's error message must say ECHO, not a
         # copy-pasted DATA -- a wrong frame name in a dispatcher-killing
@@ -1751,6 +1771,26 @@ class DispatcherTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         with self.assertRaisesRegex(RuntimeError, "invalid engine ECHO size"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_echo_frame_truncated_payload_names_the_echo_kind(self):
+        # ECHO's size and terminator checks already name ECHO explicitly
+        # (the test above); the payload read inside _read_exact still fell
+        # back to its "DATA" default, because the ECHO call sites never
+        # threaded kind through the way GRPP/GRPG's do. A declared size
+        # larger than what the stream ever offers, followed by close(),
+        # drives _read_exact's chunk == b"" branch instead of the separate
+        # size-bound or terminator checks.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ECHO " + request_id + b" 10 0 nan 0\nZZ")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "^truncated engine ECHO payload$"):
             engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
         engine.close()
 
@@ -1932,6 +1972,168 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
+
+    def test_group_frames_between_data_frames_drain_leaving_second_data_intact(self):
+        # A future engine may interleave the four group-scoring frame kinds
+        # with an ordinary request's own DATA frames on the same pipe. Each
+        # kind must be fully drained without disturbing frame sync, so the
+        # request's own second DATA frame still arrives byte-for-byte.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 1\nA\n")
+            process.stdout.feed(b"GRPP 99 2 0 nan 0\nZZ\n")
+            process.stdout.feed(b"GRPG 99 2 0 1 nan 0\nZZ\n")
+            process.stdout.feed(b"GRPS 99 0 3 2\n")
+            process.stdout.feed(b"GRPE 99 0 -1.5 2 1\n")
+            process.stdout.feed(b"DATA " + request_id + b" 1\nB\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 2 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        stats = engine.generate("hello", 8, 0.7, 0.9, chunks.append)
+        engine.close()
+        self.assertEqual(chunks, ["A", "B"])
+        self.assertEqual(stats["completion_tokens"], 2)
+
+    def test_group_payload_never_reaches_the_matching_requests_queue(self):
+        # Even when a group frame's own id field collides with an active
+        # request's id, group payload bytes must never land in that
+        # request's event queue -- this server has no group-response
+        # contract to hand them to.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"GRPP " + request_id + b" 2 0 nan 0\nZZ\n")
+            process.stdout.feed(b"DATA " + request_id + b" 1\nA\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 3 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        stats = engine.generate("hello", 4, 0.7, 0.9, chunks.append)
+        engine.close()
+        self.assertEqual(chunks, ["A"])
+        self.assertEqual(stats["completion_tokens"], 1)
+
+    def test_group_payload_size_bound_checked_before_any_read(self):
+        # The 65536-byte size bound applies to GRPP/GRPG exactly as it does
+        # to DATA, and must be enforced before any payload byte is read.
+        def respond(process, frame):
+            process.stdout.feed(b"GRPP 99 70000 0 nan 0\nxy")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine GRPP size"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_group_frame_missing_terminator_is_a_named_error(self):
+        # The byte after a GRPG frame's payload must be LF, same as DATA;
+        # the error names the frame kind that was actually malformed.
+        def respond(process, frame):
+            process.stdout.feed(b"GRPG 99 2 0 1 nan 0\nZZX")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine GRPG terminator"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_group_frame_truncated_payload_names_the_group_kind(self):
+        # A GRPP/GRPG truncation must name its own kind, not fall back to
+        # _read_exact's "DATA" default -- the counterpart to the legacy
+        # DATA/TOOL/ECHO case above, which pins that the default is still
+        # "DATA" for them. A declared size larger than what the stream ever
+        # offers, followed by close(), drives _read_exact's chunk == b""
+        # branch instead of the separate size-bound or terminator checks.
+        def respond(process, frame):
+            process.stdout.feed(b"GRPP 99 10 0 nan 0\nZZ")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "^truncated engine GRPP payload$"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def _assert_wrong_field_count_falls_to_unknown_frame_handling(self, frame_bytes,
+                                                                    expected_regex):
+        # A group frame whose field count misses its kind's guard falls
+        # through to the same catch-all every other unrecognized frame hits
+        # (pinned by test_unknown_frame_still_stops_dispatcher above). The
+        # fake stdout is closed right after feeding the hostile frame: if a
+        # regression widens a guard so the frame is silently consumed
+        # instead of raising, the dispatcher's next readline() sees a
+        # closed, empty stream and fails with "colibri engine exited
+        # unexpectedly" rather than blocking forever on a frame that will
+        # never arrive. The generate() call itself also runs on a worker
+        # thread joined with a timeout, so even an unforeseen hang fails
+        # this test with a clear message instead of hanging the suite.
+        def respond(process, frame):
+            process.stdout.feed(frame_bytes)
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        outcome = {}
+
+        def run():
+            try:
+                engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+            except Exception as error:  # noqa: BLE001 - captured for the main thread
+                outcome["error"] = error
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=10)
+        still_running = thread.is_alive()
+        engine.close()
+        if still_running:
+            thread.join(timeout=2)
+        self.assertFalse(still_running,
+                          "dispatcher did not fail within the timeout; the "
+                          "wrong-field-count guard likely let the frame "
+                          "through instead of falling to the catch-all")
+        self.assertIsInstance(outcome.get("error"), RuntimeError)
+        self.assertRegex(str(outcome["error"]), expected_regex)
+
+    def test_group_frame_with_wrong_field_count_falls_to_unknown_frame_handling(self):
+        # A GRPS frame with a short field count doesn't match the group
+        # branch's exact-5 guard.
+        self._assert_wrong_field_count_falls_to_unknown_frame_handling(
+            b"GRPS 99 0 3\n", "invalid engine response: GRPS")
+
+    def test_group_frame_grpp_wrong_field_count_falls_to_unknown_frame_handling(self):
+        # A GRPP frame with 5 fields is one short of the payload kind's
+        # minimum-6 guard.
+        self._assert_wrong_field_count_falls_to_unknown_frame_handling(
+            b"GRPP 99 2 0 nan\n", "invalid engine response: GRPP 99 2 0 nan")
+
+    def test_group_frame_grpg_wrong_field_count_falls_to_unknown_frame_handling(self):
+        # A GRPG frame with 6 fields is one short of the payload kind's
+        # minimum-7 guard.
+        self._assert_wrong_field_count_falls_to_unknown_frame_handling(
+            b"GRPG 99 2 0 1 nan\n", "invalid engine response: GRPG 99 2 0 1 nan")
+
+    def test_group_frame_grps_wrong_field_count_falls_to_unknown_frame_handling(self):
+        # A GRPS frame with 6 fields is one over the header-only kind's
+        # exact-5 guard.
+        self._assert_wrong_field_count_falls_to_unknown_frame_handling(
+            b"GRPS 99 0 3 2 1\n", "invalid engine response: GRPS 99 0 3 2 1")
+
+    def test_group_frame_grpe_wrong_field_count_falls_to_unknown_frame_handling(self):
+        # A GRPE frame with 5 fields is one short of the header-only kind's
+        # exact-6 guard.
+        self._assert_wrong_field_count_falls_to_unknown_frame_handling(
+            b"GRPE 99 0 -1.5 2\n", "invalid engine response: GRPE 99 0 -1.5 2")
 
 
 class SeedWireFrameTest(unittest.TestCase):
