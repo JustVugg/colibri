@@ -3574,6 +3574,82 @@ class AnthropicStreamCommitTest(unittest.TestCase):
         self.assertTrue(committed_at["after_accept"])
 
 
+class AnthropicColdPrefillTest(unittest.TestCase):
+    """docs/api.md's Anthropic-streaming section: "Until the engine accepts, no
+    bytes are sent at all -- a request queued behind another generation waits
+    silently, exactly as the OpenAI-style streaming path already does." Against
+    an engine binary old enough never to send ACCEPT, the first accept-equivalent
+    event is the engine's first DATA or DONE instead, so a cold multi-minute
+    prefill sends zero bytes where `dev` sent `message_start` plus a periodic
+    `ping` for the same window -- traced through the code, never exercised end
+    to end against a real socket.
+
+    `BlockingEngine` (used elsewhere for scheduler-queueing tests) stands in
+    for exactly that: `generate()` blocks -- simulating the prefill window --
+    before it ever calls `on_accept`, the same callback boundary a real
+    Engine collapses ACCEPT and "first DATA/DONE from an old engine" onto.
+    This test reads the raw socket while the engine is still blocked and
+    proves nothing at all has arrived, then releases it and proves the
+    deferred 200 and SSE stream still show up once the engine finally
+    accepts.
+
+    Note: unlike the opt-in per-token-logprobs channel (`COLI_LOGPROBS_
+    ACCEPT_TIMEOUT`, a named 503 on timeout), the Anthropic endpoint never
+    passes `logprobs`/`tok_ids` to `Engine.generate()` (see
+    `anthropic_generation()`), so `accept_deadline` is `None` for this path
+    and the wait this test pins is genuinely unbounded on a real engine that
+    never answers at all -- there is no timeout or 503 documented or
+    observed for this case, only the silent wait docs/api.md describes."""
+
+    def setUp(self):
+        self.engine = BlockingEngine()
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.engine.release.set()
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_no_bytes_reach_the_client_until_the_engine_finally_accepts(self):
+        payload = json.dumps({"model": "test-model", "stream": True, "max_tokens": 16,
+                              "messages": [{"role": "user", "content": "Hi"}]})
+        request = (f"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  f"Content-Type: application/json\r\n"
+                  f"Content-Length: {len(payload)}\r\n\r\n{payload}").encode()
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3)
+        self.addCleanup(sock.close)
+        sock.sendall(request)
+
+        self.assertTrue(self.engine.entered.wait(2),
+                        "the request never reached the engine (admitted elsewhere?)")
+        sock.settimeout(0.5)
+        with self.assertRaises(socket.timeout):
+            sock.recv(4096)
+        # Confirmed: while the (simulated) cold prefill is in progress the client
+        # sees literally nothing -- no status line, no headers, no SSE bytes --
+        # unlike `dev`, which sent `message_start` plus periodic pings here.
+
+        self.engine.release.set()      # the engine "accepts" now (ACCEPT, or an old
+                                        # engine's first DATA/DONE -- indistinguishable
+                                        # from here on)
+        sock.settimeout(3)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks).decode("utf-8", "replace")
+        head, body = raw.split("\r\n\r\n", 1)
+        self.assertIn("HTTP/1.1 200", head)
+        self.assertIn("event: message_start", body)
+        self.assertIn("event: message_stop", body)
+
+
 class _ExplodingEngine(FakeEngine):
     """ACCEPTs the prompt (committing the streaming 200), then dies mid-generation."""
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
@@ -3742,6 +3818,59 @@ class KeepAliveFramingTest(unittest.TestCase):
                          "a second HTTP response was spliced into the committed SSE stream")
         self.assertIn("partial", raw)            # the events sent before the failure survive
         self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_write_failure_reaching_the_committed_stream_ends_it_cleanly(self):
+        """docs/api.md, "Engine protocol contract: checked writes and SIGPIPE": "for a
+        request whose response is already committed as a stream, a failed write ends
+        the stream instead of producing a 500."
+
+        `test_engine_failure_after_commit_does_not_splice_a_second_response` above
+        pins the same `_fail()`/`_committed` branch with a generic engine
+        RuntimeError; `test_generate_drops_its_pending_entry_when_the_cancel_write_fails`
+        pins the checked STOP/CANCEL write itself, but only at the `Engine.generate()`
+        level -- no HTTP handler, no socket. Neither proves what a real client sees
+        when that specific checked-write failure reaches an already-committed HTTP
+        stream. This test drives a real Engine + a fake engine subprocess whose stdin
+        raises on the STOP write (the same injection those tests use) through a real
+        streaming HTTP request, and reads the raw socket."""
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            parts = frame.split()
+            if parts[0] == b"SUBMIT":
+                request_id = parts[1]
+                process.stdout.feed(b"ACCEPT " + request_id + b" 7\n")
+                process.stdout.feed(b"DATA " + request_id + b" 11\nhello STOP!\n")
+            elif parts[0] == b"STOP":
+                raise BrokenPipeError("synthetic engine stdin failure")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        server = self._server(engine)
+
+        log = io.StringIO()
+        with patch("sys.stderr", log):
+            raw = self._raw(server, self._request_bytes(
+                dict(self.CHAT, stream=True, stop=["STOP!"])))
+
+        self.assertEqual(raw.count("HTTP/1."), 1,
+                         "a failed write must not splice a second status line into "
+                         "the committed stream")
+        head, body = raw.split("\r\n\r\n", 1)
+        self.assertIn("HTTP/1.1 200", head)
+        self.assertIn("hello ", body)          # the text sent before the failed write survives
+        self.assertNotIn("STOP!", body)        # the matched stop sequence itself stays withheld
+        self.assertNotIn("data: [DONE]", body,
+                         "the stream must end at the failure, not run to a normal finish")
+        self.assertNotIn('"type": "error"', body,
+                         "no error body may be spliced into an already-committed stream")
+        self.assertNotIn("<STILL-OPEN>", raw)  # the connection actually closed, not hung
+        self.assertIn("failed to write STOP to the engine", log.getvalue(),
+                     "the write failure must be logged (do_POST's `except Exception` -> "
+                     "log_error), not silently swallowed")
 
     def test_non_streaming_response_still_reuses_the_connection(self):
         """The fix must not turn every response into a close: plain JSON stays persistent."""
