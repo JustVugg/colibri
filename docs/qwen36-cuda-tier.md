@@ -79,13 +79,15 @@ decode, same prompt, output bit-identical in all four runs:
 | experts resident | 4,391 | 3,595 |
 | cold: hit rate / tok/s | 44 % / 8.64 | 36 % / **9.62** |
 | warm: hit rate / tok/s | 95 % / 9.63 | 90.6 % / **12.92** |
+| same card, budget capped at 5 GB (a 6 GB card's share), warm | 88.9 % / 9.50 | 81.2 % / **13.15** |
 
 The warm row is the one that matters: at a 95 % hit rate the marginal expert
 is as valuable as it gets on this card, and the trunk still wins by a third.
 The hit rate drops only 4.4 points for 796 fewer residents because the
 displaced experts are the coldest of the heat order -- exactly the ones the
-placer priced as cheap. More points (a budget capped at 5 GB to stand in for
-a 6 GB card, the Quadro, two cards) follow as they are measured.
+placer priced as cheap. The smaller the card, the larger the relative win:
++34 % at 8 GB, +38 % at a 5 GB budget. The Quadro and the two-card case
+follow as they are measured.
 
 Peak RSS is ~2 GB higher under `auto`: the host-side int8 copies stay as the
 CPU fallback. Known, not yet addressed.
