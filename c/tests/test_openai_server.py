@@ -1009,8 +1009,41 @@ class DispatcherTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         output = []
+        # Il consumatore se ne va DOPO aver ricevuto qualcosa: e' lo scenario che
+        # il nome promette, e va costruito invece che sperato. Con cancelled che
+        # tornava True da subito, la corsa era fra il ramo idle -- che cancella
+        # prima di ogni dato -- e l'arrivo del frame: su Windows vinceva il primo
+        # e l'asserzione su output falliva senza che nulla fosse rotto (#1328).
+        # Qui il flag si alza dentro il sink, e nel ramo "data" decode() consegna
+        # il token PRIMA che cancelled() venga interrogato: l'ordine e' garantito
+        # dal codice, non dallo scheduler.
+        #
+        # Il tetto sui poll non e' decorativo. Senza, un guasto che impedisce la
+        # consegna del token lascerebbe il flag basso per sempre: niente cancel,
+        # niente eccezione, e il test si APPENDE invece di fallire -- misurato
+        # rompendo decode() apposta. Il ramo idle interroga cancelled() ogni 50 ms,
+        # quindi dopo un secondo si cancella comunque e l'asserzione su output
+        # fallisce subito, dicendo la cosa giusta. Deterministico quando funziona,
+        # rapido a fallire quando no.
+        #
+        # Il caso "cancella prima del primo frame" resta coperto, in modo
+        # deterministico, da test_cancels_generation_before_first_frame (#908):
+        # prima i due si sovrapponevano a caso e uno dei due vinceva a sorte.
+        disconnected = False
+        polls = 0
+
+        def sink(text):
+            nonlocal disconnected
+            output.append(text)
+            disconnected = True
+
+        def consumer_gone():
+            nonlocal polls
+            polls += 1
+            return disconnected or polls > 20
+
         with self.assertRaises(ClientCancelled):
-            engine.generate("hello", 8, 0.7, 0.9, output.append, cancelled=lambda: True)
+            engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=consumer_gone)
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])

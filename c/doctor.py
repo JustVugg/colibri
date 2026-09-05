@@ -539,9 +539,17 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     try:
         if resolved is None:
             raise ValueError("placement requires a registered model family")
-        plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
+        # The placement report describes this installed engine, not merely the
+        # hardware visible on the host. A CPU-only binary cannot spend VRAM;
+        # passing discovered GPUs through here made doctor contradict its own
+        # accelerator check and emit CUDA-only tuning advice. Keep inventory
+        # details in accelerator.gpu above, but build an executable plan below.
+        plan_gpus = detected_gpus if linkage.get("linked") else []
+        plan_gpu_indices = gpu_indices if linkage.get("linked") else []
+        plan_vram_gb = vram_gb if linkage.get("linked") else 0
+        plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus, kv_slots=kv_slots)
+                          gpus=plan_gpus, kv_slots=kv_slots)
         # build_plan() owns the single memory probe -- min(host MemAvailable,
         # finite cgroup headroom); 0 means nothing could measure it (T15).
         available_memory = plan["memory"]["available_bytes"]

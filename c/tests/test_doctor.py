@@ -138,12 +138,29 @@ class DoctorTest(unittest.TestCase):
     def test_cpu_engine_with_detected_gpu_is_only_a_warning(self):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
                "free_bytes": 10 * GB}
-        report = self.report(gpu_indices=None, gpus=[gpu])
+        report = self.report(gpu_indices=[0], vram_gb=8, gpus=[gpu])
         check = self.checks_by_id(report)["accelerator.gpu"]
 
         self.assertEqual(check["status"], "warn")
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [])
+        self.assertEqual(report["plan"]["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(report["plan"]["warnings"], [])
+        self.assertNotIn("COLI_CUDA_PIPE", report["plan"]["tune"])
+        self.assertNotIn("GPU", report["plan"]["expected_bottleneck"])
         self.assertEqual(report["status"], "warning")
         self.assertEqual(exit_code(report), 0)
+
+    def test_gpu_engine_with_detected_gpu_keeps_vram_plan(self):
+        gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
+               "free_bytes": 10 * GB}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False})
+
+        self.assertGreater(report["plan"]["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [
+            {**gpu, "reserve_bytes": 2 * GB, "usable_bytes": 8 * GB},
+        ])
+        self.assertIn("COLI_CUDA_PIPE", report["plan"]["tune"])
 
     def test_gpu_check_uses_backend_neutral_identifier(self):
         gpu = {"index": 0, "name": "Intel Arc B570", "total_bytes": 10 * GB,
