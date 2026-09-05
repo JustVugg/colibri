@@ -93,4 +93,13 @@ void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
     (void)device; if (count) *count = 0; if (bytes) *bytes = 0;
 }
 
+/* dense GEMV on a resident tensor (lm_head / DeltaNet projections placed on a
+ * device). Counted, never computed: the placement tests check WHERE work
+ * went; the arithmetic has its own oracle in the CUDA build. Parameters are
+ * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
+static int fake_matmuls;
+int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
+    fake_matmuls++; return 1;
+}
+
 #endif /* QWEN36_FAKE_CUDA_H */

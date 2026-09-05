@@ -152,6 +152,90 @@ static void *uploader(void *arg){
  * so CPU and GPU compute the same numbers up to accumulation order. */
 static struct { ColiCudaTensor *t; int dev, dev_ok, on; } G_lmh;
 
+/* ---- placement table (COLI_PLACE) --------------------------------------- */
+/* Parsed lazily on first query and cached: qt_place_of runs per layer during
+ * init and must not re-parse the environment 30 times. */
+#define QT_PLACE_MAX 8
+#define QT_SPLIT_MAX 8
+static struct {
+    char name[16];
+    struct { int dev, count; } seg[QT_SPLIT_MAX];   /* count<=0: all remaining */
+    int nseg;
+} G_place[QT_PLACE_MAX];
+static int G_place_n = 0, G_place_done = 0;
+
+/* one component spec: "cpu" | "<dev>" | "<dev>:<n>+<dev>:<n>..." */
+static void place_add(const char *name, size_t nlen, const char *spec){
+    if(G_place_n >= QT_PLACE_MAX) return;
+    if(nlen >= sizeof(G_place[0].name)) nlen = sizeof(G_place[0].name)-1;
+    memcpy(G_place[G_place_n].name, name, nlen);
+    G_place[G_place_n].name[nlen] = 0;
+    int ns = 0;
+    for(const char *p = spec; *p && ns < QT_SPLIT_MAX; ){
+        while(*p==' ') p++;
+        int dev, count = -1;
+        if(!strncmp(p,"cpu",3)){ dev = QT_PLACE_CPU; p += 3; }
+        else { dev = atoi(p); while(*p && *p!=':' && *p!='+') p++; }
+        if(*p==':'){ count = atoi(p+1); p++; while(*p && *p!='+') p++; }
+        G_place[G_place_n].seg[ns].dev = dev;
+        G_place[G_place_n].seg[ns].count = count;
+        ns++;
+        if(*p=='+') p++; else break;
+    }
+    G_place[G_place_n].nseg = ns;
+    G_place_n++;
+}
+
+static void place_parse(void){
+    G_place_done = 1;
+    const char *e = getenv("COLI_PLACE");
+    if(!e || !*e) return;
+    const char *p = e;
+    while(*p){
+        while(*p==' '||*p==','||*p==';') p++;
+        const char *name = p;
+        while(*p && *p!='=' && *p!=',' && *p!=';') p++;
+        if(*p!='='){ while(*p && *p!=','&&*p!=';') p++; continue; }
+        size_t nlen = (size_t)(p - name);
+        p++;                                   /* past '=' */
+        char spec[64]; size_t si = 0;
+        while(*p && *p!=',' && *p!=';' && si < sizeof(spec)-1) spec[si++] = *p++;
+        spec[si] = 0;
+        place_add(name, nlen, spec);
+    }
+    fprintf(stderr,"[place] COLI_PLACE=%s\n", e);
+}
+
+/* Was this component named at all? Distinguishes "experts=cpu" (an explicit
+ * request to disable the tier) from "not mentioned" (keep today's default). */
+static int qt_place_named(const char *component){
+    if(!G_place_done) place_parse();
+    for(int i=0;i<G_place_n;i++) if(!strcmp(G_place[i].name,component)) return 1;
+    return 0;
+}
+
+int qt_place_of(const char *component, int layer){
+    if(!G_place_done) place_parse();
+    for(int i = 0; i < G_place_n; i++){
+        if(strcmp(G_place[i].name, component)) continue;
+        int seen = 0;
+        for(int s = 0; s < G_place[i].nseg; s++){
+            int cnt = G_place[i].seg[s].count;
+            if(cnt <= 0) return G_place[i].seg[s].dev;      /* rest of the layers */
+            if(layer < seen + cnt) return G_place[i].seg[s].dev;
+            seen += cnt;
+        }
+        return QT_PLACE_CPU;             /* past the last segment: stay on CPU */
+    }
+    return QT_PLACE_CPU;
+}
+
+/* ---- DeltaNet input projections ----------------------------------------- */
+/* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
+ * so the array is n_layers wide and the attention slots stay empty. */
+#define QT_DN_MAX_LAYERS 128
+static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
+
 
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
@@ -177,6 +261,21 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         for(int i=0;i<want && i<QT_MAX_DEV;i++) G.dev[G.ndev++]=i;
         fprintf(stderr,"[qtier] COLI_GPUS unset: selecting %d visible device(s)\n",G.ndev);
     }
+    /* A device named only in COLI_PLACE still needs a CUDA context before
+     * anything can be uploaded to it. Fold those in here rather than making
+     * the caller repeat every device in COLI_GPUS as well -- forgetting that
+     * would silently drop a component back to the CPU mid-A/B. */
+    {
+        static const char *comps[] = {"lmhead","dnproj","dnout","attnproj"};
+        for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
+            for(int l=0; l<nl && G.ndev<QT_MAX_DEV; l++){
+                int d=qt_place_of(comps[ci],l);
+                if(d==QT_PLACE_CPU) continue;
+                int seen=0; for(int i=0;i<G.ndev;i++) if(G.dev[i]==d) seen=1;
+                if(!seen){ G.dev[G.ndev++]=d;
+                    fprintf(stderr,"[place] dev %d aus COLI_PLACE zur CUDA-Init ergaenzt\n",d); }
+            }
+    }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no visible CUDA devices -> CPU path\n"); return 0; }
     if(!coli_cuda_init(G.dev,G.ndev)){ fprintf(stderr,"[qtier] coli_cuda_init failed -> CPU path\n"); return 0; }
     int have=coli_cuda_device_count();
@@ -192,20 +291,53 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * while lm_head is one latency-tolerant call per token. If it is the ONLY
      * device, experts stay on it — a role split needs two cards. */
     {
+        int reserved[QT_MAX_DEV], nres=0;
+        /* lm_head: COLI_LMHEAD_GPU stays honoured, COLI_PLACE wins when both
+         * are set (it is the newer, general form). */
         const char *lhx=getenv("COLI_LMHEAD_GPU");
-        if(lhx && *lhx){
-            int ld=atoi(lhx), w=0, present=0;
-            for(int i=0;i<G.ndev;i++){ if(G.dev[i]==ld) present=1; else G.dev[w++]=G.dev[i]; }
+        int ld=qt_place_of("lmhead",0);
+        if(ld==QT_PLACE_CPU && lhx && *lhx) ld=atoi(lhx);
+        if(ld!=QT_PLACE_CPU){
+            int present=0; for(int i=0;i<G.ndev;i++) if(G.dev[i]==ld) present=1;
+            if(present){ G_lmh.dev=ld; G_lmh.dev_ok=1; reserved[nres++]=ld; }
+            else fprintf(stderr,"[qtier] lm_head-Device %d nicht verfuegbar -> CPU\n",ld);
+        }
+        /* every other component's devices, deduplicated */
+        static const char *comps[] = {"dnproj","dnout","attnproj"};
+        for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
+            for(int l=0; l<nl; l++){
+                int d=qt_place_of(comps[ci],l);
+                if(d==QT_PLACE_CPU) continue;
+                int seen=0; for(int r=0;r<nres;r++) if(reserved[r]==d) seen=1;
+                if(!seen && nres<QT_MAX_DEV) reserved[nres++]=d;
+            }
+        /* experts=<dev> pins the tier to one card, experts=cpu turns it off.
+         * Explicit beats inference: with BOTH cards reserved for other
+         * components, the fallback below would hand the experts back to both
+         * -- including the slow card, whose take() paces every layer (the
+         * measured reason asymmetric expert placement lost). */
+        int ed=qt_place_of("experts",0);
+        if(ed!=QT_PLACE_CPU){
+            int present=0; for(int i=0;i<G.ndev;i++) if(G.dev[i]==ed) present=1;
             if(present){
-                /* remember: the device HAS a CUDA context even after it leaves
-                 * the placement list — qt_lmhead_init keys on this, not on the
-                 * compacted list */
-                G_lmh.dev=ld; G_lmh.dev_ok=1;
-                if(w>0){
-                    G.ndev=w;
-                    fprintf(stderr,"[qtier] dev %d reserved for lm_head: excluded from expert placement\n",ld);
-                } /* w==0: lm_head device is the only one — experts stay on it */
-            } else fprintf(stderr,"[qtier] COLI_LMHEAD_GPU=%d not in COLI_GPUS -> lm_head stays on CPU\n",ld);
+                G.dev[0]=ed; G.ndev=1;
+                fprintf(stderr,"[place] Experten auf Device %d festgelegt\n",ed);
+            } else fprintf(stderr,"[place] experts=%d nicht verfuegbar -> COLI_GPUS bleibt\n",ed);
+        } else if(G_place_n && qt_place_named("experts")){
+            fprintf(stderr,"[place] experts=cpu -> VRAM-Tier aus\n");
+            return 0;
+        } else if(nres){
+            int w=0;
+            for(int i=0;i<G.ndev;i++){
+                int res=0; for(int r=0;r<nres;r++) if(G.dev[i]==reserved[r]) res=1;
+                if(!res) G.dev[w++]=G.dev[i];
+            }
+            /* w==0: the reserved devices are the only ones -- experts stay on
+             * them, exactly as the single-card lm_head case did. */
+            if(w>0 && w<G.ndev){
+                G.ndev=w;
+                fprintf(stderr,"[qtier] %d Device(s) reserviert: aus der Experten-Platzierung genommen\n",nres);
+            }
         }
     }
 
@@ -285,6 +417,29 @@ int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
     fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
             O,I,dev,(double)O*I/1073741824.0);
     return 1;
+}
+
+int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
+                   int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
+    if(device == QT_PLACE_CPU || !q || !sc) return 0;
+    /* No G.on requirement: the projections are independent of the expert tier,
+     * so they can be measured on a card that holds no experts at all. */
+    if(!coli_cuda_tensor_upload(&G_dnp[layer].t, q, sc, 1, I, O, device)){
+        fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
+        return 0;
+    }
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1;
+    return 1;
+}
+
+int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on) return 0;
+    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,1,I,O,G_dnp[layer].dev,0))
+        return 1;
+    fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
+    G_dnp[layer].on = 0;
+    return 0;
 }
 
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){

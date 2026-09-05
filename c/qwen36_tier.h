@@ -36,6 +36,35 @@
 int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O);
 int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
 
+/* ---- placement table (R4) ------------------------------------------------
+ * Every movable piece of the forward pass can be pinned to the CPU or to a
+ * specific CUDA device, so configurations can be A/B'd instead of argued
+ * about. One variable, not one per component:
+ *
+ *   COLI_PLACE="experts=0,lmhead=0,dnproj=1,dnout=1,attnproj=cpu"
+ *
+ * Target is `cpu` or a CUDA ordinal. A component may also be split across
+ * cards by layer count, joined with '+' so it cannot be confused with the
+ * component separator:
+ *
+ *   COLI_PLACE="dnproj=0:15+1:15"   first 15 DeltaNet layers on dev 0, rest on 1
+ *
+ * Unnamed components keep their default (CPU; experts keep following
+ * COLI_GPUS). Splitting matters because the DeltaNet projections hang
+ * serially in the layer chain anyway -- a slower card delays only its own
+ * layers, never the whole stream, which is what sank asymmetric EXPERT
+ * placement. `layer` is the model layer index; pass 0 for whole-model
+ * components like lmhead. */
+#define QT_PLACE_CPU (-1)
+int  qt_place_of(const char *component, int layer);
+
+/* DeltaNet input projections, qkv ++ z fused into one resident tensor per
+ * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
+ * contiguously so the result needs no split copy. */
+int  qt_dnproj_init(int layer, const int8_t *q, const float *sc,
+                    int I, int O, int device);
+int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
+
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
@@ -77,6 +106,10 @@ void qt_stats(void);
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+#define QT_PLACE_CPU (-1)
+static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}
+static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
