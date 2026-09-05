@@ -1234,6 +1234,12 @@ tests/test_rope_invfreq$(EXE): tests/test_rope_invfreq.c colibri.c st.h uring.h 
 tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# The classified logit-row reduction in sample.h and the digest in
+# evidence_digest.h: no model/weights, published SHA-256 vectors, and an
+# agreement check against the plain logprob_target the sampling path uses.
+tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
 # the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
 tests/test_ablate$(EXE): tests/test_ablate.c abl.h
