@@ -12,6 +12,17 @@
  * una allocazione anonima -- se non facesse la seconda, avremmo reso la guardia
  * cieca invece che precisa, che sarebbe peggio del difetto. */
 #include <stdio.h>
+
+/* Il contratto verificato qui e' quello di /proc/self/status, che esiste solo
+ * su Linux: la guardia RSS su altre piattaforme usa gia' un'altra strada
+ * (rss_gb). Non c'e' niente da portare -- portarlo vorrebbe dire inventare un
+ * equivalente di RssAnon che il codice sotto test non usa. Su tutto il resto
+ * il test si dichiara saltato invece di fallire, cosi' `make check` resta
+ * verde ovunque e nessuno lo scopre da un rosso in CI. */
+#if !defined(__linux__)
+int main(void) { printf("test_rss_anon: non-Linux, skip\n"); return 0; }
+#else
+
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -105,3 +116,5 @@ int main(void) {
     printf("test_rss_anon: ok\n");
     return 0;
 }
+
+#endif /* __linux__ */
