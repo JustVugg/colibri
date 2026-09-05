@@ -547,6 +547,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             if(qt_place_of(G_offer[o].name, G_offer[o].layer)==G.dev[i]) trunk += G_offer[o].bytes;
         size_t cap_i = 0;
         for(int j=0;j<ncap;j++) if(capdev[j]==G.dev[i]) cap_i = capacity[j];
+        G_trunk_bytes[i] = trunk;                 /* by expert-device index, for qt_stats */
         G.budget[i] = cap_i > trunk ? cap_i - trunk : 0;
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
@@ -867,8 +868,11 @@ void qt_stats(void){
     for(int i=0;i<G.ndev;i++){
         size_t tc=0,tb=0; coli_cuda_stats(G.dev[i],&tc,&tb);
         hits+=G.hits[i];
-        fprintf(stderr,"[qtier]   dev %d: hits %llu | %zu tensors, %.2f GB VRAM used (budget %.2f GB)\n",
-                G.dev[i], (unsigned long long)G.hits[i], tc, tb/1073741824.0, G.budget[i]/1073741824.0);
+        /* tb counts every tensor on the device, trunk included; say how much of
+         * it is trunk so "used > budget" does not read like an overrun. */
+        fprintf(stderr,"[qtier]   dev %d: hits %llu | %zu tensors, %.2f GB VRAM used (%.2f GB trunk + experts, budget %.2f GB)\n",
+                G.dev[i], (unsigned long long)G.hits[i], tc, tb/1073741824.0,
+                G_trunk_bytes[i]/1073741824.0, G.budget[i]/1073741824.0);
     }
     double tot=(double)(hits+G.miss);
     fprintf(stderr,"[qtier] VRAM hit rate: %.1f %% | LFRU swaps %llu\n",

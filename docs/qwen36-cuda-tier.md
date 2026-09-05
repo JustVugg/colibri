@@ -37,6 +37,59 @@ SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
 only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
 per-phase timings and tier telemetry.
 
+## Placement: where the dense trunk goes (`COLI_PLACE`)
+
+The tier moves the routed experts. On this hybrid model that is the *small*
+part of a token: 40 layers × top-8 experts, ~190 MB of int8 per token at an
+81 % hit rate, against a dense trunk -- attention, DeltaNet projections,
+shared expert, lm_head -- of **1.8 GB of int8 read on every token**. Leaving
+the trunk on the CPU is why a 6 GB card sees the hit rate stop mattering
+(#1040): the GPU is doing the cheap job.
+
+By default the engine now places the trunk itself. Before the tier decides its
+budget, the engine offers each trunk component with its size (lm_head once, the
+fused DeltaNet projection of every DeltaNet layer), and the tier prices them
+against the experts they would displace, in **bytes saved on the memory bus per
+token, per byte of VRAM**:
+
+- a dense component is read every token: 1.0 per byte;
+- a routed expert is read with the probability a token routes to it -- its heat
+  share when `HEAT_FILE` exists, `topk / n_experts` otherwise -- and the CPU
+  fallback reads the int8 slot, twice the VRAM bytes of an int4 expert: 2·p per
+  byte.
+
+A component goes to the device with the most room if its value beats that of
+the coldest experts it pushes out. Without heat that tail is worth 0.06 per byte
+on the 35B and the trunk always wins; with heat, a card whose marginal expert is
+routed on more than every second token keeps its experts. Placed bytes come out
+of that device's expert budget, and each decision prints as a `[place]` line.
+
+| `COLI_PLACE` | behaviour |
+|---|---|
+| unset or `auto` | automatic, as above |
+| `off` | nothing placed: experts only (the behaviour before this) |
+| `lmhead=0,dnproj=0:20+1:20,experts=0` | hand-written list (the measurement tool); obeyed as written, trunk bytes still charged to the budget |
+
+First calibration, one RTX 3070 (8 GB), per-row int4 container, 200-token
+decode, same prompt, output bit-identical in all four runs:
+
+| | `off` | `auto` |
+|---|---|---|
+| trunk in VRAM | -- | lm_head 0.47 GB + 30 dnproj 0.70 GB |
+| experts resident | 4,391 | 3,595 |
+| cold: hit rate / tok/s | 44 % / 8.64 | 36 % / **9.62** |
+| warm: hit rate / tok/s | 95 % / 9.63 | 90.6 % / **12.92** |
+
+The warm row is the one that matters: at a 95 % hit rate the marginal expert
+is as valuable as it gets on this card, and the trunk still wins by a third.
+The hit rate drops only 4.4 points for 796 fewer residents because the
+displaced experts are the coldest of the heat order -- exactly the ones the
+placer priced as cheap. More points (a budget capped at 5 GB to stand in for
+a 6 GB card, the Quadro, two cards) follow as they are measured.
+
+Peak RSS is ~2 GB higher under `auto`: the host-side int8 copies stay as the
+CPU fallback. Known, not yet addressed.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |
