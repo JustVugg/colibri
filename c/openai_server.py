@@ -5098,6 +5098,17 @@ class APIHandler(BaseHTTPRequestHandler):
             request_id, queue_headers)
 
     def completion(self, body, request_id):
+        # Group scoring is not wired up in this build: no engine or wire
+        # path routes it, and its contract changes the RESPONSE SHAPE
+        # (continuation-only logprob arrays), so silently ignoring the
+        # opt-in would hand a client a differently shaped answer than it
+        # asked for -- fail closed with a named 400 instead. Checked first,
+        # before either request shape below, so the array path can never
+        # reach batch_completion() with the opt-in still set.
+        group_score = body.get("group_score")
+        if group_score is not None and group_score is not False:
+            raise APIError(400, "`group_score` is not supported by this build.",
+                           "group_score", "unsupported_value")
         prompt_field = body.get("prompt")
         tok_ids = False
         if isinstance(prompt_field, list):

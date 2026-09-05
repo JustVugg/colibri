@@ -2227,6 +2227,24 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
         self.assertEqual(self.engine.calls[-1][4], 1)
 
+    def test_group_score_is_not_read_by_chat_or_anthropic_surfaces(self):
+        # The group_score guard lives only in completion(); the chat and
+        # Anthropic surfaces never call it, so the opt-in is ignored, not
+        # refused, on those two surfaces. Pinned here so the scope choice
+        # is visible rather than an untested accident.
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4, "group_score": True,
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(body["object"], "chat.completion")
+        with self.request("/v1/messages", {
+            "model": "test-model", "max_tokens": 4, "group_score": True,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(body["type"], "message")
+
     def test_kimi_chat_completion_uses_multiturn_wire_payload(self):
         with patch("openai_server.ARCH", "kimi"):
             with self.request("/v1/chat/completions", {
@@ -4796,6 +4814,25 @@ class SecondSubmitBadRequestEngine(ScriptedEngine):
         return super().generate(*args, **kwargs)
 
 
+class SecondSubmitContextExceededEngine(ScriptedEngine):
+    """The second engine submit in a batch raises the CONTEXT_EXCEEDED
+    APIError exactly as `_engine_error` maps it (client fault, `param`
+    "messages", `code` "context_length_exceeded") -- the batch must fail as
+    ONE 400 attributed to the failing member, `prompt[1]`."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls_made = 0
+
+    def generate(self, *args, **kwargs):
+        self.calls_made += 1
+        if self.calls_made == 2:
+            raise APIError(400, "This model's maximum context length is 4094 tokens, "
+                                "however your prompt resulted in at least 5000 tokens.",
+                           "prompt", "context_length_exceeded")
+        return super().generate(*args, **kwargs)
+
+
 class SecondSubmitServerFaultEngine(ScriptedEngine):
     """The second engine submit in a batch raises the accept-deadline
     APIError Engine.generate() raises when the engine build does not
@@ -4884,6 +4921,48 @@ class BatchCompletionHTTPTest(unittest.TestCase):
         error = self._reject({"prompt": [[1], []], "max_tokens": 1}, "prompt[1]")
         self.assertEqual(error["code"], "invalid_value")
 
+    def test_group_score_opt_in_is_refused_fail_closed(self):
+        # No group-scoring routing exists in this build, and its contract
+        # changes the response shape -- silently ignoring the opt-in would
+        # be a semantic surprise. Named 400, checked on both the array and
+        # the flat request shape, before any prompt intake or engine work.
+        error = self._reject({"prompt": ["a", "b"], "group_score": True,
+                              "max_tokens": 1}, "group_score")
+        self.assertEqual(error["code"], "unsupported_value")
+        error = self._reject({"prompt": "hi", "group_score": True,
+                              "max_tokens": 1}, "group_score")
+        self.assertEqual(error["code"], "unsupported_value")
+        # `false` and `null` are accepted as absent.
+        body = self._json({"prompt": ["a", "b"], "group_score": False, "max_tokens": 1})
+        self.assertEqual(len(body["choices"]), 2)
+        body = self._json({"prompt": "a", "group_score": None, "max_tokens": 1})
+        self.assertEqual(body["object"], "text_completion")
+
+    def test_group_score_only_literal_absence_or_false_is_safe(self):
+        # Only literal absence, `None`, or `False` are accepted -- every
+        # other value is refused, including values a truthiness check
+        # would fold into "absent" (`0`, `0.0`) or into "present" without
+        # being a real opt-in (`""`, `"false"`, `[]`, `{}`, `"0"`). This
+        # pins the guard to identity comparison, not `in (None, False)`,
+        # which Python's `==` folds `0`/`0.0` into `False`.
+        for bad in (0, 0.0, "", "false", [], {}, "0"):
+            with self.subTest(bad=bad):
+                error = self._reject({"prompt": ["a", "b"], "group_score": bad,
+                                      "max_tokens": 1}, "group_score")
+                self.assertEqual(error["code"], "unsupported_value")
+                error = self._reject({"prompt": "hi", "group_score": bad,
+                                      "max_tokens": 1}, "group_score")
+                self.assertEqual(error["code"], "unsupported_value")
+
+    def test_group_score_true_precedes_a_malformed_array_prompt(self):
+        # The guard runs before array intake, so a request that is BOTH
+        # shape-malformed AND carries the opt-in fails for `group_score`,
+        # never for `prompt` -- proof the guard precedes intake rather
+        # than merely preceding a successful dispatch.
+        error = self._reject({"prompt": [1, "a"], "group_score": True,
+                              "max_tokens": 1}, "group_score")
+        self.assertEqual(error["code"], "unsupported_value")
+
     def test_stream_and_n_together_defer_to_generation_options_first(self):
         # Batch validation checks stream last, the same position the flat
         # path checks it in -- so a request carrying both `stream: true`
@@ -4939,6 +5018,24 @@ class BatchCompletionHTTPTest(unittest.TestCase):
         self.assertIsNone(error["code"])
         # The third member must never have been submitted either -- one
         # named failure ends the whole batch, not just the failing member.
+        self.assertEqual(engine.calls_made, 2)
+
+    def test_context_exceeded_mid_batch_names_member_in_param(self):
+        # The engine's own CONTEXT_EXCEEDED rejection of one member's
+        # prompt length is a client-actionable fault: the batch fails as
+        # one named 400 attributed to that member, the same way any other
+        # engine-side client-fault rejection mid-batch is attributed.
+        engine = SecondSubmitContextExceededEngine()
+        base = _spawn_test_server(self, engine)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model",
+                                     "prompt": ["a", "b", "c"], "max_tokens": 1})
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt[1]")
+        self.assertEqual(error["code"], "context_length_exceeded")
+        self.assertIn("prompt[1]:", error["message"])
+        # The third member must never have been submitted either.
         self.assertEqual(engine.calls_made, 2)
 
     def test_id_batch_rejected_for_non_glm_engine(self):
