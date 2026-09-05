@@ -992,6 +992,50 @@ static void st_unmap_raw(st_mapped_raw *mapped) {
     mapped->nbytes = 0;
 }
 
+/* ---- per-shard mapping cache (opt-in: COLI_MAP_EXPERTS=1) --------------
+ * One mapping per FILE, kept for the process lifetime (shards stay open for
+ * the whole run, so there is nothing shorter-lived to tie the mapping to).
+ * A failed mapping is remembered per fd so it is not retried on every call;
+ * callers must treat a NULL return as "use pread", not as an error. */
+#define ST_MAX_MAPPED_FD 4096
+static uint8_t *g_st_shard_base[ST_MAX_MAPPED_FD];
+static int64_t g_st_shard_len[ST_MAX_MAPPED_FD];
+static signed char g_st_shard_tried[ST_MAX_MAPPED_FD];
+
+static int st_map_experts_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_MAP_EXPERTS"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
+
+static const uint8_t *st_shard_mapped(int fd) {
+    if (fd < 0 || fd >= ST_MAX_MAPPED_FD || !st_map_experts_enabled()) return NULL;
+    if (g_st_shard_base[fd]) return g_st_shard_base[fd];
+    if (g_st_shard_tried[fd]) return NULL;
+    g_st_shard_tried[fd] = 1;
+    int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
+    if (len <= 0) return NULL;
+    compat_ro_map map; const void *data;
+    if (compat_map_readonly(fd, 0, (size_t)len, &map, &data) != 0) return NULL;
+    /* The compat_ro_map itself is intentionally not tracked for unmap: shard
+     * mappings live exactly as long as the fd they wrap, i.e. the process. */
+    g_st_shard_base[fd] = (uint8_t *)data;
+    g_st_shard_len[fd] = len;
+    return g_st_shard_base[fd];
+}
+
+/* Serves [off, off+nbytes) of file `fd` directly out of its persistent
+ * mapping -- no allocation, no copy. Returns NULL if mapping is disabled,
+ * unavailable for this fd, or the range doesn't fit; the caller's existing
+ * pread path is the correct fallback in every NULL case. */
+static const void *st_map_shard_range(int fd, int64_t off, int64_t nbytes) {
+    if (off < 0 || nbytes <= 0) return NULL;
+    const uint8_t *base = st_shard_mapped(fd);
+    if (!base) return NULL;
+    if (off > g_st_shard_len[fd] - nbytes) return NULL;
+    return base + off;
+}
+
 /* Read an exact byte slice from a tensor into a caller-owned buffer.  This is
  * the raw counterpart of st_read_slice_f32: byte_off/nbytes are relative to
  * the tensor (not the shard), and cap is the actual byte capacity of `out`.
