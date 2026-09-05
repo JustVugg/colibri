@@ -303,6 +303,15 @@ def _walk_snapshot(root):
 
 
 def _hash_snapshot_payload(root, relative):
+    if sys.platform == "win32":
+        # The identity check below requires POSIX stat semantics: fstat of the
+        # open descriptor must agree with lstat of the path on device and
+        # inode. Windows derives those differently for a handle and a path
+        # (CI observed disagreement on a subset of files), so the witness
+        # refuses rather than report a spurious "payload changed".
+        raise WitnessError(
+            "snapshot payload identity requires POSIX stat semantics "
+            "(fstat/lstat agreement on device and inode); Windows is unsupported")
     path = pathlib.Path(root).joinpath(*relative.split("/"))
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):

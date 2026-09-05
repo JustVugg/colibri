@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import sys
 import tempfile
 import types
 import unittest
@@ -21,6 +22,10 @@ WITNESS = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(WITNESS)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "the witness requires POSIX stat semantics (fstat/lstat identity) and "
+    "refuses on Windows; WindowsRefusalTests covers that refusal")
 class NativeMtpWitnessTests(unittest.TestCase):
     REQUEST_ID = 7
     TOPK = 2
@@ -1515,3 +1520,34 @@ class NativeMtpWitnessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsRefusalTests(unittest.TestCase):
+    """The witness's payload-identity check is POSIX-only and says so.
+
+    Runs on every platform: on POSIX the platform name is patched so the
+    guard is exercised; on Windows the patch is a no-op and the same
+    assertion holds against the real platform.
+    """
+
+    def test_payload_hashing_refuses_on_windows_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "tokenizer.json").write_bytes(b"{}\n")
+            with mock.patch.object(sys, "platform", "win32"), \
+                    self.assertRaises(WITNESS.WitnessError) as caught:
+                WITNESS._hash_snapshot_payload(root, "tokenizer.json")
+        self.assertIn("POSIX stat semantics", str(caught.exception))
+        self.assertIn("Windows is unsupported", str(caught.exception))
+
+    def test_payload_hashing_works_where_not_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "tokenizer.json").write_bytes(b"{}\n")
+            if sys.platform == "win32":
+                self.skipTest("refusal covered above")
+            digest, size = WITNESS._hash_snapshot_payload(root, "tokenizer.json")
+        self.assertEqual(size, 3)
+        self.assertEqual(
+            digest, WITNESS.hashlib.sha256(b"{}\n").hexdigest())
+
