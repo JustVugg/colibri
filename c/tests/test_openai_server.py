@@ -3623,6 +3623,59 @@ class KeepAliveFramingTest(unittest.TestCase):
         self.assertIn("partial", raw)            # the events sent before the failure survive
         self.assertNotIn("<STILL-OPEN>", raw)
 
+    def test_write_failure_reaching_the_committed_stream_ends_it_cleanly(self):
+        """docs/api.md, "Engine protocol contract: checked writes and SIGPIPE": "for a
+        request whose response is already committed as a stream, a failed write ends
+        the stream instead of producing a 500."
+
+        `test_engine_failure_after_commit_does_not_splice_a_second_response` above
+        pins the same `_fail()`/`_committed` branch with a generic engine
+        RuntimeError; `test_generate_drops_its_pending_entry_when_the_cancel_write_fails`
+        pins the checked STOP/CANCEL write itself, but only at the `Engine.generate()`
+        level -- no HTTP handler, no socket. Neither proves what a real client sees
+        when that specific checked-write failure reaches an already-committed HTTP
+        stream. This test drives a real Engine + a fake engine subprocess whose stdin
+        raises on the STOP write (the same injection those tests use) through a real
+        streaming HTTP request, and reads the raw socket."""
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            parts = frame.split()
+            if parts[0] == b"SUBMIT":
+                request_id = parts[1]
+                process.stdout.feed(b"ACCEPT " + request_id + b" 7\n")
+                process.stdout.feed(b"DATA " + request_id + b" 11\nhello STOP!\n")
+            elif parts[0] == b"STOP":
+                raise BrokenPipeError("synthetic engine stdin failure")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        server = self._server(engine)
+
+        log = io.StringIO()
+        with patch("sys.stderr", log):
+            raw = self._raw(server, self._request_bytes(
+                dict(self.CHAT, stream=True, stop=["STOP!"])))
+
+        self.assertEqual(raw.count("HTTP/1."), 1,
+                         "a failed write must not splice a second status line into "
+                         "the committed stream")
+        head, body = raw.split("\r\n\r\n", 1)
+        self.assertIn("HTTP/1.1 200", head)
+        self.assertIn("hello ", body)          # the text sent before the failed write survives
+        self.assertNotIn("STOP!", body)        # the matched stop sequence itself stays withheld
+        self.assertNotIn("data: [DONE]", body,
+                         "the stream must end at the failure, not run to a normal finish")
+        self.assertNotIn('"type": "error"', body,
+                         "no error body may be spliced into an already-committed stream")
+        self.assertNotIn("<STILL-OPEN>", raw)  # the connection actually closed, not hung
+        self.assertIn("failed to write STOP to the engine", log.getvalue(),
+                     "the write failure must be logged (do_POST's `except Exception` -> "
+                     "log_error), not silently swallowed")
+
     def test_non_streaming_response_still_reuses_the_connection(self):
         """The fix must not turn every response into a close: plain JSON stays persistent."""
         server = self._server()
