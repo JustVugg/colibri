@@ -63,23 +63,39 @@ def invoked_scripts(path):
 
 
 def needed(src):
-    """Tutto cio' che coli raggiunge, come percorsi sotto <c-dir>."""
+    """Tutto cio' che coli raggiunge, come percorsi sotto <c-dir>.
+
+    A subprocess-launched script is reached the same way an imported
+    module is: its own imports are followed too, not just its own file.
+    #1296's own precedent -- a script invoked by coli missing from the
+    archive -- had a sibling shape one level deeper that #1296 itself did
+    not catch: a script invoked by coli imports a module that neither
+    coli nor any file coli imports ever mentions by name, so that module
+    was never added to `reached` and never copied, even though the
+    script that needs it was. The script paths below are pushed onto the
+    same import-following queue as every other reached file, so their
+    imports close the same way coli's own do.
+    """
     local = local_modules(src)
     reached, queue = set(), [src / "coli"]
-    scripts = set()
+    scripts, script_paths = set(), set()
     while queue:
         path = queue.pop()
-        scripts |= invoked_scripts(path)
+        for script in invoked_scripts(path):
+            if script in scripts:
+                continue
+            scripts.add(script)
+            candidate = src / "tools" / script
+            if not candidate.exists():
+                raise SystemExit(f"FAIL: coli invokes tools/{script}, which does not exist")
+            script_paths.add(candidate)
+            queue.append(candidate)
         for name in imports_of(path):
             if name in local and name not in reached:
                 reached.add(name)
                 queue.append(local[name])
     paths = {local[name] for name in reached}
-    for script in sorted(scripts):
-        candidate = src / "tools" / script
-        if not candidate.exists():
-            raise SystemExit(f"FAIL: coli invokes tools/{script}, which does not exist")
-        paths.add(candidate)
+    paths |= script_paths
     return sorted(paths)
 
 
