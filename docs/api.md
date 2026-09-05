@@ -42,11 +42,13 @@ sequences. The extension
 The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.
-Images, log probabilities, and token penalties return an explicit error rather
-than being silently ignored, with one documented exception: `seed` is accepted
-and ignored rather than rejected (see below). Audio is accepted only by Inkling
-checkpoints with audio support. The default bind address is localhost; set
-`COLI_API_KEY` before exposing the server beyond the machine.
+Images and token penalties return an explicit error rather than being silently
+ignored, with one documented exception: `seed` is accepted and ignored rather
+than rejected (see below). Log probabilities are served on the glm engine (see
+below) and refused with a named error on every other engine, never silently
+ignored. Audio is accepted only by Inkling checkpoints with audio support. The
+default bind address is localhost; set `COLI_API_KEY` before exposing the
+server beyond the machine.
 
 ### `seed`
 
@@ -61,6 +63,84 @@ decoding has no distribution to seed), but the same "no effect" is equally
 true at `temperature > 0`, where a client might otherwise expect the value
 to matter. A true per-request seed is out of scope for this build
 regardless.
+
+### Log probabilities and prompt echo (glm engine only)
+
+`/v1/completions` accepts the legacy integer `logprobs` (**1–32**; the range
+is bound to the engine's top-32 read-out interface, and anything above 32 is
+a named 400) and boolean `echo`; `/v1/chat/completions` accepts boolean
+`logprobs` plus integer `top_logprobs` (0–32) and returns
+`choices[].logprobs.content[]` (`{token, logprob, bytes, top_logprobs}` per
+generated token) — chat has no `echo` concept and rejects one with a 400. A
+non-boolean `echo` is a named 400 (`invalid_value`) on both endpoints,
+independent of whether `logprobs` is requested at all. On chat,
+`top_logprobs` is type- and range-checked even when `logprobs` is
+false or absent, so a malformed `top_logprobs` is a named 400 whether or
+not the gate it would feed is open; a valid `top_logprobs` with `logprobs`
+off remains a documented no-op.
+
+The zero semantics are explicit, not a truthiness accident: on
+`/v1/completions`, `logprobs: 0`, `false`, and `null` all mean **no log
+probabilities** (the request succeeds with `choices[].logprobs: null`,
+exactly as if the field were omitted), while boolean `true` is a named 400 —
+the legacy field is an integer count, and a boolean carries no count. On
+`/v1/chat/completions` the field is a boolean gate (`null` behaves like
+`false`; any integer is a named 400).
+
+`/v1/completions` with `echo: true` returns the full legacy `logprobs` object
+(`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`) covering the
+echoed prompt plus any generated tokens, and `text` itself is the
+reconstructed prompt followed by the completion (the standard OpenAI legacy
+behavior for `echo: true`) rather than the completion alone; `echo` without
+`logprobs` is a documented no-op. `text_offset` is a character offset into
+that same returned `text` string, always counted from 0 — including when
+`echo` is false, where `text` holds only the completion and the offsets
+describe only that text, not a position within the (unreturned) prompt. The
+requested top-k table is **unsorted** on the wire — do not assume the first
+entry is the argmax. Per-token values are printed by the engine to six
+decimal digits of precision. Non-finite values (a degenerate all-`-inf`
+logit row, say) serialize as JSON `null`, never a clamped number.
+
+Only the glm engine implements this channel; every other engine returns a
+named 400 rather than silently ignoring the request.
+
+Known limitations, current build:
+
+- **Cost.** Requesting `logprobs` at all — completions or chat, `echo` or
+  not — makes the engine re-run the ENTIRE prompt through a full read-out
+  pass to score every position (the wire has one opt-in bit, not a separate
+  "echo" bit), forfeiting prefix-cache reuse for that request. There is no
+  long-echo cap; a very long prompt pays a correspondingly large one-shot
+  activation buffer.
+- **Cancellation.** `CANCEL` is not honored while a logprobs-opted-in request
+  is inside its prefill read-out — the un-cancellable window widens by the
+  read-out's own wall time on long prompts.
+- **Alternative-token labels.** `top_logprobs` entries for candidate token
+  ids other than the position's own actual token are not decoded text (no
+  server-side tokenizer exists, by design) — they are labeled
+  `<token_id:N>`. Only the position's own token (identified by an exact
+  logprob match, not by id) gets its real decoded text.
+- **The sampled token is not guaranteed to appear in its own
+  `top_logprobs` table.** The engine's numeric channel reports the top-k
+  candidates by its own read-out; if the actually chosen token falls
+  outside that table, no entry represents it, and the response's
+  `token_logprobs`/`logprob` field is still the chosen token's own value
+  read from the DATA/ECHO frame directly, not looked up in the table.
+- **A filtered stop token's own record is dropped; a reasoning/tool-call
+  split's is not.** A matched `stop` sequence is withheld from the
+  returned text, and its own logprob record is dropped along with it, but
+  chat's `<think>`/answer split and tool-call parsing can still remove or
+  rewrite text that a generated-token logprob record continues to
+  describe — the two are not realigned in this build.
+- **An engine build older than this server's per-token logprobs extension
+  is refused, not silently ignored, but only after a bounded wait.** Such
+  an engine rejects the whole opted-in request at the wire level in a way
+  this server cannot see as a rejection of THIS specific request; after
+  `COLI_LOGPROBS_ACCEPT_TIMEOUT` seconds (default 30) with no
+  acknowledgment, the request fails with a named 503 rather than hanging.
+- **Server-side buffering.** The gateway holds a logprobs-opted-in request's
+  full echo table in memory for the whole request lifetime (no streaming is
+  allowed together with `logprobs` — the combination is a named 400).
 
 ### Tool-calling support
 

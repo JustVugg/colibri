@@ -2356,8 +2356,11 @@ def generation_options(body, limit):
         if choice != "none" and not (body.get("tools") or body.get("functions")):
             raise APIError(400, "`tool_choice` requires `tools`.", "tool_choice", "invalid_value")
     stop_sequences = parse_stop_sequences(body)
-    if body.get("logprobs"):
-        raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
+    # `logprobs`/`echo`/`top_logprobs` validation lives in logprobs_options()
+    # (called from generation(), which knows chat vs completions and the
+    # launched engine's capability) -- not here, so wiring the numeric
+    # channel can never leak chat-templating behavior into the raw
+    # completions path through this shared check.
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
     # `seed`: accepted for OpenAI-API request-shape compatibility, then
@@ -2437,6 +2440,303 @@ def generation_options(body, limit):
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p), grammar, stop_sequences
+
+
+# The per-token top-k emission cap the engine's numeric logprobs channel
+# (U7a's SUBMIT `logprobs=`) supports, mirrored in c/decode_batch.h as
+# COLI_SUBMIT_TOPK_MAX -- run_ablate_score's existing top-32 read-out
+# ceiling. The public request range is bound to exactly this engine
+# interface: 1..32, refused with a named 400 above it.
+LOGPROBS_TOP_K_CAP = 32
+
+# Engine.generate()'s bound on waiting for ACCEPT after an opted-in
+# (logprobs>0) SUBMIT -- see the comment beside accept_deadline in
+# Engine.generate() for why an engine that predates the U7a extension can
+# otherwise wedge this wait forever.
+LOGPROBS_ACCEPT_TIMEOUT = float(os.environ.get("COLI_LOGPROBS_ACCEPT_TIMEOUT", "30"))
+
+
+def logprobs_options(body, chat, engine_supports):
+    """Validate the client's logprobs/echo/top_logprobs request and translate
+    it into (engine_k, echo, display_k):
+
+    - engine_k: the SUBMIT `logprobs=` value to send to the engine (0 = the
+      per-token numeric channel stays off entirely -- no ECHO/extended DATA
+      frames).
+    - echo: whether the response should include the prompt-echo positions.
+      Chat has no echo concept (OpenAI's chat schema doesn't have one) --
+      always False for chat, and `echo: true` on a chat request is a named
+      400, not a silent ignore.
+    - display_k: how many top_logprobs alternatives the CLIENT asked to see
+      (0..LOGPROBS_TOP_K_CAP) -- may be less than engine_k when a chat
+      request asked for logprobs with `top_logprobs: 0`.
+
+    Completions' `logprobs` is the legacy integer top-k count; chat's is a
+    boolean gate plus a separate `top_logprobs` count -- two different
+    OpenAI conventions on the two endpoints, both accepted here.
+
+    The zero/false/null semantics are explicit, never a truthiness
+    accident. On completions, `null`, `false`, and `0` all mean "no
+    logprobs" -- the request succeeds with `choices[].logprobs: null` --
+    while `true` is a named 400 (the legacy field is an integer count, and
+    a boolean carries no count). On chat, `null` and `false` mean "no
+    logprobs" and any integer is a named 400 (the chat field is a boolean
+    gate). Integers outside 0..LOGPROBS_TOP_K_CAP get a named 400 on both
+    endpoints; the engine's top-k interface is the ceiling.
+
+    On chat, `top_logprobs` is TYPE- and RANGE-checked even when
+    `logprobs` is false/absent (validation tightened during review): a
+    malformed `top_logprobs` is a named 400 whether or not the gate that
+    would use it is open, so a client never has a field silently ignored
+    outright because a sibling field made it moot. A valid `top_logprobs`
+    with `logprobs` off remains a documented no-op -- it still returns
+    (0, False, 0). `top_logprobs: null` is normalized to absent -- same
+    as `logprobs: null` -- before that type/range check runs, so it never
+    itself triggers a 400; the check applies only to a PRESENT, non-null
+    value. `top_logprobs` on completions is not read at all -- it is a
+    chat-only field in the OpenAI request shape, silently ignored there
+    exactly like any other unrecognized field.
+
+    `echo`'s type is validated with the same isinstance(bool) check on
+    both endpoints before either endpoint decides what a valid value
+    means: completions accepts any boolean, chat still refuses `True`
+    with a named 400 (chat has no echo concept at all), but a non-bool
+    `echo` gets the shared "must be a boolean" 400 on either endpoint,
+    never chat's truthiness-based refusal message for a value that was
+    never a valid echo request shape to begin with.
+    """
+    if chat:
+        echo = body.get("echo", False)
+        if not isinstance(echo, bool):
+            raise APIError(400, "`echo` must be a boolean.", "echo", "invalid_value")
+        if echo:
+            raise APIError(400, "`echo` is not supported for chat completions.",
+                           "echo", "unsupported_parameter")
+        logprobs = body.get("logprobs", False)
+        if logprobs is None:
+            logprobs = False                      # null == absent == no logprobs
+        if not isinstance(logprobs, bool):
+            raise APIError(400, "`logprobs` must be a boolean.", "logprobs", "invalid_value")
+        display_k, param, echo = body.get("top_logprobs", 0), "top_logprobs", False
+        if display_k is None:
+            display_k = 0                         # null == absent, same as `logprobs`
+    else:
+        echo = body.get("echo", False)
+        if not isinstance(echo, bool):
+            raise APIError(400, "`echo` must be a boolean.", "echo", "invalid_value")
+        logprobs = body.get("logprobs")
+        if logprobs is None or logprobs is False:
+            return 0, echo, 0     # echo without logprobs: documented no-op
+        display_k, param = logprobs, "logprobs"
+    if (isinstance(display_k, bool) or not isinstance(display_k, int) or
+            not 0 <= display_k <= LOGPROBS_TOP_K_CAP):
+        raise APIError(400, f"`{param}` must be an integer between 0 and "
+                            f"{LOGPROBS_TOP_K_CAP}.", param, "invalid_value")
+    if chat and not logprobs:
+        return 0, False, 0     # top_logprobs validated above; logprobs off is still a no-op
+    if not chat and display_k == 0:
+        return 0, echo, 0                         # 0 = no logprobs, documented
+    if not engine_supports:
+        # Conservative sender-side capability gate: the server never emits
+        # SUBMIT logprobs= to an engine that does not implement the numeric
+        # per-token channel (only the glm engine's mux loop reads
+        # sub.logprobs at all). Rejecting here, before generate() ever
+        # builds the extension header, keeps a rejected-SUBMIT
+        # payload-drain hazard unreachable.
+        raise APIError(400, f"Log probabilities are not supported by the {ARCH} engine.",
+                       "logprobs", "unsupported_parameter")
+    return max(1, display_k), echo, display_k
+
+
+def _json_float(value):
+    """A logprob value that arrives non-finite (nan/inf/-inf, which the
+    engine's numeric channel can emit for a degenerate logit row) must
+    serialize as JSON `null`, matching what OpenAI clients expect --
+    never the invalid-JSON NaN/Infinity literals json.dumps would
+    otherwise write, and never clamped to a made-up finite number."""
+    return value if math.isfinite(value) else None
+
+
+def _order_echo_records(prompt_records):
+    """Place each prompt-echo record at its own wire `pos` index rather
+    than trusting the order the frames arrived in -- arrival order
+    happens to match position order for today's single-threaded engine
+    loop, but nothing here depends on that holding. A duplicate,
+    negative, out-of-range, or (by pigeonhole) missing position among the
+    N records that must fill exactly slots 0..N-1 raises a named
+    RuntimeError, the same class every other malformed-engine-output path
+    already raises, so it surfaces as a clean 500 rather than a hang or a
+    silently corrupted response."""
+    ordered = [None] * len(prompt_records)
+    for pos, data, record in prompt_records:
+        if (not isinstance(pos, int) or isinstance(pos, bool)
+                or not 0 <= pos < len(ordered) or ordered[pos] is not None):
+            raise RuntimeError(
+                f"invalid engine ECHO position {pos!r} (expected each of "
+                f"0..{len(ordered) - 1} exactly once, got {len(prompt_records)} records)")
+        ordered[pos] = (data, record)
+    return ordered
+
+
+def _logprob_positions(prompt_records, generated_records):
+    """Merge prompt-echo and generated-token logprob records into one
+    ordered list of {"text", "raw_lp", "topk", "bytes"} dicts: echoed
+    positions first, reassembled by wire `pos` via _order_echo_records,
+    then generated tokens in emission order.
+
+    Text is decoded with a single stateful incremental UTF-8 decoder
+    spanning the whole sequence -- the same pattern the main generation
+    path already uses -- rather than decoding each frame's bytes
+    independently. A multi-byte codepoint can arrive split across two
+    adjacent byte-level vocabulary pieces; decoding per-frame would turn
+    each half into its own replacement character instead of the true
+    joined text. A frame that only completes a pending byte sequence
+    contributes "" as its own text (the resolved character lands on
+    whichever position finished it), while `bytes` always stays that
+    frame's own raw payload regardless of what text, if any, it decoded
+    to."""
+    raw = [(data, record) for data, record in _order_echo_records(prompt_records)]
+    raw += [(data, record) for data, record in generated_records]
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    positions = [{"text": decoder.decode(data), "raw_lp": record["lp"],
+                 "topk": record["topk"], "bytes": data} for data, record in raw]
+    tail = decoder.decode(b"", final=True)
+    if tail and positions:
+        positions[-1]["text"] += tail
+    return positions
+
+
+def _own_token_label(entry, topk, idx):
+    """The wire's top-k table carries only raw candidate token ids, never
+    decoded text -- there is no server-side tokenizer, and the wire's
+    logprob_tail record carries no chosen-token id either (only `lp` and
+    the table). The one candidate that CAN be labeled correctly without
+    decoding is the position's own chosen token: its top-k entry and its
+    own `lp` come from the exact same computation, so an exact float
+    match identifies it without ever comparing token ids.
+
+    The engine prints logprobs to 6 decimal digits, so two distinct
+    candidates can legitimately share the printed value the chosen token
+    also carries -- a real tie, not a bug in either side. With no id to
+    break it, the match is resolved deterministically: only the FIRST
+    table entry (in wire order, up to `idx`) whose value exactly equals
+    the chosen logprob is labeled as the chosen token; any later entry
+    that also matches is labeled by its raw id like any other
+    unidentified candidate, same as `topk` argmax rank 1 falls back
+    to id when it never matches at all. This is a documented limitation,
+    not a decode -- and separately, the top-k table is unsorted on the
+    wire, so this never assumes the first entry overall is the argmax."""
+    tid, tlp = topk[idx]
+    if tlp != entry["raw_lp"]:
+        return f"<token_id:{tid}>"
+    if any(topk[j][1] == entry["raw_lp"] for j in range(idx)):
+        return f"<token_id:{tid}>"
+    return entry["text"]
+
+
+def _completions_logprobs_object(prompt_records, generated_records, display_k,
+                                  text_offset_base=0):
+    """Build the legacy `/v1/completions` `logprobs` object: `tokens[]`,
+    `token_logprobs[]`, `top_logprobs[]` (one dict per position, keyed by
+    token text via _own_token_label), and `text_offset[]` (character
+    offsets into the reconstructed text, derived from the same decode --
+    no tokenizer required). The first prompt position's `token_logprobs`
+    entry comes out `null` for free: the engine's own echo position 0
+    already carries a non-finite sentinel logprob (there is nothing to
+    condition the first token on), which _json_float maps to null.
+
+    `text_offset_base` shifts every reported offset by a fixed amount
+    (default 0, matching plain echo-from-position-0 usage) -- callers
+    serving an `echo=false` request, where OpenAI's convention counts
+    `text_offset` from the end of the prompt rather than from 0, supply
+    the prompt's character length here instead of reassembling it
+    themselves."""
+    positions = _logprob_positions(prompt_records, generated_records)
+    tokens = [p["text"] for p in positions]
+    token_logprobs = [_json_float(p["raw_lp"]) for p in positions]
+    top_logprobs = []
+    for p in positions:
+        table = {}
+        displayed = p["topk"][:display_k]
+        for idx, (tid, tlp) in enumerate(displayed):
+            table[_own_token_label(p, displayed, idx)] = _json_float(tlp)
+        top_logprobs.append(table)
+    text_offset = []
+    offset = text_offset_base
+    for text in tokens:
+        text_offset.append(offset)
+        offset += len(text)
+    return {"tokens": tokens, "token_logprobs": token_logprobs,
+            "top_logprobs": top_logprobs, "text_offset": text_offset}
+
+
+def _chat_logprobs_content(generated_records, display_k):
+    """Build chat-completions `choices[].logprobs.content[]`: one
+    `{token, logprob, bytes, top_logprobs}` entry per generated token.
+    Chat has no echo concept, so there is no `pos` field to reassemble --
+    generated records are used in emission order. Each `top_logprobs`
+    entry is `{token, logprob, bytes}`, using the same id-based labeling
+    limitation as the legacy object's dict keys (_own_token_label).
+
+    Token text for every generated record is decoded FIRST, in one pass,
+    with a single stateful incremental UTF-8 decoder spanning the whole
+    generated sequence (same reasoning as _logprob_positions: a frame
+    that only completes a prior pending multi-byte codepoint contributes
+    "" as its own token text) -- including the final flush of any
+    trailing incomplete sequence, before any `content` entry is built.
+    Building entries only after every position's final text is known
+    keeps the last entry's own `top_logprobs` label consistent with its
+    `token` field; building them interleaved with decoding would let the
+    last entry's `token` gain the flushed text while the label computed
+    from its pre-flush text stayed stale. `bytes` always stays each
+    frame's own raw payload regardless of what text, if any, it decoded
+    to."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    texts = [decoder.decode(data) for data, _record in generated_records]
+    tail = decoder.decode(b"", final=True)
+    if tail and texts:
+        texts[-1] += tail
+    content = []
+    for (data, record), text in zip(generated_records, texts):
+        entry = {"text": text, "raw_lp": record["lp"], "topk": record["topk"]}
+        alternatives = []
+        displayed = record["topk"][:display_k]
+        for idx, (tid, tlp) in enumerate(displayed):
+            label = _own_token_label(entry, displayed, idx)
+            alternatives.append({"token": label, "logprob": _json_float(tlp),
+                                 "bytes": list(data) if label == text else None})
+        content.append({"token": text, "logprob": _json_float(record["lp"]),
+                        "bytes": list(data), "top_logprobs": alternatives})
+    return content
+
+
+def _trim_generated_records_to_text(generated_records, text):
+    """Drop trailing generated-token records whose bytes were filtered out of
+    the text actually returned to the client (a matched stop sequence, most
+    commonly) -- the logprobs arrays must correspond to what `text` holds,
+    never a superset of it. Decodes each record's bytes with the same
+    incremental-UTF-8-decoder-over-the-whole-sequence approach the response
+    assembly helpers use, and keeps a record only while the text decoded so
+    far stays a prefix of `text`; the first record whose decoded text would
+    NOT be a prefix, and every record after it, is dropped.
+
+    This only closes the stop-sequence case (the common one, and a small,
+    local fix): a filtered thinking/reasoning split or a tool-call parse can
+    ALSO diverge the returned `text` from the raw generated stream in ways
+    this prefix check does not attempt to align -- callers pass this
+    function the raw, pre-split, pre-tool-parse text for exactly that
+    reason, and the divergence that remains afterward is a documented
+    limitation, not silently shipped."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    kept = []
+    acc = ""
+    for data, record in generated_records:
+        candidate = acc + decoder.decode(data)
+        if not text.startswith(candidate):
+            break
+        acc = candidate
+        kept.append((data, record))
+    return kept
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -2649,6 +2949,14 @@ class Engine:
         arch = family.id
         self.family = family
         self.model_dir = str(model)
+        # Capability gating of the extended SUBMIT namespace (logprobs=/ids=),
+        # established once here at launch, not per request, and never via an
+        # engine-version handshake -- only the glm engine (c/colibri.c)
+        # implements the U7a numeric channel and token-id intake; every other
+        # engine's mux_data/prefill loop never reads sub.logprobs or
+        # sub.tok_ids at all, so sending them would be silently wrong (an
+        # accepted-but-ignored request), not just unsupported.
+        self.supports_logprobs_echo = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
@@ -2717,6 +3025,43 @@ class Engine:
             remaining -= len(chunk)
         return b"".join(chunks)
 
+    @staticmethod
+    def _parse_logprob_tail(fields, i):
+        """Parse the numeric tail shared by opted-in DATA/ECHO frames
+        (c/colibri.c logprob_tail): "<lp> <k> [<tid> <tlp>]*k". float()
+        parses the engine's numeric wire tokens directly -- "nan"/"inf"/
+        "-inf" and any %g precision alike (an echo's position 0 -- nothing
+        to condition on -- carries "nan 0", mux_prefill_echo). The table is
+        UNSORTED on the wire (logprob_tail selects by raw logit) -- callers
+        must not assume the first pair is argmax. Every malformed shape --
+        a short or over-long field list (trailing garbage included),
+        non-numeric fields, an out-of-range k, or a negative token id --
+        is a named RuntimeError, never a silent partial record."""
+        if len(fields) < i + 2:
+            raise RuntimeError("invalid engine logprob tail: missing lp/k")
+        try:
+            lp = float(fields[i])
+            k = int(fields[i + 1])
+        except ValueError as error:
+            raise RuntimeError(f"invalid engine logprob tail: {error}") from error
+        if not 0 <= k <= LOGPROBS_TOP_K_CAP:
+            raise RuntimeError(f"invalid engine logprob tail: k={k} out of range")
+        if len(fields) != i + 2 + 2 * k:
+            raise RuntimeError("invalid engine logprob tail: field count mismatch")
+        topk = []
+        j = i + 2
+        for _ in range(k):
+            try:
+                tid = int(fields[j])
+                tlp = float(fields[j + 1])
+            except ValueError as error:
+                raise RuntimeError(f"invalid engine logprob tail: {error}") from error
+            if tid < 0:
+                raise RuntimeError(f"invalid engine logprob tail: negative token id {tid}")
+            topk.append((tid, tlp))
+            j += 2
+        return {"lp": lp, "topk": topk}
+
     def _dispatch_stdout(self):
         try:
             while True:
@@ -2732,9 +3077,15 @@ class Engine:
                     # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),
                     # emitted only for requests that opted in via the SUBMIT
                     # logprobs field. The payload framing is identical; the
-                    # numeric fields are consumed by the server feature half
-                    # (U7b) -- accepted here so the frame never kills the
-                    # dispatcher (and with it every in-flight request).
+                    # numeric tail is parsed into a record (None for legacy
+                    # frames) and carried alongside the payload bytes so a
+                    # later consumer can thread it into the response. A
+                    # malformed tail now raises and kills the dispatcher
+                    # (failing every in-flight request) rather than being
+                    # tolerated as an unrecognized trailing field -- a
+                    # deliberate reversal of this arm's older, more lenient
+                    # stance, matching the fail-closed frame-validation
+                    # policy every other frame kind here already follows.
                     request_id = fields[1]
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
@@ -2742,10 +3093,15 @@ class Engine:
                     data = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
+                    record = self._parse_logprob_tail(fields, 3) if len(fields) > 3 else None
                     with self.pending_lock:
                         events = self.pending.get(request_id)
                     if events is not None:
-                        events.put(("data", data))
+                        # A bare-bytes put on the (far more common)
+                        # non-opted-in path costs zero extra allocation per
+                        # generated token, same as before this channel
+                        # existed.
+                        events.put(("data", data if record is None else (data, record)))
                 elif kind == "TOOL" and len(fields) == 3:
                     # Opaque, request-scoped structured output. K3 emits an
                     # initial zero-byte frame before generation so DATA marker
@@ -2764,16 +3120,24 @@ class Engine:
                 elif kind == "ECHO" and len(fields) >= 6:
                     # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
                     # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
-                    # Emitted only for opted-in requests; no current request
-                    # path opts in, so the frame is read (to keep the stream
-                    # in sync) and dropped -- U7b delivers it to the response
-                    # assembly when it wires the opt-in.
+                    # Emitted only for opted-in requests. Delivered to the
+                    # pending request the same way DATA is; a request with
+                    # no pending entry (the id was never admitted, or already
+                    # finished) drops it after fully reading the frame, same
+                    # as every other frame kind here.
+                    request_id = fields[1]
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
-                        raise RuntimeError("invalid engine DATA size")
-                    self._read_exact(size)
+                        raise RuntimeError("invalid engine ECHO size")
+                    data = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
-                        raise RuntimeError("invalid engine DATA terminator")
+                        raise RuntimeError("invalid engine ECHO terminator")
+                    pos = int(fields[3])
+                    record = self._parse_logprob_tail(fields, 4)
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("echo", (pos, data, record)))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -2836,9 +3200,16 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None):
+                 on_tool=None, image=None, logprobs=0, echo=False):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
+        if logprobs and not self.supports_logprobs_echo:
+            # Defense in depth: APIHandler's logprobs_options()/generation()
+            # already refuse the HTTP request with a named 400 before ever
+            # reaching here. Reaching this with the gate false is a caller
+            # bug, not a bad request.
+            raise RuntimeError("logprobs intake requested against an engine "
+                               "that does not support the U7a extension")
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
@@ -2893,9 +3264,20 @@ class Engine:
                       default=0)
             if cut > 0:
                 prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
+        # U7b: SUBMIT's key=value extension namespace (decode_batch.h
+        # coli_submit_ext) -- logprobs=k opts into U7a's per-token numeric
+        # channel (ECHO + extended DATA frames). Only ever built when the
+        # capability gate above already passed, so this never reaches an
+        # engine that would mis-parse or silently ignore it. The extension
+        # arm requires the 7th (gbytes) field to be present even when it's
+        # 0 -- coli_submit_parse expects exactly 7 numeric fields before the
+        # first key=value token.
+        ext_field = f" logprobs={logprobs}" if logprobs else ""
+        gbytes_field = f" {len(xpayload)}" if (xpayload or logprobs) else ""
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
-                  + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
+                  + (prefix_field if prefix_field else gbytes_field)
+                  + ext_field
                   + "\n").encode()
         try:
             with self.write_lock:
@@ -2921,6 +3303,34 @@ class Engine:
         cancel_sent = False
         stop_sent = False
         accepted = False
+        # U7a's ECHO frames (whenever logprobs>0, the engine ALWAYS runs the
+        # full prefill read-out -- c/colibri.c mux_submit: `echo =
+        # sub.logprobs>0`, unconditionally, there is no separate wire bit for
+        # "logprobs but no echo") land here in position order; DATA's numeric
+        # tail lands here in emission order. `generated_logprobs` stays
+        # empty when logprobs=0. `prompt_logprobs` ALSO stays empty unless
+        # the caller opted into `echo` too -- the engine still sends every
+        # ECHO frame regardless (there is no wire bit for "logprobs but no
+        # echo"), but retaining a full prompt-length echo table for every
+        # opted-in request that never asked to see it (the common chat case,
+        # and any completions request with echo=False) would hold it in
+        # memory for the whole request lifetime for nothing: at k=32 and a
+        # 32k-token prompt that table is on the order of 100+ MB. Frames not
+        # kept are still fully drained off the wire above (read_engine_turn
+        # already consumed the payload bytes before this event is queued),
+        # so this never desyncs the dispatcher -- it only decides whether the
+        # record is RETAINED past this iteration.
+        prompt_logprobs = []
+        generated_logprobs = []
+        # Bound how long an opted-in (logprobs>0) request waits for the
+        # engine's ACCEPT before concluding the engine silently rejected the
+        # extended SUBMIT header -- c/decode_batch.h: "An OLD engine rejects
+        # ANY extended header ... the engine answers ERROR 0 BAD_REQUEST",
+        # an id that never matches this (or any) pending request, so that
+        # reply is otherwise invisible to this loop and it would wait here
+        # forever. A legacy (non-opted-in) request keeps the old, unbounded
+        # wait -- every engine build ever shipped handles a plain SUBMIT.
+        accept_deadline = time.monotonic() + LOGPROBS_ACCEPT_TIMEOUT if logprobs else None
 
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
@@ -2950,6 +3360,15 @@ class Engine:
                 # reading — every later request then hangs silently behind the
                 # orphaned generation. Wait for the engine's ERROR CANCELLED /
                 # DONE frame; ClientCancelled is raised when it arrives.
+                if (accept_deadline is not None and not accepted
+                        and time.monotonic() > accept_deadline):
+                    with self.pending_lock:
+                        self.pending.pop(request_id, None)
+                    raise APIError(
+                        503, "The colibri engine did not accept a per-token logprobs "
+                            "request in time; it may not support the per-token logprobs "
+                            "extension.", "logprobs", "engine_logprobs_unsupported",
+                        "server_error")
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
                     with self.write_lock:
@@ -2962,8 +3381,14 @@ class Engine:
                 _accept(value)
             elif kind == "data":
                 _accept({"prompt_tokens": None})
+                # The dispatcher only wraps in a tuple when a logprob record
+                # rides along; a bare-bytes value is the (far more common)
+                # non-opted-in shape.
+                data, record = value if isinstance(value, tuple) else (value, None)
+                if record is not None:
+                    generated_logprobs.append((data, record))
                 if not cancel_sent and not stop_sent:
-                    decode(value)
+                    decode(data)
                     if stopped and stopped():
                         stop_sent = True
                         with self.write_lock:
@@ -2977,6 +3402,14 @@ class Engine:
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
+            elif kind == "echo":
+                # Prompt-position readout: recorded (only when the caller
+                # asked to see it -- see the comment above prompt_logprobs),
+                # nothing emitted -- no text is decoded for a prompt echo,
+                # unlike "data"/"tool".
+                pos, data, record = value
+                if echo:
+                    prompt_logprobs.append((pos, data, record))
             elif kind == "tool":
                 _accept({"prompt_tokens": None})
                 if not cancel_sent and not stop_sent:
@@ -3005,6 +3438,9 @@ class Engine:
                 tool_tail = tool_decoder.decode(b"", final=True)
                 if tool_tail and on_tool is not None:
                     on_tool(tool_tail)
+                if logprobs:
+                    value["logprobs"] = {"prompt": prompt_logprobs,
+                                         "generated": generated_logprobs}
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 raise ClientCancelled()
@@ -3561,6 +3997,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
                                 "engine yet.", "response_format", "unsupported_parameter")
+        engine_k, echo, display_k = logprobs_options(
+            body, chat, getattr(self.server.engine, "supports_logprobs_echo", False))
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
@@ -3581,6 +4019,13 @@ class APIHandler(BaseHTTPRequestHandler):
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
+        if engine_k and stream:
+            # Streaming + logprobs together is a named 400, not a silent drop
+            # of the numeric channel: streamed per-delta logprobs are not
+            # built, and nothing downstream of this point ever threads
+            # logprobs= into a streaming call.
+            raise APIError(400, "`logprobs` is not supported together with `stream`.",
+                           "logprobs", "unsupported_parameter")
         stream_options = body.get("stream_options") if stream else None
         if stream and stream_options is not None and not isinstance(stream_options, dict):
             raise APIError(400, "`stream_options` must be an object.", "stream_options")
@@ -3607,10 +4052,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                    **({"image": image} if image is not None else {}),
+                    **({"logprobs": engine_k, "echo": echo} if engine_k else {}))
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
+                # The raw, pre-split, pre-tool-parse text -- what the stop
+                # filter actually emitted -- is what the logprobs arrays are
+                # trimmed against below, BEFORE the thinking/inkling split or
+                # tool-call parsing can further diverge `text` from them (see
+                # _trim_generated_records_to_text's own docstring).
+                raw_text = text
                 reasoning = ""
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
@@ -3620,6 +4072,44 @@ class APIHandler(BaseHTTPRequestHandler):
                     # into the visible answer / tool-call parser.
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
+                logprobs_obj = None
+                if engine_k:
+                    channel = stats.get("logprobs") or {"prompt": [], "generated": []}
+                    # A matched stop sequence withholds its own trailing
+                    # text from `output` (StopFilter._emit is never called on
+                    # it); that token's own logprob record must not survive
+                    # into the response either, or the logprobs arrays would
+                    # describe tokens the client never received. The
+                    # thinking-split/tool-call divergence this does NOT close
+                    # is a documented limitation (see docs/api.md).
+                    generated = _trim_generated_records_to_text(channel["generated"], raw_text)
+                    if chat:
+                        logprobs_obj = {"content": _chat_logprobs_content(generated, display_k),
+                                        "refusal": None}
+                    else:
+                        logprobs_obj = _completions_logprobs_object(
+                            channel["prompt"] if echo else [], generated, display_k)
+                        if echo:
+                            # The OpenAI legacy shape returns the prompt AND
+                            # the completion concatenated in `text` when
+                            # `echo` is true, and `text_offset` indexes into
+                            # exactly that concatenation. `logprobs_obj
+                            # ["tokens"]` already reconstructs prompt-then-
+                            # generated text with ONE shared incremental
+                            # decoder spanning both (_logprob_positions), so
+                            # `text` is built from that same join here
+                            # rather than by string-concatenating the
+                            # prompt's reconstruction with the completion
+                            # text decoded separately (by generate()'s own,
+                            # independent decoder) -- a codepoint split
+                            # across the last prompt byte and the first
+                            # generated byte must be decoded as ONE
+                            # character by ONE decoder, or the two halves
+                            # decode as mojibake/replacement characters on
+                            # either side of the seam and `text` and
+                            # `text_offset` disagree about how long that
+                            # character is.
+                            text = "".join(logprobs_obj["tokens"])
                 if chat and tools:
                     content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
                     message = {"role": "assistant", "content": content or None, "refusal": None}
@@ -3628,14 +4118,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
-                    choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
+                    choice = {"index": 0, "message": message, "logprobs": logprobs_obj,
+                              "finish_reason": finish}
                 else:
                     _msg = {"role": "assistant", "content": text, "refusal": None}
                     if reasoning:
                         _msg["reasoning_content"] = reasoning
                     choice = ({"index": 0, "message": _msg,
-                               "logprobs": None, "finish_reason": length_finish} if chat else
-                              {"index": 0, "text": text, "logprobs": None, "finish_reason": length_finish})
+                               "logprobs": logprobs_obj, "finish_reason": length_finish} if chat else
+                              {"index": 0, "text": text, "logprobs": logprobs_obj,
+                               "finish_reason": length_finish})
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
                     request_id, queue_headers)

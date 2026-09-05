@@ -2,7 +2,10 @@ import http.client
 import io
 import json
 import math
+import os
+import queue
 import socket
+import subprocess
 import tempfile
 import threading
 import sys
@@ -16,24 +19,38 @@ from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
-                           READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
+                           LOGPROBS_TOP_K_CAP, READY, Engine, InklingStreamSplit, StopFilter,
+                           ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
-                           generation_options, parse_tool_calls, parse_dsv4_tool_calls,
+                           generation_options, logprobs_options, parse_tool_calls,
+                           parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            split_thinking_reply,
-                           stop_policy, tune_child_env)
+                           stop_policy, tune_child_env,
+                           _chat_logprobs_content, _completions_logprobs_object,
+                           _json_float, _order_echo_records, _own_token_label)
 
 
 class FakeEngine:
+    # The U7b capability gate: glm-only in production (Engine.__init__ sets it
+    # from `arch == "glm"`). Tests run under the module's default ARCH="glm"
+    # unless a test patches it, so True is the representative default for this
+    # double; capability-gate tests override it explicitly (see NonGlmEngine
+    # below) rather than relying on this.
+    supports_logprobs_echo = True
+
     def __init__(self):
         self.calls = []
         self.stop_requests = 0
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 echo=False):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = echo
         if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
             on_accept({"prompt_tokens": 7})
         for chunk in ("Hé", "llo"):
@@ -41,7 +58,34 @@ class FakeEngine:
             if stopped and stopped():
                 self.stop_requests += 1
                 break
-        return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
+        stats = {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
+        if logprobs:
+            stats["logprobs"] = self.logprobs_channel(logprobs)
+        return stats
+
+    def logprobs_channel(self, engine_k):
+        """Canned U7a logprob records for HTTP-level response-shape tests --
+        shaped exactly like Engine.generate()'s real return value: "prompt"
+        is a list of (pos, bytes, record), "generated" a list of (bytes,
+        record), record = {"lp": float, "topk": [(tid, tlp), ...]}. Position
+        0 carries the engine's own "nothing to condition on" sentinel (nan,
+        empty table) -- the real wire behavior mux_prefill_echo always sends.
+        The tail values are NON-dyadic (e.g. -0.3, -2.7) so a `%.6f`-shaped
+        fixture is distinguishable from a `%.17g`-shaped one in tests. "H"=72
+        "\\xc3\\xa9"="é" pretend token ids; the generated tokens' own lp is
+        bit-identical to one of their own topk entries (mux's logprob_tail
+        invariant), which is what the bit-identity property test and
+        _own_token_label depend on."""
+        k = min(engine_k, 2)
+        prompt = [
+            (0, b"H", {"lp": float("nan"), "topk": []}),
+            (1, b"\xc3\xa9", {"lp": -0.3, "topk": [(72, -0.3), (100, -1.7)][:k]}),
+        ]
+        generated = [
+            (b"H", {"lp": -0.2, "topk": [(72, -0.2), (200, -2.4)][:k]}),
+            (b"\xc3\xa9", {"lp": -0.4, "topk": [(101, -0.4), (300, -3.6)][:k]}),
+        ]
+        return {"prompt": prompt, "generated": generated}
 
 
 class BlockingEngine(FakeEngine):
@@ -51,11 +95,12 @@ class BlockingEngine(FakeEngine):
         self.release = threading.Event()
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 echo=False):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
-                                cancelled, grammar, stopped, on_accept)
+                                cancelled, grammar, stopped, on_accept, logprobs, echo)
 
 
 class TemplateTest(unittest.TestCase):
@@ -408,6 +453,459 @@ class TemplateTest(unittest.TestCase):
             self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
         with self.assertRaises(APIError):
             stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
+
+
+class LogprobsOptionsTest(unittest.TestCase):
+    """logprobs_options(): pure validation/translation, no HTTP or engine.
+
+    Covers the range checks and the zero/false/null semantics, at the unit
+    level -- fast, and independent of any fixture.
+    """
+
+    def test_completions_valid_integer_logprobs(self):
+        self.assertEqual(logprobs_options({"logprobs": 3}, False, True), (3, False, 3))
+        self.assertEqual(logprobs_options({"logprobs": 3, "echo": True}, False, True),
+                         (3, True, 3))
+        self.assertEqual(logprobs_options({"logprobs": 1}, False, True), (1, False, 1))
+        self.assertEqual(logprobs_options({"logprobs": LOGPROBS_TOP_K_CAP}, False, True),
+                         (LOGPROBS_TOP_K_CAP, False, LOGPROBS_TOP_K_CAP))
+
+    def test_completions_zero_false_null_mean_no_logprobs(self):
+        # The zero semantics are explicit -- `0`, `false`, and `null` all
+        # mean "no logprobs" on completions, never a truthiness accident
+        # and never an engine channel floored on at k=1.
+        for off in ({"logprobs": 0}, {"logprobs": False}, {"logprobs": None}, {}):
+            with self.subTest(off=off):
+                self.assertEqual(logprobs_options(off, False, True), (0, False, 0))
+        self.assertEqual(logprobs_options({"logprobs": 0, "echo": True}, False, True),
+                         (0, True, 0))
+
+    def test_completions_true_is_a_named_400(self):
+        # The legacy completions field is an integer COUNT; a boolean
+        # `true` carries no count and is a named 400, not a guess at k.
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": True}, False, True)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, "logprobs")
+        self.assertEqual(caught.exception.code, "invalid_value")
+
+    def test_break_it_battery_non_integer_negative_huge(self):
+        for bad in (1.5, "5", -1, LOGPROBS_TOP_K_CAP + 1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options({"logprobs": bad}, False, True)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "logprobs")
+                self.assertEqual(caught.exception.code, "invalid_value")
+
+    def test_completions_echo_requires_a_boolean(self):
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"echo": "yes"}, False, True)
+        self.assertEqual(caught.exception.param, "echo")
+
+    def test_chat_logprobs_requires_a_boolean(self):
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 1}, True, True)
+        self.assertEqual(caught.exception.param, "logprobs")
+        self.assertEqual(caught.exception.code, "invalid_value")
+
+    def test_chat_false_and_null_mean_no_logprobs(self):
+        # Chat's boolean gate treats `null` like `false` -- explicitly.
+        for off in ({"logprobs": False}, {"logprobs": None}, {}):
+            with self.subTest(off=off):
+                self.assertEqual(logprobs_options(off, True, True), (0, False, 0))
+
+    def test_chat_echo_is_always_rejected(self):
+        # Chat has no echo concept at all -- a named 400, not a silent
+        # ignore, whether or not logprobs was also requested.
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"echo": True}, True, True)
+        self.assertEqual(caught.exception.param, "echo")
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"echo": True, "logprobs": True}, True, True)
+        self.assertEqual(caught.exception.param, "echo")
+
+    def test_chat_top_logprobs_default_and_cap(self):
+        self.assertEqual(logprobs_options({"logprobs": True}, True, True), (1, False, 0))
+        self.assertEqual(
+            logprobs_options({"logprobs": True, "top_logprobs": 5}, True, True), (5, False, 5))
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": True, "top_logprobs": LOGPROBS_TOP_K_CAP + 1},
+                             True, True)
+        self.assertEqual(caught.exception.param, "top_logprobs")
+
+    def test_capability_gate_rejects_unsupported_engine(self):
+        # The server never emits logprobs= to an engine that does not
+        # implement the numeric per-token channel -- a named 400, not a
+        # silent downgrade to "no logprobs".
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 1}, False, False)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "unsupported_parameter")
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": True}, True, False)
+        self.assertEqual(caught.exception.status, 400)
+        # Absent/zero logprobs never reach the capability check at all.
+        self.assertEqual(logprobs_options({}, False, False), (0, False, 0))
+        self.assertEqual(logprobs_options({"logprobs": 0}, False, False), (0, False, 0))
+
+    def test_range_error_precedes_capability_error(self):
+        # The named 400 above the cap fires even on a non-supporting
+        # engine -- the range check is about the public API surface, not
+        # the engine.
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": LOGPROBS_TOP_K_CAP + 1}, False, False)
+        self.assertEqual(caught.exception.code, "invalid_value")
+
+    def test_cap_pinned_to_engine_topk_maximum(self):
+        # Mirrors the engine's per-request top-k maximum, the
+        # COLI_SUBMIT_TOPK_MAX constant defined in c/decode_batch.h:19. A
+        # literal check (not the LOGPROBS_TOP_K_CAP symbol) so a change to
+        # either side is caught, instead of the test drifting in lockstep
+        # with the constant it exists to pin.
+        self.assertEqual(LOGPROBS_TOP_K_CAP, 32)
+
+    def test_cap_boundary_literals_both_endpoints(self):
+        # Literal 32/33, not LOGPROBS_TOP_K_CAP +/- 1: a boundary check
+        # that stays meaningful even if the cap constant itself drifts.
+        self.assertEqual(logprobs_options({"logprobs": 32}, False, True), (32, False, 32))
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 33}, False, True)
+        self.assertEqual(caught.exception.param, "logprobs")
+        self.assertEqual(caught.exception.code, "invalid_value")
+        self.assertEqual(
+            logprobs_options({"logprobs": True, "top_logprobs": 32}, True, True),
+            (32, False, 32))
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": True, "top_logprobs": 33}, True, True)
+        self.assertEqual(caught.exception.param, "top_logprobs")
+        self.assertEqual(caught.exception.code, "invalid_value")
+
+    def test_chat_top_logprobs_validated_even_when_logprobs_is_off(self):
+        # Pre-existing defect found by review: with `logprobs`
+        # false/absent, `top_logprobs` used to be ignored outright --
+        # 999 and "x" both passed silently. It is now TYPE- and
+        # RANGE-checked regardless, with the same named 400s as when
+        # `logprobs` is true; a genuinely valid value stays a documented
+        # no-op.
+        for bad in ("x", -1, 999):
+            with self.subTest(bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options({"top_logprobs": bad}, True, True)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "top_logprobs")
+                self.assertEqual(caught.exception.code, "invalid_value")
+        self.assertEqual(logprobs_options({"top_logprobs": 5}, True, True), (0, False, 0))
+        self.assertEqual(logprobs_options({}, True, True), (0, False, 0))
+
+    def test_echo_non_bool_rejected_same_way_both_endpoints(self):
+        # Completions already checked echo's type with isinstance(bool);
+        # chat's refusal used truthiness. Both endpoints now validate
+        # echo's TYPE first, with the shared "must be a boolean" 400 --
+        # chat's "not supported for chat completions" refusal now only
+        # ever fires for an actual boolean True.
+        for bad in (1, "true"):
+            with self.subTest(endpoint="completions", bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options({"echo": bad}, False, True)
+                self.assertEqual(caught.exception.param, "echo")
+                self.assertEqual(caught.exception.code, "invalid_value")
+            with self.subTest(endpoint="chat", bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options({"echo": bad}, True, True)
+                self.assertEqual(caught.exception.param, "echo")
+                self.assertEqual(caught.exception.code, "invalid_value")
+
+    def test_range_error_message_states_the_cap_value(self):
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 999}, False, True)
+        self.assertIn("32", caught.exception.message)
+
+    def test_chat_top_logprobs_null_normalizes_to_absent(self):
+        # `top_logprobs: null` means the same thing as the field being
+        # absent -- exactly like `logprobs: null` -- on both sides of the
+        # `logprobs` gate. It never itself reaches the type/range check.
+        self.assertEqual(
+            logprobs_options({"logprobs": False, "top_logprobs": None}, True, True),
+            (0, False, 0))
+        self.assertEqual(
+            logprobs_options({"logprobs": True, "top_logprobs": None}, True, True),
+            (1, False, 0))
+
+    def test_completions_ignores_top_logprobs_entirely(self):
+        # `top_logprobs` is a chat-only field in the OpenAI request shape;
+        # completions never reads it, so a nonsense value there changes
+        # nothing -- the result is exactly the completions tuple for
+        # `logprobs: 2` alone.
+        self.assertEqual(
+            logprobs_options({"logprobs": 2, "top_logprobs": 999}, False, True),
+            (2, False, 2))
+
+
+class ResponseAssemblyTest(unittest.TestCase):
+    """Pure response-shape builders: _json_float, _order_echo_records,
+    _own_token_label, _completions_logprobs_object, _chat_logprobs_content.
+    No HTTP, no engine -- fixtures hand-build the (pos, bytes, record) and
+    (bytes, record) tuples the wire dispatcher would otherwise produce."""
+
+    def test_json_float_maps_non_finite_to_none(self):
+        # Non-finite becomes JSON null on the wire out, never a clamped
+        # number and never a raw float (json.dumps would emit the
+        # invalid-JSON NaN/Infinity literal for that).
+        self.assertIsNone(_json_float(float("nan")))
+        self.assertIsNone(_json_float(float("inf")))
+        self.assertIsNone(_json_float(float("-inf")))
+        self.assertEqual(_json_float(-0.5), -0.5)
+        self.assertEqual(json.dumps({"x": _json_float(float("nan"))}), '{"x": null}')
+
+    def test_own_token_label_matches_by_value_not_rank_or_id(self):
+        # The chosen token need not sit first in the top-k table (the
+        # table is unsorted on the wire) -- the label must be found by
+        # exact float match against the position's own logprob, not by
+        # assuming table position 0 and not by any id-to-text mapping.
+        entry = {"text": "café", "raw_lp": -0.8}
+        topk = [(999, -0.05), (42, -0.8)]
+        self.assertEqual(_own_token_label(entry, topk, 0), "<token_id:999>")
+        self.assertEqual(_own_token_label(entry, topk, 1), "café")
+
+    def test_own_token_label_tie_break_deterministic_first_match(self):
+        # The engine prints logprobs to 6 decimal digits, so two distinct
+        # candidates can share the exact printed value the chosen token
+        # also carries -- a genuine tie the record's own shape (lp + a
+        # topk table of raw ids, no chosen-token id) cannot resolve by
+        # identity. Documented behavior: the FIRST table entry (in wire
+        # order) whose value matches is labeled as the chosen token; a
+        # later entry that also matches is labeled by its raw id like any
+        # other unidentified candidate -- deterministic, not a claim that
+        # the first entry is provably the true chosen one.
+        entry = {"text": "cat", "raw_lp": -0.223144}
+        topk = [(1, -0.223144), (2, -0.223144)]
+        self.assertEqual(_own_token_label(entry, topk, 0), "cat")
+        self.assertEqual(_own_token_label(entry, topk, 1), "<token_id:2>")
+
+    def test_completions_logprobs_object_first_prompt_token_is_null(self):
+        prompt = [(0, b"The", {"lp": float("nan"), "topk": []}),
+                  (1, b" cat", {"lp": -0.3, "topk": [(7, -0.3), (8, -1.1)]})]
+        obj = _completions_logprobs_object(prompt, [], display_k=2)
+        self.assertEqual(obj["tokens"], ["The", " cat"])
+        self.assertIsNone(obj["token_logprobs"][0])
+        self.assertEqual(obj["token_logprobs"][1], -0.3)
+        self.assertEqual(obj["top_logprobs"][0], {})
+
+    def test_text_offset_reconstruction_and_monotonic(self):
+        # "".join(tokens) reproduces the prompt text, and text_offset
+        # matches the exact per-position character counts -- a literal
+        # expected list, not a self-referential sortedness/start-at-0
+        # check that every possible offset sequence satisfies by
+        # construction (offsets are a running sum of non-negative token
+        # lengths, so both of those would hold even for a wrong sequence).
+        prompt_text = "Hé said éé"
+        pieces = ["H", "é", " said ", "é", "é"]
+        prompt = [(i, p.encode("utf-8"), {"lp": float("nan") if i == 0 else -0.1, "topk": []})
+                  for i, p in enumerate(pieces)]
+        obj = _completions_logprobs_object(prompt, [], display_k=0)
+        self.assertEqual("".join(obj["tokens"]), prompt_text)
+        self.assertEqual(obj["text_offset"], [0, 1, 2, 8, 9])
+
+    def test_text_offset_base_kwarg_shifts_all_offsets(self):
+        # An `echo=false` completions request still needs `text_offset`
+        # counted from the end of the prompt under OpenAI's own
+        # completions/echo convention -- callers that omit the echoed
+        # prompt can pass the prompt's character length here so offsets
+        # index the full text instead of just the generated tail. Default
+        # (0) preserves the behavior exercised by every other test in
+        # this class; deciding whether/when to pass a nonzero base is a
+        # caller-side concern, handled outside this helper.
+        generated = [(b"cat", {"lp": -0.05, "topk": []}), (b" dog", {"lp": -0.1, "topk": []})]
+        obj = _completions_logprobs_object([], generated, display_k=0, text_offset_base=100)
+        self.assertEqual(obj["text_offset"], [100, 103])
+
+    def test_trailing_incomplete_multibyte_sequence_flushed_in_completions_path(self):
+        # The same stateful-decoder trailing flush _chat_logprobs_content
+        # relies on lives in the shared _logprob_positions helper -- prove
+        # it from the completions/echo side too, not only via chat, so a
+        # regression in the shared helper that happens to leave the chat
+        # test green cannot slip through.
+        prompt = [(0, b"H", {"lp": float("nan"), "topk": []}),
+                  (1, b"\xc3", {"lp": -0.1, "topk": []})]    # first byte of 'é', never completed
+        obj = _completions_logprobs_object(prompt, [], display_k=0)
+        self.assertEqual(obj["tokens"][0], "H")
+        self.assertIn("\ufffd", obj["tokens"][1])
+
+    def test_bit_identity_when_chosen_token_is_argmax(self):
+        # token_logprobs[i] equals top_logprobs[i][tokens[i]] exactly when
+        # token i is itself the argmax of its own table -- checked against
+        # the fixture's own argmax logprob literal (-0.05) on both sides,
+        # not by comparing two fields of the same call's output to each
+        # other (which a shared, consistently-wrong source would pass).
+        generated = [(b"cat", {"lp": -0.05, "topk": [(7, -0.05), (8, -3.0)]})]
+        obj = _completions_logprobs_object([], generated, display_k=2)
+        self.assertEqual(obj["token_logprobs"][0], -0.05)
+        self.assertEqual(obj["top_logprobs"][0]["cat"], -0.05)
+
+    def test_display_k_truncates_alternatives_independent_of_engine_k(self):
+        generated = [(b"cat", {"lp": -0.05, "topk": [(7, -0.05), (8, -3.0), (9, -4.0)]})]
+        obj = _completions_logprobs_object([], generated, display_k=1)
+        self.assertEqual(len(obj["top_logprobs"][0]), 1)
+        obj0 = _completions_logprobs_object([], generated, display_k=0)
+        self.assertEqual(obj0["top_logprobs"][0], {})
+        self.assertEqual(obj0["token_logprobs"][0], -0.05)   # still reported
+
+    def test_chat_content_shape_and_no_echo_field(self):
+        generated = [(b"cat", {"lp": -0.05, "topk": [(7, -0.05), (8, -3.0)]})]
+        content = _chat_logprobs_content(generated, display_k=2)
+        self.assertEqual(len(content), 1)
+        entry = content[0]
+        self.assertEqual(set(entry), {"token", "logprob", "bytes", "top_logprobs"})
+        self.assertEqual(entry["token"], "cat")
+        self.assertEqual(entry["logprob"], -0.05)
+        self.assertEqual(entry["bytes"], [99, 97, 116])
+        self.assertEqual(len(entry["top_logprobs"]), 2)
+        for alt in entry["top_logprobs"]:
+            self.assertEqual(set(alt), {"token", "logprob", "bytes"})
+        own = [a for a in entry["top_logprobs"] if a["token"] == "cat"][0]
+        self.assertEqual(own["logprob"], -0.05)
+        self.assertEqual(own["bytes"], [99, 97, 116])
+        other = [a for a in entry["top_logprobs"] if a["token"] != "cat"][0]
+        self.assertIsNone(other["bytes"])
+        self.assertNotIn("echo", json.dumps(content))
+
+    def test_chat_content_nan_serializes_as_null(self):
+        generated = [(b"x", {"lp": float("-inf"), "topk": [(1, float("-inf"))]})]
+        content = _chat_logprobs_content(generated, display_k=1)
+        self.assertIsNone(content[0]["logprob"])
+        self.assertIsNone(content[0]["top_logprobs"][0]["logprob"])
+
+    # Adversarial top-k order: the chosen token's own candidate sits
+    # second in the table and is not even the highest logprob present (a
+    # sampled-path shape) -- no code here may assume table position 0.
+
+    def test_token_logprobs_sourced_from_chosen_record_not_table_position(self):
+        generated = [(b"cat", {"lp": -0.8, "topk": [(999, -0.05), (7, -0.8)]})]
+        obj = _completions_logprobs_object([], generated, display_k=2)
+        self.assertEqual(obj["token_logprobs"][0], -0.8)
+        self.assertEqual(obj["top_logprobs"][0]["cat"], -0.8)
+        self.assertNotEqual(obj["token_logprobs"][0], -0.05,
+                            "token_logprobs must not be sourced from topk[0]")
+
+    def test_chat_content_logprob_sourced_from_chosen_record_not_table_position(self):
+        generated = [(b"cat", {"lp": -0.8, "topk": [(999, -0.05), (7, -0.8)]})]
+        content = _chat_logprobs_content(generated, display_k=2)
+        self.assertEqual(content[0]["logprob"], -0.8)
+        own = [a for a in content[0]["top_logprobs"] if a["token"] == "cat"][0]
+        self.assertEqual(own["logprob"], -0.8)
+
+    # Numeric text_offset: exact values, not just monotonic/starts-at-0,
+    # over a fixture with a multi-byte character ("é": one Python
+    # character, two UTF-8 bytes) so a byte-vs-character-count confusion
+    # would fail.
+
+    def test_text_offset_exact_values_with_multibyte_character(self):
+        prompt = [(0, b"H", {"lp": float("nan"), "topk": []}),
+                  (1, b"\xc3\xa9", {"lp": -0.1, "topk": []}),   # "é", complete on its own
+                  (2, b" cat", {"lp": -0.2, "topk": []})]
+        obj = _completions_logprobs_object(prompt, [], display_k=0)
+        self.assertEqual(obj["tokens"], ["H", "é", " cat"])
+        self.assertEqual(obj["text_offset"], [0, 1, 2])
+
+    # Multi-byte character split across two adjacent frames -- must
+    # reconstruct via the stateful incremental decoder instead of
+    # mangling into two replacement-character halves.
+
+    def test_multibyte_character_split_across_adjacent_tokens_reconstructs(self):
+        prompt_text = "café"
+        prompt = [(0, b"c", {"lp": float("nan"), "topk": []}),
+                  (1, b"a", {"lp": -0.1, "topk": []}),
+                  (2, b"f", {"lp": -0.1, "topk": []}),
+                  (3, b"\xc3", {"lp": -0.1, "topk": []}),    # first byte of 'é'
+                  (4, b"\xa9", {"lp": -0.1, "topk": []})]    # second byte of 'é'
+        obj = _completions_logprobs_object(prompt, [], display_k=0)
+        self.assertEqual("".join(obj["tokens"]), prompt_text)
+        self.assertEqual(obj["tokens"], ["c", "a", "f", "", "é"])
+
+    def test_multibyte_character_split_across_generated_tokens_reconstructs(self):
+        generated = [(b"\xc3", {"lp": -0.1, "topk": []}), (b"\xa9", {"lp": -0.1, "topk": []})]
+        content = _chat_logprobs_content(generated, display_k=0)
+        self.assertEqual("".join(c["token"] for c in content), "é")
+        self.assertEqual([c["token"] for c in content], ["", "é"])
+        # `bytes` always stays the frame's own raw payload, independent
+        # of what text (if any) it resolved to.
+        self.assertEqual(content[0]["bytes"], [0xC3])
+        self.assertEqual(content[1]["bytes"], [0xA9])
+
+    def test_trailing_incomplete_multibyte_sequence_still_flushed(self):
+        # A dangling partial sequence at the very end of the stream (no
+        # more data ever completes it) must still surface via the final
+        # flush, not silently vanish.
+        generated = [(b"cat", {"lp": -0.1, "topk": []}), (b"\xc3", {"lp": -0.1, "topk": []})]
+        content = _chat_logprobs_content(generated, display_k=0)
+        self.assertEqual(content[0]["token"], "cat")
+        self.assertIn("�", content[1]["token"])
+
+    def test_chat_content_tail_flush_consistent_with_own_alternative_label(self):
+        # The trailing-flush text must reach the chosen token's OWN
+        # top_logprobs entry, not just the outer `token` field -- decoding
+        # is done in one pass over all positions (tail included) before
+        # any content entry is built, so the two can never disagree about
+        # what the last position's text actually is.
+        generated = [(b"\xc3", {"lp": -0.1, "topk": [(1, -0.1)]})]   # never completed
+        content = _chat_logprobs_content(generated, display_k=1)
+        self.assertIn("�", content[0]["token"])
+        self.assertEqual(content[0]["top_logprobs"][0]["token"], content[0]["token"])
+
+    def test_completions_top_logprobs_tie_break_deterministic_first_match(self):
+        # Two candidates print the identical 6-decimal logprob the chosen
+        # token also carries. The FIRST exact match in wire order is
+        # labeled as the chosen token; the second gets its own distinct
+        # id-labeled entry rather than being silently merged into the
+        # first (a dict keyed only by label would otherwise collapse two
+        # genuinely different candidates into one entry).
+        generated = [(b"cat", {"lp": -0.223144, "topk": [(1, -0.223144), (2, -0.223144)]})]
+        obj = _completions_logprobs_object([], generated, display_k=2)
+        self.assertEqual(set(obj["top_logprobs"][0]), {"cat", "<token_id:2>"})
+
+    # ECHO's wire `pos` field, not arrival order, decides placement.
+
+    def test_echo_positions_reassembled_by_wire_pos_not_arrival_order(self):
+        prompt = [(1, b"b", {"lp": -1.0, "topk": []}),      # delivered out of order
+                  (0, b"a", {"lp": float("nan"), "topk": []})]
+        obj = _completions_logprobs_object(prompt, [], display_k=0)
+        self.assertEqual(obj["tokens"], ["a", "b"])
+        self.assertIsNone(obj["token_logprobs"][0])
+        self.assertEqual(obj["token_logprobs"][1], -1.0)
+
+    def test_order_echo_records_repeated_token_prompt_not_fooled_by_join_check(self):
+        # A join-only check ("abab") can pass even when positions are
+        # corrupted, because repeated tokens make the wrong order look
+        # identical to the right one under "".join(). Position-indexed
+        # assembly must get the per-position values right regardless.
+        prompt = [(0, b"a", {"lp": float("nan"), "topk": []}),
+                  (2, b"a", {"lp": -2.0, "topk": []}),
+                  (1, b"b", {"lp": -1.0, "topk": []}),
+                  (3, b"b", {"lp": -3.0, "topk": []})]
+        obj = _completions_logprobs_object(prompt, [], display_k=0)
+        self.assertEqual(obj["tokens"], ["a", "b", "a", "b"])
+        self.assertEqual("".join(obj["tokens"]), "abab")
+        self.assertEqual(obj["token_logprobs"], [None, -1.0, -2.0, -3.0])
+
+    def test_duplicate_echo_position_raises_named_error(self):
+        prompt = [(0, b"a", {"lp": float("nan"), "topk": []}),
+                  (0, b"a2", {"lp": -1.0, "topk": []})]
+        with self.assertRaisesRegex(RuntimeError, "invalid engine ECHO position"):
+            _order_echo_records(prompt)
+        with self.assertRaises(RuntimeError):
+            _completions_logprobs_object(prompt, [], display_k=0)
+
+    def test_out_of_range_echo_position_raises_named_error(self):
+        prompt = [(0, b"a", {"lp": float("nan"), "topk": []}),
+                  (5, b"b", {"lp": -1.0, "topk": []})]
+        with self.assertRaisesRegex(RuntimeError, "invalid engine ECHO position"):
+            _order_echo_records(prompt)
+
+    def test_negative_echo_position_raises_named_error(self):
+        prompt = [(-1, b"a", {"lp": float("nan"), "topk": []})]
+        with self.assertRaises(RuntimeError):
+            _order_echo_records(prompt)
 
 
 class StopFilterTest(unittest.TestCase):
@@ -950,9 +1448,11 @@ class DispatcherTest(unittest.TestCase):
         # U7a forward-compat: the engine's opt-in per-token numeric channel --
         # ECHO frames for echoed prompt positions and DATA frames extended
         # with "<lp> <k> [tid tlp]*k" -- must NOT trip the dispatcher's
-        # catch-all (which kills every in-flight request). Text delivery and
-        # the DONE stats stay exactly as for legacy frames; the numeric
-        # fields are consumed by the server feature half (U7b).
+        # catch-all (which kills every in-flight request), and must not
+        # change the legacy response shape: text delivery and the DONE
+        # stats stay exactly as for legacy frames. The numeric records
+        # themselves are collected internally; response assembly reading
+        # them back out is separate, later work.
         def respond(process, frame):
             request_id = frame.split()[1]
             process.stdout.feed(b"ACCEPT " + request_id + b" 3\n")
@@ -978,6 +1478,290 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(stats["prompt_tokens"], 3)
         self.assertIsNone(engine.dispatcher_error)
+        engine.close()
+
+    def test_legacy_data_frame_dispatches_bare_bytes_no_record(self):
+        # A DATA frame WITHOUT a tail dispatches exactly as on the
+        # predecessor dispatcher -- the same event tuple, same bytes, no
+        # record object allocated. Guards against a record being allocated
+        # unconditionally on the (far more common) non-opted-in path.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        events = queue.Queue()
+        request_id = "1"
+        with engine.pending_lock:
+            engine.pending[request_id] = events
+        process.stdout.feed(b"DATA " + request_id.encode() + b" 2\nok\n")
+        kind, value = events.get(timeout=1)
+        self.assertEqual(kind, "data")
+        self.assertIs(type(value), bytes)
+        self.assertEqual(value, b"ok")
+        engine.close()
+
+    def test_echo_position_zero_nan_tail_parses_as_float_nan(self):
+        # Position 0 of an echoed prompt carries no preceding token to
+        # condition on, so the engine's tail there is always "nan 0" --
+        # this must parse to float("nan"), not 0.0.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        events = queue.Queue()
+        request_id = "1"
+        with engine.pending_lock:
+            engine.pending[request_id] = events
+        process.stdout.feed(b"ECHO " + request_id.encode() + b" 2 0 nan 0\nHi\n")
+        kind, (pos, data, record) = events.get(timeout=1)
+        self.assertEqual((kind, pos, data), ("echo", 0, b"Hi"))
+        self.assertTrue(math.isnan(record["lp"]))
+        self.assertEqual(record["topk"], [])
+        engine.close()
+
+    def test_nan_and_inf_logprob_tail_values_parse_cleanly(self):
+        # A degenerate logit row (all -inf after grammar masking, say)
+        # produces a well-formed record, not a parse failure.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        events = queue.Queue()
+        request_id = "1"
+        with engine.pending_lock:
+            engine.pending[request_id] = events
+        process.stdout.feed(
+            b"DATA " + request_id.encode() + b" 1 inf 2 5 inf 6 -inf\nx\n")
+        kind, (data, record) = events.get(timeout=1)
+        self.assertEqual((kind, data), ("data", b"x"))
+        self.assertEqual(record["lp"], float("inf"))
+        self.assertEqual(record["topk"], [(5, float("inf")), (6, float("-inf"))])
+        engine.close()
+
+    def test_high_precision_and_negative_infinity_tail_values_parse(self):
+        # The parser must not assume any particular float rendering -- a
+        # 17-significant-digit value (as a higher-precision engine build
+        # might emit, versus the shipped build's %.6f) and a bare "-inf"
+        # both parse through the same float() call as any other value.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        events = queue.Queue()
+        request_id = "1"
+        with engine.pending_lock:
+            engine.pending[request_id] = events
+        process.stdout.feed(
+            b"DATA " + request_id.encode() +
+            b" 1 -0.10536051565782628 2 3 -1.7987654321098765 8 -inf\nx\n")
+        kind, (data, record) = events.get(timeout=1)
+        self.assertEqual((kind, data), ("data", b"x"))
+        self.assertEqual(record["lp"], -0.10536051565782628)
+        self.assertEqual(record["topk"], [(3, -1.7987654321098765), (8, float("-inf"))])
+        engine.close()
+
+    def test_top_k_stays_in_wire_order_never_sorted(self):
+        # The table is unsorted on the wire; a pair earlier in the wire
+        # order but numerically/id-smaller later must stay first -- catches
+        # an accidental sort by id or by log-probability.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        events = queue.Queue()
+        request_id = "1"
+        with engine.pending_lock:
+            engine.pending[request_id] = events
+        process.stdout.feed(
+            b"DATA " + request_id.encode() + b" 1 -1.0 2 9 -1.0 2 -0.1\nx\n")
+        kind, (data, record) = events.get(timeout=1)
+        self.assertEqual((kind, data), ("data", b"x"))
+        self.assertEqual(record["topk"], [(9, -1.0), (2, -0.1)])
+        engine.close()
+
+    def test_short_logprob_tail_raises_rather_than_silently_truncating(self):
+        # A tail whose k claims more pairs than are actually present on the
+        # wire must fail loudly, never silently truncate to the pairs that
+        # happen to be there.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 1 -0.5 2 3 -0.5\nx\n")
+            # A DONE trails the malformed frame so a dispatcher that fails to
+            # catch the mismatch completes normally instead of hanging --
+            # keeping this a clean assertion failure, not a stuck test.
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine logprob tail"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_long_logprob_tail_raises_rather_than_ignoring_trailing_fields(self):
+        # The reverse of the short-tail case: a tail with MORE fields than
+        # its own k accounts for must also fail loudly, not silently
+        # ignore the trailing garbage.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"DATA " + request_id + b" 1 -0.5 1 3 -0.5 9 -9.0\nx\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine logprob tail"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_non_numeric_tail_fields_raise_named_error(self):
+        # A non-numeric lp, token id, or per-candidate log-probability must
+        # be a named engine-protocol error, not an uncaught ValueError.
+        cases = (
+            b"DATA {id} 1 nope 1 3 -0.5\nx\n",     # lp
+            b"DATA {id} 1 -0.5 1 abc -0.5\nx\n",   # tid
+            b"DATA {id} 1 -0.5 1 3 nope\nx\n",     # tlp (not "nan"/"inf")
+        )
+        for malformed in cases:
+            with self.subTest(frame=malformed):
+                def respond(process, frame, malformed=malformed):
+                    request_id = frame.split()[1]
+                    process.stdout.feed(malformed.replace(b"{id}", request_id))
+                    process.stdout.feed(
+                        b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "invalid engine logprob tail"):
+                    engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+                engine.close()
+
+    def test_negative_or_oversized_k_raises_named_error(self):
+        # k selects how many candidate pairs follow; a negative k or one
+        # past the engine's own top-32 cap is malformed, not a huge/empty
+        # read.
+        for k in (-1, LOGPROBS_TOP_K_CAP + 1):
+            with self.subTest(k=k):
+                def respond(process, frame, k=k):
+                    request_id = frame.split()[1]
+                    process.stdout.feed(
+                        b"DATA " + request_id + f" 1 -0.5 {k}\n".encode() + b"x\n")
+                    process.stdout.feed(
+                        b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "invalid engine logprob tail"):
+                    engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+                engine.close()
+
+    def test_negative_token_id_raises_named_error(self):
+        # A candidate's token id is a vocabulary index -- never negative.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"DATA " + request_id + b" 1 -0.5 1 -3 -0.5\nx\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine logprob tail"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_echo_frame_bad_terminator_is_a_named_error(self):
+        # The byte after an ECHO frame's payload must be the LF terminator;
+        # anything else is a named protocol error, matching DATA/TOOL. The
+        # stream is closed right after the bad terminator so a check that
+        # is missing or weakened surfaces "colibri engine exited
+        # unexpectedly" from the next (never-arriving) frame instead of
+        # hanging forever.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ECHO " + request_id + b" 2 0 nan 0\nHiX")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine ECHO terminator"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_data_size_bound_checked_before_any_payload_read(self):
+        # The 65536-byte size bound must be enforced BEFORE any payload
+        # byte is read. The fake stream here is closed right after a
+        # too-large claimed size and a couple of payload bytes -- a bound
+        # check that fires first raises immediately; one that is missing or
+        # weakened would instead try to read 70000 bytes from a stream that
+        # only ever offers 2 and then closes, surfacing "truncated engine
+        # DATA payload" (a different, misleading error) rather than
+        # hanging forever waiting for bytes that will never arrive.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 70000\nxy")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine DATA size"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_echo_frame_errors_are_named_echo_not_data(self):
+        # A malformed ECHO frame's error message must say ECHO, not a
+        # copy-pasted DATA -- a wrong frame name in a dispatcher-killing
+        # error is actively misleading to whoever reads it. The stream is
+        # closed right after the oversized header so a missing/weakened
+        # bound check surfaces a truncation error instead of hanging.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ECHO " + request_id + b" 99999 0 nan 0\n")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine ECHO size"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_dispatcher_drops_echo_frames_with_no_pending_request(self):
+        # An ECHO frame for an id with no pending entry (already DONE, or
+        # never admitted) stays droppable, exactly like DATA/ACCEPT already
+        # do -- it must not raise or wedge the dispatcher for the NEXT
+        # request on the same connection.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DONE " + request_id + b" STAT 0 1 0 1 3 0\n")
+            # A stray ECHO for an id that is no longer pending (this one
+            # just finished) must be read and dropped, not raise.
+            process.stdout.feed(b"ECHO " + request_id + b" 1 0 nan 0\nx\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        # The dispatcher must still be alive and able to serve a second
+        # request -- proof the stray frame didn't wedge it.
+        engine.generate("hello2", 4, 0.0, 1.0, lambda _: None)
+        self.assertIsNone(engine.dispatcher_error)
+        engine.close()
+
+    def test_supports_logprobs_echo_flag_set_once_by_arch(self):
+        # The capability flag is set once at launch from the arch id,
+        # glm only.
+        process_glm = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process_glm):
+            engine = Engine("glm", "model")
+        self.assertTrue(engine.supports_logprobs_echo)
+        engine.close()
+
+        process_other = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process_other), \
+             patch("openai_server.ARCH", "inkling"):
+            engine = Engine("inkling", "model")
+        self.assertFalse(engine.supports_logprobs_echo)
         engine.close()
 
     def test_unknown_frame_still_stops_dispatcher(self):
@@ -2835,6 +3619,718 @@ class ReasoningEffortTest(unittest.TestCase):
         text = render_chat(self.MESSAGES, enable_thinking=False,
                            reasoning_effort="xhigh")
         self.assertNotIn("Reasoning Effort", text)
+
+
+class NonGlmEngine(FakeEngine):
+    """The U7b capability gate's negative case: an engine that predates U7a
+    (or isn't glm) never gets the extension fields, never mind what it
+    would do with them."""
+    supports_logprobs_echo = False
+
+
+class LogprobsHTTPTest(unittest.TestCase):
+    """End-to-end U7b acceptance tests against a real APIServer + APIHandler,
+    with FakeEngine standing in for the engine subprocess (its
+    logprobs_channel() returns the canned U7a records documented on
+    FakeEngine.generate() above).
+
+    On the predecessor head, ANY truthy `logprobs` (an integer, or `True`)
+    unconditionally 400s before this server's own validation ever runs, and
+    `choices[].logprobs` is otherwise always null. That predecessor check
+    happens to also 400 several of this class's "reject this" cases for the
+    WRONG reason (a blanket rejection, not this server's specific named
+    validation), so only 6 of these 12 methods are regression pins (fail
+    outright on the predecessor head): test_chat_logprobs_content_shape,
+    test_chat_echo_is_rejected, test_completions_logprobs_true_is_named_400
+    (predecessor 400s but with the wrong error code),
+    test_bit_identity_end_to_end, test_echo_reconstructs_prompt_text, and
+    test_nan_logprob_serializes_as_json_null_over_the_wire. The other 6
+    already pass on the predecessor head (a truthy `logprobs`/`echo` request
+    there either already 400s for the coincidentally-matching blanket reason,
+    or a falsy/absent one already no-ops to `logprobs: null`) and are
+    REGRESSION-COVERAGE, pinning that this server's own validation reaches the
+    identical observable result: test_completions_logprobs_zero_is_no_logprobs_end_to_end,
+    test_break_it_logprobs_out_of_range, test_break_it_echo_without_logprobs_is_a_documented_noop,
+    test_break_it_streaming_plus_logprobs_is_named_400,
+    test_break_it_logprobs_rejected_for_non_glm_engine, and
+    test_golden_fixture_style_plain_request_is_unaffected. [RAN] verified by
+    running this class against the predecessor head's server file: 6
+    failed, 6 passed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = FakeEngine()
+        cls.server = APIServer(("127.0.0.1", 0), cls.engine, "test-model", "secret", 16,
+                               kv_slots=2)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def request(self, path, body=None):
+        headers = {"Authorization": "Bearer secret"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        return urlopen(Request(self.base + path, data=data, headers=headers), timeout=2)
+
+    def _temp_server(self, engine):
+        """A second, throwaway server backed by a different fake engine --
+        for the capability-gate negative cases, which must not share
+        cls.engine/cls.server with the rest of this class."""
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16, kv_slots=1)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, timeout=2)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    # ---- chat logprobs shape ------------------------------------------------
+
+    def test_chat_logprobs_content_shape(self):
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "logprobs": True, "top_logprobs": 2,
+        }) as response:
+            body = json.load(response)
+        content = body["choices"][0]["logprobs"]["content"]
+        self.assertGreater(len(content), 0)
+        for entry in content:
+            self.assertEqual(set(entry), {"token", "logprob", "bytes", "top_logprobs"})
+            for alt in entry["top_logprobs"]:
+                self.assertEqual(set(alt), {"token", "logprob", "bytes"})
+        self.assertNotIn("echo", body["choices"][0])
+
+    def test_chat_echo_is_rejected(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "echo": True,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "echo")
+
+    # ---- end to end -----------------------------------------------------------
+
+    def test_completions_logprobs_zero_is_no_logprobs_end_to_end(self):
+        # `logprobs: 0` behaves exactly like an omitted field -- the engine
+        # channel stays off and the choice carries logprobs: null.
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": "hi", "logprobs": 0,
+        }) as response:
+            body = json.load(response)
+        self.assertIsNone(body["choices"][0]["logprobs"])
+        self.assertEqual(self.engine.last_logprobs, 0)
+
+    def test_completions_logprobs_true_is_named_400(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": "hi", "logprobs": True,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "logprobs")
+        self.assertEqual(error["code"], "invalid_value")
+
+    # ---- bit-identity, end to end -------------------------------------------
+
+    def test_bit_identity_end_to_end(self):
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": "Hé", "echo": True, "logprobs": 2,
+            "max_tokens": 1,
+        }) as response:
+            body = json.load(response)
+        logprobs = body["choices"][0]["logprobs"]
+        for i, tok in enumerate(logprobs["tokens"]):
+            lp = logprobs["token_logprobs"][i]
+            table = logprobs["top_logprobs"][i]
+            if lp is not None and tok in table:
+                self.assertEqual(table[tok], lp,
+                                 f"position {i}: token_logprobs != top_logprobs[tokens[i]]")
+
+    # ---- text_offset / echoed-prompt reconstruction -------------------------
+
+    def test_echo_reconstructs_prompt_text(self):
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": "Hé", "echo": True, "logprobs": 1,
+            "max_tokens": 1,
+        }) as response:
+            body = json.load(response)
+        logprobs = body["choices"][0]["logprobs"]
+        # The canned engine always echoes exactly "H", "é" for the prompt
+        # positions (FakeEngine.logprobs_channel) -- the first two tokens
+        # reconstruct the prompt exactly; anything after that is generated.
+        self.assertEqual("".join(logprobs["tokens"][:2]), "Hé")
+        offsets = logprobs["text_offset"]
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertEqual(offsets[0], 0)
+        self.assertIsNone(logprobs["token_logprobs"][0])   # first prompt token: null by convention
+
+    # ---- break-it battery ---------------------------------------------------
+
+    def test_break_it_logprobs_out_of_range(self):
+        for bad in (-1, 33, 1.5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(HTTPError) as caught:
+                    self.request("/v1/completions", {
+                        "model": "test-model", "prompt": "hi", "logprobs": bad,
+                    })
+                self.assertEqual(caught.exception.code, 400)
+
+    def test_break_it_echo_without_logprobs_is_a_documented_noop(self):
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": "hi", "echo": True,
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(body["choices"][0]["logprobs"])
+
+    def test_break_it_streaming_plus_logprobs_is_named_400(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": "hi", "logprobs": 1, "stream": True,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "logprobs")
+
+    def test_break_it_logprobs_rejected_for_non_glm_engine(self):
+        base = self._temp_server(NonGlmEngine())
+        request = Request(base + "/v1/chat/completions", method="POST",
+                          headers={"Authorization": "Bearer secret",
+                                   "Content-Type": "application/json"},
+                          data=json.dumps({"model": "test-model",
+                                           "messages": [{"role": "user", "content": "hi"}],
+                                           "logprobs": True}).encode())
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 400)
+
+    # ---- non-finite serializes as JSON null, end to end ---------------------
+
+    def test_nan_logprob_serializes_as_json_null_over_the_wire(self):
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": "Hé", "echo": True, "logprobs": 1,
+            "max_tokens": 1,
+        }) as response:
+            raw = response.read()
+        self.assertNotIn(b"NaN", raw)
+        self.assertNotIn(b"Infinity", raw)
+        body = json.loads(raw)
+        self.assertIsNone(body["choices"][0]["logprobs"]["token_logprobs"][0])
+
+    # ---- a request that never touches logprobs is unaffected ----------------
+
+    def test_golden_fixture_style_plain_request_is_unaffected(self):
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4,
+        }) as response:
+            body = json.load(response)
+        self.assertIsNone(body["choices"][0]["logprobs"])
+        self.assertEqual(self.engine.last_logprobs, 0)
+
+
+class LogprobsSubmitHeaderRegressionTest(unittest.TestCase):
+    """REGRESSION-COVERAGE: a legacy request (no logprobs asked at all) must
+    produce a byte-identical SUBMIT header to the predecessor -- the
+    extension namespace must never appear unless the client opted in."""
+
+    def test_legacy_request_submit_header_is_byte_identical(self):
+        request_id = "1"
+        expected = f"SUBMIT {request_id} 0 5 4 0.25 0.9\n".encode() + b"hello\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA " + request_id.encode() + b" 2\nok\n"
+                b"DONE " + request_id.encode() + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        engine.generate("hello", 4, 0.25, 0.9, chunks.append)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+
+    def test_opted_in_request_submit_header_carries_the_extension(self):
+        # The mutation this pins: sending logprobs= on every request (not
+        # only opted-in ones) would make this test's own legacy sibling
+        # above fail -- the extension field would show up unconditionally.
+        request_id = "1"
+        expected = (f"SUBMIT {request_id} 0 5 4 0.25 0.9 0 logprobs=2\n".encode() +
+                    b"hello\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT " + request_id.encode() + b" 5\n"
+                b"ECHO " + request_id.encode() + b" 1 0 nan 0\nh\n"
+                b"DATA " + request_id.encode() +
+                b" 2 -0.223144 1 3 -0.223144\nok\n"
+                b"DONE " + request_id.encode() + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        engine.generate("hello", 4, 0.25, 0.9, chunks.append, logprobs=2)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+
+
+class LogprobsGoldenResponseRegressionTest(unittest.TestCase):
+    """REGRESSION-COVERAGE: a golden plain (non-logprobs) request's response
+    must be byte-identical to the predecessor's -- this feature must not
+    perturb any response field for a request that never asked for
+    logprobs."""
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_golden_plain_completions_response_is_byte_identical(self):
+        req = Request(self.base + "/v1/completions",
+                      data=json.dumps({"model": "test-model", "prompt": "hi",
+                                       "max_tokens": 4, "temperature": 0}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        self.assertEqual(set(choice), {"index", "text", "logprobs", "finish_reason"})
+        self.assertIsNone(choice["logprobs"])
+        self.assertEqual(choice["text"], "Héllo")
+        self.assertEqual(choice["finish_reason"], "stop")
+
+
+class LogprobsTailTerminatorAndRangeTest(unittest.TestCase):
+    """Two mutation survivors carried from the wire-dispatch work: a
+    wrong (not-LF) DATA terminator byte, and a k outside 0..32 presented
+    WITH a matching field count -- so the field-count check alone could
+    never catch it, only the dedicated range check."""
+
+    def test_data_frame_wrong_terminator_byte_is_a_named_error(self):
+        # The byte after a DATA frame's tail-extended payload must be LF;
+        # a wrong byte here (not a closed stream) is the same class of
+        # protocol error ECHO's terminator check already has a dedicated
+        # test for -- DATA's own wrong-byte case had none.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"DATA " + request_id + b" 2 -0.223144 1 3 -0.223144\nokX")
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine DATA terminator"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_k_out_of_range_with_matching_field_count_is_a_named_error(self):
+        # k = LOGPROBS_TOP_K_CAP + 1, with exactly that many (tid, tlp)
+        # pairs actually present -- the field-count check passes cleanly,
+        # so only the dedicated `0 <= k <= LOGPROBS_TOP_K_CAP` range check
+        # can catch this.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            k = LOGPROBS_TOP_K_CAP + 1
+            pairs = " ".join(f"{i} -0.1" for i in range(k))
+            process.stdout.feed(
+                b"DATA " + request_id + f" 1 -0.5 {k} {pairs}\n".encode() + b"x\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine logprob tail: k=.* out of range"):
+            engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        engine.close()
+
+    def test_g17_precision_tail_value_parses_through_the_same_float_call(self):
+        # The shipped engine prints tail numbers as %.6f; a %.17g
+        # value (a higher-precision build's own extension, not exactly
+        # representable at 6 decimals) must parse through the same
+        # float() call, not a format assumption.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        events = queue.Queue()
+        request_id = "1"
+        with engine.pending_lock:
+            engine.pending[request_id] = events
+        process.stdout.feed(
+            b"DATA " + request_id.encode() +
+            b" 1 -0.30000000000000004 1 3 -0.30000000000000004\nx\n")
+        kind, (data, record) = events.get(timeout=1)
+        self.assertEqual((kind, data), ("data", b"x"))
+        self.assertEqual(record["lp"], -0.30000000000000004)
+        self.assertEqual(record["topk"], [(3, -0.30000000000000004)])
+        engine.close()
+
+
+class _DistinctEchoEngine(FakeEngine):
+    """Prompt-echo text ("PQ") and generated text ("gen") are chosen so
+    they share no character -- unlike LogprobsHTTPTest's shared canned
+    fixture, where the generated text happens to start with the same two
+    characters as the reconstructed prompt, a coincidence that would make a
+    `text.startswith(prompt_text)` check pass even with the prompt never
+    actually prepended."""
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 echo=False):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = echo
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 2})
+        on_text("gen")
+        stats = {"prompt_tokens": 2, "completion_tokens": 1, "length_limited": False}
+        if logprobs:
+            stats["logprobs"] = {
+                "prompt": [
+                    (0, b"P", {"lp": float("nan"), "topk": []}),
+                    (1, b"Q", {"lp": -0.1, "topk": [(1, -0.1)]}),
+                ],
+                "generated": [(b"gen", {"lp": -0.2, "topk": [(2, -0.2)]})],
+            }
+        return stats
+
+
+class EchoTextPrependTest(unittest.TestCase):
+    """`echo: true` must return prompt+completion in `text` itself (the
+    OpenAI legacy shape), not the completion alone, with `text_offset`
+    indexing that same concatenation."""
+
+    def _server(self):
+        engine = _DistinctEchoEngine()
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, timeout=2)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_echo_true_returns_prompt_plus_completion_in_text(self):
+        base = self._server()
+        req = Request(base + "/v1/completions",
+                      data=json.dumps({"model": "test-model", "prompt": "PQ",
+                                       "echo": True, "logprobs": 1,
+                                       "max_tokens": 1}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        logprobs = choice["logprobs"]
+        self.assertEqual(choice["text"], "PQgen")
+        self.assertEqual(logprobs["tokens"], ["P", "Q", "gen"])
+        self.assertEqual(logprobs["text_offset"], [0, 1, 2])
+        for offset in logprobs["text_offset"]:
+            self.assertLessEqual(offset, len(choice["text"]))
+
+    def test_echo_false_returns_completion_only_in_text(self):
+        # The control case: without echo, `text` stays completion-only, as
+        # before this fix.
+        base = self._server()
+        req = Request(base + "/v1/completions",
+                      data=json.dumps({"model": "test-model", "prompt": "PQ",
+                                       "logprobs": 1, "max_tokens": 1}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        self.assertEqual(body["choices"][0]["text"], "gen")
+
+
+class _SeamSplitEngine(FakeEngine):
+    """A 3-byte UTF-8 character (the Euro sign, "\u20ac") is split 1+2
+    across the prompt/completion seam: its leading byte rides the last
+    prompt ECHO frame's own bytes, and its two trailing bytes ride the
+    first generated DATA frame's own bytes. `on_text` is fed exactly what
+    an incremental UTF-8 decoder with no leading-byte context produces for
+    those two trailing bytes alone -- two replacement characters -- which
+    is what a caller decoding the generated bytes independently of the
+    prompt bytes (the seam bug) would see; a decoder that instead sees the
+    whole byte stream as one sequence reconstructs the real character."""
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 echo=False):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = echo
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 2})
+        on_text("\ufffd\ufffd")
+        stats = {"prompt_tokens": 2, "completion_tokens": 1, "length_limited": False}
+        if logprobs:
+            stats["logprobs"] = {
+                "prompt": [
+                    (0, b"A", {"lp": float("nan"), "topk": []}),
+                    (1, b"\xe2", {"lp": -0.1, "topk": [(1, -0.1)]}),
+                ],
+                "generated": [(b"\x82\xac", {"lp": -0.2, "topk": [(2, -0.2)]})],
+            }
+        return stats
+
+
+class EchoSeamDecodingTest(unittest.TestCase):
+    """A UTF-8 codepoint split across the prompt/completion seam must be
+    decoded as one character by one decoder spanning both sides, not as
+    two independently decoded halves."""
+
+    def test_split_codepoint_at_the_seam_decodes_as_one_character(self):
+        engine = _SeamSplitEngine()
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, timeout=2)
+        base = f"http://127.0.0.1:{server.server_port}"
+        req = Request(base + "/v1/completions",
+                      data=json.dumps({"model": "test-model", "prompt": "A\u20ac",
+                                       "echo": True, "logprobs": 1,
+                                       "max_tokens": 1}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        logprobs = choice["logprobs"]
+        self.assertEqual(choice["text"], "A\u20ac")
+        self.assertEqual(choice["text"].count("\u20ac"), 1)
+        self.assertNotIn("\ufffd", choice["text"])
+        offsets = logprobs["text_offset"]
+        self.assertEqual(offsets, sorted(offsets), "text_offset must be monotonic")
+        for offset in offsets:
+            self.assertLessEqual(offset, len(choice["text"]))
+
+
+class _StopTokenLogprobsEngine(FakeEngine):
+    """Emits three generated chunks and a matching logprob record for each;
+    a `stop` sequence matching the second chunk exactly withholds it (and
+    everything after) from `text` -- its own record, and the record after
+    it, must not survive into the response either."""
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 echo=False):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = echo
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 3})
+        for chunk in ("ok ", "STOP", " more"):
+            on_text(chunk)
+            if stopped and stopped():
+                self.stop_requests += 1
+                break
+        stats = {"prompt_tokens": 3, "completion_tokens": 3, "length_limited": False}
+        if logprobs:
+            stats["logprobs"] = {"prompt": [], "generated": [
+                (b"ok ", {"lp": -0.1, "topk": [(1, -0.1)]}),
+                (b"STOP", {"lp": -0.2, "topk": [(2, -0.2)]}),
+                (b" more", {"lp": -0.3, "topk": [(3, -0.3)]}),
+            ]}
+        return stats
+
+
+class LogprobsDroppedStopTokenTest(unittest.TestCase):
+    """A matched stop sequence withholds its own (and any later) text from
+    the response -- the logprobs arrays must not still describe a token the
+    client never received."""
+
+    def test_filtered_stop_token_record_is_dropped(self):
+        engine = _StopTokenLogprobsEngine()
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, timeout=2)
+        base = f"http://127.0.0.1:{server.server_port}"
+        req = Request(base + "/v1/completions",
+                      data=json.dumps({"model": "test-model", "prompt": "hi",
+                                       "max_tokens": 8, "stop": ["STOP"],
+                                       "logprobs": 1}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        self.assertEqual(choice["text"], "ok ")
+        logprobs = choice["logprobs"]
+        # Only the ONE record whose bytes are a prefix of "ok " may survive;
+        # the "STOP" record (and the " more" record after it) must not.
+        self.assertEqual(logprobs["tokens"], ["ok "])
+        self.assertEqual(len(logprobs["token_logprobs"]), 1)
+        self.assertEqual(len(logprobs["top_logprobs"]), 1)
+
+
+class LogprobsOldEngineAcceptTimeoutTest(unittest.TestCase):
+    """An engine build that silently rejects the extended SUBMIT header
+    must not wedge the caller forever."""
+
+    def test_old_engine_rejection_times_out_with_a_named_503(self):
+        # engine.generate() must run on its own thread here: if the
+        # accept-deadline check is missing or broken, the call blocks
+        # forever on this stub (the "ERROR 0 ..." reply never resolves the
+        # real pending request -- see the module docstring above), and a
+        # direct call in this test's own thread would hang the whole suite
+        # rather than fail this one test. A bounded join turns that failure
+        # mode into a normal, fast test failure instead.
+        def respond(process, frame):
+            process.stdout.feed(b"ERROR 0 BAD_REQUEST\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("openai_server.LOGPROBS_ACCEPT_TIMEOUT", 0.2):
+            engine = Engine("glm", "model")
+            outcome = {}
+
+            def run():
+                try:
+                    engine.generate("hello", 4, 0.0, 1.0, lambda _: None, logprobs=1)
+                except Exception as error:               # noqa: BLE001 -- captured, not swallowed
+                    outcome["error"] = error
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive(),
+                             "engine.generate() did not return within the bound -- "
+                             "the accept-deadline check did not fire")
+        caught = outcome.get("error")
+        self.assertIsInstance(caught, APIError, f"wrong exception: {caught!r}")
+        self.assertEqual(caught.status, 503)
+        self.assertEqual(caught.param, "logprobs")
+        self.assertEqual(caught.code, "engine_logprobs_unsupported")
+        engine.close()
+
+    def test_legacy_non_opted_in_request_is_unaffected_by_the_timeout(self):
+        # The bound only applies when logprobs was requested; a legacy
+        # request keeps waiting exactly as before -- proven here by a very
+        # short LOGPROBS_ACCEPT_TIMEOUT that would fire immediately if it
+        # (wrongly) applied to every request.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("openai_server.LOGPROBS_ACCEPT_TIMEOUT", 0.01):
+            engine = Engine("glm", "model")
+            chunks = []
+            stats = engine.generate("hello", 4, 0.0, 1.0, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        engine.close()
+
+
+class LogprobsAcceptTimeoutEnvVarTest(unittest.TestCase):
+    """The tests above patch the module attribute `LOGPROBS_ACCEPT_TIMEOUT`
+    directly, which proves the accept-deadline logic reacts to that
+    attribute but proves nothing about the documented public knob: the
+    `COLI_LOGPROBS_ACCEPT_TIMEOUT` environment variable and its 30-second
+    default are only read once, at import time. A typo in the env var
+    name, or a changed default, would ship silently and green under a
+    patch()-only suite. These tests import the module fresh in a real
+    subprocess so the env var is read for real, by its real name."""
+
+    SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ENV_VAR = "COLI_LOGPROBS_ACCEPT_TIMEOUT"
+
+    def _read_timeout_in_subprocess(self, value=None):
+        # Build the child's environment from scratch for this one variable:
+        # start from a copy of ours, drop the real name unconditionally,
+        # then set it back only if a value was requested -- so neither
+        # branch is at the mercy of whatever happens to be in this
+        # process's own environment.
+        env = dict(os.environ)
+        env.pop(self.ENV_VAR, None)
+        if value is not None:
+            env[self.ENV_VAR] = value
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import openai_server; print(openai_server.LOGPROBS_ACCEPT_TIMEOUT)"],
+            cwd=self.SERVER_DIR, env=env,
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return float(result.stdout.strip())
+
+    def test_env_var_by_its_real_name_overrides_the_default(self):
+        self.assertEqual(self._read_timeout_in_subprocess("5"), 5.0)
+
+    def test_unset_env_var_defaults_to_30(self):
+        self.assertEqual(self._read_timeout_in_subprocess(), 30.0)
+
+
+class LogprobsEchoBufferingTest(unittest.TestCase):
+    """Prompt-echo records must not be retained when the caller never asked
+    to see them, even though the engine still sends every ECHO frame (there
+    is no wire bit for "logprobs but no echo")."""
+
+    def test_prompt_records_stay_empty_without_echo(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + request_id + b" 2\n")
+            process.stdout.feed(b"ECHO " + request_id + b" 1 0 nan 0\nh\n")
+            process.stdout.feed(
+                b"ECHO " + request_id + b" 1 1 -0.1 1 3 -0.1\ni\n")
+            process.stdout.feed(
+                b"DATA " + request_id + b" 2 -0.223144 1 3 -0.223144\nok\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hi", 4, 0.0, 1.0, lambda _: None, logprobs=1, echo=False)
+        self.assertEqual(stats["logprobs"]["prompt"], [])
+        self.assertEqual(len(stats["logprobs"]["generated"]), 1)
+        engine.close()
+
+    def test_prompt_records_are_kept_with_echo(self):
+        # The control case: the same wire traffic, but the caller DID ask
+        # to see the echo table -- the records must still be retained.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + request_id + b" 2\n")
+            process.stdout.feed(b"ECHO " + request_id + b" 1 0 nan 0\nh\n")
+            process.stdout.feed(
+                b"ECHO " + request_id + b" 1 1 -0.1 1 3 -0.1\ni\n")
+            process.stdout.feed(
+                b"DATA " + request_id + b" 2 -0.223144 1 3 -0.223144\nok\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hi", 4, 0.0, 1.0, lambda _: None, logprobs=1, echo=True)
+        self.assertEqual(len(stats["logprobs"]["prompt"]), 2)
+        engine.close()
 
 
 if __name__ == "__main__":
