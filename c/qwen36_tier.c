@@ -214,7 +214,54 @@ static int qt_place_named(const char *component){
     return 0;
 }
 
+/* ---- DeltaNet input projections ----------------------------------------- */
+/* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
+ * so the array is n_layers wide and the attention slots stay empty. */
+#define QT_DN_MAX_LAYERS 128
+static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
+
+/* ---- automatic placement (COLI_PLACE unset or "auto") ------------------ */
+/* The hand-written list above is a measurement tool. Nobody running a 6 GB
+ * card should have to work out that 1.2 GB of dense trunk is worth more than
+ * 800 experts (#1040); the engine knows every size involved and decides.
+ *
+ * Rule: bytes saved on the memory bus per token, per byte of VRAM spent.
+ *   dense component  -> read on EVERY token: value 1.0 per byte.
+ *   routed expert    -> read with the probability p_e that a token routes to
+ *                       it (heat share when a HEAT_FILE exists, topk/n_experts
+ *                       otherwise), and the CPU fallback reads the int8 slot,
+ *                       which is twice the bytes an int4 expert occupies in
+ *                       VRAM: value 2*p_e per byte (1*p_e on an int8 container).
+ * A trunk item goes to the device with the most room if its value beats the
+ * value of the coldest experts it would push out of that device -- the
+ * experts at the tail of the heat order that still fit today. Without heat
+ * that tail is worth 2*topk/n_experts per byte (0.06 on the 35B) and the
+ * trunk always wins; with heat, a card whose marginal expert is routed on
+ * more than every second token keeps its experts. That is the R4
+ * measurement: on two near-full 8 GB cards, moving all projections onto one
+ * card cost 0.7 GB of hot experts and lost 13 ms of savings again.
+ *
+ * The engine OFFERS the trunk before qt_init (qt_trunk_offer: component,
+ * layer, bytes -- sizes only, pointers come later as before); the decision
+ * lands in the same table qt_place_of() reads, so nothing downstream
+ * changes. Placed bytes are subtracted from that device's expert budget,
+ * which the hand-written list never did (the 0.7 GB above was the
+ * discovery). COLI_PLACE=off keeps today's behaviour: nothing placed. */
+#define QT_OFFER_MAX 1024
+static struct { char name[16]; int layer; size_t bytes; } G_offer[QT_OFFER_MAX];
+static int G_offer_n;
+static int G_auto_on;                                  /* auto placement decided */
+static int G_auto_lmh = QT_PLACE_CPU;
+static int G_auto_dnp[QT_DN_MAX_LAYERS];               /* per layer, or QT_PLACE_CPU */
+static size_t G_trunk_bytes[QT_MAX_DEV];               /* placed trunk per device index */
+
 int qt_place_of(const char *component, int layer){
+    if(G_auto_on){
+        if(!strcmp(component, "lmhead")) return G_auto_lmh;
+        if(!strcmp(component, "dnproj"))
+            return (layer >= 0 && layer < QT_DN_MAX_LAYERS) ? G_auto_dnp[layer] : QT_PLACE_CPU;
+        return QT_PLACE_CPU;               /* experts follow COLI_GPUS; dnout/attnproj not yet placed */
+    }
     if(!G_place_done) place_parse();
     for(int i = 0; i < G_place_n; i++){
         if(strcmp(G_place[i].name, component)) continue;
@@ -230,11 +277,100 @@ int qt_place_of(const char *component, int layer){
     return QT_PLACE_CPU;
 }
 
-/* ---- DeltaNet input projections ----------------------------------------- */
-/* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
- * so the array is n_layers wide and the attention slots stay empty. */
-#define QT_DN_MAX_LAYERS 128
-static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
+
+void qt_trunk_offer(const char *component, int layer, size_t bytes){
+    if(!component || !bytes || G_offer_n >= QT_OFFER_MAX) return;
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return;
+    snprintf(G_offer[G_offer_n].name, sizeof G_offer[0].name, "%s", component);
+    G_offer[G_offer_n].layer = layer; G_offer[G_offer_n].bytes = bytes;
+    G_offer_n++;
+}
+
+static int auto_mode(void){
+    const char *e = getenv("COLI_PLACE");
+    return !e || !*e || !strcmp(e, "auto");
+}
+
+/* p_e of the k coldest experts that still fit on device index di, summed as
+ * bytes-per-token they save; heat from the HEAT_FILE table when present. */
+static int cmp_double_desc(const void *a, const void *b){
+    double x=*(const double*)a, y=*(const double*)b; return x<y ? 1 : x>y ? -1 : 0;
+}
+static int auto_dnp_count(int dev){
+    int c = 0; for(int l = 0; l < QT_DN_MAX_LAYERS; l++) if(G_auto_dnp[l] == dev) c++; return c;
+}
+
+static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
+                                   int nl, int ne, int topk, const uint32_t *heat0,
+                                   double *p_marginal_out){
+    size_t homed = 0;
+    for(int e = 0; e < ne; e++) if(e % G.ndev == di) homed++;
+    homed *= (size_t)nl;
+    size_t fit = room / exp_bytes;
+    if(fit >= homed){ *p_marginal_out = 0; return 0; }   /* room to spare: displaces nothing */
+    if(k <= 0){ *p_marginal_out = 0; return 0; }
+    double cpu_factor = (G.wfmt == 1) ? 1.0 : 2.0;      /* CPU reads the int8 slot */
+    if(!heat0){
+        double p = (double)topk / ne;
+        *p_marginal_out = p;
+        return (double)k * cpu_factor * p * (double)exp_bytes;
+    }
+    /* heat share per expert on this device, sorted descending; the marginal
+     * ones sit at ranks [fit-k, fit) */
+    size_t n = homed; double *p = malloc(n * sizeof *p); size_t m = 0;
+    for(int l = 0; l < nl; l++){
+        double sum = 0;
+        for(int e = 0; e < ne; e++) sum += (double)heat0[(size_t)l*ne + e];
+        for(int e = 0; e < ne; e++){
+            if(e % G.ndev != di) continue;
+            double pe = sum > 0 ? (double)topk * heat0[(size_t)l*ne + e] / sum : (double)topk / ne;
+            p[m++] = pe > 1.0 ? 1.0 : pe;
+        }
+    }
+    qsort(p, m, sizeof *p, cmp_double_desc);
+    double value = 0, pm = 0; int cnt = 0;
+    for(size_t r = (fit > (size_t)k ? fit - k : 0); r < fit && r < m; r++){ value += cpu_factor * p[r] * (double)exp_bytes; pm = p[r]; cnt++; }
+    free(p);
+    *p_marginal_out = pm;
+    return value;
+}
+
+static void auto_place(int nl, int ne, int topk, const size_t *capacity, const uint32_t *heat0){
+    size_t room[QT_MAX_DEV];
+    for(int i = 0; i < G.ndev; i++){ room[i] = capacity[i]; G_trunk_bytes[i] = 0; }
+    for(int l = 0; l < QT_DN_MAX_LAYERS; l++) G_auto_dnp[l] = QT_PLACE_CPU;
+    G_auto_lmh = QT_PLACE_CPU;
+    int placed = 0, kept = 0;
+    /* lmhead first (one call per token, latency-tolerant), then the
+     * projections in layer order */
+    for(int pass = 0; pass < 2; pass++)
+        for(int o = 0; o < G_offer_n; o++){
+            int is_lmh = !strcmp(G_offer[o].name, "lmhead");
+            if((pass == 0) != is_lmh) continue;
+            if(!is_lmh && strcmp(G_offer[o].name, "dnproj")) continue;   /* v1: these two */
+            size_t bytes = G_offer[o].bytes;
+            int di = 0;
+            for(int i = 1; i < G.ndev; i++) if(room[i] > room[di]) di = i;
+            if(room[di] < bytes){ kept++; continue; }
+            int k = (int)((bytes + G.exp_bytes - 1) / G.exp_bytes);
+            double pm = 0;
+            double lose = auto_displaced_value(di, room[di], k, G.exp_bytes, nl, ne, topk, heat0, &pm);
+            if((double)bytes < lose){
+                fprintf(stderr,"[place] auto: %s layer %d stays on CPU -- %.1f MB would displace %d experts "
+                               "worth %.1f MB/token on dev %d (p_marginal %.3f)\n",
+                        G_offer[o].name, G_offer[o].layer, bytes/1048576.0, k, lose/1048576.0, G.dev[di], pm);
+                kept++; continue;
+            }
+            if(is_lmh) G_auto_lmh = G.dev[di]; else G_auto_dnp[G_offer[o].layer] = G.dev[di];
+            room[di] -= bytes; G_trunk_bytes[di] += bytes; placed++;
+        }
+    G_auto_on = 1;
+    for(int i = 0; i < G.ndev; i++)
+        fprintf(stderr,"[place] auto: dev %d holds %.1f MB of trunk (lmhead%s, %d dnproj layers), %.2f GB left for experts\n",
+                G.dev[i], G_trunk_bytes[i]/1048576.0, G_auto_lmh == G.dev[i] ? " yes" : " no",
+                auto_dnp_count(G.dev[i]), room[i]/1073741824.0);
+    (void)placed; (void)kept;
+}
 
 
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
@@ -248,6 +384,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     if(topk>32){ fprintf(stderr,"[qtier] topk>32 unsupported\n"); return 0; }
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
+    /* Placement state is re-derived per init: the device fold-in below reads
+     * COLI_PLACE before the automatic placement has decided anything, and a
+     * parse latched from an earlier init (tests start the tier many times)
+     * would otherwise stand in for the current environment. */
+    G_place_done = 0; G_place_n = 0; G_auto_on = 0;
 
     /* devices: COLI_GPUS="0,1" (default: first two visible devices) */
     const char *gl=getenv("COLI_GPUS");
@@ -281,6 +422,60 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     int have=coli_cuda_device_count();
     if(have<G.ndev){ G.ndev=have; }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no CUDA devices -> CPU path\n"); return 0; }
+
+    /* Weight format and bytes per expert come first now: the automatic
+     * placement below needs them to price the experts a trunk item displaces. */
+    G.wfmt = expert_is_int4 ? 4 : 1;
+    if(G.wfmt==1 && expert_gs>0){
+        fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
+                       "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
+        return 0;
+    }
+    G.egs = expert_gs;
+    G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
+    G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
+    G.exp_bytes = (G.wfmt==1 ? 3ull*D*Ih : 3ull*D*Ih/2)
+                + (2*G.sc_gu+G.sc_d)*sizeof(float) + 4096; /* + allocation slack */
+
+    /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
+     * else free minus 1 GB headroom. The heat table is loaded here too (it
+     * used to be loaded after the budgets) because the placer prices
+     * experts by heat. */
+    size_t capacity[QT_MAX_DEV]; int capdev[QT_MAX_DEV]; int ncap = G.ndev;
+    const char *bg=getenv("CUDA_EXPERT_GB");
+    for(int i=0;i<G.ndev;i++){
+        size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
+        capdev[i] = G.dev[i];
+        capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
+                   ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
+                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
+        fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
+                G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
+    }
+    G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
+    if(!G.slot) return 0;
+    const char *hf=getenv("HEAT_FILE");
+    if(hf){
+        FILE *f=fopen(hf,"rb");
+        if(f){
+            uint32_t hdr[3]={0,0,0};
+            if(fread(hdr,4,3,f)==3 && hdr[0]==0x51544831u && hdr[1]==(uint32_t)nl && hdr[2]==(uint32_t)ne){
+                G.heat0=malloc((size_t)nl*ne*4);
+                if(G.heat0 && fread(G.heat0,4,(size_t)nl*ne,f)==(size_t)nl*ne){
+                    for(size_t i=0;i<(size_t)nl*ne;i++) G.slot[i].heat=G.heat0[i]>>1; /* decay */
+                    fprintf(stderr,"[qtier] HEAT_FILE loaded: %s\n",hf);
+                } else { free(G.heat0); G.heat0=NULL; }
+            }
+            fclose(f);
+        }
+    }
+    if(auto_mode()){
+        if(G_offer_n) auto_place(nl, ne, topk, capacity, G.heat0);
+        else { G_auto_on = 1; G_auto_lmh = QT_PLACE_CPU; for(int l=0;l<QT_DN_MAX_LAYERS;l++) G_auto_dnp[l]=QT_PLACE_CPU; }
+    } else {
+        const char *e = getenv("COLI_PLACE");
+        if(e && !strcmp(e, "off")){ G_auto_on = 1; G_auto_lmh = QT_PLACE_CPU; for(int l=0;l<QT_DN_MAX_LAYERS;l++) G_auto_dnp[l]=QT_PLACE_CPU; }
+    }
 
     /* R4 role split: the lm_head device (COLI_LMHEAD_GPU) is initialized above
      * but removed from the expert PLACEMENT list. Zeroing its budget instead
@@ -323,10 +518,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 G.dev[0]=ed; G.ndev=1;
                 fprintf(stderr,"[place] Experten auf Device %d festgelegt\n",ed);
             } else fprintf(stderr,"[place] experts=%d nicht verfuegbar -> COLI_GPUS bleibt\n",ed);
-        } else if(G_place_n && qt_place_named("experts")){
+        } else if(!G_auto_on && G_place_n && qt_place_named("experts")){
             fprintf(stderr,"[place] experts=cpu -> VRAM-Tier aus\n");
             return 0;
-        } else if(nres){
+        } else if(nres && !G_auto_on){
             int w=0;
             for(int i=0;i<G.ndev;i++){
                 int res=0; for(int r=0;r<nres;r++) if(G.dev[i]==reserved[r]) res=1;
@@ -341,61 +536,25 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         }
     }
 
-    /* per-device budget: CUDA_EXPERT_GB, or auto = free minus 1 GB headroom.
-     * Scale counts follow the container: per-row (expert_gs=0) or grouped
-     * (gs64: [O, ceil(I/gs)] per projection). */
-    G.wfmt = expert_is_int4 ? 4 : 1;
-    /* fmt=1 non ha scale raggruppate: backend_cuda le onora solo per fmt=4
-     * (want_gs = (fmt==4 && ...)). Un container int8 con scale a gruppi non e'
-     * esprimibile sulla GPU, e promuoverlo lo stesso darebbe numeri sbagliati:
-     * meglio restare su CPU dicendolo. Rifiutare qui, PRIMA di riservare
-     * qualunque budget, e' il punto giusto -- il difetto di #1331 era proprio
-     * riservare per poi non promuovere.  */
-    if(G.wfmt==1 && expert_gs>0){
-        fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
-                       "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
-        return 0;
-    }
-    G.egs = expert_gs;
-    G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
-    G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
-    /* int8 occupa il doppio dell'int4 impacchettato: il budget deve saperlo,
-     * se no si promettono il doppio degli esperti che ci stanno. */
-    G.exp_bytes = (G.wfmt==1 ? 3ull*D*Ih : 3ull*D*Ih/2)
-                + (2*G.sc_gu+G.sc_d)*sizeof(float) + 4096; /* + allocation slack */
-    const char *bg=getenv("CUDA_EXPERT_GB");
+    /* Expert budget per device: the allowance minus the trunk that landed
+     * there. The hand-written list gets the same subtraction now: with
+     * COLI_PLACE="dnproj=0" the 0.7 GB of projections used to come out of the
+     * expert cache unannounced (the R4 measurement). Devices may have been
+     * dropped from the expert list by the role split above; match by ordinal. */
     for(int i=0;i<G.ndev;i++){
-        size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
-        size_t b = (bg && strcmp(bg,"auto") && atof(bg)>0)
-                   ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
-        G.budget[i]=b;
-        fprintf(stderr,"[qtier] dev %d: %.1f GB free, budget %.1f GB (~%zu experts)\n",
-                G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
+        size_t trunk = 0;
+        for(int o=0;o<G_offer_n;o++)
+            if(qt_place_of(G_offer[o].name, G_offer[o].layer)==G.dev[i]) trunk += G_offer[o].bytes;
+        size_t cap_i = 0;
+        for(int j=0;j<ncap;j++) if(capdev[j]==G.dev[i]) cap_i = capacity[j];
+        G.budget[i] = cap_i > trunk ? cap_i - trunk : 0;
+        fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
+                G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
+                trunk ? " after trunk" : "");
     }
-    G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
-    /* qt_issue strides each device's block by 32*D floats (its max row
-     * count), not 8*D: a device other than 0 with a full 32-row issue used
-     * to run past its own slice and off the end of this allocation (#1339). */
     G.is_x_floats=(size_t)G.ndev*32*D;
     G.is_x=malloc(G.is_x_floats*sizeof(float));
-    if(!G.slot||!G.is_x) return 0;
-    /* load learned heat (HEAT_FILE): warmstart order + initial values */
-    const char *hf=getenv("HEAT_FILE");
-    if(hf){
-        FILE *f=fopen(hf,"rb");
-        if(f){
-            uint32_t hdr[3]={0,0,0};
-            if(fread(hdr,4,3,f)==3 && hdr[0]==0x51544831u && hdr[1]==(uint32_t)nl && hdr[2]==(uint32_t)ne){
-                G.heat0=malloc((size_t)nl*ne*4);
-                if(G.heat0 && fread(G.heat0,4,(size_t)nl*ne,f)==(size_t)nl*ne){
-                    for(size_t i=0;i<(size_t)nl*ne;i++) G.slot[i].heat=G.heat0[i]>>1; /* decay */
-                    fprintf(stderr,"[qtier] HEAT_FILE loaded: %s\n",hf);
-                } else { free(G.heat0); G.heat0=NULL; }
-            }
-            fclose(f);
-        }
-    }
+    if(!G.is_x) return 0;
     pthread_mutex_init(&G.mx,NULL); pthread_cond_init(&G.cv,NULL); pthread_cond_init(&G.cv_take,NULL);
     if(pthread_create(&G.th,NULL,uploader,NULL)!=0) return 0;
     G.on=1;

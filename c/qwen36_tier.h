@@ -57,6 +57,14 @@ int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
  * components like lmhead. */
 #define QT_PLACE_CPU (-1)
 int  qt_place_of(const char *component, int layer);
+/* Automatic placement (COLI_PLACE unset or "auto"; "off" disables). The
+ * engine offers each trunk component with its byte size BEFORE qt_init --
+ * "lmhead" once (layer 0), "dnproj" per DeltaNet layer -- and qt_init decides
+ * by bytes saved per token per byte of VRAM, pricing displaced experts by
+ * heat. The decision is what qt_place_of() then returns, and the placed
+ * bytes come out of that device's expert budget. Sizes only; the tensors
+ * follow through qt_lmhead_init / qt_dnproj_init as before. */
+void qt_trunk_offer(const char *component, int layer, size_t bytes);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -108,6 +116,7 @@ static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(voi
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
 static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}
+static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(void)c;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_ready(void){return 0;}
