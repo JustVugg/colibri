@@ -52,6 +52,13 @@ ifneq (,$(DARWIN))
 # Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
 CC      = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+# CLT-only Macs routinely have Homebrew installed but off the non-interactive
+# PATH (`make` from scripts, SSH, CI), which turned this probe into a silent
+# single-threaded build with libomp sitting right there on disk. Fall back to
+# the two standard Homebrew prefixes before concluding it is absent.
+ifeq ($(OMPDIR),)
+OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
+endif
 # `brew --prefix libomp` can print the formula's prospective path even when it
 # is not installed, so verify both artifacts before adding unusable flags.
 ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
