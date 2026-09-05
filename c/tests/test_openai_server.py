@@ -4196,6 +4196,39 @@ class LogprobsHTTPTest(unittest.TestCase):
         self.assertEqual(error["code"], "prompt_batch_token_budget_exceeded")
         self.assertIn(str(total_bytes), error["message"])
 
+    def test_array_prompt_token_budget_counts_actual_tokens_for_token_id_batches(self):
+        # docs/api.md (isolated-batch-limits section): "token-id batches
+        # count actual tokens, string batches count total UTF-8 bytes as
+        # an upper bound on tokens (no tokenizer is available
+        # server-side)." Every existing budget test (this class, above)
+        # uses STRING members, so only the byte-counting half of that
+        # sentence was ever exercised; the token-id half
+        # (`c/openai_server.py`'s `_completion_prompt_array`, `sum(len(member)
+        # for member in members)` when `tok_ids`) was unexercised. A member
+        # with 32769 ints has 32769 UTF-8-encoded-repr bytes that are
+        # irrelevant here -- if the aggregate check ever counted bytes (or
+        # anything else) instead of list length for a token-id batch, this
+        # request would be silently ADMITTED instead of refused. Two such
+        # members = 65538 actual tokens, one over PROMPT_BATCH_TOKEN_BUDGET
+        # (65536).
+        self.assertEqual(PROMPT_BATCH_TOKEN_BUDGET, 65536)
+        member = list(range(32769))
+        before = len(self.engine.calls)
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": [member, member], "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt")
+        self.assertEqual(error["code"], "prompt_batch_token_budget_exceeded")
+        self.assertIn("65538", error["message"])
+        self.assertIn(str(PROMPT_BATCH_TOKEN_BUDGET), error["message"])
+        self.assertIn("tokens", error["message"])
+        # The defining property, matching the string-prompt budget test's
+        # shape: no engine work started on a refused batch.
+        self.assertEqual(len(self.engine.calls), before)
+
     def test_array_prompt_of_more_than_one_member_dispatches(self):
         # A real (N>1) batch that passes shape/cap/budget validation
         # dispatches -- one choice per member, in order.
@@ -5729,6 +5762,98 @@ class BatchCompletionBudgetHTTPTest(unittest.TestCase):
         self.assertIn("max_tokens", error["message"])
         self.assertIn("was not set", error["message"])
         self.assertEqual(len(engine.calls), before)
+
+
+class SlotAwareBlockingEngine(ScriptedEngine):
+    """Blocks exactly the request naming `blocked_prompt` until told to
+    proceed, while any other request dispatched concurrently -- a batch,
+    in particular -- runs to completion in the meantime. Lets a test hold
+    one KV slot open on a live admission so the scheduler's only
+    remaining free slot is forced onto whatever runs next."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked_prompt = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 *args, **kwargs):
+        if prompt == self.blocked_prompt:
+            self.entered.set()
+            self.release.wait(2)
+        return super().generate(prompt, maximum, temperature, top_p, on_text,
+                                cache_slot, *args, **kwargs)
+
+
+class BatchCacheSlotHTTPTest(unittest.TestCase):
+    """docs/api.md's isolated-KV-contexts section (a batch holds the
+    engine's scheduler admission -- and so the engine itself -- for the
+    sum of every member's generation time; validation order for a batch
+    "matches the flat path for `stream`, `cache_slot`..."): no test
+    anywhere set `cache_slot` on a batch before this one. A batch that
+    omits `cache_slot` is admitted ONCE -- the
+    scheduler picks a single free slot for the whole batch -- and every
+    member's engine.generate() call must carry that SAME slot, not a
+    fresh scheduler pick per member and not the unresolved
+    pre-admission value (`c/openai_server.py`'s `batch_completion`:
+    `with self.server.scheduler.admit(self.client_disconnected, cache_slot)
+    as admission: queue_wait, cache_slot = admission`, then every
+    `submit_one` closes over that same rebound `cache_slot`)."""
+
+    def test_batch_without_cache_slot_shares_the_one_slot_the_scheduler_picked(self):
+        # kv_slots=2, and slot 0 is held open by a concurrent, deliberately
+        # blocked single-prompt request that pins cache_slot=0 explicitly.
+        # With slot 0 unavailable, the scheduler's admit(slot=None) for the
+        # batch has exactly one candidate: slot 1. If the admitted slot
+        # were not correctly threaded through to every member's engine
+        # call -- e.g. a bug that re-read the pre-admission `cache_slot`
+        # (None) instead of the tuple admit() returned, or that called
+        # admit() fresh per member -- at least one member would show a
+        # slot other than 1 (or None), instead of every member agreeing.
+        engine = SlotAwareBlockingEngine()
+        engine.blocked_prompt = "hold this slot"
+        base = _spawn_test_server(self, engine, kv_slots=2)
+
+        holder_errors = []
+
+        def hold_slot_zero():
+            try:
+                _post_completions(base, {"model": "test-model",
+                                         "prompt": "hold this slot",
+                                         "cache_slot": 0, "max_tokens": 1}).read()
+            except Exception as error:
+                holder_errors.append(error)
+
+        holder = threading.Thread(target=hold_slot_zero)
+        holder.start()
+        self.assertTrue(engine.entered.wait(2),
+                        "the slot-0 holder never reached generate()")
+        try:
+            with _post_completions(base, {"model": "test-model",
+                                          "prompt": ["a", "b", "c"],
+                                          "max_tokens": 1}) as response:
+                body = json.load(response)
+        finally:
+            engine.release.set()
+            holder.join(timeout=2)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(holder_errors, [])
+
+        self.assertEqual(len(body["choices"]), 3)
+        batch_slots = [call[4] for call in engine.calls if call[0] in ("a", "b", "c")]
+        self.assertEqual(len(batch_slots), 3)
+        # The defining property: every member of the batch agrees on ONE slot.
+        self.assertEqual(len(set(batch_slots)), 1,
+                         f"batch members landed on different slots: {batch_slots}")
+        # And it is the only slot free while slot 0 is held -- not None,
+        # not 0, not a value that never went through admission.
+        self.assertEqual(batch_slots[0], 1)
+        # The concurrent single request on its own explicit slot is
+        # unaffected by the batch: it completed independently, on the
+        # different slot it asked for.
+        held_call = next(call for call in engine.calls if call[0] == "hold this slot")
+        self.assertEqual(held_call[4], 0)
 
 
 class FlushTrackingProcess(FakeProcess):
