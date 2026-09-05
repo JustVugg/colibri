@@ -102,6 +102,16 @@ static void drain(void) {
     }
 }
 
+static int cv_take_woke;
+static void *cv_take_waiter(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&G.mx);
+    while (!G.th_stop) pthread_cond_wait(&G.cv_take, &G.mx);
+    cv_take_woke = 1;
+    pthread_mutex_unlock(&G.mx);
+    return NULL;
+}
+
 int main(void) {
     enum { NL = 2, NE = 4, D = 64, IH = 32, TOPK = 2 };
     setenv("COLI_CUDA", "1", 1);
@@ -162,6 +172,51 @@ int main(void) {
     qt_shutdown();
 
     free(g); free(u); free(d); free(sc);
+    /* ---- 4. #1339: il blocco per-device deve stare dentro il buffer ----------
+       L'indirizzamento era `di * 8 * D` su un buffer da `32 * D`: con due GPU il
+       device 1 scriveva oltre la fine. Qui si CHIAMANO qt_is_offset/qt_is_floats,
+       le stesse che usa qt_issue, invece di riscrivere la formula: una prima
+       versione di questo test ricalcolava l'aritmetica con le costanti e restava
+       verde anche col passo sbagliato rimesso -- verificava se stessa. */
+    {
+        const int D_ = 64;
+        for (int ndev = 1; ndev <= QT_MAX_DEV; ndev++) {
+            size_t capacity = qt_is_floats(ndev, D_);
+            for (int di = 0; di < ndev; di++) {
+                size_t end = qt_is_offset(di, D_) + (size_t)QT_IS_ROWS * D_;
+                check(end <= capacity,
+                      "un device scrive oltre la fine di G.is_x: passo e capienza "
+                      "non sono d'accordo (#1339)");
+            }
+        }
+    }
+
+    /* ---- 5. #1340: lo spegnimento sveglia chi aspetta su cv_take ------------
+       th_stop lo guardano DUE condizioni, e qt_shutdown ne segnalava una sola:
+       chi era fermo su cv_take -- coda piena in enqueue_locked, o un gruppo in
+       volo nell'uploader -- non si svegliava, e il pthread_join dentro
+       qt_shutdown restava appeso.
+
+       Il thread qui sotto aspetta su cv_take con lo STESSO predicato dello
+       spegnimento, senza toccare lo stato interno della coda: una versione
+       precedente di questo test falsificava G.qn e faceva leggere spazzatura
+       all'uploader, che e' un modo di rompere il test invece di provare la
+       correzione. Se qt_shutdown non fa broadcast su cv_take, il thread non si
+       sveglia mai e il join qui sotto non torna: il guasto si manifesta come
+       blocco, ed e' giusto cosi' -- e' esattamente il guasto reale. */
+    {
+        if (qt_init(NL, NE, D, IH, NE, TOPK, 0, 0)) {
+            pthread_t waiter;
+            pthread_create(&waiter, NULL, cv_take_waiter, NULL);
+            struct timespec settle = {0, 50000000};        /* 50 ms: entra in attesa */
+            nanosleep(&settle, NULL);
+            qt_shutdown();
+            pthread_join(waiter, NULL);
+            check(cv_take_woke, "qt_shutdown non ha svegliato chi aspettava su "
+                                "cv_take: pthread_join puo' restare appeso (#1340)");
+        }
+    }
+
     if (fails) { printf("test_qwen36_tier_int8: %d fallimenti\n", fails); return 1; }
     printf("test_qwen36_tier_int8: ok\n");
     return 0;

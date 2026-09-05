@@ -9,6 +9,23 @@
 #include "tier.h"
 
 #define QT_MAX_DEV 8
+/* Righe di input che UN device puo' ricevere in una issue. E' anche il passo
+ * fra i blocchi per-device in G.is_x e la seconda dimensione di is_k: erano tre
+ * numeri scritti a mano (32, 8, 32) e due di loro non erano d'accordo (#1339). */
+#define QT_IS_ROWS 32
+
+/* Offset (in float) del blocco di input del device `di` dentro G.is_x, e
+ * dimensione totale del buffer. Sono una funzione e non due espressioni sparse
+ * perche' #1339 e' nato proprio da questo: il passo era scritto a mano in un
+ * punto (8*D) e la capienza in un altro (32*D), e i due numeri non erano
+ * d'accordo. Con una funzione sola il test puo' CHIAMARE cio' che chiama il
+ * codice, invece di riscrivere la formula e verificare se stesso. */
+static inline size_t qt_is_offset(int device_index, int hidden){
+    return (size_t)device_index * QT_IS_ROWS * (size_t)hidden;
+}
+static inline size_t qt_is_floats(int ndev, int hidden){
+    return (size_t)QT_IS_ROWS * (size_t)ndev * (size_t)hidden;
+}
 #define QT_QCAP 48            /* upload queue depth (staging ~1.6 MB/entry) */
 
 typedef struct {
@@ -45,7 +62,7 @@ static struct {
     uint64_t hits[QT_MAX_DEV], miss, uploads, q_full_skips;
     /* issue state of the (single) decode thread */
     int is_cnt[QT_MAX_DEV];
-    int is_k[QT_MAX_DEV][32];
+    int is_k[QT_MAX_DEV][QT_IS_ROWS];
     float *is_x;                          /* count*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
@@ -198,7 +215,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
     }
     G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
-    G.is_x=malloc((size_t)32*D*sizeof(float));
+    /* un blocco da QT_IS_ROWS righe PER DEVICE: prima era 32*D in tutto, cioe'
+     * la capienza di un device solo, mentre l'indirizzamento ne assumeva uno per
+     * ciascuno (#1339). */
+    G.is_x=malloc(qt_is_floats(G.ndev, D)*sizeof(float));
     if(!G.slot||!G.is_x) return 0;
     /* load learned heat (HEAT_FILE): warmstart order + initial values */
     const char *hf=getenv("HEAT_FILE");
@@ -426,7 +446,13 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*8*G.D;               /* per-device input block */
+        /* #1339: il passo era 8*D mentre un solo device puo' ricevere fino a 32
+         * righe (is_k[..][32], e K>32 viene rifiutato sopra). Con due o piu' GPU
+         * il blocco del device 1 partiva a 8*D e scriveva fino a 8*D+32*D, cioe'
+         * oltre la fine di un buffer da 32*D. Passo e capienza devono essere lo
+         * STESSO numero: se un device puo' avere 32 righe, ogni blocco ne vale
+         * 32. Il buffer cresce di conseguenza in qt_init. */
+        float *xr=G.is_x + qt_is_offset(di, G.D);          /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
         if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */
@@ -493,7 +519,14 @@ void qt_shutdown(void){
             fprintf(stderr,"[qtier] HEAT_FILE saved: %s\n",hf);
         }
     }
-    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_mutex_unlock(&G.mx);
+    /* #1340: th_stop lo guardano DUE condizioni. Chi aspetta su cv_take -- la
+     * coda piena in enqueue_locked, o un gruppo in volo nell'uploader -- non si
+     * sveglia con un signal sulla sola cv, e pthread_join qui sotto resta
+     * appeso. Broadcast su entrambe: fermarsi non deve dipendere da quale delle
+     * due attese e' capitata in quel momento. */
+    pthread_mutex_lock(&G.mx); G.th_stop=1;
+    pthread_cond_broadcast(&G.cv); pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     G.on=0;
     coli_cuda_shutdown();
