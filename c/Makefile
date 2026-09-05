@@ -1659,6 +1659,11 @@ tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c q
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Linux-only: legge /proc/self/status. La regola c'e' comunque, il test si
+# salta da solo dove /proc non esiste.
+tests/test_rss_anon$(EXE): tests/test_rss_anon.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
