@@ -1026,7 +1026,7 @@ QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
