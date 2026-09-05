@@ -1,9 +1,11 @@
 import http.client
+import inspect
 import io
 import json
 import math
 import os
 import queue
+import signal
 import socket
 import subprocess
 import tempfile
@@ -4766,6 +4768,44 @@ class LogprobsOldEngineAcceptTimeoutTest(unittest.TestCase):
         engine.close()
 
 
+class LogprobsAcceptTimeoutEnvVarTest(unittest.TestCase):
+    """The tests above patch the module attribute `LOGPROBS_ACCEPT_TIMEOUT`
+    directly, which proves the accept-deadline logic reacts to that
+    attribute but proves nothing about the documented public knob: the
+    `COLI_LOGPROBS_ACCEPT_TIMEOUT` environment variable and its 30-second
+    default are only read once, at import time. A typo in the env var
+    name, or a changed default, would ship silently and green under a
+    patch()-only suite. These tests import the module fresh in a real
+    subprocess so the env var is read for real, by its real name."""
+
+    SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ENV_VAR = "COLI_LOGPROBS_ACCEPT_TIMEOUT"
+
+    def _read_timeout_in_subprocess(self, value=None):
+        # Build the child's environment from scratch for this one variable:
+        # start from a copy of ours, drop the real name unconditionally,
+        # then set it back only if a value was requested -- so neither
+        # branch is at the mercy of whatever happens to be in this
+        # process's own environment.
+        env = dict(os.environ)
+        env.pop(self.ENV_VAR, None)
+        if value is not None:
+            env[self.ENV_VAR] = value
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import openai_server; print(openai_server.LOGPROBS_ACCEPT_TIMEOUT)"],
+            cwd=self.SERVER_DIR, env=env,
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return float(result.stdout.strip())
+
+    def test_env_var_by_its_real_name_overrides_the_default(self):
+        self.assertEqual(self._read_timeout_in_subprocess("5"), 5.0)
+
+    def test_unset_env_var_defaults_to_30(self):
+        self.assertEqual(self._read_timeout_in_subprocess(), 30.0)
+
+
 class TokenIdPromptWireErrorTest(unittest.TestCase):
     """The engine's own vocabulary/structural refusal of a token-id prompt
     (`coli_ids_parse` returning -1 for a malformed or out-of-vocabulary id,
@@ -4824,44 +4864,6 @@ class TokenIdPromptWireErrorTest(unittest.TestCase):
         # own BAD_REQUEST (mapped above) that is authoritative.
         self.assertEqual(_encode_token_id_prompt([1, 2, 999999999]),
                          "1 2 999999999")
-
-
-class LogprobsAcceptTimeoutEnvVarTest(unittest.TestCase):
-    """The tests above patch the module attribute `LOGPROBS_ACCEPT_TIMEOUT`
-    directly, which proves the accept-deadline logic reacts to that
-    attribute but proves nothing about the documented public knob: the
-    `COLI_LOGPROBS_ACCEPT_TIMEOUT` environment variable and its 30-second
-    default are only read once, at import time. A typo in the env var
-    name, or a changed default, would ship silently and green under a
-    patch()-only suite. These tests import the module fresh in a real
-    subprocess so the env var is read for real, by its real name."""
-
-    SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ENV_VAR = "COLI_LOGPROBS_ACCEPT_TIMEOUT"
-
-    def _read_timeout_in_subprocess(self, value=None):
-        # Build the child's environment from scratch for this one variable:
-        # start from a copy of ours, drop the real name unconditionally,
-        # then set it back only if a value was requested -- so neither
-        # branch is at the mercy of whatever happens to be in this
-        # process's own environment.
-        env = dict(os.environ)
-        env.pop(self.ENV_VAR, None)
-        if value is not None:
-            env[self.ENV_VAR] = value
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import openai_server; print(openai_server.LOGPROBS_ACCEPT_TIMEOUT)"],
-            cwd=self.SERVER_DIR, env=env,
-            capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return float(result.stdout.strip())
-
-    def test_env_var_by_its_real_name_overrides_the_default(self):
-        self.assertEqual(self._read_timeout_in_subprocess("5"), 5.0)
-
-    def test_unset_env_var_defaults_to_30(self):
-        self.assertEqual(self._read_timeout_in_subprocess(), 30.0)
 
 
 class LogprobsEchoBufferingTest(unittest.TestCase):
@@ -5698,6 +5700,565 @@ class BatchCompletionBudgetHTTPTest(unittest.TestCase):
         self.assertIn("max_tokens", error["message"])
         self.assertIn("was not set", error["message"])
         self.assertEqual(len(engine.calls), before)
+
+
+class FlushTrackingProcess(FakeProcess):
+    """A FakeProcess that also counts stdin.flush() calls, so a test can
+    pin that a write is followed by a flush rather than only that the bytes
+    landed in `writes`."""
+
+    def __init__(self, on_write):
+        super().__init__(on_write)
+        self.flushes = 0
+
+    def flush(self):
+        self.flushes += 1
+
+
+class DeadStdinProcess(FakeProcess):
+    """A process whose stdin write always raises BrokenPipeError, standing
+    in for an engine child that has already died: the pipe is broken, so
+    the write itself is what surfaces the failure."""
+
+    def write(self, data):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+class ShortWriteProcess(FakeProcess):
+    """A FakeProcess whose stdin.write() accepts only `chunk` bytes per
+    call, standing in for the production engine's raw, unbuffered pipe (a
+    raw FileIO whose write() is a single os.write() and can transfer fewer
+    bytes than given). Every partial write is recorded in `self.writes` in
+    order, so a test can reassemble the frame and prove the retry loop
+    delivered every byte."""
+
+    def __init__(self, on_write=None, chunk=3):
+        super().__init__(on_write or (lambda _process, _chunk: None))
+        self.chunk = chunk
+
+    def write(self, data):
+        n = min(self.chunk, len(data))
+        self.writes.append(bytes(data[:n]))
+        self.on_write(self, self.writes[-1])
+        return n
+
+
+class StalledWriteProcess(FakeProcess):
+    """A FakeProcess whose stdin takes a few bytes and then reports that it
+    took none. A raw pipe may legitimately return a short count, but a
+    count of zero is no progress: re-offering the same bytes forever is a
+    hang, so the writer has to give up and raise instead."""
+
+    def __init__(self, chunk=3):
+        super().__init__(lambda _process, _chunk: None)
+        self.chunk = chunk
+
+    def write(self, data):
+        if self.writes:
+            return 0
+        n = min(self.chunk, len(data))
+        self.writes.append(bytes(data[:n]))
+        return n
+
+
+class UncountedWriteProcess(FakeProcess):
+    """A FakeProcess whose stdin.write() returns None instead of a count.
+    Under the RawIOBase contract that answer means the stream is
+    non-blocking and could not take a single byte, so nothing is recorded
+    as written -- the writer has to fail closed rather than treat the
+    missing count as a full write."""
+
+    def __init__(self):
+        super().__init__(lambda _process, _chunk: None)
+        self.offered = []
+
+    def write(self, data):
+        self.offered.append(bytes(data))
+        return None
+
+
+class SlowStdin:
+    """A stdin stand-in that appends one byte at a time, with a scheduling
+    yield between bytes, into a single shared buffer -- so a test can prove
+    two threads calling _write_frame never interleave their bytes: without
+    write_lock serializing the two calls, a concurrent writer's bytes land
+    in the middle of the other frame while this one is mid-write."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.started = threading.Event()   # set once a write is under way
+
+    def write(self, data):
+        for byte in data:
+            self.buffer.append(byte)
+            self.started.set()
+            time.sleep(0.002)
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+class EngineWriteCheckingTest(unittest.TestCase):
+    """The server half of the checked-write contract: every SUBMIT/CANCEL/
+    STOP write onto the engine's stdin is checked, and a failed write
+    surfaces as a named RuntimeError -- never silence.
+
+    Every call below that could wait -- on a write loop, on an engine
+    response, on an HTTP round trip -- is driven through _bounded, so that
+    a defect in the code under test or in a fake is reported as a failure
+    inside the bound instead of stalling the run."""
+
+    def _bounded(self, call, *args, timeout=10):
+        """Run `call(*args)` on a daemon thread and hand back whatever it
+        raised (None if it returned). A call that has not come back within
+        `timeout` seconds fails the test rather than hanging it: nothing
+        here is allowed to wait on an engine that may never answer."""
+        raised = []
+        thread = threading.Thread(
+            target=lambda: raised.append(self._capture(call, *args)),
+            daemon=True)
+        thread.start()
+        thread.join(timeout)
+        self.assertFalse(thread.is_alive(),
+                         f"the call under test never returned within {timeout}s")
+        return raised[0]
+
+    @staticmethod
+    def _capture(call, *args):
+        """Run `call` and hand back whatever it raised, so a test can drive
+        it on a worker thread and still assert on the exception."""
+        try:
+            call(*args)
+        except BaseException as error:   # noqa: BLE001 - handed to the caller
+            return error
+        return None
+
+    def _wait_until(self, predicate, what, timeout=10):
+        """Poll `predicate` until it holds, and fail the test if it has not
+        held within `timeout` seconds -- a bounded stand-in for waiting on
+        a side effect that a background thread produces."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail(f"{what} did not happen within {timeout}s")
+
+    def test_dead_engine_submit_is_a_named_500_engine_error_not_silence(self):
+        # Regression pin: at the pre-fix revision this write's BrokenPipeError
+        # (a ConnectionError subclass) falls straight into do_POST's
+        # client-hangup handler and the client sees a silent connection
+        # close instead of an answer.
+        process = DeadStdinProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        base = _spawn_test_server(self, engine)
+        raised = self._bounded(
+            lambda: _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                             "max_tokens": 1}, timeout=3))
+        self.assertIsInstance(raised, HTTPError)
+        self.assertEqual(raised.code, 500)
+        error = json.load(raised)["error"]
+        self.assertEqual(error["code"], "engine_error")
+        # and the failed request must not leak a pending entry
+        self.assertEqual(engine.pending, {})
+
+    def test_submit_write_failure_wraps_oserror_and_names_the_frame(self):
+        process = DeadStdinProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        raised = self._bounded(engine.generate, "hi", 8, 0.7, 0.9, lambda _: None)
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertNotIsInstance(raised, ConnectionError)
+        self.assertIn("failed to write SUBMIT", str(raised))
+
+    def test_write_frame_wraps_oserror_and_names_the_frame(self):
+        process = DeadStdinProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        raised = self._bounded(engine._write_frame, b"CANCEL 7\n", "CANCEL")
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertNotIsInstance(raised, ConnectionError)
+        self.assertIn("failed to write CANCEL", str(raised))
+
+    def test_submit_refuses_before_any_write_when_the_process_has_exited(self):
+        # require_running semantics: a process already dead when generate()
+        # is first called is refused before request_id registration.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        process.returncode = 1
+        raised = self._bounded(engine.generate, "hi", 8, 0.7, 0.9, lambda _: None)
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertIn("colibri engine is not running", str(raised))
+        self.assertEqual(process.writes, [])
+
+    def test_submit_refuses_before_the_write_lock_write_when_process_exits_late(self):
+        # require_running semantics, at the write_lock's own check: the
+        # process is still alive at request_id registration but has exited
+        # by the time the write is about to happen -- the check inside the
+        # lock must catch this too, before any byte reaches stdin. A stub
+        # poll() answers None on the registration-time call and non-None
+        # thereafter, standing in for the engine dying in between.
+        class LateExitProcess(FakeProcess):
+            def __init__(self, on_write):
+                super().__init__(on_write)
+                self.poll_calls = 0
+
+            def poll(self):
+                self.poll_calls += 1
+                return None if self.poll_calls == 1 else 1
+
+        def respond(process, frame):
+            # A frame reaching stdin at all means the require_running check
+            # was skipped; answer immediately so a defect here is a fast,
+            # clean test failure rather than a hang waiting on a response
+            # that a correct implementation would never let through.
+            if frame.startswith(b"SUBMIT"):
+                process.stdout.feed(b"ERROR " + frame.split()[1] + b" CANCELLED\n")
+
+        process = LateExitProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        raised = self._bounded(engine.generate, "hi", 8, 0.7, 0.9, lambda _: None)
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertIn("colibri engine is not running", str(raised))
+        self.assertEqual(process.writes, [])
+
+    def test_submit_and_cancel_writes_are_each_followed_by_a_flush(self):
+        def respond(process, frame):
+            fields = frame.split()
+            if fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + fields[1] + b" CANCELLED\n")
+
+        process = FlushTrackingProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        flag = {"cancelled": False}
+        outcome = []
+
+        def generate():
+            try:
+                engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                outcome.append("cancelled")
+
+        thread = threading.Thread(target=generate, daemon=True)
+        thread.start()
+        # One flush for the SUBMIT frame before the CANCEL is sent. Waiting
+        # for the flush rather than for the write keeps the poll bounded
+        # and free of the write/flush race a writes-only wait would have.
+        self._wait_until(lambda: process.flushes >= 1, "the SUBMIT frame was flushed")
+        self.assertEqual(process.flushes, 1)
+        flag["cancelled"] = True
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "the cancelled generate never returned")
+        self.assertEqual(outcome, ["cancelled"])
+        # A second flush for the CANCEL frame.
+        self.assertEqual(process.flushes, 2)
+
+    def test_write_frame_loops_until_a_short_write_delivers_every_byte(self):
+        # The production stdin is a raw, unbuffered pipe (bufsize=0):
+        # write() is one os.write() and may transfer fewer bytes than
+        # given. Bite: remove _write_all's retry loop in _write_frame and
+        # this fails -- only the first `chunk` bytes ever reach stdin.
+        process = ShortWriteProcess(chunk=3)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        data = b"CANCEL 1234567\n"
+        self.assertIsNone(self._bounded(engine._write_frame, data, "CANCEL"))
+        self.assertEqual(b"".join(process.writes), data)
+        self.assertGreater(len(process.writes), 1)
+
+    def test_submit_write_loops_until_a_short_write_delivers_every_byte(self):
+        # Same hazard, in the SUBMIT block, with an IMAGE frame ahead of
+        # the header: both must survive short writes, and the IMAGE bytes
+        # must still precede the SUBMIT header in the reassembled stream.
+        # Bite: remove _write_all's retry loop in the SUBMIT block and
+        # this fails.
+        # The responder answers the very first partial write so a writer
+        # that stops early still lets generate() return quickly, but the
+        # bound does not depend on it: generate() runs through _bounded, so
+        # a responder that never fires is a failure, not a hang.
+        answered = []
+
+        def respond(process, _chunk):
+            if not answered:
+                answered.append(True)
+                process.stdout.feed(b"DONE 1 STAT 1 2.500 50.0 1.25 2 0\n")
+
+        process = ShortWriteProcess(respond, chunk=3)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        image = (b"\x01\x02\x03\x04", 2, 2)
+        self.assertIsNone(self._bounded(
+            lambda: engine.generate("hi", 8, 0.7, 0.9, lambda _: None, image=image)))
+        expected = (b"IMAGE 1 4 2 2\n\x01\x02\x03\x04\n"
+                    b"SUBMIT 1 0 2 8 0.7 0.9\nhi\n")
+        self.assertEqual(b"".join(process.writes), expected)
+        self.assertGreater(len(process.writes), 2)
+
+    def test_write_frame_raises_when_stdin_takes_no_bytes(self):
+        # A short write is retried; a write that takes zero bytes is not
+        # progress, and retrying it is an unbreakable spin. It has to fail
+        # closed as the same named engine-write error a broken pipe gives.
+        # Bite: drop the zero-count check and this test times out instead
+        # of passing, which _bounded reports as a failure.
+        process = StalledWriteProcess()
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        raised = self._bounded(engine._write_frame, b"CANCEL 7\n", "CANCEL")
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertIn("CANCEL", str(raised))
+        self.assertIn("3 of 9 bytes", str(raised))
+
+    def test_write_frame_raises_when_stdin_reports_no_count(self):
+        # RawIOBase.write answers None when a non-blocking stream could not
+        # take a byte -- no progress, exactly like a zero count, and not an
+        # uncounted full write. Bite: treat None as a completed write and
+        # the frame is silently dropped, which is the stdin desynchronization
+        # this whole group exists to prevent.
+        process = UncountedWriteProcess()
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        raised = self._bounded(engine._write_frame, b"STOP 9\n", "STOP")
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertIn("STOP", str(raised))
+        self.assertIn("0 of 7 bytes", str(raised))
+        # and the writer gave up on the first refusal rather than spinning
+        self.assertEqual(process.offered, [b"STOP 9\n"])
+
+    def test_write_frame_lock_prevents_interleaved_writes(self):
+        # Bite: drop `with self.write_lock:` from _write_frame -- two
+        # threads writing through a slow stdin then interleave their
+        # bytes and this fails.
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        slow_stdin = SlowStdin()
+        engine.process.stdin = slow_stdin
+
+        first = b"CANCEL 111\n"
+        second = b"STOP 222\n"
+        errors = []
+        threads = [
+            threading.Thread(
+                target=lambda d=data, f=frame: errors.append(
+                    self._capture(engine._write_frame, d, f)),
+                daemon=True)
+            for data, frame in ((first, "CANCEL"), (second, "STOP"))
+        ]
+        threads[0].start()
+        # Start the second writer only once the first is demonstrably mid
+        # frame, so the test really does put two writes in flight at once.
+        self.assertTrue(slow_stdin.started.wait(timeout=10),
+                        "the first frame write never started")
+        threads[1].start()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "a frame write never finished")
+        self.assertEqual(errors, [None, None])
+        # Serialized by write_lock: the second write cannot start until the
+        # first completes, so the buffer holds each frame whole, in order.
+        self.assertEqual(bytes(slow_stdin.buffer), first + second)
+
+
+class WireTranscriptTest(unittest.TestCase):
+    """The server->engine stdin bytes for a fixed request sequence (a plain
+    SUBMIT, a SUBMIT carrying an IMAGE frame, a CANCEL, and a STOP) must be
+    byte-identical to the pre-existing wire format.
+
+    BASE_TRANSCRIPT below was captured by running the same four
+    Engine.generate() calls as _run_fixed_sequence against the commit
+    before this change, in an isolated scratch checkout, with a FakeProcess
+    responder recording every frame written to stdin and concatenating
+    them; the captured bytes are pasted here verbatim as the expectation.
+    This test reproduces the identical call sequence against the current
+    code and asserts the two byte strings are equal -- any change to frame
+    order, content, or a stray extra/missing byte fails it."""
+
+    BASE_TRANSCRIPT = (
+        b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n"
+        b"IMAGE 2 4 2 2\n\x01\x02\x03\x04\nSUBMIT 2 0 8 8 0.7 0.9\ndescribe\n"
+        b"SUBMIT 3 0 9 8 0.7 0.9\ncancel-me\nCANCEL 3\n"
+        b"SUBMIT 4 0 7 8 0.7 0.9\nstop-me\nSTOP 4\n"
+    )
+
+    def _run_fixed_sequence(self):
+        writes = []
+
+        def respond_submit_only(process, frame):
+            writes.append(frame)
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n"
+                                    b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond_submit_only)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+
+        # 1) a plain SUBMIT, no IMAGE frame.
+        engine.generate("hello", 8, 0.7, 0.9, lambda _: None)
+
+        # 2) a SUBMIT with an IMAGE frame ahead of it, one lock acquisition.
+        image = (b"\x01\x02\x03\x04", 2, 2)
+        engine.generate("describe", 8, 0.7, 0.9, lambda _: None, image=image)
+
+        # 3) a CANCEL sent before the first frame arrives (mirrors
+        #    test_cancels_generation_before_first_frame above).
+        def respond_cancel(process, frame):
+            writes.append(frame)
+            fields = frame.split()
+            if fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + fields[1] + b" CANCELLED\n")
+
+        process.on_write = respond_cancel
+        flag = {"cancelled": False}
+
+        def run_cancel():
+            try:
+                engine.generate("cancel-me", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                pass
+
+        thread = threading.Thread(target=run_cancel)
+        thread.start()
+        for _ in range(200):
+            if any(frame.startswith(b"SUBMIT 3") for frame in writes):
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+        flag["cancelled"] = True
+        thread.join(timeout=2)
+
+        # 4) a STOP sent after one DATA frame (mirrors
+        #    test_stops_generation_through_successful_done_path above).
+        def respond_stop(process, frame):
+            writes.append(frame)
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"STOP":
+                process.stdout.feed(b"DONE " + fields[1] + b" STAT 1 1 0 1 2 0\n")
+
+        process.on_write = respond_stop
+        output = []
+        engine.generate("stop-me", 8, 0.7, 0.9, output.append,
+                        stopped=lambda: output == ["x"])
+
+        return b"".join(writes)
+
+    def test_wire_transcript_is_byte_identical_to_base(self):
+        self.assertEqual(self._run_fixed_sequence(), self.BASE_TRANSCRIPT)
+
+
+@unittest.skipUnless(os.name == "posix",
+                     "SIGPIPE disposition and a real fork/pipe child are POSIX-only; "
+                     "the policy under test does not exist on Windows.")
+class SigpipeDispositionTest(unittest.TestCase):
+    """The disconnected-consumer policy on the engine side of the pipe, and
+    the precondition that makes it hold: the engine child is launched under
+    the default POSIX SIGPIPE disposition."""
+
+    # The stand-in writer restores SIG_DFL explicitly because CPython
+    # re-ignores SIGPIPE at interpreter startup -- SIG_DFL is the exec-time
+    # disposition the real engine inherits from Popen(restore_signals=True)
+    # and never changes. Frames are protocol-shaped DATA frames; COMPLETED
+    # on stderr marks a writer that outlived the disconnect (must never
+    # appear in the default-disposition arm).
+    WRITER = (
+        "import os, signal, sys\n"
+        "signal.signal(signal.SIGPIPE, {disposition})\n"
+        "out = os.fdopen(1, 'wb', buffering=0)\n"
+        "try:\n"
+        "    for i in range(1000000):\n"
+        "        out.write(b'DATA 1 2\\nok\\n')\n"
+        "except BrokenPipeError:\n"
+        "    sys.stderr.write('EPIPE\\n')\n"
+        "    sys.exit(3)\n"
+        "sys.stderr.write('COMPLETED\\n')\n"
+    )
+
+    def _run_writer(self, disposition):
+        process = subprocess.Popen(
+            [sys.executable, "-c", self.WRITER.format(disposition=disposition)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # Consume a couple of well-formed frames, then disconnect the
+            # consumer: closing the read end is exactly what a dying server
+            # does to the engine's stdout pipe.
+            head = process.stdout.read(24)
+            self.assertEqual(head, b"DATA 1 2\nok\nDATA 1 2\nok\n")
+            process.stdout.close()
+            stderr = process.stderr.read()
+            process.stderr.close()
+            returncode = process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        return returncode, stderr
+
+    def test_default_disposition_terminates_the_writer_with_no_evidence_after_failure(self):
+        # The default SIGPIPE disposition (SIG_DFL): a disconnected consumer
+        # kills the writer with signal 13 at its next write -- fail-closed,
+        # no DONE/ERROR/PROF evidence records after the failure point.
+        returncode, stderr = self._run_writer("signal.SIG_DFL")
+        self.assertEqual(returncode, -signal.SIGPIPE)
+        self.assertNotIn(b"COMPLETED", stderr)
+        self.assertNotIn(b"EPIPE", stderr)   # the SIG_IGN/EPIPE path never ran
+
+    def test_sigpipe_ignored_fails_closed_on_epipe_instead(self):
+        # With SIGPIPE ignored, the same write instead sees EPIPE and must
+        # fail closed: nonzero exit, a named diagnostic, no completion
+        # record.
+        returncode, stderr = self._run_writer("signal.SIG_IGN")
+        self.assertEqual(returncode, 3)
+        self.assertIn(b"EPIPE", stderr)
+        self.assertNotIn(b"COMPLETED", stderr)
+
+    def test_engine_launch_uses_the_deployment_default_signal_disposition(self):
+        # The policy's precondition: the server does not opt the engine out
+        # of signal restoration -- it passes no restore_signals kwarg to
+        # Popen at all, so the child inherits Popen's own default rather
+        # than a value this server chooses. Asserting `.get(..., True)`
+        # is truthy would pass whether or not the real call ever expresses
+        # this policy -- it only reflects the probe's own fallback. Assert
+        # the kwarg is genuinely absent instead, and pin Python's own
+        # default separately so this test would still catch it if a
+        # future stdlib version changed that default.
+        captured = {}
+
+        class _PopenProbe:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                raise RuntimeError("probe stop")
+
+        with patch("openai_server.subprocess.Popen", _PopenProbe):
+            with self.assertRaisesRegex(RuntimeError, "probe stop"):
+                Engine("glm", "model")
+        self.assertNotIn("restore_signals", captured)
+        default = inspect.signature(subprocess.Popen.__init__).parameters[
+            "restore_signals"].default
+        self.assertIs(default, True)
 
 
 if __name__ == "__main__":

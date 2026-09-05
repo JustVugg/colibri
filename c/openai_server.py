@@ -2971,6 +2971,35 @@ def _win_kill_on_close_job(pid):
         return None   # never let process bookkeeping break starting the engine
 
 
+def _write_all(stream, data, frame):
+    """Write every byte of `data` to `stream`, looping on short writes.
+
+    The production engine stdin is a raw, unbuffered pipe (bufsize=0 ->
+    io.FileIO), whose write() is a single os.write() and may transfer fewer
+    bytes than it was given (a signal landing mid-write, a full pipe buffer
+    on a large IMAGE frame). Discarding the return value would leave the
+    tail of a frame unsent and desynchronize the engine's stdin framing, so
+    the remainder is re-offered until it is all consumed.
+
+    Neither `None` nor 0 is progress. `RawIOBase.write` answers `None` when
+    the stream is non-blocking and could not take a single byte, and 0 says
+    the same thing with a count; re-offering the buffer after either would
+    spin forever, so both fail closed as the named engine-write error a
+    broken pipe raises. The production stdin is a blocking raw pipe whose
+    write() always returns a positive int, so neither ever runs there."""
+    written = 0
+    total = len(data)
+    while written < total:
+        sent = stream.write(data[written:])
+        # None is RawIOBase's "not one byte went out", not an uncounted
+        # full write, so it fails closed exactly as a zero count does.
+        if sent is None or sent <= 0:
+            raise RuntimeError(
+                f"failed to write {frame} to the engine "
+                f"(stdin took {written} of {total} bytes)")
+        written += sent
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -3054,6 +3083,22 @@ class Engine:
             self.pending.clear()
         for events in requests:
             events.put(("error", error))
+
+    def _write_frame(self, data, frame):
+        """Checked server->engine protocol write for CANCEL/STOP: the write
+        and its flush happen under one write_lock acquisition, and a failed
+        write is re-raised as a named RuntimeError rather than left as the
+        OSError it started as. BrokenPipeError is a ConnectionError
+        subclass, so an unwrapped failure here would fall into do_POST's
+        client-hangup handler (`except ConnectionError: pass`) and the
+        client would see a silent connection close instead of the 500
+        engine_error the failure actually is."""
+        try:
+            with self.write_lock:
+                _write_all(self.process.stdin, data, frame)
+                self.process.stdin.flush()
+        except OSError as error:
+            raise RuntimeError(f"failed to write {frame} to the engine ({error})") from error
 
     def _read_exact(self, size, kind="DATA"):
         chunks = []
@@ -3349,18 +3394,24 @@ class Engine:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
-                # Le patch sono binarie e grosse: viaggiano in un frame loro,
-                # annunciato subito prima del SUBMIT a cui appartengono. Deve
-                # partire dentro lo stesso lock, o un'altra richiesta potrebbe
-                # infilarsi in mezzo e prendersi l'immagine di questa.
-                if image is not None:
-                    patches, grid_h, grid_w = image
-                    blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
-                    self.process.stdin.write(
-                        f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
-                        + blob + b"\n")
-                self.process.stdin.write(header + payload + xpayload + b"\n")
-                self.process.stdin.flush()
+                try:
+                    # Le patch sono binarie e grosse: viaggiano in un frame loro,
+                    # annunciato subito prima del SUBMIT a cui appartengono. Deve
+                    # partire dentro lo stesso lock, o un'altra richiesta potrebbe
+                    # infilarsi in mezzo e prendersi l'immagine di questa.
+                    if image is not None:
+                        patches, grid_h, grid_w = image
+                        blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
+                        _write_all(
+                            self.process.stdin,
+                            f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
+                            + blob + b"\n", "SUBMIT")
+                    _write_all(self.process.stdin,
+                               header + payload + xpayload + b"\n", "SUBMIT")
+                    self.process.stdin.flush()
+                except OSError as error:
+                    raise RuntimeError(
+                        f"failed to write SUBMIT to the engine ({error})") from error
         except Exception:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
@@ -3450,9 +3501,7 @@ class Engine:
                         "server_error")
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
-                    with self.write_lock:
-                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                        self.process.stdin.flush()
+                    self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
                 continue
             if kind == "accept":
                 if accepted:
@@ -3470,17 +3519,13 @@ class Engine:
                     decode(data)
                     if stopped and stopped():
                         stop_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
                         # Same admission-holding rule as the idle branch above:
                         # send CANCEL, then keep consuming frames until the
                         # engine acknowledges with ERROR CANCELLED or DONE.
                         cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
             elif kind == "echo":
                 # Prompt-position readout: recorded (only when the caller
                 # asked to see it -- see the comment above prompt_logprobs),
@@ -3495,14 +3540,10 @@ class Engine:
                     decode_tool(value)
                     if stopped and stopped():
                         stop_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
                         cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:

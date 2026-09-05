@@ -295,6 +295,33 @@ refusals on the same request — `stream: true` or `n` other than 1 with
 more than one member, an invalid `cache_slot`, and so on — carry their
 own `param` and `code`, independent of this list.
 
+### Engine protocol contract: checked writes and SIGPIPE
+
+The server↔engine stdio protocol is fail-closed in both directions:
+
+- **Server→engine writes are checked.** Every `SUBMIT`/`CANCEL`/`STOP`
+  frame write is verified; a failed write (the engine died, its stdin pipe
+  broke) surfaces as a named HTTP 500 `engine_error` on the affected
+  request, as long as the response has not already been committed. `CANCEL`
+  and `STOP` writes only ever happen after `SUBMIT` has been written, mid
+  response; for a request whose response is already committed as a stream,
+  a failed write ends the stream instead of producing a 500.
+- **Engine→server frames are strictly validated.** The dispatcher checks
+  the frame grammar of every `ACCEPT`/`DATA`/`ECHO`/`TOOL`/`GRPP`/`GRPG`/
+  `GRPS`/`GRPE`/`ERROR`/`PROF`/`DONE` (and telemetry) line; a malformed
+  frame is a protocol failure that fails every in-flight request with a
+  500 and stops the dispatcher, rather than desynchronizing the stream.
+  No engine in this tree emits `GRPP`/`GRPG`/`GRPS`/`GRPE` yet — the
+  dispatcher validates and drains them for a group-scoring wire channel
+  proposed separately.
+- **Disconnected consumer (frozen POSIX policy).** The engine child runs
+  under the **default** SIGPIPE disposition (the server launches it with
+  signal restoration on, and the engine installs no handler). If the
+  server-side reader goes away, the engine is terminated by signal 13
+  (wait status 141) at its next stdout write — fail-closed: no completion
+  or error "evidence" can be fabricated after the failure point. This
+  policy is pinned by a real fork/pipe test in the server suite.
+
 ### Tool-calling support
 
 | Engine | OpenAI `tools` | Anthropic `tool_use` | Native format |
