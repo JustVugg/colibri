@@ -80,14 +80,26 @@ decode, same prompt, output bit-identical in all four runs:
 | cold: hit rate / tok/s | 44 % / 8.64 | 36 % / **9.62** |
 | warm: hit rate / tok/s | 95 % / 9.63 | 90.6 % / **12.92** |
 | same card, budget capped at 5 GB (a 6 GB card's share), warm | 88.9 % / 9.50 | 81.2 % / **13.15** |
+| Quadro RTX 4000 (8 GB) alone, warm | 93.6 % / 11.09 | 88.4 % / **16.55** |
+| both cards, experts on both, warm | 100 % / 10.79 | 100 % / **14.80** |
 
 The warm row is the one that matters: at a 95 % hit rate the marginal expert
 is as valuable as it gets on this card, and the trunk still wins by a third.
 The hit rate drops only 4.4 points for 796 fewer residents because the
 displaced experts are the coldest of the heat order -- exactly the ones the
-placer priced as cheap. The smaller the card, the larger the relative win:
-+34 % at 8 GB, +38 % at a 5 GB budget. The Quadro and the two-card case
-follow as they are measured.
+placer priced as cheap. The smaller or slower the card, the larger the
+relative win: +34 % on the 3070, +38 % at a 5 GB budget, +49 % on the Quadro.
+All sixteen runs of this calibration produced bit-identical text.
+
+**Two cards are the open case.** With experts on both cards the second card
+paces every layer (the slower `take()` gates the chain), so `off` on two cards
+is barely ahead of the Quadro alone (10.79 vs 11.09), and `auto` -- which in
+this version spreads the trunk by free room and leaves the experts on both --
+reaches 14.80 where the hand-written R4 split (`experts=0,lmhead=0,
+dnproj=0:20+1:20`: experts on ONE card, trunk across both) reaches 17.11. On
+two unequal cards the list still wins; the next version of the placer has to
+learn that lesson (experts on one card, the trunk on the other) rather than
+have it written for it.
 
 Peak RSS is ~2 GB higher under `auto`: the host-side int8 copies stay as the
 CPU fallback. Known, not yet addressed.
