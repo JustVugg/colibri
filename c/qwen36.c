@@ -2817,19 +2817,28 @@ int main(int argc, char **argv) {
                      * distinta, e slot_ensure_int8() sa rimaterializzare da li'
                      * dopo uno sfratto LFRU.
                      *
-                     * Su un container int8 NIENTE di tutto cio' e' vero, ed e' la
-                     * regressione di #1341: il puntatore appena consegnato al
-                     * tier E' `e->g`. Liberarlo lascia il tier con un puntatore
-                     * a memoria morta per il re-staging, e slot_ensure_int8()
-                     * -- che esce subito quando g4 e' NULL -- non ha nulla da
-                     * cui ricostruire, quindi il fallback CPU dereferenzia NULL.
+                     * Su un container int8 niente di cio' e' vero, ed e' la
+                     * regressione di #1341: il puntatore consegnato al tier E'
+                     * `e->g`. Liberarlo lascia il tier con memoria morta per il
+                     * re-staging, e slot_ensure_int8() -- che esce subito quando
+                     * g4 e' NULL -- non ha nulla da cui ricostruire, quindi il
+                     * fallback CPU dereferenzia NULL.
                      *
-                     * Il costo onesto e' questo: un container int8 non ha una
+                     * La condizione qui NON nomina i formati apposta. Scrivere
+                     * "libera solo se int4" funzionerebbe oggi e codificherebbe
+                     * la corrispondenza ATTUALE fra formato e proprieta' della
+                     * memoria: chi domani aggiunge un terzo formato che aliasa
+                     * `e->g` non ha motivo di sospettare che quel controllo
+                     * parli di ownership. `wg != e->g` dice invece l'invariante
+                     * vero e per sempre -- non liberare cio' che hai appena
+                     * consegnato -- e un formato futuro che aliasa e' corretto
+                     * senza che nessuno se ne ricordi.
+                     *
+                     * Il costo resta, e va detto: un container int8 non ha una
                      * copia impacchettata a meta' dimensione da tenere al posto
                      * dell'altra, quindi il risparmio di RAM che l'int4 ottiene
-                     * qui l'int8 non puo' ottenerlo. Fingere il contrario e'
-                     * esattamente cio' che ha creato il bug. */
-                    if (!keep8 && e->g && expert_is_int4) {
+                     * qui l'int8 non puo' ottenerlo. */
+                    if (!keep8 && e->g && wg != (const uint8_t *)e->g) {
                         free(e->g); e->g = e->u = e->d = NULL;
                     }
                 }
