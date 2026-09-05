@@ -143,6 +143,23 @@ int main(void) {
         if (captured[i] != (unsigned char)(i & 0x7f)) { intact = 0; break; }
     check(intact, "i pesi int8 sono stati alterati durante lo staging (XOR di troppo?)");
 
+    /* ---- 1b. il tier CONSERVA il puntatore: chi glielo passa non puo' liberarlo
+       ----------------------------------------------------------------------
+       #1341: la mia prima versione consegnava al tier i pesi int8 e la riga
+       dopo li liberava. Il test guardava che i byte ARRIVASSERO, non che
+       restassero validi, quindi non se n'e' accorto. Qui si pretende che il
+       tier stia ancora puntando alla memoria viva del chiamante -- se la
+       ritiene, il chiamante deve tenerla in vita, ed e' un contratto che va
+       scritto invece che sperato. */
+    {
+        QSlot *slot = qs(layers[0], eids[0]);
+        check(slot->g4 == g,
+              "il tier deve ritenere il puntatore che gli e' stato dato: chi lo "
+              "libera dopo averlo consegnato crea un use-after-free (#1341)");
+        check(slot->u4 == u && slot->d4 == d,
+              "anche up/down devono restare quelli consegnati");
+    }
+
     qt_shutdown();
 
     /* ---- 2. int8 + scale raggruppate: il kernel non sa esprimerle ---- */

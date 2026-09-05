@@ -2811,11 +2811,27 @@ int main(int argc, char **argv) {
                 const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
                 if (planned[gi] && wg) {
                     qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
-                    /* The staging copy is done; free the int8 copy RIGHT AWAY
-                     * so it never shows up in peak RSS. On LFRU eviction
-                     * slot_ensure_int8() rematerializes from g4 (no container
-                     * access). */
-                    if (!keep8 && e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+                    /* Liberare la copia int8 subito tiene basso il picco di RSS,
+                     * e su un container int4 e' sicuro: quel che si libera e'
+                     * `e->g`, mentre il tier tiene `e->g4`, un'allocazione
+                     * distinta, e slot_ensure_int8() sa rimaterializzare da li'
+                     * dopo uno sfratto LFRU.
+                     *
+                     * Su un container int8 NIENTE di tutto cio' e' vero, ed e' la
+                     * regressione di #1341: il puntatore appena consegnato al
+                     * tier E' `e->g`. Liberarlo lascia il tier con un puntatore
+                     * a memoria morta per il re-staging, e slot_ensure_int8()
+                     * -- che esce subito quando g4 e' NULL -- non ha nulla da
+                     * cui ricostruire, quindi il fallback CPU dereferenzia NULL.
+                     *
+                     * Il costo onesto e' questo: un container int8 non ha una
+                     * copia impacchettata a meta' dimensione da tenere al posto
+                     * dell'altra, quindi il risparmio di RAM che l'int4 ottiene
+                     * qui l'int8 non puo' ottenerlo. Fingere il contrario e'
+                     * esattamente cio' che ha creato il bug. */
+                    if (!keep8 && e->g && expert_is_int4) {
+                        free(e->g); e->g = e->u = e->d = NULL;
+                    }
                 }
             }
             qt_fill_wait();
