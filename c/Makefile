@@ -1235,8 +1235,10 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c st.h uring.
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The classified logit-row reduction in sample.h and the digest in
-# evidence_digest.h: no model/weights, published SHA-256 vectors, and an
-# agreement check against the plain logprob_target the sampling path uses.
+# evidence_digest.h: no model/weights, published SHA-256 vectors, an
+# agreement check against the plain logprob_target the sampling path uses
+# on rows a float subtraction cannot mis-round, and a double-precision
+# check against a second double computation on rows that do.
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

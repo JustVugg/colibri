@@ -187,9 +187,12 @@ static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c, tok_eos, NULL
  * that a run can refuse a position instead of writing a NaN into an artifact a
  * reader cannot distinguish from a real value.  The row reduction and the
  * per-target subtraction are kept separately reusable because a caller often
- * reduces a row once and then reads several targets out of it.  Both keep the
- * subtraction in float before promoting to double, so a value produced here
- * matches the one the plain path produces for the same row. */
+ * reduces a row once and then reads several targets out of it.  The
+ * per-target subtraction promotes the float logit to double before
+ * subtracting the row's own double logZ, so its value carries the double
+ * arithmetic's own rounding (a few ulp); logprob_target() below still takes the float-scale subtraction
+ * the sampling path has always used, so the two need not agree past a
+ * float's own precision on a widely spread row. */
 typedef enum {
     LOGPROB_FINITE=0,          /* row reduced normally; the value is usable */
     LOGPROB_NAN,               /* at least one logit was NaN */
@@ -285,9 +288,12 @@ static inline LogprobStatus logprob_from_row_checked(const float *lo, int target
     if(out) *out=NAN;
     if(!lo || !r || target<0) return LOGPROB_INVALID;
     if(r->status!=LOGPROB_FINITE) return r->status;
-    float delta=lo[target]-r->max;  /* same float subtraction as the plain path */
-    if(!isfinite(delta)) return LOGPROB_FINITE_OVERFLOW;
-    double value=(double)delta-r->logse;
+    /* The subtraction is done wholly in double: the float logit is promoted
+     * BEFORE subtracting the row's own double logZ (max+logse).  Taking it in
+     * float first rounds away up to an ulp of the row maximum -- on a logit-
+     * scale row that is about 2e-6, visible in every digit a %.17g consumer
+     * reads past the seventh. */
+    double value=(double)lo[target]-r->logZ;
     if(!isfinite(value)) return LOGPROB_FINITE_OVERFLOW;
     if(out) *out=value;
     return LOGPROB_FINITE;

@@ -9,9 +9,19 @@
  * were a measurement.
  *
  * Required properties:
- *   P1 AGREEMENT — on a well-behaved row the classified path returns exactly
- *      the value and argmax flag the plain logprob_target() returns, so adding
- *      the classified path changes no existing number.
+ *   P1 AGREEMENT — on a row whose logits sit close enough together that a
+ *      float-scale subtraction cannot lose precision, the classified path
+ *      returns exactly the value and argmax flag the plain logprob_target()
+ *      returns. The two paths are not required to agree past a float's own
+ *      precision on a widely spread row: logprob_target() keeps its
+ *      historical float-scale subtraction, while the classified path
+ *      promotes to double first (P1B).
+ *   P1B PRECISION — the classified path's value is accurate to double
+ *      precision: it matches, bit for bit, a reference computed
+ *      a second time in this file by promoting the row's logit to double
+ *      before subtracting, on rows spanning ordinary, widely spread,
+ *      subnormal and full-double-precision inputs. This is the property
+ *      P1's exact test rows are too narrow to exercise.
  *   P2 CLASSIFICATION — each exceptional row shape reports its own cause, not a
  *      generic failure, no partition function is invented for it, and the
  *      precedence between the causes is the documented one.
@@ -40,7 +50,18 @@ static int close_enough(double a, double b){
     return d <= 1e-12;
 }
 
-/* P1: the classified path must not move a single existing number. */
+/* Tight tolerance for P1B: the classified path's value against an
+ * second double computation should agree to a few ulp; the relative bound leaves no room
+ * for a float-scale rounding to sneak back in while tolerating, at most,
+ * a difference in the last bit of a double reduction. */
+static int close_enough_precise(double a, double b){
+    /* a few units in the last place, relative to the reference magnitude */
+    double tol = 16.0 * DBL_EPSILON * fabs(b) + 1e-300;
+    return fabs(a - b) <= tol;
+}
+
+/* P1: on a row a float subtraction cannot mis-round, the classified path
+ * agrees with the plain path exactly. */
 static void t_agreement(void){
     printf("P1 agreement with the plain path\n");
     static const float rows[3][5] = {
@@ -73,6 +94,79 @@ static void t_agreement(void){
     CHECK(close_enough(value,-log(2.0)), "uniform pair gives log(1/2)");
     CHECK(close_enough(row.logZ,log(2.0)), "uniform pair has logZ = log(2)");
     CHECK(row.argmax==0, "uniform pair takes the first maximum");
+}
+
+/* A second double computation for P1B (same formula as the code under test, so it
+ * detects float-first rounding, not ulp-level error): re-finds the row's maximum and
+ * log-sum-exp from scratch, entirely in double, without touching the
+ * LogprobRow the function under test already reduced. This is not the same
+ * code path as logprob_from_row_checked() -- it recomputes the row instead
+ * of reading r->max/r->logZ -- so it cannot agree with a wrong answer by
+ * sharing a mistake. */
+static double reference_double(const float *lo, int V, int target){
+    double mx = (double)lo[0];
+    for(int i=1;i<V;i++){ double v=(double)lo[i]; if(v>mx) mx=v; }
+    double se = 0;
+    for(int i=0;i<V;i++) se += exp((double)lo[i]-mx);
+    return (double)lo[target] - (mx + log(se));
+}
+
+static void check_row_precise(const char *name, const float *lo, int V,
+                               const int *targets, int ntargets){
+    LogprobRow row;
+    CHECK(logprob_row_checked(lo,V,&row)==LOGPROB_FINITE, name);
+    for(int k=0;k<ntargets;k++){
+        int target = targets[k];
+        double value = 0;
+        CHECK(logprob_from_row_checked(lo,target,&row,&value)==LOGPROB_FINITE,
+              "the target reads back finite");
+        double ref = reference_double(lo,V,target);
+        CHECK(close_enough_precise(value,ref),
+              "the classified path's value agrees with the second double computation to a few ulp");
+    }
+}
+
+/* P1B: the classified path agrees with a second double computation (to a few units in
+ * the last place; ~13 significant digits on the widest rows) on rows P1's own
+ * exact test rows are too narrow to tell apart from a float-rounded answer.
+ * Table covers: an ordinary tightly-spread row; a wide-spread row mirroring
+ * test_ablate_mode.c's t_nll_pin (max 1.0e7, one target's contribution under
+ * half a float ulp at that magnitude); a moderately spread row whose correct
+ * value needs digits past a float's own seven to state; and a subnormal row,
+ * where the magnitudes are so small a float-first subtraction cannot lose
+ * anything, so this also checks the fix introduces no new problem there. */
+static void t_precision(void){
+    printf("P1B classified path agrees with a second double computation to a few ulp\n");
+
+    static const float ordinary[4] = { 2.0f, -1.5f, 0.25f, -3.0f };
+    int t_ordinary[4] = { 0, 1, 2, 3 };
+    check_row_precise("ordinary row reduces to FINITE", ordinary, 4, t_ordinary, 4);
+
+    /* Mirrors test_ablate_mode.c's t_nll_pin: max 1.0e7 at index 0, the
+     * target of interest at index 2 with a logit of 0.25 -- a contribution
+     * the float subtraction lo[2]-max rounds away entirely, since the ulp
+     * near 1.0e7 is 1.0 and 0.25 is under half of it. */
+    static float wide_spread[64];
+    for(int i=0;i<64;i++) wide_spread[i] = -1.0e7f;
+    wide_spread[0] = 1.0e7f;
+    wide_spread[2] = 0.25f;
+    int t_wide[5] = { 0, 1, 2, 5, 63 };
+    check_row_precise("wide-spread row reduces to FINITE", wide_spread, 64, t_wide, 5);
+
+    /* A moderately spread row: max in the tens of thousands, targets with
+     * fractional digits a float at that magnitude cannot all hold. */
+    static const float moderate[5] =
+        { 10000.0f, 0.123456789f, -5000.5f, 9999.99f, 3.14159265f };
+    int t_moderate[5] = { 0, 1, 2, 3, 4 };
+    check_row_precise("moderate-spread row reduces to FINITE", moderate, 5, t_moderate, 5);
+
+    /* Subnormal logits: values this small carry no ulp large enough for a
+     * float-first subtraction to lose, so this is a robustness check as much
+     * as a precision one. */
+    static const float subnormal[3] =
+        { 1e-45f, 1e-45f*3.0f, 1e-45f*7.0f };
+    int t_subnormal[3] = { 0, 1, 2 };
+    check_row_precise("subnormal row reduces to FINITE", subnormal, 3, t_subnormal, 3);
 }
 
 /* P2: every exceptional row shape names its own cause. */
@@ -137,8 +231,10 @@ static void t_classification(void){
     CHECK(strcmp(logprob_status_name(LOGPROB_INVALID),"INVALID")==0, "INVALID names itself");
 }
 
-/* P3: a target read out of a bad row reports the row's cause, and a target the
- * float subtraction cannot represent is refused rather than rounded. */
+/* P3: a target read out of a bad row reports the row's cause. A spread that
+ * would overflow a float subtraction no longer refuses the target, because
+ * the classified path takes that subtraction in double: it is pinned below
+ * as a status change, not silently absorbed into "still finite". */
 static void t_propagation(void){
     printf("P3 target reads propagate the row's cause\n");
     LogprobRow row;
@@ -171,12 +267,17 @@ static void t_propagation(void){
     CHECK(logprob_from_row_checked(NULL,0,&row,&value)==LOGPROB_INVALID,
           "no logit vector is a caller mistake even when the row is bad");
 
-    /* The widest representable spread: the float difference saturates even
-     * though every logit in the row is finite. */
+    /* The widest representable spread: a float subtraction between these two
+     * values would saturate to infinity even though every logit in the row
+     * is finite. The classified path subtracts in double, so it does not:
+     * this is a real, disclosed widening of what the layer accepts, pinned
+     * here so it cannot regress silently in either direction. */
     float wide[2] = { FLT_MAX, -FLT_MAX };
     CHECK(logprob_row_checked(wide,2,&row)==LOGPROB_FINITE, "an extreme finite row still reduces");
-    CHECK(logprob_from_row_checked(wide,1,&row,&value)==LOGPROB_FINITE_OVERFLOW,
-          "a target the float subtraction cannot hold -> FINITE_OVERFLOW");
+    CHECK(logprob_from_row_checked(wide,1,&row,&value)==LOGPROB_FINITE,
+          "a target the float subtraction could not hold -> FINITE, not refused, under the double subtraction");
+    CHECK(value==-2.0*(double)FLT_MAX,
+          "the saturated target's value is the exact double difference, not an infinity");
     CHECK(logprob_from_row_checked(wide,0,&row,&value)==LOGPROB_FINITE,
           "the maximum itself still reads back finite");
     CHECK(close_enough(value,0.0), "the maximum of a saturated row has log-probability 0");
@@ -229,6 +330,7 @@ static void t_digest(void){
 int main(void){
     printf("test_logprob_status\n");
     t_agreement();
+    t_precision();
     t_classification();
     t_propagation();
     t_digest();
