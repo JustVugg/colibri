@@ -148,6 +148,15 @@ Known limitations, current build:
 
 ### Array `prompt` intake on `/v1/completions` (glm engine for token ids)
 
+`group_score` (a future opt-in that would change the response shape to
+continuation-only log-probability arrays) is not implemented yet, and on
+`/v1/completions` — flat or array `prompt` alike — is refused outright with
+a named 400 (`param: "group_score"`, `code: "unsupported_value"`) rather
+than silently ignored; `false` and `null` are accepted as absent. This
+guard applies to `/v1/completions` only: `/v1/chat/completions` and
+`/v1/messages` do not read the field, so the same request sent to either
+of those endpoints is accepted and the opt-in is silently ignored.
+
 `prompt` also accepts a flat array of non-negative integers — a single
 pre-tokenized prompt, sent as ASCII decimal token ids straight to the
 engine rather than re-tokenized from text — and, structurally, the two
