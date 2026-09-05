@@ -1951,6 +1951,35 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(outcome, ["cancelled"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
+    def test_generate_drops_its_pending_entry_when_the_cancel_write_fails(self):
+        # Every raise out of generate() after admission must still clear its
+        # own self.pending[request_id] slot. The DATA/ERROR dispatcher arms
+        # pop that slot themselves on the frames they own, but a raise from
+        # anywhere else in generate() -- here, a broken engine stdin on the
+        # CANCEL write an already-disconnected client triggers -- has no
+        # other code path clearing it. A leaked slot sits in self.pending
+        # until an unrelated dispatcher failure clears the whole map via
+        # _fail_pending, which can be arbitrarily far in the future.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                raise BrokenPipeError("synthetic engine stdin failure")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "failed to write CANCEL"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                            cancelled=lambda: True)
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
 

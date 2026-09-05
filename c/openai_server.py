@@ -3353,44 +3353,44 @@ class Engine:
             request_id = str(self.next_request_id)
             self.next_request_id += 1
             self.pending[request_id] = events
-        xpayload = gpayload or apayload
-        # DeepSeek V4 prefix hint (optional 8th header field): the byte length of
-        # the rendered prompt up to the first user/assistant turn marker — the
-        # stable system prefix. The engine snapshots its attention state at that
-        # token boundary during the prefill, so the FIRST request of the first
-        # conversation already seeds the shared-prefix checkpoint that every later
-        # conversation (opencode session) restores in seconds; without the hint
-        # the engine only discovers the boundary on the second fresh prompt.
-        # Older engines parse six or seven fields and ignore the eighth.
-        prefix_field = ""
-        if ARCH == "deepseek_v4":
-            cut = min((i for i in (prompt.find("<\uff5cUser\uff5c>"),
-                                   prompt.find("<\uff5cAssistant\uff5c>")) if i > 0),
-                      default=0)
-            if cut > 0:
-                prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
-        # SUBMIT's key=value extension namespace (decode_batch.h
-        # coli_submit_ext) -- logprobs=k opts into U7a's per-token numeric
-        # channel (ECHO + extended DATA frames), ids=1 marks the payload as
-        # pre-tokenized ASCII decimal ids rather than raw text. Only ever
-        # built when the capability gate above already passed, so this never
-        # reaches an engine that would mis-parse or silently ignore it. The
-        # extension arm requires the 7th (gbytes) field to be present even
-        # when it's 0 -- coli_submit_parse expects exactly 7 numeric fields
-        # before the first key=value token.
-        ext_parts = []
-        if logprobs:
-            ext_parts.append(f"logprobs={logprobs}")
-        if tok_ids:
-            ext_parts.append("ids=1")
-        ext_field = (" " + " ".join(ext_parts)) if ext_parts else ""
-        gbytes_field = f" {len(xpayload)}" if (xpayload or ext_parts) else ""
-        header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
-                  f"{temperature:.8g} {top_p:.8g}"
-                  + (prefix_field if prefix_field else gbytes_field)
-                  + ext_field
-                  + "\n").encode()
         try:
+            xpayload = gpayload or apayload
+            # DeepSeek V4 prefix hint (optional 8th header field): the byte length of
+            # the rendered prompt up to the first user/assistant turn marker — the
+            # stable system prefix. The engine snapshots its attention state at that
+            # token boundary during the prefill, so the FIRST request of the first
+            # conversation already seeds the shared-prefix checkpoint that every later
+            # conversation (opencode session) restores in seconds; without the hint
+            # the engine only discovers the boundary on the second fresh prompt.
+            # Older engines parse six or seven fields and ignore the eighth.
+            prefix_field = ""
+            if ARCH == "deepseek_v4":
+                cut = min((i for i in (prompt.find("<\uff5cUser\uff5c>"),
+                                       prompt.find("<\uff5cAssistant\uff5c>")) if i > 0),
+                          default=0)
+                if cut > 0:
+                    prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
+            # SUBMIT's key=value extension namespace (decode_batch.h
+            # coli_submit_ext) -- logprobs=k opts into U7a's per-token numeric
+            # channel (ECHO + extended DATA frames), ids=1 marks the payload as
+            # pre-tokenized ASCII decimal ids rather than raw text. Only ever
+            # built when the capability gate above already passed, so this never
+            # reaches an engine that would mis-parse or silently ignore it. The
+            # extension arm requires the 7th (gbytes) field to be present even
+            # when it's 0 -- coli_submit_parse expects exactly 7 numeric fields
+            # before the first key=value token.
+            ext_parts = []
+            if logprobs:
+                ext_parts.append(f"logprobs={logprobs}")
+            if tok_ids:
+                ext_parts.append("ids=1")
+            ext_field = (" " + " ".join(ext_parts)) if ext_parts else ""
+            gbytes_field = f" {len(xpayload)}" if (xpayload or ext_parts) else ""
+            header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
+                      f"{temperature:.8g} {top_p:.8g}"
+                      + (prefix_field if prefix_field else gbytes_field)
+                      + ext_field
+                      + "\n").encode()
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
@@ -3412,174 +3412,171 @@ class Engine:
                 except OSError as error:
                     raise RuntimeError(
                         f"failed to write SUBMIT to the engine ({error})") from error
-        except Exception:
+
+            cancel_sent = False
+            stop_sent = False
+            accepted = False
+            # U7a's ECHO frames (whenever logprobs>0, the engine ALWAYS runs the
+            # full prefill read-out -- c/colibri.c mux_submit: `echo =
+            # sub.logprobs>0`, unconditionally, there is no separate wire bit for
+            # "logprobs but no echo") land here in position order; DATA's numeric
+            # tail lands here in emission order. `generated_logprobs` stays
+            # empty when logprobs=0. `prompt_logprobs` ALSO stays empty unless
+            # the caller opted into `echo` too -- the engine still sends every
+            # ECHO frame regardless (there is no wire bit for "logprobs but no
+            # echo"), but retaining a full prompt-length echo table for every
+            # opted-in request that never asked to see it (the common chat case,
+            # and any completions request with echo=False) would hold it in
+            # memory for the whole request lifetime for nothing: at k=32 and a
+            # 32k-token prompt that table is on the order of 100+ MB. Frames not
+            # kept are still fully drained off the wire above (read_engine_turn
+            # already consumed the payload bytes before this event is queued),
+            # so this never desyncs the dispatcher -- it only decides whether the
+            # record is RETAINED past this iteration.
+            prompt_logprobs = []
+            generated_logprobs = []
+            # Bound how long a request that opted into the extended SUBMIT
+            # namespace (logprobs=k, ids=1, or both) waits for the engine's
+            # ACCEPT before concluding the engine silently rejected the extended
+            # header -- c/decode_batch.h: "An OLD engine rejects ANY extended
+            # header ... the engine answers ERROR 0 BAD_REQUEST", an id that
+            # never matches this (or any) pending request, so that reply is
+            # otherwise invisible to this loop and it would wait here forever.
+            # A legacy (non-opted-in) request keeps the old, unbounded wait --
+            # every engine build ever shipped handles a plain SUBMIT.
+            accept_deadline = (time.monotonic() + LOGPROBS_ACCEPT_TIMEOUT
+                               if (logprobs or tok_ids) else None)
+
+            def _accept(info):
+                # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
+                # ACCEPT before any output, so on_accept fires before prefill and a preceding
+                # CONTEXT_EXCEEDED never reaches here (it propagates as a 400 with nothing committed).
+                # An older engine that never sends ACCEPT still commits on its first DATA/DONE.
+                nonlocal accepted
+                if not accepted:
+                    accepted = True
+                    if on_accept is not None:
+                        on_accept(info)
+
+            while True:
+                try:
+                    kind, value = events.get(timeout=0.05)
+                except queue.Empty:
+                    # #908: cancelled() is only polled in the "data" branch, so a
+                    # client that disconnects before the engine's first DATA frame
+                    # (it is still prefilling) never cancels: the CANCEL never went
+                    # out, the turn ran to its token limit, and this thread stayed
+                    # blocked until the engine emitted something. Poll the callback
+                    # while idle so a pre-first-frame disconnect cancels too.
+                    #
+                    # Do NOT raise here: this thread holds the scheduler admission,
+                    # and releasing it before the engine confirms the cancel lets
+                    # the next request SUBMIT into a pipe the busy engine is not
+                    # reading — every later request then hangs silently behind the
+                    # orphaned generation. Wait for the engine's ERROR CANCELLED /
+                    # DONE frame; ClientCancelled is raised when it arrives.
+                    if (accept_deadline is not None and not accepted
+                            and time.monotonic() > accept_deadline):
+                        # logprobs takes priority in the message/param/code when
+                        # both were requested together -- an established,
+                        # already-tested shape this must not disturb; tok_ids
+                        # alone gets its own named error instead of borrowing
+                        # the logprobs one.
+                        if logprobs:
+                            raise APIError(
+                                503, "The colibri engine did not accept a per-token logprobs "
+                                    "request in time; it may not support the per-token logprobs "
+                                    "extension.", "logprobs", "engine_logprobs_unsupported",
+                                "server_error")
+                        raise APIError(
+                            503, "The colibri engine did not accept a token-id prompt "
+                                "request in time; it may not support the pre-tokenized "
+                                "prompt extension.", "prompt", "engine_tok_ids_unsupported",
+                            "server_error")
+                    if not cancel_sent and not stop_sent and cancelled and cancelled():
+                        cancel_sent = True
+                        self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
+                    continue
+                if kind == "accept":
+                    if accepted:
+                        raise RuntimeError("engine sent a duplicate ACCEPT frame")
+                    _accept(value)
+                elif kind == "data":
+                    _accept({"prompt_tokens": None})
+                    # The dispatcher only wraps in a tuple when a logprob record
+                    # rides along; a bare-bytes value is the (far more common)
+                    # non-opted-in shape.
+                    data, record = value if isinstance(value, tuple) else (value, None)
+                    if record is not None:
+                        generated_logprobs.append((data, record))
+                    if not cancel_sent and not stop_sent:
+                        decode(data)
+                        if stopped and stopped():
+                            stop_sent = True
+                            self._write_frame(f"STOP {request_id}\n".encode(), "STOP")
+                        elif cancelled and cancelled():
+                            # Same admission-holding rule as the idle branch above:
+                            # send CANCEL, then keep consuming frames until the
+                            # engine acknowledges with ERROR CANCELLED or DONE.
+                            cancel_sent = True
+                            self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
+                elif kind == "echo":
+                    # Prompt-position readout: recorded (only when the caller
+                    # asked to see it -- see the comment above prompt_logprobs),
+                    # nothing emitted -- no text is decoded for a prompt echo,
+                    # unlike "data"/"tool".
+                    pos, data, record = value
+                    if echo:
+                        prompt_logprobs.append((pos, data, record))
+                elif kind == "tool":
+                    _accept({"prompt_tokens": None})
+                    if not cancel_sent and not stop_sent:
+                        decode_tool(value)
+                        if stopped and stopped():
+                            stop_sent = True
+                            self._write_frame(f"STOP {request_id}\n".encode(), "STOP")
+                        elif cancelled and cancelled():
+                            cancel_sent = True
+                            self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
+                elif kind == "done":
+                    _accept({"prompt_tokens": None})
+                    if cancel_sent:
+                        # The engine finished the turn before seeing the CANCEL
+                        # (or honored it at a token boundary and still framed a
+                        # DONE). Either way the client is gone: the ack is what
+                        # mattered, the output is not deliverable.
+                        raise ClientCancelled()
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        on_text(tail)
+                    tool_tail = tool_decoder.decode(b"", final=True)
+                    if tool_tail and on_tool is not None:
+                        on_tool(tool_tail)
+                    if logprobs:
+                        value["logprobs"] = {"prompt": prompt_logprobs,
+                                             "generated": generated_logprobs}
+                    return value
+                elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+                    raise ClientCancelled()
+                elif (tok_ids and isinstance(value, RuntimeError)
+                      and str(value) == "BAD_REQUEST"):
+                    # coli_ids_parse (c/decode_batch.h) reports a malformed or
+                    # out-of-vocabulary token id as "ERROR <id> BAD_REQUEST",
+                    # carrying THIS request's own id (unlike the "ERROR 0
+                    # BAD_REQUEST" an old engine sends for an unrecognized
+                    # extended header, which never reaches here at all -- id 0
+                    # never matches a pending request, see accept_deadline
+                    # above). This is the client's fault, not the server's: a
+                    # named 400 on `prompt`, not the generic 500 engine_error
+                    # every other unexpected RuntimeError still becomes.
+                    raise APIError(400, "The engine rejected this token-id prompt (a "
+                                        "malformed or out-of-vocabulary token id).",
+                                   "prompt", "invalid_value")
+                else:
+                    raise value
+        finally:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
-            raise
-
-        cancel_sent = False
-        stop_sent = False
-        accepted = False
-        # U7a's ECHO frames (whenever logprobs>0, the engine ALWAYS runs the
-        # full prefill read-out -- c/colibri.c mux_submit: `echo =
-        # sub.logprobs>0`, unconditionally, there is no separate wire bit for
-        # "logprobs but no echo") land here in position order; DATA's numeric
-        # tail lands here in emission order. `generated_logprobs` stays
-        # empty when logprobs=0. `prompt_logprobs` ALSO stays empty unless
-        # the caller opted into `echo` too -- the engine still sends every
-        # ECHO frame regardless (there is no wire bit for "logprobs but no
-        # echo"), but retaining a full prompt-length echo table for every
-        # opted-in request that never asked to see it (the common chat case,
-        # and any completions request with echo=False) would hold it in
-        # memory for the whole request lifetime for nothing: at k=32 and a
-        # 32k-token prompt that table is on the order of 100+ MB. Frames not
-        # kept are still fully drained off the wire above (read_engine_turn
-        # already consumed the payload bytes before this event is queued),
-        # so this never desyncs the dispatcher -- it only decides whether the
-        # record is RETAINED past this iteration.
-        prompt_logprobs = []
-        generated_logprobs = []
-        # Bound how long a request that opted into the extended SUBMIT
-        # namespace (logprobs=k, ids=1, or both) waits for the engine's
-        # ACCEPT before concluding the engine silently rejected the extended
-        # header -- c/decode_batch.h: "An OLD engine rejects ANY extended
-        # header ... the engine answers ERROR 0 BAD_REQUEST", an id that
-        # never matches this (or any) pending request, so that reply is
-        # otherwise invisible to this loop and it would wait here forever.
-        # A legacy (non-opted-in) request keeps the old, unbounded wait --
-        # every engine build ever shipped handles a plain SUBMIT.
-        accept_deadline = (time.monotonic() + LOGPROBS_ACCEPT_TIMEOUT
-                           if (logprobs or tok_ids) else None)
-
-        def _accept(info):
-            # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
-            # ACCEPT before any output, so on_accept fires before prefill and a preceding
-            # CONTEXT_EXCEEDED never reaches here (it propagates as a 400 with nothing committed).
-            # An older engine that never sends ACCEPT still commits on its first DATA/DONE.
-            nonlocal accepted
-            if not accepted:
-                accepted = True
-                if on_accept is not None:
-                    on_accept(info)
-
-        while True:
-            try:
-                kind, value = events.get(timeout=0.05)
-            except queue.Empty:
-                # #908: cancelled() is only polled in the "data" branch, so a
-                # client that disconnects before the engine's first DATA frame
-                # (it is still prefilling) never cancels: the CANCEL never went
-                # out, the turn ran to its token limit, and this thread stayed
-                # blocked until the engine emitted something. Poll the callback
-                # while idle so a pre-first-frame disconnect cancels too.
-                #
-                # Do NOT raise here: this thread holds the scheduler admission,
-                # and releasing it before the engine confirms the cancel lets
-                # the next request SUBMIT into a pipe the busy engine is not
-                # reading — every later request then hangs silently behind the
-                # orphaned generation. Wait for the engine's ERROR CANCELLED /
-                # DONE frame; ClientCancelled is raised when it arrives.
-                if (accept_deadline is not None and not accepted
-                        and time.monotonic() > accept_deadline):
-                    with self.pending_lock:
-                        self.pending.pop(request_id, None)
-                    # logprobs takes priority in the message/param/code when
-                    # both were requested together -- an established,
-                    # already-tested shape this must not disturb; tok_ids
-                    # alone gets its own named error instead of borrowing
-                    # the logprobs one.
-                    if logprobs:
-                        raise APIError(
-                            503, "The colibri engine did not accept a per-token logprobs "
-                                "request in time; it may not support the per-token logprobs "
-                                "extension.", "logprobs", "engine_logprobs_unsupported",
-                            "server_error")
-                    raise APIError(
-                        503, "The colibri engine did not accept a token-id prompt "
-                            "request in time; it may not support the pre-tokenized "
-                            "prompt extension.", "prompt", "engine_tok_ids_unsupported",
-                        "server_error")
-                if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    cancel_sent = True
-                    self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
-                continue
-            if kind == "accept":
-                if accepted:
-                    raise RuntimeError("engine sent a duplicate ACCEPT frame")
-                _accept(value)
-            elif kind == "data":
-                _accept({"prompt_tokens": None})
-                # The dispatcher only wraps in a tuple when a logprob record
-                # rides along; a bare-bytes value is the (far more common)
-                # non-opted-in shape.
-                data, record = value if isinstance(value, tuple) else (value, None)
-                if record is not None:
-                    generated_logprobs.append((data, record))
-                if not cancel_sent and not stop_sent:
-                    decode(data)
-                    if stopped and stopped():
-                        stop_sent = True
-                        self._write_frame(f"STOP {request_id}\n".encode(), "STOP")
-                    elif cancelled and cancelled():
-                        # Same admission-holding rule as the idle branch above:
-                        # send CANCEL, then keep consuming frames until the
-                        # engine acknowledges with ERROR CANCELLED or DONE.
-                        cancel_sent = True
-                        self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
-            elif kind == "echo":
-                # Prompt-position readout: recorded (only when the caller
-                # asked to see it -- see the comment above prompt_logprobs),
-                # nothing emitted -- no text is decoded for a prompt echo,
-                # unlike "data"/"tool".
-                pos, data, record = value
-                if echo:
-                    prompt_logprobs.append((pos, data, record))
-            elif kind == "tool":
-                _accept({"prompt_tokens": None})
-                if not cancel_sent and not stop_sent:
-                    decode_tool(value)
-                    if stopped and stopped():
-                        stop_sent = True
-                        self._write_frame(f"STOP {request_id}\n".encode(), "STOP")
-                    elif cancelled and cancelled():
-                        cancel_sent = True
-                        self._write_frame(f"CANCEL {request_id}\n".encode(), "CANCEL")
-            elif kind == "done":
-                _accept({"prompt_tokens": None})
-                if cancel_sent:
-                    # The engine finished the turn before seeing the CANCEL
-                    # (or honored it at a token boundary and still framed a
-                    # DONE). Either way the client is gone: the ack is what
-                    # mattered, the output is not deliverable.
-                    raise ClientCancelled()
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    on_text(tail)
-                tool_tail = tool_decoder.decode(b"", final=True)
-                if tool_tail and on_tool is not None:
-                    on_tool(tool_tail)
-                if logprobs:
-                    value["logprobs"] = {"prompt": prompt_logprobs,
-                                         "generated": generated_logprobs}
-                return value
-            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
-                raise ClientCancelled()
-            elif (tok_ids and isinstance(value, RuntimeError)
-                  and str(value) == "BAD_REQUEST"):
-                # coli_ids_parse (c/decode_batch.h) reports a malformed or
-                # out-of-vocabulary token id as "ERROR <id> BAD_REQUEST",
-                # carrying THIS request's own id (unlike the "ERROR 0
-                # BAD_REQUEST" an old engine sends for an unrecognized
-                # extended header, which never reaches here at all -- id 0
-                # never matches a pending request, see accept_deadline
-                # above). This is the client's fault, not the server's: a
-                # named 400 on `prompt`, not the generic 500 engine_error
-                # every other unexpected RuntimeError still becomes.
-                raise APIError(400, "The engine rejected this token-id prompt (a "
-                                    "malformed or out-of-vocabulary token id).",
-                               "prompt", "invalid_value")
-            else:
-                raise value
 
     def close(self):
         with self.pending_lock:
