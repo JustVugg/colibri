@@ -156,8 +156,10 @@ class GoldenArtifactAcceptedTests(_GoldenFixture):
             cli = _run_cli(manifest, evidence, config)
             self.assertEqual(cli.returncode, 0, cli.stderr.decode(errors="replace"))
             self.assertEqual(cli.stderr, b"")
+            # print() terminates the line with the platform's newline, so a
+            # Windows child hands back CRLF; the pin is on the line's content.
             self.assertEqual(
-                cli.stdout,
+                cli.stdout.replace(b"\r\n", b"\n"),
                 f"[ablate-evidence] PASS manifest={self.MANIFEST_SHA256} "
                 f"items=2 targets=3\n".encode("ascii"))
 
