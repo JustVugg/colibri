@@ -137,7 +137,7 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
         wv = as_type<float>(0x7fc00000u);           // qNaN -- matches quant.h's e4m3_decode
       } else {
         float mag = (exp == 0) ? (float(mant) * 0.001953125f)                 // subnormal: mant*2^-9
-                                : (1.0f + float(mant)*0.125f) * exp2(float(int(exp) - 7));
+                                : (1.0f + float(mant)*0.125f) * as_type<float>((uint(exp) + 120u) << 23);
         wv = sign ? -mag : mag;
       }
       acc += wv * xr[i] * scl[i/128];
