@@ -4199,9 +4199,14 @@ class LogprobsHTTPTest(unittest.TestCase):
 
     def test_lm_eval_fixture_bytes_match_the_bound_blob(self):
         import hashlib
-        digest = hashlib.sha256(self.LMEVAL_FIXTURE.read_bytes()).hexdigest()
+        # The committed blob uses LF line endings. A checkout with line-ending
+        # conversion (git's autocrlf on Windows) hands the test CRLF bytes for the
+        # same blob, so normalise CRLF back to LF before comparing to the bound
+        # digest; the digest and length below are those of the committed bytes.
+        raw = self.LMEVAL_FIXTURE.read_bytes().replace(b"\r\n", b"\n")
+        digest = hashlib.sha256(raw).hexdigest()
         self.assertEqual(digest, self.LMEVAL_FIXTURE_SHA256)
-        self.assertEqual(len(self.LMEVAL_FIXTURE.read_bytes()), 2732)
+        self.assertEqual(len(raw), 2732)
 
     def test_lm_eval_captured_request_replay(self):
         # The captured request itself (a single nested token-id member --
