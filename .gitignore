@@ -120,6 +120,10 @@ c/olmoe_i4/
 .idea
 c/tiny_inkling/
 c/qwen38_tiny/
+c/qwen36_tiny/
+c/qwen36_tiny_c/
+c/qwen38_2p4t_tiny/
+c/qwen38_2p4t_tiny_c/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/

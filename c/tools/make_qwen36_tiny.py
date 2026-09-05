@@ -18,6 +18,17 @@ matching what qwen36.c Phase 1 computes. No tokenizer needed.
 Usage:
   python tools/make_qwen36_tiny.py --out ./qwen36_tiny
   python tools/make_qwen36_tiny.py --out ./qwen36_tiny --emit-ref ref_qwen36.json
+
+Geometry presets (--geometry): the structural numbers of a real checkpoint at
+toy widths, so the config-shape guards, the layer pattern, the routing and the
+converter's tensor contract are exercised without a single real weight:
+  qwen36-35b   8 layers (2 attention), 8 experts top-2, GQA 2:1  (default)
+  qwen38-2p4t  92 layers (23 attention), 512 experts top-10, GQA 16:1,
+               DeltaNet value:key heads 8:1, FUSED expert tensors and an
+               mtp.* head, exactly as Qwen/Qwen3.8-2.4T-A95B ships them
+--fused-experts rewrites the saved shard into the per-layer gate_up_proj /
+down_proj layout the real checkpoints use (transformers saves per-expert);
+--mtp adds a one-layer multi-token-prediction head the engine must skip.
 """
 import argparse, json, sys
 from pathlib import Path
@@ -68,10 +79,82 @@ class Zero(nn.Module):
         return hidden_states
 
 
+GEOMETRIES = {
+    # the shipped fixture: what CI has gated since #712
+    "qwen36-35b": dict(hidden=64, n_layers=8, q_heads=4, kv_heads=2, head_dim=16,
+                       rope_dim=8, n_experts=8, topk=2, inter=32,
+                       dn_key_heads=4, dn_value_heads=8,
+                       fused_experts=False, mtp=False),
+    # Qwen/Qwen3.8-2.4T-A95B, config.json: 92 layers / full_attention_interval 4
+    # / 512 experts top-10 / 64:4 attention heads / 128:16 DeltaNet heads /
+    # mtp_num_hidden_layers 1 / fused experts. Widths shrunk, ratios kept.
+    "qwen38-2p4t": dict(hidden=32, n_layers=92, q_heads=16, kv_heads=1, head_dim=16,
+                        rope_dim=8, n_experts=512, topk=10, inter=16,
+                        dn_key_heads=2, dn_value_heads=16,
+                        fused_experts=True, mtp=True),
+}
+
+
+def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
+    """Post-process the transformers shard into the real checkpoints' layout.
+
+    transformers saves routed experts one tensor per expert and never writes an
+    mtp head. The real 35B and 2.4T checkpoints do the opposite on both counts,
+    and those are the two paths the converter's tensor contract has to be seen
+    handling: splitting the fused tensor, and skipping mtp.* on purpose.
+    """
+    from safetensors.torch import load_file, save_file
+    path = out / "model.safetensors"
+    tens = load_file(str(path))
+    if fused_experts:
+        for i in range(n_layers):
+            pre = f"model.layers.{i}.mlp.experts."
+            gate, up, down = [], [], []
+            e = 0
+            while f"{pre}{e}.gate_proj.weight" in tens:
+                gate.append(tens.pop(f"{pre}{e}.gate_proj.weight"))
+                up.append(tens.pop(f"{pre}{e}.up_proj.weight"))
+                down.append(tens.pop(f"{pre}{e}.down_proj.weight"))
+                e += 1
+            if e == 0:
+                sys.exit(f"layer {i}: no per-expert tensors to fuse")
+            # [E, 2*inter, H] with gate rows first, then up -- the split the
+            # converter performs is gu[:, :inter] / gu[:, inter:]
+            tens[f"{pre}gate_up_proj"] = torch.stack(
+                [torch.cat([g, u], dim=0) for g, u in zip(gate, up)]).contiguous()
+            tens[f"{pre}down_proj"] = torch.stack(down).contiguous()   # [E, H, inter]
+    if mtp:
+        # One MTP layer shaped like the last transformer layer (an attention
+        # layer, since (n_layers-1) % 4 == 3 for every geometry here), plus the
+        # four glue tensors the real checkpoints carry. Random, never read.
+        g = torch.Generator().manual_seed(seed + 1)
+        src = f"model.layers.{n_layers - 1}."
+        for k in list(tens):
+            if k.startswith(src):
+                tens["mtp.layers.0." + k[len(src):]] = torch.randn(
+                    tens[k].shape, generator=g, dtype=torch.float32).to(tens[k].dtype) * 0.02
+        tens["mtp.fc.weight"] = torch.randn((hidden, 2 * hidden), generator=g) * 0.02
+        for k in ("mtp.norm.weight", "mtp.pre_fc_norm_embedding.weight",
+                  "mtp.pre_fc_norm_hidden.weight"):
+            tens[k] = torch.ones(hidden)
+        cfg_path = out / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["mtp_num_hidden_layers"] = 1
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    save_file(tens, str(path), metadata={"format": "pt"})
+    print(f"shard rewritten: fused_experts={fused_experts} mtp={mtp} ({len(tens)} tensors)")
+
+
 def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           head_dim=16, rope_dim=8, n_experts=8, topk=2, inter=32,
           vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
-          ref_mode="attention_only", seed=20260817):
+          ref_mode="attention_only", seed=20260817,
+          dn_key_heads=None, dn_value_heads=None,
+          fused_experts=False, mtp=False):
+    if dn_key_heads is None:
+        dn_key_heads = q_heads
+    if dn_value_heads is None:
+        dn_value_heads = q_heads * 2
     # Fixed by default: an unseeded draw makes the gate flaky. Measured --
     # three local draws passed, one CI draw failed at 11/16, with identical
     # code. A gate that reddens at random gets muted within a week.
@@ -88,7 +171,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         rms_norm_eps=1e-6, rope_theta=10000.0, tie_word_embeddings=False,
         head_dim=head_dim, linear_conv_kernel_dim=4,
         linear_key_head_dim=8, linear_value_head_dim=8,
-        linear_num_key_heads=q_heads, linear_num_value_heads=q_heads * 2,
+        linear_num_key_heads=dn_key_heads, linear_num_value_heads=dn_value_heads,
         layer_types=layer_types, hidden_act="silu",
         attention_bias=False, attention_dropout=0.0, use_cache=True,
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
@@ -151,6 +234,10 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         print(f"ref.json -> {emit_ref}")
         print(f"  prompt_ids={prompt_ids}")
         print(f"  full_ids ={full}")
+    if fused_experts or mtp:
+        # after the reference: generate() ran on the in-memory model, the
+        # rewrite only changes what is on disk
+        _rewrite_shard(out, n_layers, fused_experts, mtp, hidden, seed)
 
 
 def main():
@@ -168,7 +255,26 @@ def main():
     ap.add_argument("--max-new", type=int, default=16)
     ap.add_argument("--prompt-ids", default=None,
                     help="Comma-separated token ids for the prompt (default 1,2,3,4,5)")
+    ap.add_argument("--geometry", choices=sorted(GEOMETRIES), default="qwen36-35b",
+                    help="structural numbers of a real checkpoint at toy widths")
+    for name in ("layers", "experts", "topk", "q-heads", "kv-heads", "hidden", "inter",
+                 "dn-key-heads", "dn-value-heads"):
+        ap.add_argument(f"--{name}", type=int, default=None,
+                        help=f"override the preset's {name.replace('-', '_')}")
+    ap.add_argument("--fused-experts", action="store_true", default=None,
+                    help="save experts as per-layer gate_up_proj/down_proj (real layout)")
+    ap.add_argument("--mtp", action="store_true", default=None,
+                    help="add a one-layer mtp.* head and mtp_num_hidden_layers=1")
     args = ap.parse_args()
+    geo = dict(GEOMETRIES[args.geometry])
+    for arg, key in (("layers", "n_layers"), ("experts", "n_experts"), ("topk", "topk"),
+                     ("q_heads", "q_heads"), ("kv_heads", "kv_heads"), ("hidden", "hidden"),
+                     ("inter", "inter"), ("dn_key_heads", "dn_key_heads"),
+                     ("dn_value_heads", "dn_value_heads"), ("fused_experts", "fused_experts"),
+                     ("mtp", "mtp")):
+        if getattr(args, arg) is not None:
+            geo[key] = getattr(args, arg)
+    print(f"geometry {args.geometry}: " + ", ".join(f"{k}={v}" for k, v in geo.items()))
 
     prompt_ids = None
     if args.prompt_ids:
@@ -176,7 +282,7 @@ def main():
     emit = args.emit_ref if args.emit_ref else None
 
     build(Path(args.out), max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit,
-          ref_mode=args.ref_mode, seed=args.seed)
+          ref_mode=args.ref_mode, seed=args.seed, **geo)
 
 
 if __name__ == "__main__":

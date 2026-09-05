@@ -388,6 +388,39 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
+        run: |
+          cd c
+          # The 2.4T checkpoint declares the same model_type as the 35B and
+          # resolves to this engine (#1045). Its structural numbers at toy
+          # widths: 92 layers / interval 4 / 512 experts top-10 / 16:1 attention
+          # heads / 8:1 DeltaNet heads. The shard is rewritten into the layout
+          # the real checkpoints ship -- fused expert tensors and an mtp.* head
+          # -- so the converter is seen splitting the one and skipping the other
+          # ON PURPOSE (it must say so), not by never selecting them.
+          # --seed 3: the default seed collapses this geometry's reference to a
+          # single repeated token, which a shape error could still reproduce.
+          python3 tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 \
+                  --out qwen38_2p4t_tiny --ref-mode full \
+                  --emit-ref qwen38_2p4t_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen38_2p4t_tiny \
+                  --out qwen38_2p4t_tiny_c --ebits 8 | tee convert_2p4t.log
+          grep -q "skipping 19 \`mtp.\*\` tensor" convert_2p4t.log
+          grep -q "tensor kinds: 1587 in 92 layers, 3 globals" convert_2p4t.log
+          # the container must not carry the head it skipped
+          python3 - <<'EOF'
+          import glob
+          from safetensors import safe_open
+          for path in glob.glob("qwen38_2p4t_tiny_c/*.safetensors"):
+              with safe_open(path, "pt") as f:
+                  assert not [k for k in f.keys() if k.startswith("mtp.")], path
+          EOF
+          for cap in 1 2 512; do
+            echo "::group::2.4T geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_2p4t_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_2p4t_tiny/ref_full.json
+            echo "::endgroup::"
+          done
       - name: Same run under ASan + UBSan
         run: |
           cd c
@@ -407,13 +440,15 @@ jobs:
           # diagnostic.
           make clean >/dev/null 2>&1 || true
           make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
-            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
-            ./qwen36 1 8 qwen36_tiny/ref_full.json > san.log 2>&1 || true
-          if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
-            echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
-          fi
-          echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
+          for fx in qwen36_tiny qwen38_2p4t_tiny; do
+            ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+              COLI_DENSE_I8=0 SNAP=${fx}_c PILOT=1 WIDE=2 \
+              ./qwen36 1 8 $fx/ref_full.json > san.log 2>&1 || true
+            if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
+              echo "FAIL: sanitizer diagnostic under PILOT ($fx)"; cat san.log; exit 1
+            fi
+            echo "sanitizers clean ($fx):"; grep -E "Matching tokens" san.log || true
+          done
       - name: A malformed container is refused, not read
         run: |
           cd c
