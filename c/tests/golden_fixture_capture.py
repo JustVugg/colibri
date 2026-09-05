@@ -22,7 +22,7 @@ Usage:
     python3 tests/golden_fixture_capture.py diff fixtures_pre fixtures_post
 
 Battery: chat, chat+tools, chat streaming, completions without logprobs, and
-the error cases whose behavior must not move (seed 400, array-prompt 400,
+the error cases whose behavior must not move (seed accepted-and-ignored, array-prompt 400,
 logprobs 400, out-of-range temperature 400) plus /v1/models.
 
 Normalization: every "id"/"created" field (recursively, and per SSE event) is
@@ -76,7 +76,7 @@ def battery(model):
         ("completions_stop", "POST", "/v1/completions",
          {"model": model, "prompt": "Count: one, two,",
           "max_tokens": 16, "temperature": 0, "stop": ["five"]}),
-        ("err_seed", "POST", "/v1/completions",
+        ("seed_accepted", "POST", "/v1/completions",
          {"model": model, "prompt": "hello", "max_tokens": 1, "seed": 1234}),
         ("err_array_prompt", "POST", "/v1/completions",
          {"model": model, "prompt": [1, 2, 3], "max_tokens": 1}),
