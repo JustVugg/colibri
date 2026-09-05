@@ -19,7 +19,9 @@ from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
-                           LOGPROBS_TOP_K_CAP, READY, Engine, InklingStreamSplit, StopFilter,
+                           LOGPROBS_TOP_K_CAP, PROMPT_BATCH_CAP, PROMPT_BATCH_COMPLETION_BUDGET,
+                           PROMPT_BATCH_TOKEN_BUDGET,
+                           READY, Engine, InklingStreamSplit, StopFilter,
                            ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, logprobs_options, parse_tool_calls,
@@ -30,15 +32,17 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            split_thinking_reply,
                            stop_policy, tune_child_env,
                            _chat_logprobs_content, _completions_logprobs_object,
-                           _json_float, _order_echo_records, _own_token_label)
+                           _encode_token_id_prompt,
+                           _json_float, _order_echo_records, _own_token_label,
+                           _trim_generated_records_to_text)
 
 
 class FakeEngine:
-    # The U7b capability gate: glm-only in production (Engine.__init__ sets it
-    # from `arch == "glm"`). Tests run under the module's default ARCH="glm"
-    # unless a test patches it, so True is the representative default for this
-    # double; capability-gate tests override it explicitly (see NonGlmEngine
-    # below) rather than relying on this.
+    # The per-token logprobs capability gate: glm-only in production
+    # (Engine.__init__ sets it from `arch == "glm"`). Tests run under the
+    # module's default ARCH="glm" unless a test patches it, so True is the
+    # representative default for this double; capability-gate tests override
+    # it explicitly (see NonGlmEngine below) rather than relying on this.
     supports_logprobs_echo = True
 
     def __init__(self):
@@ -47,10 +51,11 @@ class FakeEngine:
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
-                 echo=False):
+                 echo=False, tok_ids=False):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
         self.last_logprobs = logprobs
         self.last_echo = echo
+        self.last_tok_ids = tok_ids
         if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
             on_accept({"prompt_tokens": 7})
         for chunk in ("Hé", "llo"):
@@ -96,11 +101,11 @@ class BlockingEngine(FakeEngine):
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
-                 echo=False):
+                 echo=False, tok_ids=False):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
-                                cancelled, grammar, stopped, on_accept, logprobs, echo)
+                                cancelled, grammar, stopped, on_accept, logprobs, echo, tok_ids)
 
 
 class TemplateTest(unittest.TestCase):
@@ -707,19 +712,6 @@ class ResponseAssemblyTest(unittest.TestCase):
         self.assertEqual("".join(obj["tokens"]), prompt_text)
         self.assertEqual(obj["text_offset"], [0, 1, 2, 8, 9])
 
-    def test_text_offset_base_kwarg_shifts_all_offsets(self):
-        # An `echo=false` completions request still needs `text_offset`
-        # counted from the end of the prompt under OpenAI's own
-        # completions/echo convention -- callers that omit the echoed
-        # prompt can pass the prompt's character length here so offsets
-        # index the full text instead of just the generated tail. Default
-        # (0) preserves the behavior exercised by every other test in
-        # this class; deciding whether/when to pass a nonzero base is a
-        # caller-side concern, handled outside this helper.
-        generated = [(b"cat", {"lp": -0.05, "topk": []}), (b" dog", {"lp": -0.1, "topk": []})]
-        obj = _completions_logprobs_object([], generated, display_k=0, text_offset_base=100)
-        self.assertEqual(obj["text_offset"], [100, 103])
-
     def test_trailing_incomplete_multibyte_sequence_flushed_in_completions_path(self):
         # The same stateful-decoder trailing flush _chat_logprobs_content
         # relies on lives in the shared _logprob_positions helper -- prove
@@ -775,6 +767,15 @@ class ResponseAssemblyTest(unittest.TestCase):
         content = _chat_logprobs_content(generated, display_k=1)
         self.assertIsNone(content[0]["logprob"])
         self.assertIsNone(content[0]["top_logprobs"][0]["logprob"])
+
+    def test_encode_token_id_prompt_round_trips_and_validates(self):
+        self.assertEqual(_encode_token_id_prompt([1, 2, 30000]), "1 2 30000")
+        for bad in ([], [1, -1], [1, 2.5], [1, True], "not-a-list", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    _encode_token_id_prompt(bad)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "prompt")
 
     # Adversarial top-k order: the chosen token's own candidate sits
     # second in the table and is not even the highest logprob present (a
@@ -906,6 +907,33 @@ class ResponseAssemblyTest(unittest.TestCase):
         prompt = [(-1, b"a", {"lp": float("nan"), "topk": []})]
         with self.assertRaises(RuntimeError):
             _order_echo_records(prompt)
+
+
+class TrimGeneratedRecordsTest(unittest.TestCase):
+    """_trim_generated_records_to_text: a helper the flat and batch paths
+    both call to drop trailing generated-token records whose bytes were
+    filtered out of `text` (a matched stop sequence, most commonly), so
+    the logprobs table stays aligned with what is actually returned. Each
+    candidate piece must be checked against `text` at the RUNNING offset
+    -- the byte count of every record kept so far -- never from the start
+    of `text`, and that offset must advance by exactly the decoded piece
+    length, not off by one."""
+
+    def test_all_records_kept_when_text_holds_every_piece(self):
+        # Three records of unequal length, none trimmed: proves the
+        # running offset lands on the true boundary between every pair
+        # (2, then 5), not merely that the whole concatenation matches.
+        records = [(b"abc", {"r": 1}), (b"de", {"r": 2}), (b"fgh", {"r": 3})]
+        self.assertEqual(_trim_generated_records_to_text(records, "abcdefgh"), records)
+
+    def test_records_after_a_stop_sequence_truncation_are_dropped(self):
+        # `text` was cut short by a matched stop sequence after "ab" --
+        # the second and third records' bytes are no longer a prefix of
+        # what is actually returned, so both are dropped, not just the
+        # record whose own bytes fail to match.
+        records = [(b"ab", {"r": 1}), (b"cd", {"r": 2}), (b"ef", {"r": 3})]
+        self.assertEqual(_trim_generated_records_to_text(records, "ab"),
+                         [(b"ab", {"r": 1})])
 
 
 class StopFilterTest(unittest.TestCase):
@@ -3622,14 +3650,15 @@ class ReasoningEffortTest(unittest.TestCase):
 
 
 class NonGlmEngine(FakeEngine):
-    """The U7b capability gate's negative case: an engine that predates U7a
-    (or isn't glm) never gets the extension fields, never mind what it
-    would do with them."""
+    """The per-token logprobs / token-id-prompt capability gate's negative
+    case: an engine that predates the U7a extension (or isn't glm) never
+    gets the extension fields, never mind what it would do with them."""
     supports_logprobs_echo = False
 
 
 class LogprobsHTTPTest(unittest.TestCase):
-    """End-to-end U7b acceptance tests against a real APIServer + APIHandler,
+    """End-to-end acceptance tests for the per-token logprobs and
+    token-id-prompt capability gate, against a real APIServer + APIHandler,
     with FakeEngine standing in for the engine subprocess (its
     logprobs_channel() returns the canned U7a records documented on
     FakeEngine.generate() above).
@@ -3655,7 +3684,10 @@ class LogprobsHTTPTest(unittest.TestCase):
     test_break_it_logprobs_rejected_for_non_glm_engine, and
     test_golden_fixture_style_plain_request_is_unaffected. [RAN] verified by
     running this class against the predecessor head's server file: 6
-    failed, 6 passed.
+    failed, 6 passed. (That 6/6/12 count covers only the original
+    per-token-logprobs methods above; the array/token-id-prompt methods
+    added later in this class are a separate capability and are not
+    included in it.)
     """
 
     @classmethod
@@ -3776,6 +3808,168 @@ class LogprobsHTTPTest(unittest.TestCase):
         self.assertEqual(offsets[0], 0)
         self.assertIsNone(logprobs["token_logprobs"][0])   # first prompt token: null by convention
 
+    # ---- array / token-id prompt intake --------------------------------------
+
+    # The LITERAL request body a genuine unmodified lm-eval run sent over
+    # the wire against a real bridge server, captured by a passive logging
+    # proxy (not hand-constructed).
+    LMEVAL_FIXTURE = Path(__file__).parent / "fixtures" / "captured_lmeval_request.json"
+    LMEVAL_FIXTURE_SHA256 = \
+        "8242860518586177bba0dbe4d85a41a183c60b32ae56953be9e2e1e09251fe69"
+
+    def test_lm_eval_fixture_bytes_match_the_bound_blob(self):
+        import hashlib
+        digest = hashlib.sha256(self.LMEVAL_FIXTURE.read_bytes()).hexdigest()
+        self.assertEqual(digest, self.LMEVAL_FIXTURE_SHA256)
+        self.assertEqual(len(self.LMEVAL_FIXTURE.read_bytes()), 2732)
+
+    def test_lm_eval_captured_request_replay(self):
+        # The captured request itself (a single nested token-id member --
+        # lm-eval's tokenized loglikelihood shape wraps even one prompt in
+        # an outer batch list) replayed byte-for-byte against a real
+        # server, past both array intake and the batch dispatch path it
+        # would take if lm-eval ever grew to N>1: still just the
+        # single-prompt unwrap at N=1, producing a normal response.
+        captured = json.loads(self.LMEVAL_FIXTURE.read_text())["body_json"]
+        captured["model"] = "test-model"
+        with self.request("/v1/completions", captured) as response:
+            replayed = json.load(response)
+        self.assertEqual(len(replayed["choices"]), 1)
+        self.assertIsNotNone(replayed["choices"][0]["logprobs"])
+        self.assertIn("prompt_tokens", replayed["usage"])
+        self.assertEqual(self.engine.last_tok_ids, True)
+
+    def test_nested_batch_of_one_prompt_is_identical_to_flat(self):
+        # An unmodified lm-eval-style client's tokenized loglikelihood path
+        # always wraps its token-id array in an outer batch-of-one list,
+        # even at batch size 1 -- it must unwrap to the identical flat
+        # behavior.
+        ids = [72, 233, 108]
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": ids, "max_tokens": 1,
+        }) as response:
+            flat = json.load(response)
+        self.assertEqual(self.engine.calls[-1][0], "72 233 108")
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": [ids], "max_tokens": 1,
+        }) as response:
+            nested = json.load(response)
+        self.assertEqual(self.engine.calls[-1][0], "72 233 108")
+        self.assertEqual(flat["choices"], nested["choices"])
+        self.assertEqual(self.engine.last_tok_ids, True)
+
+    def test_nested_single_prompt_with_non_int_element_is_a_named_400(self):
+        # After unwrapping the length-1 outer list, this must hit the SAME
+        # existing validation _encode_token_id_prompt already does for a
+        # flat list with a bad element -- no new error path.
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": [[1, "bad", 3]], "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
+
+    def test_array_prompt_over_the_batch_cap_is_a_named_400(self):
+        # Pinned against the documented cap value itself (not just derived
+        # from PROMPT_BATCH_CAP), so a mutation that raises the constant
+        # cannot silently widen this test's own boundary along with it.
+        self.assertEqual(PROMPT_BATCH_CAP, 128)
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": ["hi"] * 129,
+                "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt")
+        # A distinct code from the "batch dispatch not yet implemented"
+        # refusal (see test_array_prompt_of_more_than_one_member_is_a_named_400
+        # below) -- this asserts the CAP is what fired, not that other,
+        # separate reason (both are named 400/param=prompt, so param alone
+        # cannot tell them apart).
+        self.assertEqual(error["code"], "prompt_batch_cap_exceeded")
+
+    def test_array_prompt_at_exactly_the_batch_cap_is_not_a_cap_refusal(self):
+        # An off-by-one guard on the cap boundary itself: exactly
+        # PROMPT_BATCH_CAP (128) members must NOT trip the cap check (the
+        # one-over case above pins that 129 does) -- the batch dispatches
+        # and is admitted, one choice per member.
+        self.assertEqual(PROMPT_BATCH_CAP, 128)
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": ["hi"] * 128,
+            "max_tokens": 1,
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"]), 128)
+
+    def test_array_prompt_over_the_token_budget_is_a_named_400(self):
+        # Pinned against the documented budget value itself (not just
+        # derived from PROMPT_BATCH_TOKEN_BUDGET), so a mutation that
+        # widens the constant cannot silently widen this test's own
+        # boundary along with it.
+        self.assertEqual(PROMPT_BATCH_TOKEN_BUDGET, 65536)
+        big = "x" * 32769
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": [big, big], "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt")
+        self.assertEqual(error["code"], "prompt_batch_token_budget_exceeded")
+        self.assertIn("budget", error["message"])
+
+    def test_array_prompt_token_budget_is_counted_in_utf8_bytes_not_characters(self):
+        # For string batches (no tokenizer available) the docs and the
+        # code both say the budget is applied to total UTF-8 BYTES, an
+        # upper bound on tokens -- not characters. "e-acute" is one
+        # character but two UTF-8 bytes, so this batch's byte total and
+        # character total straddle the budget on opposite sides: over by
+        # bytes, comfortably under by characters. If the accounting were
+        # ever swapped to count characters, this request would wrongly be
+        # ADMITTED (200, not 400).
+        self.assertEqual(PROMPT_BATCH_TOKEN_BUDGET, 65536)
+        member = "\u00e9" * 16385                # 16,385 chars, 32,770 UTF-8 bytes
+        self.assertEqual(len(member.encode("utf-8")), 32770)
+        total_bytes = 2 * len(member.encode("utf-8"))
+        total_chars = 2 * len(member)
+        self.assertGreater(total_bytes, PROMPT_BATCH_TOKEN_BUDGET)
+        self.assertLessEqual(total_chars, PROMPT_BATCH_TOKEN_BUDGET)
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": [member, member], "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt")
+        self.assertEqual(error["code"], "prompt_batch_token_budget_exceeded")
+        self.assertIn(str(total_bytes), error["message"])
+
+    def test_array_prompt_of_more_than_one_member_dispatches(self):
+        # A real (N>1) batch that passes shape/cap/budget validation
+        # dispatches -- one choice per member, in order.
+        with self.request("/v1/completions", {
+            "model": "test-model", "prompt": ["hi", "there"], "max_tokens": 1,
+        }) as response:
+            body = json.load(response)
+        self.assertEqual([choice["index"] for choice in body["choices"]], [0, 1])
+
+    def test_array_prompt_mixed_shapes_is_a_named_400(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": ["hi", [1, 2]], "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
+
+    def test_empty_array_prompt_is_a_named_400(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": [], "max_tokens": 1,
+            })
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
+
     # ---- break-it battery ---------------------------------------------------
 
     def test_break_it_logprobs_out_of_range(self):
@@ -3814,6 +4008,18 @@ class LogprobsHTTPTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             urlopen(request, timeout=2)
         self.assertEqual(caught.exception.code, 400)
+
+    def test_break_it_array_prompt_rejected_for_non_glm_engine(self):
+        base = self._temp_server(NonGlmEngine())
+        request = Request(base + "/v1/completions", method="POST",
+                          headers={"Authorization": "Bearer secret",
+                                   "Content-Type": "application/json"},
+                          data=json.dumps({"model": "test-model", "prompt": [1, 2, 3],
+                                           "max_tokens": 1}).encode())
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
 
     # ---- non-finite serializes as JSON null, end to end ---------------------
 
@@ -3885,6 +4091,56 @@ class LogprobsSubmitHeaderRegressionTest(unittest.TestCase):
             engine = Engine("glm", "model")
         chunks = []
         engine.generate("hello", 4, 0.25, 0.9, chunks.append, logprobs=2)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+
+    def test_token_id_prompt_submit_header_carries_ids_extension(self):
+        # The mutation this pins: dropping `ids=1` from the extension
+        # namespace when `tok_ids=True` -- the engine would then tok_encode
+        # the decimal-digit payload as literal text instead of reading it
+        # as pre-tokenized ids (coli_ids_parse never runs).
+        request_id = "1"
+        payload = b"72 233 108"
+        expected = (f"SUBMIT {request_id} 0 {len(payload)} 4 0.25 0.9 0 ids=1\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA " + request_id.encode() + b" 2\nok\n"
+                b"DONE " + request_id.encode() + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        engine.generate("72 233 108", 4, 0.25, 0.9, chunks.append, tok_ids=True)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+
+    def test_token_id_prompt_with_logprobs_submit_header_carries_both(self):
+        # Both extension fields together, ordered logprobs= before ids=1
+        # (the order this server always emits them in).
+        request_id = "1"
+        payload = b"72 233 108"
+        expected = (f"SUBMIT {request_id} 0 {len(payload)} 4 0.25 0.9 0 "
+                    f"logprobs=2 ids=1\n".encode() + payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT " + request_id.encode() + b" 3\n"
+                b"ECHO " + request_id.encode() + b" 1 0 nan 0\nh\n"
+                b"DATA " + request_id.encode() +
+                b" 2 -0.223144 1 3 -0.223144\nok\n"
+                b"DONE " + request_id.encode() + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        engine.generate("72 233 108", 4, 0.25, 0.9, chunks.append,
+                        logprobs=2, tok_ids=True)
         engine.close()
         self.assertEqual(process.writes, [expected])
 
@@ -4249,6 +4505,106 @@ class LogprobsOldEngineAcceptTimeoutTest(unittest.TestCase):
         self.assertEqual(stats["completion_tokens"], 1)
         engine.close()
 
+    def test_old_engine_rejects_a_token_id_prompt_times_out_with_a_named_503(self):
+        # A token-id prompt (`tok_ids=True`, no logprobs) carries its own
+        # extended SUBMIT field (`ids=1`) -- an old engine that predates
+        # this extension rejects it the exact same silent way ("ERROR 0
+        # BAD_REQUEST", an id that never matches this request), so the
+        # SAME accept-deadline bound must apply here too, not only when
+        # logprobs was requested.
+        def respond(process, frame):
+            process.stdout.feed(b"ERROR 0 BAD_REQUEST\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("openai_server.LOGPROBS_ACCEPT_TIMEOUT", 0.2):
+            engine = Engine("glm", "model")
+            outcome = {}
+
+            def run():
+                try:
+                    engine.generate("72 233 108", 4, 0.0, 1.0, lambda _: None,
+                                    tok_ids=True)
+                except Exception as error:               # noqa: BLE001
+                    outcome["error"] = error
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive(),
+                             "engine.generate() did not return within the bound -- "
+                             "the accept-deadline check did not fire for a token-id "
+                             "prompt")
+        caught = outcome.get("error")
+        self.assertIsInstance(caught, APIError, f"wrong exception: {caught!r}")
+        self.assertEqual(caught.status, 503)
+        self.assertEqual(caught.param, "prompt")
+        self.assertEqual(caught.code, "engine_tok_ids_unsupported")
+        # The pending entry is dropped (treated as cancelled), not left
+        # for a stray late frame to resolve against.
+        self.assertNotIn("1", engine.pending)
+        engine.close()
+
+
+class TokenIdPromptWireErrorTest(unittest.TestCase):
+    """The engine's own vocabulary/structural refusal of a token-id prompt
+    (`coli_ids_parse` returning -1 for a malformed or out-of-vocabulary id,
+    c/decode_batch.h) must surface as a named 400 on `prompt`, not the
+    generic 500 `engine_error` every other unexpected engine RuntimeError
+    still becomes."""
+
+    def test_engine_bad_request_for_a_token_id_prompt_is_a_named_400(self):
+        # Unlike the old-engine-rejects-the-header case ("ERROR 0
+        # BAD_REQUEST", never matching a pending request), a real engine
+        # that understands `ids=1` but rejects THIS id list answers with
+        # the request's own id -- that is what distinguishes the two wire
+        # shapes here.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ERROR " + request_id + b" BAD_REQUEST\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+            with self.assertRaises(APIError) as caught:
+                engine.generate("1 2 999999999", 4, 0.0, 1.0, lambda _: None,
+                                tok_ids=True)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, "prompt")
+        engine.close()
+
+    def test_engine_bad_request_without_tok_ids_still_a_generic_error(self):
+        # The BAD_REQUEST-to-400 mapping is scoped to token-id-prompt
+        # requests specifically -- a plain-text request that somehow drew
+        # a matching-id BAD_REQUEST (should not happen in practice; NUL
+        # bytes and the cache-slot range are both already rejected before
+        # SUBMIT is ever sent) is NOT silently reinterpreted as a prompt
+        # validation failure it did not have.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ERROR " + request_id + b" BAD_REQUEST\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+            with self.assertRaises(RuntimeError) as caught:
+                engine.generate("hello", 4, 0.0, 1.0, lambda _: None)
+        self.assertNotIsInstance(caught.exception, APIError)
+        engine.close()
+
+    def test_out_of_vocabulary_looking_id_is_not_rejected_before_submit(self):
+        # This server has no accessible vocabulary size at request time
+        # (FamilyDescriptor carries no vocab_size field, and the real
+        # embedding-table bound the engine enforces -- c/colibri.c's
+        # m->c.vocab, read by coli_ids_parse -- is derived per-arch inside
+        # family_registry.py's geometry functions, not surfaced to the
+        # HTTP layer). _encode_token_id_prompt is therefore structural
+        # validation only (non-negative integers), by design: an
+        # implausibly large id is NOT rejected here -- it is the engine's
+        # own BAD_REQUEST (mapped above) that is authoritative.
+        self.assertEqual(_encode_token_id_prompt([1, 2, 999999999]),
+                         "1 2 999999999")
+
 
 class LogprobsAcceptTimeoutEnvVarTest(unittest.TestCase):
     """The tests above patch the module attribute `LOGPROBS_ACCEPT_TIMEOUT`
@@ -4331,6 +4687,718 @@ class LogprobsEchoBufferingTest(unittest.TestCase):
         stats = engine.generate("hi", 4, 0.0, 1.0, lambda _: None, logprobs=1, echo=True)
         self.assertEqual(len(stats["logprobs"]["prompt"]), 2)
         engine.close()
+
+
+def _spawn_test_server(case, engine, kv_slots=1, max_tokens=16):
+    """A throwaway APIServer on an ephemeral port, torn down with the test
+    case -- the shared harness for the batch-dispatch batteries below.
+    max_tokens is the operator's --max-tokens/--ngen cap that
+    generation_options() clamps a request's max_tokens to; it defaults to
+    16 (the value every other test in this file was written against) and
+    is only raised where a test needs headroom above that to reach the
+    generated-side completion budget."""
+    server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", max_tokens,
+                       kv_slots=kv_slots)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    case.addCleanup(server.scheduler.close)
+    case.addCleanup(server.shutdown)
+    case.addCleanup(server.server_close)
+    case.addCleanup(thread.join, timeout=2)
+    return f"http://127.0.0.1:{server.server_port}"
+
+
+def _post_completions(base, body, timeout=5):
+    return urlopen(Request(base + "/v1/completions",
+                           data=json.dumps(body).encode(),
+                           headers={"Authorization": "Bearer secret",
+                                    "Content-Type": "application/json"}),
+                   timeout=timeout)
+
+
+class ScriptedEngine(FakeEngine):
+    """A deterministic pure function of the prompt: the same prompt always
+    produces the same text, stats, and logprob frames, so a batched-vs-
+    single comparison can assert exact equality instead of a tolerance."""
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
+                 on_tool=None, image=None, logprobs=0, echo=False, tok_ids=False):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = echo
+        self.last_tok_ids = tok_ids
+        if on_accept is not None:
+            on_accept({"prompt_tokens": len(prompt)})
+        for chunk in ("out<", prompt, ">"):
+            on_text(chunk)
+        stats = {"prompt_tokens": len(prompt), "completion_tokens": 3,
+                 "length_limited": len(prompt) % 2 == 0}
+        if logprobs:
+            stats["logprobs"] = self.scripted_channel(prompt, logprobs)
+        return stats
+
+    def scripted_channel(self, prompt, engine_k):
+        """One echo record per whitespace piece of the (encoded) prompt --
+        position 0 carrying the real wire's nothing-to-condition-on
+        sentinel -- with logprob values derived from the piece itself, plus
+        one generated record. Same record shapes as FakeEngine's canned
+        channel, but prompt-dependent."""
+        echoed = []
+        for pos, piece in enumerate(prompt.split()):
+            if pos == 0:
+                echoed.append((pos, piece.encode(), {"lp": float("nan"), "topk": []}))
+                continue
+            lp = -float(len(piece)) - pos / 8.0
+            topk = [(pos, lp), (pos + 1000, lp - 1.0)][:min(engine_k, 2)]
+            echoed.append((pos, piece.encode(), {"lp": lp, "topk": topk}))
+        generated = [(b"G", {"lp": -0.25, "topk": [(9, -0.25)][:min(engine_k, 1)]})]
+        return {"prompt": echoed, "generated": generated}
+
+
+class SecondSubmitErrorEngine(ScriptedEngine):
+    """The first engine submit in a batch succeeds normally; the second
+    raises an APIError (an engine-side rejection reached mid-dispatch, as
+    opposed to a member that never gets this far because pre-submit
+    validation already rejected it) -- exercises the "a later member's
+    engine-level failure must not leave an earlier member's output
+    on the wire" guarantee."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls_made = 0
+
+    def generate(self, *args, **kwargs):
+        self.calls_made += 1
+        if self.calls_made == 2:
+            raise APIError(400, "the engine rejected this prompt.", "prompt")
+        return super().generate(*args, **kwargs)
+
+
+class SecondSubmitBadRequestEngine(ScriptedEngine):
+    """The second engine submit in a batch raises a bare
+    RuntimeError("BAD_REQUEST") -- the matching-id engine rejection that
+    Engine.generate() only converts into an APIError when `tok_ids` is
+    set. A string batch member never sets tok_ids, so this is the shape a
+    non-tok_ids engine rejection actually takes on the wire, and it must
+    land exactly where the flat single-prompt path lands the same
+    condition: a generic, un-attributed 500, never a member-named 400
+    batch_completion() invents on its own."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls_made = 0
+
+    def generate(self, *args, **kwargs):
+        self.calls_made += 1
+        if self.calls_made == 2:
+            raise RuntimeError("BAD_REQUEST")
+        return super().generate(*args, **kwargs)
+
+
+class SecondSubmitServerFaultEngine(ScriptedEngine):
+    """The second engine submit in a batch raises the accept-deadline
+    APIError Engine.generate() raises when the engine build does not
+    accept a per-token-logprobs request in time -- a server_error: the
+    engine's own capability gap, never any one member's content."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls_made = 0
+
+    def generate(self, *args, **kwargs):
+        self.calls_made += 1
+        if self.calls_made == 2:
+            raise APIError(
+                503, "The colibri engine did not accept a per-token logprobs "
+                    "request in time; it may not support the per-token logprobs "
+                    "extension.", "logprobs", "engine_logprobs_unsupported",
+                "server_error")
+        return super().generate(*args, **kwargs)
+
+
+class BatchCompletionHTTPTest(unittest.TestCase):
+    """Acceptance tests for real multi-prompt batches on /v1/completions
+    against a real APIServer, with ScriptedEngine standing in for the
+    engine subprocess: batch admission, prompt[i] member attribution, and
+    (once dispatch is wired) the assembled response itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = ScriptedEngine()
+        cls.server = APIServer(("127.0.0.1", 0), cls.engine, "test-model", "secret", 16,
+                               kv_slots=1)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def _json(self, body):
+        with _post_completions(self.base, {"model": "test-model", **body}) as response:
+            return json.load(response)
+
+    def _reject(self, body, param):
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(self.base, {"model": "test-model", **body})
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], param)
+        return error
+
+    def test_break_it_mixed_element_types_are_named_400(self):
+        # Whole-array shape defects carry param "prompt" with NO member
+        # attribution (the array as a whole is malformed).
+        for bad in (["a", [1, 2]], [[1, 2], "a"], [1, "a"], ["a", 1],
+                    [None], [{"p": 1}], [True, False], [1.5, 2]):
+            with self.subTest(bad=bad):
+                error = self._reject({"prompt": bad, "max_tokens": 1}, "prompt")
+                self.assertEqual(error["code"], "invalid_value")
+
+    def test_break_it_bad_member_elements_are_member_attributed(self):
+        # A member-attributable 400 carries error.param = "prompt[i]" --
+        # the literal indexed param, not a bare "prompt" with the index
+        # buried in prose.
+        for bad_member in ([3, "x"], [3, -4], [3, True], []):
+            with self.subTest(bad_member=bad_member):
+                error = self._reject({"prompt": [[1, 2], bad_member],
+                                      "max_tokens": 1}, "prompt[1]")
+                self.assertEqual(error["code"], "invalid_value")
+                self.assertIn("prompt[1]:", error["message"])
+
+    def test_break_it_empty_forms_are_named_400(self):
+        error = self._reject({"prompt": [], "max_tokens": 1}, "prompt")
+        self.assertEqual(error["code"], "invalid_value")
+        # An empty STRING member is member-attributed (param "prompt[1]",
+        # code null -- the single-prompt empty error's own code) and the
+        # message carries the same "prompt[1]:" prefix every other
+        # member-attributed message carries.
+        error = self._reject({"prompt": ["a", ""], "max_tokens": 1}, "prompt[1]")
+        self.assertIsNone(error["code"])
+        self.assertIn("prompt[1]:", error["message"])
+        error = self._reject({"prompt": [[1], []], "max_tokens": 1}, "prompt[1]")
+        self.assertEqual(error["code"], "invalid_value")
+
+    def test_stream_and_n_together_defer_to_generation_options_first(self):
+        # Batch validation checks stream last, the same position the flat
+        # path checks it in -- so a request carrying both `stream: true`
+        # and `n: 2` is refused for `n`, not `stream`, matching the flat
+        # path's own precedence.
+        error = self._reject({"prompt": ["a", "b"], "stream": True, "n": 2}, "n")
+        self.assertEqual(error["code"], "unsupported_value")
+
+    def test_budget_does_not_apply_to_a_single_tokenized_prompt(self):
+        # The flat and batch-of-one shapes keep their pre-batch behavior --
+        # oversize single prompts stay the engine's own CONTEXT_EXCEEDED
+        # business, not the batch budget's (a length-1 array never reaches
+        # batch_completion() at all).
+        over = 65536 + 1000
+        body = self._json({"prompt": [[3] * over], "max_tokens": 1})
+        self.assertEqual(len(body["choices"]), 1)
+
+    def test_break_it_streaming_with_array_prompt_is_named_400(self):
+        error = self._reject({"prompt": ["a", "b"], "stream": True}, "stream")
+        self.assertEqual(error["code"], "unsupported_parameter")
+
+    def test_break_it_n_above_one_with_array_prompt_is_named_400(self):
+        error = self._reject({"prompt": ["a", "b"], "n": 2}, "n")
+        self.assertEqual(error["code"], "unsupported_value")
+
+    def test_rejected_batch_makes_no_engine_submits(self):
+        # A malformed member fails the WHOLE request before any engine work
+        # starts -- never a partial batch.
+        before = len(self.engine.calls)
+        self._reject({"prompt": ["a", ""], "max_tokens": 1}, "prompt[1]")
+        self._reject({"prompt": [[1], []], "max_tokens": 1}, "prompt[1]")
+        self._reject({"prompt": ["a", "b"], "stream": True}, "stream")
+        self.assertEqual(len(self.engine.calls), before)
+
+    def test_mid_batch_engine_failure_never_emits_a_partial_response(self):
+        # A member that fails only once engine dispatch is already under
+        # way (as opposed to a member that fails pre-submit validation)
+        # must still fail the WHOLE request -- never a 200 carrying just
+        # the members that happened to finish before it.
+        engine = SecondSubmitErrorEngine()
+        base = _spawn_test_server(self, engine)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model",
+                                     "prompt": ["a", "b", "c"], "max_tokens": 1})
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt[1]")
+        self.assertIn("prompt[1]:", error["message"])
+        # This is the engine's own client-fault rejection of one member's
+        # content, not a shape defect caught pre-submit -- it carries no
+        # `code` at all, the same `code: null` the single-prompt path's
+        # own engine rejections carry, never `invalid_value`.
+        self.assertIsNone(error["code"])
+        # The third member must never have been submitted either -- one
+        # named failure ends the whole batch, not just the failing member.
+        self.assertEqual(engine.calls_made, 2)
+
+    def test_id_batch_rejected_for_non_glm_engine(self):
+        base = _spawn_test_server(self, NonGlmEngine())
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model",
+                                     "prompt": [[1, 2], [3, 4]], "max_tokens": 1})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
+
+    def test_string_batch_works_on_non_glm_engine(self):
+        # Sequential text submits carry no numeric-logprobs/token-id
+        # extension fields, so a string batch is engine-agnostic.
+        engine = NonGlmEngine()
+        base = _spawn_test_server(self, engine)
+        with _post_completions(base, {"model": "test-model",
+                                      "prompt": ["a", "b"], "max_tokens": 4}) as response:
+            body = json.load(response)
+        self.assertEqual([choice["text"] for choice in body["choices"]],
+                         ["Héllo", "Héllo"])
+        self.assertEqual(engine.last_logprobs, 0)
+        self.assertEqual(engine.last_tok_ids, False)
+
+    def test_engine_bad_request_without_tok_ids_is_the_same_generic_500_as_flat(self):
+        # A non-tok_ids engine BAD_REQUEST is NOT subsumed by the
+        # member-attributed mapping -- it lands as the same generic 500
+        # engine_error the flat single-prompt path already uses for this
+        # condition, with no partial output and no member attribution
+        # invented for it.
+        engine = SecondSubmitBadRequestEngine()
+        base = _spawn_test_server(self, engine)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model",
+                                     "prompt": ["a", "b", "c"], "max_tokens": 1})
+        self.assertEqual(caught.exception.code, 500)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["code"], "engine_error")
+        self.assertIsNone(error["param"])
+        # The third member must never have been submitted either.
+        self.assertEqual(engine.calls_made, 2)
+
+    def test_server_fault_mid_batch_keeps_status_and_param_names_member_in_message_only(self):
+        # A server-fault APIError (the engine's own capability gap, not
+        # any one member's content) keeps its original status, code and
+        # param; only its message gains the failing member's index, so a
+        # client is never told the wrong prompt is the problem.
+        engine = SecondSubmitServerFaultEngine()
+        base = _spawn_test_server(self, engine)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model",
+                                     "prompt": ["a", "b", "c"], "max_tokens": 1,
+                                     "logprobs": 1})
+        self.assertEqual(caught.exception.code, 503)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["code"], "engine_logprobs_unsupported")
+        self.assertEqual(error["param"], "logprobs")
+        self.assertIn("prompt[1]:", error["message"])
+        self.assertEqual(engine.calls_made, 2)
+
+    def test_batch_usage_is_built_by_the_shared_usage_helper(self):
+        # batch_completion() must produce `usage` by calling
+        # APIHandler.usage(), not a hand-rolled duplicate dict that could
+        # silently stop matching it if a field is ever added there.
+        original = APIHandler.usage
+
+        def usage_with_marker(stats):
+            result = original(stats)
+            result["_shared_usage_helper_marker"] = True
+            return result
+
+        with patch.object(APIHandler, "usage", staticmethod(usage_with_marker)):
+            body = self._json({"prompt": ["a", "b"], "max_tokens": 1})
+        self.assertIn("_shared_usage_helper_marker", body["usage"])
+
+    def test_client_disconnect_mid_batch_stops_further_submits(self):
+        # Built, not hoped for (#1329): the engine signals an Event only
+        # once the third member has actually finished, and then blocks on
+        # a second Event that the test sets only after confirming the
+        # socket is closed. client_disconnected() is wrapped so the
+        # moment it first observes the closed socket is itself an Event
+        # -- the batch loop raises ClientCancelled synchronously inside
+        # that same call, before any further engine submit, so waiting
+        # for this Event (rather than a fixed sleep) is enough to know
+        # engine.calls has already reached its final count.
+        member_three_done = threading.Event()
+        resume = threading.Event()
+        disconnect_observed = threading.Event()
+
+        class DisconnectAfterThirdEngine(ScriptedEngine):
+            def generate(self, *args, **kwargs):
+                stats = super().generate(*args, **kwargs)
+                if len(self.calls) == 3:
+                    member_three_done.set()
+                    resume.wait(5)
+                return stats
+
+        engine = DisconnectAfterThirdEngine()
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16,
+                           kv_slots=1)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+
+        original_client_disconnected = APIHandler.client_disconnected
+
+        def watched_client_disconnected(self):
+            seen = original_client_disconnected(self)
+            if seen:
+                disconnect_observed.set()
+            return seen
+
+        body = json.dumps({"model": "test-model",
+                           "prompt": [f"p{i}" for i in range(8)],
+                           "max_tokens": 1}).encode()
+        sock = socket.create_connection(("127.0.0.1", server.server_port), 5)
+        request = (f"POST /v1/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  f"Authorization: Bearer secret\r\nContent-Type: application/json\r\n"
+                  f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+        with patch.object(APIHandler, "client_disconnected", watched_client_disconnected):
+            sock.sendall(request)
+            self.assertTrue(member_three_done.wait(5), "engine never reached the third member")
+            # An RST rather than a clean FIN, same idiom ClientHangupTest
+            # uses, so client_disconnected()'s recv() sees the closure
+            # immediately.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sock.close()
+            resume.set()
+            self.assertTrue(disconnect_observed.wait(5),
+                            "server's own client_disconnected() never observed "
+                            "the closed socket")
+        self.assertEqual(len(engine.calls), 3,
+                         "batch kept submitting members after the client left")
+
+    def test_batch_admission_is_released_before_the_response_write(self):
+        # Built, not hoped for: send_json is wrapped so a batch's (more
+        # than one choice) response parks on an Event the instant its
+        # write begins. While it is parked, a second client's flat
+        # request goes to the same kv_slots=1 server -- if the scheduler
+        # admission the batch holds were still held during that write,
+        # the second request would queue behind it instead of completing
+        # promptly. It must complete first: the admission is released
+        # before send_json runs.
+        writing = threading.Event()
+        release_write = threading.Event()
+        original_send_json = APIHandler.send_json
+
+        def blocking_send_json(self, status, body, request_id=None, headers=None):
+            if isinstance(body, dict) and len(body.get("choices", [])) > 1:
+                writing.set()
+                release_write.wait(5)
+            return original_send_json(self, status, body, request_id, headers)
+
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, kv_slots=1)
+        first_status = []
+
+        def first_request():
+            with _post_completions(base, {"model": "test-model",
+                                          "prompt": ["a", "b"], "max_tokens": 1}) as response:
+                first_status.append(response.status)
+
+        with patch.object(APIHandler, "send_json", blocking_send_json):
+            first = threading.Thread(target=first_request)
+            first.start()
+            self.assertTrue(writing.wait(5), "batch response write never started")
+
+            second_start = time.monotonic()
+            with _post_completions(base, {"model": "test-model", "prompt": "c",
+                                          "max_tokens": 1}, timeout=2) as response:
+                second_elapsed = time.monotonic() - second_start
+                self.assertEqual(response.status, 200)
+            self.assertLess(second_elapsed, 1.0,
+                            "second client's admission waited behind the first "
+                            "client's batch response write")
+
+            release_write.set()
+            first.join(5)
+
+        self.assertEqual(first_status, [200])
+
+    # ---- batch shapes, N in {1, 2, 5, 128}, both forms ----------------------
+
+    def test_string_batch_shapes(self):
+        for n in (1, 2, 5, 128):
+            with self.subTest(n=n):
+                prompts = [f"p{i}" for i in range(n)]
+                body = self._json({"prompt": prompts, "max_tokens": 4})
+                self.assertEqual(len(body["choices"]), n)
+                for i, choice in enumerate(body["choices"]):
+                    self.assertEqual(choice["index"], i)
+                    self.assertEqual(choice["text"], f"out<p{i}>")
+                self.assertEqual(body["usage"]["prompt_tokens"],
+                                 sum(len(p) for p in prompts))
+                self.assertEqual(body["usage"]["completion_tokens"], 3 * n)
+                self.assertEqual(body["usage"]["total_tokens"],
+                                 body["usage"]["prompt_tokens"]
+                                 + body["usage"]["completion_tokens"])
+
+    def test_id_array_batch_shapes(self):
+        for n in (1, 2, 5, 128):
+            with self.subTest(n=n):
+                prompts = [[100 + i, 200 + i] for i in range(n)]
+                body = self._json({"prompt": prompts, "max_tokens": 4})
+                self.assertEqual(len(body["choices"]), n)
+                for i, choice in enumerate(body["choices"]):
+                    self.assertEqual(choice["index"], i)
+                    self.assertEqual(choice["text"], f"out<{100 + i} {200 + i}>")
+                self.assertEqual(self.engine.last_tok_ids, True)
+
+    # ---- batched == N single-prompt requests, field for field ---------------
+
+    def test_batched_id_choices_bit_identical_to_singles(self):
+        prompts = [[7, 8, 9], [7, 8, 10, 11], [42]]
+        base = {"max_tokens": 1, "echo": True, "logprobs": 2, "temperature": 0}
+        batched = self._json({**base, "prompt": prompts})
+        singles = [self._json({**base, "prompt": [p]}) for p in prompts]
+        for i, single in enumerate(singles):
+            expect = dict(single["choices"][0])
+            got = dict(batched["choices"][i])
+            self.assertEqual(got.pop("index"), i)
+            expect.pop("index")
+            self.assertEqual(got, expect)
+        self.assertEqual(batched["usage"]["prompt_tokens"],
+                         sum(s["usage"]["prompt_tokens"] for s in singles))
+        self.assertEqual(batched["usage"]["completion_tokens"],
+                         sum(s["usage"]["completion_tokens"] for s in singles))
+
+    def test_batched_string_choices_bit_identical_to_singles(self):
+        prompts = ["alpha", "béta gamma", "delta!"]
+        base = {"max_tokens": 4, "temperature": 0}
+        batched = self._json({**base, "prompt": prompts})
+        for i, prompt in enumerate(prompts):
+            single = self._json({**base, "prompt": prompt})
+            expect = dict(single["choices"][0])
+            got = dict(batched["choices"][i])
+            self.assertEqual(got.pop("index"), i)
+            expect.pop("index")
+            self.assertEqual(got, expect)
+
+
+class BoundaryUtf8Engine(FakeEngine):
+    """Odd calls end the echo stream with the FIRST byte of a two-byte
+    UTF-8 codepoint; even calls begin with the SECOND byte (0xC3 / 0xA9 --
+    a clean 'e-acute' if wrongly joined). The per-member decoder contract
+    requires each batch member to surface its own replacement character;
+    a decoder shared across members would join the halves and leak one
+    prompt's bytes into the next prompt's token text."""
+
+    def __init__(self):
+        super().__init__()
+        self.channel_calls = 0
+
+    def logprobs_channel(self, engine_k):
+        self.channel_calls += 1
+        if self.channel_calls % 2 == 1:
+            echoed = [(0, b"A", {"lp": float("nan"), "topk": []}),
+                      (1, b"\xc3", {"lp": -0.5, "topk": []})]
+        else:
+            echoed = [(0, b"\xa9", {"lp": float("nan"), "topk": []}),
+                      (1, b"B", {"lp": -0.5, "topk": []})]
+        return {"prompt": echoed, "generated": []}
+
+
+class HostileEchoEngine(FakeEngine):
+    """Well-formed frames for the first member, then a duplicate wire
+    `pos` on the second member's echo frames: the batch must fail as ONE
+    clean engine_error -- never a partial response, never a hang."""
+
+    def __init__(self):
+        super().__init__()
+        self.channel_calls = 0
+
+    def logprobs_channel(self, engine_k):
+        self.channel_calls += 1
+        if self.channel_calls == 1:
+            return super().logprobs_channel(engine_k)
+        return {"prompt": [(0, b"A", {"lp": float("nan"), "topk": []}),
+                           (0, b"B", {"lp": -0.5, "topk": []})],
+                "generated": []}
+
+
+class BatchSequenceIsolationTest(unittest.TestCase):
+    """Per-member echo reassembly and per-member stateful UTF-8 decoding
+    across a batch's members."""
+
+    def test_utf8_codepoint_split_across_members_stays_per_sequence(self):
+        base = _spawn_test_server(self, BoundaryUtf8Engine())
+        with _post_completions(base, {"model": "test-model", "prompt": [[1, 2], [3, 4]],
+                                      "max_tokens": 1, "echo": True,
+                                      "logprobs": 1}) as response:
+            body = json.load(response)
+        first = body["choices"][0]["logprobs"]["tokens"]
+        second = body["choices"][1]["logprobs"]["tokens"]
+        self.assertEqual(first, ["A", "�"])
+        self.assertEqual(second, ["�", "B"])
+        self.assertNotIn("é", "".join(first) + "".join(second))
+
+    def test_hostile_echo_positions_mid_batch_fail_clean_not_hang(self):
+        base = _spawn_test_server(self, HostileEchoEngine())
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model", "prompt": [[1, 2], [3, 4]],
+                                     "max_tokens": 1, "echo": True, "logprobs": 1},
+                              timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        self.assertEqual(json.load(caught.exception)["error"]["code"], "engine_error")
+
+
+class BatchCompletionBudgetHTTPTest(unittest.TestCase):
+    """The GENERATED-side batch budget: members * the request's effective
+    max_tokens must not exceed PROMPT_BATCH_COMPLETION_BUDGET, or the
+    whole batch is refused before any engine submit. Each test spawns its
+    own server so it can set the operator's --max-tokens cap
+    independently of the shared 16 every other batch test in this file
+    uses."""
+
+    def test_over_budget_batch_is_refused_before_any_engine_submit(self):
+        # 2 members * 32769 max_tokens = 65538, one over
+        # PROMPT_BATCH_COMPLETION_BUDGET (65536): without this budget,
+        # nothing bounds the generated side and the batch would dispatch
+        # (200, two engine submits) instead of a named 400 with zero
+        # engine submits.
+        self.assertEqual(PROMPT_BATCH_COMPLETION_BUDGET, 65536)
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=1 << 20)
+        before = len(engine.calls)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model", "prompt": ["a", "b"],
+                                     "max_tokens": 32769})
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "max_tokens")
+        self.assertEqual(error["code"], "batch_completion_budget_exceeded")
+        self.assertIn("2", error["message"])
+        self.assertIn("32769", error["message"])
+        self.assertIn("65538", error["message"])
+        self.assertIn(str(PROMPT_BATCH_COMPLETION_BUDGET), error["message"])
+        # The defining property: no engine work started on a refused batch.
+        self.assertEqual(len(engine.calls), before)
+
+    def test_product_exactly_at_the_budget_is_admitted(self):
+        # Boundary companion to the regression-pin test above: 2 * 32768 =
+        # 65536, exactly the budget, must be ADMITTED, not refused -- the
+        # budget is an inclusive ceiling, same convention as
+        # PROMPT_BATCH_TOKEN_BUDGET's own boundary test.
+        self.assertEqual(PROMPT_BATCH_COMPLETION_BUDGET, 65536)
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=1 << 20)
+        with _post_completions(base, {"model": "test-model", "prompt": ["a", "b"],
+                                      "max_tokens": 32768}) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"]), 2)
+        self.assertEqual(len(engine.calls), 2)
+
+    def test_product_one_above_the_budget_is_refused(self):
+        # The other half of the boundary pair: one token over (32769) trips
+        # the refusal -- pinned separately from the regression-pin test so a
+        # future edit to that test's other assertions cannot silently lose
+        # boundary coverage.
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=1 << 20)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model", "prompt": ["a", "b"],
+                                     "max_tokens": 32769})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["code"],
+                         "batch_completion_budget_exceeded")
+
+    def test_budget_is_checked_against_the_clamped_max_tokens_not_the_raw_request(self):
+        # The check must use `maximum` -- generation_options()'s return
+        # value AFTER its clamp to the operator's --max-tokens/--ngen --
+        # not the client's raw requested max_tokens. Server cap is 100
+        # here; the client asks for 1,000,000 (which alone, times 2
+        # members, would be 2,000,000 and hugely over budget), but the
+        # clamped value is 100, and 2 * 100 = 200 is comfortably inside
+        # the budget, so the batch must be ADMITTED. engine.calls records
+        # the actual `maximum` each submit carried, so this also confirms
+        # which value the engine itself received.
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=100)
+        with _post_completions(base, {"model": "test-model", "prompt": ["a", "b"],
+                                      "max_tokens": 1000000}) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"]), 2)
+        self.assertEqual(engine.calls[0][1], 100)
+        self.assertEqual(engine.calls[1][1], 100)
+
+    def test_budget_does_not_apply_to_a_flat_single_prompt(self):
+        # A flat (non-array) prompt never reaches batch_completion() at
+        # all: the same huge max_tokens that trips the batch budget above
+        # must be unaffected on the flat path, whose own oversize handling
+        # (the operator's --max-tokens/--ngen clamp) is unchanged here.
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=1 << 20)
+        with _post_completions(base, {"model": "test-model", "prompt": "a",
+                                      "max_tokens": 1000000}) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"]), 1)
+        self.assertEqual(engine.calls[0][1], 1000000)
+
+    def test_budget_does_not_apply_to_a_batch_of_one(self):
+        # A batch-of-one array unwraps to the flat single-prompt path and
+        # never reaches batch_completion() either, so the same huge
+        # max_tokens in a length-1 array must also be unaffected.
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=1 << 20)
+        with _post_completions(base, {"model": "test-model", "prompt": ["a"],
+                                      "max_tokens": 1000000}) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"]), 1)
+        self.assertEqual(engine.calls[0][1], 1000000)
+
+    def test_a_malformed_member_wins_over_the_completion_budget(self):
+        # Regression pin: 2 members, one empty, with max_tokens large
+        # enough that the product also exceeds PROMPT_BATCH_COMPLETION_BUDGET
+        # (2 * 40000 = 80000 > 65536). Member validation runs before the
+        # budget check, so the empty member wins the refusal -- the client
+        # is told to fix prompt[1], never told to shrink max_tokens for a
+        # request that was never going to reach the engine over that
+        # member anyway. At 187f770 the budget check ran first, so this
+        # request was refused with param "max_tokens" / code
+        # "batch_completion_budget_exceeded" instead.
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=1 << 20)
+        before = len(engine.calls)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model", "prompt": ["a", ""],
+                                     "max_tokens": 40000})
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "prompt[1]")
+        self.assertIsNone(error["code"])
+        self.assertEqual(len(engine.calls), before)
+
+    def test_budget_measures_an_omitted_max_tokens_at_the_server_cap(self):
+        # An omitted max_tokens is not exempt from the budget: generation_
+        # options() returns the operator's own --max-tokens/--ngen cap in
+        # that case, and the budget check uses that same clamped value.
+        # 3 members * a 32768 server cap = 98304, over budget; 2 members *
+        # 32768 = 65536, exactly at it and admitted. The refusal message
+        # also tells the client that max_tokens was not set, and to set
+        # one, since the client cannot see the operator's cap otherwise.
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine, max_tokens=32768)
+        with _post_completions(base, {"model": "test-model",
+                                      "prompt": ["a", "b"]}) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"]), 2)
+        before = len(engine.calls)
+        with self.assertRaises(HTTPError) as caught:
+            _post_completions(base, {"model": "test-model", "prompt": ["a", "b", "c"]})
+        self.assertEqual(caught.exception.code, 400)
+        error = json.load(caught.exception)["error"]
+        self.assertEqual(error["param"], "max_tokens")
+        self.assertEqual(error["code"], "batch_completion_budget_exceeded")
+        self.assertIn("max_tokens", error["message"])
+        self.assertIn("was not set", error["message"])
+        self.assertEqual(len(engine.calls), before)
 
 
 if __name__ == "__main__":

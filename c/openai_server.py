@@ -2449,11 +2449,37 @@ def generation_options(body, limit):
 # interface: 1..32, refused with a named 400 above it.
 LOGPROBS_TOP_K_CAP = 32
 
-# Engine.generate()'s bound on waiting for ACCEPT after an opted-in
-# (logprobs>0) SUBMIT -- see the comment beside accept_deadline in
-# Engine.generate() for why an engine that predates the U7a extension can
-# otherwise wedge this wait forever.
+# Engine.generate()'s bound on waiting for ACCEPT after a SUBMIT that
+# carries the extended key=value namespace (logprobs=k, ids=1, or both) --
+# see the comment beside accept_deadline in Engine.generate() for why an
+# engine that predates the U7a extension can otherwise wedge this wait
+# forever.
 LOGPROBS_ACCEPT_TIMEOUT = float(os.environ.get("COLI_LOGPROBS_ACCEPT_TIMEOUT", "30"))
+
+# The most prompts one /v1/completions request may batch via an array
+# `prompt`. A calibration marker, not a measured limit -- a batch above
+# this is a named 400, never a silent truncation.
+PROMPT_BATCH_CAP = 128
+
+# The aggregate-token accounting boundary for a `prompt` array batch: total
+# prompt tokens across a batch's members, named 400 above it -- a batch
+# summing to exactly this many is admitted, one more is refused. Bounds
+# worst-case echo-record memory when logprobs is also requested. For string
+# batches the server has no tokenizer, so the same budget is applied to
+# total UTF-8 bytes instead: every token carries at least one byte, so byte
+# count is an exact upper bound on token count -- conservative for typical
+# text, never under-protective.
+PROMPT_BATCH_TOKEN_BUDGET = 65536
+
+# The aggregate-token accounting boundary for a batch's GENERATED side:
+# members multiplied by the request's effective max_tokens (the single
+# `max_tokens`/`max_completion_tokens` value generation_options() returns
+# after its own clamp to the operator's --max-tokens/--ngen), named 400
+# above it. Every member of a batch shares one generation_options() call,
+# so this is members * maximum, not a per-member sum. Symmetric with
+# PROMPT_BATCH_TOKEN_BUDGET, but bounds the response the batch will hold in
+# memory before its single write rather than the prompt it submits.
+PROMPT_BATCH_COMPLETION_BUDGET = 65536
 
 
 def logprobs_options(body, chat, engine_supports):
@@ -2557,6 +2583,23 @@ def _json_float(value):
     return value if math.isfinite(value) else None
 
 
+def _encode_token_id_prompt(ids):
+    """A `prompt` array of token ids, encoded into the exact ASCII decimal
+    wire form c/decode_batch.h's coli_ids_parse expects -- straight
+    passthrough, no detokenize/re-encode round trip. Structural validation
+    only; an id the engine's own vocab rejects still comes back as a named
+    BAD_REQUEST from the engine itself (coli_ids_parse), not silently
+    accepted here."""
+    if not isinstance(ids, list) or not ids:
+        raise APIError(400, "`prompt` array must be a non-empty array of token ids.",
+                       "prompt", "invalid_value")
+    for value in ids:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise APIError(400, "`prompt` array must contain only non-negative integer "
+                                "token ids.", "prompt", "invalid_value")
+    return " ".join(str(value) for value in ids)
+
+
 def _order_echo_records(prompt_records):
     """Place each prompt-echo record at its own wire `pos` index rather
     than trusting the order the frames arrived in -- arrival order
@@ -2634,23 +2677,16 @@ def _own_token_label(entry, topk, idx):
     return entry["text"]
 
 
-def _completions_logprobs_object(prompt_records, generated_records, display_k,
-                                  text_offset_base=0):
+def _completions_logprobs_object(prompt_records, generated_records, display_k):
     """Build the legacy `/v1/completions` `logprobs` object: `tokens[]`,
     `token_logprobs[]`, `top_logprobs[]` (one dict per position, keyed by
     token text via _own_token_label), and `text_offset[]` (character
     offsets into the reconstructed text, derived from the same decode --
-    no tokenizer required). The first prompt position's `token_logprobs`
-    entry comes out `null` for free: the engine's own echo position 0
-    already carries a non-finite sentinel logprob (there is nothing to
-    condition the first token on), which _json_float maps to null.
-
-    `text_offset_base` shifts every reported offset by a fixed amount
-    (default 0, matching plain echo-from-position-0 usage) -- callers
-    serving an `echo=false` request, where OpenAI's convention counts
-    `text_offset` from the end of the prompt rather than from 0, supply
-    the prompt's character length here instead of reassembling it
-    themselves."""
+    no tokenizer required, always counted from 0). The first prompt
+    position's `token_logprobs` entry comes out `null` for free: the
+    engine's own echo position 0 already carries a non-finite sentinel
+    logprob (there is nothing to condition the first token on), which
+    _json_float maps to null."""
     positions = _logprob_positions(prompt_records, generated_records)
     tokens = [p["text"] for p in positions]
     token_logprobs = [_json_float(p["raw_lp"]) for p in positions]
@@ -2662,7 +2698,7 @@ def _completions_logprobs_object(prompt_records, generated_records, display_k,
             table[_own_token_label(p, displayed, idx)] = _json_float(tlp)
         top_logprobs.append(table)
     text_offset = []
-    offset = text_offset_base
+    offset = 0
     for text in tokens:
         text_offset.append(offset)
         offset += len(text)
@@ -2729,12 +2765,17 @@ def _trim_generated_records_to_text(generated_records, text):
     limitation, not silently shipped."""
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     kept = []
-    acc = ""
+    offset = 0
     for data, record in generated_records:
-        candidate = acc + decoder.decode(data)
-        if not text.startswith(candidate):
+        piece = decoder.decode(data)
+        # `text[:offset]` is already established as a prefix of `text` by
+        # every prior iteration, so checking `piece` against `text` at
+        # `offset` is equivalent to rebuilding and checking the whole
+        # accumulated candidate, without the O(len(acc)) rebuild -- this
+        # loop is O(len(text)) total instead of O(len(text)^2).
+        if not text.startswith(piece, offset):
             break
-        acc = candidate
+        offset += len(piece)
         kept.append((data, record))
     return kept
 
@@ -3200,15 +3241,15 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None, logprobs=0, echo=False):
+                 on_tool=None, image=None, logprobs=0, echo=False, tok_ids=False):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
-        if logprobs and not self.supports_logprobs_echo:
-            # Defense in depth: APIHandler's logprobs_options()/generation()
-            # already refuse the HTTP request with a named 400 before ever
-            # reaching here. Reaching this with the gate false is a caller
-            # bug, not a bad request.
-            raise RuntimeError("logprobs intake requested against an engine "
+        if (logprobs or tok_ids) and not self.supports_logprobs_echo:
+            # Defense in depth: APIHandler's logprobs_options()/generation()/
+            # completion() already refuse the HTTP request with a named 400
+            # before ever reaching here. Reaching this with the gate false is
+            # a caller bug, not a bad request.
+            raise RuntimeError("logprobs/token-id intake requested against an engine "
                                "that does not support the U7a extension")
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
@@ -3264,16 +3305,22 @@ class Engine:
                       default=0)
             if cut > 0:
                 prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
-        # U7b: SUBMIT's key=value extension namespace (decode_batch.h
+        # SUBMIT's key=value extension namespace (decode_batch.h
         # coli_submit_ext) -- logprobs=k opts into U7a's per-token numeric
-        # channel (ECHO + extended DATA frames). Only ever built when the
-        # capability gate above already passed, so this never reaches an
-        # engine that would mis-parse or silently ignore it. The extension
-        # arm requires the 7th (gbytes) field to be present even when it's
-        # 0 -- coli_submit_parse expects exactly 7 numeric fields before the
-        # first key=value token.
-        ext_field = f" logprobs={logprobs}" if logprobs else ""
-        gbytes_field = f" {len(xpayload)}" if (xpayload or logprobs) else ""
+        # channel (ECHO + extended DATA frames), ids=1 marks the payload as
+        # pre-tokenized ASCII decimal ids rather than raw text. Only ever
+        # built when the capability gate above already passed, so this never
+        # reaches an engine that would mis-parse or silently ignore it. The
+        # extension arm requires the 7th (gbytes) field to be present even
+        # when it's 0 -- coli_submit_parse expects exactly 7 numeric fields
+        # before the first key=value token.
+        ext_parts = []
+        if logprobs:
+            ext_parts.append(f"logprobs={logprobs}")
+        if tok_ids:
+            ext_parts.append("ids=1")
+        ext_field = (" " + " ".join(ext_parts)) if ext_parts else ""
+        gbytes_field = f" {len(xpayload)}" if (xpayload or ext_parts) else ""
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else gbytes_field)
@@ -3322,15 +3369,17 @@ class Engine:
         # record is RETAINED past this iteration.
         prompt_logprobs = []
         generated_logprobs = []
-        # Bound how long an opted-in (logprobs>0) request waits for the
-        # engine's ACCEPT before concluding the engine silently rejected the
-        # extended SUBMIT header -- c/decode_batch.h: "An OLD engine rejects
-        # ANY extended header ... the engine answers ERROR 0 BAD_REQUEST",
-        # an id that never matches this (or any) pending request, so that
-        # reply is otherwise invisible to this loop and it would wait here
-        # forever. A legacy (non-opted-in) request keeps the old, unbounded
-        # wait -- every engine build ever shipped handles a plain SUBMIT.
-        accept_deadline = time.monotonic() + LOGPROBS_ACCEPT_TIMEOUT if logprobs else None
+        # Bound how long a request that opted into the extended SUBMIT
+        # namespace (logprobs=k, ids=1, or both) waits for the engine's
+        # ACCEPT before concluding the engine silently rejected the extended
+        # header -- c/decode_batch.h: "An OLD engine rejects ANY extended
+        # header ... the engine answers ERROR 0 BAD_REQUEST", an id that
+        # never matches this (or any) pending request, so that reply is
+        # otherwise invisible to this loop and it would wait here forever.
+        # A legacy (non-opted-in) request keeps the old, unbounded wait --
+        # every engine build ever shipped handles a plain SUBMIT.
+        accept_deadline = (time.monotonic() + LOGPROBS_ACCEPT_TIMEOUT
+                           if (logprobs or tok_ids) else None)
 
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
@@ -3364,10 +3413,21 @@ class Engine:
                         and time.monotonic() > accept_deadline):
                     with self.pending_lock:
                         self.pending.pop(request_id, None)
+                    # logprobs takes priority in the message/param/code when
+                    # both were requested together -- an established,
+                    # already-tested shape this must not disturb; tok_ids
+                    # alone gets its own named error instead of borrowing
+                    # the logprobs one.
+                    if logprobs:
+                        raise APIError(
+                            503, "The colibri engine did not accept a per-token logprobs "
+                                "request in time; it may not support the per-token logprobs "
+                                "extension.", "logprobs", "engine_logprobs_unsupported",
+                            "server_error")
                     raise APIError(
-                        503, "The colibri engine did not accept a per-token logprobs "
-                            "request in time; it may not support the per-token logprobs "
-                            "extension.", "logprobs", "engine_logprobs_unsupported",
+                        503, "The colibri engine did not accept a token-id prompt "
+                            "request in time; it may not support the pre-tokenized "
+                            "prompt extension.", "prompt", "engine_tok_ids_unsupported",
                         "server_error")
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
@@ -3444,6 +3504,20 @@ class Engine:
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 raise ClientCancelled()
+            elif (tok_ids and isinstance(value, RuntimeError)
+                  and str(value) == "BAD_REQUEST"):
+                # coli_ids_parse (c/decode_batch.h) reports a malformed or
+                # out-of-vocabulary token id as "ERROR <id> BAD_REQUEST",
+                # carrying THIS request's own id (unlike the "ERROR 0
+                # BAD_REQUEST" an old engine sends for an unrecognized
+                # extended header, which never reaches here at all -- id 0
+                # never matches a pending request, see accept_deadline
+                # above). This is the client's fault, not the server's: a
+                # named 400 on `prompt`, not the generic 500 engine_error
+                # every other unexpected RuntimeError still becomes.
+                raise APIError(400, "The engine rejected this token-id prompt (a "
+                                    "malformed or out-of-vocabulary token id).",
+                               "prompt", "invalid_value")
             else:
                 raise value
 
@@ -3978,7 +4052,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None):
+                   enable_thinking=False, audio=None, image=None, tok_ids=False):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -4053,7 +4127,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
-                    **({"logprobs": engine_k, "echo": echo} if engine_k else {}))
+                    **({"logprobs": engine_k, "echo": echo} if engine_k else {}),
+                    **({"tok_ids": True} if tok_ids else {}))
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
@@ -4281,7 +4356,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                    **({"image": image} if image is not None else {}),
+                    **({"tok_ids": True} if tok_ids else {}))
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -4313,7 +4389,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                    **({"image": image} if image is not None else {}),
+                    **({"tok_ids": True} if tok_ids else {}))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -4728,13 +4805,335 @@ class APIHandler(BaseHTTPRequestHandler):
             send_event("message_stop", {"type": "message_stop"})
             # close_connection was already set when the 200 was committed (#597 item 3).
 
+    def _completion_prompt_array(self, prompt_field):
+        """Classify an array `prompt` into its batch members.
+
+        Accepted array forms (the two OpenAI legacy batch shapes, plus the
+        flat tokenized single prompt):
+        - flat [int, ...]      -> ONE tokenized prompt (unchanged behavior)
+        - [str, ...]           -> N string prompts
+        - [[int, ...], ...]    -> N tokenized prompts (N=1 keeps the
+                                  batch-of-one unwrap byte-identical)
+        Mixed element types, an empty array, a batch above
+        PROMPT_BATCH_CAP, and a batch over the PROMPT_BATCH_TOKEN_BUDGET
+        aggregate boundary are each a named 400 with param `prompt` --
+        whole-array conditions carry no member attribution.
+
+        Returns (members, tok_ids): members is a non-empty list of prompts
+        (strings, or token-id lists still to be validated per member),
+        tok_ids says which kind. A real (N>1) batch is dispatched by the
+        caller through batch_completion() once this validation passes, so
+        a batch that is too large or over budget is refused here for
+        THAT specific reason, distinctly from anything batch_completion()
+        itself might later refuse.
+        """
+        if not prompt_field:
+            raise APIError(400, "`prompt` array must not be empty.", "prompt",
+                           "invalid_value")
+        if all(isinstance(item, str) for item in prompt_field):
+            members, tok_ids = list(prompt_field), False
+        elif all(isinstance(item, list) for item in prompt_field):
+            members, tok_ids = list(prompt_field), True
+        elif all(isinstance(item, int) and not isinstance(item, bool)
+                 for item in prompt_field):
+            # One flat token-id prompt (a tokenized single shape sent as a
+            # bare array), not a batch: no cap or budget, and the
+            # single-prompt path downstream applies the glm gate and
+            # per-id validation exactly as before.
+            return [list(prompt_field)], True
+        else:
+            raise APIError(400, "`prompt` array must be homogeneous: all strings, "
+                                "all token ids, or all token-id arrays.", "prompt",
+                           "invalid_value")
+        if len(members) > PROMPT_BATCH_CAP:
+            # Its own code (prompt_batch_cap_exceeded) so a client or test
+            # can tell a size violation apart from every other array-prompt
+            # refusal.
+            raise APIError(400, f"`prompt` accepts at most {PROMPT_BATCH_CAP} prompts "
+                                f"per request (got {len(members)}).", "prompt",
+                           "prompt_batch_cap_exceeded")
+        if tok_ids and not getattr(self.server.engine, "supports_logprobs_echo", False):
+            # Same capability gate and message as the single-prompt path --
+            # a nested batch must not smuggle token ids past it.
+            raise APIError(400, f"Token-ID array prompts are only supported by the glm "
+                                f"engine (current engine: {ARCH}).", "prompt",
+                           "unsupported_parameter")
+        if len(members) > 1:
+            # The aggregate-token boundary applies to real batches (N>1)
+            # only: a length-1 nested array must stay byte-identical to the
+            # flat single-prompt path, whose oversize handling remains the
+            # engine's own CONTEXT_EXCEEDED.
+            if tok_ids:
+                total, unit = sum(len(member) for member in members), "tokens"
+            else:
+                total = sum(len(member.encode("utf-8")) for member in members
+                            if isinstance(member, str))
+                unit = "UTF-8 bytes (an upper bound on tokens)"
+            if total > PROMPT_BATCH_TOKEN_BUDGET:
+                # Its own code (prompt_batch_token_budget_exceeded), same
+                # reasoning as the cap check above. This budget bounds the
+                # prompt side of the request only -- nothing here bounds
+                # the tokens a batch can be asked to generate.
+                raise APIError(400, f"`prompt` batch exceeds the total prompt budget: "
+                                    f"{total} {unit} across {len(members)} prompts "
+                                    f"(limit {PROMPT_BATCH_TOKEN_BUDGET}).", "prompt",
+                               "prompt_batch_token_budget_exceeded")
+        return members, tok_ids
+
+    def batch_completion(self, body, members, request_id, tok_ids):
+        """Multi-prompt batch dispatch for /v1/completions: one request, N
+        prompts, N indexed choices (choices[i]["index"] == i), each choice
+        carrying exactly what a single-prompt request for that same prompt
+        would have produced (text, the logprobs object under echo/logprobs,
+        finish_reason), and `usage` summed across prompts.
+
+        A batch is all-or-nothing: every member's shape is validated before
+        the first engine submit, so a malformed member seven is a clean 400
+        naming `prompt[7]` with no engine submits made. A member the engine
+        itself rejects (rather than a shape defect caught here) can still
+        fail after earlier members have already been submitted; see
+        submit_member below for how that failure is still member-named.
+        Engine dispatch, once it starts, is strictly sequential per-prompt
+        submits in request order, and stops the moment the client is gone;
+        nothing goes on the wire until every remaining member finished.
+        """
+        # generation_options also rejects n != 1 with its own named 400:
+        # nothing here ever fans one prompt out to n samples.
+        maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
+            body, self.server.max_tokens)
+        family = family_by_id(ARCH)
+        if grammar is not None and not family.capabilities.grammar_payload:
+            raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
+                                "engine yet.", "response_format", "unsupported_parameter")
+        # Validate every member before the first engine submit: a malformed
+        # member seven must be a clean 400 with no engine submits made,
+        # never a failure discovered mid-batch -- and the 400 names the
+        # member (param "prompt[7]").
+        encoded = []
+        for index, member in enumerate(members):
+            if tok_ids:
+                try:
+                    encoded.append(_encode_token_id_prompt(member))
+                except APIError as error:
+                    raise APIError(error.status, f"prompt[{index}]: {error.message}",
+                                   f"prompt[{index}]", error.code, error.error_type,
+                                   error.headers)
+            else:
+                if not member:
+                    raise APIError(400, f"prompt[{index}]: `prompt` must not be empty.",
+                                   f"prompt[{index}]")
+                encoded.append(member)
+        # Bound the GENERATED side before any engine submit: every member
+        # shares this one `maximum` (already clamped to the operator's
+        # --max-tokens/--ngen above), so members * maximum is the batch's
+        # worst-case held-in-memory generated total. A batch of one member
+        # never reaches this function (it unwraps to the flat path), and the
+        # flat path itself is never subject to this budget. Checked after
+        # every member's own shape, not before: a malformed member still
+        # gets its own prompt[i] refusal even on a batch that is also over
+        # this budget, matching the shape-before-budget order the prompt-side
+        # budget already uses.
+        completion_total = len(members) * maximum
+        if completion_total > PROMPT_BATCH_COMPLETION_BUDGET:
+            if body.get("max_completion_tokens") is None and body.get("max_tokens") is None:
+                omitted_note = (f" `max_tokens` was not set, so this used the server's "
+                                f"configured cap ({maximum}); set an explicit `max_tokens` "
+                                f"on the request to fit this batch inside the budget.")
+            else:
+                omitted_note = ""
+            raise APIError(400, f"`prompt` batch would generate too many tokens: "
+                                f"{len(members)} members x {maximum} max_tokens = "
+                                f"{completion_total} (limit {PROMPT_BATCH_COMPLETION_BUDGET})."
+                                f"{omitted_note}",
+                           "max_tokens", "batch_completion_budget_exceeded")
+        engine_k, echo, display_k = logprobs_options(
+            body, False, getattr(self.server.engine, "supports_logprobs_echo", False))
+        stop_sequences, ignore_leading_stop = stop_policy(body, False)
+        cache_slot = body.get("cache_slot")
+        if (cache_slot is not None and
+                (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
+                 not 0 <= cache_slot < self.server.kv_slots)):
+            raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
+                           "cache_slot")
+        # Checked last, same position as the flat path's own stream check:
+        # a batch validates everything else about the request before
+        # refusing the one thing only a batch refuses outright.
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise APIError(400, "`stream` must be a boolean.", "stream")
+        if stream:
+            # No interleaved multi-prompt SSE -- a named 400, not a silently
+            # non-streamed 200.
+            raise APIError(400, "`stream` is not supported with an array of prompts; "
+                                "send one prompt per request to stream.", "stream",
+                           "unsupported_parameter")
+        completion_id = "cmpl-" + uuid.uuid4().hex
+        created = int(time.time())
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+            queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+
+            def submit_one(prompt):
+                """One engine submit plus choice-field assembly: the same
+                non-streaming single-prompt recipe generation() uses -- a
+                fresh StopFilter, and (inside _completions_logprobs_object)
+                a fresh per-sequence echo reassembly and stateful UTF-8
+                decoder for this member alone. Sharing one incremental
+                decoder across members would smuggle one prompt's
+                trailing partial codepoint into the next prompt's first
+                token text.
+                """
+                if dbg >= 2:
+                    sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n"
+                                     f"===== OUTPUT [{request_id}] =====\n")
+                    sys.stderr.flush()
+                output = []
+                stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
+                    **({"logprobs": engine_k, "echo": echo} if engine_k else {}),
+                    **({"tok_ids": True} if tok_ids else {}))
+                stop_filter.finish()
+                raw_text = "".join(output)
+                text = raw_text
+                if ARCH == "inkling":
+                    text, _reasoning = split_inkling(text)
+                finish = "length" if stats["length_limited"] else "stop"
+                logprobs_obj = None
+                if engine_k:
+                    channel = stats.get("logprobs") or {"prompt": [], "generated": []}
+                    generated = _trim_generated_records_to_text(channel["generated"], raw_text)
+                    logprobs_obj = _completions_logprobs_object(
+                        channel["prompt"] if echo else [], generated, display_k)
+                    if echo:
+                        # Same "text is the logprobs reconstruction" rule
+                        # generation() applies -- one shared decoder spans
+                        # the prompt-then-generated join for THIS member,
+                        # never one string-concatenated from two separate
+                        # decodes.
+                        text = "".join(logprobs_obj["tokens"])
+                return {"text": text, "logprobs": logprobs_obj, "finish_reason": finish}, stats
+
+            def submit_member(index, prompt):
+                """A batch is all-or-nothing, so when one member sinks the
+                request the client must learn which one -- but only when
+                the member is actually at fault.
+
+                A client-fault APIError from a member submit (the engine
+                rejecting that member's own content as malformed or
+                out-of-vocabulary) is re-raised with the failing member
+                named in both the message and `param` ("prompt[index]");
+                status/code/type pass through unchanged. This already
+                covers a token-id member the engine rejects: for a
+                tok_ids submit, Engine.generate() itself turns the wire's
+                "ERROR <id> BAD_REQUEST" frame into a client-fault
+                APIError(400, param="prompt") before this function ever
+                sees it.
+
+                A server-fault APIError (error_type "server_error" -- the
+                engine failing to accept a per-token-logprobs or token-id
+                request in time) is not this member's doing: it keeps its
+                own status, code and `param` unchanged, and only its
+                message gains the member index, so a client is not told
+                to fix a prompt that was never the problem.
+
+                Every other exception (protocol corruption, dispatcher
+                death, hostile frames, a matching-id engine BAD_REQUEST
+                that never became an APIError) propagates unattributed,
+                landing on the generic 500 engine_error the flat
+                single-prompt path already uses for the same failures --
+                ONE clean engine_error for the whole batch, never a hang
+                and never a partial response.
+                """
+                try:
+                    return submit_one(prompt)
+                except APIError as error:
+                    if error.error_type == "server_error":
+                        raise APIError(error.status, f"prompt[{index}]: {error.message}",
+                                       error.param, error.code, error.error_type,
+                                       error.headers)
+                    raise APIError(error.status, f"prompt[{index}]: {error.message}",
+                                   f"prompt[{index}]", error.code, error.error_type,
+                                   error.headers)
+
+            # Sequential, in request order: member i+1 is never submitted
+            # until member i has fully finished and the client is still
+            # there to read the answer -- a departed client stops the
+            # batch at whichever member is in flight, and nothing is
+            # written to the client until every remaining member has
+            # finished, so a mid-batch failure on any member fails the
+            # whole request with no partial choices ever assembled.
+            outcomes = []
+            for index, prompt in enumerate(encoded):
+                if self.client_disconnected():
+                    raise ClientCancelled()
+                outcomes.append(submit_member(index, prompt))
+
+            choices = []
+            prompt_tokens = completion_tokens = 0
+            for index, (choice, stats) in enumerate(outcomes):
+                choices.append({"index": index, **choice})
+                prompt_tokens += stats["prompt_tokens"]
+                completion_tokens += stats["completion_tokens"]
+            usage = self.usage({"prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens})
+
+        # The scheduler admission (and this batch's hold on the engine) is
+        # released here, before the response is serialized and written --
+        # a slow client reading a large batched response no longer holds
+        # the engine, or the clients queued behind it, hostage on socket
+        # I/O. A batch still occupies the engine for the sum of every
+        # member's generation time while the `with` block above is open;
+        # other clients queue behind it exactly as they would behind one
+        # long single-prompt request.
+        self.send_json(200, {
+            "id": completion_id, "object": "text_completion", "created": created,
+            "model": self.server.model_id, "choices": choices, "usage": usage},
+            request_id, queue_headers)
+
     def completion(self, body, request_id):
-        prompt = body.get("prompt")
-        if not isinstance(prompt, str):
-            raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
+        prompt_field = body.get("prompt")
+        tok_ids = False
+        if isinstance(prompt_field, list):
+            # Array intake: validate shape, cap, the glm gate, and the
+            # aggregate budget regardless of what happens next. A length-1
+            # array unwraps to the single-prompt path below -- for
+            # [[ids]] that keeps the batch-of-one unwrap byte-identical
+            # (a tokenized-request client that always wraps its token-id
+            # array in an outer batch-of-one list, even at batch size 1,
+            # gets the same response the flat prompt would have produced).
+            # A real batch (N>1) dispatches through batch_completion().
+            members, batch_tok_ids = self._completion_prompt_array(prompt_field)
+            if len(members) > 1:
+                self.batch_completion(body, members, request_id, batch_tok_ids)
+                return
+            prompt_field = members[0]
+        if isinstance(prompt_field, list):
+            # A tokenized single shape sends a token-ID array. Only the glm
+            # engine's mux_submit reads sub.tok_ids at all (coli_ids_parse)
+            # -- every other engine would tok_encode the decimal-digit
+            # string as if it were literal text, a silent wrong-answer, not
+            # a crash. Named 400 instead.
+            if not getattr(self.server.engine, "supports_logprobs_echo", False):
+                raise APIError(400, f"Token-ID array prompts are only supported by the glm "
+                                    f"engine (current engine: {ARCH}).", "prompt",
+                               "unsupported_parameter")
+            prompt = _encode_token_id_prompt(prompt_field)
+            tok_ids = True
+        elif isinstance(prompt_field, str):
+            prompt = prompt_field
+        else:
+            raise APIError(400, "Colibri currently requires `prompt` to be a string or an "
+                                "array of token ids.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
-        self.generation(body, prompt, request_id, False)
+        self.generation(body, prompt, request_id, False, tok_ids=tok_ids)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
