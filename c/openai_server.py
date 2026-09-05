@@ -4043,18 +4043,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     request_id, queue_headers)
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "close")   # see the OpenAI path: SSE is close-framed
-            self.close_connection = True
-            self.send_header("x-request-id", request_id)
-            for name, value in queue_headers.items():
-                self.send_header(name, value)
-            self.send_cors_headers()
-            self.end_headers()
-            connected = [True]
+            # Defer the HTTP 200 until the engine ACCEPTs the prompt: a refusal before
+            # ACCEPT -- today, CONTEXT_EXCEEDED -- must surface with its mapped HTTP status
+            # in the Anthropic error envelope rather than as a committed 200 followed by a
+            # truncated stream -- the same contract the OpenAI-style path already follows.
+            connected = [False]
+            stream_started = [False]
+            ka_thread = [None]
             write_lock = threading.Lock()
             last_write = [time.time()]
             ka_stop = threading.Event()
@@ -4080,21 +4075,51 @@ class APIHandler(BaseHTTPRequestHandler):
                     if time.time() - last_write[0] >= 10.0:
                         send_event("ping", {"type": "ping"})
 
-            send_event("message_start", {"type": "message_start", "message": {
-                "id": message_id, "type": "message", "role": "assistant",
-                "model": self.server.model_id, "content": [], "stop_reason": None,
-                "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
             text_index = 1 if enable_thinking else 0
             stream_state = {"thinking_closed": not enable_thinking,
                             "text_started": not enable_thinking}
-            if enable_thinking:
-                send_event("content_block_start", {"type": "content_block_start", "index": 0,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
-            else:
-                send_event("content_block_start", {"type": "content_block_start", "index": 0,
-                                                   "content_block": {"type": "text", "text": ""}})
-            ka_thread = threading.Thread(target=keepalive, daemon=True)
-            ka_thread.start()
+
+            def start_stream(_accept_info=None):
+                # Commit the streaming 200 (and start the keepalive) exactly once, only after
+                # the engine ACCEPTs the prompt. Idempotent: also called after generate()
+                # returns, so an older engine with no ACCEPT frame still streams.
+                if stream_started[0]:
+                    return
+                stream_started[0] = True
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.send_header("Connection", "close")   # see the OpenAI path: SSE is close-framed
+                    self.close_connection = True
+                    self.send_header("x-request-id", request_id)
+                    for name, value in queue_headers.items():
+                        self.send_header(name, value)
+                    self.send_cors_headers()
+                    self.end_headers()
+                except OSError:
+                    # The client vanished at the exact moment the engine accepted. Do not let
+                    # this unwind out of generate()'s dispatch loop -- that would skip the
+                    # CANCEL and leave the request stuck in the engine's pending map. Marking
+                    # disconnected instead makes the cancelled() callback below fire on the
+                    # loop's very next poll, so the normal cancel path takes it from here.
+                    connected[0] = False
+                    return
+                connected[0] = True
+                last_write[0] = time.time()
+                send_event("message_start", {"type": "message_start", "message": {
+                    "id": message_id, "type": "message", "role": "assistant",
+                    "model": self.server.model_id, "content": [], "stop_reason": None,
+                    "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+                if enable_thinking:
+                    send_event("content_block_start", {"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+                else:
+                    send_event("content_block_start", {"type": "content_block_start", "index": 0,
+                                                       "content_block": {"type": "text", "text": ""}})
+                ka_thread[0] = threading.Thread(target=keepalive, daemon=True)
+                ka_thread[0].start()
 
             raw = []
             sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
@@ -4169,8 +4194,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
+                # Before the 200 commits, disconnect detection is the socket's (same as
+                # the OpenAI path); after it, a failed SSE write flips connected[0].
+                lambda: (not connected[0]) if stream_started[0] else self.client_disconnected(),
+                grammar=grammar, stopped=generation_stopped,
+                on_accept=start_stream,
                 **({"on_tool": sideband.feed} if sideband.enabled else {}))
+            # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
+            start_stream()
             stop_filter.finish()
             sideband.finish()
             if split:
@@ -4179,7 +4210,8 @@ class APIHandler(BaseHTTPRequestHandler):
             if tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
             ka_stop.set()
-            ka_thread.join(timeout=2)
+            if ka_thread[0] is not None:
+                ka_thread[0].join(timeout=2)
             if stream_state["text_started"]:
                 send_event("content_block_stop", {"type": "content_block_stop",
                                                   "index": text_index})

@@ -2260,6 +2260,106 @@ class AcceptFrameTest(unittest.TestCase):
             engine.generate("hi", 8, 0.7, 0.9, lambda _: None, on_accept=lambda _: None)
         engine.close()
 
+    def _streaming_commit_probe(self):
+        """Real Engine + FakeProcess + a real APIServer/socket, wired so a CANCEL frame
+        written to the (fake) engine is observable deterministically (no sleep-and-hope):
+        `cancel_seen` fires the instant the CANCEL write happens, synchronously in the
+        request-handling thread; `pending_empty()` bounded-polls for the dispatcher
+        thread's async pop of the request out of `engine.pending`, which is genuinely
+        asynchronous relative to the CANCEL write."""
+        cancel_seen = threading.Event()
+
+        def respond(process, frame):
+            parts = frame.split()
+            if parts[0] == b"SUBMIT":
+                process.stdout.feed(b"ACCEPT " + parts[1] + b" 7\n")
+            elif parts[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + parts[1] + b" CANCELLED\n")
+                cancel_seen.set()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(engine.close)
+
+        def pending_empty(timeout=3.0):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if "1" not in engine.pending:
+                    return True
+                time.sleep(0.01)
+            return "1" not in engine.pending
+
+        return process, engine, server, cancel_seen, pending_empty
+
+    def _post_streaming_request(self, server):
+        payload = json.dumps({"model": "test-model", "stream": True, "max_tokens": 16,
+                              "messages": [{"role": "user", "content": "Hi"}]})
+        request = (f"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  f"Content-Type: application/json\r\n"
+                  f"Content-Length: {len(payload)}\r\n\r\n{payload}").encode()
+        sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=3)
+        self.addCleanup(sock.close)
+        sock.sendall(request)
+        return sock
+
+    def test_anthropic_end_headers_failure_at_commit_does_not_orphan_the_pending_request(self):
+        """If the client vanishes at the exact moment the engine ACCEPTs, the real header
+        flush -- end_headers(), where BaseHTTPRequestHandler actually hits the socket --
+        can raise. That must not unwind out of generate()'s dispatch loop with nothing
+        sent: the request would sit in the engine's pending map forever, with no CANCEL
+        ever going out to free it. Patches end_headers() itself (not send_response), so
+        send_response's real _committed/close_connection bookkeeping still runs first,
+        exactly as it would for a real dropped socket."""
+        process, engine, server, cancel_seen, pending_empty = self._streaming_commit_probe()
+        with patch.object(APIHandler, "end_headers",
+                          side_effect=BrokenPipeError("client vanished exactly at ACCEPT")):
+            self._post_streaming_request(server)
+            self.assertTrue(cancel_seen.wait(timeout=3),
+                            "the commit failure never triggered a CANCEL")
+        self.assertTrue(any(w.startswith(b"CANCEL ") for w in process.writes),
+                        "the commit failure never triggered a CANCEL")
+        self.assertTrue(pending_empty(),
+                        "the request was never removed from the engine's pending map")
+
+    def test_anthropic_first_sse_write_failure_after_commit_does_not_orphan_the_pending_request(self):
+        """Companion to the end_headers() variant above: a write failure on the FIRST SSE
+        body write (message_start, right after headers commit cleanly) is already caught
+        by send_event()'s own try/except -- this is REGRESSION-COVERAGE that pathway keeps
+        working, not a new defect. Patches the handler's wfile so only that first write
+        after headers raises; the header commit itself goes through for real."""
+        process, engine, server, cancel_seen, pending_empty = self._streaming_commit_probe()
+        real_end_headers = APIHandler.end_headers
+        state = {"headers_done": False}
+
+        def committing_end_headers(handler):
+            real_end_headers(handler)
+            state["headers_done"] = True
+            real_write = handler.wfile.write
+
+            def failing_write(data):
+                if state["headers_done"]:
+                    state["headers_done"] = False   # only the first post-header write fails
+                    raise BrokenPipeError("client vanished on the first SSE write")
+                return real_write(data)
+            handler.wfile.write = failing_write
+
+        with patch.object(APIHandler, "end_headers", committing_end_headers):
+            self._post_streaming_request(server)
+            self.assertTrue(cancel_seen.wait(timeout=3),
+                            "the first-SSE-write failure never triggered a CANCEL")
+        self.assertTrue(any(w.startswith(b"CANCEL ") for w in process.writes),
+                        "the first-SSE-write failure never triggered a CANCEL")
+        self.assertTrue(pending_empty(),
+                        "the request was never removed from the engine's pending map")
+
 
 class _ContextExceededEngine(FakeEngine):
     """Engine that rejects the prompt before ACCEPT — on_accept is never called."""
@@ -2297,6 +2397,118 @@ class StreamingContextRejectTest(unittest.TestCase):
         body = json.load(caught.exception)
         self.assertEqual(body["error"]["code"], "context_length_exceeded")
         self.assertEqual(body["error"]["param"], "messages")
+
+    def test_anthropic_streaming_context_exceeded_is_clean_400(self):
+        # The Anthropic streaming path must defer its 200 the same way the OpenAI path
+        # above does: a refusal discovered before the engine accepts the prompt is a
+        # real HTTP 400 in the Anthropic error envelope, never a committed 200 followed
+        # by a truncated (or empty) SSE body.
+        req = Request(self.base + "/v1/messages",
+                      data=json.dumps({"model": "test-model", "stream": True,
+                        "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "x" * 100}]}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
+        raw = caught.exception.read()
+        self.assertNotIn(b"event:", raw, "a pre-accept refusal must not emit any SSE bytes")
+        body = json.loads(raw)
+        self.assertEqual(body["type"], "error")               # the Anthropic envelope
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("maximum context length", body["error"]["message"])
+
+
+class AnthropicStreamCommitTest(unittest.TestCase):
+    """On a healthy engine the deferred commit is invisible -- the stream's byte-level
+    framing (headers, message_start through message_stop order) is unchanged, and the
+    200 is provably committed from the engine's ACCEPT, not before generate() is even
+    called."""
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _raw(self, body):
+        payload = json.dumps(body)
+        request = (f"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   f"Content-Type: application/json\r\n"
+                   f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
+                   f"{payload}").encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_port),
+                                      timeout=3) as sock:
+            sock.sendall(request)
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
+
+    def test_success_stream_framing_is_unchanged(self):
+        raw = self._raw({"model": "test-model", "stream": True, "max_tokens": 16,
+                         "messages": [{"role": "user", "content": "Hi"}]})
+        head, body = raw.split("\r\n\r\n", 1)
+        self.assertIn("HTTP/1.1 200", head)
+        self.assertIn("content-type: text/event-stream", head.lower())
+        self.assertIn("connection: close", head.lower())
+        # Exact sequence, not mere presence: two chunks ("Hé", "llo") from FakeEngine's
+        # default script must produce two content_block_delta events in position, not
+        # just an unordered set of the six event names.
+        names = [line[len("event: "):] for line in body.splitlines()
+                 if line.startswith("event: ")]
+        self.assertEqual(names, ["message_start", "content_block_start", "content_block_delta",
+                                 "content_block_delta", "content_block_stop", "message_delta",
+                                 "message_stop"])
+        deltas = "".join(json.loads(line[len("data: "):])["delta"]["text"]
+                         for line in body.splitlines()
+                         if line.startswith("data: ") and '"text_delta"' in line)
+        self.assertEqual(deltas, "Héllo")
+
+    def test_stream_commits_only_after_accept(self):
+        # The mechanism itself: the 200 must be sent from the engine's on_accept
+        # callback, not unconditionally before generate() is even called.
+        committed_at = {}
+        commit_flags = []
+
+        def handler_committed():
+            return bool(commit_flags)
+
+        class CommitProbeEngine(FakeEngine):
+            def generate(self, prompt, maximum, temperature, top_p, on_text,
+                         cache_slot=0, cancelled=None, grammar=None, stopped=None,
+                         on_accept=None):
+                committed_at["before_accept"] = handler_committed()
+                if on_accept is not None:
+                    on_accept({"prompt_tokens": 7})
+                committed_at["after_accept"] = handler_committed()
+                on_text("ok")
+                return {"prompt_tokens": 7, "completion_tokens": 1, "length_limited": False}
+
+        original = APIHandler.send_response
+
+        def recording_send_response(handler, code, message=None):
+            commit_flags.append(code)
+            return original(handler, code, message)
+
+        self.server.engine = CommitProbeEngine()
+        with patch.object(APIHandler, "send_response", recording_send_response):
+            raw = self._raw({"model": "test-model", "stream": True, "max_tokens": 16,
+                             "messages": [{"role": "user", "content": "Hi"}]})
+        self.assertIn("HTTP/1.1 200", raw)
+        self.assertFalse(committed_at["before_accept"],
+                         "the Anthropic stream committed its 200 before engine ACCEPT")
+        self.assertTrue(committed_at["after_accept"])
 
 
 class _ExplodingEngine(FakeEngine):
