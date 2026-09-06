@@ -2073,8 +2073,24 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
                    "expert-read is disk service and fp8-expand is synchronous miss work\n");
 }
 
+/* Snapshot of the timer bank taken when the prompt's forward has finished
+ * (generate() sets it), so a "decode" bank can be reported apart from the
+ * prefill. Without it the per-forward figures of a long prompt are prefill
+ * work divided by decode forwards, which reads like a decode budget and is
+ * not one. */
+static Q38Timers g_tm_prefill_snapshot; static int g_tm_have_snapshot;
+static void q38_tm_snapshot_prefill(const Model *m) {
+    g_tm_prefill_snapshot=m->timers; g_tm_have_snapshot=1;
+}
 static void tm_report(const Model *m) {
     q38_tm_report_bank(&m->timers,"total");
+    if(g_tm_have_snapshot&&q38_tm_enabled()){
+        Q38Timers decode=m->timers;
+        for(int i=0;i<Q38_TM_COUNT;i++)decode.seconds[i]-=g_tm_prefill_snapshot.seconds[i];
+        decode.forwards-=g_tm_prefill_snapshot.forwards;
+        q38_tm_report_bank(&g_tm_prefill_snapshot,"prefill");
+        q38_tm_report_bank(&decode,"decode");
+    }
     if(q38_tm_enabled())
         fprintf(stderr,"[qwen38 expert I/O] weight-ranges=%llu scale-ranges=%llu "
                        "coalesced-gate-up=%llu prefetched=%llu parallel-batches=%llu "
