@@ -1832,6 +1832,59 @@ def cmd_cluster_worker(a):
     finally:
         stop_heartbeat.set()
 
+def _stop_proc_table(port):
+    """(pid, cmdline, comm) for every process, in /proc's NUL-separated byte format.
+
+    macOS and the BSDs have no /proc, so cmd_stop's scan used to iterate an empty list and
+    report "nothing running" while a live serve and its multi-GB engine kept the box. That is
+    worse than a crash: this command exists to stop the ghost engines that once OOM'd a
+    machine, and a silent success invites the operator to walk away.
+
+    `ps` is asked for everything ONCE rather than per pid, and its space-separated output is
+    normalised to NUL-separated bytes so _serve_cmdline_matches_port keeps working unchanged."""
+    try:
+        pids=[int(d) for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        pids=None
+    if pids is not None:
+        table=[]
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline","rb") as f: cmd=f.read()
+                with open(f"/proc/{pid}/comm") as f: comm=f.read().strip()
+            except (OSError,PermissionError): continue
+            table.append((pid,cmd,comm))
+        return table
+    try:
+        out=subprocess.run(["ps","-Ao","pid=,comm=,command="],capture_output=True,text=True,
+                           timeout=10).stdout
+    except (OSError,subprocess.SubprocessError):
+        return []
+    table=[]
+    for line in out.splitlines():
+        parts=line.strip().split(None,2)
+        if len(parts)<3 or not parts[0].isdigit(): continue
+        pid=int(parts[0]); comm=os.path.basename(parts[1])
+        try: argv=shlex.split(parts[2])
+        except ValueError: argv=parts[2].split()
+        table.append((pid,b"\0".join(a.encode("utf-8","replace") for a in argv)+b"\0",comm))
+    return table
+
+def _stop_environ(pid):
+    """A process's environment as NUL-separated KEY=VAL bytes, /proc or `ps eww`."""
+    try:
+        with open(f"/proc/{pid}/environ","rb") as f: return f.read()
+    except OSError:
+        pass
+    try:
+        out=subprocess.run(["ps","eww","-o","command=","-p",str(pid)],capture_output=True,
+                           text=True,timeout=5).stdout
+    except (OSError,subprocess.SubprocessError):
+        return b""
+    # `ps eww` appends the environment after the command line; keep only KEY=VAL tokens.
+    pairs=[t for t in out.split() if "=" in t and t.split("=",1)[0].replace("_","").isalnum()]
+    return b"\0".join(t.encode("utf-8","replace") for t in pairs)+b"\0"
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -1846,22 +1899,14 @@ def cmd_stop(a):
         with open(pf) as f: pid=int(f.read().split()[0])
         if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
-    try: proc_entries=os.listdir("/proc")
-    except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
-    for pd in proc_entries:
-        if not pd.isdigit(): continue
-        pid=int(pd)
+    process_names={"exe"}
+    for family in all_families(): process_names.update(family.process_names)
+    for pid,cmd,comm in _stop_proc_table(a.port):
         try:
-            with open(f"/proc/{pd}/cmdline","rb") as f: cmd=f.read()
             if pid!=os.getpid() and _serve_cmdline_matches_port(cmd,a.port):
                 targets.setdefault(pid,f"coli serve (cmdline, port {a.port})")
-            with open(f"/proc/{pd}/comm") as f: comm=f.read().strip()
-            process_names={"exe"}
-            for family in all_families(): process_names.update(family.process_names)
-            if comm in process_names:
-                with open(f"/proc/{pd}/environ","rb") as f: env=f.read()
-                if _serve_environ_matches_port(env,a.port):
-                    targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
+            if comm in process_names and _serve_environ_matches_port(_stop_environ(pid),a.port):
+                targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
