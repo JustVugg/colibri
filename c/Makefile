@@ -1653,7 +1653,28 @@ tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
 # coli_cuda_* e registra cosa riceve. E' il solo modo di provare in CI che un
 # esperto arriva davvero in VRAM e nel formato giusto (#1331) -- un test che si
 # fermasse a "qt_init ritorna 1" sarebbe passato anche col difetto.
-tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c qwen36_tier.h backend_cuda.h
+tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend (tests/qwen36_fake_cuda.h), two devices: proves the tier's
+# per-device input-replica block (G.is_x) is sized and strided so device 1's
+# block cannot run past the end of the buffer or into device 0's (#1339).
+tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, single device: proves qt_shutdown returns (under an
+# alarm(10) watchdog) instead of hanging forever when a group is still open
+# and an LFRU swap is parked waiting for cv_take (#1340).
+tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
+# tier raw pointers into the RAM expert slots, so only a test that includes
+# qwen36.c can prove the weights behind them are still there afterwards -- on an
+# int8 container there is no packed copy to rebuild them from (#1341). Includes
+# qwen36_tier.c in its own TU like the other tier tests, so nothing else is
+# compiled in and no model file is needed.
+tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
