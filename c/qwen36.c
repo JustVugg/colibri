@@ -615,10 +615,12 @@ typedef struct {
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; float *gs, *us, *ds; uint64_t used;
+                 int rprev, rnext; int8_t rlist; } Slot;   /* #1050: recency-list links */
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
+    int ev_head, ev_tail, pin_head, pin_tail;   /* #1050: LRU victim lists, head = least recent */
     int n, cap;
 } LCache;
 
@@ -665,6 +667,75 @@ static void slot_ensure_allocated(Model *m, Slot *s);
 static uint64_t g_slot_index_probes;
 #endif
 
+/* ---------- #1050: intrusive recency lists (identical to olmoe.c; derived) ----------
+ * rlist encoding: 0 = unlinked (calloc-zero safe), 1 = ev-list, 2 = pin-list. */
+static int g_victim_scan_mode;   /* 1 = legacy linear scan (COLI_VICTIM_SCAN=1) */
+static void victim_unlink(LCache *lc, Slot *s, int idx) {
+    if (s->rlist == 0) return;
+    int *head = s->rlist == 2 ? &lc->pin_head : &lc->ev_head;
+    int *tail = s->rlist == 2 ? &lc->pin_tail : &lc->ev_tail;
+    if (s->rprev >= 0) lc->slots[s->rprev].rnext = s->rnext; else *head = s->rnext;
+    if (s->rnext >= 0) lc->slots[s->rnext].rprev = s->rprev; else *tail = s->rprev;
+    s->rlist = 0; s->rprev = s->rnext = -1;
+    (void)idx;
+}
+static void victim_push_back(LCache *lc, Slot *s, int idx, int list) {
+    int *head = list == 2 ? &lc->pin_head : &lc->ev_head;
+    int *tail = list == 2 ? &lc->pin_tail : &lc->ev_tail;
+    s->rlist = (int8_t)list; s->rnext = -1; s->rprev = *tail;
+    if (*tail >= 0) lc->slots[*tail].rnext = idx; else *head = idx;
+    *tail = idx;
+}
+static void victim_touch(LCache *lc, Slot *s, int idx) {
+    if (s->rlist == 0) return;
+    int list = s->rlist;
+    int cur_tail = list == 2 ? lc->pin_tail : lc->ev_tail;
+    if (cur_tail == idx) return;
+    victim_unlink(lc, s, idx);
+    victim_push_back(lc, s, idx, list);
+}
+static void victim_refile(LCache *lc, Slot *s, int idx) {
+    int want = s->pinned ? 2 : 1;
+    if (want == 1) {
+        if (s->rlist == 1 && lc->ev_tail == idx) return;
+        victim_unlink(lc, s, idx);
+        victim_push_back(lc, s, idx, 1);
+        return;
+    }
+    /* pin-list: ordered by `used` (pin flips don't bump the stamp); O(k), k
+     * bounded by the pin budget (Sol-r1 M3). */
+    victim_unlink(lc, s, idx);
+    int at = lc->pin_tail;
+    while (at >= 0 && lc->slots[at].used > s->used) at = lc->slots[at].rprev;
+    if (at < 0) {
+        s->rlist = 2; s->rprev = -1; s->rnext = lc->pin_head;
+        if (lc->pin_head >= 0) lc->slots[lc->pin_head].rprev = idx;
+        lc->pin_head = idx;
+        if (lc->pin_tail < 0) lc->pin_tail = idx;
+    } else {
+        s->rlist = 2; s->rprev = at; s->rnext = lc->slots[at].rnext;
+        if (s->rnext >= 0) lc->slots[s->rnext].rprev = idx; else lc->pin_tail = idx;
+        lc->slots[at].rnext = idx;
+    }
+}
+static int victim_pick(Model *m, LCache *lc) {
+    /* Same contract as olmoe.c: oldest unpinned resident, else oldest
+     * non-in-flight (may be pinned), else -1 (caller waits/rescans). */
+    (void)m;
+    if (lc->ev_head >= 0) return lc->ev_head;
+    if (lc->pin_head >= 0) return lc->pin_head;
+    return -1;
+}
+/* allow_pinned=false (Sol-r1 M5): speculation never displaces pinned slots,
+ * matching the legacy pilot scan exactly. */
+static int victim_pick_ex(Model *m, LCache *lc, int allow_pinned) {
+    (void)m;
+    if (lc->ev_head >= 0) return lc->ev_head;
+    if (allow_pinned && lc->pin_head >= 0) return lc->pin_head;
+    return -1;
+}
+__attribute__((unused)) static void victim_rescan_all(LCache *lc) { (void)lc; }   /* kept for olmoe parity; qwen36 rescans via victim_pick */
+
 /* Runtime callers hold g_pilot_mx.  Validate both sides so stale bookkeeping
  * can only become a cache miss, never a wrong-expert hit. */
 static Slot *slot_indexed(Model *m, int layer, int eid) {
@@ -683,6 +754,7 @@ static Slot *slot_indexed(Model *m, int layer, int eid) {
 static void cache_unindex(Model *m, int layer, Slot *s) {
     LCache *lc = &m->cache[layer];
     int eid = s->eid, i = (int)(s - lc->slots);
+    victim_unlink(lc, s, i);              /* #1050 */
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts &&
         lc->slot_by_expert[eid] == i)
         lc->slot_by_expert[eid] = -1;
@@ -699,6 +771,8 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     s->eid = eid;
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
+    if (eid >= 0)                          /* #1050: residency re-entry at MRU end */
+        victim_refile(lc, s, (int)(s - lc->slots));
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -1354,6 +1428,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
+        m->cache[i].ev_head = m->cache[i].ev_tail = -1;   /* #1050 recency lists */
+        m->cache[i].pin_head = m->cache[i].pin_tail = -1;
     }
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
     m->DN_rec = calloc((size_t)c->n_layers, sizeof(float*));
@@ -1575,21 +1651,17 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
+        victim_touch(lc, hit, (int)(hit - lc->slots));   /* #1050: O(1) MRU re-link */
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
     m->miss++;
     Cfg *c = &m->c; Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        /* #1050: LRU eviction via recency list (legacy: 3-phase linear scan). */
+        int lru = victim_pick(m, lc);
         if (lru < 0) {
-            /* All slots are pinned or in-flight; find the oldest non-in-flight
-             * slot (may be pinned, but never one currently being loaded). */
+            /* All slots pinned or in-flight: oldest non-in-flight fallback. */
             for (int i = 0; i < lc->n; i++) { if (lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
         }
         while (lru < 0) {
@@ -1609,10 +1681,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             pthread_mutex_unlock(&g_pilot_mx);
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
+            lru = victim_pick(m, lc);   /* #1050: lists already reflect publishes */
         }
         s = &lc->slots[lru]; s->pinned = 0;
     }
@@ -1621,6 +1690,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     load_expert_merged(m, layer, eid, s);
     pthread_mutex_lock(&g_pilot_mx);
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    victim_refile(lc, s, (int)(s - lc->slots));   /* #1050: pin flip re-files */
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -1657,7 +1727,11 @@ static void pin_hot_experts(Model *m) {
             int found = 0;
             pthread_mutex_lock(&g_pilot_mx);
             Slot *resident = slot_indexed(m, l, eid);
-            if (resident) { resident->pinned = 1; found = 1; }
+            if (resident) {
+                resident->pinned = 1; found = 1;
+                victim_refile(&m->cache[l], resident,   /* #1050: re-file ev->pin */
+                              (int)(resident - m->cache[l].slots));
+            }
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found && g_pilot > 0) {
                 ensure_pilot_worker_started(m);
@@ -1704,8 +1778,11 @@ static int apply_resident(Model *m, int quiet) {
         if (seen > cap) over += seen - cap;
         LCache *lc = &m->cache[l];
         for (int i = 0; i < lc->n; i++)
-            if (lc->slots[i].eid >= 0 && row[lc->slots[i].eid])
+            if (lc->slots[i].eid >= 0 && row[lc->slots[i].eid]) {
+                int was = lc->slots[i].pinned;
                 lc->slots[i].pinned = 1;
+                if (!was) victim_refile(lc, &lc->slots[i], i);   /* #1050 (Sol-r1 M4): ev->pin re-file */
+            }
     }
     if (!quiet || newly > 0)
         fprintf(stderr, "[RESIDENT] Pinned %d new experts (CPU no-evict -> GPU resident)%s\n",
@@ -2268,8 +2345,9 @@ static void pilot_realload(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) { if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
+        /* #1050: LRU eviction via recency list (legacy: single linear scan).
+         * allow_pinned=0 (Sol-r1 M5): speculation never displaces pinned. */
+        int lru = victim_pick_ex(m, lc, 0);
         if (lru < 0) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
         s = &lc->slots[lru]; s->pinned = 0;
     }
@@ -2278,6 +2356,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     load_expert_merged(m, layer, eid, s);
     pthread_mutex_lock(&g_pilot_mx);
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer*c->n_experts+eid]; s->used = ++m->clock;
+    victim_refile(lc, s, (int)(s - lc->slots));   /* #1050: pin flip re-files */
     m->is_queued[layer*c->n_experts+eid] = 0; pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -2720,6 +2799,7 @@ int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
+    g_victim_scan_mode = getenv("COLI_VICTIM_SCAN") ? atoi(getenv("COLI_VICTIM_SCAN")) : 0;  /* #1050 kill-switch (parsed for parity; qwen36 victim_pick is list-only) */
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     if (g_wide < 1) g_wide = 1; if (g_wide > 4) g_wide = 4;
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
