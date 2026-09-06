@@ -471,13 +471,26 @@ endif
 TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
-# unconditional rules and therefore remain portable gates.
+# unconditional rules and therefore remain portable gates. The six forced
+# SSE4.1 tests use -msse4.1/-mno-avx2/-mno-fma, which only exist as gcc/clang
+# flags on x86 -- unconditionally in TEST_BINS they take down `check` on
+# arm64 (e.g. macOS): "unsupported option '-msse4.1' for target arm64-...".
+# Appended back below only on x86-64 hosts, alongside the other conditional
+# platform tests already handled the same way.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
-	test_edge_adapters_registration test_edge_adapters_real
+	test_edge_adapters_registration test_edge_adapters_real \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 \
+	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 \
+	test_i4_grouped_sse41_no_contract
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+endif
+ifneq (,$(X86_64))
+TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
+	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_i4_grouped_sse41$(EXE) \
+	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
@@ -1297,8 +1310,18 @@ tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< -o $@ $(LDFLAGS)
+
+# Force the grouped-int4 oracle onto the SSE4.1 tier even on an AVX2 host.
+tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+tests/test_i4_grouped_sse41_no_contract$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sse41_kernels.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -O3 -ffp-contract=off -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
 
 tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1743,6 +1766,42 @@ tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h
 
 tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Standalone: proves the group-scaled int8 GEMV keeps every row's float
+# operations in their original order -- the assumption qwen36's byte-identical
+# output rests on. Links the SAME gsgemv.h the engine links.
+tests/test_gsgemv$(EXE): tests/test_gsgemv.c gsgemv.h sse41_kernels.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in gsgemv.h is actually exercised even on a devbox that
+# would otherwise always pick the AVX2 tier.
+tests/test_gsgemv_sse41$(EXE): tests/test_gsgemv.c gsgemv.h sse41_kernels.h
+	$(CC) $(CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+# Standalone: proves the plain (non-group-scaled) int8 GEMV keeps its exact
+# sequence of float operations -- the assumption qwen36's byte-identical
+# output rests on. Links the SAME qgemv.h the engine links.
+tests/test_qgemv$(EXE): tests/test_qgemv.c qgemv.h sse41_kernels.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in qgemv.h is actually exercised even on a devbox that
+# would otherwise always pick the AVX2 tier.
+tests/test_qgemv_sse41$(EXE): tests/test_qgemv.c qgemv.h sse41_kernels.h
+	$(CC) $(CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+# olmoe's dot_i8_16 (ARM NEON/AVX2/SSE4.1 variants): must be bit-exact against
+# a scalar int8 reference -- pure integer arithmetic, no tolerance needed.
+# NOCUDA_* for the same reason the other olmoe.c-including test rules use it.
+tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in olmoe.c's dot_i8_16 is actually exercised even on a
+# devbox that would otherwise always pick the AVX2 tier.
+tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(NOCUDA_LDFLAGS)
 
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)

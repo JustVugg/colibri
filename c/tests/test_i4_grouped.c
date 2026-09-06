@@ -12,11 +12,9 @@
  * nibble edges 0 and 15 (which decode to -8 and +7 — an offset encoding, NOT
  * two's complement; getting this backwards is silent and looks like noise).
  *
- * FP note: the kernel sums each group in f32 (AVX2 accumulator + scalar tail)
- * while the reference sums in double, so we compare against a relative epsilon
- * rather than bit-exactly. The tolerance is tight enough that a wrong scale
- * index, a wrong group boundary or a swapped nibble cannot hide under it —
- * those are O(1) relative errors, not O(1e-6). */
+ * FP note: the kernel sums in f32 while the format reference sums in double, so
+ * we compare those two against a relative epsilon. Forced-SSE builds separately
+ * require byte identity with the scalar f32 operation tree. */
 #define main coli_glm_main_unused
 #include "../colibri.c"
 #undef main
@@ -53,15 +51,54 @@ static void ref_grouped(double *y, double *mag, const float *x, const uint8_t *q
     }
 }
 
+/* Scalar contract: this is the scalar grouped kernel's operation tree, not a
+ * higher-precision format reference. The forced-SSE builds compare its output
+ * byte for byte with the four-output-row SIMD path. */
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+static void ref_grouped_scalar(float *y,const float *x,const uint8_t *q4,
+                               const float *scale,int S,int I,int O,int gs){
+    int rb=(I+1)/2,ng=(I+gs-1)/gs;
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0;g*gs<I;g++){
+                int base=g*gs,glen=gs; if(base+glen>I) glen=I-base;
+                float sc=scl[g];
+                for(int i=base;i<base+glen;i+=2){
+                    if(i+1<base+glen){
+                        uint8_t byte=w[i>>1];
+                        a+=(xs[i]*(float)((int)(byte&0xF)-8)
+                           +xs[i+1]*(float)((int)(byte>>4)-8))*sc;
+                    }else{
+                        uint8_t byte=w[i>>1];
+                        a+=xs[i]*(float)((int)(byte&0xF)-8)*sc;
+                    }
+                }
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+#endif
+
 static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
     int rb=(I+1)/2, ng=(I+gs-1)/gs;
     uint8_t *q4=malloc((size_t)O*rb);
     float *scale=malloc((size_t)O*ng*sizeof(float));
     float *x=malloc((size_t)S*I*sizeof(float));
     float *y=malloc((size_t)S*O*sizeof(float));
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+    float *ys=malloc((size_t)S*O*sizeof(float));
+#endif
     double *yr=malloc((size_t)S*O*sizeof(double));
     double *ym=malloc((size_t)S*O*sizeof(double));
-    if(!q4||!scale||!x||!y||!yr||!ym){ fprintf(stderr,"%s: OOM\n",name); return 1; }
+    if(!q4||!scale||!x||!y||!yr||!ym
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+       ||!ys
+#endif
+      ){ fprintf(stderr,"%s: OOM\n",name); return 1; }
 
     for(size_t i=0;i<(size_t)O*rb;i++) q4[i]=(uint8_t)(xr()&0xFF);
     if(fill_edges){
@@ -75,6 +112,9 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
 
     matmul_i4_grouped(y,x,q4,scale,S,I,O,gs);
     ref_grouped(yr,ym,x,q4,scale,S,I,O,gs);
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+    ref_grouped_scalar(ys,x,q4,scale,S,I,O,gs);
+#endif
 
     int bad=0; double worst=0;
     for(int i=0;i<S*O;i++){
@@ -87,9 +127,26 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
             bad++;
         }
     }
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+    if(memcmp(y,ys,(size_t)S*O*sizeof(float))!=0){
+        int first=0;
+        while(first<S*O && memcmp(y+first,ys+first,sizeof(float))==0) first++;
+        fprintf(stderr,"%s: FAIL SSE4.1 != scalar at [%d]: %.9g vs %.9g\n",
+                name,first,(double)y[first],(double)ys[first]);
+        bad++;
+    }
+    free(ys);
+#endif
     free(q4);free(scale);free(x);free(y);free(yr);free(ym);
     if(bad){ fprintf(stderr,"%s: FAIL (%d/%d mismatched, worst rel %.3g)\n",name,bad,S*O,worst); return 1; }
-    printf("  %-42s ok (S=%d I=%d O=%d gs=%d ng=%d, worst rel %.2g)\n",name,S,I,O,gs,ng,worst);
+    printf("  %-42s ok (S=%d I=%d O=%d gs=%d ng=%d, worst rel %.2g%s)\n",
+           name,S,I,O,gs,ng,worst,
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+           ", bit-exact vs scalar"
+#else
+           ""
+#endif
+    );
     return 0;
 }
 
@@ -98,16 +155,12 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
  *
  *  - Correctness, always: both outputs must match the double reference within
  *    the same magnitude-relative epsilon as the unfused kernel.
- *  - Bit-exactness, only when I % gs == 0: then every group is covered by the
- *    AVX2 body, whose accumulation order is identical to the unfused kernel, so
- *    the results agree to the last bit. This is the shape the real g64
- *    checkpoints have (I = 2048 / 6144, gs = 64), i.e. the production path.
+ *  - Bit-exactness: forced-SSE builds require every shape to match two scalar
+ *    calls. Other builds retain the aligned-shape invariant used by AVX2.
  *
- * With a PARTIAL last group the group tail falls to scalar code, and the
- * compiler is free to contract/reassociate the fused body differently from the
- * single-matrix one. The results then differ by ~1e-7 -- rounding, not logic
- * (which of gate/up "differs" is arbitrary, the tell that it is FP luck).
- * Demanding bit-exactness there would report a compiler artifact as a bug. */
+ * On AVX2, a PARTIAL last group falls to scalar code and the fused body can
+ * round differently from the single-matrix one. The forced-SSE rows4 path has
+ * no horizontal reduction or group tail and is exact for those shapes too. */
 #ifdef COLI_HAVE_GROUPED_PAIR
 static int check_pair(const char *name, int S, int I, int O, int gs){
     int rb=(I+1)/2, ng=(I+gs-1)/gs;
@@ -143,18 +196,20 @@ static int check_pair(const char *name, int S, int I, int O, int gs){
         }
         if(yg[i]!=rg[i]||yu[i]!=ru[i]) exact=0;
     }
-    /* Aligned shapes run entirely through the AVX2 body: same order as unfused,
-     * so bit-exactness is a real invariant there and worth asserting. */
-    if(I%gs==0 && !exact){
-        fprintf(stderr,"%s: FAIL fused != unfused bitwise on an ALIGNED shape "
-                       "(no scalar tail runs here; the orders must match)\n",name);
+    int require_exact=I%gs==0;
+#ifdef COLI_I4_GROUPED_SCALAR_EXACT
+    require_exact=1;
+#endif
+    if(require_exact && !exact){
+        fprintf(stderr,"%s: FAIL fused != unfused bitwise "
+                       "(the operation order must match)\n",name);
         bad++;
     }
     free(qg);free(qu);free(sg);free(su);free(x);free(yg);free(yu);free(rg);free(ru);
     free(dg);free(du);free(mg);free(mu);
     if(bad){ fprintf(stderr,"%s: FAIL (%d mismatched)\n",name,bad); return 1; }
     printf("  %-42s ok (S=%d I=%d O=%d gs=%d, worst rel %.2g%s)\n",name,S,I,O,gs,worst,
-           I%gs==0?", bit-exact vs unfused":"");
+           require_exact?", bit-exact vs unfused":"");
     return 0;
 }
 #endif
