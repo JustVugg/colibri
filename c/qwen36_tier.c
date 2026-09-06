@@ -456,10 +456,19 @@ int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e
 /* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
  * see the exp_bytes comment in qt_init). */
 static size_t dev_alloc_footprint(size_t bytes){
-    const size_t MiB = 1048576u;
-    if(bytes <= 10240u) return 10240u;
-    if(bytes <= MiB) return MiB;
-    return (bytes + 2*MiB - 1) / (2*MiB) * (2*MiB);
+    /* measured with cudaMemGetInfo over 256 allocations each (driver 5xx):
+     *   400 B, 3 KiB, 4 KiB -> 8 KiB      10 KiB -> 16 KiB     16..64 KiB -> exact
+     *   96 KiB -> 104 KiB   384 KiB -> 416 KiB   768 KiB -> 1 MiB   1 MiB -> 1 MiB
+     *   1.5 MiB -> 2 MiB    3 MiB -> 4 MiB
+     * i.e. above 1 MiB multiples of 2 MiB, above 512 KiB one 1 MiB page, and
+     * below that roughly the size plus a sixteenth, in 8 KiB steps, 8 KiB
+     * minimum. The small-size rule is a fit, slightly conservative. */
+    const size_t KiB = 1024u, MiB = 1048576u;
+    if(bytes > MiB) return (bytes + 2*MiB - 1) / (2*MiB) * (2*MiB);
+    if(bytes > 512*KiB) return MiB;
+    size_t b = bytes + bytes/16;
+    if(b < 8*KiB) b = 8*KiB;
+    return (b + 8*KiB - 1) / (8*KiB) * (8*KiB);
 }
 
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
@@ -544,9 +553,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
     }
     /* Charge what the device allocator takes, not what the bytes measure:
-     * cudaMalloc rounds an allocation above 1 MiB up to a multiple of 2 MiB
-     * and one at or below 1 MiB up to 1 MiB (measured with cudaMemGetInfo,
-     * driver 5xx; 1,638,400 B -> 2 MiB, 819,200 B -> 1 MiB, 400 B -> 10 KiB).
+     * cudaMalloc rounds an allocation above 1 MiB up to a multiple of 2 MiB,
+     * one above 512 KiB up to 1 MiB, and small ones to 8 KiB steps
+     * (dev_alloc_footprint has the measured table).
      * An expert is three weight allocations plus three scale allocations.
      * Charged by payload, the fp8 Qwen3.8 expert (3 x 1.56 MiB) looked like
      * 4.69 MiB and took 6.03 MiB: the budget filled the card to the last
