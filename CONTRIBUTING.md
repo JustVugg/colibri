@@ -38,3 +38,16 @@ make -C c cuda-test CUDA_ARCH=native
 
 Benchmark reports should include the commit, exact commands, hardware and
 storage details, warm-up policy, run count, and median throughput.
+
+Performance PRs should attach an experiment manifest based on
+`docs/experiments/manifest.example.json`. Validate it before submission with:
+
+```sh
+python3 c/experiment_manifest.py path/to/result.json
+```
+
+The validator requires a full commit identity, at least three raw throughput
+samples per arm, medians derived from those samples, hashed raw evidence, a
+passing correctness gate, and exactly one changed configuration variable.
+Negative and no-change results use the same record and remain first-class
+evidence.
