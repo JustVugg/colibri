@@ -65,6 +65,11 @@ int main(void) {
 
     /* ---- 1. the mode starts with cap < n_experts, publishes the LUT, sizes fmt 8 ---- */
     printf(" 1. init\n");
+#ifdef __linux__
+    /* what libgomp does with OMP_PROC_BIND: the initial thread sits on one CPU */
+    unsigned long one[QT_AFF_WORDS]; memset(one, 0, sizeof one); one[0] = 1ul;
+    int bound = syscall(SYS_sched_setaffinity, 0, sizeof one, one) == 0;
+#endif
     /* allowance for exactly 3 experts on the one device */
     size_t exp_bytes = 3 * dev_alloc_footprint((size_t)D * IH) + 3 * dev_alloc_footprint(NSC * sizeof(float));
     char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(3 * exp_bytes + exp_bytes / 2) / 1073741824.0);
@@ -75,6 +80,13 @@ int main(void) {
     check(fake_lut_published, "e4m3 LUT published to the backend before any upload");
     check(G.exp_bytes == exp_bytes, "exp_bytes = three fmt-8 matrices + three scale tables at cudaMalloc granularity");
     check(G.sc_gu == NSC && G.sc_d == NSC, "one scale per 128x128 block per matrix");
+#ifdef __linux__
+    if (bound && sysconf(_SC_NPROCESSORS_ONLN) > 1) {
+        for (int i = 0; i < 200 && !G_uploader_cpus; i++) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
+        check(G_uploader_cpus > 1, "uploader thread is not jailed on the caller's CPU");
+        check(qt_aff_count_self() == 1, "the caller's own mask is restored after init");
+    }
+#endif
 
     /* ---- 2. a note uploads fmt 8, bytes intact, scales in order, pointers dropped ---- */
     printf(" 2. note -> upload\n");

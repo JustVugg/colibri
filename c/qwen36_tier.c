@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 #include "qwen36_tier.h"
 #include "backend_cuda.h"
 #include "tier.h"
@@ -82,8 +86,56 @@ static void stage(uint8_t *dw, float *dsc,
     memcpy(dsc+2*G.sc_gu,       ds, G.sc_d *sizeof(float));
 }
 
+/* Thread affinity around the tier's own threads (Linux).
+ *
+ * With OMP_PROC_BIND set, libgomp binds the initial thread to place 0 before
+ * main() runs, and a pthread inherits the CPU mask of the thread that creates
+ * it. The uploader thread and the CUDA runtime's own threads were therefore
+ * jailed on the OpenMP master's core: every staging copy and every driver
+ * call competed with the master thread's share of each expert matmul, and
+ * the whole team waited for it. Measured on Qwen3.8 (12 threads, one card):
+ * the CPU time per remaining expert rose 64 % while the tier was on, eating
+ * the whole gain of computing 45-59 % of the experts on the GPU. So the tier
+ * widens the calling thread's mask to every online CPU while it creates its
+ * thread and initializes CUDA, and restores the caller's mask afterwards.
+ * Raw syscalls, no _GNU_SOURCE: this file is also #included by tests after
+ * the engine's own headers. */
+#ifdef __linux__
+#define QT_AFF_WORDS 64                              /* 4096 CPUs */
+typedef struct { unsigned long w[QT_AFF_WORDS]; int len; } qt_affmask;
+static int qt_aff_get(qt_affmask *m){
+    long r=syscall(SYS_sched_getaffinity,0,sizeof m->w,m->w);
+    if(r<=0) return 0;
+    m->len=(int)r; return 1;
+}
+static void qt_aff_widen(const qt_affmask *saved){
+    if(!saved->len) return;
+    long n=sysconf(_SC_NPROCESSORS_ONLN);
+    if(n<=1) return;
+    qt_affmask all; memset(&all,0,sizeof all);
+    for(long i=0;i<n && i<(long)(8*sizeof all.w);i++) all.w[i/(8*sizeof(unsigned long))] |= 1ul<<(i%(8*sizeof(unsigned long)));
+    syscall(SYS_sched_setaffinity,0,(size_t)saved->len,all.w);
+}
+static void qt_aff_restore(const qt_affmask *saved){
+    if(saved->len) syscall(SYS_sched_setaffinity,0,(size_t)saved->len,saved->w);
+}
+static int qt_aff_count_self(void){
+    qt_affmask m; if(!qt_aff_get(&m)) return 0;
+    int c=0; for(int i=0;i<m.len/(int)sizeof(unsigned long);i++) c+=__builtin_popcountl(m.w[i]);
+    return c;
+}
+#else
+typedef struct { int len; } qt_affmask;
+static int  qt_aff_get(qt_affmask *m){ m->len=0; return 0; }
+static void qt_aff_widen(const qt_affmask *m){ (void)m; }
+static void qt_aff_restore(const qt_affmask *m){ (void)m; }
+static int  qt_aff_count_self(void){ return 0; }
+#endif
+static int G_uploader_cpus;   /* CPUs the uploader thread may run on (0 = unknown) */
+
 static void *uploader(void *arg){
     (void)arg;
+    G_uploader_cpus=qt_aff_count_self();
     for(;;){
         pthread_mutex_lock(&G.mx);
         while(G.qn==0 && !G.th_stop) pthread_cond_wait(&G.cv,&G.mx);
@@ -459,7 +511,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             }
     }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no visible CUDA devices -> CPU path\n"); return 0; }
-    if(!coli_cuda_init(G.dev,G.ndev)){ fprintf(stderr,"[qtier] coli_cuda_init failed -> CPU path\n"); return 0; }
+    qt_affmask aff; qt_aff_get(&aff); qt_aff_widen(&aff);   /* CUDA's threads are born here */
+    int cuda_ok_=coli_cuda_init(G.dev,G.ndev);
+    qt_aff_restore(&aff);
+    if(!cuda_ok_){ fprintf(stderr,"[qtier] coli_cuda_init failed -> CPU path\n"); return 0; }
     int have=coli_cuda_device_count();
     if(have<G.ndev){ G.ndev=have; }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no CUDA devices -> CPU path\n"); return 0; }
@@ -623,7 +678,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.is_x=malloc(G.is_x_floats*sizeof(float));
     if(!G.is_x) return 0;
     pthread_mutex_init(&G.mx,NULL); pthread_cond_init(&G.cv,NULL); pthread_cond_init(&G.cv_take,NULL);
-    if(pthread_create(&G.th,NULL,uploader,NULL)!=0) return 0;
+    qt_aff_get(&aff); qt_aff_widen(&aff);                  /* the uploader inherits this mask */
+    int th_ok=pthread_create(&G.th,NULL,uploader,NULL)==0;
+    qt_aff_restore(&aff);
+    if(!th_ok) return 0;
     G.on=1;
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
