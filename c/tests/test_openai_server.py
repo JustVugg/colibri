@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -17,7 +18,7 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
+                           _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
@@ -2565,6 +2566,49 @@ class ReasoningEffortTest(unittest.TestCase):
         text = render_chat(self.MESSAGES, enable_thinking=False,
                            reasoning_effort="xhigh")
         self.assertNotIn("Reasoning Effort", text)
+
+
+class ImageUrlPathGuard(unittest.TestCase):
+    """image_url.url points at a local file read with the server's rights.
+    A '..' path is refused; COLI_IMAGE_ROOT confines reads; errors stay
+    generic so a reply never confirms a path or its permissions."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("COLI_IMAGE_ROOT", None)
+
+    def tearDown(self):
+        os.environ.pop("COLI_IMAGE_ROOT", None)
+        if self._saved is not None:
+            os.environ["COLI_IMAGE_ROOT"] = self._saved
+
+    def test_reads_a_plain_file_by_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"\x89PNG\r\n")
+            self.assertEqual(_image_bytes_from_url(str(img)), b"\x89PNG\r\n")
+            self.assertEqual(_image_bytes_from_url("file://" + str(img)),
+                             b"\x89PNG\r\n")
+
+    def test_dotdot_is_refused(self):
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url("/var/data/../../etc/passwd")
+        self.assertEqual(caught.exception.status, 400)
+        self.assertNotIn("passwd", str(caught.exception))
+
+    def test_image_root_confines_reads(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile() as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            inside = Path(root) / "ok.png"
+            inside.write_bytes(b"ok")
+            self.assertEqual(_image_bytes_from_url(str(inside)), b"ok")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(outside.name)
+
+    def test_error_does_not_leak_the_path(self):
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url("/no/such/secret-name.png")
+        self.assertNotIn("secret-name", str(caught.exception))
 
 
 if __name__ == "__main__":
