@@ -1955,11 +1955,15 @@ def cmd_bench(a):
     print(f"  {C.dim}decode is disk-bound: this takes HOURS on slow hardware. Raise --limit on faster machines.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
-#: I flag di `coli convert` che scelgono la precisione, e il loro nome sulla
-#: riga di comando. Serve a sapere se l'utente li ha SCRITTI: un default non
-#: passato al convertitore non fa danno, uno scritto e ignorato si'.
+#: Le opzioni di precisione di `coli convert`: nome sulla riga di comando e
+#: default. Il parser le dichiara con default=None apposta, cosi' "l'utente
+#: l'ha scritta" e' semplicemente "non e' None" -- vale per --ebits 3,
+#: --ebits=3 e per le abbreviazioni che argparse accetta, senza frugare in
+#: sys.argv. Un default non passato al convertitore non fa danno; un valore
+#: scritto e ignorato si'.
 _CONVERT_PRECISION_FLAGS = {"ebits": "--ebits", "io_bits": "--io-bits",
                             "xbits": "--xbits", "group_size": "--group-size"}
+_CONVERT_DEFAULTS = {"ebits": 4, "io_bits": 8, "xbits": 0, "group_size": 64}
 
 
 def checkpoint_family(repo):
@@ -2010,10 +2014,15 @@ def cmd_convert(a):
         # le indicazioni per famiglia, sotto test; le si lascia dire a lei
         # invece di tenerne una seconda copia qui.
         script = "convert_fp8_to_int4.py"
+    written_names = [name for name in _CONVERT_PRECISION_FLAGS
+                     if getattr(a, name) is not None]
+    for name, value in _CONVERT_DEFAULTS.items():
+        if getattr(a, name) is None:
+            setattr(a, name, value)
     if family:
         print(f"  {C.dim}checkpoint: {family.display_name} -> tools/{script}{C.r}")
-        written = [flag for name, flag in _CONVERT_PRECISION_FLAGS.items()
-                   if flag in sys.argv and name not in family.converter_accepts]
+        written = [_CONVERT_PRECISION_FLAGS[name] for name in written_names
+                   if name not in family.converter_accepts]
         if written and family.converter:
             sys.exit(f"{C.yel}{' '.join(written)}: tools/{script} does not take "
                      f"{'them' if len(written) > 1 else 'it'}.{C.r}\n"
@@ -2196,8 +2205,14 @@ def main():
     _bench_cache = os.path.join(_cache_root, "colibri", "bench")
     pb.add_argument("--data",default=_bench_cache)
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
-    pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
-    pc.add_argument("--group-size",type=int,default=64,
+    # default=None e non il valore: cosi' e' argparse a dire se l'opzione e'
+    # stata SCRITTA (--ebits 3, --ebits=3, o abbreviata), e cmd_convert puo'
+    # rifiutarla su un convertitore che non la prende invece di ignorarla.
+    # I valori di default veri stanno in _CONVERT_DEFAULTS.
+    pc.add_argument("--ebits",type=int,default=None,help="routed expert bits (default 4)")
+    pc.add_argument("--io-bits",type=int,default=None,help="embedding/head bits (default 8)")
+    pc.add_argument("--xbits",type=int,default=None,help="streaming expert bits (default = ebits)")
+    pc.add_argument("--group-size",type=int,default=None,
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()

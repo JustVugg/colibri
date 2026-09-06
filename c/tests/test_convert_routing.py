@@ -55,10 +55,12 @@ class Args:
     def __init__(self, out, **overrides):
         self.repo = "some/checkpoint"
         self.model = out
-        self.ebits = 4
-        self.io_bits = 8
-        self.xbits = 0
-        self.group_size = 64
+        # None = not written on the command line, exactly as argparse reports
+        # it (the convert parser declares default=None for these four).
+        self.ebits = None
+        self.io_bits = None
+        self.xbits = None
+        self.group_size = None
         self.no_mtp = False
         self.__dict__.update(overrides)
 
@@ -68,7 +70,7 @@ class ConvertRoutingTest(unittest.TestCase):
     def setUpClass(cls):
         cls.cli = load_cli()
 
-    def run_convert(self, model_type, argv=("coli", "convert"), **overrides):
+    def run_convert(self, model_type, **overrides):
         """cmd_convert with the subprocess replaced: returns the commands it
         would have run, or the SystemExit it raised instead."""
         directory = tempfile.TemporaryDirectory()
@@ -86,7 +88,6 @@ class ConvertRoutingTest(unittest.TestCase):
                                return_value=(family_by_id(model_type)
                                              if model_type else None)):
             subprocess_module.call = fake_call
-            system.argv = list(argv)
             system.exit.side_effect = SystemExit   # sys.exit must RAISE, not build
             try:
                 self.cli.cmd_convert(Args(directory.name, **overrides))
@@ -136,11 +137,25 @@ class ConvertRoutingTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_an_option_the_target_does_not_take_is_refused_not_dropped(self):
-        calls = self.run_convert(
-            "glm53", argv=("coli", "convert", "--ebits", "3"), ebits=3)
+        """Detection comes from argparse (the value is not None), so it holds
+        for `--ebits 3`, `--ebits=3` and any abbreviation argparse accepts. A
+        scan of sys.argv for the literal flag missed the second form and
+        dropped the option silently, which is the bug in better manners."""
+        calls = self.run_convert("glm53", ebits=3)
         self.assertEqual(calls, [],
                          "--ebits was silently dropped and the conversion ran "
                          "anyway; the user asked for a precision they did not get")
+
+    def test_an_accepted_option_written_explicitly_is_passed_through(self):
+        command = self.run_convert("glm53", group_size=128)[0]
+        index = command.index("--group-size")
+        self.assertEqual(command[index + 1], "128")
+
+    def test_defaults_are_applied_when_nothing_is_written(self):
+        command = self.run_convert("glm")[0]
+        for flag, value in (("--ebits", "4"), ("--io-bits", "8"), ("--group-size", "64")):
+            self.assertEqual(command[command.index(flag) + 1], value)
+        self.assertNotIn("--xbits", command, "xbits defaults to 0 and is omitted")
 
     def test_an_unresolvable_family_keeps_the_old_command(self):
         """A metadata fetch that fails is not a reason to refuse a conversion
