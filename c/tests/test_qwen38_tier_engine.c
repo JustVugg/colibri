@@ -46,6 +46,10 @@ int main(void) {
     setenv("QT_NO_WARMSTART", "1", 1);
     setenv("COLI_PLACE", "off", 1);
     setenv("HEAT_FILE", "", 1);
+    /* the fake backend counts matmuls but computes nothing, so a trunk matrix
+     * placed on it would answer garbage; keep the trunk on the CPU here (the
+     * placement itself is pinned by test_qwen36_tier_dense) */
+    setenv("Q38_TRUNK_GPU", "0", 1);
     /* room for six of the sixteen experts, so promotion has to swap */
     size_t exp_bytes = 3 * dev_alloc_footprint(32 * 8) + 3 * dev_alloc_footprint(1 * sizeof(float));
     char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(6 * exp_bytes + exp_bytes / 2) / 1073741824.0);

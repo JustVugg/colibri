@@ -48,6 +48,7 @@ typedef struct {
     int64_t elements, scale_count;
     Q38WeightKind kind;
     unsigned owns_data:1, owns_scales:1;
+    int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -262,6 +263,11 @@ static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
 
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
+    /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
+     * GEMV from there; prefill rows and any failure take the CPU path below,
+     * so the BF16 copy stays the reference for everything but S == 1. */
+    if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
+       qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
     if(!weight||weight->rows!=O||weight->cols!=I||!weight->data){
         fprintf(stderr,"invalid matmul weight: have [%d,%d] kind=%d, need [%d,%d]\n",
                 weight?weight->rows:0,weight?weight->cols:0,
@@ -1679,6 +1685,87 @@ static void q38_tier_note(int layer,int eid,const Slot *ex) {
             (const uint8_t*)ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales);
 }
 
+/* ---- dense trunk on the GPU (R7b, stage 1) ---------------------------------
+ * The BF16 trunk is the largest fixed cost of a decode token here (about a
+ * third), and it is bandwidth-bound. Every matrix of at least 1 MiB is
+ * offered to the tier's placer by name and layer before qt_init; whatever
+ * the placer accepts is quantized to int8 per row at start (scale = max|w| /
+ * 127, the qwen36 dnproj/lmhead format) and uploaded once; the BF16 copy
+ * stays for prefill and as fallback. Q38_TRUNK_GPU=0 keeps the trunk on the
+ * CPU (parity runs against the BF16 reference). */
+typedef struct { Q38Weight *w; char name[16]; int layer; } Q38TrunkItem;
+static Q38TrunkItem *g_trunk; static int g_trunk_n, g_trunk_cap;
+static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
+    if(!w||!w->data||(w->kind!=Q38_WEIGHT_BF16&&w->kind!=Q38_WEIGHT_F32))return;
+    size_t bytes=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
+    if(bytes<(1u<<20))return;                      /* a round trip costs more than a tiny GEMV saves */
+    if(g_trunk_n==g_trunk_cap){
+        g_trunk_cap=g_trunk_cap?2*g_trunk_cap:256;
+        g_trunk=(Q38TrunkItem*)realloc(g_trunk,(size_t)g_trunk_cap*sizeof(*g_trunk));
+        if(!g_trunk){fprintf(stderr,"OOM trunk table\n");exit(1);}
+    }
+    Q38TrunkItem *it=&g_trunk[g_trunk_n++]; it->w=w; it->layer=layer;
+    snprintf(it->name,sizeof it->name,"%s",name);
+    qt_trunk_offer(it->name,layer,bytes);
+}
+static int q38_trunk_enabled(void) {
+    const char *e=getenv("Q38_TRUNK_GPU"); return !(e&&e[0]=='0'&&!e[1]);
+}
+/* offers, before qt_init: lm_head first (the placer takes it first), then the
+ * layers in order so a partial placement is a prefix of the layers */
+static void q38_trunk_offer_all(Model *m) {
+    if(!q38_trunk_enabled())return;
+    Cfg *c=&m->c;
+    q38_trunk_add(&m->lm_head,"lmhead",0);
+    for(int l=0;l<c->layers;l++){
+        Layer *L=&m->L[l];
+        if(c->is_attn[l]){
+            q38_trunk_add(&L->q,"attnq",l); q38_trunk_add(&L->k,"attnk",l);
+            q38_trunk_add(&L->v,"attnv",l); q38_trunk_add(&L->o,"attno",l);
+            q38_trunk_add(&L->idx_qk,"qsaidx",l);
+        } else {
+            q38_trunk_add(&L->dn_qkv,"dnqkv",l); q38_trunk_add(&L->dn_z,"dnz",l);
+            q38_trunk_add(&L->dn_out,"dnout",l);
+        }
+        q38_trunk_add(&L->attn_gr.down,"hcad",l); q38_trunk_add(&L->attn_gr.up,"hcau",l);
+        q38_trunk_add(&L->attn_gr.inject,"hcai",l);
+        q38_trunk_add(&L->mlp_gr.down,"hcmd",l); q38_trunk_add(&L->mlp_gr.up,"hcmu",l);
+        q38_trunk_add(&L->mlp_gr.inject,"hcmi",l);
+        q38_trunk_add(&L->sh_g,"shg",l); q38_trunk_add(&L->sh_u,"shu",l); q38_trunk_add(&L->sh_d,"shd",l);
+        q38_trunk_add(&L->router,"router",l);
+    }
+}
+/* after qt_init: quantize and upload what the placer accepted */
+static void q38_trunk_place_all(Model *m) {
+    (void)m;
+    int placed=0; size_t placed_bytes=0; double t0=now_s();
+    for(int i=0;i<g_trunk_n;i++){
+        Q38TrunkItem *it=&g_trunk[i]; Q38Weight *w=it->w;
+        int dev=qt_place_of(it->name,it->layer);
+        if(dev==QT_PLACE_CPU)continue;
+        int O=w->rows,I=w->cols;
+        int8_t *q=(int8_t*)malloc((size_t)O*I); float *sc=(float*)malloc((size_t)O*sizeof(float));
+        if(!q||!sc){fprintf(stderr,"OOM trunk quantization\n");exit(1);}
+        #pragma omp parallel for schedule(static)
+        for(int r=0;r<O;r++){
+            float row[8192]; float *src=row; float *heap=NULL;
+            if(I>8192){heap=(float*)malloc((size_t)I*sizeof(float)); src=heap;}
+            q38_weight_row(w,r,src);
+            float mx=0.f; for(int k=0;k<I;k++){float a=fabsf(src[k]); if(a>mx)mx=a;}
+            float s=mx>0.f?mx/127.f:1.f, inv=1.f/s; sc[r]=s;
+            int8_t *dst=q+(size_t)r*I;
+            for(int k=0;k<I;k++){int v=(int)lrintf(src[k]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[k]=(int8_t)v;}
+            free(heap);
+        }
+        int h=qt_dense_init(q,sc,I,O,dev);
+        free(q); free(sc);
+        if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
+    }
+    if(g_trunk_n)
+        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident as int8 (%.2f GiB) in %.1fs; the rest stays BF16 on the CPU\n",
+                placed,g_trunk_n,placed_bytes/1073741824.0,now_s()-t0);
+}
+
 /* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
  * tier reads that itself); it needs every layer's experts in native FP8 with
  * the block-scale bank resident, because the GPU kernels consume exactly the
@@ -1696,9 +1783,11 @@ static void q38_tier_start(Model *m,int cap) {
             fprintf(stderr,"[qtier] qwen38: layer %d experts are not native FP8; staying on the CPU\n",layer);
             return;
         }
+    q38_trunk_offer_all(m);                        /* sizes only; the placer decides in qt_init */
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+        q38_trunk_place_all(m);
     }
 }
 
