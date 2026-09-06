@@ -193,8 +193,9 @@ heat file from an earlier run therefore does not help, and the engine does no
 warmstart. Inside a run the locality is strong -- on the route trace of a
 315-token prompt plus 100 generated tokens, an LRU of 32 slots per layer
 serves 55 % of decode routes, 64 serve 79 %, 128 serve 90 % -- so the tier
-earns its VRAM by promotion at touch time: with the RAM LRU at cap 128 and one
-8 GB card, 49 % of decode routes were served from VRAM on the real checkpoint.
+earns its VRAM by promotion at touch time: with the RAM LRU at cap 128, one
+8 GB card served 45 % of decode routes from VRAM on the real checkpoint, two
+cards 59 %.
 
 **VRAM per expert.** The tier charges what `cudaMalloc` takes, not the payload:
 an allocation above 1 MiB rounds up to a multiple of 2 MiB, so each 1.56 MiB
@@ -204,13 +205,30 @@ are exactly 512 KiB and are served exactly, so its accounting was already
 right.) Pooling experts into one arena per device would recover the 22 %; it
 is not done yet.
 
-**Where the time goes** (this checkpoint, Threadripper 3945WX 12 cores, 12
-threads, cap 32, `COLI_TIMERS=1`): 4.6 s per decode token were 1.4 s dense
-kernels (BF16 trunk and DeltaNet projections), 1.8 s expert disk reads, 0.9 s
-routed-expert GEMV on the CPU (1.9 ms per expert: e4m3 decode, not bandwidth),
-0.3 s the rest. The VRAM tier attacks the routed-expert GEMV and, together
-with a larger cap, the disk reads; the dense trunk is the largest item and is
-not on the GPU yet.
+**What it is worth on this machine -- measured, not projected.** Threadripper
+PRO 3945WX (12 cores, `OMP_PLACES=cores`), 94 GB, checkpoint in the page cache,
+prompt of 315 tokens plus 100 generated, cap 128, `COLI_TIMERS=1` decode bank
+(the `Speed` line the engine prints divides by the whole generation time
+including the prompt; the numbers below are decode only):
+
+| | CPU only | tier, one 8 GB card | tier, two cards |
+|---|---:|---:|---:|
+| VRAM share of routed experts | -- | 45 % | 59 % |
+| routed-expert GEMV on the CPU, ms/token | 192 | 126 | 93 |
+| decode, ms/token | 806 | 808 | 808 |
+| decode tok/s (three runs each) | 1.14 - 1.24 | 1.20 - 1.24 | 1.21 - 1.24 |
+| greedy tokens | identical | identical | identical |
+
+A decode token costs about 0.8 s here: 260 ms dense kernels (BF16 trunk and
+the DeltaNet projections), 244 ms expert reads (page-cache copies of the cap
+misses), 192 ms routed-expert GEMVs on the CPU (0.5 ms for the three FP8
+matrices of one expert), 42 ms LM head, 24 ms QSA, 19 ms shared expert. The
+tier removes 66 - 99 ms of GEMV time and spends about as much on its own
+per-layer issue/take round trips and on staging the experts it promotes, so
+the wall time does not move. The parity holds, the plumbing is exercised on a
+real checkpoint, and the honest summary is: on a machine of this class the
+expert tier is not where Qwen3.8's decode time is. The dense trunk (a third of
+the token) and the expert reads (another third, a RAM-cap question) are.
 
 ## Performance telemetry
 
