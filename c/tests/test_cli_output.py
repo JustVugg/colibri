@@ -261,6 +261,24 @@ class BannerModelLineTest(unittest.TestCase):
         self.assertIn("unknown model", line)
         self.assertNotIn("GLM-5.2", line)
 
+    def test_a_pruned_checkpoint_is_not_announced_with_the_reference_size(self):
+        """#1310 made the REAP-pruned DeepSeek V4 Flash load: same model_type,
+        same 43 layers, 132 routed experts instead of 256, 150B instead of
+        284B. The family's display_scale is the reference checkpoint's number,
+        so printing it here is #1367 again -- except that this time the config
+        can tell the two apart, so the banner must."""
+        reap = self.line({"model_type": "deepseek_v4", "num_hidden_layers": 43,
+                          "n_routed_experts": 132})
+        self.assertIn("DeepSeek V4 Flash", reap)
+        self.assertNotIn("284B", reap, "a 150B checkpoint announced as 284B")
+        self.assertIn("43L x 132E", reap)
+
+    def test_the_reference_checkpoint_keeps_its_declared_size(self):
+        official = self.line({"model_type": "deepseek_v4", "num_hidden_layers": 43,
+                              "n_routed_experts": 256})
+        self.assertIn("284B", official)
+        self.assertNotIn("43L x 256E", official)
+
     def test_no_model_keeps_the_generic_tagline(self):
         """What matters is that a tagline comes back and that it names no
         model. It used to assert the substring "GLM-5.2", which pinned the
