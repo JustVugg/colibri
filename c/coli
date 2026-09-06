@@ -193,6 +193,13 @@ def model_banner_line(model):
     try:
         family = resolve_model(model).descriptor
         name, scale = family.display_name, family.display_scale
+        # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
+        # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
+        # di nuovo. Quando la geometria non e' quella del riferimento si
+        # lascia parlare la geometria, che e' misurata e non puo' mentire.
+        experts = cfg.get("n_routed_experts")
+        if family.reference_experts and experts and experts != family.reference_experts:
+            scale = ""
     except (FamilyConfigError, UnknownFamilyError):
         # Unknown checkpoint: say so with its own words rather than guess.
         name = kind or "unknown model"

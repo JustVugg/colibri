@@ -54,6 +54,21 @@ hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
   --local-dir /path/to/DeepSeek-V4-Flash
 ```
 
+The REAP-pruned 150B variant loads with the same engine and needs no
+conversion either. It keeps the official FP4 expert layout and the official
+dense FP8, and drops 124 of the 256 routed experts per layer:
+
+```bash
+hf download puwaer/DeepSeek-V4-Flash-0731-reap-150b \
+  --local-dir /path/to/DeepSeek-V4-Flash-reap-150b
+```
+
+85 GB on disk instead of 167. Its shards pack an expert's three weights and
+three scales non-contiguously, sometimes across shards; the engine reads such
+experts per matrix and takes the original contiguous fast path everywhere else
+(#1310). The banner reports it by its measured geometry, `43L x 132E`, rather
+than the 284B of the official checkpoint, because that number is not its.
+
 A download can finish with a truncated shard even when the client reports
 success. If `st.h` rejects a shard as out of bounds, compare every local shard
 size with the Hugging Face repository before treating it as an engine failure.

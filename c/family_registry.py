@@ -109,6 +109,14 @@ class FamilyDescriptor:
     converter: str = ""
     converter_accepts: tuple = ()
     converter_mtp_pass: bool = False
+    # Gli esperti per layer del checkpoint con cui display_scale e' stato
+    # scritto. display_scale e' un numero del checkpoint di riferimento, non
+    # della famiglia: un checkpoint potato (REAP) ha la stessa architettura e
+    # lo stesso model_type ma meno esperti, e annunciarlo con la taglia del
+    # riferimento e' lo stesso errore di #1367 -- con la differenza che qui
+    # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
+    # banner stampa display_scale come sempre.
+    reference_experts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1159,6 +1167,10 @@ FAMILIES = (
         model_types=("deepseek_v4",),
         display_name="DeepSeek V4 Flash",
         display_scale="284B",
+        # deepseek-ai/DeepSeek-V4-Flash-0731 config.json: 43 layer, 256
+        # esperti, top-k 6. Il REAP a 150B (#1310) ne ha 132 sugli stessi 43
+        # layer: e' quello che fa scattare la geometria misurata nel banner.
+        reference_experts=256,
         engine_artifact="deepseek_v4",
         engine_aliases=(),
         engine_group="deepseek_v4",
