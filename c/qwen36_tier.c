@@ -46,7 +46,7 @@ static struct {
     /* issue state of the (single) decode thread */
     int is_cnt[QT_MAX_DEV];
     int is_k[QT_MAX_DEV][32];
-    float *is_x;                          /* count*D input replicas per device */
+    float *is_x; size_t is_x_floats;      /* 32*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
@@ -97,6 +97,17 @@ static void *uploader(void *arg){
             /* LFRU swap: free the victim only when no group is in flight */
             while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
             QSlot *v=qs(vl,ve);
+            if(G.th_stop && G.issue_open){
+                /* Shutting down with a group still open: qt_take() -- the only
+                 * thing that clears issue_open -- will never come. Abandon
+                 * this swap instead of freeing a victim tensor the in-flight
+                 * group may still reference; qt_lfru_tick_locked already
+                 * cleared the victim's resident flag before enqueueing, so
+                 * restore it to keep the flag consistent with the tensor it
+                 * still holds. */
+                v->resident=1; qs(layer,eid)->queued=0;
+                pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
+            }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
             pthread_mutex_unlock(&G.mx);
@@ -198,7 +209,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
     }
     G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
-    G.is_x=malloc((size_t)32*D*sizeof(float));
+    /* qt_issue strides each device's block by 32*D floats (its max row
+     * count), not 8*D: a device other than 0 with a full 32-row issue used
+     * to run past its own slice and off the end of this allocation (#1339). */
+    G.is_x_floats=(size_t)G.ndev*32*D;
+    G.is_x=malloc(G.is_x_floats*sizeof(float));
     if(!G.slot||!G.is_x) return 0;
     /* load learned heat (HEAT_FILE): warmstart order + initial values */
     const char *hf=getenv("HEAT_FILE");
@@ -426,7 +441,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*8*G.D;               /* per-device input block */
+        float *xr=G.is_x + (size_t)di*32*G.D;              /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
         if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */
@@ -493,7 +508,10 @@ void qt_shutdown(void){
             fprintf(stderr,"[qtier] HEAT_FILE saved: %s\n",hf);
         }
     }
-    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_mutex_unlock(&G.mx);
+    /* Wake cv_take too: the uploader's LFRU victim wait (and qt_note_block /
+     * qt_note_planned / qt_fill_wait, all waiting on the same condvar) would
+     * otherwise never notice th_stop and pthread_join below would hang (#1340). */
+    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     G.on=0;
     coli_cuda_shutdown();

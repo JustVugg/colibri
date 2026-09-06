@@ -1412,5 +1412,59 @@ class FamilyRegistryTest(unittest.TestCase):
                       "l'archivio non spedirebbe family_registry.py")
 
 
+class GlmFamilyNamesBothModelsTest(unittest.TestCase):
+    """#1365 follow-up: a GLM-5.3 container was announced as "GLM-5.2 744B".
+
+    The engine loaded the right weights; only the banner named a different
+    model. The fix is the name, and the reason the name covers two models
+    rather than choosing between them is worth pinning here, because the
+    obvious "improvement" later is to add detection.
+
+    There is nothing to detect. Z.ai say so on GLM-5.3's own card -- "GLM-5.3
+    uses the same base model as GLM-5.2; every gain comes from post-training"
+    -- and the checkpoints agree: diffing the two real config.json leaves one
+    extra key and the transformers_version that wrote the file. If a release
+    ever ships a genuine discriminator, split the family then, on evidence,
+    and this test is where to record it.
+    """
+
+    #: The two configs, reduced to what the registry reads plus the only two
+    #: keys that actually differ between the real files.
+    BASE = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 78,
+        "n_routed_experts": 256,
+        "hidden_size": 6144,
+        "moe_intermediate_size": 2048,
+    }
+
+    def test_both_checkpoints_resolve_to_the_same_family(self):
+        v52 = dict(self.BASE, transformers_version="5.12.0")
+        v53 = dict(self.BASE, transformers_version="5.15.0",
+                   moe_router_dtype="float32")
+        self.assertEqual(family_for_config(v52).id, family_for_config(v53).id)
+        self.assertEqual(family_for_config(v53).engine_artifact, "colibri")
+
+    def test_the_only_differences_are_not_discriminators(self):
+        """Neither key can carry the decision, so neither may be read as if it
+        could. `transformers_version` records the library that wrote the file
+        and changes when anyone re-exports; `moe_router_dtype` is a precision
+        hint that a re-export of GLM-5.2 could equally carry."""
+        source = Path(__file__).resolve().parents[1] / "family_registry.py"
+        text = source.read_text(encoding="utf-8")
+        for key in ("transformers_version", "moe_router_dtype"):
+            self.assertNotIn(f'"{key}"', text,
+                             f"{key} is not a version discriminator; naming a "
+                             f"checkpoint from it would be a guess wearing a "
+                             f"rule's clothes")
+
+    def test_the_name_states_both_models(self):
+        family = family_for_config(dict(self.BASE))
+        for model in ("5.2", "5.3"):
+            self.assertIn(model, family.display_name,
+                          "a user running one of the two must not read the "
+                          "name of the other")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
+  <a href="https://discord.gg/FkyrEeJR"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
@@ -12,7 +12,7 @@ miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogen
 in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
-Oggi girano otto famiglie: **GLM-5.2** (744B), **GLM-5.3-Flash** (321B, con
+Oggi girano otto famiglie: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, con
 vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B),
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) e
 **OLMoE** (7B) — un
@@ -352,7 +352,7 @@ Se ti è utile:
 - ⭐ metti una stella al repository e condividilo;
 - 🐛 apri issue con i numeri di benchmark del tuo hardware — i datapoint
   fanno avanzare questo progetto più di qualsiasi altra cosa;
-- 💬 entra nella [comunità Discord](https://discord.gg/MAaKtQRc) per discutere
+- 💬 entra nella [comunità Discord](https://discord.gg/FkyrEeJR) per discutere
   esperimenti, risultati hardware e direzioni di ricerca;
 - 💬 contattaci via GitHub issues per sponsorizzare lo sviluppo o donare hardware.
 

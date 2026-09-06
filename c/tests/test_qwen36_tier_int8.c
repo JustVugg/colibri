@@ -17,75 +17,9 @@
 #include <string.h>
 
 /* ---- backend CUDA finto: le firme vengono da backend_cuda.h, che il tier
-   include per conto suo; qui si definisce solo il corpo. ---- */
-#include <stdint.h>
-#include <time.h>
-
-/* MinGW non ha setenv: il tier legge la sua configurazione dall'ambiente, e il
- * test deve poterla impostare anche su Windows. */
-#if defined(_WIN32)
-#include <stdlib.h>
-static int test_setenv(const char *name, const char *value, int overwrite) {
-    (void)overwrite; return _putenv_s(name, value);
-}
-#define setenv test_setenv
-#endif
-#include "../backend_cuda.h"
-
-struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; };
-
-static int fake_uploads;
-static int last_fmt = -1;
-static size_t last_bytes;
-static unsigned char captured[4096];
-static size_t captured_len;
-
-static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
-                         int I, int O, int device, int gs) {
-    ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
-    n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w;
-    *t = n;
-    fake_uploads++;
-    last_fmt = fmt;
-    last_bytes = (size_t)I * O / (fmt == 1 ? 1 : 2);
-    if (fake_uploads == 1) {
-        captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
-        memcpy(captured, w, captured_len);
-    }
-    return 1;
-}
-int coli_cuda_tensor_upload(ColiCudaTensor **t, const void *w, const float *s,
-                            int fmt, int I, int O, int device) {
-    (void)s; return upload_common(t, w, fmt, I, O, device, 0);
-}
-int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
-                              int fmt, int I, int O, int device, int gs) {
-    (void)s; return upload_common(t, w, fmt, I, O, device, gs);
-}
-void coli_cuda_tensor_free(ColiCudaTensor *t) { free(t); }
-int coli_cuda_available_device_count(void) { return 1; }
-int coli_cuda_device_count(void) { return 1; }
-int coli_cuda_init(const int *d, int n) { (void)d; (void)n; return 1; }
-void coli_cuda_shutdown(void) {}
-int coli_cuda_mem_info(int device, size_t *freeb, size_t *total) {
-    (void)device;
-    *freeb = 2ull << 30; *total = 4ull << 30;      /* 2 GiB liberi */
-    return 1;
-}
-int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
-                                 ColiCudaTensor *const *d, const int *rows,
-                                 int count, const float *x) {
-    (void)g; (void)u; (void)d; (void)rows; (void)count; (void)x; return 0;
-}
-const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
-void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
-                           double *h2d, double *kernel, double *d2h) {
-    if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;
-    if (h2d) *h2d = 0; if (kernel) *kernel = 0; if (d2h) *d2h = 0;
-}
-void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
-    (void)device; if (count) *count = 0; if (bytes) *bytes = 0;
-}
+   include per conto suo; il corpo (condiviso con gli altri test del tier) e'
+   in qwen36_fake_cuda.h. ---- */
+#include "qwen36_fake_cuda.h"
 
 #include "../qwen36_tier.c"
 

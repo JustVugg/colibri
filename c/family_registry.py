@@ -89,6 +89,34 @@ class FamilyDescriptor:
     # separate from expert_inventory prevents a fixed allocation from
     # being multiplied by the cache capacity.
     fixed_resident_inventory: object = None
+    # Lo script sotto tools/ che `coli convert` puo' guidare per questa famiglia,
+    # e le opzioni di `coli convert` che quello script accetta davvero.
+    #
+    # #1368: `coli convert` lanciava convert_fp8_to_int4.py qualunque cosa gli si
+    # desse. Quel convertitore e' di GLM-5.2 e classifica i tensori per nome
+    # PIATTO, mentre GLM-5.3-Flash annida il testuale sotto il wrapper vision:
+    # `model.language_model.embed_tokens.weight` non corrisponde a nessuna regola
+    # e cade nel fallback finale, che lo quantizza. Poi glm53.c lo legge con
+    # load_f32, rifiuta l'U8, e il motore muore dentro `coli web`.
+    #
+    # Vuoto significa "coli non guida questa famiglia": non e' una lacuna, e'
+    # che il suo convertitore ha un'altra riga di comando (convert_qwen36.py usa
+    # --out e --gs, convert_inkling_int4.py non ha --repo) o non serve affatto
+    # (Qwen3.8 gira sul checkpoint ufficiale). In quel caso si lascia parlare la
+    # guardia del convertitore, che quelle indicazioni le ha gia' per famiglia e
+    # sotto test: due copie della stessa mappa sarebbero il difetto che questa
+    # correzione sta chiudendo.
+    converter: str = ""
+    converter_accepts: tuple = ()
+    converter_mtp_pass: bool = False
+    # Gli esperti per layer del checkpoint con cui display_scale e' stato
+    # scritto. display_scale e' un numero del checkpoint di riferimento, non
+    # della famiglia: un checkpoint potato (REAP) ha la stessa architettura e
+    # lo stesso model_type ma meno esperti, e annunciarlo con la taglia del
+    # riferimento e' lo stesso errore di #1367 -- con la differenza che qui
+    # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
+    # banner stampa display_scale come sempre.
+    reference_experts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -888,6 +916,12 @@ FAMILIES = (
         # export di solo testo dichiara "glm5_next_text" al primo livello.
         model_types=("glm5_next", "glm5_next_text"),
         display_name="GLM-5.3-Flash",
+        # Niente ebits/io_bits/xbits: questo convertitore tiene i densi e
+        # l'embedding in BF16 e la precisione la sceglie il motore a load time
+        # (GLM53_BITS). Accettare quelle opzioni per poi ignorarle sarebbe la
+        # versione silenziosa dello stesso guasto.
+        converter="convert_glm53.py",
+        converter_accepts=("group_size",),
         display_scale="321B",
         engine_artifact="glm53",
         engine_aliases=(),
@@ -928,7 +962,26 @@ FAMILIES = (
     FamilyDescriptor(
         id="glm",
         model_types=("glm_moe_dsa", "glm5_moe", "glm"),
-        display_name="GLM-5.2",
+        # Two model names, one family, and that is not a shortcut. Z.ai state
+        # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
+        # GLM-5.2 -- every gain comes from post-training." The checkpoints
+        # agree. Diffing the two config.json leaves exactly one extra key
+        # (moe_router_dtype) and the transformers_version that wrote the file:
+        # same 78 layers, 256 experts, hidden 6144, moe_intermediate 2048, same
+        # parameter count. There is nothing architectural to tell them apart,
+        # so no rule over the configuration can name one and not the other, now
+        # or later. #1326's approach for Qwen -- name a checkpoint by its
+        # geometry -- cannot apply here, because the geometry is identical.
+        #
+        # Announcing a GLM-5.3 container as "GLM-5.2" was wrong in the one way
+        # that matters: the engine ran the right weights and the banner named a
+        # different model. Naming both is the honest statement of what this
+        # family loads. If a future release ever adds a real discriminator,
+        # split this then, on evidence.
+        display_name="GLM-5.2/5.3",
+        converter="convert_fp8_to_int4.py",
+        converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
+        converter_mtp_pass=True,
         display_scale="744B",
         engine_artifact="colibri",
         engine_aliases=("glm",),
@@ -1114,6 +1167,10 @@ FAMILIES = (
         model_types=("deepseek_v4",),
         display_name="DeepSeek V4 Flash",
         display_scale="284B",
+        # deepseek-ai/DeepSeek-V4-Flash-0731 config.json: 43 layer, 256
+        # esperti, top-k 6. Il REAP a 150B (#1310) ne ha 132 sugli stessi 43
+        # layer: e' quello che fa scattare la geometria misurata nel banner.
+        reference_experts=256,
         engine_artifact="deepseek_v4",
         engine_aliases=(),
         engine_group="deepseek_v4",
