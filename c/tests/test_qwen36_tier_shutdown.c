@@ -12,7 +12,7 @@
  * This test reproduces exactly that sequence with the fake CUDA backend
  * (tests/qwen36_fake_cuda.h, no GPU needed): budget one expert in, issue it
  * without taking it, queue an LFRU swap directly (what qt_lfru_tick_locked
- * does), then call qt_shutdown() under an alarm(10) so a hang fails loudly
+ * does), then call qt_shutdown() under a 10 s watchdog so a hang fails loudly
  * instead of wedging CI. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,10 +34,22 @@ static int issue_ok(int device, int count, const float *x) {
     (void)device; (void)count; (void)x; return 1;
 }
 
-static void on_alarm(int sig) {
-    (void)sig;
-    (void)!write(2,"FAIL: qt_shutdown hung\n",23);
-    _exit(1);
+/* A hang must fail, not sit forever in CI. alarm()/SIGALRM would do it on
+ * POSIX, but MinGW has neither, and the Windows job is the one that proved
+ * it. A detached thread that sleeps and then checks a flag does the same
+ * job everywhere the test already builds (it uses pthread and nanosleep). */
+static volatile int shutdown_done = 0;
+static void *hang_watchdog(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 100 && !shutdown_done; i++) {   /* 100 x 100 ms = 10 s */
+        struct timespec ts = {0, 100000000};
+        nanosleep(&ts, NULL);
+    }
+    if (!shutdown_done) {
+        (void)!write(2, "FAIL: qt_shutdown hung\n", 23);
+        _exit(1);
+    }
+    return NULL;
 }
 
 /* Poll a G.mx-guarded predicate without a busy spin. */
@@ -112,10 +124,11 @@ int main(void) {
     }
     check(parked, "the uploader should have dequeued the swap within 1s");
 
-    signal(SIGALRM, on_alarm);
-    alarm(10);
+    pthread_t watchdog;
+    if (pthread_create(&watchdog, NULL, hang_watchdog, NULL) == 0)
+        pthread_detach(watchdog);
     qt_shutdown();
-    alarm(0);
+    shutdown_done = 1;
     check(!G.on, "shutdown_returns_while_a_group_is_open");
     /* The abandoned swap must leave the victim exactly as the open group left
      * it, and must not have driven the incoming expert's upload after
