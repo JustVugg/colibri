@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
-  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
+  <a href="https://discord.gg/FkyrEeJR"><b>Discord</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -597,7 +597,7 @@ today its numbers come from a community of real machines. If it's useful to you:
 - ⭐ star the repo and share it;
 - 🐛 open issues with benchmark numbers from your hardware — datapoints move
   this project more than anything else;
-- 💬 join the [Discord community](https://discord.gg/MAaKtQRc) to discuss
+- 💬 join the [Discord community](https://discord.gg/FkyrEeJR) to discuss
   experiments, hardware results, and research directions;
 - 💬 reach out via GitHub issues to sponsor development or donate hardware.
 
