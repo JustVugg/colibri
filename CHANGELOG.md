@@ -41,9 +41,17 @@ days after it shipped.
   engine (#1310), is documented, and is announced by its measured geometry
   rather than the official checkpoint's 284B.
 - The qwen36 VRAM tier promotes int8 experts instead of reserving for nothing
-  (#1334); Kimi K3 stops paying for a DSA indexer nothing reads (#1335).
+  (#1334), and the three tier bugs that surfaced with it are fixed: an `is_x`
+  overrun with two or more GPUs, a shutdown that could hang, and a
+  use-after-free on int8 containers (#1339, #1340, #1341, #1344). Kimi K3
+  stops paying for a DSA indexer nothing reads (#1335).
 - Opt-in: `COLI_MAP_EXPERTS=1` serves experts through a per-shard file mapping
   (#1325). Off by default; output is byte-identical either way.
+
+### Docs
+
+- Windows DeepSeek V4 users are led to the release launcher (`coli.cmd`)
+  instead of a source build (#1291).
 
 ### Build and CI
 
