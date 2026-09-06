@@ -32,6 +32,12 @@ days after it shipped.
 - `coli doctor` omits the GPU plan for a CPU-only engine (#1322); a missing core
   tensor explains itself on every fatal path (#1318); GLM-5.3-Flash `--no-think`
   is the template's lowest effort level, not a shape of ours (#1327).
+- GLM-5.3-Flash `serve` can use the 16 KV slots the engine has; the registry
+  declared 1 (#1283).
+- `image_url` local reads: `..` is refused, and with `COLI_IMAGE_ROOT` set a
+  path must resolve inside it, so an authenticated client of a non-loopback
+  server cannot read arbitrary files through the image API. Error messages no
+  longer confirm a path or its permissions (#1354).
 
 ### Changed
 
@@ -55,6 +61,8 @@ days after it shipped.
 
 ### Build and CI
 
+- CI workflows run with `contents: read`, and third-party actions are pinned
+  by commit SHA (#1354).
 - Makefile lists the headers each engine includes as prerequisites (#1284,
   #1349). Site and READMEs carry the eight families with real RAM figures under
   a contract test (#1302).
