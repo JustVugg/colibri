@@ -12,6 +12,27 @@ stage it declines. Every GPU stage was accepted only when it reproduced the
 engine's CPU reference on greedy text; what "identical" can and cannot mean
 across kernels and cache states is spelled out in [Validation](#validation).
 
+## Windows release (recommended)
+
+Windows users do not need to build or copy an engine manually. Download and
+unpack the [latest Windows release](https://github.com/JustVugg/colibri/releases/latest),
+then start Colibri through the release launcher:
+
+```powershell
+coli.cmd web --model F:\path\to\DeepSeek-V4-Flash
+```
+
+The launcher reads the checkpoint's `config.json`, selects `deepseek_v4` from
+its `model_type`, and starts the matching prebuilt engine. The archive also
+contains the CUDA backend; hardware detection and the safe initial CPU/GPU
+plan are automatic. Use `coli.cmd doctor --model F:\path\to\DeepSeek-V4-Flash`
+to inspect that plan before changing any of the advanced CUDA controls below.
+
+The build instructions in this document are for contributors and custom
+builds. Do not mix an engine built from current source into an older release:
+the launcher, family registry, engine, and backend libraries are one versioned
+unit.
+
 ## Scope
 
 - Production code is in `c/deepseek_v4.c` (amalgamated units); the public
