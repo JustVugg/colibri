@@ -70,7 +70,7 @@ of that device's expert budget, and each decision prints as a `[place]` line.
 | `off` | nothing placed: experts only (the behaviour before this) |
 | `lmhead=0,dnproj=0:20+1:20,experts=0` | hand-written list (the measurement tool); obeyed as written, trunk bytes still charged to the budget |
 
-First calibration, one RTX 3070 (8 GB), per-row int4 container, 200-token
+First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:
 
 | | `off` | `auto` |
@@ -80,7 +80,7 @@ decode, same prompt, output bit-identical in all four runs:
 | cold: hit rate / tok/s | 44 % / 8.64 | 36 % / **9.62** |
 | warm: hit rate / tok/s | 95 % / 9.63 | 90.6 % / **12.92** |
 | same card, budget capped at 5 GB (a 6 GB card's share), warm | 88.9 % / 9.50 | 81.2 % / **13.15** |
-| Quadro RTX 4000 (8 GB) alone, warm | 93.6 % / 11.09 | 88.4 % / **16.55** |
+| RTX 3070 (8 GB) alone, warm | 93.6 % / 11.09 | 88.4 % / **16.55** |
 | both cards, experts on both, warm | 100 % / 10.79 | 100 % / **14.80** |
 | reference: Ollama 0.32.5, same model Q4_K_M, same prompt, both cards (57 % CPU / 43 % GPU, 11.8 GB VRAM) | 20.3 warm (21.3 cold) | |
 
@@ -88,8 +88,10 @@ The warm row is the one that matters: at a 95 % hit rate the marginal expert
 is as valuable as it gets on this card, and the trunk still wins by a third.
 The hit rate drops only 4.4 points for 796 fewer residents because the
 displaced experts are the coldest of the heat order -- exactly the ones the
-placer priced as cheap. The smaller or slower the card, the larger the
-relative win: +34 % on the 3070, +38 % at a 5 GB budget, +49 % on the Quadro.
+placer priced as cheap. The relative win grows with the trunk's share of the
+token: +34 % on the Quadro, +38 % at a 5 GB budget, +49 % on the 3070. (An
+earlier version of this table had the two card names swapped: CUDA orders
+devices fastest-first, `nvidia-smi` by bus, and I had read the wrong one.)
 All sixteen runs of this calibration produced bit-identical text. Against
 Ollama on the same box the gap closes from 1.5× (14.97 vs 22.4 in August, two
 cards, hand-placed) to **1.23× on a single 8 GB card** (16.55 vs 20.3) --
@@ -98,7 +100,7 @@ against this engine's 1.0 (int8), and using both cards.
 
 **Two cards are the open case.** With experts on both cards the second card
 paces every layer (the slower `take()` gates the chain), so `off` on two cards
-is barely ahead of the Quadro alone (10.79 vs 11.09), and `auto` -- which in
+is barely ahead of the 3070 alone (10.79 vs 11.09), and `auto` -- which in
 this version spreads the trunk by free room and leaves the experts on both --
 reaches 14.80 where the hand-written R4 split (`experts=0,lmhead=0,
 dnproj=0:20+1:20`: experts on ONE card, trunk across both) reaches 17.11. On
