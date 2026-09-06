@@ -401,6 +401,15 @@ int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e
     return ok;
 }
 
+/* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
+ * see the exp_bytes comment in qt_init). */
+static size_t dev_alloc_footprint(size_t bytes){
+    const size_t MiB = 1048576u;
+    if(bytes <= 10240u) return 10240u;
+    if(bytes <= MiB) return MiB;
+    return (bytes + 2*MiB - 1) / (2*MiB) * (2*MiB);
+}
+
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
@@ -418,8 +427,12 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * would otherwise stand in for the current environment. */
     G_place_done = 0; G_place_n = 0; G_auto_on = 0;
 
-    /* devices: COLI_GPUS="0,1" (default: first two visible devices) */
+    /* devices: COLI_GPUS="0,1" (default: first two visible devices).
+     * COLI_GPU is the singular the planner writes for a one-device plan
+     * (resource_plan.py) and colibri.c reads; accept it here as well, or a
+     * `coli chat --gpu 1` lands on every visible device. */
     const char *gl=getenv("COLI_GPUS");
+    if(!gl || !*gl) gl=getenv("COLI_GPU");
     if (gl && *gl) {
         char buf[128]; snprintf(buf,sizeof buf,"%s",gl);
         for(char *t=strtok(buf,","); t && G.ndev<QT_MAX_DEV; t=strtok(NULL,","))
@@ -475,8 +488,20 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
         G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
     }
-    G.exp_bytes = (G.wfmt==4 ? 3ull*D*Ih/2 : 3ull*D*Ih)
-                + (2*G.sc_gu+G.sc_d)*sizeof(float) + 4096; /* + allocation slack */
+    /* Charge what the device allocator takes, not what the bytes measure:
+     * cudaMalloc rounds an allocation above 1 MiB up to a multiple of 2 MiB
+     * and one at or below 1 MiB up to 1 MiB (measured with cudaMemGetInfo,
+     * driver 5xx; 1,638,400 B -> 2 MiB, 819,200 B -> 1 MiB, 400 B -> 10 KiB).
+     * An expert is three weight allocations plus three scale allocations.
+     * Charged by payload, the fp8 Qwen3.8 expert (3 x 1.56 MiB) looked like
+     * 4.69 MiB and took 6.03 MiB: the budget filled the card to the last
+     * megabyte and the uploader ran into "tensor allocation: out of memory"
+     * before its stop-trying fallback shrank the budget. Now the planned count
+     * is the resident count. The 22-28 % the granularity costs is real; only
+     * pooling experts into one arena per device would win it back (open). */
+    size_t mat_bytes = G.wfmt==4 ? (size_t)D*Ih/2 : (size_t)D*Ih;
+    size_t scl_bytes = (2*G.sc_gu+G.sc_d)/3*sizeof(float);
+    G.exp_bytes = 3*dev_alloc_footprint(mat_bytes) + 3*dev_alloc_footprint(scl_bytes); /* + allocation slack */
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
      * else free minus 1 GB headroom. The heat table is loaded here too (it

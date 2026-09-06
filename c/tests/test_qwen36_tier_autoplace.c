@@ -92,8 +92,10 @@ int main(void) {
         enum { NL = 1, NE = 48 };
         const char *heat = write_uniform_heat(NL, NE);
         char gb[64];
-        /* exp_bytes for D=64, IH=32, per-row int4: 3072 + 512 + 4096 = 7680 */
-        size_t exp_bytes = 3ull * D * IH / 2 + (2 * IH + D) * sizeof(float) + 4096;
+        /* exp_bytes for D=64, IH=32, per-row int4, at cudaMalloc granularity:
+         * three 1 KiB matrices charged 1 MiB each, three scale tables 10 KiB each */
+        size_t exp_bytes = 3 * dev_alloc_footprint((size_t)D * IH / 2)
+                         + 3 * dev_alloc_footprint((2 * IH + D) / 3 * sizeof(float));
         snprintf(gb, sizeof gb, "%.15f", (double)(16 * exp_bytes + exp_bytes / 2) / 1073741824.0);
         /* the allowance as the tier will parse it back from the string */
         size_t allowance = (size_t)(atof(gb) * 1024.0 * 1024.0 * 1024.0);

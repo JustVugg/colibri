@@ -66,14 +66,14 @@ int main(void) {
     /* ---- 1. the mode starts with cap < n_experts, publishes the LUT, sizes fmt 8 ---- */
     printf(" 1. init\n");
     /* allowance for exactly 3 experts on the one device */
-    size_t exp_bytes = 3ull * D * IH + 3ull * NSC * sizeof(float) + 4096;
+    size_t exp_bytes = 3 * dev_alloc_footprint((size_t)D * IH) + 3 * dev_alloc_footprint(NSC * sizeof(float));
     char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(3 * exp_bytes + exp_bytes / 2) / 1073741824.0);
     setenv("CUDA_EXPERT_GB", gb, 1);
     fake_ndev = 1; fake_uploads = 0; fake_lut_published = 0;
     check(qt_init_fp8(NL, NE, D, IH, CAP, TOPK, lut), "fp8 streaming mode must start with cap 4 < 16 experts");
     check(G.wfmt == 8, "weight format is 8");
     check(fake_lut_published, "e4m3 LUT published to the backend before any upload");
-    check(G.exp_bytes == exp_bytes, "exp_bytes = 3*D*IH bytes + 3 block-scale tables + slack");
+    check(G.exp_bytes == exp_bytes, "exp_bytes = three fmt-8 matrices + three scale tables at cudaMalloc granularity");
     check(G.sc_gu == NSC && G.sc_d == NSC, "one scale per 128x128 block per matrix");
 
     /* ---- 2. a note uploads fmt 8, bytes intact, scales in order, pointers dropped ---- */
