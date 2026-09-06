@@ -1214,6 +1214,19 @@ static void expert_table_init(GModel *m) {
 /* Quanta RAM il sistema dice di poter dare adesso. MemAvailable e non MemFree:
  * la seconda ignora la page cache riutilizzabile e farebbe stimare molto meno
  * di quello che c'e'. */
+static double memory_total_gb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0.0;
+    char line[256];
+    double gb = 0.0;
+    while (fgets(line, sizeof(line), f)) {
+        long kb;
+        if (sscanf(line, "MemTotal: %ld kB", &kb) == 1) { gb = kb / 1048576.0; break; }
+    }
+    fclose(f);
+    return gb;
+}
+
 static double memory_available_gb(void) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return 0.0;
@@ -1236,19 +1249,37 @@ static void expert_cache_init(GModel *m) {
      * versi -- su una macchina piccola va in OOM, su una grande lascia RAM
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
-    double budget;
-    if (setting) budget = atof(setting);
-    else {
-        const double free_now = memory_available_gb();
-        budget = free_now - 3.0;
-        if (budget < 1.0) budget = 1.0;
-        if (getenv("GLM53_VERBOSE"))
-            fprintf(stderr, "budget esperti: %.1f GB (%.1f disponibili, 3 di margine)\n",
-                    budget, free_now);
-    }
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
+    double budget;
+    if (setting) budget = atof(setting);
+    else {
+        /* MemAvailable conta la page cache come "libera". Fidarsi di quel
+         * numero significa allocare in anonimo tutta la RAM e sfrattare
+         * proprio le pagine del modello che poi si rileggono dal disco: le
+         * due cache tengono gli stessi byte. Si lascia quindi al modello lo
+         * spazio per restare in page cache e si prende solo l'avanzo. */
+        const double free_now = memory_available_gb();
+        const double total = memory_total_gb();
+        /* gli esperti instradati dominano; il resto dei pesi e' un ~7% */
+        const double model_gb = (double)sparse * c->n_experts * (double)m->e_slot / 1e9 * 1.07;
+        double margin = total * 0.08;
+        if (margin < 4.0) margin = 4.0;
+        if (total <= 0.0 || model_gb >= total - margin) {
+            /* il modello non ci sta comunque: la page cache non puo' aiutare
+             * e tanto vale tenere piu' slot possibile, come prima. */
+            budget = free_now - 3.0;
+        } else {
+            budget = total - model_gb - margin;
+            if (budget > free_now - 3.0) budget = free_now - 3.0;
+        }
+        if (budget < 1.0) budget = 1.0;
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "budget esperti: %.1f GB (%.1f totali, %.1f modello, "
+                            "%.1f margine, %.1f disponibili)\n",
+                    budget, total, model_gb, margin, free_now);
+    }
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
     if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
