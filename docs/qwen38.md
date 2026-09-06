@@ -199,8 +199,10 @@ earns its VRAM by promotion at touch time: with the RAM LRU at cap 128 and one
 **VRAM per expert.** The tier charges what `cudaMalloc` takes, not the payload:
 an allocation above 1 MiB rounds up to a multiple of 2 MiB, so each 1.56 MiB
 expert matrix occupies 2 MiB and an expert costs 6.03 MiB of VRAM for 4.69 MiB
-of bytes. A 6.5 GB budget holds about 1,080 experts. Pooling experts into one
-arena per device would recover the 22 %; it is not done yet.
+of bytes. A 6.5 GB budget holds about 1,080 experts. (Qwen3.6's int4 matrices
+are exactly 512 KiB and are served exactly, so its accounting was already
+right.) Pooling experts into one arena per device would recover the 22 %; it
+is not done yet.
 
 **Where the time goes** (this checkpoint, Threadripper 3945WX 12 cores, 12
 threads, cap 32, `COLI_TIMERS=1`): 4.6 s per decode token were 1.4 s dense
