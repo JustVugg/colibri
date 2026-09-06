@@ -69,7 +69,8 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, resolve_model, tuning_replay_prompt)
+                             family_by_id, family_for_config, resolve_model,
+                             tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
     "A service has high median throughput but poor tail latency. Explain how "
@@ -174,7 +175,13 @@ def model_banner_line(model):
     this runs before every command, and a banner may not cost a scan of a
     400 GB checkpoint.
     """
-    generic = "GLM-5.2 · 744B MoE · int4 · streaming CPU"
+    # Senza un modello non si nomina un modello. Diceva "GLM-5.2 · 744B", che
+    # era la famiglia di punta quando e' stata scritta e che dal #1367 non si
+    # chiama nemmeno piu' cosi'; una riga che invecchia perche' cita un caso
+    # invece di descrivere il programma. Il conto viene dal registry: aggiungere
+    # una famiglia lo aggiorna, dimenticarsene non lo sbaglia.
+    generic = (f"{len(_BANNER_MODELS)} model families · "
+               f"MoE experts streamed from disk · CPU")
     if not model:
         return generic
     try:
@@ -1948,6 +1955,42 @@ def cmd_bench(a):
     print(f"  {C.dim}decode is disk-bound: this takes HOURS on slow hardware. Raise --limit on faster machines.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
+#: Le opzioni di precisione di `coli convert`: nome sulla riga di comando e
+#: default. Il parser le dichiara con default=None apposta, cosi' "l'utente
+#: l'ha scritta" e' semplicemente "non e' None" -- vale per --ebits 3,
+#: --ebits=3 e per le abbreviazioni che argparse accetta, senza frugare in
+#: sys.argv. Un default non passato al convertitore non fa danno; un valore
+#: scritto e ignorato si'.
+_CONVERT_PRECISION_FLAGS = {"ebits": "--ebits", "io_bits": "--io-bits",
+                            "xbits": "--xbits", "group_size": "--group-size"}
+_CONVERT_DEFAULTS = {"ebits": 4, "io_bits": 8, "xbits": 0, "group_size": 64}
+
+
+def checkpoint_family(repo):
+    """La famiglia del checkpoint, letta dal solo config.json.
+
+    Cinque KB decidono quale convertitore ha senso per i prossimi 300 GB, ed e'
+    lo stesso appiglio che usa la guardia dentro convert_fp8_to_int4.py.
+
+    None quando non si riesce a stabilirlo -- rete assente, huggingface_hub non
+    installato, repo senza config.json. In quel caso si prosegue come prima: la
+    guardia del convertitore scarica lo stesso file e rifiuta lei. Meglio
+    proseguire che fermare una conversione valida per un errore di rete.
+    """
+    try:
+        local = os.path.join(os.path.expanduser(repo), "config.json")
+        if os.path.isfile(local):
+            with open(local, encoding="utf-8") as handle:
+                return family_for_config(json.load(handle))
+        from huggingface_hub import hf_hub_download
+        with open(hf_hub_download(repo, "config.json"), encoding="utf-8") as handle:
+            return family_for_config(json.load(handle))
+    except SystemExit:
+        raise
+    except Exception:
+        return None
+
+
 def cmd_convert(a):
     banner("convert")
     # here --model is the DESTINATION the converted weights are written to, not an
@@ -1957,15 +2000,59 @@ def cmd_convert(a):
                  f"  --model <dir> is where the converted model is written")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     py = project_python()
-    base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
-          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
-          "--group-size", str(a.group_size)]
-    if a.xbits: base+=["--xbits",str(a.xbits)]
-    # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
-    print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
-    rc=subprocess.call(base)
-    if rc!=0: sys.exit(rc)
-    if a.no_mtp: sys.exit(0)
+
+    # #1368: quale convertitore, deciso dal checkpoint e non dal fatto che GLM-5.2
+    # e' arrivato per primo. Prima di questo, una GLM-5.3-Flash passava per il
+    # convertitore di GLM-5.2, che le quantizzava l'embedding perche' il suo nome
+    # annidato non corrisponde a nessuna delle sue regole; il contenitore usciva
+    # senza un errore e moriva ore dopo, dentro `coli web`.
+    family = checkpoint_family(a.repo)
+    script = family.converter if family else "convert_fp8_to_int4.py"
+    if family and not script:
+        # Famiglia nota che coli non guida: il suo convertitore ha un'altra riga
+        # di comando, o non serve. La guardia dentro convert_fp8_to_int4.py tiene
+        # le indicazioni per famiglia, sotto test; le si lascia dire a lei
+        # invece di tenerne una seconda copia qui.
+        script = "convert_fp8_to_int4.py"
+    written_names = [name for name in _CONVERT_PRECISION_FLAGS
+                     if getattr(a, name) is not None]
+    for name, value in _CONVERT_DEFAULTS.items():
+        if getattr(a, name) is None:
+            setattr(a, name, value)
+    if family:
+        print(f"  {C.dim}checkpoint: {family.display_name} -> tools/{script}{C.r}")
+        written = [_CONVERT_PRECISION_FLAGS[name] for name in written_names
+                   if name not in family.converter_accepts]
+        if written and family.converter:
+            sys.exit(f"{C.yel}{' '.join(written)}: tools/{script} does not take "
+                     f"{'them' if len(written) > 1 else 'it'}.{C.r}\n"
+                     f"  {family.display_name} keeps its dense weights and embedding "
+                     f"wide and picks the precision when the engine loads them.\n"
+                     f"  Re-run without {' '.join(written)}.")
+
+    # Quando la famiglia non si e' potuta stabilire si passano tutte le opzioni,
+    # cioe' esattamente il comando di prima: nessuna conversione che funzionava
+    # cambia comportamento perche' la rete non ha risposto.
+    accepts = family.converter_accepts if family and family.converter else \
+        tuple(_CONVERT_PRECISION_FLAGS)
+    base = [py, os.path.join(TOOLS, script), "--repo", a.repo, "--outdir", a.model]
+    if "ebits" in accepts:
+        base += ["--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
+    if "group_size" in accepts:
+        base += ["--group-size", str(a.group_size)]
+    if a.xbits and "xbits" in accepts:
+        base += ["--xbits", str(a.xbits)]
+
+    mtp_pass = family.converter_mtp_pass if family and family.converter else True
+    steps = 2 if (mtp_pass and not a.no_mtp) else 1
+    print(f"  {C.dim}[1/{steps}] model: {' '.join(base)}{C.r}")
+    rc = subprocess.call(base)
+    if rc != 0: sys.exit(rc)
+    if steps == 1:
+        # Non tutte le famiglie hanno una testa MTP da convertire a parte, e
+        # convert_glm53.py non ha proprio --mtp: chiamarlo con quel flag e' un
+        # errore di argomenti dopo che il modello e' gia' stato scritto.
+        sys.exit(0)
     # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
     # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
     mtp_cmd=list(base); i=mtp_cmd.index("--ebits"); mtp_cmd[i+1]=str(max(8,a.ebits))
@@ -2118,8 +2205,14 @@ def main():
     _bench_cache = os.path.join(_cache_root, "colibri", "bench")
     pb.add_argument("--data",default=_bench_cache)
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
-    pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
-    pc.add_argument("--group-size",type=int,default=64,
+    # default=None e non il valore: cosi' e' argparse a dire se l'opzione e'
+    # stata SCRITTA (--ebits 3, --ebits=3, o abbreviata), e cmd_convert puo'
+    # rifiutarla su un convertitore che non la prende invece di ignorarla.
+    # I valori di default veri stanno in _CONVERT_DEFAULTS.
+    pc.add_argument("--ebits",type=int,default=None,help="routed expert bits (default 4)")
+    pc.add_argument("--io-bits",type=int,default=None,help="embedding/head bits (default 8)")
+    pc.add_argument("--xbits",type=int,default=None,help="streaming expert bits (default = ebits)")
+    pc.add_argument("--group-size",type=int,default=None,
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
